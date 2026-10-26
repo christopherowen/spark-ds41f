@@ -90,6 +90,9 @@ RECIPE_ENV = {
 RECIPE_SIZING = {4: ["--max-num-seqs", "16"], 3: ["--max-num-seqs", "8"]}
 
 
+GRID_ROWS = {1: 0, 8: 2}
+
+
 def recipe_sizing(tp):
     """iket_step.py options for the recipe's sizing at ``tp``: its streams, a 1M context,
     prefix caching and its CUDA-graph capture ladder. With the measured batches' sizes
@@ -99,12 +102,12 @@ def recipe_sizing(tp):
             "--prefix-caching", "--capture-ladder"]
 
 
-def time_spec(ref, tp, requests, tokens=32, grid=8):
+def time_spec(ref, tp, requests, tokens=32, grid=8, grid_rows=0):
     """A bundle timing DS4.1 decode steps with nsys alone, at the recipe's environment and
     sizing: the step bundle's timed run, its timeline, and its decode steps against the
     grid's (step_diff.py joins a step bundle's IKET table later, by kernel name)."""
     shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens),
-             "--grid", str(grid)]
+             "--grid", str(grid), *(["--grid-rows", str(grid_rows)] if grid_rows else [])]
     return dict(
         ref=ref,
         what=f"DS4.1 decode steps timed with nsys: TP{tp} rank shapes at TP1, the recipe's "
@@ -125,7 +128,8 @@ def time_spec(ref, tp, requests, tokens=32, grid=8):
     )
 
 
-def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)", grid=8):
+def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)", grid=8,
+              grid_rows=0):
     """A bundle timing DS4.1 decode steps, kernel by kernel and phase by phase: iket_step.py
     at TP1 with one rank's shapes at ``tp``, ``requests`` concurrent requests of ``tokens``
     tokens, then ``grid`` runs of the engine grid's dummy step at their shape; on under
@@ -133,7 +137,7 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
     nsys of off with the graphs, the records against the dry run's count, the timeline
     and tables of the measured requests, and their decode steps against the grid's."""
     shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens),
-             "--grid", str(grid)]
+             "--grid", str(grid), *(["--grid-rows", str(grid_rows)] if grid_rows else [])]
     # The timed run (nsys, off) takes the recipe's sizing. The IKET run keeps an 8K context:
     # at 1M the warmup and capture launch the indexer's top-k with up to a million warps,
     # run-iket's pool reserves a record for every warp (37.6M warps, 17.2 GB), and its exit
@@ -439,8 +443,12 @@ BUNDLES = {
                                "{out}/capped-run/iket/sources"], 1800),
         ],
     ),
-    **{f"step-tp{tp}-c{requests}": step_spec(IKET, tp, requests) for tp in (4, 3) for requests in (1, 8)},
-    **{f"time-tp{tp}-c{requests}": time_spec(IKET, tp, requests) for tp in (4, 3) for requests in (1, 8)},
+    # The grid's rows a request: a c1 step verifies all six; at c8, adaptive verification
+    # verifies two a request, and the recipe's ladder replays that size (run 47).
+    **{f"step-tp{tp}-c{requests}": step_spec(IKET, tp, requests, grid_rows=GRID_ROWS[requests])
+       for tp in (4, 3) for requests in (1, 8)},
+    **{f"time-tp{tp}-c{requests}": time_spec(IKET, tp, requests, grid_rows=GRID_ROWS[requests])
+       for tp in (4, 3) for requests in (1, 8)},
     # Run 42's TP3 c1 dry run stopped launching between a kernel and the next graph replay
     # (as run 30's did at TP4): the dry run repeated, each bounded, while a host-side
     # watcher (hangcatch.sh) records stacks and GPU power when a run's log stops growing.

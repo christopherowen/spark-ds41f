@@ -243,6 +243,10 @@ def main():
                         help="after the request, the engine grid's dummy step (servebench engine) "
                              "at its requests, verification rows and context: one warm-up and this "
                              "many timed runs, between iket_grid_marker launches")
+    parser.add_argument("--grid-rows", type=int, default=0,
+                        help="the grid's verified rows a request (0: 1 + drafts). Adaptive "
+                             "verification verifies 2 a request at c8 (run 47): with the recipe's "
+                             "capture ladder a c8 step replays that size, so its grid should too")
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     parser.add_argument("--skip", default="", help="VLLM_DS41_IKET_SKIP")
@@ -384,7 +388,7 @@ def main():
         # midpoint.
         context = len(measured.prompt_token_ids) + args.tokens // 2
         spec = {"shapes": [{"num_reqs": args.requests, "context_len": context,
-                            "num_tokens": args.requests * (args.drafts + 1)}],
+                            "num_tokens": args.requests * (args.grid_rows or args.drafts + 1)}],
                 "replays": args.grid, "warmup": 1, "settle": 0}
         grid_marker(count)
         torch.cuda.synchronize()

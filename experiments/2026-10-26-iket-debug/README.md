@@ -343,28 +343,55 @@ What a whole-engine trace needed:
 
 ### Step 4 results: c1 and c8 decode steps at the ring's and the triangle's rank shapes (dgx3)
 
-dgx3, vLLM 736e86a25 (with the MoE output fix below), bundles `step-tp{4,3}-c{1,8}`:
-run 42, and run 43 for TP3 c1 (run 42's TP3 c1 dry run hung; see "Found on the way").
-Receipts are in `runs/step-*-42` and `runs/step-tp3-c1-43`: `tables.md` (the output),
-`table.json`, `step-diff.json`, and both runs' `result-*.json`.
+dgx3, vLLM 736e86a25 (with the MoE output fix below).
 - **The requests:** c1 is a 32-token prompt and 32 tokens, as one prefill and 16 decode
   steps (dummy weights accept about 1.9 tokens a step). c8 is eight such requests
   together.
 - **The grid:** after the requests, nine runs of the engine grid's dummy step at the same
   shape (one or eight requests, six verification rows each), about the requests'
   context.
-- Both are traced under IKET, and timed with nsys without it.
-- **Earlier c1 runs:** runs 32 and 33 (vLLM 734932a56, `runs/step-tp4-c1-32`,
-  `runs/step-tp3-c1-33`) predate the fix. Each layer read the previous layer's MoE
-  output from the workspace arena after the mHC entry had overwritten it: finite, but
-  wrong. So their routing was wrong too, and their routed GEMMs came out 0.2 ms
-  shorter.
+- **Timing:** nsys without IKET times the steps; IKET traces them for in-kernel phases.
+- **Final timings: run 47** (`time-tp{4,3}-c{1,8}`, receipts `runs/time-*-47`).
+  - The recipe's environment (`RECIPE_ENV`): breakable CUDA graphs off, late admission,
+    32 device connections.
+  - The recipe's sizing: 16 or 8 streams, a 1M context, prefix caching.
+  - The recipe's CUDA-graph capture ladder.
+- **Phase splits: run 46's IKET runs** (`runs/step-*-46`), which ran the same
+  environment at an 8K context.
+- **Earlier runs, superseded:**
+  - **Runs 42 and 43** (`runs/step-*-42`, `runs/step-tp3-c1-43`) left vLLM to switch
+    breakable CUDA graphs on: it does for DS4.1 unless the variable is set. They also
+    ran the harness's small sizing and capture sizes.
+  - **Runs 32 and 33** predate the MoE fix: each layer read a finite but wrong MoE
+    output.
+- **What changed between them:**
+  - The recipe's environment and sizing moved a c1 step by under 0.2 ms; the 1M
+    context adds six `indexer_topk_merge` launches a step.
+  - The ladder took about 1.2 ms off a c8 step. With only 6, 12 and 48 rows captured, a
+    c8 step's 16 verified rows ran the 48-row graph.
 
 | a decode step (nsys, no IKET) | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
 |---|---:|---:|---:|---:|
-| GPU busy, requests | 14.26 ms | 15.48 ms | 17.12 ms | 18.45 ms |
-| GPU busy, the grid's step | 8.76 ms | 9.57 ms | 11.38 ms | 12.31 ms |
-| the grid's own timer (`engine_grid`): step / target / drafter | 10.06 / 2.19 / 6.73 ms | 10.80 / 2.71 / 6.99 ms | 12.83 / 3.47 / 8.18 ms | 13.81 / 4.02 / 8.53 ms |
+| GPU busy, requests (run 47) | 14.30 ms | 15.51 ms | 16.15 ms | 17.34 ms |
+| GPU busy, the grid's step (run 47) | 8.87 ms | 9.73 ms | 13.30 ms\* | 12.21 ms\* |
+| the grid's own timer (`engine_grid`): step / target / drafter | 10.07 / 2.20 / 6.68 ms | 11.03 / 2.79 / 6.99 ms | 14.73 / 3.53 / 9.90 ms | 13.25 / 4.06 / 8.04 ms |
+| runs 42-43, for comparison: requests / grid | 14.26 / 8.76 | 15.48 / 9.57 | 17.12 / 11.38 | 18.45 / 12.31 |
+
+\* **c8's grid is not yet matched.**
+- **Rows:**
+  - A c8 request step verifies 2 rows a request: adaptive verification, 16 rows. Its
+    router launches show grid 8 against the grid's 24.
+  - The grid's dummy step verifies 6 a request. So run 47's c8 grid does about three
+    times the request's per-layer target work.
+  - The c8 bundles now give the grid 2 rows a request (`--grid-rows`). Their re-run is
+    held: the nodes went into the production ring at 21:38 CET.
+- **TP4's grid:**
+  - On the 16-stream engine, the grid's 8-request dummy step runs the drafter's
+    head over two row tiles (grid (2, 4040), 5.8 ms) and `partial_argmax` over 16
+    rows.
+  - The c8 request step runs (1, 4040) at 4.4 ms over 8 rows, and so do TP3's grid
+    (8 streams) and every c1 grid.
+  - That is about 1.4 ms in TP4's c8 grid that an 8-request step does not do.
 
 The vocabulary head is whole at TP1: each launch is 4.0-4.7 ms, where a TP4 rank's
 quarter is about 1.0 ms. So the absolute steps above are long by about 3 ms (the
@@ -372,54 +399,64 @@ target's head) plus 3 ms (the drafter's head), and the vocabulary-wide BF16 GEMM
 TP times a rank's too. Every other kernel is at a rank's shapes. The model has 40
 target layers and the drafter's 3, where this harness has 6 and 3.
 
-**A decode step by phase** (nsys, no IKET; kernel time a step, then the part exposed:
-time a kernel runs alone on the GPU, so on the step's critical path):
+**A decode step by phase** (run 47, nsys, no IKET; kernel time a step, then the part
+exposed: time a kernel runs alone on the GPU, so on the step's critical path):
 
 | phase | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
 |---|---:|---:|---:|---:|
-| packed vocabulary head (two launches, whole) | 8084 / 8084 us | 8126 / 8126 | 8850 / 8850 | 8868 / 8868 |
-| vocabulary-wide BF16 GEMM (whole) | 1353 / 1353 | 1342 / 1342 | 1465 / 1465 | 1465 / 1465 |
-| dense GEMMs (MXFP8, FP8 weights, BF16 partials, split-K) | 2126 / 1187 | 2845 / 1790 | 2760 / 2043 | 3592 / 2915 |
-| routed experts (router, dispatch, GEMMs, SwiGLU, combine) | 1427 / 1281 | 1937 / 1566 | 2061 / 1832 | 2473 / 2214 |
-| L2 prefetch (a side stream) | 1671 / 226 | 1788 / 226 | 1399 / 120 | 1376 / 115 |
-| mHC and norms | 593 / 89 | 693 / 91 | 1083 / 336 | 1138 / 364 |
-| attention (sparse MLA, indexer, compressor, cache, rope, metadata) | 539 / 145 | 555 / 143 | 699 / 421 | 745 / 441 |
-| sampler, verification, sink rejection, the harness's logprobs | 185 / 185 | 188 / 188 | 358 / 358 | 354 / 354 |
-| inputs, copies, others | 69 / 69 | 65 / 65 | 85 / 85 | 88 / 88 |
+| packed vocabulary head (two launches, whole) | 8123 / 8123 us | 8163 / 8163 | 8798 / 8798 | 8834 / 8834 |
+| vocabulary-wide BF16 GEMM (whole) | 1312 / 1312 | 1334 / 1334 | 1421 / 1421 | 1437 / 1437 |
+| dense GEMMs (MXFP8, FP8 weights, BF16 partials, split-K) | 2097 / 1156 | 2929 / 1750 | 2195 / 1442 | 3125 / 2169 |
+| routed experts (router, dispatch, GEMMs, SwiGLU, combine) | 1429 / 1253 | 1929 / 1505 | 1677 / 1491 | 2024 / 1716 |
+| L2 prefetch (a side stream) | 1724 / 244 | 1847 / 245 | 1845 / 219 | 1978 / 215 |
+| mHC and norms | 622 / 92 | 643 / 87 | 918 / 136 | 911 / 120 |
+| attention (sparse MLA, indexer, compressor, cache, rope, metadata) | 591 / 198 | 607 / 203 | 773 / 317 | 784 / 315 |
+| sampler, verification, sink rejection, the harness's logprobs | 173 / 173 | 172 / 172 | 367 / 367 | 358 / 358 |
+| inputs, copies, others | 55 / 55 | 55 / 55 | 90 / 90 | 87 / 87 |
 
-**Where a decode step's time goes inside the kernels** (IKET, 17 decode steps; spans a
-step, then the phase split of the launch's last recording warp; loop ranges are
+**Where a decode step's time goes inside the kernels** (run 46's IKET, 17 decode steps;
+spans a step, then the phase split of the launch's last recording warp; loop ranges are
 estimates, see Sampling above). TP4 c1:
 
 | kernel (grid) | launches | span a step | last warp: wait / load / compute | its longest wait |
 |---|---:|---:|---|---|
-| packed vocabulary head (1, 4040) | 2 | 8079 us | 56% / 31% / 10% | the block sync after its cp.async waits |
-| L2 prefetch (2) | 25 | 1599 us | load (a side stream; 86% overlapped) | |
-| BF16 GEMM (2020), vocabulary-wide (2020 x 64 = 129,280 rows: also whole at TP1) | 5 | 1315 us | 89% / 0% / 5% | its mbarrier wait |
-| routed gate-up GEMM (9, 30) | 8.6 | 806 us | 54% / 21% / 30% | the TMA weight tile's mbarrier |
-| routed down GEMM (40, 30) | 8.6 | 487 us | 14% / 20% / 0% | |
-| MXFP8 GEMMs (80, 64, 28, 36, 40, 40) | 48 | 1561 us | 27-77% wait | `cp_async_wait`, then the sync after it |
-| mHC project streams (40) | 18 | 300 us | 19% / 32% / 17% | the block sync |
+| packed vocabulary head (1, 4040) | 2 | 8107 us | 65% / 29% / 11% | the block sync after its cp.async waits |
+| L2 prefetch (2) | 25 | 1589 us | load (a side stream; 86% overlapped) | |
+| BF16 GEMM (2020), vocabulary-wide (2020 x 64 = 129,280 rows: also whole at TP1) | 5 | 1331 us | 89% / 0% / 5% | its mbarrier wait |
+| routed gate-up GEMM (9, 30) | 8.6 | 817 us | 46% / 20% / 29% | the TMA weight tile's mbarrier |
+| routed down GEMM (40, 30) | 8.6 | 495 us | 14% / 20% / 0% | |
+| MXFP8 GEMMs (80, 64, 28, 36, 40, 40) | 48 | 1585 us | 29-77% wait | `cp_async_wait`, then the sync after it |
+| mHC project streams (40) | 18 | 293 us | 18% / 31% / 17% | the block sync |
 
-TP3's is the same order, with larger routed GEMMs. At c8 one of the two head launches
-computes more (24% of its last warp, against 10%). The routed GEMMs' grids grow from
-(9, 30) and (40, 30) to (9, 288) and (40, 288), and the down GEMM's last warp spends 56%
-loading (TP4).
+TP3's is the same order, with larger routed GEMMs.
+
+c8's IKET runs replayed the 48-row graph (their capture sizes stop at 6, 12 and 48),
+where the recipe's ladder replays a 16-row one. There:
+- one of the two head launches computes more: 24% of its last warp, against 10%;
+- the routed GEMMs' grids grow from (9, 30) and (40, 30) to (9, 288) and (40, 288);
+- the down GEMM's last warp spends 56% loading (TP4, run 42).
 
 **What a decode step adds to the grid's step** (`step_diff.py`, nsys; kernel time,
-then exposed):
+then exposed).
+- **c1** is run 47: both sides verify 6 rows.
+- **c8** is run 46, whose short capture list ran both sides at 48 rows. So it is
+  matched, but at more rows than a real c8 step verifies.
+- **TP4 c8's grid** carries the drafter's 16-request head and argmax, about 1.4 ms (see
+  above), so its head and BF16 rows read low.
+- `runs/time-tp{4,3}-c1-47/step-diff.md` has each kernel, with run 46's IKET phase split
+  beside it.
 
-| a decode step less the grid's | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
+| a decode step less the grid's | TP4 c1 | TP3 c1 | TP3 c8 (48 rows) | TP4 c8 (48 rows; grid padded) |
 |---|---:|---:|---:|---:|
-| the target's verification head: a second packed-head launch the grid does not run | +4.08 / +4.08 ms | +4.11 / +4.11 | +4.34 / +4.34 | +4.34 / +4.34 |
-| the routed GEMMs (dummy rows reach 6 experts, the requests' rows more) | +1.17 / +1.13 | +1.64 / +1.43 | +1.21 / +1.13 | +1.58 / +1.51 |
-| the other per-layer kernels (mHC, router, sparse MLA, SwiGLU, combine, rope) | +0.21 / +0.03 | +0.30 / -0.12 | +0.10 / -0.18 | +0.18 / -0.08 |
-| L2 prefetch (a side stream) | +0.13 / -0.01 | +0.17 / -0.01 | +0.18 / +0.01 | +0.12 / 0.00 |
-| the vocabulary-wide BF16 GEMM (whole) | +0.08 / +0.08 | +0.07 / +0.07 | +0.10 / +0.10 | +0.10 / +0.10 |
-| kernels only a request runs: sampler, sink rejection, verification, inputs | +0.07 / +0.07 | +0.07 / +0.07 | +0.12 / +0.12 | +0.11 / +0.11 |
-| the harness's top-5 logprobs (`token_ranks`, `topk_log_softmax`, `topk_ids`) | +0.09 / +0.09 | +0.09 / +0.09 | +0.11 / +0.11 | +0.11 / +0.11 |
-| kernels only the grid runs (its dummy fills) | -0.11 / -0.11 | -0.12 / -0.12 | -0.14 / -0.14 | -0.15 / -0.15 |
-| **total (GPU busy)** | **+5.50 ms** | **+5.91** | **+5.74** | **+6.14** |
+| the target's verification head: a second packed-head launch the grid does not run | +4.05 / +4.05 ms | +4.08 / +4.08 | +4.34 / +4.34 | +3.21 / +3.21 |
+| the routed GEMMs (dummy rows reach 6 experts, the requests' rows more) | +1.19 / +1.12 | +1.64 / +1.38 | +1.58 / +1.48 | +1.19 / +1.09 |
+| the other per-layer kernels (mHC, router, sparse MLA, SwiGLU, combine, rope) | +0.22 / +0.02 | +0.27 / -0.12 | +0.35 / +0.01 | -0.16 / -0.42 |
+| L2 prefetch (a side stream) | +0.10 / -0.02 | +0.12 / -0.01 | +0.20 / 0.00 | +0.15 / +0.01 |
+| the vocabulary-wide BF16 GEMM (whole) | +0.02 / +0.02 | +0.05 / +0.05 | +0.10 / +0.10 | -0.20 / 0.00 |
+| kernels only a request runs: sampler, sink rejection, verification, inputs | +0.07 / +0.07 | +0.07 / +0.07 | +0.12 / +0.12 | +0.13 / +0.13 |
+| the harness's top-5 logprobs (`token_ranks`, `topk_log_softmax`, `topk_ids`) | +0.09 / +0.09 | +0.09 / +0.09 | +0.11 / +0.11 | +0.12 / +0.12 |
+| kernels only the grid runs (its dummy fills) | -0.11 / -0.11 | -0.13 / -0.13 | -0.15 / -0.15 | -0.16 / -0.16 |
+| **total (GPU busy)** | **+5.43 ms** | **+5.79** | **+6.31** | **+4.13** |
 
 A negative exposed time means the grid's step ran those kernels alone for longer than
 the requests' step did.
@@ -428,30 +465,39 @@ the requests' step did.
   target's runs on its verified rows, eagerly after the target's graph (`ced_copy_rows`,
   the head, then `logits_rows`, `sink_cut`, `local_stats`, `verify`). The drafter's runs
   inside its graph. The grid's dummy step runs only the drafter's.
-- **The routed GEMMs** match #616's routing estimate. TP4 c1's +1.17 ms over this
-  harness's 9 MoE layers is about 5.6 ms over the model's 43 (+1.13 ms exposed: 5.4
+- **The routed GEMMs** match #616's routing estimate. TP4 c1's +1.19 ms over this
+  harness's 9 MoE layers is about 5.7 ms over the model's 43 (+1.12 ms exposed: 5.4
   ms), against #616's 5.3 ms.
 - **Applied to #616's c1 gap** (TP4, 1025: 11.9 ms, of which routing explains about
-  5.3 ms and about 6.5 ms is unattributed GPU work), this accounts for:
-  - about 1.0 ms of the target's verification head at a TP4 rank's shard (4.08 / 4),
+  5.3 ms and about 6.5 ms is unattributed GPU work), run 47 accounts for:
+  - about 1.0 ms of the target's verification head at a TP4 rank's shard (4.05 / 4),
     all on the critical path;
   - about 0.07 ms of sampler, sink rejection, verification and inputs, all exposed
     (serving asks no logprobs);
-  - about 1.0 ms of slower per-layer kernels over 43 layers (0.21 ms x 43 / 9), of
+  - about 1.0 ms of slower per-layer kernels over 43 layers (0.22 ms x 43 / 9), of
     which about 0.1 ms is exposed;
-  - about 0.6 ms more L2 prefetch over 43 layers, on its side stream (none exposed);
-  - 0.02 ms of the vocabulary-wide BF16 GEMM at a rank's quarter.
+  - about 0.5 ms more L2 prefetch over 43 layers, on its side stream (none exposed);
+  - under 0.01 ms of the vocabulary-wide BF16 GEMM at a rank's quarter.
 
-  That is about 1.2 ms on the critical path, of up to 2.7 ms of kernel time. The
-  1.3-1.7 ms from runs 32 and 33 scaled the vocabulary-wide BF16 GEMM's difference by
-  43 / 9 with the per-layer kernels. That GEMM runs five times a step, not once a
-  layer, and it was most of what was exposed. The other 5.3 ms is not in a one-GPU step
-  at these shapes. It must lie in what this harness leaves out: Engram (layers 1 and
-  14), the collectives with real peers, and the request's real context.
-- **c8 against c1:** a c8 step adds 0.2-0.3 ms more than a c1 step does. The head's
-  launches run longer (4.4 ms against 4.0), and the request-only kernels take 0.12 ms.
-  The routed difference stays about the same, because the grid's eight dummy requests
-  already reach more experts (0.68 ms against 0.11 at c1).
+  That is about 1.2 ms on the critical path, of up to 2.6 ms of kernel time.
+  - **Runs 42 and 43** gave the same 1.2 ms on the critical path, of up to 2.7 ms of
+    kernel time.
+  - **Runs 32 and 33** gave 1.3-1.7 ms. They scaled the vocabulary-wide BF16 GEMM's
+    difference by 43 / 9 with the per-layer kernels. That GEMM runs five times a
+    step, not once a layer, and it was most of what was exposed.
+
+  The other 5.3 ms is not in a one-GPU step at these shapes. It must lie in what this
+  harness leaves out: Engram (layers 1 and 14), the collectives with real peers, and
+  the request's real context.
+- **c8 against c1** (TP3, run 46, each matched to its grid): a c8 step adds about 0.3 ms
+  more than a c1 step does (+6.31 against +6.00 ms).
+  - The head's launches run longer: 4.4 ms against 4.0.
+  - The request-only kernels take 0.12 ms.
+  - The routed difference stays about the same, because the grid's eight dummy
+    requests already reach more experts (0.68 ms against 0.11 at c1).
+
+  A matched c8 at the recipe's ladder (2 rows a request on both sides) waits for the
+  held re-run.
 
 **c8 found a vLLM bug: at TP1 the routed experts' output lived in the workspace arena**
 (runs 33-41; summaries in `runs/c8-nan-*` and `runs/nan-*`):
@@ -611,10 +657,27 @@ What a serving trace on the cluster would take:
      its log ends in `Finalize Dump Json`. The live harness was the measured run,
      decoding its records at exit (`iket::to_json`, GPU idle). The catcher now skips a
      log that ends that way.
-   - **What it needs (run 44):** the same dry run eight times in each of three setups:
-     - `metadata_builder` and `padding_rows` uninstrumented (`dry-skip-tp3-c1`);
-     - the mode off, so the tracker sees no events (`dry-off-tp3-c1`);
-     - no CUDA graphs (`dry-eager-tp3-c1`).
+   - **What it needs (runs 44, 46 and 47):** the same TP3 c1 dry run, eight at a time.
+
+     | setup | hung |
+     |---|---:|
+     | the mode on, with CUDA graphs (runs 42, 43, 45 and 46's dry runs) | 3 of 18 |
+     | `metadata_builder` and `padding_rows` uninstrumented (`dry-skip-tp3-c1`, runs 44 and 47) | 2 of 16 |
+     | the mode off, so the tracker sees no events (`dry-off-tp3-c1`) | 0 of 8 |
+     | no CUDA graphs (`dry-eager-tp3-c1`, run 46) | 0 of 8 |
+
+     So it needs IKET events and CUDA graph launches under the tracker. It does not
+     need the events of the two kernels before the graph launch it stops at.
+   - **Where the fault is:** run-iket's injection, NVIDIA's closed tool. Its
+     graph-launch callback waits for GPU work that does not complete. The kernels
+     queued before that launch cannot spin.
+     - The tracker leaves each marker's store to reserved shared memory executing.
+     - Measured runs replace that store, and none of them has hung.
+     - The next step is a reproduction small enough for NVIDIA: one tracked TileLang
+       kernel and a CUDA graph, launched in a loop under `run-iket --skip-run`.
+   - **Until then, the step bundles' dry run hangs about one time in five.**
+     `iket_profile.py` kills it after 1800 s and the bundle fails. Run the bundle
+     again.
 
 ## Timing a decode step with your own vLLM branch
 
