@@ -110,8 +110,9 @@ def main():
         # Two: the dead-row warmup launches for one request and for two.
         max_num_seqs=2,
         # A small profile run keeps the startup's share of a trace small; prefill
-        # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192).
-        max_num_batched_tokens=512,
+        # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192),
+        # with room in the step for the decode rows beside one.
+        max_num_batched_tokens=1024,
         long_prefill_token_threshold=512,
         max_parallel_prefills=1,
         async_scheduling=True,
