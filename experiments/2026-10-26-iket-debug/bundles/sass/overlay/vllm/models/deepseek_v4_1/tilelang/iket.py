@@ -75,6 +75,20 @@ _SETTLE = (
     "mov.u32 a, 0x20;\\n\\t"  # ptxas takes no immediate shared address
     'ld.volatile.shared.u32 s, [a];\\n\\t}" ::: "memory")\n'
 )
+# run-iket gives every event a warp issues a slot in the warp's record, predicated off
+# or not, and ptxas predicates a short guarded block whatever its condition (the
+# sampled sparse MLA: 26 of its 64 events, so warps took 109 slots for 42 records). It
+# does not predicate a loop: a sampled event runs in a loop of zero or one iterations,
+# whose count an asm hides from the compilers.
+_WHEN = (
+    "__device__ __forceinline__ int __tl_iket_count(bool c) {\n"
+    "  int n;\n"
+    '  asm volatile("mov.b32 %0, %1;" : "=r"(n) : "r"((int)c));\n'
+    "  return n;\n"
+    "}\n"
+    '#define TL_IKET_WHEN(C) _Pragma("unroll 1") '
+    "for (int __tl_iket_n = __tl_iket_count(C); __tl_iket_n > 0; --__tl_iket_n)\n"
+)
 
 # (phase, kind, patterns): the first kind a statement matches names its phase.
 _PATTERNS = [
@@ -444,9 +458,8 @@ def annotate(
             inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
     for item in found:
         # Each condition holds through a range: the CTA's and its loops' iterations (a
-        # loop variable does not change inside one iteration). All are uniform in a
-        # warp: run-iket gives a slot to every event a warp issues, and ptxas branches
-        # around a uniform guard but predicates the events behind a lane's.
+        # loop variable does not change inside one iteration). Both are uniform in a
+        # warp, so a range opens and closes in a warp's every lane or in none.
         conditions = ["__tl_iket_cta"] if ctas else []
         unsampled = []
         for header in item.loops if iters else ():
@@ -455,7 +468,9 @@ def annotate(
                 unsampled.append(" ".join(header.split()))
             else:
                 conditions.append(condition)
-        guard = f"if ({' && '.join(conditions)}) " if conditions else ""
+        condition = " && ".join(conditions)
+        guard = f"if ({condition}) " if conditions else ""
+        when = f"TL_IKET_WHEN({condition}) " if conditions else ""
         sites.append(
             {
                 "kernel": item.kernel,
@@ -478,14 +493,14 @@ def annotate(
             (
                 item.first.start,
                 1,
-                f'{indent}{guard}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+                f'{indent}{when}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
             )
         )
         # Settled: a barrier inside the range (a block sync, TileLang's AllReduce)
         # holds the range's end, not the next statement's.
         end = (
             f"{indent}{guard}TL_IKET_SETTLE();\n"
-            f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n"
+            f"{indent}{when}TL_IKET_EVENT({RANGE_END});\n"
         )
         inserts.append((item.last.end, 0, end))
     # The events a warp can record, with the loops sampled: each range opens and closes
@@ -509,6 +524,8 @@ def annotate(
         out += [code[last:offset], text]
         last = offset
     annotated = "".join(out) + code[last:]
+    if "TL_IKET_WHEN(" in annotated:
+        annotated = _WHEN + annotated
     if "TL_IKET_SETTLE();" in annotated:
         annotated = _SETTLE + annotated
     return annotated, sites

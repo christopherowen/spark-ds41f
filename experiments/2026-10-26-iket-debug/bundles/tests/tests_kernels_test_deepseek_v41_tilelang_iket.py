@@ -132,9 +132,15 @@ def test_sampled_ctas_guard_every_event():
     assert "gridDim.x * gridDim.y * gridDim.z / 8u" in lines[body + 1]
     events = [line.strip() for line in lines if "TL_IKET_EVENT(" in line]
     assert len(events) == 2 * len(sites)
-    assert all(e.startswith("if (__tl_iket_cta) TL_IKET_EVENT(") for e in events)
-    # Unsampled, the kernel declares nothing.
-    assert "__tl_iket_cta" not in iket.annotate(KERNEL, _token)[0]
+    # Each in a loop of zero or one iterations, which ptxas does not predicate.
+    assert all(
+        e.startswith("TL_IKET_WHEN(__tl_iket_cta) TL_IKET_EVENT(") for e in events
+    )
+    assert "#define TL_IKET_WHEN(C) " in out
+    # Unsampled, the kernel declares nothing and its events need no loop.
+    unsampled = iket.annotate(KERNEL, _token)[0]
+    assert "__tl_iket_cta" not in unsampled
+    assert "TL_IKET_WHEN" not in unsampled
 
 
 def test_sampled_iterations_guard_loop_ranges():
@@ -145,15 +151,17 @@ def test_sampled_iterations_guard_loop_ranges():
     lines = [line.strip() for line in out.splitlines()]
     in_loop = [s["range"] for s in sites if s["loops"]]
     assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
-    guarded = [line for line in lines if line.startswith(f"if ({stride}) ")]
-    # Each in-loop range: its start, its settle and its end.
-    assert len(guarded) == 3 * len(in_loop)
+    # Each in-loop range: its start and end events, and its settle.
+    events = [line for line in lines if line.startswith(f"TL_IKET_WHEN({stride}) ")]
+    assert len(events) == 2 * len(in_loop)
+    settles = [line for line in lines if line == f"if ({stride}) TL_IKET_SETTLE();"]
+    assert len(settles) == len(in_loop)
     # Ranges outside the loop, and the unrolled loop wrapped whole, have no condition;
-    # none depends on the lane (a lane's guard would leave ptxas predicating events).
+    # none depends on the lane.
     assert 'TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");' in lines
     assert "laneid" not in out
     both = iket.annotate(KERNEL, _token, ctas=4, iters=2)[0]
-    assert f"if (__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
+    assert f"TL_IKET_WHEN(__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
 
 
 def test_while_loop_ranges_have_no_bound():
