@@ -8,8 +8,10 @@ spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
 (6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
 MoE output fix; its image is built and its release tests show two order-dependent test failures,
-root-caused and fixed in test files (vLLM 31312f358). The cluster qualification is prepared for
-candidate 8 ([rc8/](rc8)), not run. The production cluster is down: it was re-cabled for the
+root-caused and fixed in test files (vLLM 31312f358). **Candidate 9** ([below](#candidate-9-rc9))
+adds 0534-0536 (that fix, the MoE lease without its dead output buffer, the SageMaker import's
+root logging); its image passes the release tests (6,585 passed, 0 failed). The cluster
+qualification is prepared for candidate 9 ([rc9/](rc9)), not run. The production cluster is down: it was re-cabled for the
 four-node ring and the dgx4-dgx1 cable is missing.
 
 ## What it is
@@ -411,3 +413,104 @@ vLLM's profile run at the budget; [rc8/make_peak_bundles.py](rc8/make_peak_bundl
 both candidates; its fix (31312f358) changes test files only, so the package files and serving
 are unchanged. If the coordinator takes 31312f358 into `next-candidate`, it becomes 0534 and a
 candidate 9 image carries its test files, as candidate 6 carried 0489-0490.
+
+## Candidate 9 ([rc9/](rc9))
+
+Candidate 8 with three vLLM commits, on branch `candidate-9-fixes` from e846e64dc (head
+**e2b2b0b59**; the coordinator fast-forwards `next-candidate` to it). Candidate 8's records above
+stay as they ran; candidate 9 supersedes it for the qualification.
+
+| Patch | Commit | What | Outputs |
+| --- | --- | --- | --- |
+| 0534 | 31312f358 | Tests: each test restores the root logger's level and its handlers' levels (candidate 8's two order-dependent failures) | test files only |
+| 0535 | 1fca420fa | MoE: a lease prepared for the caller's output holds no output buffer (0533 left buffer 0, `M x 5120` BF16, leased and unused) | unchanged (bit for bit, below) |
+| 0536 | e2b2b0b59 | Entrypoints: the SageMaker routes' import puts the root logging back, unless `SAGEMAKER_CONTAINER_LOG_LEVEL` or `LOG_LEVEL` is set | unchanged; `vllm serve` logs third-party warnings again |
+
+- **0535 in detail:** `_allocate_buffers` takes the caller's output shape. It leases no output
+  buffer when that is the experts' output and they write a matching alias (not on ROCm without
+  aiter, which copies from its own buffer). `prepare_workspace` passes `hidden_states`' shape,
+  and the per-call lease passes the alias's. A lease without an output buffer refuses a call
+  without a matching output. The FlashInfer NVFP4 workspace tests still asserted that the output
+  was `workspace[2]`, which 0533 had already made untrue; they now assert the new contract.
+- **0536 in detail:** `vllm/entrypoints/serve/sagemaker/standards.py` imports
+  `model_hosting_container_standards.sagemaker` for both routers, then puts the root logger's
+  level and its handlers' levels back. If either variable is set, the library's documented
+  behavior applies. The routes are unchanged, and no switch is added.
+- **Series:** candidate 8's plus 0534-0536 ([rc9/vllm/series](rc9/vllm/series),
+  [rc9/make_series.py](rc9/make_series.py)): patch head `52ebc12e`, tree `2b0931a0` (the
+  branch's). [rc9/source.json](rc9/source.json) adds the capabilities `moe-lease-without-output-buffer`
+  and `sagemaker-import-keeps-root-logging`.
+- **Classification:** `tests/test_root_logging_isolation.py`,
+  `tests/entrypoints/serve/test_sagemaker_root_logging.py` and `tests/kernels/moe/test_flashinfer_moe.py`
+  join the gate: 163 selected, 108 gate, 0 problems.
+- **Before the build** ([rc9/bundles/precheck-next8](rc9/bundles/precheck-next8), `precheck2`):
+  the branch's eleven files mounted over next-8 pass the new and changed tests (22) and the DS4.1
+  MoE and model tests on the changed path (350). 0536's test first lived in
+  `tests/entrypoints/serve/sagemaker/`, whose conftest needs `pytest_asyncio`, which the image
+  doesn't install; it moved up a directory.
+- **Image:** `spark-ds41f:19f2c20ed4d6-next-9`, image `sha256:22bfd440fb18`, built on dgx4 at
+  19:52-20:00 CET from deployment commit `466e678b` (458 s; the build's lowest MemAvailable was
+  52.5 GiB because peak runs shared the node). Labels: vLLM patch head `52ebc12e`, tree
+  `2b0931a0`; every other tree candidate 8's. The smoke passed, B12X 1.3.0 is still in it, and
+  all three changes are in the image.
+- **Arms and specs:** each [rc9/](rc9) arm extends candidate 8's with only the image, its tree
+  label and the lock (each renders with only the image tag changed). The specs are candidate 8's
+  on them, with `startup_memory` on every qualification and release-comparison arm.
+
+### Release tests (rc9/bundles/release-tests, dgx4, 20:03-20:29 CET)
+
+**6,585 passed, 163 skipped, 0 failed** in 108 files and 1,590 s, every chunk at its first run
+([rc9/runs/2026-10-26-dgx4/rc9-release-tests-1](rc9/runs/2026-10-26-dgx4/rc9-release-tests-1)).
+- The new and changed files: `test_flashinfer_moe.py` 158 passed, `test_moe_output_outlives_workspace.py`
+  4, `test_sagemaker_root_logging.py` 2, `test_root_logging_isolation.py` 4.
+- `test_kv_cache_utils.py` 149 passed and 40 skipped, candidate 8's two failures among the passes.
+- The skips are candidate 8's 163, each with its reason.
+
+### 0535: memory and bits (run 3 of the step-harness measurement)
+
+The same method as candidate 8's runs 1-2: #610's harness at 63fca56c, six layers at one rank's
+shapes, dummy weights, TP1, max_model_len 32,768, each step in a fresh process
+([rc9/make_peak_bundles.py](rc9/make_peak_bundles.py), `moe-peak3-*`, runs in `rc9/runs`).
+Peaks in GiB, two repeats each:
+
+| Shape, budget | next-7 allocated / reserved | next-8 allocated / reserved | next-9 allocated / reserved |
+| --- | --- | --- | --- |
+| TP4, 16,384 | 24.111 / 24.689, 24.689 | 24.268 / 25.195, 25.195 | **24.111** / 25.039, 24.926 |
+| TP3, 8,192 | 25.380 / 25.604, 25.604 | 25.458 / 26.133, 26.133 | **25.380** / 26.055, 25.861 |
+
+Run 3 repeats runs 1-2 for next-7 and next-8 to the MiB (next-8's run 2 also saw 25.082 and 25.881
+reserved).
+- **Peak allocated: recovered completely.** next-9's equals next-7's at both shapes. The fresh
+  output now replaces the arena's slot instead of coming on top of it.
+- **Peak reserved: recovered only in part.** 0535 removes the slot from reserved memory too: in
+  run 3, next-9 is 0.16-0.27 GiB below next-8 at TP4 and 0.08-0.27 GiB at TP3 (the slot is
+  160 MiB at TP4, 80 at TP3). But it is still
+  0.24-0.35 GiB above next-7 at TP4 and 0.26-0.45 GiB at TP3, and it varies between repeats where
+  next-7's never does. That is allocator fragmentation from allocating a budget-sized output
+  each layer call: the slot sat inside one arena allocation, while the fresh tensor is allocated
+  and freed beside other work. That it varies with timing points at reuse delayed across streams
+  (the shared expert's combine runs on the aux stream). This is a likely explanation, not a
+  measured one.
+- **Outputs: bit for bit.** The filled runs' token ids and top-5 log probabilities
+  ([rc9/compare_results.py](rc9/compare_results.py)):
+  - next-9 equals next-8 for one request with the graphs, three requests eager, and the 16K
+    budget request;
+  - next-7 differs from both at one request, which is 0533's bug ("silently wrong rows below
+    three requests");
+  - next-7 still asserts on non-finite gate logits at three requests.
+- **What recovering the rest would take:** the output allocated once rather than per call. One
+  way is a DS4.1-only output buffer per workspace lane, outside the arena's leases, reused by
+  every MoE layer. It is safe only while each layer's output is consumed (by the next mHC entry
+  at TP1, by the all-reduce at TP3 and TP4) before the next MoE call writes it. That is the class
+  of aliasing 0533 fixed, so it is a design change for the coordinator to decide, not part of
+  this candidate.
+- **For the qualification:** unchanged from candidate 8. Every candidate-9 boot records
+  `startup_memory` against the 5 GiB guard beside 1025, with dgx1's serving memory no lower than
+  1025's. Candidate 7's memory cuts (up to about 1.8 GiB a rank at TP4) are larger than this
+  residual.
+
+### Outputs against 1025
+
+Candidate 7's expected deltas (above) apply unchanged. 0534 changes test files only, 0535 no
+bits, and 0536 only what `vllm serve` logs: warnings from libraries that log through the root
+logger appear again.
