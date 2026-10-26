@@ -285,10 +285,9 @@ Nothing ran on dgx1-dgx3.
 equals that tree's single chunk. The single chunk keeps the same rows from the same
 replay start in both trees, and every other kernel the stack runs is the same code, so
 the two trees agree on these prompts. A second run of both bundles adds a SHA-256 of
-every case's rows to check this across trees. It started at about 08:10 CET. All four
-DGX nodes then dropped off the network (Tailscale: offline from about 08:20 CET), so its
-outputs (`~/spark-lab/agents/ced-prompt-anchor/out/*-2` on dgx4) are not in this record
-yet.
+every case's rows to check this across trees. **That run was interrupted:** it started at
+about 08:10 CET, and dgx1-dgx4 powered off at about 08:15 CET for re-cabling, on the
+owner's instruction. It re-runs once dgx4 is back, as `out/*-3`.
 
 ## What the gate and the release comparison must expect
 
