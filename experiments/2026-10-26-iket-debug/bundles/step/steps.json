@@ -1,6 +1,6 @@
 [
  [
-  "decode steps, on, under run-iket",
+  "decode steps, on, eager, under run-iket",
   [
    "run-iket",
    "--output-dir",
@@ -15,6 +15,7 @@
    "{python}",
    "/b/iket_step.py",
    "on",
+   "--eager",
    "--iket",
    "{out}/trace-run/iket",
    "--ctas",
@@ -39,7 +40,7 @@
   1800
  ],
  [
-  "decode steps, nsys, off",
+  "decode steps, nsys, off, eager",
   [
    "/opt/nsys/bin/nsys",
    "profile",
@@ -49,13 +50,34 @@
    "--export=sqlite",
    "--force-overwrite=true",
    "--output",
-   "{out}/nsys-off",
+   "{out}/nsys-eager",
+   "{python}",
+   "/b/iket_step.py",
+   "off",
+   "--eager",
+   "--out",
+   "{out}/nsys-eager-run"
+  ],
+  5400
+ ],
+ [
+  "decode steps, nsys, off, graphs",
+  [
+   "/opt/nsys/bin/nsys",
+   "profile",
+   "--trace=cuda",
+   "--sample=none",
+   "--cpuctxsw=none",
+   "--export=sqlite",
+   "--force-overwrite=true",
+   "--output",
+   "{out}/nsys-graphs",
    "--cuda-graph-trace=node",
    "{python}",
    "/b/iket_step.py",
    "off",
    "--out",
-   "{out}/nsys-off-run"
+   "{out}/nsys-graphs-run"
   ],
   5400
  ],
@@ -70,7 +92,8 @@
    "--between",
    "iket_step_marker_kernel",
    "--nsys",
-   "off={out}/nsys-off.sqlite",
+   "eager={out}/nsys-eager.sqlite",
+   "graphs={out}/nsys-graphs.sqlite",
    "--json",
    "{out}/table.json"
   ],

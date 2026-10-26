@@ -64,8 +64,12 @@ the hot kernels did not:
 - `VLLM_DS41_IKET_CTAS=N`: only about N CTAs of a launch record ranges, evenly spread.
   The flag is uniform per CTA, so ranges stay balanced.
 - `VLLM_DS41_IKET_ITERS=N`: a range inside a `for` loop records in at most N of its
-  iterations, evenly spread. The guard uses the loop variable, so it is uniform within
-  an iteration.
+  iterations, each in the middle of its share of the loop, so `N=1` samples the middle
+  iteration rather than the pipeline's fill. The guard uses the loop variable, so it is
+  uniform within an iteration. With it, only lane 0 of a warp records: IKET records an
+  event each time a group of a warp's lanes runs it, so where lanes diverge, one
+  statement would leave several records. Each range then records at most once per
+  sampled iteration, and every site's static bound in the manifests holds.
 - `VLLM_DS41_IKET_SKIP=REGEX`: kernels whose name matches compile uninstrumented. run-iket
   still records their warps' lifetimes.
 
@@ -252,27 +256,55 @@ What a whole-engine trace needed:
   stay exact.
   - Unsampled, the hot kernels alone wrote a 1.39 GB trace.json from 61 launches: the
     expert GEMMs' K loops put up to 36 iterations of ranges in every warp.
-- **Bounded records (`VLLM_DS41_IKET_ITERS=2`).** run-iket's device pool is a bump
-  allocator for the whole process (`ContextBuffer::Allocate`). Every instrumented
-  launch reserves the run's largest per-warp record for each of its warps:
+- **Bounded records (`VLLM_DS41_IKET_ITERS=1`, `--max-ts-cnt-per-warp 128`).** run-iket's
+  device pool is a bump allocator for the whole process (`ContextBuffer::Allocate`).
+  Every instrumented launch reserves the run's largest per-warp record for each of its
+  warps (`compute_required_buffer_size`), whether or not the warp records anything. Graph
+  replays count as launches of their own (`graph_exec_<id>:<replay>`).
   - The first engine trace's dry run saw 16,894 launches and 86 graph launches, mostly
     the engine's startup. Its largest warp held 5,016 timestamps.
   - The pool came to 898 GB, and the run was killed.
   - With a fixed 8 GB pool, the run exhausted it during the encoder's profile run:
     8.49 GB in, a 695 MB request failed.
 
-  Ranges inside a loop now record in at most two iterations, evenly spread. With CTA
-  sampling, that bounds every warp's record and the pool sized from the dry run. The
-  run's 41 million TileLang warps cost about 20 GiB at 128 timestamps a warp.
+  With CTA sampling, lane 0 recording and the middle iteration of each loop, the
+  sources' static bound is at most 64 timestamps a warp (sparse MLA: 32 ranges). The
+  dry run still recommends more: 352 and 424 in the engine runs, and 152 where the hot
+  kernels' warps recorded at most 86. Run 14 had 26.6 million instrumented warps, 19.7
+  million of them in eager launches (the profile run, the warmups and prefill; the
+  routed gate-up GEMM alone 9.1 million). At 424 that is a 52 GB pool, more than GB10
+  has beside the engine. The memory watchdog stopped the run at 7 GiB available.
+  So the step bundle sets the record size: 128 timestamps, twice the static bound, a
+  16 GB pool. The trace's per-warp counts (`trace_counts.py`) show whether any warp
+  came near it.
 - **Room on the GPU.** The pool counts against vLLM's startup check, so the harness sets
-  `gpu_memory_utilization=0.6`. The KV pool is fixed by bytes. The profile run is kept
-  small: 256-token chunks in a 512-token step.
+  `gpu_memory_utilization=0.5`. The KV pool is fixed by bytes. The profile run is kept
+  small: 256-token chunks in a 512-token step. Graphs are captured for one and two
+  requests' verification rows only (6 and 12), since every capture warmup's launches
+  reserve records too.
+- **Uninstrumented kernels (`VLLM_DS41_IKET_SKIP=^(vision_|topk_topp)`).** The vision
+  tower and the top-k/top-p sampler are not in a greedy text decode step. Left
+  uninstrumented, their warps reserve no records.
 - **Comparable runs.** vLLM's dummy loader leaves integer tensors uninitialized: the
   packed FP4 experts and their UE8M0 scales. The harness zeroes them. Even then, two off
   runs give different tokens, because more of what the TP1 dummy engine reads is never
   written. So the token comparison (`step-bits`) fills uninitialized tensors with
   `torch.use_deterministic_algorithms(True, warn_only=True)`. The trace run does not,
   since the fills add kernels to the graphs.
+
+  The comparison cannot decide anything at the engine level (run 12, `runs/step-bits-12`).
+  With dummy weights the output distribution is nearly flat: every top-5 logprob is
+  about −11.7696 (−ln 129,280), with neighbours 1e-6 apart, so greedy tokens are argmaxes
+  over near-ties.
+  - The first off run's tokens differ from every other run's.
+  - The second off run and the three on runs (unsampled, CTAs sampled, CTAs and
+    iterations sampled) give the same tokens.
+  - Their logprobs are equal exactly in seven of the eight steps. In the first step the
+    top-5 sets differ, also between two on runs of the same build.
+
+  So off-path identity rests on step 3: the generated sources and the outputs' bits.
+  When the mode is off, no callback is registered, so every module is TileLang's own
+  output.
 
 <step 4 results>
 

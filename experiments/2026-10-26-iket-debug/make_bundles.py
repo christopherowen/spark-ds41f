@@ -112,9 +112,10 @@ BUNDLES = {
     "step": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
-             "production recipe's kernels and graphs): on under run-iket (four CTAs a launch and "
-             "the middle iteration of each loop record ranges; the vision tower and the sampler's "
-             "top-k/top-p kernel uninstrumented), nsys durations off, and the decode-step table",
+             "production recipe's kernels): on under run-iket without CUDA graphs (four CTAs a "
+             "launch and the middle iteration of each loop record ranges; the vision tower and "
+             "the sampler's top-k/top-p kernel uninstrumented), nsys durations off without and "
+             "with the graphs, and the decode-step table",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
@@ -122,24 +123,31 @@ BUNDLES = {
             # instrumented launch gets the run's largest warp record (5,016 timestamps
             # unsampled: 898 GB). Sampled CTAs and iterations bound that record: lane 0
             # records, and each range at most once a loop, so no warp records more than 64
-            # (the sources' static bounds). The dry run still recommends 424 (52 GB for 26.6M
-            # instrumented warps, more than GB10 has beside the engine), so the cap is set:
-            # twice the bound, which the trace's counts show no warp reaches.
+            # (the sources' static bounds). With the graphs, the dry run recommends 424 all
+            # the same (52 GB for 26.6M instrumented warps, more than GB10 has beside the
+            # engine), and capped at 128 the run's exit dump crashed in a warp record
+            # (iket::to_json, run 15). A graph's kernel nodes seem to keep their records
+            # across replays, so this trace runs without graphs, capped at twice the bound;
+            # the trace's counts show whether any warp reaches it.
             # The vision tower and the top-k/top-p sampler are not in a greedy text decode
             # step; left uninstrumented, their warps reserve no records.
-            ("decode steps, on, under run-iket",
+            ("decode steps, on, eager, under run-iket",
              [*PROFILE, "{out}/trace", "profile", "--keep", "--max-ts-cnt-per-warp", "128",
               "--postprocess", "all", "--",
-              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "1",
-              "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
+              "{python}", STEP, "on", "--eager", "--iket", "{out}/trace-run/iket", "--ctas", "4",
+              "--iters", "1", "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
                                        "{out}/trace-run/iket/sources"], 1800),
-            ("decode steps, nsys, off", [*NSYS_PROFILE, "{out}/nsys-off", "--cuda-graph-trace=node",
-                                         "{python}", STEP, "off", "--out", "{out}/nsys-off-run"], 5400),
+            ("decode steps, nsys, off, eager",
+             [*NSYS_PROFILE, "{out}/nsys-eager", "{python}", STEP, "off", "--eager",
+              "--out", "{out}/nsys-eager-run"], 5400),
+            ("decode steps, nsys, off, graphs",
+             [*NSYS_PROFILE, "{out}/nsys-graphs", "--cuda-graph-trace=node",
+              "{python}", STEP, "off", "--out", "{out}/nsys-graphs-run"], 5400),
             ("decode-step table",
              ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
-              "--between", "iket_step_marker_kernel", "--nsys", "off={out}/nsys-off.sqlite",
-              "--json", "{out}/table.json"], 1800),
+              "--between", "iket_step_marker_kernel", "--nsys", "eager={out}/nsys-eager.sqlite",
+              "graphs={out}/nsys-graphs.sqlite", "--json", "{out}/table.json"], 1800),
         ],
     ),
     "hot-sampled": dict(

@@ -302,7 +302,7 @@ class _Range:
     kinds: set[str]
     first: _Node
     last: _Node
-    loops: tuple[str, ...] = ()  # the headers of the for loops around the range
+    loops: tuple[str, ...] = ()  # the headers of the loops around the range
     kernel: str = ""
     base: str = ""
     name: str = ""
@@ -323,7 +323,8 @@ def _ranges(nodes: list[_Node], loops: tuple[str, ...] = ()) -> list[_Range]:
         )
         if node.jumps or node.phase == "mixed" or not node.alone or waits:
             run = None
-            inner = (*loops, node.text) if node.text.startswith("for") else loops
+            looped = node.text.startswith(("for", "while", "do"))
+            inner = (*loops, node.text) if looped else loops
             for children in (node.body, node.orelse):
                 if children and node.phase is not None:
                     found.extend(_ranges(children, inner))
@@ -393,7 +394,8 @@ def annotate(
     spread, record their ranges (run-iket still records every warp's lifetime):
     a kernel with many CTAs and loop-carried ranges otherwise writes millions of
     records a launch. With ``iters`` > 0 a range inside a ``for`` loop records in
-    at most that many of its iterations, evenly spread, and only lane 0 of a warp
+    at most that many of its iterations, evenly spread (a ``while`` loop has no
+    variable to sample: its site lists it, unsampled), and only lane 0 of a warp
     records (where lanes diverge each group of them would record): run-iket
     reserves the run's largest warp record for every warp of every instrumented
     launch, so one long or divergent kernel sizes the whole run's buffer. A module with

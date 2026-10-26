@@ -2,13 +2,16 @@
 """A per-phase table from an IKET trace (run-iket's ``*.trace.json``).
 
 usage: iket_table.py TRACE.json|RUN_DIR [--sources DIR] [--nsys NAME=FILE.sqlite ...]
-                     [--kernels REGEX] [--between MARKER_KERNEL] [--json OUT.json]
+                     [--kernels REGEX] [--between MARKER_KERNEL [--gap-us US]]
+                     [--json OUT.json]
 
 Launches (those inside CUDA graph launches too) are ordered by their first warp's
 start; ``--between`` keeps the ones between the first and last launch of a marker
-kernel (iket_step.py brackets its measured request with ``iket_step_marker``).
+kernel (iket_step.py brackets its measured request with ``iket_step_marker``), and
+starts with their timeline: wall time, the GPU's busy time (the union of the launches'
+spans) and idle gaps, and the segments that gaps over ``--gap-us`` (100) separate.
 
-An overview comes first: kernel shapes by total span, with the phase split of their
+An overview follows: kernel shapes by total span, with the phase split of their
 launches' last warps, and the waits those last warps spend most time in, summed over
 the launches. A launch ends when its last warp does, so these are the waits that
 lengthen the step.
@@ -26,7 +29,12 @@ Then launches are grouped by kernel name, grid and block. For each group:
   that ends last, the one the launch waits for.
 
 ``--sources`` is the IKET mode's ``sources`` directory: each range's first
-statement is printed beside it. ``--nsys`` adds, per group, the median kernel
+statement is printed beside it, and the manifests say how a kernel was sampled. For a
+kernel with sampled CTAs (``VLLM_DS41_IKET_CTAS``), warp, range and last-warp numbers
+come from the CTAs that recorded ranges (the span stays the whole launch's). With
+sampled iterations (``VLLM_DS41_IKET_ITERS``), a range inside a loop holds only its
+sampled iterations; it is marked, and the loop's other iterations count as
+unattributed. ``--nsys`` adds, per group, the median kernel
 duration of nsys exports (``nsys export --type sqlite``) of the same kernel
 (name, grid and block); NAME labels the column, e.g. ``off=nsys-off.sqlite``.
 
@@ -51,14 +59,20 @@ def phase_of(name):
 
 
 def sites(directory):
-    """(kernel, range) -> first statement, from the IKET mode's site manifests."""
+    """From the IKET mode's site manifests: (kernel, range) -> first statement, and
+    kernel -> its sampling: CTAs and iterations (0: all) and the ranges inside a loop."""
     found = defaultdict(set)
+    sampling = {}
     for path in sorted(Path(directory).glob("*.json")):
         manifest = json.loads(path.read_text())
+        kernel = sampling.setdefault(manifest["kernel"], {
+            "ctas": manifest.get("ctas", 0), "iters": manifest.get("iters", 0), "in_loops": set()})
         for site in manifest["sites"]:
             if "range" in site:
                 found[(site["kernel"], site["range"])].add(site["statement"])
-    return {key: " | ".join(sorted(statements)) for key, statements in found.items()}
+                if site.get("loops"):
+                    kernel["in_loops"].add(site["range"])
+    return {key: " | ".join(sorted(statements)) for key, statements in found.items()}, sampling
 
 
 def nsys_durations(path):
@@ -74,8 +88,10 @@ def nsys_durations(path):
     return out
 
 
-def launch_numbers(launch, names, locations):
-    """One launch: span, warp lifetimes and each warp's time per range."""
+def launch_numbers(launch, names, locations, sampled=False):
+    """One launch: span, warp lifetimes and each warp's time per range. With sampled CTAs,
+    lifetimes, ranges and the last warp are those of the CTAs that recorded ranges; the
+    span is always the whole launch's."""
     lifetimes = {w["locIdx"]: (w["startTs"], w["endTs"]) for w in launch["warpLifetimes"]}
     if not lifetimes:
         return None
@@ -89,10 +105,16 @@ def launch_numbers(launch, names, locations):
         per_warp[warp][name] += (r["endTs"] - r["startTs"]) / 1000
         counts[warp][name] += 1
     warps = list(lifetimes)
+    if sampled and per_warp:
+        recording = {tuple(locations[w]["ctaId"]) for w in per_warp}
+        warps = [w for w in warps if tuple(locations[w]["ctaId"]) in recording]
     life = {w: (lifetimes[w][1] - lifetimes[w][0]) / 1000 for w in warps}
     last = max(warps, key=lambda w: lifetimes[w][1])
     return {
         "span": (end - start) / 1000,
+        "start": start,
+        "end": end,
+        "all_warps": len(lifetimes),
         "warps": len(warps),
         "life": sum(life.values()) / len(warps),
         "ranges": {
@@ -128,23 +150,25 @@ def window(launches, marker):
     return launches[marks[0] + 1 : marks[-1]]
 
 
-def summarize(trace, kernels=None, between=None):
-    names, locations = trace["stringTable"], trace["locationTable"]
+def summarize(launches, names, locations, kernels=None, sampling=None):
+    """Groups of launches by kernel, grid and block. ``sampling`` is the manifests'
+    (``sites``): a CTA-sampled kernel's numbers come from its recording CTAs, and a range
+    inside a loop of an iteration-sampled kernel holds the sampled iterations only."""
+    sampling = sampling or {}
     groups = defaultdict(list)
-    launches = all_launches(trace)
-    if between:
-        launches = window(launches, between)
     for launch in launches:
         if kernels and not re.search(kernels, launch["kernelName"]):
             continue
         key = (launch["kernelName"],
                (launch["gridDimX"], launch["gridDimY"], launch["gridDimZ"]),
                (launch["blockDimX"], launch["blockDimY"], launch["blockDimZ"]))
-        numbers = launch_numbers(launch, names, locations)
+        sampled = sampling.get(launch["kernelName"], {}).get("ctas", 0) > 0
+        numbers = launch_numbers(launch, names, locations, sampled)
         if numbers is not None:
             groups[key].append(numbers)
     out = []
     for (kernel, grid, block), launches in groups.items():
+        kernel_sampling = sampling.get(kernel, {})
         life = median([n["life"] for n in launches])
         range_names = sorted({name for n in launches for name in n["ranges"]})
         ranges = {}
@@ -155,6 +179,8 @@ def summarize(trace, kernels=None, between=None):
                 "share": mean / life if life else 0.0,
                 "count": median([n["ranges"].get(name, {}).get("count", 0.0) for n in launches]),
                 "max_us": median([n["ranges"].get(name, {}).get("max", 0.0) for n in launches]),
+                "sampled_iterations": bool(kernel_sampling.get("iters"))
+                and name in kernel_sampling.get("in_loops", ()),
             }
         phases = defaultdict(float)
         last = defaultdict(float)
@@ -174,12 +200,63 @@ def summarize(trace, kernels=None, between=None):
         out.append({
             "kernel": kernel, "grid": grid, "block": block, "launches": len(launches),
             "warps": launches[0]["warps"], "ctas": launches[0]["ctas"],
+            "all_warps": launches[0]["all_warps"],
+            "sampled_ctas": kernel_sampling.get("ctas", 0), "sampled_iters": kernel_sampling.get("iters", 0),
             "span_us": median([n["span"] for n in launches]), "warp_us": life,
             "span_total_us": sum(n["span"] for n in launches),
             "ranges": ranges, "phases": dict(phases),
             "last_warp": {"us": last_life, "phases": dict(last), "ranges_total_us": dict(last_ranges)},
         })
     return sorted(out, key=lambda g: -g["span_total_us"])
+
+
+def timeline(launches, gap_us, top=10):
+    """Markdown and numbers: the launches' GPU time. Busy is the union of their spans;
+    idle gaps longer than ``gap_us`` split it into segments (in an engine run, mostly its
+    steps, between which the host schedules)."""
+    items = [(min(w["startTs"] for w in launch["warpLifetimes"]),
+              max(w["endTs"] for w in launch["warpLifetimes"]), launch["kernelName"])
+             for launch in launches]
+    busy, gaps = 0, []
+    run_start, run_end, run_last = items[0]
+    segments = [{"launches": 0, "start": run_start, "busy": 0, "first": run_last}]
+    for start, end, name in items:
+        if start > run_end:
+            busy += run_end - run_start
+            segments[-1]["busy"] += run_end - run_start
+            gaps.append(((start - run_end) / 1000, run_last, name))
+            if (start - run_end) / 1000 > gap_us:
+                segments[-1]["end"] = run_end
+                segments.append({"launches": 0, "start": start, "busy": 0, "first": name})
+            run_start, run_end, run_last = start, end, name
+        elif end > run_end:
+            run_end, run_last = end, name
+        segments[-1]["launches"] += 1
+    busy += run_end - run_start
+    segments[-1]["busy"] += run_end - run_start
+    segments[-1]["end"] = run_end
+    wall = (run_end - items[0][0]) / 1000
+    idle = sum(g for g, _, _ in gaps)
+    numbers = {
+        "launches": len(items), "wall_us": wall, "busy_us": busy / 1000, "idle_us": idle,
+        "gaps": len(gaps), "gap_us": gap_us,
+        "segments": [{"launches": s["launches"], "wall_us": (s["end"] - s["start"]) / 1000,
+                      "busy_us": s["busy"] / 1000, "first": s["first"]} for s in segments],
+        "largest_gaps": [{"us": g, "after": a, "before": b}
+                         for g, a, b in sorted(gaps, key=lambda item: -item[0])[:top]],
+    }
+    lines = [f"\n## Timeline: {len(items)} launches in {wall:.1f} us; the GPU is busy "
+             f"{busy / 1000:.1f} us ({busy / 1000 / wall:.0%}) and idle {idle:.1f} us in "
+             f"{len(gaps)} gaps; gaps over {gap_us:g} us split it into {len(segments)} segments\n",
+             "| segment | launches | wall us | busy us | busy | first kernel |",
+             "|---:|---:|---:|---:|---:|---|"]
+    for i, s in enumerate(numbers["segments"]):
+        lines.append(f"| {i} | {s['launches']} | {s['wall_us']:.1f} | {s['busy_us']:.1f} | "
+                     f"{s['busy_us'] / s['wall_us'] if s['wall_us'] else 1:.0%} | {s['first']} |")
+    lines += ["\n| idle us | after | before |", "|---:|---|---|"]
+    for g in numbers["largest_gaps"]:
+        lines.append(f"| {g['us']:.1f} | {g['after']} | {g['before']} |")
+    return lines, numbers
 
 
 def overview(groups, statements, top=20):
@@ -217,6 +294,7 @@ def main():
     parser.add_argument("--nsys", nargs="*", default=[])
     parser.add_argument("--kernels")
     parser.add_argument("--between")
+    parser.add_argument("--gap-us", type=float, default=100.0)
     parser.add_argument("--json")
     args = parser.parse_args()
     trace = Path(args.trace)
@@ -226,8 +304,12 @@ def main():
     graphs = data.get("graphLaunches")
     print(f"trace {trace.name}: {len(data['launches'])} launches, graphLaunches "
           f"{type(graphs).__name__} of {len(graphs or [])}")
-    groups = summarize(data, args.kernels, args.between)
-    statements = sites(args.sources) if args.sources else {}
+    launches = all_launches(data)
+    if args.between:
+        launches = window(launches, args.between)
+    statements, sampling = sites(args.sources) if args.sources else ({}, {})
+    groups = summarize(launches, data["stringTable"], data["locationTable"], args.kernels, sampling)
+    del data
     nsys = {}
     for item in args.nsys:
         label, path = item.split("=", 1)
@@ -236,29 +318,38 @@ def main():
         key = (g["kernel"], tuple(g["grid"]), tuple(g["block"]))
         g["nsys_us"] = {label: median(d.get(key, [])) for label, d in nsys.items()}
         g["nsys_launches"] = {label: len(d.get(key, [])) for label, d in nsys.items()}
-    lines = overview(groups, statements)
+    lines, numbers = timeline(launches, args.gap_us) if args.between else ([], None)
+    lines += overview(groups, statements)
     for g in groups:
         nsys_text = "".join(f", nsys {label} {us:.2f} us" for label, us in g["nsys_us"].items())
         lines.append(f"\n### {g['kernel']} grid {g['grid']} block {g['block']}\n")
-        lines.append(f"{g['launches']} launches, {g['ctas']} CTAs, {g['warps']} warps; "
-                     f"span {g['span_us']:.2f} us, warp {g['warp_us']:.2f} us{nsys_text}\n")
+        if g["sampled_ctas"]:
+            counted = (f"{g['all_warps']} warps; ranges, warp and last warp from the "
+                       f"{g['ctas']} recording CTAs' {g['warps']} warps")
+        else:
+            counted = f"{g['ctas']} CTAs, {g['warps']} warps"
+        lines.append(f"{g['launches']} launches, {counted}; span {g['span_us']:.2f} us, "
+                     f"warp {g['warp_us']:.2f} us{nsys_text}\n")
         lines.append("| phase | us a warp | share | last warp us | last warp share |")
         lines.append("|---|---:|---:|---:|---:|")
         last = g["last_warp"]
+        partial = any(r["sampled_iterations"] for r in g["ranges"].values())
         for phase in sorted(g["phases"], key=lambda p: -g["phases"][p]):
             us = g["phases"][phase]
             lu = last["phases"].get(phase, 0.0)
-            lines.append(f"| {phase} | {us:.2f} | {us / g['warp_us']:.1%} | {lu:.2f} | "
+            label = "unattributed, with loops' unsampled iterations" if partial and phase == "unattributed" else phase
+            lines.append(f"| {label} | {us:.2f} | {us / g['warp_us']:.1%} | {lu:.2f} | "
                          f"{lu / last['us'] if last['us'] else 0:.1%} |")
         lines.append("\n| range | us a warp | share | entries | longest warp us | first statement |")
         lines.append("|---|---:|---:|---:|---:|---|")
         for name, r in sorted(g["ranges"].items(), key=lambda item: -item[1]["us"]):
             statement = statements.get((g["kernel"], name), "")[:90].replace("|", "\\|")
-            lines.append(f"| {name} | {r['us']:.2f} | {r['share']:.1%} | {r['count']:.1f} | "
+            label = f"{name} (sampled iterations)" if r["sampled_iterations"] else name
+            lines.append(f"| {label} | {r['us']:.2f} | {r['share']:.1%} | {r['count']:.1f} | "
                          f"{r['max_us']:.2f} | `{statement}` |")
     print("\n".join(lines))
     if args.json:
-        Path(args.json).write_text(json.dumps(groups, indent=1) + "\n")
+        Path(args.json).write_text(json.dumps({"timeline": numbers, "groups": groups}, indent=1) + "\n")
 
 
 if __name__ == "__main__":

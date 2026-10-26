@@ -159,6 +159,24 @@ def test_sampled_iterations_guard_loop_ranges():
     assert f"if (__tl_iket_cta && __tl_iket_lane0 && {stride}) TL_IKET_EVENT(1," in both
 
 
+def test_while_loop_ranges_have_no_bound():
+    # TVM's while loop has no variable to sample: a range in it records in every
+    # iteration, so the kernel's bound on a warp's events is None.
+    code = KERNEL.replace(
+        "  C[threadIdx.x] = acc[0];\n",
+        "  int t = 0;\n  while (1) {\n    if (!((t < e))) { break; }\n"
+        "    C[t] = acc[0];\n    t = (t + 1);\n  }\n  C[threadIdx.x] = acc[0];\n",
+    )
+    _, sites = iket.annotate(code, _token, iters=1)
+    assert [s["unsampled_loops"] for s in sites if "unsampled_loops" in s] == [
+        ["while (1)"]
+    ]
+    assert {s["events_per_warp_bound"] for s in sites} == {None}
+    # Without it, each range opens and closes once in the sampled iteration.
+    sites = iket.annotate(KERNEL, _token, iters=1)[1]
+    assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}
+
+
 def test_module_without_kernels_is_unchanged():
     code = (
         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"

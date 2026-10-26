@@ -1,12 +1,14 @@
 """DS4.1 decode steps end to end on one GPU, for IKET traces.
 
-usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--filled]
-                    [--batched N] [--chunk N] [--model DIR] [--drafts N] [--tokens N]
+usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--skip REGEX]
+                    [--eager] [--filled] [--batched N] [--chunk N] [--model DIR]
+                    [--drafts N] [--tokens N]
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
 TileLang attention, linear and MoE backends, DSpark with ``--drafts`` greedy drafts and
-block verification, full and piecewise CUDA graphs, the packed BF16 head in FP32. One GPU
+block verification, full and piecewise CUDA graphs (``--eager``: none), the packed BF16
+head in FP32. One GPU
 holds six of the 40 layers: two SWA layers (ratio 0), a CSA layer that is a KV and index
 source and one that reuses it (ratio 2), the HCA candidate source and a layer that
 re-indexes its candidates (ratio 1); the drafter's three layers follow. The Engram layers
@@ -106,6 +108,8 @@ def main():
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     parser.add_argument("--skip", default="", help="VLLM_DS41_IKET_SKIP")
+    parser.add_argument("--eager", action="store_true",
+                        help="no CUDA graphs (enforce_eager): every kernel is a launch of its own")
     parser.add_argument("--batched", type=int, default=512, help="max_num_batched_tokens")
     parser.add_argument("--chunk", type=int, default=256, help="long_prefill_token_threshold")
     parser.add_argument("--filled", action="store_true",
@@ -161,6 +165,7 @@ def main():
         # The startup check wants this share free; run-iket's pool takes some.
         gpu_memory_utilization=0.5,
         enable_prefix_caching=False,
+        enforce_eager=args.eager,
         attention_backend="TILELANG",
         linear_backend="tilelang",
         moe_backend="tilelang",
@@ -218,6 +223,7 @@ def main():
         "VLLM_DS41_IKET_ITERS": envs.VLLM_DS41_IKET_ITERS,
         "VLLM_DS41_IKET_SKIP": envs.VLLM_DS41_IKET_SKIP,
         "filled": args.filled,
+        "eager": args.eager,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "text_overrides": TEXT_OVERRIDES,
         "drafts": args.drafts,
