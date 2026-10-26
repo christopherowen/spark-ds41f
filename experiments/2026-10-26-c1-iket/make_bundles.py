@@ -340,14 +340,16 @@ BUNDLES = {
     ),
     "markov-tests": dict(
         ref=MARKOV,
-        what="the persistent few-row BF16 GEMM for the Markov bias projection: the TileLang "
-             "linear tests (its bit-identity against bf16_gemm included), every launched kernel "
-             "source-checked",
+        what="the persistent few-row BF16 GEMM on the Markov bias head's 16-row tile: the TileLang "
+             "linear and vocabulary head tests (its bit-identity against bf16_gemm and the head's "
+             "own tile included), every launched kernel source-checked",
         tests=["tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",
+               "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py",
                "tests/kernels/deepseek_v41_pdl_sources.py", "tests/kernels/deepseek_v41_contracts.py"],
-        steps=[("TileLang linear tests, every launched kernel source-checked",
+        steps=[("TileLang linear and vocabulary head tests, every launched kernel source-checked",
                 [*PYTEST_CHECKED, "--basetemp", "{out}/pytest",
-                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"], 3600)],
+                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",
+                 "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py"], 3600)],
     ),
     "markov-l2-rows": dict(
         ref=MARKOV,

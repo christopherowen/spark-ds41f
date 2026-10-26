@@ -538,6 +538,10 @@ def bf16_gemm(
 ROWS_GEMM_ROWS = 16
 ROWS_GEMM_MAX_K = 512
 ROWS_GEMM_MIN_TILES = 192  # N tiles of 64: four waves of GB10's 48 SMs
+# The gain is the drafts after the first reading the weight from L2 (24 MB on GB10):
+# 12.3 us for TP4's 16.5 MB shard against 69.5. A whole 66 MB head streams from DRAM
+# either way, 4% slower on this kernel.
+ROWS_GEMM_MAX_BYTES = 24 << 20
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})

@@ -8,8 +8,9 @@ Markov embedding (rank 256) to the vocabulary through ``markov_w2``, a BF16
 TP3's (43,136) and 66 MB whole (129,280). GB10's L2 holds 24 MB. Between drafts only an
 argmax-sized kernel runs.
 
-Per shape, the production BF16 projection (``TileLangLinearMethod``, one row, FP32 out)
-is timed with CUDA events: once after a 128 MiB read that evicts L2 (cold), five times
+Per shape, the production projection (the BF16 head's, ``vocab.prepare_bf16_head`` and
+``project_head``, one row, FP32 out, as the drafter's logits processor runs it) is timed
+with CUDA events: once after a 128 MiB read that evicts L2 (cold), five times
 back to back after that read with an argmax between (draft by draft), and the argmax
 alone. If drafts 2-5 take about as long as the cold one, every draft streams the weight
 from DRAM; if they are much faster, the weight stays in L2 and there is nothing to gain.
@@ -41,18 +42,16 @@ SHAPES = {"tp4": 32320, "tp3": 43136, "tp1": 129280}
 
 
 class _Projection:
-    """A BF16 projection as the TileLang linear method holds one (its registry keeps
-    weak references, which a plain namespace does not allow)."""
+    """A BF16 head: its weight, and the kernels ``prepare_bf16_head`` binds."""
 
     def __init__(self, weight):
         self.weight = weight
-        self.out_dtype = torch.float32
 
 
 def main():
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.models.deepseek_v4_1.tilelang import prepare
-    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangLinearMethod, _bf16_linear
+    from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head, project_head
     from vllm.models.glm5next.nvidia import l2_prefetch as l2pf
     from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
 
@@ -68,7 +67,7 @@ def main():
         for name, n in SHAPES.items():
             weight = (torch.randn((n, RANK), generator=gen, device="cuda") * 0.02).bfloat16()
             layer = _Projection(weight)
-            TileLangLinearMethod().declare_layer_kernels(layer)
+            prepare_bf16_head(layer, torch.float32)
             layers[name] = layer
         prefetch_kernel = l2_prefetch_kernel(l2pf._GRID, l2pf._BLOCK, l2pf._CHUNK_BYTES)
         readers = {name: expert_stream(n * RANK // 2) for name, n in SHAPES.items()}
@@ -78,13 +77,13 @@ def main():
         for name, layer in layers.items():
             n = layer.weight.shape[0]
             x = torch.randn((1, RANK), generator=gen, device="cuda").bfloat16()
-            out = torch.empty((1, n), dtype=torch.float32, device="cuda")
+            logits = [None]
 
             def project():
-                _bf16_linear(x, out, layer.tilelang_key, None)
+                logits[0] = project_head(layer, x)
 
             def argmax():
-                torch.argmax(out, dim=-1)
+                torch.argmax(logits[0], dim=-1)
 
             for _ in range(3):  # warm
                 project()

@@ -41,9 +41,6 @@ from .gemm import (
     BF16_SPLIT_ROWS,
     DECODE_ROWS,
     DECODE_TILE_ROWS,
-    ROWS_GEMM_MAX_K,
-    ROWS_GEMM_MIN_TILES,
-    ROWS_GEMM_ROWS,
     SF_BLOCK,
     SPLIT_BF16,
     SPLIT_DECODE_ROWS,
@@ -53,7 +50,6 @@ from .gemm import (
     bf16_gemm_partials,
     bf16_gemm_splitk,
     bf16_gemm_two,
-    bf16_rows_gemm,
     bf16_shards,
     decode_tile_rows,
     fp8_decode_config,
@@ -323,8 +319,6 @@ def _bf16_linear(
         (partials,) = _scratch(specs, scratch)
         partials_kernel(layer, rows)(x, layer.weight, partials)
         layer.tilelang_reduce(partials, out)
-    elif 0 < rows <= ROWS_GEMM_ROWS and getattr(layer, "tilelang_rows", None):
-        layer.tilelang_rows(x, layer.weight, out)
     else:
         layer.tilelang_gemm(x, layer.weight, out)
 
@@ -560,9 +554,6 @@ def _bf16_kernels(layer: nn.Module) -> dict:
     kernels = {
         "gemm": prepare.call(bf16_gemm, n, k, out_dtype=out_dtype, shards=shards)
     }
-    if shards == 1 and k <= ROWS_GEMM_MAX_K and -(-n // 64) >= ROWS_GEMM_MIN_TILES:
-        # A wide, short weight (the Markov bias projection): its few-row calls.
-        kernels["rows"] = prepare.call(bf16_rows_gemm, n, k, out_dtype=out_dtype)
     if shards > 1:
         kernels["partials"] = {
             block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)

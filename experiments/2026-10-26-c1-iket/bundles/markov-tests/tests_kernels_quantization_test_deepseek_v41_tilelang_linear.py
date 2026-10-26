@@ -257,38 +257,6 @@ def test_bf16_rows_gemm_gives_bf16_gemm_bits(n, k, out_dtype):
         assert torch.equal(got, want), f"rows={rows}"
 
 
-def test_markov_projection_takes_the_rows_gemm(default_vllm_config, n=32320, k=256):
-    """A wide, short BF16 projection declares the few-row GEMM and its calls of up to
-    16 rows take it, with ``bf16_gemm``'s bits; a narrow one (the router) does not."""
-    from torch import nn
-
-    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangLinearMethod
-
-    gen = _gen(12)
-    layer = nn.Module()
-    layer.weight = nn.Parameter(
-        (torch.randn((n, k), generator=gen, device=DEVICE) * 0.02).bfloat16(),
-        requires_grad=False,
-    )
-    layer.out_dtype = torch.float32
-    method = TileLangLinearMethod()
-    method.declare_layer_kernels(layer)
-    assert layer.tilelang_rows is not None
-    gemm = bf16_gemm(n, k, out_dtype="float32")
-    for rows in (1, 5, ROWS_GEMM_ROWS, ROWS_GEMM_ROWS + 1):
-        x = torch.randn((rows, k), generator=gen, device=DEVICE).bfloat16()
-        want = torch.empty((rows, n), dtype=torch.float32, device=DEVICE)
-        gemm(x, layer.weight, want)
-        assert torch.equal(method.apply(layer, x), want), rows
-    router = nn.Module()
-    router.weight = nn.Parameter(
-        torch.zeros((384, 5120), dtype=torch.bfloat16, device=DEVICE),
-        requires_grad=False,
-    )
-    method.declare_layer_kernels(router)
-    assert getattr(router, "tilelang_rows", None) is None
-
-
 # The indexer's head weights (32 x 5120) scaled by 1/64.
 def test_scaled_linear(n=32, k=5120, scale=1 / 64):
     from torch import nn
