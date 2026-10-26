@@ -236,18 +236,24 @@ def mla_call(tp, rows):
     run = SparseMlaV41Plan.run
     chosen = {}
 
-    def production_route(self, q, *args, kernel=None, **kwargs):
-        chosen.setdefault("route", self.kernel_for(q.shape[0]))
-        if kernel != chosen["route"]:
+    def production_route(self, q, *args, kernel=None, scratch=None, **kwargs):
+        route = chosen.setdefault("route", self.kernel_for(q.shape[0]))
+        if route == "extend":
+            # Past the decode routes (c16's rows): the hot harness's first call runs
+            # it, without scratch, and its second does nothing.
+            if "out" in chosen and chosen["out"] is not args[6]:
+                return args[6]
+            chosen["out"] = args[6]
+            return run(self, q, *args, kernel="extend", **kwargs)
+        if kernel != route:
             return args[6]  # out, left unwritten
-        return run(self, q, *args, kernel=kernel, **kwargs)
+        chosen["out"] = args[6]
+        return run(self, q, *args, kernel=kernel, scratch=scratch, **kwargs)
 
     SparseMlaV41Plan.run = production_route
-    call, outs = iket_hot.mla_case(rows)
-    call()  # resolves the route
-    # The hot harness's outputs are split's then decode's, for the routes the plan has.
-    index = ("split", "decode").index(chosen["route"]) if len(outs) == 2 else 0
-    return call, (outs[index],), chosen["route"]
+    call, _ = iket_hot.mla_case(rows)
+    call()  # resolves the route and the output it writes
+    return call, (chosen["out"],), chosen["route"]
 
 
 def head_call(tp, rows, gen, x):
