@@ -7,8 +7,8 @@ usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--skip
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
 TileLang attention, linear and MoE backends, DSpark with ``--drafts`` greedy drafts and
-block verification, full and piecewise CUDA graphs (``--eager``: none), the packed BF16
-head in FP32. One GPU
+block verification, full and piecewise CUDA graphs (``--eager``: none, and without
+adaptive verification, which needs them), the packed BF16 head in FP32. One GPU
 holds six of the 40 layers: two SWA layers (ratio 0), a CSA layer that is a KV and index
 source and one that reuses it (ratio 2), the HCA candidate source and a layer that
 re-indexes its candidates (ratio 1); the drafter's three layers follow. The Engram layers
@@ -173,7 +173,9 @@ def main():
             "method": "dspark", "num_speculative_tokens": args.drafts,
             "draft_tensor_parallel_size": 1, "attention_backend": "TILELANG",
             "draft_sample_method": "greedy", "rejection_sample_method": "block",
-            "enable_adaptive_verification": True, "adaptive_verification_row_cost": 0.035,
+            # Adaptive verification needs full graphs; eager, every draft is verified.
+            "enable_adaptive_verification": not args.eager,
+            "adaptive_verification_row_cost": 0.035,
         },
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
