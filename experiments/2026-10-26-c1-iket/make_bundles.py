@@ -44,6 +44,7 @@ FUSION2 = "c1-fusion2"
 MHCFOLD = "c1-mhcfold"
 MIXAUX = "c1-mixaux"
 FRONT = "c1-front"
+MARKOV = "c1-markov"
 MHC_TESTS = "tests/kernels/test_deepseek_v41_tilelang_mhc.py"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
@@ -334,6 +335,23 @@ BUNDLES = {
     "markov-l2": dict(
         ref=LEVER2_BASE,
         what="the DSpark Markov bias projection (BF16 [vocab, 256], one row) at TP4, TP3 and whole "
+             "shapes: cold after an L2 eviction against five drafts back to back",
+        steps=[("Markov projection, cold and five drafts", ["{python}", "/b/markov_l2.py"], 1800)],
+    ),
+    "markov-tests": dict(
+        ref=MARKOV,
+        what="the persistent few-row BF16 GEMM for the Markov bias projection: the TileLang "
+             "linear tests (its bit-identity against bf16_gemm included), every launched kernel "
+             "source-checked",
+        tests=["tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",
+               "tests/kernels/deepseek_v41_pdl_sources.py", "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("TileLang linear tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest",
+                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"], 3600)],
+    ),
+    "markov-l2-rows": dict(
+        ref=MARKOV,
+        what="the Markov bias projection on the persistent few-row GEMM at TP4, TP3 and whole "
              "shapes: cold after an L2 eviction against five drafts back to back",
         steps=[("Markov projection, cold and five drafts", ["{python}", "/b/markov_l2.py"], 1800)],
     ),
