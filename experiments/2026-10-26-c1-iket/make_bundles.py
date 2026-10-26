@@ -36,11 +36,13 @@ BASE, IMAGE, ROOT, MISSING, RUN = iket.BASE, iket.IMAGE, iket.ROOT, iket.MISSING
 PROFILE, NSYS_PROFILE, NSYS, NVDISASM = iket.PROFILE, iket.NSYS_PROFILE, iket.NSYS, iket.NVDISASM
 STUDY = "c1-iket"
 NEXT = "next-candidate"
+LEVER2_BASE = "c579b3fe1"  # next-candidate when lever 2's prototypes branched from it
 STREAM = "c1-stream"
 STREAM_IKET = "c1-stream-iket"
 FUSION = "c1-fusion"
 FUSION2 = "c1-fusion2"
 MHCFOLD = "c1-mhcfold"
+MIXAUX = "c1-mixaux"
 MHC_TESTS = "tests/kernels/test_deepseek_v41_tilelang_mhc.py"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
@@ -224,7 +226,7 @@ BUNDLES = {
                 [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
     ),
     "fusion-ab": dict(
-        ref=NEXT,
+        ref=LEVER2_BASE,
         builds={"mhcfn": FUSION},
         what="the mHC entry with every stream's fn block loaded at once against next-candidate on the "
              "layer harness with all-reduce stand-ins, in alternation, four rounds: c1 (6 rows, 3 live), "
@@ -244,7 +246,7 @@ BUNDLES = {
                 [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
     ),
     "fusion2-ab": dict(
-        ref=NEXT,
+        ref=LEVER2_BASE,
         builds={"mhcfn2": FUSION2},
         what="the mHC entry loading the next stream's fn block during the current stream's GEMMs "
              "against next-candidate on the layer harness with all-reduce stand-ins, in alternation, "
@@ -264,9 +266,29 @@ BUNDLES = {
                 [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
     ),
     "mhcfold-ab": dict(
-        ref=NEXT,
+        ref=LEVER2_BASE,
         builds={"mhcfold": MHCFOLD},
         what="the mHC entry in one launch at decode sizes against next-candidate on the layer "
+             "harness with all-reduce stand-ins, in alternation, four rounds: c1, c8 and c16 at "
+             "TP4 and TP3 shapes",
+        steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
+                                     *(f"tp={tp} rows={rows} live={live} ar=on"
+                                       for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
+                14400)],
+    ),
+    "mixaux-tests": dict(
+        ref=MIXAUX,
+        what="the mHC entry's new mixes on a side stream at decode sizes, joined at the next "
+             "mHC operation: the mHC and PDL tests, every launched kernel source-checked",
+        tests=[MHC_TESTS, PDL_TESTS, "tests/kernels/deepseek_v41_pdl_sources.py",
+               "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("mHC and PDL tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
+    ),
+    "mixaux-ab": dict(
+        ref=LEVER2_BASE,
+        builds={"mixaux": MIXAUX},
+        what="the mHC entry's new mixes on a side stream against next-candidate on the layer "
              "harness with all-reduce stand-ins, in alternation, four rounds: c1, c8 and c16 at "
              "TP4 and TP3 shapes",
         steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",

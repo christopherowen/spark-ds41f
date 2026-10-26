@@ -337,12 +337,18 @@ def main():
         print(f"built {args.sets} weight sets and {args.layers} layers in {time.monotonic() - started:.1f} s",
               flush=True)
 
+        # A build whose entries compute their mixes on a side stream joins it at the
+        # next entry; the pass ends by joining the last one.
+        join_mixes = getattr(mhc, "join_mixes", None)
+
         def one_pass():
             state = (x, streams, post, comb, pre)
             for layer in layers:
                 state = layer.run(*state, mla=mla)
             if head is not None:
                 head()
+            if join_mixes is not None:
+                join_mixes(x.device)
 
         evict = torch.ones(128 << 20, dtype=torch.uint8, device=DEVICE).view(torch.int32)
         one_pass()
