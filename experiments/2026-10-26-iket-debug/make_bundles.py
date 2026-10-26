@@ -225,10 +225,19 @@ BUNDLES = {
              [*PROFILE, "{out}/sampled", "profile", "--keep", "--postprocess", "json", "--",
               "{python}", HOT, "on", "--iket", "{out}/sampled-run/iket", "--out", "{out}/sampled-run",
               "--iters", "3", "--sample-ctas", "4", "--sample-iters", "1"], 3600),
+            # The dry run's maximum is above every warp's record; a cap between the two:
+            # does the run's exit dump hold (it crashed in the engine runs 15 and 18)?
+            ("sampled, under run-iket, capped at 64",
+             [*PROFILE, "{out}/capped", "profile", "--keep", "--max-ts-cnt-per-warp", "64",
+              "--postprocess", "json", "--",
+              "{python}", HOT, "on", "--iket", "{out}/capped-run/iket", "--out", "{out}/capped-run",
+              "--iters", "3", "--sample-ctas", "4", "--sample-iters", "1"], 3600),
             ("unsampled counts", ["{python}", "/b/trace_counts.py", "{out}/full",
                                   "{out}/full-run/iket/sources"], 1800),
             ("sampled counts", ["{python}", "/b/trace_counts.py", "{out}/sampled",
                                 "{out}/sampled-run/iket/sources"], 1800),
+            ("capped counts", ["{python}", "/b/trace_counts.py", "{out}/capped",
+                               "{out}/capped-run/iket/sources"], 1800),
         ],
     ),
     "tests": dict(
