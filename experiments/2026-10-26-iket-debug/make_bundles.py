@@ -30,6 +30,7 @@ NEXT = "577091997"  # next-candidate when the branch was cut
 IKET = "iket-debug"
 NSYS = ["/opt/nvidia/nsight-systems/2025.3.2", "/opt/nsys"]
 HUB = ["~/.cache/huggingface/hub", "/hf/hub"]
+NVDISASM = ["/usr/local/cuda-13.0/bin/nvdisasm", "/opt/nvdisasm"]
 MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
@@ -96,6 +97,18 @@ BUNDLES = {
               "--json", "{out}/table-late.json"], 600),
         ],
     ),
+    "sass": dict(
+        ref=IKET,
+        what="where ptxas puts the IKET events' timer reads around barriers, in the hot kernels",
+        env={"NVDISASM": "/opt/nvdisasm"},
+        mounts=[NVDISASM],
+        steps=[
+            ("hot kernels, on", ["{python}", HOT, "on", "--iket", "{out}/on/iket", "--out", "{out}/on",
+                                 "--iters", "1"], 3600),
+            ("SASS check", ["{python}", "/b/sass_check.py", "{out}/on/iket/sources", "{out}/sass",
+                            "oneshot", "moe_grouped", "sparse_mla", "mhc_finalize"], 1800),
+        ],
+    ),
     "step-off": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
@@ -134,7 +147,7 @@ print(json.dumps({"output": OUT, "steps": codes}), flush=True)
 sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
 SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
-           "iket_table.py": HERE / "iket_table.py"}
+           "sass_check.py": HERE / "harness" / "sass_check.py", "iket_table.py": HERE / "iket_table.py"}
 
 
 def git(repo, *args):

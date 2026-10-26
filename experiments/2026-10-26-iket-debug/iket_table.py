@@ -129,10 +129,11 @@ def summarize(trace, kernels=None):
         last = defaultdict(float)
         for name, r in ranges.items():
             phases[phase_of(name)] += r["us"]
+        # The last warp's split and lifetime are means over the same launches.
         for n in launches:
             for name, us in n["last"].items():
                 last[phase_of(name)] += us / len(launches)
-        last_life = median([n["last_life"] for n in launches])
+        last_life = sum(n["last_life"] for n in launches) / len(launches)
         phases["unattributed"] = max(0.0, life - sum(phases.values()))
         last["unattributed"] = max(0.0, last_life - sum(last.values()))
         out.append({

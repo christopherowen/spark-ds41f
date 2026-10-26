@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_DS41_IKET: str | None = None
+    VLLM_DS41_IKET_CTAS: int = 0
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_ALPHA: str | None = None
     WEIGHTLESS_STEER_LAYERS: str | None = None
@@ -1923,6 +1924,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TileLang's caches under this directory (models/deepseek_v4_1/tilelang/iket.py).
     # Traces need the process to run under NVIDIA's run-iket profiler.
     "VLLM_DS41_IKET": lambda: os.getenv("VLLM_DS41_IKET") or None,
+    # With VLLM_DS41_IKET: record ranges in about this many CTAs of each launch, evenly
+    # spread (0: all); run-iket still records every warp's lifetime.
+    "VLLM_DS41_IKET_CTAS": lambda: int(os.getenv("VLLM_DS41_IKET_CTAS", "0")),
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
     # and overrides of its alpha and steered layers. Part of the compile key, as
     # every variable here is: steering adds the fold and projection to the graph.

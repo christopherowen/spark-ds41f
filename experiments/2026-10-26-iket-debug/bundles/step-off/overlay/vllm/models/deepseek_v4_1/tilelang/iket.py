@@ -349,20 +349,28 @@ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
         yield name.group(0), pointers, j, parser.scan(j, None)
 
 
-def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dict]]:
+def annotate(
+    code: str, token: Callable[[str, int], str], ctas: int = 0
+) -> tuple[str, list[dict]]:
     """``code`` with each phase of each kernel in an IKET range, and its sites.
 
     ``token(name, range_id)`` returns the IKET metadata token of a range named
-    ``name``. A module with no ``__global__`` definition comes back unchanged; a
-    kernel with a preprocessor conditional in its body is left as it is."""
+    ``name``. With ``ctas`` > 0 only about that many CTAs of a launch, evenly
+    spread, record their ranges (run-iket still records every warp's lifetime):
+    a kernel with many CTAs and loop-carried ranges otherwise writes millions of
+    records a launch. A module with no ``__global__`` definition comes back
+    unchanged; a kernel with a preprocessor conditional in its body is left as
+    it is."""
     found: list[_Range] = []
     sites: list[dict] = []
+    bodies: dict[str, int] = {}
     for kernel, params, start, end in _kernels(code):
         if _CONDITIONAL.search(code, start, end):
             sites.append(
                 {"kernel": kernel, "skipped": "a preprocessor conditional in its body"}
             )
             continue
+        bodies[kernel] = start
         nodes, _ = _Parser(code).block(start)
         for node in nodes:
             _classify(node, params)
@@ -384,6 +392,17 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
             item.name = item.base
     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
     inserts: list[tuple[int, int, str]] = []
+    guard = "if (__tl_iket_cta) " if ctas else ""
+    for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):
+        if not ctas:
+            break
+        # Uniform in a CTA, so a range opens and closes in every warp or in none.
+        sample = (
+            f"  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y) * "
+            "gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z / "
+            f"{ctas}u)) == 0u;\n"
+        )
+        inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
     for item in found:
         sites.append(
             {
@@ -405,10 +424,12 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
             (
                 item.first.start,
                 1,
-                f'{indent}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+                f'{indent}{guard}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
             )
         )
-        inserts.append((item.last.end, 0, f"{indent}TL_IKET_EVENT({RANGE_END});\n"))
+        inserts.append(
+            (item.last.end, 0, f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n")
+        )
     out, last = [], 0
     # At one offset a range's end goes before the next range's start.
     for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
@@ -419,6 +440,7 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
 
 _lock = threading.Lock()
 _directory: Path | None = None
+_ctas = 0
 
 
 def directory() -> Path | None:
@@ -426,16 +448,18 @@ def directory() -> Path | None:
     return _directory
 
 
-def enable(output: str | os.PathLike[str]) -> Path:
+def enable(output: str | os.PathLike[str], ctas: int = 0) -> Path:
     """Turn the IKET mode on for this process, before it compiles any TileLang
-    kernel. Idempotent for the same directory."""
-    global _directory
+    kernel; ``ctas`` > 0 samples about that many CTAs a launch (``annotate``).
+    Idempotent for the same directory and sampling."""
+    global _directory, _ctas
     root = Path(output).expanduser().resolve()
     with _lock:
         if _directory is not None:
-            if root != _directory:
+            if (root, ctas) != (_directory, _ctas):
                 raise RuntimeError(
-                    f"IKET mode is already on with {_directory}, not {root}"
+                    f"IKET mode is already on with {_directory} and {_ctas} CTAs, "
+                    f"not {root} and {ctas}"
                 )
             return _directory
         import tilelang.cache
@@ -459,7 +483,7 @@ def enable(output: str | os.PathLike[str]) -> Path:
         os.environ["TILELANG_CACHE_DIR"] = str(root / "tilelang-cache")
         disable_cache()
         tvm_ffi.register_global_func(_CUDA_POSTPROC, f=_postproc)
-        _directory = root
+        _directory, _ctas = root, int(ctas)
     return root
 
 
@@ -475,12 +499,13 @@ def _postproc(code: str, target) -> str:
     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
 
     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
-    annotated, sites = annotate(code, _token)
+    annotated, sites = annotate(code, _token, _ctas)
     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
     kernel = next((name for name, *_ in _kernels(code)), "module")
-    stem = _directory / "sources" / f"{kernel}.{digest}"
-    stem.with_suffix(".cu").write_text(instrumented)
-    stem.with_suffix(".json").write_text(
-        json.dumps({"kernel": kernel, "sites": sites}, indent=1) + "\n"
+    stem = f"{kernel}.{digest}"
+    (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
+    manifest = {"kernel": kernel, "ctas": _ctas, "sites": sites}
+    (_directory / "sources" / f"{stem}.json").write_text(
+        json.dumps(manifest, indent=1) + "\n"
     )
     return instrumented

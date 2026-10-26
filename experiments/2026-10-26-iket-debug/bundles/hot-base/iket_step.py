@@ -47,6 +47,15 @@ PROMPTS = [
 ]
 
 
+def shrink(config):
+    """The six-layer config, for the target and (a callable override reaches it too)
+    the DSpark drafter."""
+    text = config.get_text_config()
+    for key, value in TEXT_OVERRIDES.items():
+        setattr(text, key, value)
+    return config
+
+
 def marker_kernel():
     import tilelang
     import tilelang.language as T
@@ -112,7 +121,7 @@ def main():
             "cudagraph_capture_sizes": [1, 2, 4, 6, 8],
         },
         generation_config="vllm",
-        hf_overrides={"text_config": TEXT_OVERRIDES},
+        hf_overrides=shrink,
         jit_monitor_mode="off",
         limit_mm_per_prompt={"image": 0},
         mm_processor_cache_gb=0,

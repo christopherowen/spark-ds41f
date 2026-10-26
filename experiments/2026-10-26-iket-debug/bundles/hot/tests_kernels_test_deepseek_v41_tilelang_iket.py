@@ -111,6 +111,21 @@ def test_pragma_stays_with_its_loop():
     assert lines[pragma + 1].startswith("  for (int s = 0;")
 
 
+def test_sampled_ctas_guard_every_event():
+    out, sites = iket.annotate(KERNEL, _token, ctas=8)
+    lines = out.splitlines()
+    body = next(
+        i for i, line in enumerate(lines) if line.endswith("{") and "k_kernel" in line
+    )
+    assert lines[body + 1].startswith("  const bool __tl_iket_cta = ")
+    assert "gridDim.x * gridDim.y * gridDim.z / 8u" in lines[body + 1]
+    events = [line.strip() for line in lines if "TL_IKET_EVENT(" in line]
+    assert len(events) == 2 * len(sites)
+    assert all(e.startswith("if (__tl_iket_cta) TL_IKET_EVENT(") for e in events)
+    # Unsampled, the kernel declares nothing.
+    assert "__tl_iket_cta" not in iket.annotate(KERNEL, _token)[0]
+
+
 def test_module_without_kernels_is_unchanged():
     code = (
         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
@@ -193,7 +208,8 @@ b = torch.ones(1024, device="cuda")
 c = torch.empty_like(a)
 kernel(a, b, c)
 torch.cuda.synchronize()
-import hashlib, tilelang.env, tvm_ffi
+import hashlib, tvm_ffi
+from tilelang.env import env as tilelang_env
 callback = "tilelang_callback_cuda_postproc"
 print(json.dumps({
     "sum": c.double().sum().item(),
@@ -201,7 +217,7 @@ print(json.dumps({
     "source_instrumented": "__iket_meta_info" in kernel.get_kernel_source(),
     "modules": sorted(m for m in sys.modules if m.endswith(".iket") or ".iket." in m),
     "callback": tvm_ffi.get_global_func(callback, allow_missing=True) is not None,
-    "cache_enabled": tilelang.env.env.is_cache_enabled(),
+    "cache_enabled": tilelang_env.is_cache_enabled(),
     "cache_dir": os.environ.get("TILELANG_CACHE_DIR"),
 }))
 """
