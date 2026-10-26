@@ -57,6 +57,27 @@ def shrink(config):
     return config
 
 
+def same_dummy_weights():
+    """vLLM's dummy loader seeds floating tensors but leaves integer ones (the packed FP4
+    experts and their UE8M0 scales) as allocated, different in every process. Zero them,
+    as it does on ROCm, so that every process loads the same weights and runs' tokens
+    can be compared bit for bit."""
+    import torch
+    from vllm.model_executor.model_loader import dummy_loader, weight_utils
+
+    seeded = weight_utils.initialize_single_dummy_weight
+
+    def initialize(param, *args, **kwargs):
+        if (param.device.type != "meta" and not torch.is_floating_point(param)
+                and getattr(param, "dummy_weight_value", None) is None):
+            param.zero_()
+            return
+        seeded(param, *args, **kwargs)
+
+    dummy_loader.initialize_single_dummy_weight = initialize
+    weight_utils.initialize_single_dummy_weight = initialize
+
+
 def marker_kernel():
     import tilelang
     import tilelang.language as T
@@ -97,6 +118,7 @@ def main():
 
     from vllm import LLM, SamplingParams
 
+    same_dummy_weights()
     started = time.monotonic()
     llm = LLM(
         model=args.model,
