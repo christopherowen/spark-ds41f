@@ -129,7 +129,7 @@ def policies(shape: str) -> dict:
         "bypass-ft": Policy(order="bypass", first_token_priority=True, long_wait_cap_s=10.0),
         "spf": Policy(order="spf", long_wait_cap_s=10.0),
         "lanes2 (vLLM)": Policy(order="rr2"),
-        "lanes2-release": Policy(order="rr2", lane_release=True),
+        "lanes2-fixed": Policy(order="rr2", lanes_whole_chunks=True),
         "tiers-8k": Policy(chunk_tiers=tiers((0, top), (1, 8192)), grid=grid) if ring else None,
         "tiers-4k": Policy(chunk_tiers=tiers((0, top), (1, 4096)), grid=grid),
         "tiers-2k": Policy(chunk_tiers=tiers((0, top), (1, 2048)), grid=grid),

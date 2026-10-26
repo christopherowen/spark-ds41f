@@ -37,12 +37,14 @@ class TracingEngine(Engine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.trace = []
+        self.plans = []
         self.totals = []
         self.decode_counts = []
 
     def schedule(self):
         plan = super().schedule()
         if plan is not None:
+            self.plans.append(plan["entries"])
             self.trace.extend(plan["entries"])
             self.totals.append(sum(e[2] for e in plan["entries"]))
             self.decode_counts.append((plan["n_dec"], plan["prefill"]))
@@ -212,7 +214,7 @@ class PolicyTest(unittest.TestCase):
         """vLLM's two prefill lanes give each long prompt half the budget; its whole aligned
         chunk never fits, and neither lane is released. Releasing the lane fixes it."""
         for release in (False, True):
-            engine = Engine(toy(max_seqs=4), Policy(order="rr2", lane_release=release), seed=11)
+            engine = Engine(toy(max_seqs=4), Policy(order="rr2", lanes_whole_chunks=release), seed=11)
             engine.livelock_s = 5.0
             engine.submit("stream", 0.0, 20, 4000, Lineage())
             first = engine.submit("doc", 0.5, 6 * engine.threshold, 1, Lineage())
@@ -221,6 +223,16 @@ class PolicyTest(unittest.TestCase):
             done = first.first is not None and second.first is not None
             self.assertEqual(done, release, release)
             self.assertEqual(engine.livelocked, not release, release)
+
+    def test_fixed_lanes_rotate_whole_chunks_as_vllm_does(self):
+        """vLLM's tests/v1/core/test_aligned_prefill_lanes.py, on the toy shape (threshold 1,000)."""
+        engine = TracingEngine(toy(max_seqs=4), Policy(order="rr2", lanes_whole_chunks=True), seed=12)
+        for name, tokens in (("a", 3000), ("b", 2500), ("c", 300)):
+            engine.submit(name, 0.0, tokens, 1, Lineage())
+        engine.run(100.0)
+        steps = [{e[0].cls: e[2] for e in entries if e[1] == "prefill"} for entries in engine.plans]
+        self.assertEqual(steps[:6], [{"a": 1000}, {"b": 1000}, {"a": 1000}, {"b": 1000}, {"a": 1000},
+                                     {"b": 500, "c": 300}])
 
     def test_tiers_use_the_small_chunk_beside_decodes(self):
         policy = Policy(chunk_tiers=[(0, 1024), (1, 256)], grid=256)

@@ -149,7 +149,7 @@ class Policy:
     bypass_tokens: int | None = None   # "bypass": a prefill this short is short (default: a chunk)
     first_token_priority: bool = False  # long chunks also wait while a first token is held
     long_wait_cap_s: float | None = None  # a long prefill held back this long goes first
-    lane_release: bool = False         # "rr2": a lane whose aligned chunk exceeds its share is released
+    lanes_whole_chunks: bool = False   # "rr2": vLLM's fix (prefill-lanes-aligned): no share caps an aligned chunk
     alpha_scale: float = 1.0           # decode rows in a prefill step cost this share of today's
     dec_extrapolation: float | None = None  # sensitivity: the decode step's slope past the last knot
     max_seqs: int | None = None
@@ -869,7 +869,8 @@ class Engine:
             # lanes go to the prefills scheduled longest ago; each lane's budget is the step's
             # remaining budget over the lanes not yet served. With aligned chunks a lane whose
             # whole chunk exceeds its share is skipped (running pass) or stops the waiting pass,
-            # and keeps its lane. `lane_release` is the fix: such a lane gives its lane up.
+            # and keeps its lane. `lanes_whole_chunks` is vLLM's fix (f05748ead): an aligned
+            # chunk is never capped at its share; it takes the step's budget when that holds it.
             started = running_prefills()
             open_ = len(self.running) < self.max_seqs and not preempted
             ranked = sorted(started + (list(self.waiting)[: policy.lookup_window] if open_ else []),
@@ -897,11 +898,12 @@ class Engine:
 
             def serve(request: Request, fresh: bool) -> int:
                 nonlocal budget
-                used = admit(request, min(budget, share())) if fresh else take_prefill(request, False, min(budget, share()))
+                limit = budget if policy.lanes_whole_chunks else min(budget, share())
+                used = admit(request, limit) if fresh else take_prefill(request, False, limit)
                 if used > 0:
                     budget -= used
                     request.meta["last_step"] = len(self.steps)
-                elif used < 0 or policy.lane_release:
+                elif used < 0:
                     release(request)
                 return used
 
@@ -913,7 +915,7 @@ class Engine:
                 lanes = [r for r in selected if r.status == "waiting" and r.rid not in unavailable]
                 if not lanes:
                     break
-                if serve(lanes[0], True) == 0 and not policy.lane_release:
+                if serve(lanes[0], True) == 0:
                     break  # "No partial chunk this step."
             for request in started:
                 if budget > 0 and request in selected and request.rid not in scheduled:

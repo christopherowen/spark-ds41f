@@ -9,7 +9,7 @@ This record answers that in five parts:
    and our records;
 2. a discrete-event model of vLLM's step building, calibrated on the 1025 release suites;
 3. replays of realistic mixes under production scheduling and under each candidate fix;
-4. a vLLM patch for the top fix and the lab specs that validate it (not run);
+4. a vLLM patch for the top fix, tested on dgx2 (CPU), and the lab specs that validate it (not run);
 5. the ranked plan.
 
 Base: origin/main da7fef4b (spark-ds41f-1025 serving). Laptop only: no cluster, GPU or node time
@@ -64,11 +64,16 @@ over sustainable mixes; overload mixes apart; details in section 4):
 | 7 | **Per-step GPU idle** (late peers, host gaps, prefetch timing; Engram first chunk) | — | small | +1% per 1.5 ms at c8-c16, up to +5% at c1 | — | sessions #614, #615, #616 |
 
 **Not recommended:**
-- **vLLM's own prefill lanes (`--max-parallel-prefills 2`) livelock with aligned chunks.**
-  - Each lane gets half the budget, so two long prompts' whole chunks never fit.
-  - Neither lane is released, and nothing prefills.
-  - Simulated: it livelocked in 76 of 76 agent, soak and chat runs.
-  - Pinned for vLLM's own tests in [vllm-tests/](vllm-tests/test_concurrency_stalls.py).
+- **vLLM's own prefill lanes (`--max-parallel-prefills 2`).**
+  - They livelocked with aligned chunks. Each lane got half the budget, so two long prompts'
+    whole chunks never fit; neither lane was released, and nothing prefilled.
+  - Simulated, that was 76 of 76 agent, soak and chat runs. On vLLM itself, the pin passed on
+    dgx2: two long prompts scheduled nothing.
+  - Fixed in vLLM (branch `prefill-lanes-aligned`, f05748ead, local): an aligned chunk is no
+    longer capped at its share.
+  - Still not for DS4.1. Round-robin of whole chunks keeps several prompts half-prefilled, each
+    holding its 3,810 in-flight fill blocks (7.7% of the ring's pool). At overload that starts a
+    cache-miss cascade: output −20% / −42% and p99 x3 / x9 at 16 / 24 agent lanes.
 - **Shortest-prefill-first** starves long prompts until their cached prefixes are evicted: at
   overload, −28% output and p99 +373%.
 - **Prefix-aware eviction** had no measurable effect at these loads. The ring's pool holds the
@@ -106,7 +111,7 @@ idles or serves other work while the request waits.
 | 12 | **Host gaps** | Python between kernels | 0.72 ms c1 greedy (2.1%), 1.98 ms sampled (6.7%), 0.79 ms mixed c8 (#616, rank 0) | as 11 | every step | **idle** |
 | 13 | **Late L2 prefetch** | fills that land late or are evicted | 1.67 ms at c1 (#615) | as 11 | every step | partly idle |
 | 14 | **Frontend** | the API server renders and tokenizes the whole history each turn | about 20 ms fixed (fitted to c1 TTFT); per-token cost unmeasured. The triangle's traced 120K prefill had TTFT equal to its chunks' sum, so it is small (2026-10-22) | assumed 1 us a token: 0.3 s of a 300K agent turn (unmeasured; AgentX's miss-cost fit measures it) | every turn | idle only if nothing else runs |
-| 15 | **vLLM prefill lanes livelock** (latent) | `PrefillInterleaveStep` with aligned chunks: half-budget shares never fit a whole chunk, the waiting pass `break`s without releasing the lane, and the second running pass still divides by both lanes | — (production runs one lane) | every agent, soak and chat mix livelocked | only with `--max-parallel-prefills` > 1 | stuck |
+| 15 | **vLLM prefill lanes livelock** (latent; fixed in vLLM f05748ead) | `PrefillInterleaveStep` with aligned chunks: half-budget shares never fit a whole chunk, the waiting pass `break`s without releasing the lane, and the second running pass still divides by both lanes | — (production runs one lane) | every agent, soak and chat mix livelocked | only with `--max-parallel-prefills` > 1 | stuck |
 
 What this means for "maximum bandwidth at all times":
 - **Idle GPU** (items 10-13) is about 4 ms of a 30 ms one-stream step and about 3.5 ms of a 120 ms
@@ -157,13 +162,13 @@ unit suite, two of them that the arms follow the recipe):
 - late admission and the held first token;
 - prompt-end hits, replay rows, divergent branches and LRU against prefix eviction;
 - LIFO preemption;
-- the lane livelock and its fix;
+- the lane livelock, and vLLM's fix reproducing vLLM's own test sequence;
 - that the reordering policies never move a long prompt's chunk boundaries.
 
-[vllm-tests/test_concurrency_stalls.py](vllm-tests/test_concurrency_stalls.py) checks the two
-scheduler behaviours the conclusions rest on against the real scheduler. Those are the wait
-behind a long prompt and the lane livelock. It is CPU only; the laptop has no torch, so it runs
-on a test box.
+The real scheduler confirms the two behaviours the conclusions rest on: the wait behind a long
+prompt's aligned chunks, and the lane livelock. Both passed as tests on next-candidate on dgx2
+(section 6, [runs/dgx2-tests/summary.txt](runs/dgx2-tests/summary.txt)). The fix's own sequence
+test passed there as well.
 
 ### Step costs and calibration ([calibrate.py](calibrate.py), [runs/calibration.txt](runs/calibration.txt))
 
@@ -381,8 +386,12 @@ invariance). Gate: `token_determinism_text.py --wide` (long and mixed scenarios)
   image's tree; alignment there is `ALIGN_PREFILL_CHUNKS`). Patches are in
   [vllm/spark-ds41f-1025/](vllm/spark-ds41f-1025/); the three changed files are in
   [overlay/](overlay/), mounted by the A/B arms.
-- **Not run:** the laptop has no torch. The tests run on a test box (CPU). They and the overlay's
-  boot are the A/B's first gates.
+- **Tested on dgx2** (`kernel-local`, CPU, in the 1025 image;
+  [runs/dgx2-tests/summary.txt](runs/dgx2-tests/summary.txt)):
+  - the eight tests pass on both trees;
+  - the regression set (vLLM's aligned-chunk, scheduler and compute-share scheduler tests) gives
+    233 passed and the same 49 offline failures with and without the change, on both trees.
+  - The overlay's boot is the A/B's first gate.
 
 ### 4.2 More slots
 
@@ -445,9 +454,9 @@ rate at 8,192.
   when it is admitted, or while it waits. Small: TTFT p50 −2%.
 - **Per-step idle**: #614 (IKET), #615 (prefetch schedule), #616 (late peers, host gaps).
 - **Rejected:**
-  - vLLM's prefill lanes (livelock; section 5);
-  - shortest-prefill-first (starvation, then a cache-miss cascade at overload);
-  - lanes with the release fix (no better than prefill yield; p99 +33% at overload);
+  - vLLM's prefill lanes. The livelock is fixed (section 5), but round-robin whole chunks start
+    a cache-miss cascade at overload: −20% to −42% output;
+  - shortest-prefill-first (starvation, then the same cascade);
   - prefix-aware eviction (no effect at these loads).
 
 ## 5. Findings for other sessions
@@ -459,8 +468,15 @@ rate at 8,192.
   - The second running pass still divides by both lanes.
   - So two long prompts never prefill. The 2026-10-01 lanes experiment (never run) would have hit
     it.
-  - Pinned in [vllm-tests/test_concurrency_stalls.py](vllm-tests/test_concurrency_stalls.py).
-  - A fix (release the lane) exists in the simulator, but prefill yield supersedes it.
+  - Shown on vLLM itself on dgx2 (next-candidate).
+  - **Fixed:** vLLM branch `prefill-lanes-aligned`, f05748ead on next-candidate, local; patch in
+    [vllm/next-candidate/](vllm/next-candidate/).
+    - With aligned chunks a lane's share no longer caps its chunk. It takes the step's budget
+      when that holds it, and lanes rotate whole chunks; unaligned chunks keep their shares.
+    - `tests/v1/core/test_aligned_prefill_lanes.py`: two long prompts prefill; three prompts
+      rotate exactly as the simulator predicts; unaligned shares unchanged. 3 passed on dgx2.
+    - The pin that asserted the livelock is gone with it.
+  - Lanes remain a bad choice for DS4.1 at overload (section 4.5).
 - **The stall probe needs free slots and realistic prompts.**
   - With 15 streams and the document, all 16 ring slots are taken, so probes measure slot
     queueing.
@@ -485,12 +501,26 @@ spec uses #574's job kind and is checked once #574 is on main.
 | [ab-tp3.json](ab-tp3.json) | production, prefill yield, retention 2,048, slots 12 (bracket) | [stall-suite-tp3.json](stall-suite-tp3.json) | about 3.5 h | as above; slots 12 must boot past dgx1's startup guard |
 | [agentx-tp4.json](agentx-tp4.json) (needs #574) | production c8/c16/c24, prefill yield c8/c16, slots 24 c16/c24 | AgentX: TTFT, hit rate, miss cost, KV use, preemptions | about 8.5 h | the agent tail (model: −32% p99 at c8 with yield; −47% p50 at c16 with slots) and the frontend's per-token cost (the miss-cost fit) |
 
+**Scheduler tests on dgx2** (2026-10-26 20:42-20:44 CET).
+- How they ran: `scripts/lab.py kernel-local`, CPU tests in the 1025 image's container.
+- What they ran: [make_bundles.py](make_bundles.py) mounts each vLLM tree's changed package files
+  over the image. `facebook/opt-125m` (config and tokenizer only) is a synced input.
+- Outputs: [runs/dgx2-tests/](runs/dgx2-tests/).
+
+| Tree | New tests | Regression set |
+| --- | --- | --- |
+| the image (1025, e0ccc837d) | — | 233 passed, 49 failed |
+| prefill yield on 1025 (d29e028de) | 8 passed | 233 passed, the same 49 |
+| next-candidate (e846e64dc) | 3 passed: the wait behind a long prompt; the lanes livelock; one lane in turn | 233 passed, the same 49 |
+| next-candidate + prefill yield + lanes fix (`concurrency-stalls-next`, 6f4adad09) | 11 passed | 233 passed, the same 49 |
+
+The 49 failures are the same set in every tree ([runs/dgx2-tests/regression-failures.txt](runs/dgx2-tests/regression-failures.txt)).
+They are offline cache misses: the encoder-cache connector tests need llava-1.5-7b, and the
+half-life CLI test needs Qwen3-0.6B, neither cached on dgx2.
+
 **Before queueing.**
-- **Prefill yield:**
-  1. Run `tests/v1/core/test_prefill_yield.py` and
-     [vllm-tests/test_concurrency_stalls.py](vllm-tests/test_concurrency_stalls.py) on a test
-     box (CPU), next-candidate and the 1025 branch.
-  2. Merge this PR so the overlay is on the nodes.
+- **Prefill yield:** done. Its tests and the regression set ran on dgx2 (section 4.1), and #620
+  put the overlay on main.
 - **Slots:** nothing more.
 - **AgentX:** #574 rebased (its arm predates 1025).
 
@@ -525,7 +555,7 @@ The ring is the production shape; while a cable is missing, the triangle specs a
 | [make_arms.py](make_arms.py) and the arms | production, prefill yield, slots, retention (ring and triangle), AgentX ports |
 | [stall-suite-tp4.json](stall-suite-tp4.json), [stall-suite-tp3.json](stall-suite-tp3.json), the specs | section 6 |
 | [overlay/](overlay/), [vllm/](vllm/) | prefill yield for the 1025 image; the patches |
-| [vllm-tests/](vllm-tests/) | scheduler behaviour pinned for vLLM's CPU tests |
+| [make_bundles.py](make_bundles.py), [runs/dgx2-tests/](runs/dgx2-tests/) | the scheduler test bundles (kernel-local, CPU, the 1025 image) and their outputs |
 
 Also changed: `servebench stall` gains `--probes`, `--probe-tokens` and `--probe-max-tokens`
 (short cold requests during the prefill, their TTFT and its verdict rows; off by default, so

@@ -1,0 +1,23 @@
+Scheduler tests on dgx2 (2026-10-26 20:42-20:44 CET), scripts/lab.py kernel-local, CPU, in
+spark-ds41f-1025's image spark-ds41f:19f2c20ed4d6-next-6 (tree e0ccc837d). Bundles from
+make_bundles.py; each mounts its vLLM tree's changed package files over the image.
+
+sched-1025-base      new tests: -                      regression set: 49 failed, 233 passed, 14 warnings in 20.25s; failure set sha256 75d6cbe73453
+prefill-yield-1025   new tests: 8 passed in 9.89s      regression set: 49 failed, 233 passed, 14 warnings in 15.41s; failure set sha256 75d6cbe73453
+sched-next-base      new tests: 3 passed in 9.75s      regression set: 49 failed, 233 passed, 14 warnings in 15.63s; failure set sha256 75d6cbe73453
+sched-next-fixes     new tests: 11 passed in 10.24s    regression set: 49 failed, 233 passed, 14 warnings in 14.87s; failure set sha256 75d6cbe73453
+
+New tests:
+- prefill-yield-1025: tests/v1/core/test_prefill_yield.py (the 1025 variant), 8 tests.
+- sched-next-base: the unfixed next-candidate's behaviour, 3 tests, all pass: a short request
+  waits for a long prompt's last aligned chunk; with --max-parallel-prefills 2 two long prompts
+  are never scheduled (the livelock); one lane schedules them in turn.
+- sched-next-fixes: next-candidate + prefill yield (344bed088) + the lanes fix (6f4adad09):
+  test_prefill_yield.py (8) and test_aligned_prefill_lanes.py (3), 11 tests.
+
+Regression set (the tree's test_aligned_prefill_chunks.py, test_scheduler.py and
+test_prefill_compute_share_scheduler.py, --noconftest: the root conftest imports tblib, which
+the image lacks): 233 passed and the same 49 failures in all four trees
+(regression-failures.txt). They are offline cache misses: the encoder-cache connector tests
+need llava-hf/llava-1.5-7b-hf and the half-life CLI test Qwen/Qwen3-0.6B, neither cached on
+dgx2 (facebook/opt-125m is mounted from ~/spark-lab/inputs/hf-opt-125m).
