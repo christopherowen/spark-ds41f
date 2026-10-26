@@ -88,7 +88,25 @@ def chain_steps(tp, live, tag, phases=True):
     return steps
 
 
+SMOKE = ["--layers", "2", "--sets", "2", "--mla", "--head"]
+
 BUNDLES = {
+    "smoke": dict(
+        ref=STUDY,
+        what="the layer harness in brief: two layers at each rank's shapes, a graph and eager, "
+             "and one run-iket lifetimes trace with its CTA timelines",
+        steps=[
+            *((f"TP{tp}: off, graph", layer("off", tp, f"{{out}}/tp{tp}", *SMOKE, "--graph", "--replays", "5"), 1800)
+              for tp in (4, 3)),
+            ("TP4: off, eager", layer("off", 4, "{out}/tp4-eager", *SMOKE, "--replays", "3"), 1800),
+            ("TP4: lifetimes, run-iket",
+             [*PROFILE, "{out}/lifetimes", "profile", "--postprocess", "json", "--",
+              *layer("on", 4, "{out}/lifetimes-run", *SMOKE, "--iket", "{out}/lifetimes-run/iket", "--skip", ".",
+                     "--replays", "1")], 1800),
+            ("TP4: CTA timelines", ["{python}", TIMELINE, "{out}/lifetimes", "--tp", "4", "--json",
+                                    "{out}/timeline.json"], 600),
+        ],
+    ),
     "layer": dict(
         ref=STUDY,
         what="c1 decode layers at a TP4 and a TP3 rank's shapes (reference routes, 3 of 6 rows "
