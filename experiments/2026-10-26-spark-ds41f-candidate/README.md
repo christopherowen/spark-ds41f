@@ -5,8 +5,8 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
-**Status (2026-10-26, CET):** image built on dgx4; release tests on dgx4 (below); cluster
-qualification prepared, not run. The production cluster is down: it was re-cabled for the
+**Status (2026-10-26, CET):** image built on dgx4; release tests passed on dgx4 (6,417 passed,
+163 skipped, 0 failed); cluster qualification prepared, not run. The production cluster is down: it was re-cabled for the
 four-node ring and the dgx4-dgx1 cable is missing.
 
 ## What it is
@@ -138,7 +138,36 @@ The direct loader's three test files were already gated (#594). Manifest:
 [release-tests-gate-manifest.json](release-tests-gate-manifest.json); bundle:
 [bundles/release-tests](bundles/release-tests), on the next-7 image.
 
-**Run 1 (dgx4, `scripts/lab.py kernel-local`):** running.
+**Run 1 (dgx4, 15:56-16:41 CET): passed.** `scripts/lab.py kernel-local
+experiments/2026-10-26-spark-ds41f-candidate/bundles/release-tests` from the dgx4 working copy at
+2ba20f14, on image `sha256:2319f8e7f5dc`
+([runs/2026-10-26-dgx4/release-tests](runs/2026-10-26-dgx4/release-tests)). **6,417 passed, 163
+skipped, 0 failed**, in 104 files and 2,717 s. Every chunk exited 0 at its first run, so no chunk
+was rerun file by file:
+
+| Chunk | Files | Tests | Failed | Skipped | Seconds |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 10 | 325 | 0 | 2 | 274 |
+| 1 | 10 | 336 | 0 | 0 | 171 |
+| 2 | 10 | 518 | 0 | 0 | 264 |
+| 3 | 10 | 249 | 0 | 0 | 105 |
+| 4 | 10 | 299 | 0 | 2 | 71 |
+| 5 | 10 | 844 | 0 | 157 | 204 |
+| 6 | 10 | 229 | 0 | 1 | 172 |
+| 7 | 10 | 834 | 0 | 0 | 273 |
+| 8 | 10 | 1,157 | 0 | 1 | 463 |
+| 9 | 10 | 1,754 | 0 | 0 | 703 |
+| 10 | 4 | 35 | 0 | 0 | 17 |
+
+- **The new and changed gate files:** the CED replay test 4 passed, the PDL tests 10, the workspace
+  tests 22; the direct loader's 44 + 38 GPU + 11 digest.
+- **Every skip has its reason:** 148 need a Hugging Face model the offline container lacks; 10
+  are ROCm-only; and one each for two GPUs, no GLP test file, no compute-sanitizer in the image,
+  a draft budget below the scheduled drafts, and the indexer NaN contract's strict xfail of
+  2026-10-14. These are candidate 6's skip classes (163 skips against its 160).
+- Per-test JUnit reports stay on dgx4 in `~/.cache/spark-lab/compile/release-tests/candidate-7`.
+
+No failure, so no fix branch.
 
 ## Qualification (prepared, not run)
 
