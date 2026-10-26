@@ -505,11 +505,44 @@ The per-kernel chain costs show why (layer-1, both ranks):
 Nothing reads those mixes before the next entry: the post-mix and combination fold the
 next sublayer's output in, and the new pre-mix is the next collapse's.
 
-**Next: the mix chain off the PDL chain.** `finalize`'s warp 0 moves to a kernel on a
-side stream, forked after the entry and joined at the next entry. That entry already
-follows the all-reduce's ordinary edge, so the join should cost nothing there. It is
-bit-identical (the same macros) and bounded at about 3-4 µs a boundary: +0.9% TP4,
-+0.7% TP3 at c1.
+IKET's `finalize` trace (layer-1, TP4) shows where warp 0's time goes:
+- the Sinkhorn's 4-lane reductions take 2.27 µs: 40 dependent two-shuffle reductions,
+  each followed by a division;
+- the split partials' reduction takes 0.8 µs, and the other warps wait for it at the
+  block sync before they start on the rows.
+
+**A4: the mix chain on a side stream** (`c1-mixaux` 6139240b7, bit-identical). Up to
+64 tokens, `finalize` runs in two parts with its operations in its order:
+- the rows (`y` and its cast, on all four warps) after the projection on the chain;
+- the mixes on a side stream, forked after the projection, from partials kept outside
+  the shared workspace.
+
+Every mHC operation that reads mixes joins the side stream first. In a decode step the
+next entry follows the all-reduce's ordinary edge, so that join costs no PDL overlap.
+
+Runs mixaux-tests-1 and mixaux-ab-1, against c579b3fe1:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A4: the mix chain on a side stream (`c1-mixaux` 6139240b7) | +0.23% | −0.20% | −0.14% | −0.70% | −0.05% | −0.06% | 122 passed, kernels source-checked |
+
+The new test checks that the two parts write the whole kernel's outputs bit for bit, at
+both widths and 1-64 tokens. TP3 c1's rounds spread from +2.6 to −16.6 µs.
+
+No gain, so warp 0's chain was not the critical path. What `finalize` adds after the
+projection is the PDL dependency wait plus its rows' L2 round trips: the split
+reductions, then the collapse and the weight, then the stores. Every kernel boundary on
+the chain pays these. Production wiring would also have needed joins before the CED
+boundary's and sequence-parallel row gathers of the mixes.
+
+**The mHC boundary is done for c1.** Its byte part is DRAM-bound. Four bit-identical
+restructurings of the rest are all within noise:
+- `fn`'s loads, two ways;
+- the fold;
+- the side stream.
+
+What remains is the fusion survey's cluster idea, which one GPU cannot measure: the
+post, the collapse and the norm in the all-reduce's reduce phase.
 
 **Then the attention front.** At about 1 µs a removed launch, the front is worth about
 as many microseconds as the launches it removes. One kernel for both norms, the Q-B
@@ -555,6 +588,9 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | smoke-8 | 16:47 | smoke | pass, 115 s |
 | mhcfold-tests-1 | 16:49 | mhcfold-tests (A3) | 136 passed, every launched kernel source-checked |
 | mhcfold-ab-1 | 16:51 | mhcfold-ab (A3) | pass, 626 s: bits equal, +0.3% at c1 at most, −0.3% at TP4 c16 |
+| smoke-9 | 17:21 | smoke | pass, 116 s |
+| mixaux-tests-1 | 17:23 | mixaux-tests (A4) | 122 passed, every launched kernel source-checked |
+| mixaux-ab-1 | 17:25 | mixaux-ab (A4) | pass, 618 s: bits equal, within noise (+0.2% to −0.7%) |
 
 ## Files
 
