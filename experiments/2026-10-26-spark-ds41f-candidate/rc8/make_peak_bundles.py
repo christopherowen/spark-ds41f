@@ -31,7 +31,9 @@ IMAGES = {"next7": "spark-ds41f:19f2c20ed4d6-next-7", "next8": "spark-ds41f:19f2
 ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
-    "PYTHONPATH": "/b",
+    # The image's own path (its vLLM and B12X trees) after the bundle's: without it the
+    # base image's vLLM in dist-packages is imported.
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
     "MAX_JOBS": "8",
     "VLLM_PLUGINS": "",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
