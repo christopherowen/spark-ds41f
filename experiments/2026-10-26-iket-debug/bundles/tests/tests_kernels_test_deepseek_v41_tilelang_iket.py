@@ -150,7 +150,11 @@ def test_sampled_iterations_guard_loop_ranges():
     stride = f"((int)((ko) - (0)) % {block} == {block} / 2)"
     lines = [line.strip() for line in out.splitlines()]
     in_loop = [s["range"] for s in sites if s["loops"]]
-    assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
+    # Each name carries the factor from its two sampled iterations to the loop's four.
+    assert in_loop == ["wait.cp_async*2", "wait.sync#2*2", "compute.mma*2"]
+    # The loop's trips scale its sampled iterations; a site outside it has none.
+    assert {s["loop_trips"] for s in sites if s["loops"]} == {4}
+    assert not any("loop_trips" in s for s in sites if not s["loops"])
     # Each in-loop range: its start and end events, and its settle.
     events = [line for line in lines if line.startswith(f"TL_IKET_WHEN({stride}) ")]
     assert len(events) == 2 * len(in_loop)
@@ -177,6 +181,7 @@ def test_while_loop_ranges_have_no_bound():
         ["while (1)"]
     ]
     assert {s["events_per_warp_bound"] for s in sites} == {None}
+    assert [s["loop_trips"] for s in sites if "unsampled_loops" in s] == [None]
     # Without it, each range opens and closes once in the sampled iteration.
     sites = iket.annotate(KERNEL, _token, iters=1)[1]
     assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}

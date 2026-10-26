@@ -33,8 +33,10 @@ statement is printed beside it, and the manifests say how a kernel was sampled. 
 kernel with sampled CTAs (``VLLM_DS41_IKET_CTAS``), warp, range and last-warp numbers
 come from the CTAs that recorded ranges (the span stays the whole launch's). With
 sampled iterations (``VLLM_DS41_IKET_ITERS``), a range inside a loop holds only its
-sampled iterations; it is marked, and the loop's other iterations count as
-unattributed. ``--nsys`` adds, per group, the median kernel
+sampled iterations. Where the loops' bounds are literals, its name carries the factor
+to all of them (``*N``) and its time is that estimate, marked "est."; otherwise it is
+marked, and the loop's other iterations count as unattributed. ``--nsys`` adds, per
+group, the median kernel
 duration of nsys exports (``nsys export --type sqlite``) of the same kernel
 (name, grid and block); NAME labels the column, e.g. ``off=nsys-off.sqlite``.
 
@@ -55,7 +57,13 @@ def median(values):
 
 
 def phase_of(name):
-    return name.split("#")[0].split(".")[0]
+    return name.split("*")[0].split("#")[0].split(".")[0]
+
+
+def factor_of(name):
+    """The factor a sampled range's name carries to its whole loops (``*N``), else 1."""
+    match = re.search(r"\*([0-9.]+)$", name)
+    return float(match.group(1)) if match else 1.0
 
 
 def sites(directory):
@@ -102,7 +110,9 @@ def launch_numbers(launch, names, locations, sampled=False):
     for r in launch["ranges"]:
         warp = r["warpLocIdxs"][0]
         name = names[r["rangeNameIdx"]]
-        per_warp[warp][name] += (r["endTs"] - r["startTs"]) / 1000
+        # A sampled range stands for its whole loops: its estimate is its time times the
+        # factor its name carries.
+        per_warp[warp][name] += (r["endTs"] - r["startTs"]) / 1000 * factor_of(name)
         counts[warp][name] += 1
     warps = list(lifetimes)
     if sampled and per_warp:
@@ -181,6 +191,7 @@ def summarize(launches, names, locations, kernels=None, sampling=None):
                 "max_us": median([n["ranges"].get(name, {}).get("max", 0.0) for n in launches]),
                 "sampled_iterations": bool(kernel_sampling.get("iters"))
                 and name in kernel_sampling.get("in_loops", ()),
+                "factor": factor_of(name),
             }
         phases = defaultdict(float)
         last = defaultdict(float)
@@ -224,12 +235,15 @@ def find_trace(path):
 
 
 def engine_steps(launches, step_kernel, prefill_kernel):
-    """The launches split at each launch of ``step_kernel`` (once an engine step), as
-    (kind, launches): "prefill" where the step launches ``prefill_kernel``, else
-    "decode". Launches before the first ``step_kernel`` are left out."""
+    """The launches split at each launch of ``step_kernel`` (once an engine step) after
+    the first, as (kind, launches): "prefill" where the step launches
+    ``prefill_kernel``, else "decode"."""
     starts = [i for i, launch in enumerate(launches) if launch["kernelName"] == step_kernel]
     if not starts:
         raise SystemExit(f"{step_kernel}: not launched in the window")
+    # The window opens on the first step, whose prefill inputs come before its first
+    # step kernel (run 29).
+    starts[0] = 0
     out = []
     for a, b in zip(starts, starts[1:] + [len(launches)]):
         part = launches[a:b]
@@ -318,7 +332,12 @@ def timeline(items, gap_us, top=10):
              f"{len(gaps)} gaps; gaps over {gap_us:g} us split it into {len(segments)} segments\n",
              "| segment | launches | wall us | busy us | busy | first kernel |",
              "|---:|---:|---:|---:|---:|---|"]
+    shown = set(sorted(range(len(segments)), key=lambda i: -numbers["segments"][i]["busy_us"])[:top + 5])
+    if len(shown) < len(segments):
+        lines.insert(1, f"The {len(shown)} of {len(segments)} segments with the most busy time:\n")
     for i, s in enumerate(numbers["segments"]):
+        if i not in shown:
+            continue
         lines.append(f"| {i} | {s['launches']} | {s['wall_us']:.1f} | {s['busy_us']:.1f} | "
                      f"{s['busy_us'] / s['wall_us'] if s['wall_us'] else 1:.0%} | {s['first']} |")
     lines += ["\n| idle us | after | before |", "|---:|---|---|"]
@@ -419,7 +438,7 @@ def main():
         lines.append("| phase | us a warp | share | last warp us | last warp share |")
         lines.append("|---|---:|---:|---:|---:|")
         last = g["last_warp"]
-        partial = any(r["sampled_iterations"] for r in g["ranges"].values())
+        partial = any(r["sampled_iterations"] and r["factor"] == 1 for r in g["ranges"].values())
         for phase in sorted(g["phases"], key=lambda p: -g["phases"][p]):
             us = g["phases"][phase]
             lu = last["phases"].get(phase, 0.0)
@@ -430,7 +449,12 @@ def main():
         lines.append("|---|---:|---:|---:|---:|---|")
         for name, r in sorted(g["ranges"].items(), key=lambda item: -item[1]["us"]):
             statement = statements.get((g["kernel"], name), "")[:90].replace("|", "\\|")
-            label = f"{name} (sampled iterations)" if r["sampled_iterations"] else name
+            if r["factor"] > 1:
+                label = f"{name} (est.: sampled iterations x{r['factor']:g})"
+            elif r["sampled_iterations"]:
+                label = f"{name} (sampled iterations)"
+            else:
+                label = name
             lines.append(f"| {label} | {r['us']:.2f} | {r['share']:.1%} | {r['count']:.1f} | "
                          f"{r['max_us']:.2f} | `{statement}` |")
     print("\n".join(lines))
