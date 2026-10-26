@@ -40,6 +40,13 @@ STREAM = "c1-stream"
 STREAM_IKET = "c1-stream-iket"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
+# The PDL experiment's test invocation: with vLLM's conftest (the layer-chain tests take
+# its default_vllm_config), the release-tests bundle's two plugins, and the PDL source
+# check of every launched kernel.
+RELEASE_TESTS = HERE.parent / "2026-10-25-spark-ds41f-candidate" / "rc6" / "bundles" / "release-tests"
+PYTEST_CHECKED = ["{python}", "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-p", "tblib_stub",
+                  "-p", "offline_skip", "-p", "tests.kernels.deepseek_v41_pdl_sources",
+                  "-o", "faulthandler_timeout=600"]
 LAYER = "/b/c1_layer.py"
 BOUND = "/b/stream_bound.py"
 TABLE = "/b/iket_table.py"
@@ -53,10 +60,31 @@ def layer(mode, tp, out, *extra):
     return ["{python}", LAYER, mode, "--tp", str(tp), "--routes", ROUTES, "--out", out, *extra]
 
 
+# run-iket writes an empty trace when no kernel is instrumented (smoke run 2). With one
+# small kernel instrumented, every launch's warp lifetimes are recorded, and the others
+# run as built.
+LIFETIMES_SKIP = "^(?!moe_combine_kernel$)"
+
+
+def lifetime_steps(tp, live, tag):
+    """run-iket with only the combine instrumented (exact warp lifetimes of every other
+    kernel), and cta_timeline.py's SM occupancy and weight stream from them."""
+    shape = ["--live", str(live), "--mla", "--head"]
+    out = f"{{out}}/tp{tp}-{tag}"
+    return [
+        (f"TP{tp} {tag}: lifetimes, run-iket, only the combine instrumented",
+         [*PROFILE, f"{out}/lifetimes", "profile", "--postprocess", "json", "--",
+          *layer("on", tp, f"{out}/lifetimes-run", *shape, "--iket", f"{out}/lifetimes-run/iket",
+                 "--skip", LIFETIMES_SKIP, "--layers", "4", "--replays", "3")], 3600),
+        (f"TP{tp} {tag}: CTA timelines",
+         ["{python}", TIMELINE, f"{out}/lifetimes", "--tp", str(tp), "--routes", ROUTES, "--live", str(live),
+          "--layers", "4", "--json", f"{out}/timeline.json"], 1800),
+    ]
+
+
 def chain_steps(tp, live, tag, phases=True):
     """One rank's shapes: the off build's times (graph, and its nsys kernel times),
-    then run-iket twice: every kernel uninstrumented (exact warp lifetimes, from which
-    cta_timeline.py rebuilds each launch's SM occupancy and weight stream), and with
+    then run-iket twice: with only the combine instrumented (lifetime_steps), and with
     ``phases`` every kernel instrumented with no sampling (the phase table)."""
     shape = ["--live", str(live), "--mla", "--head"]
     out = f"{{out}}/tp{tp}-{tag}"
@@ -68,10 +96,7 @@ def chain_steps(tp, live, tag, phases=True):
         (f"TP{tp} {tag}: nsys, off, eager",
          [*NSYS_PROFILE, f"{out}/nsys-eager",
           *layer("off", tp, f"{out}/nsys-eager-run", *shape, "--replays", "10")], 3600),
-        (f"TP{tp} {tag}: lifetimes, run-iket, every kernel uninstrumented",
-         [*PROFILE, f"{out}/lifetimes", "profile", "--postprocess", "json", "--",
-          *layer("on", tp, f"{out}/lifetimes-run", *shape, "--iket", f"{out}/lifetimes-run/iket",
-                 "--skip", ".", "--layers", "4", "--replays", "3")], 3600),
+        lifetime_steps(tp, live, tag)[0],
         (f"TP{tp} {tag}: phases, run-iket, every kernel instrumented",
          [*PROFILE, f"{out}/trace", "profile", "--postprocess", "json", "--",
           *layer("on", tp, f"{out}/trace-run", *shape, "--iket", f"{out}/trace-run/iket",
@@ -80,9 +105,7 @@ def chain_steps(tp, live, tag, phases=True):
          ["{python}", TABLE, f"{out}/trace", "--sources", f"{out}/trace-run/iket/sources",
           "--nsys", f"graph={out}/nsys-graph.sqlite", f"eager={out}/nsys-eager.sqlite",
           "--json", f"{out}/table.json"], 1800),
-        (f"TP{tp} {tag}: CTA timelines",
-         ["{python}", TIMELINE, f"{out}/lifetimes", "--tp", str(tp), "--routes", ROUTES, "--live", str(live),
-          "--layers", "4", "--json", f"{out}/timeline.json"], 1800),
+        lifetime_steps(tp, live, tag)[1],
     ]
     if not phases:
         steps = [step for step in steps if not step[0].split(": ")[1].startswith("phase")]
@@ -102,8 +125,8 @@ BUNDLES = {
             ("TP4: off, eager", layer("off", 4, "{out}/tp4-eager", *SMOKE, "--replays", "3"), 1800),
             ("TP4: lifetimes, run-iket",
              [*PROFILE, "{out}/lifetimes", "profile", "--postprocess", "json", "--",
-              *layer("on", 4, "{out}/lifetimes-run", *SMOKE, "--iket", "{out}/lifetimes-run/iket", "--skip", ".",
-                     "--replays", "1")], 1800),
+              *layer("on", 4, "{out}/lifetimes-run", *SMOKE, "--iket", "{out}/lifetimes-run/iket",
+                     "--skip", LIFETIMES_SKIP, "--replays", "1")], 1800),
             ("TP4: CTA timelines", ["{python}", TIMELINE, "{out}/lifetimes", "--tp", "4", "--json",
                                     "{out}/timeline.json"], 600),
         ],
@@ -136,6 +159,18 @@ BUNDLES = {
         steps=[*chain_steps(4, 3, "live3", phases=False), *chain_steps(4, 6, "live6", phases=False),
                *chain_steps(3, 3, "live3", phases=False)],
     ),
+    "lifetimes": dict(
+        ref=STUDY,
+        what="warp lifetimes of every launch (only the combine instrumented) and their CTA "
+             "timelines: TP4 at 3 and 6 live rows, TP3 at 3",
+        steps=[*lifetime_steps(4, 3, "live3"), *lifetime_steps(4, 6, "live6"), *lifetime_steps(3, 3, "live3")],
+    ),
+    "lifetimes-stream": dict(
+        ref=STREAM_IKET,
+        what="the stream grouped GEMM's warp lifetimes and CTA timelines: TP4 at 3 and 6 live "
+             "rows, TP3 at 3",
+        steps=[*lifetime_steps(4, 3, "live3"), *lifetime_steps(4, 6, "live6"), *lifetime_steps(3, 3, "live3")],
+    ),
     "bound": dict(
         ref=NEXT,
         what="the routed experts' chain against an ideal read of the same bytes (one launch a "
@@ -160,8 +195,8 @@ BUNDLES = {
              "shapes and 1-15 rows, the routed-expert tests, and the PDL tests and source check",
         tests=[MOE_TESTS, PDL_TESTS, "tests/kernels/deepseek_v41_pdl_sources.py",
                "tests/kernels/deepseek_v41_contracts.py"],
-        steps=[("routed-expert and PDL tests",
-                [*iket.PYTEST, "--basetemp", "{out}/pytest", MOE_TESTS, PDL_TESTS], 3600)],
+        steps=[("routed-expert and PDL tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MOE_TESTS, PDL_TESTS], 3600)],
     ),
     "stream-ab": dict(
         ref=NEXT,
@@ -182,6 +217,8 @@ SCRIPTS = {
     "iket_table.py": IKET_DIR / "iket_table.py",
     "nsys_window.py": IKET_DIR / "nsys_window.py",
     "ref-woa1.json": HERE.parent / "2026-10-18-json-count" / "runs" / "ref-woa1.json",
+    "tblib_stub.py": RELEASE_TESTS / "tblib_stub.py",
+    "offline_skip.py": RELEASE_TESTS / "offline_skip.py",
 }
 
 
