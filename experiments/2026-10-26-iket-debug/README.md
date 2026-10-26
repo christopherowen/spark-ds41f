@@ -788,3 +788,141 @@ kernels by total duration and how many ran in graphs:
 ```sh
 python3 experiments/2026-10-26-iket-debug/nsys_window.py nsys-graphs.sqlite --gap-us 200
 ```
+
+## Perfetto: a decode step lane by lane
+
+`iket_perfetto.py` turns one decode step of a run-iket run into a Perfetto trace:
+
+```sh
+python3 experiments/2026-10-26-iket-debug/iket_perfetto.py \
+  RUN/trace/iket/pid_*/iket.decoded_results.json OUT.pftrace [--layer T2] [--step K]
+```
+
+- **Streaming.**
+  - The 3-4.5 GB records file is never loaded whole. A first pass indexes each launch
+    record (its offset, kernel, span and graph exec), from an mmap and one
+    `raw_decode` call an element.
+  - The chosen step's records and the warp locations they use are then decoded.
+  - TracePackets (protobuf, interned names) are written as they are made.
+  - About 25 s and 0.44 GB of memory a file, whatever the records' size.
+- **Opening it:** drag the file onto https://ui.perfetto.dev, which parses it in the
+  browser; nothing is uploaded. A file too large for a tab opens through a local trace
+  processor:
+
+  ```sh
+  trace_processor_shell --httpd OUT.pftrace
+  ```
+
+  Then ui.perfetto.dev offers to use it.
+- **What it covers:**
+  - what IKET recorded, which is the TileLang kernels only. ATen and Triton kernels and
+    copies are absent;
+  - from the harness: 6 target layers, the drafter's 3 and the head, at one rank's
+    shapes. Not the model's 43 layers;
+  - times are IKET's (`%globaltimer`), including its instrumentation. Run 46's TP4 c1
+    step spans 35.9 ms under IKET, against 14.5 ms in nsys.
+- **Tracks** (one GPU process):
+  - **1 model:**
+    - **step;**
+    - **segment:** graph replays and eager runs, named from the whole step (the target's
+      forward, the verification head and sampler, the drafter);
+    - **layer:** T0-T5 and D0-D2, cut at each MoE combine, with the all-reduce points as
+      markers. One GPU runs none: the markers show where a TP rank would wait;
+    - **sublayer,** from kernel names.
+  - **2 kernel launches:** first warp start to last warp end, in lanes where launches
+    overlap.
+  - **3 counters:**
+    - CTAs and warps resident;
+    - the share of traced warps waiting, by reason (`wait.*` ranges): cp.async,
+      mbarrier (TMA), block barrier, PDL dependency, flag or spin, fence.
+  - **4 SMs:**
+    - SM 00-47, each with CTA slots for CTAs that overlap there;
+    - each CTA's slice spans its warps' lifetimes;
+    - under a slot, each traced warp's track holds its ranges nested in its lifetime.
+- **Sampling:** the run's.
+  - Every warp's lifetime is recorded, so CTA slices and counters cover every CTA.
+  - Phases cover the 4 traced CTAs a launch (`VLLM_DS41_IKET_CTAS=4`).
+  - Loops show their middle iteration, with `*N` the factor to the whole loop.
+  - `--max-traced-warps N` thins a CTA's traced warps further.
+
+- **Real times, for now: `--base-nsys EXPORT`.**
+  - The timeline becomes an IKET-off run's nsys export of the same step: the interim
+    stand-in for a `--warp-trace` base run.
+  - **Pairing:** each IKET launch pairs with the base launch at the same ordinal, its
+    place among the step's launches of one kernel, grid and block. Shapes whose counts
+    differ pair by kernel name; a name whose counts differ stays unpaired.
+  - **Rescaling:** the launch's CTAs, warps and phases are rescaled into the base
+    launch's span. Kernel spans and overlap are the base's.
+  - **Per-launch args:** `real_us`, `instrumented_us`, the scale and the overhead.
+  - **Flags:**
+    - overhead above 50%: phase proportions unreliable, mostly tiny kernels;
+    - a paired grid that differs: phases from a launch of another shape.
+  - **Non-TileLang kernels:** a "5 streams" group shows the base's every kernel per CUDA
+    stream, ATen and Triton included.
+  - **Pairing on run 46's records:**
+    - TP4 and TP3 c1 against run 47 (the recipe's ladder): 431 of 432 launches pair. The
+      exception is `indexer_topk_merge`, 1 launch at 8K against 7 at 1M. 74 and 77 pairs
+      differ in grid: the drafter's 10 rows against 5, and the indexer's context.
+    - TP4 c8 against run 47 does not pair: its 16-row graphs against the IKET run's 48
+      rows give 178 different grids and other L2 prefetch counts. Against run 46's own
+      nsys (48-row graphs, a 1M context) 419 of 420 pair, 8 with other grids.
+  - **Small kernels' times:** nsys's duration includes a kernel's launch and drain, which
+    IKET's warp spans do not. So a small kernel's instrumented time can read below its
+    real time.
+
+Files from run 46 (dgx3, vLLM 736e86a25), in `~/projects/commander/outputs/iket-perfetto/`:
+
+| file | what | size |
+|---|---|---:|
+| `harness-tp4-c1-layerT2-736e86a2-run46-dgx3-20261026.pftrace` | TP4 c1, target layer T2 (compressor, indexer, sparse MLA, WO, MoE): 51 launches, 2,960 CTAs, 864 traced warps | 1.1 MB |
+| `harness-tp4-c1-decode-step-...` | TP4 c1, decode step 9 of 18: 432 launches, 43,793 CTAs, 7,097 traced warps | 12 MB |
+| `harness-tp4-c8-decode-step-...` | TP4 c8, decode step 9: 420 launches, 174,866 CTAs | 29 MB |
+| `harness-tp3-c1-decode-step-...` | TP3 c1, decode step 9: 432 launches, 49,776 CTAs | 13 MB |
+
+Interim files, timed by an nsys base (`--base-nsys`), labelled INTERIM in their names:
+
+| file | base | step span |
+|---|---|---:|
+| `harness-tp4-c1-layerT2-INTERIM-timed-by-nsys-run47-...` | run 47 TP4 c1 | 632 us (the layer) |
+| `harness-tp4-c1-decode-step-INTERIM-timed-by-nsys-run47-...` | run 47 TP4 c1 | 14.47 ms |
+| `harness-tp3-c1-decode-step-INTERIM-timed-by-nsys-run47-...` | run 47 TP3 c1 | 16.20 ms |
+| `harness-tp4-c8-decode-step-INTERIM-timed-by-nsys-run46-...` | run 46's own nsys, 48-row graphs | 17.56 ms |
+
+### Next: a full forward pass from one base run and a lean run (needs a test box)
+
+`full-pass-spec.md` is the spec for a lab window: which runs, settings, sizes, times per
+configuration, hang retries and stitching. The sketch below is its background.
+
+These need GPU runs:
+- **Payloads, for what a warp does:**
+  - TileLang's IKET records unsigned 32-bit or float32 runtime payloads
+    (`iket.session(runtime_payloads=True)`, `TL_IKET_EVENT_PAYLOAD_U32`).
+  - The mode would attach per-kernel values to range starts: the warp's role
+    (producer or consumer warp group), the tile, the expert, the row block.
+  - Off stays identical, because the payloads exist only when the mode is on.
+  - Bytes per load phase come from the load's tile size at codegen time, recorded in
+    the manifest rather than at run time.
+- **A base run:**
+  - The deterministic request: temperature 0, a fixed prompt and batch, a fresh
+    prefix cache, the recipe's environment and sizing.
+  - It runs under `run-iket profile --warp-trace`: the IKET mode off, no tracker pass.
+  - Every kernel launch (ATen, NCCL and sparknet included) records its warps' start
+    and end, one slot a warp. That is the timeline of record, with a small pool.
+- **Slice runs:**
+  - The same request again, with the mode on for one kernel family a run (attention,
+    MoE, GEMMs, head and sampler, inputs), so each run-iket pool stays small.
+  - `VLLM_DS41_IKET_SKIP` selects the family.
+- **Stitching, by launch ordinal:**
+  - The key of a launch:
+    - eager launches: their order in the step;
+    - graph launches: the graph exec, the replay's ordinal in the step and the
+      record's index in the replay.
+  - Each slice's launch sequence (kernel, grid, block) must match the base run's at
+    every ordinal, or the stitch refuses.
+  - A slice's warps are scaled into the base launch's span, keeping both the raw and
+    the scaled times.
+- **The cluster:**
+  - The same spec on all four ranks, giving one file per node.
+  - A combined file aligns the ranks at the collectives, which are rendezvous, by a
+    fitted clock offset and drift with its residual.
+  - Each rank's wait at every collective shows directly.

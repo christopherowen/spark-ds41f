@@ -163,7 +163,7 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
               "--iters", str(iters), "--skip", skip, *shape, "--out", "{out}/trace-run"], 7200),
             ("records against the dry run's count",
              ["{python}", "/b/trace_counts.py", "{out}/trace", "{out}/trace-run/iket/sources",
-              "--tracker", "{out}/dry/tracker"], 1800),
+              "--tracker", "{out}/dry-used/tracker"], 1800),
             ("decode steps, nsys, off, graphs",
              [*NSYS_PROFILE, "{out}/nsys-graphs", "--cuda-graph-trace=node", "{python}", STEP, "off",
               *shape, *sizing, "--out", "{out}/nsys-graphs-run"], 5400),
