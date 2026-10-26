@@ -12,7 +12,13 @@ failed; ``{python}`` is the image's interpreter and ``{out}`` the output root,
 
 Refs (each bundle's candidate.json records the commit):
 - ``c1-iket``: next-candidate with the IKET mode merged (iket-debug 52862f2ca);
-- ``next-candidate``: itself, for the off build's bits and times.
+- ``next-candidate``: itself, for the off build's bits and times;
+- ``c1-stream``: next-candidate with the stream grouped GEMM (the first prototype);
+- ``c1-stream-iket``: that with the IKET mode merged, for its traces.
+
+An A/B bundle (``builds``) mounts its base ref's files over the image's tree at
+/b/base/vllm, with the layer chain's test helper, and each prototype's files over the
+base ref at /b/<name>/vllm; ab.py builds and alternates the trees.
 """
 import importlib.util
 import json
@@ -30,6 +36,10 @@ BASE, IMAGE, ROOT, MISSING, RUN = iket.BASE, iket.IMAGE, iket.ROOT, iket.MISSING
 PROFILE, NSYS_PROFILE, NSYS, NVDISASM = iket.PROFILE, iket.NSYS_PROFILE, iket.NSYS, iket.NVDISASM
 STUDY = "c1-iket"
 NEXT = "next-candidate"
+STREAM = "c1-stream"
+STREAM_IKET = "c1-stream-iket"
+MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
+PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
 LAYER = "/b/c1_layer.py"
 TABLE = "/b/iket_table.py"
 TIMELINE = "/b/cta_timeline.py"
@@ -42,14 +52,14 @@ def layer(mode, tp, out, *extra):
     return ["{python}", LAYER, mode, "--tp", str(tp), "--routes", ROUTES, "--out", out, *extra]
 
 
-def chain_steps(tp, live, tag):
+def chain_steps(tp, live, tag, phases=True):
     """One rank's shapes: the off build's times (graph, and its nsys kernel times),
     then run-iket twice: every kernel uninstrumented (exact warp lifetimes, from which
-    cta_timeline.py rebuilds each launch's SM occupancy and weight stream), and every
-    kernel instrumented with no sampling (the phase table)."""
+    cta_timeline.py rebuilds each launch's SM occupancy and weight stream), and with
+    ``phases`` every kernel instrumented with no sampling (the phase table)."""
     shape = ["--live", str(live), "--mla", "--head"]
     out = f"{{out}}/tp{tp}-{tag}"
-    return [
+    steps = [
         (f"TP{tp} {tag}: off, graph", layer("off", tp, f"{out}/off", *shape, "--graph", "--replays", "30"), 3600),
         (f"TP{tp} {tag}: nsys, off, graph",
          [*NSYS_GRAPH, f"{out}/nsys-graph",
@@ -73,6 +83,9 @@ def chain_steps(tp, live, tag):
          ["{python}", TIMELINE, f"{out}/lifetimes", "--tp", str(tp), "--routes", ROUTES, "--live", str(live),
           "--layers", "4", "--json", f"{out}/timeline.json"], 1800),
     ]
+    if not phases:
+        steps = [step for step in steps if not step[0].split(": ")[1].startswith("phase")]
+    return steps
 
 
 BUNDLES = {
@@ -97,9 +110,34 @@ BUNDLES = {
                 layer("off", tp, f"{{out}}/tp{tp}", "--live", "3", "--mla", "--head", "--graph", "--replays", "30"),
                 3600) for tp in (4, 3)],
     ),
+    "layer-stream": dict(
+        ref=STREAM_IKET,
+        what="the stream grouped GEMM on the c1 layer harness: times, nsys kernel times and warp "
+             "lifetimes at TP4 (3 and 6 live rows) and TP3 (3)",
+        steps=[*chain_steps(4, 3, "live3", phases=False), *chain_steps(4, 6, "live6", phases=False),
+               *chain_steps(3, 3, "live3", phases=False)],
+    ),
+    "stream-tests": dict(
+        ref=STREAM,
+        what="the stream grouped GEMM: its bits against the grid GEMM's at both ranks' expert "
+             "shapes and 1-15 rows, the routed-expert tests, and the PDL tests and source check",
+        tests=[MOE_TESTS, PDL_TESTS, "tests/kernels/deepseek_v41_pdl_sources.py",
+               "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("routed-expert and PDL tests",
+                [*iket.PYTEST, "--basetemp", "{out}/pytest", MOE_TESTS, PDL_TESTS], 3600)],
+    ),
+    "stream-ab": dict(
+        ref=NEXT,
+        builds={"stream": STREAM},
+        what="the stream grouped GEMM against next-candidate on the c1 layer harness, in "
+             "alternation, six rounds: TP4 at 3 and 6 live rows, TP3 at 3",
+        steps=[("A/B, six rounds", ["{python}", "/b/ab.py", "6", "tp=4 live=3", "tp=4 live=6", "tp=3 live=3"],
+                14400)],
+    ),
 }
 
 SCRIPTS = {
+    "ab.py": HERE / "ab.py",
     "c1_layer.py": HERE / "harness" / "c1_layer.py",
     "cta_timeline.py": HERE / "cta_timeline.py",
     "iket_hot.py": IKET_DIR / "harness" / "iket_hot.py",
@@ -117,33 +155,47 @@ def main():
             continue
         ref = spec["ref"]
         head = iket.git(repo, "rev-parse", "--short=9", ref).strip()
-        status = [line.split("\t") for line in
-                  iket.git(repo, "diff", "--no-renames", "--name-status", BASE, ref).splitlines() if line]
-        package = [(kind, path) for kind, path in status if path.startswith("vllm/")]
-        tests = [CHAINS]
+        package = changed(repo, BASE, ref)
+        builds = {build: (build_ref, changed(repo, ref, build_ref))
+                  for build, build_ref in spec.get("builds", {}).items()}
         bundle = HERE / "bundles" / name
-        planned = {"run.py", "steps.json", "candidate.json", *SCRIPTS}
-        planned |= {f"overlay/{path}" for _, path in package}
-        planned |= {path.replace("/", "_") for path in tests}
+        # An A/B bundle carries its builds' trees; any other bundle overlays the image.
+        files = {}
+        if builds:
+            for kind, path in package:
+                files[f"base/{path}"] = (kind, ref, path)
+            files[f"base/{CHAINS}"] = ("M", ref, CHAINS)
+            for build, (build_ref, build_package) in builds.items():
+                for kind, path in build_package:
+                    files[f"{build}/{path}"] = (kind, build_ref, path)
+            tests = []
+        else:
+            for kind, path in package:
+                files[f"overlay/{path}"] = (kind, ref, path)
+            tests = [CHAINS, *spec.get("tests", [])]
+            for path in tests:
+                files[path.replace("/", "_")] = ("M", ref, path)
+        planned = {"run.py", "steps.json", "candidate.json", *SCRIPTS, *files}
         # Files are overwritten in place, never deleted: a file this run would not
         # write stops it, for a person to remove.
         stale = sorted(str(p.relative_to(bundle)) for p in bundle.rglob("*")
                        if p.is_file() and str(p.relative_to(bundle)) not in planned)
         if stale:
             raise SystemExit(f"{bundle} holds files this run would not write: {stale}")
-        for kind, path in package:
-            target = bundle / "overlay" / path
+        for target_path, (kind, at, path) in files.items():
+            target = bundle / target_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(MISSING.encode() if kind == "D" else iket.show(repo, ref, path))
-        for path in tests:
-            (bundle / path.replace("/", "_")).write_bytes(iket.show(repo, ref, path))
+            target.write_bytes(MISSING.encode() if kind == "D" else iket.show(repo, at, path))
         for target, source in SCRIPTS.items():
             shutil.copy(source, bundle / target)
         (bundle / "run.py").write_text(RUN)
         (bundle / "steps.json").write_text(json.dumps(spec["steps"], indent=1) + "\n")
+        build_text = "".join(f"; build {build}: {build_ref} {iket.git(repo, 'rev-parse', '--short=9', build_ref).strip()}, "
+                             f"{len(build_package)} package files over it"
+                             for build, (build_ref, build_package) in builds.items())
         candidate = {
             "description": f"{spec['what']} (vLLM {ref} {head}, {len(package)} package files over the "
-                           f"release's {BASE}) on candidate 6's image.",
+                           f"release's {BASE}{build_text}) on candidate 6's image.",
             "image": IMAGE,
             "env": {
                 "HF_HUB_OFFLINE": "1",
@@ -159,10 +211,18 @@ def main():
             "verdict": "status",
             "mounts": [["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
                        *([target, f"/b/{target}"] for target in SCRIPTS), NSYS, *spec.get("mounts", []),
-                       *([path.replace("/", "_"), f"{ROOT}/{path}"] for path in tests)],
+                       *([path.replace("/", "_"), f"{ROOT}/{path}"] for path in tests),
+                       *([tree, f"/b/{tree}"] for tree in (["base", *builds] if builds else []))],
         }
         (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
-        print(f"{name}: {ref} {head}, {len(package)} package files, {len(spec['steps'])} steps")
+        print(f"{name}: {ref} {head}, {len(package)} package files{build_text}, {len(spec['steps'])} steps")
+
+
+def changed(repo, old, new):
+    """(kind, path) of every vLLM package file ``new`` changes from ``old``."""
+    status = [line.split("\t") for line in
+              iket.git(repo, "diff", "--no-renames", "--name-status", old, new).splitlines() if line]
+    return [(kind, path) for kind, path in status if path.startswith("vllm/")]
 
 
 if __name__ == "__main__":
