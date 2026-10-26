@@ -132,6 +132,16 @@ BUNDLES = {
               "--json", "{out}/table.json"], 1800),
         ],
     ),
+    "inspect": dict(
+        ref=IKET,
+        what="the image's run-iket CLI sources, copied out for reading (how it injects into a "
+             "process and its children, the dry run, the buffer sizing)",
+        steps=[("copy iket.cli", ["{python}", "-c",
+                                  "import iket.cli, pathlib, shutil, sys; "
+                                  "src = pathlib.Path(iket.cli.__file__).parent; "
+                                  "shutil.copytree(src, sys.argv[1], ignore=shutil.ignore_patterns('__pycache__'))",
+                                  "{out}/iket-cli"], 300)],
+    ),
     "step-off": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "

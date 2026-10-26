@@ -107,7 +107,8 @@ def main():
         tensor_parallel_size=1,
         block_size=256,
         max_model_len=8192,
-        max_num_seqs=1,
+        # Two: the dead-row warmup launches for one request and for two.
+        max_num_seqs=2,
         # A small profile run keeps the startup's share of a trace small; prefill
         # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192).
         max_num_batched_tokens=512,
@@ -127,7 +128,7 @@ def main():
         },
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
-            "cudagraph_capture_sizes": [1, 2, 4, 6, 8],
+            "cudagraph_capture_sizes": [1, 2, 4, 6, 8, 12],
         },
         generation_config="vllm",
         hf_overrides=shrink,
