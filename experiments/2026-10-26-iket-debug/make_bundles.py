@@ -58,6 +58,40 @@ STEP_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
 }
 
+# The decode step's instrumented kernels (run 18) by family. Each step-counts dry run
+# instruments one family, to find the kernel whose warps record past the static bound.
+COUNT_FAMILIES = {
+    "gemm": "gemm_bf16_kernel gemm_bf16_partials_kernel gemm_bf16_splitk_kernel gemm_bf16_two_kernel "
+            "gemm_fp8w_bf16_cast_kernel gemm_fp8w_bf16_partials_kernel gemm_mxfp8_kernel "
+            "gemm_mxfp8_partials_kernel gemm_splitk_reduce_cast_kernel gemm_splitk_reduce_kernel "
+            "vocab_packed_projection_kernel vocab_embedding_kernel l2_prefetch_kernel",
+    "moe": "moe_combine_kernel moe_dispatch_kernel moe_grouped_fp8_fp4_gemm_kernel "
+           "moe_swiglu_cast_kernel_kernel moe_topk_gate_forward_kernel_kernel router_partials_kernel "
+           "routing_masks_kernel activation_swiglu_clamp_kernel",
+    "attention": "sparse_mla_kernel indexer_mxfp4_quantize_kernel indexer_score_kernel "
+                 "indexer_topk_merge_kernel indexer_topk_segment_kernel compress_gather_partial_state_kernel "
+                 "compress_kernel cache_writer_kernel rope_kernel metadata_builder_kernel "
+                 "metadata_chunk_kernel metadata_decode_kernel metadata_pages_kernel",
+    "mhc": "mhc_collapse_column_kernel mhc_collapse_kernel mhc_finalize_kernel mhc_post_kernel "
+           "mhc_project_streams_kernel norm_forward_and_per_token_cast_kernel_kernel "
+           "per_token_cast_kernel_kernel split_columns_kernel",
+    "inputs": "ced_copy_rows_kernel ced_indices_kernel ced_requests_kernel ced_routing_mask_kernel "
+              "ced_slots_kernel ced_token_metadata_kernel compute_slot_mappings_kernel "
+              "gather_block_tables_kernel context_inputs_kernel prepare_pos_seq_lens_kernel "
+              "prepare_prefill_inputs_kernel prepare_dflash_inputs_kernel expand_idx_mapping_kernel "
+              "combine_sampled_and_draft_tokens_kernel post_update_kernel fill_ids_kernel fill_rows_kernel "
+              "padding_rows_kernel scatter_rows_gather_kernel gather_rows_kernel clear_rows_kernel "
+              "apply_write_kernel insert_kernel zero_packs_kernel iket_step_marker_kernel",
+    "sampler": "bias_kernel bad_words_kernel bincount_kernel penalties_kernel temperature_kernel min_p_kernel "
+               "topk_ids_kernel topk_ids_only_kernel topk_log_softmax_kernel topp_mask_kernel "
+               "topp_stats_kernel topp_step_kernel gumbel_finish_kernel gumbel_sample_kernel resample_kernel "
+               "finish_argmax_kernel partial_argmax_kernel logits_rows_kernel local_stats_kernel "
+               "token_counts_kernel token_ranks_kernel prompt_ids_kernel grammar_bitmask_kernel "
+               "flatten_sampled_kernel greedy_rejection_kernel verify_kernel dspark_confidence_kernel "
+               "sink_candidates_kernel sink_cut_kernel sink_flags_kernel sink_merge_kernel sink_policy_kernel "
+               "sink_rows_kernel sink_shard_top_kernel",
+}
+
 BUNDLES = {
     "hot-base": dict(
         ref=NEXT,
@@ -145,8 +179,36 @@ BUNDLES = {
               "{python}", STEP, "off", "--out", "{out}/nsys-graphs-run"], 5400),
             ("decode-step table",
              ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
-              "--between", "iket_step_marker_kernel", "--nsys", "eager={out}/nsys-eager.sqlite",
-              "graphs={out}/nsys-graphs.sqlite", "--json", "{out}/table.json"], 1800),
+              "--between", "iket_step_marker_kernel", "--gap-us", "200",
+              "--nsys", "eager={out}/nsys-eager.sqlite", "graphs={out}/nsys-graphs.sqlite",
+              "--json", "{out}/table.json"], 1800),
+            *((f"nsys timeline, {mode}",
+               ["{python}", "/b/nsys_window.py", f"{{out}}/nsys-{mode}.sqlite", "--gap-us", "200"], 600)
+              for mode in ("eager", "graphs")),
+        ],
+    ),
+    "step-counts": dict(
+        ref=IKET,
+        what="which kernels' warps record past the static bound in the eager decode steps: one "
+             "run-iket dry run (--skip-run) per kernel family, the others uninstrumented, and "
+             "each dry run's per-warp maximum",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            *((f"dry run, {family} instrumented",
+               [*PROFILE, f"{{out}}/{family}", "--skip-run", "profile", "--keep", "--postprocess", "none",
+                "--", "{python}", STEP, "on", "--eager", "--iket", f"{{out}}/{family}-run/iket",
+                "--ctas", "4", "--iters", "1",
+                "--skip", f"^(?!(?:{'|'.join(names.split())})$)", "--out", f"{{out}}/{family}-run"], 1800)
+              for family, names in COUNT_FAMILIES.items()),
+            ("per-warp maximum per family", ["{python}", "-c",
+                "import glob, json, sys\n"
+                "for d in sys.argv[1:]:\n"
+                "    for p in sorted(glob.glob(d + '/tracker/pid_*/tracker.json')):\n"
+                "        t = json.load(open(p))\n"
+                "        print(d.rsplit('/', 1)[1], p.split('/')[-2], t.get('recommended_max_ts_cnt_per_warp'), "
+                "len(t['launches']), 'launches')",
+                *(f"{{out}}/{family}" for family in COUNT_FAMILIES)], 60),
         ],
     ),
     "hot-sampled": dict(
@@ -263,7 +325,8 @@ sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
 SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
            "sass_check.py": HERE / "harness" / "sass_check.py",
-           "trace_counts.py": HERE / "harness" / "trace_counts.py", "iket_table.py": HERE / "iket_table.py"}
+           "trace_counts.py": HERE / "harness" / "trace_counts.py", "iket_table.py": HERE / "iket_table.py",
+           "nsys_window.py": HERE / "nsys_window.py"}
 
 
 def git(repo, *args):

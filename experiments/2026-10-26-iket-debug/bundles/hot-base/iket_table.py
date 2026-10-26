@@ -210,13 +210,18 @@ def summarize(launches, names, locations, kernels=None, sampling=None):
     return sorted(out, key=lambda g: -g["span_total_us"])
 
 
-def timeline(launches, gap_us, top=10):
-    """Markdown and numbers: the launches' GPU time. Busy is the union of their spans;
-    idle gaps longer than ``gap_us`` split it into segments (in an engine run, mostly its
-    steps, between which the host schedules)."""
-    items = [(min(w["startTs"] for w in launch["warpLifetimes"]),
-              max(w["endTs"] for w in launch["warpLifetimes"]), launch["kernelName"])
-             for launch in launches]
+def spans(launches):
+    """(start ns, end ns, kernel) of each IKET launch: its first warp start, last warp end."""
+    return [(min(w["startTs"] for w in launch["warpLifetimes"]),
+             max(w["endTs"] for w in launch["warpLifetimes"]), launch["kernelName"])
+            for launch in launches]
+
+
+def timeline(items, gap_us, top=10):
+    """Markdown and numbers: the GPU time of ``items``, (start ns, end ns, kernel) in
+    start order. Busy is the union of their spans; idle gaps longer than ``gap_us``
+    split it into segments (in an engine run, mostly its steps, between which the host
+    schedules)."""
     busy, gaps = 0, []
     run_start, run_end, run_last = items[0]
     segments = [{"launches": 0, "start": run_start, "busy": 0, "first": run_last}]
@@ -318,7 +323,7 @@ def main():
         key = (g["kernel"], tuple(g["grid"]), tuple(g["block"]))
         g["nsys_us"] = {label: median(d.get(key, [])) for label, d in nsys.items()}
         g["nsys_launches"] = {label: len(d.get(key, [])) for label, d in nsys.items()}
-    lines, numbers = timeline(launches, args.gap_us) if args.between else ([], None)
+    lines, numbers = timeline(spans(launches), args.gap_us) if args.between else ([], None)
     lines += overview(groups, statements)
     for g in groups:
         nsys_text = "".join(f", nsys {label} {us:.2f} us" for label, us in g["nsys_us"].items())

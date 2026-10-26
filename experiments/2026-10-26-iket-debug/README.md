@@ -69,7 +69,11 @@ the hot kernels did not:
   uniform within an iteration. With it, only lane 0 of a warp records: IKET records an
   event each time a group of a warp's lanes runs it, so where lanes diverge, one
   statement would leave several records. Each range then records at most once per
-  sampled iteration, and every site's static bound in the manifests holds.
+  sampled iteration, and every site's static bound in the manifests holds. A TVM
+  `while (1)` loop has no variable to sample: a range inside one records in every
+  iteration, the site lists the loop as unsampled, and its kernel has no bound. In the
+  decode step that is the logits processor (`bias_kernel`, at most 16 vocabulary tiles)
+  and the slot-mapping binary search.
 - `VLLM_DS41_IKET_SKIP=REGEX`: kernels whose name matches compile uninstrumented. run-iket
   still records their warps' lifetimes.
 
