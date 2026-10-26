@@ -20,7 +20,8 @@ records (run 29); ``run-iket postprocess`` makes them for a smaller run.
 Each run-iket gets ``--timeout`` seconds (default 1800) in a session of its own, which
 is killed whole when they run out: run 30's dry run spun in a graph replay for 45
 minutes. Then the end of each process's injection log is printed (``--log-level
-debug`` makes it name every launch).
+debug`` makes it name every launch). ``--dry-only`` stops after the dry run, to repeat
+it until it hangs (run 42's TP3 c1 dry run stopped the same way).
 """
 
 import argparse
@@ -57,6 +58,7 @@ def main():
     parser.add_argument("out")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--log-level", default="error")
+    parser.add_argument("--dry-only", action="store_true")
     args = parser.parse_args(sys.argv[1:split])
     command = sys.argv[split + 1:]
     out = Path(args.out)
@@ -69,6 +71,8 @@ def main():
     counts = {path.parent.name: json.loads(path.read_text()).get("recommended_max_ts_cnt_per_warp", 0)
               for path in sorted((out / "dry" / "tracker").glob("pid_*/tracker.json"))}
     print(f"dry run's per-warp counts by process: {counts}", flush=True)
+    if args.dry_only:
+        sys.exit(0)
     most = max(counts.values(), default=0)
     if not most:
         raise SystemExit("no process of the dry run recorded a count")

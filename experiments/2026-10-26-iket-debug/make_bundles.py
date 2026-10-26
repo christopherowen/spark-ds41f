@@ -344,6 +344,27 @@ BUNDLES = {
         ],
     ),
     **{f"step-tp{tp}-c{requests}": step_spec(IKET, tp, requests) for tp in (4, 3) for requests in (1, 8)},
+    # Run 42's TP3 c1 dry run stopped launching between a kernel and the next graph replay
+    # (as run 30's did at TP4): the dry run repeated, each bounded, while a host-side
+    # watcher (hangcatch.sh) records stacks and GPU power when a run's log stops growing.
+    "dry-loop-tp3-c1": dict(
+        ref=IKET,
+        what="the TP3 c1 step bundle's run-iket dry run eight times, each killed after 600 s, to "
+             "catch the hang of runs 30 and 42 with a host-side watcher",
+        # step-tp3-c1's compile caches: each dry run starts as run 42's did.
+        env={**STEP_ENV, **{variable: f"/c/{prefix}-iket-step-tp3-c1" for variable, prefix in (
+            ("TILELANG_CACHE_DIR", "tilelang"), ("TRITON_CACHE_DIR", "triton"),
+            ("VLLM_CACHE_ROOT", "vllm"))}},
+        mounts=[HUB],
+        steps=[
+            (f"dry run {k}",
+             ["{python}", "/b/iket_profile.py", f"{{out}}/dry-{k}", "--timeout", "600", "--log-level",
+              "debug", "--dry-only", "--", "{python}", STEP, "on", "--iket", f"{{out}}/dry-{k}/run/iket",
+              "--ctas", "4", "--iters", "1", "--skip", "^(vision_|topk_topp)", "--tp-shape", "3",
+              "--requests", "1", "--tokens", "32", "--grid", "8", "--out", f"{{out}}/dry-{k}/run"], 900)
+            for k in range(1, 9)
+        ],
+    ),
     "c8-nan": dict(
         ref=IKET,
         what="why c8 stops at boot (runs 33: route_partials' gate logits nan or inf in vLLM's sampler "
