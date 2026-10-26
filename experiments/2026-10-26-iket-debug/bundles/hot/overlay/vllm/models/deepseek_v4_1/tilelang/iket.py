@@ -32,16 +32,16 @@ or from the global buffers it reads or writes: ``load`` (TMA, cp.async, a global
 read), ``wait`` (cp.async wait, mbarrier wait, block sync, PDL grid dependency,
 sparknet's flag wait, fences, a spin on a global flag), ``compute`` (MMA and
 ldmatrix, warp reductions), ``store`` (a global write, TMA store, atomics,
-sparknet's staging) and ``signal`` (sparknet's doorbell and tail). A block's phase
-is its statements' phase when they share one. Consecutive siblings of one phase
-become one range, the phaseless statements between them included; a block whose
-statements mix phases is entered instead. Every wait statement is a range of its
-own. A range never contains ``return``, ``break``, ``continue`` or ``goto``, so it
-closes on every warp path. Names are ``<phase>.<kind>`` (just ``<phase>`` over
-several kinds), with ``#<n>`` for later sites of a name; at most 30 names a module,
-as IKET keeps the event id in the five low bits of a 32 ns timestamp and id 31 ends
-a range. A module with more names folds the ``#<n>`` sites into their first name,
-and traces only its first 30.
+sparknet's staging) and ``signal`` (sparknet's doorbell, release stores and tail).
+A block's phase is its statements' phase when they share one. Consecutive siblings
+of one phase become one range, the phaseless statements between them included; a
+block whose statements mix phases is entered instead. Every wait statement is a
+range of its own. A range never contains ``return``, ``break``, ``continue`` or
+``goto``, so it closes on every warp path. Names are ``<phase>.<kind>`` (just
+``<phase>`` over several kinds), with ``#<n>`` for later sites of a name; at most 30
+names a module, as IKET keeps the event id in the five low bits of a 32 ns
+timestamp and id 31 ends a range. A module with more names folds the ``#<n>``
+sites into their first name, and traces only its first 30.
 """
 
 from __future__ import annotations
@@ -82,7 +82,8 @@ _PATTERNS = [
                            r"\b__shfl_\w+", r"\broce_reduce_\w+"]),
     ("store", "tma", [r"\btl::tma_store\w*"]),
     ("store", "stage", [r"\broce_copy_\w+\s*\("]),
-    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\("]),
+    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\(",
+                         r"\broce_st_\w+\s*\("]),
     ("store", "atomic", [r"\batomic\w+\s*\(", r"\btl::Atomic\w+\s*\("]),
 ]  # fmt: skip
 _COMPILED = [

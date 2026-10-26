@@ -1,0 +1,486 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""IKET debug mode: where each TileLang kernel loads, computes and waits.
+
+``VLLM_DS41_IKET=<directory>`` turns it on for a process; the GPU worker calls
+``enable`` first thing in ``init_device``, before any kernel compiles.
+From then on every TileLang kernel the process compiles carries IKET events
+(TileLang's ``tilelang.tools.cuda.iket``, NVIDIA's in-kernel event tracing): the
+phase pass below reads each kernel's generated CUDA and wraps its phases in
+warp-local IKET ranges. The kernels' own sources are unchanged, and so is every
+kernel while the variable is unset: then nothing here is imported and no TileLang
+callback is registered.
+
+When on:
+
+- TileLang's kernel and binary caches are off and its cache directory is
+  ``<directory>/tilelang-cache``, so an instrumented kernel is never read from or
+  written to the deployment's cache. Kernels still go through declare, prepare and
+  freeze; preparation compiles every one of them.
+- ``<directory>/sources`` holds each instrumented module's CUDA source and its
+  sites (``<kernel>.<hash>.cu`` and ``.json``: each range's name, phase, source
+  lines and first statement), which the trace's range names refer to.
+- Traces need NVIDIA's profiler: run the process under ``run-iket profile`` (CuTe
+  DSL's ``nvidia-cutlass-dsl-libs-base``), which patches the events into trace
+  stores. Outside it an event's placeholder store writes shared address 0x20, in
+  the 1 KiB per-block reservation below the dynamic shared base, and the kernels
+  compute what they compute without IKET, more slowly.
+
+Phases. The pass parses each ``__global__`` body into statements and blocks and
+gives each statement a phase from the TileLang intrinsic it calls (``_PATTERNS``)
+or from the global buffers it reads or writes: ``load`` (TMA, cp.async, a global
+read), ``wait`` (cp.async wait, mbarrier wait, block sync, PDL grid dependency,
+sparknet's flag wait, fences, a spin on a global flag), ``compute`` (MMA and
+ldmatrix, warp reductions), ``store`` (a global write, TMA store, atomics,
+sparknet's staging) and ``signal`` (sparknet's doorbell, release stores and tail).
+A block's phase is its statements' phase when they share one. Consecutive siblings
+of one phase become one range, the phaseless statements between them included; a
+block whose statements mix phases is entered instead. Every wait statement is a
+range of its own. A range never contains ``return``, ``break``, ``continue`` or
+``goto``, so it closes on every warp path. Names are ``<phase>.<kind>`` (just
+``<phase>`` over several kinds), with ``#<n>`` for later sites of a name; at most 30
+names a module, as IKET keeps the event id in the five low bits of a 32 ns
+timestamp and id 31 ends a range. A module with more names folds the ``#<n>``
+sites into their first name, and traces only its first 30.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import zlib
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+MAX_EVENTS = 30
+MAX_NAME_BYTES = 32
+RANGE_END = 31
+_CUDA_POSTPROC = "tilelang_callback_cuda_postproc"
+
+# (phase, kind, patterns): the first kind a statement matches names its phase.
+_PATTERNS = [
+    ("wait", "pdl", [r"\bcudaGridDependencySynchronize\s*\("]),
+    ("wait", "cp_async", [r"\btl::cp_async_wait\s*<", r"\bcp\.async\.(bulk\.)?wait_"]),
+    ("wait", "tma_store", [r"\btl::tma_store_wait\s*<"]),
+    ("wait", "mbarrier", [r"\.wait\s*\(", r"\bmbarrier_wait\w*\s*\(",
+                          r"mbarrier\.\w+_wait"]),
+    ("wait", "sync", [r"\b__syncthreads\s*\(", r"\btl::__sync_thread_partial\s*\(",
+                      r"\bbar\.sync\b", r"\bbarrier\.sync\b", r"\.sync\s*\(\s*\)"]),
+    ("wait", "flags", [r"\broce_wait_\w+\s*\("]),
+    ("wait", "fence", [r"\broce_fence_\w+\s*\(", r"\b__threadfence\w*\s*\(",
+                       r"\bfence\.(sc|acq_rel)\b"]),
+    ("load", "tma", [r"\btl::tma_load\w*", r"\.expect_transaction\s*\(",
+                     r"\barrive_and_expect_tx\b"]),
+    ("load", "cp_async", [r"\btl::cp_async_\w+", r"\bcp\.async\b"]),
+    ("compute", "mma", [r"\btl::\w*mma\w*", r"\bmma\.sync\b",
+                        r"\btl::ptx_ldmatrix\w*", r"\btl::gemm_\w+", r"\bwmma::"]),
+    ("compute", "reduce", [r"\btl::AllReduce\b", r"\btl::warp_reduce\w*",
+                           r"\b__shfl_\w+", r"\broce_reduce_\w+"]),
+    ("store", "tma", [r"\btl::tma_store\w*"]),
+    ("store", "stage", [r"\broce_copy_\w+\s*\("]),
+    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\(",
+                         r"\broce_st_\w+\s*\("]),
+    ("store", "atomic", [r"\batomic\w+\s*\(", r"\btl::Atomic\w+\s*\("]),
+]  # fmt: skip
+_COMPILED = [
+    (phase, kind, re.compile("|".join(alts))) for phase, kind, alts in _PATTERNS
+]
+_JUMP = re.compile(r"(?:return|break|continue|goto)\b")
+_KEYWORDS = ("for", "while", "if", "switch", "do")
+_IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+_ATTRIBUTE = re.compile(r"__\w+__\s*")
+# A preprocessor line other than a pragma: a range could split its #if and #endif.
+_CONDITIONAL = re.compile(r"^[ \t]*#(?!\s*pragma\b)", re.M)
+
+
+@dataclass
+class _Node:
+    """A statement (``body`` None) or a block (``for``/``while``/``if``/scope, with
+    ``orelse`` for an ``else`` part). ``start``..``end`` are whole source lines, the
+    node's ``#pragma`` lines included; ``alone`` says no other node shares them."""
+
+    start: int
+    end: int
+    text: str
+    alone: bool
+    body: list[_Node] | None = None
+    orelse: list[_Node] | None = None
+    phase: str | None = None  # None: no phase of its own; "mixed": several
+    kinds: set[str] = field(default_factory=set)
+    jumps: bool = False
+
+
+class _Parser:
+    """Statements and blocks of a ``__global__`` body, in TVM's CUDA layout (one
+    statement per line, every control statement braced)."""
+
+    def __init__(self, source: str) -> None:
+        self.s = source
+
+    def skip_space(self, i: int) -> int:
+        s = self.s
+        while i < len(s):
+            if s[i].isspace():
+                i += 1
+            elif s.startswith("//", i):
+                i = self.line_end(i)
+            elif s.startswith("/*", i):
+                i = s.index("*/", i) + 2
+            else:
+                break
+        return i
+
+    def literal_end(self, i: int) -> int:
+        s, quote = self.s, self.s[i]
+        i += 1
+        while s[i] != quote:
+            i += 2 if s[i] == "\\" else 1
+        return i + 1
+
+    def scan(self, i: int, stop: str | None) -> int:
+        """End of the bracketed group opening at ``i`` (``stop`` None), or of the
+        statement starting at ``i``, after its top-level ``stop``."""
+        s, depth = self.s, 0
+        while True:
+            c = s[i]
+            if c in "\"'":
+                i = self.literal_end(i)
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+                if depth == 0 and stop is None:
+                    return i + 1
+            elif c == stop and depth == 0:
+                return i + 1
+            i += 1
+
+    def line_start(self, i: int) -> int:
+        return self.s.rfind("\n", 0, i) + 1
+
+    def line_end(self, i: int) -> int:
+        end = self.s.find("\n", i)
+        return len(self.s) if end < 0 else end + 1
+
+    def blank(self, a: int, b: int) -> bool:
+        return not self.s[a:b].strip()
+
+    def block(self, i: int) -> tuple[list[_Node], int]:
+        """The nodes of the braced block opening at ``i``, and the end of its ``}``."""
+        nodes, i, pragma = [], i + 1, None
+        while True:
+            i = self.skip_space(i)
+            if self.s[i] == "}":
+                return nodes, i + 1
+            if self.s[i] == "#":  # #pragma unroll goes with the next statement
+                pragma = self.line_start(i) if pragma is None else pragma
+                i = self.line_end(i)
+                continue
+            node, i = self.node(i)
+            first = self.line_start(node.start)
+            node.alone = node.alone and self.blank(first, node.start)
+            node.start = pragma if pragma is not None else first
+            pragma = None
+            nodes.append(node)
+
+    def node(self, i: int) -> tuple[_Node, int]:
+        """The node starting at ``i``, and the end of its last character."""
+        s = self.s
+        if s[i] == "{":
+            body, j = self.block(i)
+            return self.close(_Node(i, 0, "{", True, body), j), j
+        word = _IDENTIFIER.match(s, i)
+        keyword = word.group(0) if word else ""
+        if keyword not in _KEYWORDS:
+            j = self.scan(i, ";")
+            return self.close(_Node(i, 0, s[i:j], True), j), j
+        j = self.skip_space(word.end())
+        if keyword == "do":
+            body, j = self.block(j)
+            j = self.scan(self.skip_space(j), ";")
+            return self.close(_Node(i, 0, s[i:j], True, body), j), j
+        header_end = self.scan(j, None)
+        j = self.skip_space(header_end)
+        node = _Node(i, 0, s[i:header_end], True)
+        if s[j] == "{":
+            node.body, j = self.block(j)
+        else:
+            child, j = self.node(j)
+            node.body, child.alone = [child], False
+        k = self.skip_space(j)
+        if (
+            keyword == "if"
+            and s.startswith("else", k)
+            and not _IDENTIFIER.match(s, k + 4)
+        ):
+            k = self.skip_space(k + 4)
+            if s[k] == "{":
+                node.orelse, j = self.block(k)
+            else:  # else if: the inner if starts mid-line
+                child, j = self.node(k)
+                node.orelse, child.alone = [child], False
+        return self.close(node, j), j
+
+    def close(self, node: _Node, j: int) -> _Node:
+        node.end = self.line_end(j - 1)
+        node.alone = node.alone and self.blank(j, node.end)
+        return node
+
+
+def _assignment(text: str) -> int:
+    """Offset of the top-level assignment operator in a statement, or -1."""
+    depth = 0
+    for i, c in enumerate(text):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "=" and depth == 0:
+            before, after = text[i - 1 : i], text[i + 1 : i + 2]
+            if after == "=" or before in ("=", "!"):
+                continue
+            if before in ("<", ">") and text[i - 2 : i - 1] != before:
+                continue  # <= and >=, but not <<= and >>=
+            return i
+    return -1
+
+
+def _classify(node: _Node, params: frozenset[str]) -> None:
+    """Set ``node``'s phase, kinds and jumps, bottom up."""
+    if node.body is None:
+        node.jumps = bool(_JUMP.match(node.text))
+        for phase, kind, pattern in _COMPILED:
+            if pattern.search(node.text):
+                node.phase, node.kinds = phase, {kind}
+                return
+        at = _assignment(node.text)
+        if at >= 0 and set(_IDENTIFIER.findall(node.text[:at])) & params:
+            node.phase, node.kinds = "store", {"global"}
+        elif set(_IDENTIFIER.findall(node.text)) & params:
+            node.phase, node.kinds = "load", {"global"}
+        return
+    phases = set()
+    for child in node.body + (node.orelse or []):
+        _classify(child, params)
+        node.jumps |= child.jumps
+        if child.phase is not None:
+            phases.add(child.phase)
+            node.kinds |= child.kinds
+    if set(_IDENTIFIER.findall(node.text)) & params:
+        if node.text.startswith("while"):
+            phases.add("wait")  # a spin on a global flag
+            node.kinds.add("spin")
+        else:  # a condition or bound read from global memory
+            phases.add("load")
+            node.kinds.add("global")
+    node.phase = None if not phases else phases.pop() if len(phases) == 1 else "mixed"
+
+
+@dataclass
+class _Range:
+    phase: str
+    kinds: set[str]
+    first: _Node
+    last: _Node
+    kernel: str = ""
+    base: str = ""
+    name: str = ""
+
+
+def _ranges(nodes: list[_Node]) -> list[_Range]:
+    """Ranges over a statement list: runs of one phase, each wait alone. A block
+    that mixes phases, jumps, shares a line or waits (other than a spin loop) is
+    entered instead."""
+    found: list[_Range] = []
+    run: _Range | None = None
+    for node in nodes:
+        if node.phase is None and not node.jumps:
+            continue  # phaseless: joins a run that continues past it
+        # A wait is its statement alone; a block is a wait only as a spin loop.
+        waits = (
+            node.phase == "wait" and node.body is not None and "spin" not in node.kinds
+        )
+        if node.jumps or node.phase == "mixed" or not node.alone or waits:
+            run = None
+            for children in (node.body, node.orelse):
+                if children and node.phase is not None:
+                    found.extend(_ranges(children))
+            continue
+        if node.phase == "wait":
+            found.append(_Range("wait", set(node.kinds), node, node))
+            run = None
+        elif run is not None and run.phase == node.phase:
+            run.last = node
+            run.kinds |= node.kinds
+        else:
+            run = _Range(node.phase, set(node.kinds), node, node)
+            found.append(run)
+    return found
+
+
+def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
+    """(name, pointer parameters, body start, body end) of each ``__global__``
+    definition."""
+    parser = _Parser(code)
+    for match in re.finditer(r"__global__\s+void\s+", code):
+        i = match.end()
+        while attribute := _ATTRIBUTE.match(code, i):  # __launch_bounds__(...)
+            i = attribute.end()
+            if code[i] == "(":
+                i = parser.skip_space(parser.scan(i, None))
+        name = _IDENTIFIER.match(code, i)
+        i = parser.skip_space(name.end()) if name else i
+        if name is None or code[i] != "(":
+            continue
+        params_end = parser.scan(i, None)
+        j = parser.skip_space(params_end)
+        if code[j] != "{":  # a declaration
+            continue
+        pointers = frozenset(
+            _IDENTIFIER.findall(param)[-1]
+            for param in code[i + 1 : params_end - 1].split(",")
+            if "*" in param and _IDENTIFIER.findall(param)
+        )
+        yield name.group(0), pointers, j, parser.scan(j, None)
+
+
+def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dict]]:
+    """``code`` with each phase of each kernel in an IKET range, and its sites.
+
+    ``token(name, range_id)`` returns the IKET metadata token of a range named
+    ``name``. A module with no ``__global__`` definition comes back unchanged; a
+    kernel with a preprocessor conditional in its body is left as it is."""
+    found: list[_Range] = []
+    sites: list[dict] = []
+    for kernel, params, start, end in _kernels(code):
+        if _CONDITIONAL.search(code, start, end):
+            sites.append(
+                {"kernel": kernel, "skipped": "a preprocessor conditional in its body"}
+            )
+            continue
+        nodes, _ = _Parser(code).block(start)
+        for node in nodes:
+            _classify(node, params)
+        for item in _ranges(nodes):
+            kind = next(iter(item.kinds)) if len(item.kinds) == 1 else ""
+            item.kernel, item.base = (
+                kernel,
+                f"{item.phase}.{kind}" if kind else item.phase,
+            )
+            found.append(item)
+    counts: dict[str, int] = {}
+    for item in found:
+        counts[item.base] = counts.get(item.base, 0) + 1
+        item.name = (
+            item.base if counts[item.base] == 1 else f"{item.base}#{counts[item.base]}"
+        )
+    if len({item.name for item in found}) > MAX_EVENTS:
+        for item in found:
+            item.name = item.base
+    traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
+    inserts: list[tuple[int, int, str]] = []
+    for item in found:
+        sites.append(
+            {
+                "kernel": item.kernel,
+                "range": item.name,
+                "phase": item.phase,
+                "kinds": sorted(item.kinds),
+                "first_line": code.count("\n", 0, item.first.start) + 1,
+                "last_line": code.count("\n", 0, item.last.end - 1) + 1,
+                "statement": " ".join(item.first.text.split())[:160],
+                "traced": item.name in traced,
+            }
+        )
+        if item.name not in traced:
+            continue
+        indent = re.match(r"[ \t]*", code[item.first.start :]).group(0)
+        range_id = zlib.crc32(item.name.encode()) & 0xFFFFFFFF or 1
+        inserts.append(
+            (
+                item.first.start,
+                1,
+                f'{indent}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+            )
+        )
+        inserts.append((item.last.end, 0, f"{indent}TL_IKET_EVENT({RANGE_END});\n"))
+    out, last = [], 0
+    # At one offset a range's end goes before the next range's start.
+    for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
+        out += [code[last:offset], text]
+        last = offset
+    return "".join(out) + code[last:], sites
+
+
+_lock = threading.Lock()
+_directory: Path | None = None
+
+
+def directory() -> Path | None:
+    """The IKET output directory, or None while the mode is off."""
+    return _directory
+
+
+def enable(output: str | os.PathLike[str]) -> Path:
+    """Turn the IKET mode on for this process, before it compiles any TileLang
+    kernel. Idempotent for the same directory."""
+    global _directory
+    root = Path(output).expanduser().resolve()
+    with _lock:
+        if _directory is not None:
+            if root != _directory:
+                raise RuntimeError(
+                    f"IKET mode is already on with {_directory}, not {root}"
+                )
+            return _directory
+        import tilelang.cache
+        import tvm_ffi
+        from tilelang.env import disable_cache
+
+        compiled = sum(
+            len(cache._memory_cache) for cache in tilelang.cache._dispatch_map.values()
+        )
+        if compiled:
+            # Their calls would keep launching the uninstrumented kernels.
+            raise RuntimeError(
+                "IKET mode must be on before TileLang compiles; "
+                f"{compiled} kernels are compiled"
+            )
+        if tvm_ffi.get_global_func(_CUDA_POSTPROC, allow_missing=True) is not None:
+            raise RuntimeError(f"{_CUDA_POSTPROC} is already registered")
+        (root / "sources").mkdir(parents=True, exist_ok=True)
+        # TileLang reads its cache directory at each use; with its caches off nothing
+        # is read or written there either.
+        os.environ["TILELANG_CACHE_DIR"] = str(root / "tilelang-cache")
+        disable_cache()
+        tvm_ffi.register_global_func(_CUDA_POSTPROC, f=_postproc)
+        _directory = root
+    return root
+
+
+def _token(name: str, range_id: int) -> str:
+    from tilelang.tools.cuda.iket.metadata import Event, encode_event
+
+    if len(name.encode()) > MAX_NAME_BYTES:
+        raise ValueError(f"IKET range name over {MAX_NAME_BYTES} bytes: {name!r}")
+    return encode_event(Event(name=name, event_id=1, kind="range", range_id=range_id))
+
+
+def _postproc(code: str, target) -> str:
+    from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
+
+    digest = hashlib.sha256(code.encode()).hexdigest()[:12]
+    annotated, sites = annotate(code, _token)
+    instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
+    kernel = next((name for name, *_ in _kernels(code)), "module")
+    stem = _directory / "sources" / f"{kernel}.{digest}"
+    stem.with_suffix(".cu").write_text(instrumented)
+    stem.with_suffix(".json").write_text(
+        json.dumps({"kernel": kernel, "sites": sites}, indent=1) + "\n"
+    )
+    return instrumented

@@ -221,7 +221,10 @@ def allreduce_case(rows, delay_us):
     run = oneshot.get_launcher("bfloat16", WORLD, 0, THREADS, layout.slots, layout.flag_stride, LANES, 0)
     region = torch.zeros(layout.total_bytes, dtype=torch.uint8, pin_memory=True)
     classes = BLOCKS.bit_length()
-    counters = torch.zeros(1 + 2 * classes, dtype=torch.int32, device=DEVICE)
+    # sparknet 0.5.0 (the image's) adds two words after the stage and tail counters:
+    # the rung doorbell's sequence and block 0's arrival, which the other blocks wait on.
+    handoff = "rung_index" in Launch.__dataclass_fields__
+    counters = torch.zeros(1 + 2 * classes + 2 * handoff, dtype=torch.int32, device=DEVICE)
     g = gen(4)
     parts = [torch.randn((rows, HIDDEN), generator=g, device=DEVICE).bfloat16() for _ in range(WORLD)]
     out = torch.empty_like(parts[0])
@@ -237,10 +240,12 @@ def allreduce_case(rows, delay_us):
     flags = raw.view("uint32")
     grid = runtime._grid_blocks(nbytes // 16, THREADS, BLOCKS)
     stage, tail = 1 + grid.bit_length() - 1, 1 + classes + grid.bit_length() - 1
+    extra = dict(rung_index=1 + 2 * classes, arrival_index=2 + 2 * classes) if handoff else {}
     launch = Launch(input=parts[0].reshape(-1).view(torch.int32), output=out.reshape(-1).view(torch.int32),
                     size_packs=nbytes // 16, nbytes=nbytes, region=region, recv_off=layout.recv_off,
                     flag_off=layout.flag_off, send_off=layout.send_off, ctrl_off=layout.ctrl_off,
-                    slot_bytes=slot_bytes, counters=counters, stage_index=stage, tail_index=tail, grid_x=grid)
+                    slot_bytes=slot_bytes, counters=counters, stage_index=stage, tail_index=tail, grid_x=grid,
+                    **extra)
     def peers():
         """Each launch rings the doorbell with the next sequence number; answer it."""
         seq = 1

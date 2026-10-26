@@ -207,10 +207,17 @@ print(json.dumps({
 """
 
 
+def _script(tmp_path, source):
+    """A script file: TileLang reads a kernel's Python source, which ``-c`` lacks."""
+    path = tmp_path / f"script_{len(list(tmp_path.glob('script_*.py')))}.py"
+    path.write_text(source)
+    return str(path)
+
+
 def _run(tmp_path, *args):
     env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "deployment-cache"))
     process = subprocess.run(
-        [sys.executable, "-c", KERNEL_SCRIPT, *args],
+        [sys.executable, _script(tmp_path, KERNEL_SCRIPT), *args],
         env=env,
         capture_output=True,
         text=True,
@@ -223,7 +230,13 @@ def _run(tmp_path, *args):
 @GPU
 def test_on_matches_off_and_keeps_its_own_cache(tmp_path):
     off = _run(tmp_path, "off")
+    cache = tmp_path / "deployment-cache"
+    before = sorted(str(p.relative_to(cache)) for p in cache.rglob("*"))
     on = _run(tmp_path, "on", str(tmp_path / "iket"))
+    # The on run neither read nor wrote the deployment's cache.
+    assert (
+        before and sorted(str(p.relative_to(cache)) for p in cache.rglob("*")) == before
+    )
     assert off["bits"] == on["bits"] and off["sum"] == on["sum"]
     assert not off["source_instrumented"] and on["source_instrumented"]
     # Off imports nothing of IKET and registers no callback.
@@ -261,7 +274,7 @@ def test_enable_refuses_after_a_compile(tmp_path):
     """)
     env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "cache"))
     process = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path / "iket")],
+        [sys.executable, _script(tmp_path, script), str(tmp_path / "iket")],
         env=env,
         capture_output=True,
         text=True,

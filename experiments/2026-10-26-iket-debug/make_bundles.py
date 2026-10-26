@@ -12,7 +12,9 @@ runs next-candidate (NEXT, the branch's base), the others the IKET branch (IKET)
 The steps run in order (run.py); each prints its exit status and the bundle fails if
 any failed. ``{python}`` in a step is the image's interpreter and ``{out}`` the
 bundle's output root under the node's compile cache, /c/iket/<bundle>-<UTC stamp>,
-which the runner prints first. dgx4's Nsight Systems is mounted at /opt/nsys.
+which the runner prints first. dgx4's Nsight Systems is mounted at /opt/nsys, and the
+step bundles mount the node's Hugging Face hub (DS4.1-Flash-1017's config and
+tokenizer; their weights are dummies) at /hf/hub.
 """
 import json
 import shutil
@@ -27,10 +29,12 @@ BASE = "26382f5cf"
 NEXT = "577091997"  # next-candidate when the branch was cut
 IKET = "iket-debug"
 NSYS = ["/opt/nvidia/nsight-systems/2025.3.2", "/opt/nsys"]
+HUB = ["~/.cache/huggingface/hub", "/hf/hub"]
 MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
 HOT = "/b/iket_hot.py"
+STEP = "/b/iket_step.py"
 TABLE = "/b/iket_table.py"
 PROFILE = ["run-iket", "--output-dir"]
 NSYS_PROFILE = ["/opt/nsys/bin/nsys", "profile", "--trace=cuda", "--sample=none", "--cpuctxsw=none",
@@ -38,30 +42,42 @@ NSYS_PROFILE = ["/opt/nsys/bin/nsys", "profile", "--trace=cuda", "--sample=none"
 
 TESTS = ["tests/kernels/test_deepseek_v41_tilelang_iket.py"]
 PYTEST = ["{python}", "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest"]
+# The production recipe's variables that the TP1 engine reads (config/cluster.json).
+STEP_ENV = {
+    "TRANSFORMERS_OFFLINE": "1",
+    "MAX_JOBS": "8",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "VLLM_DS41_HEAD_DTYPE": "float32",
+    "VLLM_DS41_PACKED_BF16_LM_HEAD": "1",
+    "VLLM_L2_PREFETCH_KERNELS": "tilelang",
+    "VLLM_L2_PREFETCH_GRID": "2",
+    "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2",
+    "SPARK_DS41F_DSPARK_MAIN_PROJ_TP": "1",
+    "SPARK_DS41F_DSPARK_VOCAB_PARALLEL": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
+}
 
-# bundle: (ref, description, test files mounted from the ref,
-#          [(label, argv, timeout seconds)])
 BUNDLES = {
-    "hot-base": (
-        NEXT,
-        "next-candidate without the IKET mode: the hot kernels' generated sources and output bits",
-        [],
-        [("hot kernels, next-candidate", ["{python}", HOT, "off", "--out", "{out}/off"], 3600)],
+    "hot-base": dict(
+        ref=NEXT,
+        what="next-candidate without the IKET mode: the hot kernels' generated sources and output bits",
+        steps=[("hot kernels, next-candidate", ["{python}", HOT, "off", "--out", "{out}/off"], 3600)],
     ),
-    "hot": (
-        IKET,
-        "the IKET mode on the hot kernels (routed experts, sparse MLA decode, the mHC entry, "
-        "sparknet's all-reduce with simulated peers): its tests, off, on outside the profiler, "
-        "on under run-iket, and nsys durations of both builds",
-        TESTS,
-        [
+    "hot": dict(
+        ref=IKET,
+        what="the IKET mode on the hot kernels (routed experts, sparse MLA decode, the mHC entry, "
+             "sparknet's all-reduce with simulated peers): its tests, off, on outside the profiler, "
+             "on under run-iket, and nsys durations of both builds",
+        tests=TESTS,
+        steps=[
             ("IKET mode tests", [*PYTEST, "--basetemp", "{out}/pytest", *TESTS], 1800),
             ("off", ["{python}", HOT, "off", "--out", "{out}/off"], 3600),
-            ("on, outside the profiler", ["{python}", HOT, "on", "--iket", "{out}/on/iket", "--out", "{out}/on"],
-             3600),
-            ("on, under run-iket", [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
-                                    "{python}", HOT, "on", "--iket", "{out}/trace-run/iket",
-                                    "--out", "{out}/trace-run", "--iters", "3"], 5400),
+            ("on, outside the profiler",
+             ["{python}", HOT, "on", "--iket", "{out}/on/iket", "--out", "{out}/on"], 3600),
+            ("on, under run-iket",
+             [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
+              "{python}", HOT, "on", "--iket", "{out}/trace-run/iket", "--out", "{out}/trace-run",
+              "--iters", "3"], 5400),
             ("all-reduce, peers 20 us late, under run-iket",
              [*PROFILE, "{out}/trace-late", "profile", "--postprocess", "all", "--",
               "{python}", HOT, "on", "--iket", "{out}/trace-late-run/iket", "--out", "{out}/trace-late-run",
@@ -71,13 +87,22 @@ BUNDLES = {
             ("nsys, on", [*NSYS_PROFILE, "{out}/nsys-on", "{python}", HOT, "on",
                           "--iket", "{out}/nsys-on-run/iket", "--out", "{out}/nsys-on-run", "--iters", "50"],
              3600),
-            ("per-phase table", ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
-                                 "--nsys", "off={out}/nsys-off.sqlite", "on={out}/nsys-on.sqlite",
-                                 "--json", "{out}/table.json"], 600),
+            ("per-phase table",
+             ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
+              "--nsys", "off={out}/nsys-off.sqlite", "on={out}/nsys-on.sqlite", "--json", "{out}/table.json"],
+             600),
             ("per-phase table, peers 20 us late",
              ["{python}", TABLE, "{out}/trace-late", "--sources", "{out}/trace-late-run/iket/sources",
               "--json", "{out}/table-late.json"], 600),
         ],
+    ),
+    "step-off": dict(
+        ref=IKET,
+        what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
+             "production recipe's kernels and graphs) with the IKET mode off: does the engine run",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[("decode steps, off", ["{python}", STEP, "off", "--out", "{out}/off"], 5400)],
     ),
 }
 
@@ -108,6 +133,8 @@ for label, argv, timeout in json.load(open("/b/steps.json")):
 print(json.dumps({"output": OUT, "steps": codes}), flush=True)
 sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
+SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
+           "iket_table.py": HERE / "iket_table.py"}
 
 
 def git(repo, *args):
@@ -122,15 +149,16 @@ def show(repo, ref, path):
 def main():
     repo = sys.argv[1]
     only = sys.argv[sys.argv.index("--only") + 1:] if "--only" in sys.argv else []
-    for name, (ref, what, tests, steps) in BUNDLES.items():
+    for name, spec in BUNDLES.items():
         if only and name not in only:
             continue
+        ref, tests = spec["ref"], spec.get("tests", [])
         head = git(repo, "rev-parse", "--short=9", ref).strip()
         status = [line.split("\t") for line in
                   git(repo, "diff", "--no-renames", "--name-status", BASE, ref).splitlines() if line]
         package = [(kind, path) for kind, path in status if path.startswith("vllm/")]
         bundle = HERE / "bundles" / name
-        planned = {"run.py", "steps.json", "candidate.json", "iket_hot.py", "iket_table.py"}
+        planned = {"run.py", "steps.json", "candidate.json", *SCRIPTS}
         planned |= {f"overlay/{path}" for _, path in package}
         planned |= {path.replace("/", "_") for path in tests}
         # Files are overwritten in place, never deleted: a file this run would not
@@ -145,29 +173,32 @@ def main():
             target.write_bytes(MISSING.encode() if kind == "D" else show(repo, ref, path))
         for path in tests:
             (bundle / path.replace("/", "_")).write_bytes(show(repo, ref, path))
-        shutil.copy(HERE / "harness" / "iket_hot.py", bundle / "iket_hot.py")
-        shutil.copy(HERE / "iket_table.py", bundle / "iket_table.py")
+        for target, source in SCRIPTS.items():
+            shutil.copy(source, bundle / target)
         (bundle / "run.py").write_text(RUN)
-        (bundle / "steps.json").write_text(json.dumps(steps, indent=1) + "\n")
+        (bundle / "steps.json").write_text(json.dumps(spec["steps"], indent=1) + "\n")
         candidate = {
-            "description": f"{what} (vLLM {ref} {head}, {len(package)} package files over the "
+            "description": f"{spec['what']} (vLLM {ref} {head}, {len(package)} package files over the "
                            f"release's {BASE}) on candidate 6's image.",
             "image": IMAGE,
             "env": {
                 "HF_HUB_OFFLINE": "1",
                 "IKET_BUNDLE": name,
                 "TILELANG_CACHE_DIR": f"/c/tilelang-iket-{name}",
+                "TRITON_CACHE_DIR": f"/c/triton-iket-{name}",
+                "VLLM_CACHE_ROOT": f"/c/vllm-iket-{name}",
                 "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm",
+                **spec.get("env", {}),
             },
             "workdir": "vllm",
             "argv": ["/b/run.py"],
             "verdict": "status",
             "mounts": [["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
-                       ["iket_hot.py", HOT], ["iket_table.py", TABLE], NSYS,
+                       *([target, f"/b/{target}"] for target in SCRIPTS), NSYS, *spec.get("mounts", []),
                        *([path.replace("/", "_"), f"{ROOT}/{path}"] for path in tests)],
         }
         (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
-        print(f"{name}: {ref} {head}, {len(package)} package files, {len(steps)} steps")
+        print(f"{name}: {ref} {head}, {len(package)} package files, {len(spec['steps'])} steps")
 
 
 if __name__ == "__main__":
