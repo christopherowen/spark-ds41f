@@ -1,0 +1,19 @@
+{
+ "notes": "The long-copy lab arm at tp4-ring on the same build: copy_drafts max_drafts 64, its own sizing (the ladder to max_num_seqs x 6 + 59 rows, the budget 59 more). The long-prefill threshold is the release's, so its text compares with every other arm's.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-ring"
+ },
+ "set": {
+  "container": {
+   "image": "spark-ds41f:19f2c20ed4d6-copy-drafts"
+  }
+ },
+ "serve_options": {
+  "--max-num-batched-tokens": "16443",
+  "--max-cudagraph-capture-size": "155",
+  "--compilation-config": "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,155]}",
+  "--long-prefill-token-threshold": "16288",
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":4,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035,\"copy_drafts\":{\"min_match\":16,\"initial_drafts\":8,\"max_drafts\":64}}"
+ }
+}
