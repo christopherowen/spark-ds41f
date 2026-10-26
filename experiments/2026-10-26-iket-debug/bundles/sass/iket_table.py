@@ -2,9 +2,18 @@
 """A per-phase table from an IKET trace (run-iket's ``*.trace.json``).
 
 usage: iket_table.py TRACE.json|RUN_DIR [--sources DIR] [--nsys NAME=FILE.sqlite ...]
-                     [--kernels REGEX] [--json OUT.json]
+                     [--kernels REGEX] [--between MARKER_KERNEL] [--json OUT.json]
 
-Launches are grouped by kernel name, grid and block. For each group:
+Launches (those inside CUDA graph launches too) are ordered by their first warp's
+start; ``--between`` keeps the ones between the first and last launch of a marker
+kernel (iket_step.py brackets its measured request with ``iket_step_marker``).
+
+An overview comes first: kernel shapes by total span, with the phase split of their
+launches' last warps, and the waits those last warps spend most time in, summed over
+the launches. A launch ends when its last warp does, so these are the waits that
+lengthen the step.
+
+Then launches are grouped by kernel name, grid and block. For each group:
 
 - ``span``: first warp start to last warp end of a launch (median over launches),
   which is what nsys reports as the kernel's duration less its launch latency;
@@ -100,10 +109,32 @@ def launch_numbers(launch, names, locations):
     }
 
 
-def summarize(trace, kernels=None):
+def all_launches(trace):
+    """The trace's launches, those of CUDA graph launches included, by first warp start."""
+    launches = list(trace["launches"])
+    graphs = trace.get("graphLaunches") or {}
+    for value in graphs.values() if isinstance(graphs, dict) else graphs:
+        items = value if isinstance(value, list) else value.get("launches", []) if isinstance(value, dict) else []
+        launches.extend(item for item in items if isinstance(item, dict) and "kernelName" in item)
+    launches = [launch for launch in launches if launch.get("warpLifetimes")]
+    return sorted(launches, key=lambda launch: min(w["startTs"] for w in launch["warpLifetimes"]))
+
+
+def window(launches, marker):
+    """The launches strictly between the first and the last launch of ``marker``."""
+    marks = [i for i, launch in enumerate(launches) if launch["kernelName"] == marker]
+    if len(marks) < 2:
+        raise SystemExit(f"{marker}: {len(marks)} launches in the trace, need two")
+    return launches[marks[0] + 1 : marks[-1]]
+
+
+def summarize(trace, kernels=None, between=None):
     names, locations = trace["stringTable"], trace["locationTable"]
     groups = defaultdict(list)
-    for launch in trace["launches"]:
+    launches = all_launches(trace)
+    if between:
+        launches = window(launches, between)
+    for launch in launches:
         if kernels and not re.search(kernels, launch["kernelName"]):
             continue
         key = (launch["kernelName"],
@@ -136,14 +167,47 @@ def summarize(trace, kernels=None):
         last_life = sum(n["last_life"] for n in launches) / len(launches)
         phases["unattributed"] = max(0.0, life - sum(phases.values()))
         last["unattributed"] = max(0.0, last_life - sum(last.values()))
+        last_ranges = defaultdict(float)
+        for n in launches:
+            for name, us in n["last"].items():
+                last_ranges[name] += us
         out.append({
             "kernel": kernel, "grid": grid, "block": block, "launches": len(launches),
             "warps": launches[0]["warps"], "ctas": launches[0]["ctas"],
             "span_us": median([n["span"] for n in launches]), "warp_us": life,
+            "span_total_us": sum(n["span"] for n in launches),
             "ranges": ranges, "phases": dict(phases),
-            "last_warp": {"us": last_life, "phases": dict(last)},
+            "last_warp": {"us": last_life, "phases": dict(last), "ranges_total_us": dict(last_ranges)},
         })
-    return sorted(out, key=lambda g: -g["span_us"] * g["launches"])
+    return sorted(out, key=lambda g: -g["span_total_us"])
+
+
+def overview(groups, statements, top=20):
+    """Markdown: kernels by their total span, and the waits the launches' last warps spend
+    most time in (a launch ends with its last warp)."""
+    total = sum(g["span_total_us"] for g in groups)
+    lines = [f"\n## Overview: {sum(g['launches'] for g in groups)} launches of {len(groups)} kernel "
+             f"shapes, spans summing to {total:.1f} us\n",
+             "| kernel | grid | launches | span total us | share | last warp: wait | load | compute "
+             "| store | unattributed |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for g in groups[:top]:
+        last = g["last_warp"]
+        shares = [last["phases"].get(p, 0.0) / last["us"] if last["us"] else 0.0
+                  for p in ("wait", "load", "compute", "store", "unattributed")]
+        lines.append(f"| {g['kernel']} | {g['grid']} | {g['launches']} | {g['span_total_us']:.1f} | "
+                     f"{g['span_total_us'] / total:.1%} | " + " | ".join(f"{s:.0%}" for s in shares) + " |")
+    waits = []
+    for g in groups:
+        for name, us in g["last_warp"]["ranges_total_us"].items():
+            if phase_of(name) == "wait":
+                waits.append((us, g, name))
+    lines += ["\n| wait | kernel | grid | last-warp us, all launches | per launch | first statement |",
+              "|---|---|---|---:|---:|---|"]
+    for us, g, name in sorted(waits, key=lambda item: -item[0])[:top]:
+        statement = statements.get((g["kernel"], name), "")[:80].replace("|", "\\|")
+        lines.append(f"| {name} | {g['kernel']} | {g['grid']} | {us:.1f} | {us / g['launches']:.2f} | "
+                     f"`{statement}` |")
+    return lines
 
 
 def main():
@@ -152,12 +216,17 @@ def main():
     parser.add_argument("--sources")
     parser.add_argument("--nsys", nargs="*", default=[])
     parser.add_argument("--kernels")
+    parser.add_argument("--between")
     parser.add_argument("--json")
     args = parser.parse_args()
     trace = Path(args.trace)
     if trace.is_dir():  # run-iket's output directory: its largest trace
         trace = max(trace.glob("*.trace.json"), key=lambda p: p.stat().st_size)
-    groups = summarize(json.loads(trace.read_text()), args.kernels)
+    data = json.loads(trace.read_text())
+    graphs = data.get("graphLaunches")
+    print(f"trace {trace.name}: {len(data['launches'])} launches, graphLaunches "
+          f"{type(graphs).__name__} of {len(graphs or [])}")
+    groups = summarize(data, args.kernels, args.between)
     statements = sites(args.sources) if args.sources else {}
     nsys = {}
     for item in args.nsys:
@@ -167,7 +236,7 @@ def main():
         key = (g["kernel"], tuple(g["grid"]), tuple(g["block"]))
         g["nsys_us"] = {label: median(d.get(key, [])) for label, d in nsys.items()}
         g["nsys_launches"] = {label: len(d.get(key, [])) for label, d in nsys.items()}
-    lines = []
+    lines = overview(groups, statements)
     for g in groups:
         nsys_text = "".join(f", nsys {label} {us:.2f} us" for label, us in g["nsys_us"].items())
         lines.append(f"\n### {g['kernel']} grid {g['grid']} block {g['block']}\n")

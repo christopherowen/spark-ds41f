@@ -67,8 +67,9 @@ _CUDA_POSTPROC = "tilelang_callback_cuda_postproc"
 # and stalled in the next event's store to 24 us). A volatile shared load (IKET's
 # own slot) first holds the timer read until the barrier is through.
 _SETTLE = (
-    '#define TL_IKET_SETTLE() asm volatile("{\\n\\t.reg .b32 s;\\n\\t'
-    'ld.volatile.shared.u32 s, [0x20];\\n\\t}" ::: "memory")\n'
+    '#define TL_IKET_SETTLE() asm volatile("{\\n\\t.reg .b32 a, s;\\n\\t'
+    "mov.u32 a, 0x20;\\n\\t"  # ptxas takes no immediate shared address
+    'ld.volatile.shared.u32 s, [a];\\n\\t}" ::: "memory")\n'
 )
 
 # (phase, kind, patterns): the first kind a statement matches names its phase.

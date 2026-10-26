@@ -109,6 +109,29 @@ BUNDLES = {
                             "oneshot", "moe_grouped", "sparse_mla", "mhc_finalize"], 1800),
         ],
     ),
+    "step": dict(
+        ref=IKET,
+        what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
+             "production recipe's kernels and graphs): off, on outside the profiler (four CTAs a "
+             "launch record ranges), on under run-iket, and nsys durations off",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            ("decode steps, off", ["{python}", STEP, "off", "--out", "{out}/off"], 5400),
+            ("decode steps, on", ["{python}", STEP, "on", "--iket", "{out}/on/iket", "--ctas", "4",
+                                  "--out", "{out}/on"], 5400),
+            ("decode steps, on, under run-iket",
+             [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
+              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4",
+              "--out", "{out}/trace-run"], 7200),
+            ("decode steps, nsys, off", [*NSYS_PROFILE, "{out}/nsys-off", "--cuda-graph-trace=node",
+                                         "{python}", STEP, "off", "--out", "{out}/nsys-off-run"], 5400),
+            ("decode-step table",
+             ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
+              "--between", "iket_step_marker_kernel", "--nsys", "off={out}/nsys-off.sqlite",
+              "--json", "{out}/table.json"], 1800),
+        ],
+    ),
     "step-off": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "

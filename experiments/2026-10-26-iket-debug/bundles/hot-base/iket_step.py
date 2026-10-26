@@ -1,6 +1,7 @@
 """DS4.1 decode steps end to end on one GPU, for IKET traces.
 
-usage: iket_step.py off|on --out DIR [--iket DIR] [--model DIR] [--drafts N] [--tokens N]
+usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--model DIR] [--drafts N]
+                    [--tokens N]
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
@@ -76,6 +77,7 @@ def main():
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--drafts", type=int, default=5)
     parser.add_argument("--tokens", type=int, default=8)
+    parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -84,10 +86,12 @@ def main():
 
     torch.cuda.init()
     if args.mode == "on":
+        # The worker enables the mode again from these; the same arguments agree.
         os.environ["VLLM_DS41_IKET"] = args.iket
+        os.environ["VLLM_DS41_IKET_CTAS"] = str(args.ctas)
         from vllm.models.deepseek_v4_1.tilelang import iket
 
-        iket.enable(args.iket)
+        iket.enable(args.iket, args.ctas)
     marker = marker_kernel()
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
 
@@ -104,9 +108,10 @@ def main():
         block_size=256,
         max_model_len=8192,
         max_num_seqs=1,
-        max_num_batched_tokens=2048,
-        # Aligned chunks, as CED's nonfinal-row skip requires (production: 8,192).
-        long_prefill_token_threshold=2048,
+        # A small profile run keeps the startup's share of a trace small; prefill
+        # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192).
+        max_num_batched_tokens=512,
+        long_prefill_token_threshold=512,
         max_parallel_prefills=1,
         async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
@@ -155,6 +160,7 @@ def main():
         "prompt_tokens": len(measured.prompt_token_ids),
         "token_ids": list(measured.outputs[0].token_ids),
         "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
+        "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "text_overrides": TEXT_OVERRIDES,
         "drafts": args.drafts,
