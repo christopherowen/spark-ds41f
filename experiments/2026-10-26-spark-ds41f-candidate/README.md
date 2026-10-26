@@ -5,8 +5,11 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
-**Status (2026-10-26, CET):** image built on dgx4; release tests passed on dgx4 (6,417 passed,
-163 skipped, 0 failed); cluster qualification prepared, not run. The production cluster is down: it was re-cabled for the
+**Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
+(6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
+MoE output fix; its image is built and its release tests show two order-dependent test failures,
+root-caused and fixed in test files (vLLM 31312f358). The cluster qualification is prepared for
+candidate 8 ([rc8/](rc8)), not run. The production cluster is down: it was re-cabled for the
 four-node ring and the dgx4-dgx1 cable is missing.
 
 ## What it is
@@ -277,3 +280,134 @@ Promotion follows rc6's: `config/cluster.json` becomes the resolved arms, image 
 release version (`spark-ds41f:19f2c20ed4d6-MMDD`), the source manifest under `manifests/sources`,
 the comparison's first candidate arm as each shape's `benchmark_reference`, and 1025's frozen
 recipe here as the rollback.
+
+## Candidate 8 ([rc8/](rc8))
+
+Candidate 7 with one vLLM commit: `next-candidate` e846e64dc, "[MoE] A modular kernel's output
+never lives in the workspace arena" (0533). Candidate 7's records above stay as they ran; candidate
+8 supersedes it for the qualification.
+
+- **The bug** (spark-ds41f #610, "c8 found a vLLM bug"): `FusedMoEKernelModularImpl.apply`
+  returned `workspace[2]`, a view into the workspace arena, whenever the runner had prepared a
+  shared workspace. At TP1 nothing copied it before the next decoder layer's mHC entry leased its
+  scratch from the same bytes and overwrote it: NaN gate logits with three or more requests in a
+  batch, silently wrong rows below that. 1025's tree has it too. TP3 and TP4 production are not
+  exposed: every all-reduce path writes a fresh tensor.
+- **The fix:** the output is always `torch.empty_like(hidden_states)`; the experts still write it
+  directly (`output_alias`), so no copy is added.
+- **Series:** candidate 7's plus 0533 ([rc8/vllm/series](rc8/vllm/series),
+  [rc8/make_series.py](rc8/make_series.py)): patch head `52da6d93`, tree `e63ab9e9`
+  (e846e64dc's). [rc8/source.json](rc8/source.json) and [rc8/upstreams.lock.json](rc8/upstreams.lock.json)
+  are candidate 7's with the series, its digest, the head, the tree and the capability
+  `moe-output-outside-workspace`.
+- **Release-test classification:** 0533's `tests/kernels/moe/test_moe_output_outlives_workspace.py`
+  joins the gate: 160 selected, 105 gate, 0 problems.
+- **Image:** `spark-ds41f:19f2c20ed4d6-next-8`, image `sha256:225088ee6a8f`, built on dgx4 at
+  17:29-17:37 CET from deployment commit `ecbbef97` (463 s; lowest MemAvailable 79.4 GiB). Labels:
+  vLLM patch head `52da6d93`, tree `e63ab9e9`; every other tree candidate 7's. The smoke passed;
+  B12X 1.3.0 and its plugins are still in it; the image's `modular_kernel.py` has the fix.
+- **Arms and specs:** each [rc8/](rc8) arm extends candidate 7's with only the image, its vLLM
+  tree label and the lock (each renders with only the image tag changed). The specs are candidate
+  7's on those arms (run names `candidate-8-*`), and the qualification and release comparisons
+  set `startup_memory` on every arm.
+- **Outputs:** unchanged against candidate 7 at TP3 and TP4, so candidate 7's expected deltas
+  against 1025 (above) are candidate 8's. At TP1 the fix changes outputs (no more corruption).
+
+### Release tests (rc8/bundles/release-tests, dgx4, 17:40-18:07 CET)
+
+**6,416 passed, 163 skipped, 2 failed**, in 105 files and 1,496 s
+([rc8/runs/2026-10-26-dgx4/rc8-release-tests-1](rc8/runs/2026-10-26-dgx4/rc8-release-tests-1)).
+Every chunk but 5 passed; 0533's new test passed. The two failures:
+
+- `tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group`
+- `tests/v1/core/test_kv_cache_utils.py::test_unidentifiable_draft_with_mamba_warns`
+
+Both assert a warning in `caplog_vllm.text`, which was empty. Neither is a non-finite output, and
+both passed in candidate 7's run.
+
+**Root cause: a library's import resets root logging for the rest of the pytest process, and the
+release runner's chunking decides which tests come after it.** Five diagnostic runs on dgx4
+([rc8/bundles/kvlog-next8](rc8/bundles/kvlog-next8) to `kvlog5-next8`, runs in `rc8/runs`):
+
+1. Adding one gate file moved `tests/quantization/test_register_quantization_config.py` from
+   chunk 4 into chunk 5, ahead of `test_kv_cache_utils.py` in the same pytest process. The two
+   tests pass alone, after either of that file's passing tests, and fail after the whole file.
+2. The warnings are emitted (a handler on `kv_cache_utils`' own logger receives them), and the
+   `vllm` logger chain is intact; they never reach the capture handler.
+3. The culprit is `test_custom_quant`'s `dist_init` fixture: after it, the root logger and every
+   root handler, pytest's two session-long capture handlers included, are at level 40 (ERROR).
+4. A trap on `setLevel` gives the stack: `dist_init` imports `tests.utils`, which imports
+   `vllm.entrypoints.cli.serve`, the API server app and `vllm/entrypoints/serve/sagemaker/api_router.py`.
+   That imports `model_hosting_container_standards` 0.1.16 (from the vLLM base image). Its
+   `logging_config.py` runs `configure_root_logger()` on import: the root logger to
+   `SAGEMAKER_CONTAINER_LOG_LEVEL` (else `LOG_LEVEL`, else ERROR), and every root handler below
+   that raised to it.
+5. pytest reuses its capture handlers for the whole session, so every later test in that process
+   drops warnings. Which tests that hits depends only on the chunking.
+
+**Not candidate 8's: candidate 7's image fails the same way in the same order**
+([rootlog-order-next7](rc8/bundles/rootlog-order-next7): 2 failed). 0533 touches neither file.
+
+**The fix (test files only):** vLLM branch `release-tests-root-logging`, commit **31312f358** on
+e846e64dc (local, worktree `~/projects/vllm-root-logging`; `next-candidate` untouched), also as
+[rc8/fix/0534-...patch](rc8/fix/0534-Tests-each-test-restores-the-root-logger-s-level-and.patch)
+(not in rc8's series):
+- `tests/conftest.py`: an autouse fixture restores the root logger's level and its handlers'
+  levels after each test;
+- `tests/test_root_logging_isolation.py`: raises the root levels (by hand, then through the real
+  `configure_root_logger()`), and the test after each checks that `caplog` still captures a
+  warning.
+
+Validated on dgx4 with the two files mounted over the next-8 image ([rootlog-next8](rc8/bundles/rootlog-next8)):
+the regression tests pass (4), and chunk 5's ten files in the release runner's order give 624
+passed, 158 skipped, 0 failed. **The whole gate with the fix mounted**
+([release-tests-rootlog](rc8/bundles/release-tests-rootlog): 105 gate files and the regression
+test, 18:42-19:09 CET, [run](rc8/runs/2026-10-26-dgx4/rc8-rootlog-release-tests-1)): **6,422
+passed, 163 skipped, 0 failed**, every chunk at its first run. That is run 1's 6,416 passes, its
+two failures now passing, and the 4 regression tests; the skips are run 1's.
+
+The same import puts `vllm serve`'s API server at root level ERROR in production too: third-party
+warnings that propagate to the root logger are dropped (vLLM's own loggers have their own handler).
+That is 1025's behaviour as well, and a separate change.
+
+### Memory (0533)
+
+The MoE output is now one fresh BF16 tensor of `hidden_states`' shape per layer call: 5,120 x 2
+bytes, 10 KiB a row. The arena's slot for it (buffer 0 of the MoE lease, sized `M x 5120` BF16,
+since `workspace13` is empty) is still leased and now unused. So the fresh tensor adds to peak
+memory. At SP prefill the combine writes the exchange's slots (`defer_combine`), so there the
+output is allocated and never written.
+
+Measured with #610's step harness on dgx4 (one rank's shapes, six layers, dummy weights, TP1,
+vLLM's profile run at the budget; [rc8/make_peak_bundles.py](rc8/make_peak_bundles.py),
+`moe-peak2-*`), PyTorch's peak after startup:
+
+| Shape, budget | Peak allocated, next-7 → next-8 | Peak reserved, next-7 → next-8 (two runs each) |
+| --- | --- | --- |
+| TP4, 16,384 | 24.111 → 24.268 GiB (+160 MiB: 16,384 rows x 10 KiB) | 24.689, 24.689 → 25.195, 25.082 (+0.39-0.51 GiB) |
+| TP3, 8,192 | 25.380 → 25.458 GiB (+80 MiB: 8,192 x 10 KiB) | 25.604, 25.604 → 25.881, 26.133 (+0.28-0.53 GiB) |
+
+- **Allocation** grows by exactly one budget-sized output. **Reserved** memory, what costs
+  MemAvailable on GB10's shared memory, grows 0.3-0.5 GiB and varies between runs: allocator
+  fragmentation around the budget-sized tensor. A one-rank load would not show any of it: the
+  output is allocated in the forward, not while loading.
+- **Against the guards:** the 5 GiB startup guard and the 3 GiB running guard see reserved
+  memory. Candidate 7's memory cuts against 1025 (0505-0507: block-id candidates 56 KiB a token,
+  the unread buffers 10 KiB a token, the drafter's lane 837 to 13 MiB) are larger, so candidate 8
+  should still end above 1025. But dgx1's startup low varies by up to 0.76 GiB between boots, and
+  the triangle's 1M prefills have the thinnest margin.
+- **What the qualification must check:** every candidate-8 arm records `startup_memory`, so
+  each boot's lowest MemAvailable on every node comes out beside 1025's in the release comparison.
+  - Pass: every boot clears the unchanged 5 GiB startup guard.
+  - Pass: dgx1's serving memory (`mem_snapshot.py`) is no lower than 1025's in the same session.
+  - At TP3, the 1M prefills keep dgx1 at least 4.5 GiB, the fit-check rule.
+  - Record the margin and its change from 1025. The guards are not loosened.
+- **A follow-up that recovers it:** drop the dead output slot from the MoE lease when the caller
+  supplies the output. That returns `M x 10 KiB` of arena, if the MoE lease is what sizes its lane.
+
+### What it means for the candidate
+
+0533's fix is in candidate 8's image. The release-test failure is a test-harness bug that predates
+both candidates; its fix (31312f358) changes test files only, so the package files and serving
+are unchanged. If the coordinator takes 31312f358 into `next-candidate`, it becomes 0534 and a
+candidate 9 image carries its test files, as candidate 6 carried 0489-0490.

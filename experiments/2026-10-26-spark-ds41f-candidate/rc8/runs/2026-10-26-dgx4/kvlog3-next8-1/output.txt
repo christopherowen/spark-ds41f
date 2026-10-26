@@ -1,0 +1,172 @@
+=== output /c/kvlog/kvlog3-next8-20261026T172928Z
+=== alone (control)
+
+CHAIN during tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#45008 is_getLogger=True propagate=True handlers=[] -> vllm#53936 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#99312 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99312 getLogger()#99312 Logger.root#99312 manager.root#99312
+WARNING 10-26 17:29:33 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+.
+CHAIN after tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#45008 is_getLogger=True propagate=True handlers=[] -> vllm#53936 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#99312 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99312 getLogger()#99312 Logger.root#99312 manager.root#99312
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 14 warnings in 1.39s
+=== alone (control): exit 0 in 7 s
+=== after test_custom_quant
+INFO 10-26 17:29:39 [scheduler.py:409] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-26 17:29:39 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 17:29:39 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpsvv6fjdw backend=nccl
+INFO 10-26 17:29:39 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+
+CHAIN during tests/quantization/test_register_quantization_config.py::test_custom_quant[meta-llama/Llama-3.2-1B-Instruct]: vllm.v1.core.kv_cache_utils#98736 is_getLogger=True propagate=True handlers=[] -> vllm#58688 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#45952 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#45952 getLogger()#45952 Logger.root#45952 manager.root#45952
+s
+CHAIN after tests/quantization/test_register_quantization_config.py::test_custom_quant[meta-llama/Llama-3.2-1B-Instruct]: vllm.v1.core.kv_cache_utils#98736 is_getLogger=True propagate=True handlers=[] -> vllm#58688 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#45952 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#45952 getLogger()#45952 Logger.root#45952 manager.root#45952
+
+CHAIN during tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#98736 is_getLogger=True propagate=True handlers=[] -> vllm#58688 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#45952 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#45952 getLogger()#45952 Logger.root#45952 manager.root#45952
+WARNING 10-26 17:29:40 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+F
+CHAIN after tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#98736 is_getLogger=True propagate=True handlers=[] -> vllm#58688 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#45952 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#45952 getLogger()#45952 Logger.root#45952 manager.root#45952
+
+=================================== FAILURES ===================================
+________ test_mla_with_incompatible_swa_uses_one_full_allocation_group _________
+
+caplog_vllm = <_pytest.logging.LogCaptureFixture object at 0xfe3f50727590>
+
+    def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog_vllm):
+        # Sparse MLA pages cannot be padded safely. Keeping the draft's attention
+        # compute sliding-window while promoting only its allocation semantics lets
+        # every layer share the target's block table and remain contiguous.
+        draft = new_sliding_window_spec(block_size=16)
+        specs = {
+            "target.0.attn": new_mla_spec(block_size=64),
+            "target.0.indexer": new_indexer_mla_spec(block_size=64),
+            "draft.0": draft,
+        }
+    
+        groups = get_kv_cache_groups(_grouping_config(), specs)
+        assert len(groups) == 1
+        assert set(groups[0].layer_names) == set(specs)
+        group_spec = groups[0].kv_cache_spec
+        assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+        assert group_spec.block_size == 64
+        promoted_draft = group_spec.kv_cache_specs["draft.0"]
+        assert isinstance(promoted_draft, FullAttentionSpec)
+        assert not isinstance(promoted_draft, SlidingWindowSpec)
+        assert promoted_draft.block_size == 64
+        assert promoted_draft.sliding_window == draft.sliding_window
+        assert specs["draft.0"] is draft
+>       assert "attention compute is unchanged" in caplog_vllm.text
+E       AssertionError: assert 'attention compute is unchanged' in ''
+E        +  where '' = <_pytest.logging.LogCaptureFixture object at 0xfe3f50727590>.text
+
+tests/v1/core/test_kv_cache_utils.py:4347: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group
+SKIPPED [1] tests/quantization/test_register_quantization_config.py:174: needs Hugging Face meta-llama/Llama-3.2-1B-Instruct (offline)
+1 failed, 1 skipped, 14 warnings in 2.27s
+=== after test_custom_quant: exit 1 in 7 s
+=== after dist_init alone
+INFO 10-26 17:29:46 [scheduler.py:409] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-26 17:29:46 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 17:29:46 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp6y8vt0hj backend=nccl
+INFO 10-26 17:29:46 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+
+CHAIN during tests/test_logprobe.py::test_only_dist_init: vllm.v1.core.kv_cache_utils#84192 is_getLogger=True propagate=True handlers=[] -> vllm#92432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#30400 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#30400 getLogger()#30400 Logger.root#30400 manager.root#30400
+.
+CHAIN after tests/test_logprobe.py::test_only_dist_init: vllm.v1.core.kv_cache_utils#84192 is_getLogger=True propagate=True handlers=[] -> vllm#92432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#30400 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#30400 getLogger()#30400 Logger.root#30400 manager.root#30400
+
+CHAIN during tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#84192 is_getLogger=True propagate=True handlers=[] -> vllm#92432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#30400 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#30400 getLogger()#30400 Logger.root#30400 manager.root#30400
+WARNING 10-26 17:29:47 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+F
+CHAIN after tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#84192 is_getLogger=True propagate=True handlers=[] -> vllm#92432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#30400 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#30400 getLogger()#30400 Logger.root#30400 manager.root#30400
+
+=================================== FAILURES ===================================
+________ test_mla_with_incompatible_swa_uses_one_full_allocation_group _________
+
+caplog_vllm = <_pytest.logging.LogCaptureFixture object at 0xee28bc7d59a0>
+
+    def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog_vllm):
+        # Sparse MLA pages cannot be padded safely. Keeping the draft's attention
+        # compute sliding-window while promoting only its allocation semantics lets
+        # every layer share the target's block table and remain contiguous.
+        draft = new_sliding_window_spec(block_size=16)
+        specs = {
+            "target.0.attn": new_mla_spec(block_size=64),
+            "target.0.indexer": new_indexer_mla_spec(block_size=64),
+            "draft.0": draft,
+        }
+    
+        groups = get_kv_cache_groups(_grouping_config(), specs)
+        assert len(groups) == 1
+        assert set(groups[0].layer_names) == set(specs)
+        group_spec = groups[0].kv_cache_spec
+        assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+        assert group_spec.block_size == 64
+        promoted_draft = group_spec.kv_cache_specs["draft.0"]
+        assert isinstance(promoted_draft, FullAttentionSpec)
+        assert not isinstance(promoted_draft, SlidingWindowSpec)
+        assert promoted_draft.block_size == 64
+        assert promoted_draft.sliding_window == draft.sliding_window
+        assert specs["draft.0"] is draft
+>       assert "attention compute is unchanged" in caplog_vllm.text
+E       AssertionError: assert 'attention compute is unchanged' in ''
+E        +  where '' = <_pytest.logging.LogCaptureFixture object at 0xee28bc7d59a0>.text
+
+tests/v1/core/test_kv_cache_utils.py:4347: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group
+1 failed, 1 passed, 14 warnings in 1.86s
+=== after dist_init alone: exit 1 in 7 s
+=== after workspace_init alone
+
+CHAIN during tests/test_logprobe.py::test_only_workspace_init: vllm.v1.core.kv_cache_utils#1408 is_getLogger=True propagate=True handlers=[] -> vllm#12432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#99264 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99264 getLogger()#99264 Logger.root#99264 manager.root#99264
+.
+CHAIN after tests/test_logprobe.py::test_only_workspace_init: vllm.v1.core.kv_cache_utils#1408 is_getLogger=True propagate=True handlers=[] -> vllm#12432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#99264 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99264 getLogger()#99264 Logger.root#99264 manager.root#99264
+
+CHAIN during tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#1408 is_getLogger=True propagate=True handlers=[] -> vllm#12432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#99264 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99264 getLogger()#99264 Logger.root#99264 manager.root#99264
+WARNING 10-26 17:29:53 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+.
+CHAIN after tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#1408 is_getLogger=True propagate=True handlers=[] -> vllm#12432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#99264 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#99264 getLogger()#99264 Logger.root#99264 manager.root#99264
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 14 warnings in 1.08s
+=== after workspace_init alone: exit 0 in 6 s
+=== after the offline model load alone
+
+CHAIN during tests/test_logprobe.py::test_only_model_load: vllm.v1.core.kv_cache_utils#39456 is_getLogger=True propagate=True handlers=[] -> vllm#66432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#87968 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#87968 getLogger()#87968 Logger.root#87968 manager.root#87968
+.
+CHAIN after tests/test_logprobe.py::test_only_model_load: vllm.v1.core.kv_cache_utils#39456 is_getLogger=True propagate=True handlers=[] -> vllm#66432 is_getLogger=True propagate=False handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] -> root#87968 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#87968 getLogger()#87968 Logger.root#87968 manager.root#87968
+
+CHAIN during tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#39456 is_getLogger=True propagate=True handlers=[] -> vllm#66432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#87968 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#87968 getLogger()#87968 Logger.root#87968 manager.root#87968
+WARNING 10-26 17:29:59 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+.
+CHAIN after tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group: vllm.v1.core.kv_cache_utils#39456 is_getLogger=True propagate=True handlers=[] -> vllm#66432 is_getLogger=True propagate=True handlers=['StreamHandler', '_LiveLoggingNullHandler', '_FileHandler'] -> root#87968 is_getLogger=True propagate=True handlers=['_LiveLoggingNullHandler', '_FileHandler', 'LogCaptureHandler', 'LogCaptureHandler'] | logging.root#87968 getLogger()#87968 Logger.root#87968 manager.root#87968
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 14 warnings in 1.13s
+=== after the offline model load alone: exit 0 in 6 s
+{"output": "/c/kvlog/kvlog3-next8-20261026T172928Z", "steps": [["alone (control)", 0], ["after test_custom_quant", 1], ["after dist_init alone", 1], ["after workspace_init alone", 0], ["after the offline model load alone", 0]]}

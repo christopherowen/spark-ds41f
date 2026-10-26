@@ -1,0 +1,96 @@
+=== output /c/kvlog/kvlog5-next8-20261026T173347Z
+=== after dist_init alone, with the level trap
+
+TRAP root logger setLevel -> ERROR:
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/common/transforms/base_api_transform.py", line 9, in <module>
+    from ...logging_config import logger
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/logging_config.py", line 89, in <module>
+    configure_root_logger()
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/logging_config.py", line 50, in configure_root_logger
+    _safe_set_level(root, level)
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/logging_config.py", line 37, in _safe_set_level
+    logger.setLevel(level)
+
+
+TRAP root handler _LiveLoggingNullHandler setLevel -> 40:
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/common/__init__.py", line 3, in <module>
+    from .transforms.base_api_transform import BaseApiTransform, BaseTransformRequestOutput
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/common/transforms/base_api_transform.py", line 9, in <module>
+    from ...logging_config import logger
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/logging_config.py", line 89, in <module>
+    configure_root_logger()
+  File "/usr/local/lib/python3.12/dist-packages/model_hosting_container_standards/logging_config.py", line 55, in configure_root_logger
+    handler.setLevel(resolved)
+
+INFO 10-26 17:33:53 [scheduler.py:409] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-26 17:33:53 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 17:33:53 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp7lpud0k9 backend=nccl
+INFO 10-26 17:33:53 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+.
+TRAP after tests/test_logprobe.py::test_only_dist_init: root level 40, handler levels [40, 40, 40, 40]
+WARNING 10-26 17:33:53 [kv_cache_utils.py:2203] KV cache page sizes cannot be unified; treating sliding-window layers as full attention for cache allocation. Sliding-window attention compute is unchanged.
+F
+=================================== FAILURES ===================================
+________ test_mla_with_incompatible_swa_uses_one_full_allocation_group _________
+
+caplog_vllm = <_pytest.logging.LogCaptureFixture object at 0xe170ce1d6900>
+
+    def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog_vllm):
+        # Sparse MLA pages cannot be padded safely. Keeping the draft's attention
+        # compute sliding-window while promoting only its allocation semantics lets
+        # every layer share the target's block table and remain contiguous.
+        draft = new_sliding_window_spec(block_size=16)
+        specs = {
+            "target.0.attn": new_mla_spec(block_size=64),
+            "target.0.indexer": new_indexer_mla_spec(block_size=64),
+            "draft.0": draft,
+        }
+    
+        groups = get_kv_cache_groups(_grouping_config(), specs)
+        assert len(groups) == 1
+        assert set(groups[0].layer_names) == set(specs)
+        group_spec = groups[0].kv_cache_spec
+        assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+        assert group_spec.block_size == 64
+        promoted_draft = group_spec.kv_cache_specs["draft.0"]
+        assert isinstance(promoted_draft, FullAttentionSpec)
+        assert not isinstance(promoted_draft, SlidingWindowSpec)
+        assert promoted_draft.block_size == 64
+        assert promoted_draft.sliding_window == draft.sliding_window
+        assert specs["draft.0"] is draft
+>       assert "attention compute is unchanged" in caplog_vllm.text
+E       AssertionError: assert 'attention compute is unchanged' in ''
+E        +  where '' = <_pytest.logging.LogCaptureFixture object at 0xe170ce1d6900>.text
+
+tests/v1/core/test_kv_cache_utils.py:4347: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_kv_cache_utils.py::test_mla_with_incompatible_swa_uses_one_full_allocation_group
+1 failed, 1 passed, 14 warnings in 2.80s
+=== after dist_init alone, with the level trap: exit 1 in 8 s
+{"output": "/c/kvlog/kvlog5-next8-20261026T173347Z", "steps": [["after dist_init alone, with the level trap", 1]]}

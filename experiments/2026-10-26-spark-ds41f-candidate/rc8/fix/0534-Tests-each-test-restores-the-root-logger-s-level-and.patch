@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:37:02 +0100
+Subject: [PATCH 534/534] Tests: each test restores the root logger's level and
+ its handlers' levels
+
+model_hosting_container_standards sets the root logger, and raises every
+root handler below it, to SAGEMAKER_CONTAINER_LOG_LEVEL (ERROR by default)
+when it is first imported. The SageMaker routes import it, so whichever test
+first pulls them in (dist_init's distributed setup does) leaves the process's
+root logging at ERROR. pytest reuses its capture handlers for the whole
+session, so every later caplog dropped warnings: two caplog_vllm tests of
+test_kv_cache_utils.py failed once a chunk ran them after
+tests/quantization/test_register_quantization_config.py's test_custom_quant.
+
+An autouse fixture now restores the root logger's level and its handlers'
+levels after each test. Package files are unchanged.
+---
+ tests/conftest.py                    | 22 ++++++++++++
+ tests/test_root_logging_isolation.py | 51 ++++++++++++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+ create mode 100644 tests/test_root_logging_isolation.py
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5fd594a04..9e92080cc 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -306,6 +306,28 @@ def dynamo_reset():
+     torch._dynamo.reset()
+ 
+ 
++@pytest.fixture(autouse=True)
++def restore_root_logging_levels():
++    """Undo a test's changes to the root logger's level and its handlers' levels.
++
++    Some libraries reconfigure root logging when they are first imported:
++    model_hosting_container_standards (imported with the SageMaker routes) sets
++    the root logger, and raises every root handler below it, to
++    SAGEMAKER_CONTAINER_LOG_LEVEL, ERROR by default. pytest reuses its capture
++    handlers for the whole session, so without this every later test's caplog
++    drops warnings.
++    """
++    import logging
++
++    root = logging.getLogger()
++    level = root.level
++    handler_levels = [(handler, handler.level) for handler in root.handlers]
++    yield
++    root.setLevel(level)
++    for handler, handler_level in handler_levels:
++        handler.setLevel(handler_level)
++
++
+ @pytest.fixture
+ def example_prompts() -> list[str]:
+     return [prompt for filename in _TEST_PROMPTS for prompt in _read_prompts(filename)]
+diff --git a/tests/test_root_logging_isolation.py b/tests/test_root_logging_isolation.py
+new file mode 100644
+index 000000000..72aa20b95
+--- /dev/null
++++ b/tests/test_root_logging_isolation.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A test that raises the root logger's handlers leaves the next test's log capture
++working (tests/conftest.py's restore_root_logging_levels).
++
++model_hosting_container_standards sets the root logger and its handlers to ERROR when
++it is first imported, during whichever test imports the SageMaker routes first. pytest
++reuses its capture handlers for the session, so later tests' caplog dropped warnings
++(the next release's release tests: two caplog_vllm tests of test_kv_cache_utils.py
++after tests/quantization/test_register_quantization_config.py's dist_init). The tests
++run in file order: each "raises" test changes the levels, the test after it captures.
++"""
++
++import logging
++
++import pytest
++
++LOGGER = "tests.test_root_logging_isolation"
++
++
++def test_a_test_raises_the_root_logging_levels():
++    root = logging.getLogger()
++    root.setLevel(logging.ERROR)
++    for handler in root.handlers:
++        handler.setLevel(logging.ERROR)
++
++
++def test_the_next_test_captures_warnings(caplog):
++    root = logging.getLogger()
++    assert root.level < logging.ERROR
++    assert all(handler.level < logging.ERROR for handler in root.handlers)
++    logging.getLogger(LOGGER).warning("captured after raised root levels")
++    assert "captured after raised root levels" in caplog.text
++
++
++def test_the_sagemaker_standards_raise_the_root_logging_levels(monkeypatch):
++    logging_config = pytest.importorskip(
++        "model_hosting_container_standards.logging_config"
++    )
++    monkeypatch.delenv("SAGEMAKER_CONTAINER_LOG_LEVEL", raising=False)
++    monkeypatch.delenv("LOG_LEVEL", raising=False)
++    # What its import does: the root logger and every handler below it go to ERROR.
++    logging_config.configure_root_logger()
++    root = logging.getLogger()
++    assert root.level == logging.ERROR
++    assert all(handler.level >= logging.ERROR for handler in root.handlers)
++
++
++def test_the_next_test_captures_warnings_again(caplog):
++    logging.getLogger(LOGGER).warning("captured after the sagemaker standards")
++    assert "captured after the sagemaker standards" in caplog.text
