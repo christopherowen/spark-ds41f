@@ -658,6 +658,25 @@ What the numbers are:
 - **Shapes.** One GPU runs six layers and the drafter with one rank's shapes. The
   vocabulary head and the embedding stay whole: a rank's are a TP-th of them, so the
   head's share of a step is TP times too large.
+- **The recipe's environment and sizing** (`RECIPE_ENV`, `RECIPE_SIZING` in
+  `make_bundles.py`):
+  - breakable CUDA graphs off, so torch.compile on, as the recipe serves;
+  - late admission at layer 4 of 6 (the recipe's 30 of 40);
+  - 32 device connections;
+  - for the timed (nsys) run, 16 (TP4) or 8 (TP3) streams, a 1,048,576-token context
+    and prefix caching.
+
+  The IKET run keeps an 8K context and as many streams as requests. At 1M, the
+  warmup and capture launch the indexer's top-k with up to a million warps.
+  run-iket reserves a record for every warp: 37.6M warps and a 17.2 GB pool. Its
+  exit decode then ran the node out of memory (run 45). So the indexer kernels' phase
+  splits come from 8K-context launches.
+
+  Left out:
+  - the multi-rank settings;
+  - TP3's display carve-out (a whole head does not fit);
+  - the batched-token budget, kept small so a run-iket pool stays small. It shapes
+    the profile run and prefill chunks, not a decode step.
 - **Dummy weights.** Routing, and how many drafts the target accepts, are not real.
 - **Under run-iket,** kernels run slower (GEMMs +26-40%, tiny kernels about 3x) and so
   does the host. Read shares and in-kernel phases from IKET, and take absolute times

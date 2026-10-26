@@ -24,6 +24,7 @@ import argparse
 import json
 import sqlite3
 from collections import defaultdict
+from pathlib import Path
 
 
 def window(rows, marker):
@@ -117,7 +118,10 @@ def main():
     for key in ("busy_us", "kernel_us"):
         grid[key] /= args.grid_runs
     grid["steps"] = args.grid_runs
-    split = phases(args.table) if args.table else {}
+    # Without the IKET run's table (it failed), the nsys steps still diff, without phases.
+    split = phases(args.table) if args.table and Path(args.table).exists() else {}
+    if args.table and not split:
+        print(f"no phase split: {args.table} is missing", flush=True)
     names = set(request["kernels"]) | set(grid["kernels"])
     empty = {"launches": 0, "us": 0.0, "exposed_us": 0.0}
     diff = sorted(((request["kernels"].get(n, empty), grid["kernels"].get(n, empty), n) for n in names),

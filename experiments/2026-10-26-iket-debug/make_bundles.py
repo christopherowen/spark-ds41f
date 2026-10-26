@@ -98,16 +98,21 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
     nsys of off with the graphs, the records against the dry run's count, the timeline
     and tables of the measured requests, and their decode steps against the grid's."""
     shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens),
-             "--grid", str(grid), *RECIPE_SIZING.get(tp, []), "--max-model-len", "1048576",
-             "--kv-bytes", str(6 << 30), "--prefix-caching"]
+             "--grid", str(grid)]
+    # The timed run (nsys, off) takes the recipe's sizing. The IKET run keeps an 8K context:
+    # at 1M the warmup and capture launch the indexer's top-k with up to a million warps,
+    # run-iket's pool reserves a record for every warp (37.6M warps, 17.2 GB), and its exit
+    # decode ran the node out of memory (run 45).
+    sizing = [*RECIPE_SIZING.get(tp, []), "--max-model-len", "1048576", "--kv-bytes", str(6 << 30),
+              "--prefix-caching"]
     return dict(
         ref=ref,
         what=f"DS4.1 decode steps timed by kernel and phase: TP{tp} rank shapes at TP1 (six layers "
-             f"and the drafter, dummy weights, the production recipe's kernels, graphs, "
-             f"environment and sizing), c{requests}, {tokens} tokens a request, then {grid} "
-             f"engine-grid steps at that shape; on under run-iket ({ctas} CTAs a launch, {iters} "
-             f"iteration(s) a loop), nsys of off with the graphs, the timeline and tables, and a "
-             f"decode step against the grid's",
+             f"and the drafter, dummy weights, the production recipe's kernels, graphs and "
+             f"environment), c{requests}, {tokens} tokens a request, then {grid} engine-grid "
+             f"steps at that shape; on under run-iket ({ctas} CTAs a launch, {iters} iteration(s) "
+             f"a loop, an 8K context), nsys of off with the graphs and the recipe's sizing, the "
+             f"timeline and tables, and a decode step against the grid's",
         env=RECIPE_ENV,
         mounts=[HUB],
         steps=[
@@ -123,7 +128,7 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
               "--tracker", "{out}/dry/tracker"], 1800),
             ("decode steps, nsys, off, graphs",
              [*NSYS_PROFILE, "{out}/nsys-graphs", "--cuda-graph-trace=node", "{python}", STEP, "off",
-              *shape, "--out", "{out}/nsys-graphs-run"], 5400),
+              *shape, *sizing, "--out", "{out}/nsys-graphs-run"], 5400),
             # prepare_pos_seq_lens_kernel is the first of the kernels an engine step
             # launches once (run 29); a step that prepares prefill inputs is a prefill step.
             ("timeline and tables",
