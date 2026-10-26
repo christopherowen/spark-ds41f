@@ -72,6 +72,14 @@ PROMPTS = [
 ]
 
 
+def capture_ladder(max_size):
+    """The recipe's CUDA-graph capture sizes up to ``max_size`` (scripts/recipe.py
+    ``capture_sizes``): 1-4, 6, 8, every 4th to 32, then every 8th, ending at
+    ``max_size``."""
+    ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, max_size + 1, 8)]
+    return [*(size for size in ladder if size < max_size), max_size]
+
+
 def shrink(config, overrides):
     """The six-layer config with ``overrides``, for the target and (a callable override
     reaches it too) the DSpark drafter."""
@@ -251,6 +259,10 @@ def main():
     parser.add_argument("--kv-bytes", type=int, default=2 << 30, help="kv_cache_memory_bytes")
     parser.add_argument("--prefix-caching", action="store_true",
                         help="enable_prefix_caching, as the recipe serves")
+    parser.add_argument("--capture-ladder", action="store_true",
+                        help="the recipe's CUDA-graph capture sizes (scripts/recipe.py "
+                             "capture_sizes: 1-4, 6, 8, every 4th to 32, every 8th to the "
+                             "streams' rows) instead of the measured batches' alone")
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
@@ -329,8 +341,12 @@ def main():
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
             # One, two and the measured batch's requests' verification rows (1 + drafts
-            # each): fewer warmup launches, each of which reserves IKET records.
-            "cudagraph_capture_sizes": sorted({n * (args.drafts + 1) for n in (1, 2, args.requests)}),
+            # each): fewer warmup launches, each of which reserves IKET records. Or the
+            # recipe's ladder, whose graphs the drafter's dummy step picks from too.
+            "cudagraph_capture_sizes": (
+                capture_ladder((args.max_num_seqs or max(2, args.requests)) * (args.drafts + 1))
+                if args.capture_ladder
+                else sorted({n * (args.drafts + 1) for n in (1, 2, args.requests)})),
         },
         generation_config="vllm",
         hf_overrides=functools.partial(shrink, overrides=overrides),
@@ -398,6 +414,7 @@ def main():
         "max_model_len": args.max_model_len,
         "kv_bytes": args.kv_bytes,
         "prefix_caching": args.prefix_caching,
+        "capture_ladder": args.capture_ladder,
         # The recipe's environment that shapes a step (the bundle sets it).
         "environment": {name: os.environ.get(name) for name in (
             "VLLM_USE_BREAKABLE_CUDAGRAPH", "VLLM_LATE_ADMISSION_LAYER", "CUDA_DEVICE_MAX_CONNECTIONS",
