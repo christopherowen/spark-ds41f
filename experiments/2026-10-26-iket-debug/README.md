@@ -407,26 +407,46 @@ a kernel runs alone on the GPU, so on the step's critical path):
   in what this harness leaves out: Engram, the collectives with real peers, and the
   request's real context.
 
-**c8 does not run yet: the dummy engine makes NaNs with three or more requests**
-(`c8-nan` bundle, runs 33-37; summaries in `runs/c8-nan-*`):
-- **Where it shows:** `route_partials` asserts that its gate logits contain NaN or Inf.
-  At c8 that happens at boot, in vLLM's sampler warmup (`_warmup_kernels`, eight 7-row
-  requests). At c3 and c4 it happens in the requests.
-- **Not my choices:**
-  - It is the same without IKET.
-  - It is the same with the whole model's shapes (TP1).
-  - It is the same with the uint8 dummy weights filled with 0x77 instead of zeroed.
-  - c1 and c2 run.
-- **The first non-finite tensor** (eager, a hook on every module) is the input of layer
-  1's `attn.fused_wqa_wkv`: NaN in 36, then 31, of the c3 prefill's 104 rows, scattered
-  over all three prompts. Layer 0's module outputs are finite.
-- **So** something between layer 0's output and layer 1's attention, in functional mHC
-  or norm code that the hooks do not see, reads memory that was never written when a
-  batch holds three or more requests. The rows change from run to run.
-- **Open:** whether production's real weights hide the same read is not known.
-
-Root-causing it is a follow-up. The c8 bundles (`step-tp4-c8`, `step-tp3-c8`) are ready
-for when it is fixed.
+**c8 found a vLLM bug: at TP1 the routed experts' output lived in the workspace arena**
+(runs 33-41; summaries in `runs/c8-nan-*` and `runs/nan-*`):
+- **The symptom:** `route_partials` asserts that its gate logits contain NaN or Inf.
+  - At c8 it fires at boot, in vLLM's sampler warmup (eight 7-row requests).
+  - At c3 and c4 it fires in the requests.
+  - It happens without IKET, at the whole model's shapes, and with other dummy weights.
+- **Trees:**
+  - next-candidate c579b3fe1 fails (`nan-next`).
+  - 1025's runtime tree fails the same way (26382f5cf, `nan-1025`; 0489-0490 change
+    only tests). It predates both, so there is nothing to bisect.
+- **The cause:**
+  - `FusedMoEKernelModularImpl.apply` (`fused_moe/modular_kernel.py`) returned
+    `output = workspace[2]` whenever it was handed a workspace.
+  - The MoE runner hands it one when the shared expert needs scratch
+    (`prepare_workspace`), so the layer's output was a view into the workspace arena.
+  - With the shared expert folded into the TileLang combine, the output is BF16, so
+    nothing casts it. At TP1 no all-reduce copies it either.
+  - The next decoder layer's mHC entry (`TileKernelsMHC.pre`) leases its scratch from
+    offset 0 of the same arena (`get_simultaneous`). It overwrote the routed output
+    while its CTAs were still reading it.
+- **The evidence:**
+  - Eager, with a hook on every module and on each layer's functional `mhc.pre`: layer
+    1's `mhc.pre` turns its `previous_output` (layer 0's MoE output) non-finite.
+  - That tensor lies in workspace lane 0 at c1 too (run 40), where it is silently wrong
+    rather than NaN. At three or more requests the corruption reaches NaN, on rows that
+    vary from run to run.
+- **Production:** TP4 and TP3 are not exposed. The routed output goes through the TP
+  all-reduce, whose paths all write a fresh tensor (sparknet's one-shot and
+  hierarchical, the two-shot, the rank-order path), and the drafter runs at the
+  target's TP. TP1 engines are exposed: single-GPU tests and harnesses like this one.
+- **The fix** is vLLM branch `moe-output-fresh` e846e64dc, over next-candidate
+  c579b3fe1.
+  - The output is always a fresh tensor. The experts still write it directly
+    (`output_alias`), so no copy is added.
+  - Its test, `tests/kernels/moe/test_moe_output_outlives_workspace.py`, fails on
+    c579b3fe1 and passes with the fix.
+  - With the fix, c1 shows no alias, and c3 (eager and graphs) and c8 run (`nan-fix`,
+    run 41).
+- **Reproduction:** bundle `nan-next` (`harness/iket_step.py off --tp-shape 4
+  --requests 3 --eager --nan-hooks`), about 2 minutes.
 
 ## Tracing a multi-rank serving step later (not run)
 
