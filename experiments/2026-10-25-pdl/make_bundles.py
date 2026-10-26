@@ -6,7 +6,8 @@ usage: make_bundles.py [VLLM_REPO] [IMAGE_TREE] [BASE] [HEAD] [NAME=REF...]
 
 Each NAME=REF is a variant of the PDL build (a fix candidate on HEAD): its package
 files over BASE, those that differ from HEAD's written to overlay-NAME/. With variants,
-bundles/pdl-fix and bundles/pdl-fix-trace time and trace every build side by side.
+bundles/pdl-fix, bundles/pdl-fix-focus (fifteen rounds at six row counts) and
+bundles/pdl-fix-trace time and trace every build side by side.
 
 IMAGE_TREE is the tree image -next-6 carries (candidate 6's, 26382f5cf); BASE is the
 build PDL is measured against (next-candidate); HEAD is the PDL branch on it. Every file
@@ -366,6 +367,9 @@ def main() -> None:
              "side stream, ten rounds rotating", ["/b/pdl_chain_ab.py", "10", "/b/pdl_rows.py", "--modes", "aux"]),
             ("pdl-fix-trace", "The 16- and 48-row chains under the torch profiler, two rounds rotating",
              ["/b/pdl_chain_ab.py", "2", "/b/pdl_trace.py", "--rows", "16,48"]),
+            ("pdl-fix-focus", "The decode layer's chain at 2, 3, 6, 16, 48 and 96 rows, the shared expert on its "
+             "side stream, fifteen rounds rotating",
+             ["/b/pdl_chain_ab.py", "15", "/b/pdl_rows.py", "--rows", "2,3,6,16,48,96", "--modes", "aux"]),
         ):  # fmt: skip
             script = argv[2].removeprefix("/b/")
             fixed = bundle(

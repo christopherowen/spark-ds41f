@@ -573,6 +573,40 @@ unchained like the other input-preparation kernels.
        The regression should vanish if this is the cause.
      - The serving screen's c8 and c16 rows measure it on real routes.
 
+### 48 rows: the shared expert pushed behind the routed down GEMM (2026-10-26, CET)
+
+Owner via the orchestrator: a reproducible 0.4% at 48 rows is a bug to root-cause. The checks,
+all on dgx4 with kernel-local, next-candidate's build (base) against `pdl-next`, each round a
+fresh process per build:
+
+9. **Every engine-grid row count, with the shared expert beside the routed experts and
+   inline** ([bundles/pdl-rows](bundles/pdl-rows), [pdl_rows.py](pdl_rows.py), 70cbefec, five
+   rounds; [runs/rows-70cbefec.txt](runs/rows-70cbefec.txt)). The grid's decode rows are
+   requests x (1 + depth): 2, 3, 6, 8, 12, 16, 24, 32, 48, 72 and 96. PDL is 0.1-1.7% faster
+   at 2-12 rows and within +-0.4% from 16 rows up, in both modes alike. At 48 rows it is
+   -0.03% (side stream) and -0.00% (inline). A round's difference at the larger row counts is
+   nearly the same in both modes (72 rows, round 5: -45.9 and -46.9 us), so the spread is set
+   per process: each process lays out its expert weights anew, and the larger chains stream
+   them.
+10. **Fifteen rounds where PDL was level or slower** ([bundles/pdl-rows-focus](bundles/pdl-rows-focus),
+    ce9021c3; [runs/rows-focus-ce9021c3.txt](runs/rows-focus-ce9021c3.txt)), base - PDL a
+    round, mean +- standard error: 6 rows +1.08% +- 0.20, 16 rows +0.32% +- 0.09, 32 rows
+    +0.10% +- 0.06, **48 rows -0.17% +- 0.08** (PDL slower in 9 of 15), 72 rows -0.01% +- 0.07.
+    The 0.4% was the three-round runs' spread; a residual of about 7 us a layer stayed at 48
+    rows alone.
+11. **Kernel by kernel** ([bundles/pdl-trace](bundles/pdl-trace), [pdl_trace.py](pdl_trace.py),
+    cc007707; [runs/trace-cc007707.txt](runs/trace-cc007707.txt);
+    [trace_compare.py](trace_compare.py)): the 16- and 48-row chains replayed under the torch
+    profiler.
+    - In the base build the shared expert's SwiGLU, cast and down GEMM run on the aux stream
+      in the SM slots the routed gate/up GEMM's last CTAs free. Its down GEMM ends 537 us
+      (16 rows) and 1208 us (48 rows) before the routed down GEMM.
+    - With PDL the routed SwiGLU's CTAs launch early into those slots and wait there, and the
+      routed down GEMM's grid-wide CTAs, launched early in turn, hold every SM. The shared
+      down GEMM (15-17 us) then starts only when the routed one drains: it ends 14-16 us after
+      it in every traced layer, on the critical path, about what PDL saved in the rest of the
+      layer.
+
 The cluster checks stay queued as [screen.json](screen.json) and [profile.json](profile.json).
 
 ## Interactions with the other sessions
