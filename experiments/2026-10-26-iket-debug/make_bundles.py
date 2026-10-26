@@ -58,19 +58,22 @@ STEP_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
 }
 
-def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)"):
+def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)", grid=8):
     """A bundle timing DS4.1 decode steps, kernel by kernel and phase by phase: iket_step.py
     at TP1 with one rank's shapes at ``tp``, ``requests`` concurrent requests of ``tokens``
-    tokens, on under run-iket (``ctas`` CTAs a launch and ``iters`` iterations a loop
-    record ranges), then nsys of off with the graphs, the records against the dry run's
-    count, and the timeline and tables of the measured requests."""
-    shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens)]
+    tokens, then ``grid`` runs of the engine grid's dummy step at their shape; on under
+    run-iket (``ctas`` CTAs a launch and ``iters`` iterations a loop record ranges), then
+    nsys of off with the graphs, the records against the dry run's count, the timeline
+    and tables of the measured requests, and their decode steps against the grid's."""
+    shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens),
+             "--grid", str(grid)]
     return dict(
         ref=ref,
         what=f"DS4.1 decode steps timed by kernel and phase: TP{tp} rank shapes at TP1 (six layers "
              f"and the drafter, dummy weights, the production recipe's kernels and graphs), "
-             f"c{requests}, {tokens} tokens a request; on under run-iket ({ctas} CTAs a launch, "
-             f"{iters} iteration(s) a loop), nsys of off with the graphs, the timeline and tables",
+             f"c{requests}, {tokens} tokens a request, then {grid} engine-grid steps at that shape; "
+             f"on under run-iket ({ctas} CTAs a launch, {iters} iteration(s) a loop), nsys of off "
+             f"with the graphs, the timeline and tables, and a decode step against the grid's",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
@@ -95,6 +98,9 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
               "--nsys", "graphs={out}/nsys-graphs.sqlite", "--json", "{out}/table.json"], 1800),
             ("nsys timeline", ["{python}", "/b/nsys_window.py", "{out}/nsys-graphs.sqlite",
                                "--gap-us", "200"], 600),
+            ("decode steps against the grid's step",
+             ["{python}", "/b/step_diff.py", "{out}/nsys-graphs.sqlite", "--grid-runs", str(grid + 1),
+              "--table", "{out}/table.json", "--json", "{out}/step-diff.json"], 600),
         ],
     )
 
@@ -402,7 +408,8 @@ sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
            "sass_check.py": HERE / "harness" / "sass_check.py",
            "trace_counts.py": HERE / "harness" / "trace_counts.py", "iket_table.py": HERE / "iket_table.py",
-           "nsys_window.py": HERE / "nsys_window.py", "iket_profile.py": HERE / "harness" / "iket_profile.py"}
+           "nsys_window.py": HERE / "nsys_window.py", "iket_profile.py": HERE / "harness" / "iket_profile.py",
+           "step_diff.py": HERE / "step_diff.py"}
 
 
 def git(repo, *args):

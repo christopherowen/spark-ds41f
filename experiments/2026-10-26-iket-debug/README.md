@@ -432,6 +432,63 @@ What a serving trace on the cluster would take:
    buffer: the exit dump then crashes in `iket::to_json(WarpBuffer)`. ptxas predicates
    short guarded blocks freely, so a guard on an event only saves slots if the event
    cannot be predicated: the IKET mode's zero-or-one loops.
+6. **run-iket sizes records from one process's dry run** (NVIDIA's tool). It reads
+   `recommended_max_ts_cnt_per_warp` from the first `pid_*` directory it lists and
+   stops (`iket.cli.run_iket`). The step harness starts two children that load CUDA and
+   launch nothing (count 0). When one lists first, every warp gets a 16-byte header and
+   no slots, and the exit dump crashes (run 28 on dgx3: a 0.46 GB pool against 10.3 GB
+   needed). `harness/iket_profile.py` runs the dry run alone and passes the largest
+   count over its processes to the measured run.
+7. **run-iket's perfetto and html postprocesses do not scale either** (NVIDIA's tool).
+   They build the whole trace in memory: for a decode-step run's 2.6 GB of decoded
+   records they took more than 100 GB (run 29). The json postprocess only copies
+   `iket.decoded_results.json`, so the step bundles postprocess nothing and read that
+   file.
+
+## Timing a decode step with your own vLLM branch
+
+`step_bundle.py` writes a kernel-local bundle that times DS4.1 decode steps by kernel
+and phase, from any vLLM ref that carries the IKET mode.
+1. Cherry-pick vLLM branch `iket-debug`'s commits onto your branch. The mode is
+   `vllm/models/deepseek_v4_1/tilelang/iket.py`, its variables in `vllm/envs.py`, the
+   hook in `vllm/v1/worker/gpu_worker.py` and a test.
+2. Write the bundle, here for one TP4 (ring) rank at c1:
+
+   ```sh
+   python3 experiments/2026-10-26-iket-debug/step_bundle.py ~/projects/<your-vllm> <ref> <bundle-dir> \
+     --tp 4 --requests 1
+   ```
+
+   `--tp 3` gives a triangle rank's shapes, and `--requests 8` is c8.
+3. On your test node, from a spark-ds41f checkout that has this folder:
+
+   ```sh
+   python3 scripts/lab.py kernel-local <bundle-dir> --out <out>
+   ```
+
+4. Read `<out>/output.txt`, in this order:
+   - the timeline;
+   - the engine steps (split at each `prepare_pos_seq_lens_kernel`; the step that
+     prepares prefill inputs is the prefill);
+   - the overview over the decode steps: each kernel shape's launches and span a step,
+     its share, and its last warp's phase split;
+   - the waits the launches' last warps spend most time in;
+   - each kernel's phase and range tables.
+
+   The numbers are in `table.json`, under the node's compile cache
+   (`~/.cache/spark-lab/compile/iket/<bundle>-<stamp>/`).
+
+What the numbers are:
+- **Shapes.** One GPU runs six layers and the drafter with one rank's shapes. The
+  vocabulary head and the embedding stay whole: a rank's are a TP-th of them, so the
+  head's share of a step is TP times too large.
+- **Dummy weights.** Routing, and how many drafts the target accepts, are not real.
+- **Under run-iket,** kernels run slower (GEMMs +26-40%, tiny kernels about 3x) and so
+  does the host. Read shares and in-kernel phases from IKET, and take absolute times
+  from the nsys timeline of the same steps without IKET (the bundle's last step).
+- **Sampling.** Four CTAs a launch record ranges, and loops record their middle
+  iteration. A loop range with literal bounds is scaled to the whole loop and marked
+  "est."; other loop ranges hold their one iteration.
 
 ## Reading a trace
 

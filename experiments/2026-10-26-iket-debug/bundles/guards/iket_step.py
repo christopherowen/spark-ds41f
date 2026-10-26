@@ -1,12 +1,14 @@
 """DS4.1 decode steps end to end on one GPU, for IKET traces.
 
 usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--skip REGEX]
-                    [--tp-shape 1|3|4] [--requests N] [--tokens N] [--drafts N]
+                    [--tp-shape 1|3|4] [--requests N] [--tokens N] [--drafts N] [--grid N]
                     [--eager] [--filled] [--batched N] [--chunk N] [--model DIR]
                     [--overrides JSON]
 
 ``--tp-shape`` gives the layers one rank's shapes at TP4 (the ring) or TP3 (the
-triangle); ``--requests`` is the measured batch (c1, c8).
+triangle); ``--requests`` is the measured batch (c1, c8); ``--grid N`` follows the
+request with the engine grid's dummy step at its shape (servebench engine), between
+``iket_grid_marker`` launches, for step_diff.py.
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
@@ -100,7 +102,9 @@ def same_dummy_weights():
     weight_utils.initialize_single_dummy_weight = initialize
 
 
-def marker_kernel():
+def marker_kernels():
+    """Two one-thread kernels whose launches bracket the measured request
+    (``iket_step_marker``) and the engine grid's steps (``iket_grid_marker``)."""
     import tilelang
     import tilelang.language as T
 
@@ -109,7 +113,13 @@ def marker_kernel():
         with T.Kernel(1, threads=32):
             A[0] = A[0] + 1
 
-    return tilelang.compile(iket_step_marker, target="cuda")
+    @T.prim_func
+    def iket_grid_marker(A: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=32):
+            A[0] = A[0] + 2
+
+    return (tilelang.compile(iket_step_marker, target="cuda"),
+            tilelang.compile(iket_grid_marker, target="cuda"))
 
 
 def main():
@@ -122,6 +132,10 @@ def main():
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--requests", type=int, default=1,
                         help="concurrent requests in the measured batch (c1, c8)")
+    parser.add_argument("--grid", type=int, default=0,
+                        help="after the request, the engine grid's dummy step (servebench engine) "
+                             "at its requests, verification rows and context: one warm-up and this "
+                             "many timed runs, between iket_grid_marker launches")
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     parser.add_argument("--skip", default="", help="VLLM_DS41_IKET_SKIP")
@@ -159,7 +173,7 @@ def main():
         from vllm.models.deepseek_v4_1.tilelang import iket
 
         iket.enable(args.iket, args.ctas, args.iters, args.skip)
-    marker = marker_kernel()
+    marker, grid_marker = marker_kernels()
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     from vllm import LLM, SamplingParams
@@ -232,6 +246,24 @@ def main():
     timings.append(time.monotonic() - started)
     marker(count)
     torch.cuda.synchronize()
+    grid = None
+    if args.grid:
+        # The grid's dummy step does the same work on every build, with no text,
+        # acceptance or scheduling: diffed kernel by kernel against the request's decode
+        # steps (step_diff.py), it says what serving adds. Its context is the request's
+        # midpoint.
+        context = len(measured.prompt_token_ids) + args.tokens // 2
+        spec = {"shapes": [{"num_reqs": args.requests, "context_len": context,
+                            "num_tokens": args.requests * (args.drafts + 1)}],
+                "replays": args.grid, "warmup": 1, "settle": 0}
+        grid_marker(count)
+        torch.cuda.synchronize()
+        reply = llm.collective_rpc("engine_grid", args=(json.dumps(spec),))[0]["shapes"][0]
+        torch.cuda.synchronize()
+        grid_marker(count)
+        torch.cuda.synchronize()
+        grid = {"spec": spec, "runs": 1 + args.grid,
+                **{key: reply[key] for key in ("step_ms", "forward_ms", "drafter_ms")}}
 
     from vllm import envs
 
@@ -255,6 +287,7 @@ def main():
         "filled": args.filled,
         "eager": args.eager,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
+        "grid": grid,
         "tp_shape": args.tp_shape,
         "text_overrides": overrides,
         "drafts": args.drafts,
