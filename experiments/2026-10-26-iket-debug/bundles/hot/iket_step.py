@@ -105,6 +105,7 @@ def main():
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
+    parser.add_argument("--skip", default="", help="VLLM_DS41_IKET_SKIP")
     parser.add_argument("--batched", type=int, default=512, help="max_num_batched_tokens")
     parser.add_argument("--chunk", type=int, default=256, help="long_prefill_token_threshold")
     parser.add_argument("--filled", action="store_true",
@@ -127,9 +128,10 @@ def main():
         os.environ["VLLM_DS41_IKET"] = args.iket
         os.environ["VLLM_DS41_IKET_CTAS"] = str(args.ctas)
         os.environ["VLLM_DS41_IKET_ITERS"] = str(args.iters)
+        os.environ["VLLM_DS41_IKET_SKIP"] = args.skip
         from vllm.models.deepseek_v4_1.tilelang import iket
 
-        iket.enable(args.iket, args.ctas, args.iters)
+        iket.enable(args.iket, args.ctas, args.iters, args.skip)
     marker = marker_kernel()
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
 
@@ -212,6 +214,7 @@ def main():
         "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
         "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
         "VLLM_DS41_IKET_ITERS": envs.VLLM_DS41_IKET_ITERS,
+        "VLLM_DS41_IKET_SKIP": envs.VLLM_DS41_IKET_SKIP,
         "filled": args.filled,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "text_overrides": TEXT_OVERRIDES,

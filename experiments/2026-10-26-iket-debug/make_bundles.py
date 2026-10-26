@@ -121,16 +121,40 @@ BUNDLES = {
             # instrumented launch gets the run's largest warp record (5,016 timestamps
             # unsampled: 898 GB). Sampled CTAs and iterations bound that record, and the
             # pool it sizes from the dry run.
+            # The vision tower and the top-k/top-p sampler are not in a greedy text decode
+            # step; left uninstrumented, their warps reserve no records.
             ("decode steps, on, under run-iket",
-             [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
+             [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
               "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "2",
-              "--out", "{out}/trace-run"], 7200),
+              "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
+            ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
+                                       "{out}/trace-run/iket/sources"], 1800),
             ("decode steps, nsys, off", [*NSYS_PROFILE, "{out}/nsys-off", "--cuda-graph-trace=node",
                                          "{python}", STEP, "off", "--out", "{out}/nsys-off-run"], 5400),
             ("decode-step table",
              ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
               "--between", "iket_step_marker_kernel", "--nsys", "off={out}/nsys-off.sqlite",
               "--json", "{out}/table.json"], 1800),
+        ],
+    ),
+    "hot-sampled": dict(
+        ref=IKET,
+        what="what sizes run-iket's buffer: the hot kernels under run-iket unsampled and with "
+             "four CTAs a launch and two iterations a loop, the tracker kept; its per-warp "
+             "maximum against the traces' and the static bounds",
+        steps=[
+            ("unsampled, under run-iket",
+             [*PROFILE, "{out}/full", "profile", "--keep", "--postprocess", "json", "--",
+              "{python}", HOT, "on", "--iket", "{out}/full-run/iket", "--out", "{out}/full-run",
+              "--iters", "3"], 3600),
+            ("sampled, under run-iket",
+             [*PROFILE, "{out}/sampled", "profile", "--keep", "--postprocess", "json", "--",
+              "{python}", HOT, "on", "--iket", "{out}/sampled-run/iket", "--out", "{out}/sampled-run",
+              "--iters", "3", "--sample-ctas", "4", "--sample-iters", "2"], 3600),
+            ("unsampled counts", ["{python}", "/b/trace_counts.py", "{out}/full",
+                                  "{out}/full-run/iket/sources"], 1800),
+            ("sampled counts", ["{python}", "/b/trace_counts.py", "{out}/sampled",
+                                "{out}/sampled-run/iket/sources"], 1800),
         ],
     ),
     "tests": dict(
@@ -226,7 +250,8 @@ print(json.dumps({"output": OUT, "steps": codes}), flush=True)
 sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
 SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
-           "sass_check.py": HERE / "harness" / "sass_check.py", "iket_table.py": HERE / "iket_table.py"}
+           "sass_check.py": HERE / "harness" / "sass_check.py",
+           "trace_counts.py": HERE / "harness" / "trace_counts.py", "iket_table.py": HERE / "iket_table.py"}
 
 
 def git(repo, *args):

@@ -309,6 +309,8 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--delay-us", type=float, default=0.0)
     parser.add_argument("--only", nargs="*", default=["moe", "mla", "mhc", "allreduce"])
+    parser.add_argument("--sample-ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
+    parser.add_argument("--sample-iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     args = parser.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -316,7 +318,7 @@ def main():
     if args.mode == "on":
         from vllm.models.deepseek_v4_1.tilelang import iket
 
-        iket.enable(args.iket)
+        iket.enable(args.iket, args.sample_ctas, args.sample_iters)
     from vllm.models.deepseek_v4_1.tilelang import prepare
 
     builders = {"moe": moe_case, "mla": mla_case, "mhc": mhc_case}

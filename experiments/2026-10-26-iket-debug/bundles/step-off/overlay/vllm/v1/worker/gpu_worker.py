@@ -432,7 +432,10 @@ class Worker(WorkerBase):
             from vllm.models.deepseek_v4_1.tilelang import iket
 
             iket.enable(
-                envs.VLLM_DS41_IKET, envs.VLLM_DS41_IKET_CTAS, envs.VLLM_DS41_IKET_ITERS
+                envs.VLLM_DS41_IKET,
+                envs.VLLM_DS41_IKET_CTAS,
+                envs.VLLM_DS41_IKET_ITERS,
+                envs.VLLM_DS41_IKET_SKIP,
             )
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
