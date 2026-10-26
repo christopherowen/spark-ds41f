@@ -620,4 +620,27 @@ into 1dad52cc1; the series' other commits are unchanged and renumbered. The mHC 
 pass stands for the new head: only the compressor test file differs, and that bundle
 does not run it.
 
-### Run 9: the next attention bundle (vLLM kernel-audit-next 83be1f379): queued
+### Run 9: the next attention bundle, 00:45-00:47 CET (branch 4413ed45, vLLM 83be1f379): PASSED
+
+Output `~/spark-lab/agents/kernel-audit/out/audit-next-attention-9/` on dgx4; bundle
+exit 0.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 0 | 173 passed, 1 skipped (compute-sanitizer is not on the image), 1 xfailed |
+| attention layer tests | 0 | 5 passed |
+| compressor tests | 0 | 5 passed |
+| live-page benchmark | 0 | Gate held |
+| one-launch builder benchmark | 0 | Gate held |
+
+With run 8's mHC bundle (96 mHC and 76 model-forward tests), both kernel bundles pass at
+`kernel-audit-next` 83be1f379, which next-candidate can fast-forward to.
+
+### Inclusion (2026-10-26)
+
+The coordinator put the audit's seven commits on vLLM `next-candidate` as 412777ce1,
+c36f686d4, 8c6c5fe14, 18f7760c9, cf7120d64, 967a508b2 and 16c1b8cae, on top of
+e20c47020. It did not take 47185fe76: the conditionals session had found the same
+chunk-reference bug, and its fix, e20c47020, was already on the branch. The two fixes
+differ only in a docstring and one comment, so `next-candidate` 16c1b8cae has the same
+tree as 83be1f379 apart from those lines.
