@@ -12,6 +12,87 @@
   - the memory cuts (levers 2-4): layer 20's candidates as block ids, the drafter's workspace lane
     without the target's indexer scratch, the two unread buffers.
 
+## On next-candidate (2026-10-26, about 01:00 CET)
+
+Owner direction, through the coordinator: build a new candidate from next-candidate, and push
+each lever once if it can improve first.
+- **vLLM branch:** `tp3-levers-next` (local, not pushed), on next-candidate 4209a1903. The four
+  levers are individual commits, in order:
+  1. 0504 e836c5e71: 64-row MoE tiles for prefill calls;
+  2. 0505 9895b5ea7: the two unread buffers dropped;
+  3. 0506 bbfa2b3ac: the drafter's workspace lane;
+  4. 0507 e0e89bb13: layer 20's candidates as block ids.
+- **Patches:** [vllm-next-candidate/](vllm-next-candidate) (`git format-patch`). They replay onto
+  4209a1903 to the branch's tree.
+- **Overlaps resolved:**
+  - **0504 and the mHC cast (a7ba079c7):** the routed experts take the `MXFP8Rows` the cast
+    produces, and the benchmark casts once for both plans.
+  - **0507 and the B12X retirement (0493):** `CANDIDATE_WIDTH` goes with B12X's indexer, and the
+    staging is sized by `CANDIDATE_BLOCKS`.
+  - **0507 and 0503:** 0503 makes the indexer read no key past a row's visible positions; see
+    the push below.
+
+**The one push.** 0507 is the only lever that changed.
+- **The problem:** past a row's count, the last block's ids point past the row's end. On
+  next-candidate the score kernel must not read those keys.
+- **Every position is a written one now:**
+  - a masked block reads block 0, which is whole in any row of more than one block;
+  - past the count, a candidate takes offset 0. That is the last kept block's first position,
+    or position 0 past the kept blocks, just as a position list's `-1` reads position 0.
+- **Only the tile holding the count needs the bound.** The kernel chooses once a tile, so the
+  tiles wholly below the count compute positions without it.
+- **Timings** (dgx4, re-index call against next-candidate's position lists):
+
+  | Form of the bound | Block ids vs positions (µs) | Record |
+  | --- | --- | --- |
+  | every load predicated on the count | 257.3 vs 247.1 (+4.1%, interval +7.9 to +10.9) | [runs/next-levers-predicated.json](runs/next-levers-predicated.json) |
+  | every offset sent to position 0 through `if_then_else` | 262.9 vs 247.1 (+6.4%, interval +13.5 to +17.3) | [runs/next-levers-position0.json](runs/next-levers-position0.json) |
+  | every offset selected (`T.Select`) | 260.4 vs 250.0 (+4.2%, interval spans 0) | [runs/next-levers-select.json](runs/next-levers-select.json) |
+  | **the count's tile only, chosen once a tile** | **238.6 vs 246.3 (−3.1%, interval −27.6 to +14.3)** | [runs/next-levers.json](runs/next-levers.json) |
+
+- **The other levers:**
+  - **0504:** no change. The 2,048-token threshold is where the average expert fills a 32-row
+    tile, and 128-row tiles exceed shared memory and registers. Its benchmark got a closure
+    lint fix and ruff formatting.
+  - **0505 and 0506:** no change.
+
+**dgx4 runs** (`kernel-local`):
+- **Setup:**
+  - image `-next-6`, with next-candidate's tree mounted and its deleted modules failing import;
+  - dgx4's compute-sanitizer mounted, so the read-bound test (`test_indexer_reads_only_visible_rows`)
+    runs instead of skipping;
+  - bundles `bundles/next-candidate` and `bundles/next-levers`.
+- **next-candidate itself** ([runs/next-candidate.json](runs/next-candidate.json)): 203
+  passed, 1 xfailed over every test file the levers touch, the initcheck included. The
+  release's 12 failures pass there, so nothing is deselected.
+- **The levers** ([runs/next-levers.json](runs/next-levers.json)):
+  - **Tests:** 228 passed, 1 xfailed.
+  - **The prefill-tiles gate:** bits identical. Routed MoE −12.2% at TP3's 8,192 (23.62 →
+    20.74 ms), −16.9% at 12,288 and −15.4% at TP4's 16,384 (32.73 → 27.69 ms).
+  - **The candidate-ids gate:** bit-identical and not slower (above).
+  - **The lane check.**
+  - **The positive control** ([initcheck_control.py](initcheck_control.py)): the indexer without
+    the count's bound reports thousands of unwritten reads under initcheck.
+- **The FAIL in kernel-local's own output:** its `exit` verdict reads the last output line as a
+  pytest summary, and these bundles end with a check. run.py's exit status (0, recorded as
+  `exit`) is the verdict.
+- **Not run per commit:** the GPU checks ran on the branch head, not on each commit's own tree.
+
+**With the kernel audit:**
+- **The conflict:** `kernel-audit-next` (39fcba699) conflicts with this branch only in
+  `test_deepseek_v41_tilelang.py`, where both sides append.
+- **More than keeping both:** the audit's `test_indexer_reads_only_live_pages[candidates=True]`
+  passes position lists to the re-index plan, which takes block ids after 0507. Whichever lands
+  second rebuilds that case in block ids, as `deepseek_v41_indexer_reads.py` does.
+
+**Needs the cluster:**
+- [tp3-memory-cuts.json](tp3-memory-cuts.json) and
+  [tp3-memory-cuts-gate.json](tp3-memory-cuts-gate.json) measure the cuts over candidate 6.
+- For the new candidate, the same questions are answered by its own triangle qualification:
+  - its start-up low against the 5 GiB guard;
+  - its determinism gate;
+  - the prefill suite for 0504's gain.
+
 ## Built and tested for next week (2026-10-25 evening, CET)
 
 Owner direction: "queue up the tests that TP=3 recommends". Nothing else open covered these
@@ -546,10 +627,15 @@ is kept here, ready, in case candidate 6's own cost per budget token is wanted l
 - [bundles/moe-rows](bundles/moe-rows): the first dgx4 kernel bundle and its record.
 - [make_bundles.py](make_bundles.py): writes the levers' bundles (`bundles/<lever>`) and their
   serving arms (`<lever>-tp3.json`, `<lever>-tp4.json`) from the vLLM branches. It writes in
-  place and stops on stale files; it never deletes.
+  place and stops on stale files; it never deletes. `bundles/next-candidate` and
+  `bundles/next-levers` are next-candidate and `tp3-levers-next`, with no serving arms.
+- [initcheck_control.py](initcheck_control.py): the read-bound test's positive control in
+  candidate mode.
 - [lane_check.py](lane_check.py): each attention layer role's workspace reservation (lever 3's
   bound).
 - [record_run.py](record_run.py): a kernel-lab output directory as a run record.
 - [runs/](runs): the dgx4 run records.
 - [vllm/](vllm): patches 0504-0507 (`git format-patch` of the four local branches, each on
   the release's 26382f5cf).
+- [vllm-next-candidate/](vllm-next-candidate): the same four on next-candidate 4209a1903, as
+  `tp3-levers-next` holds them.

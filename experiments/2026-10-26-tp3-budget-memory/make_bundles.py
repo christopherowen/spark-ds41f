@@ -12,6 +12,14 @@ benchmarks as mounts, and the release's copy of a module its benchmark compares 
 (``baseline_*``). <change>-tp3.json and <change>-tp4.json are serving arms: candidate
 6's arm on the triangle and on the ring (rc6/rc-tp3.json, rc6/rc-tp4.json) with the
 same package files mounted.
+
+``next-candidate`` and ``next-levers`` are vLLM next-candidate (NEXT) and the four levers
+on it as individual commits (tp3-levers-next). They run over the same image, whose tree is
+still BASE's: every package file the ref changes from BASE is mounted, and a package module
+it deletes is mounted as one that fails to import (as
+experiments/2026-10-25-retire-conditionals/make_review_bundle.py does). Their benchmarks
+compare against NEXT's modules. They have no serving arms: candidate 6's recipe still
+selects the kernel family that next-candidate removes.
 """
 import json
 import shutil
@@ -29,6 +37,15 @@ BASE_ARMS = {
     "tp4": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json",
 }
 FIXTURES = HERE.parent / "2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
+NEXT = "4209a1903"
+ON_NEXT = ("next-candidate", "next-levers")
+MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.
+raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
+'''
+# The image has no compute-sanitizer; the next bundles mount dgx4's, so
+# test_indexer_reads_only_visible_rows runs instead of skipping.
+SANITIZER = "/usr/local/cuda-13.0/compute-sanitizer"
+SANITIZER_MOUNT = "/opt/compute-sanitizer"
 
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
           "-p", "prepare_fixtures"]
@@ -38,6 +55,13 @@ MODEL_TESTS = [
     "tests/models/test_deepseek_v4_1_ced_model.py",
     "tests/models/test_deepseek_v4_1_sp_prefill.py",
     "tests/models/test_deepseek_v4_dspark_context_kv.py",
+]
+# Every test file the levers' bundles run.
+LEVER_TESTS = [
+    "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
+    "tests/v1/worker/test_workspace.py",
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+    *MODEL_TESTS,
 ]
 
 # Tests that fail on the release's own tree (bundles/release, runs/release.json: hand-built
@@ -117,11 +141,36 @@ CHANGES = {
         "the failures that predate them",
         [],
         [("the levers' test files on the release", PYTEST + [
-            "--basetemp", "/c/pytest-tp3-levers-release",
-            "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
-            "tests/v1/worker/test_workspace.py",
-            "tests/kernels/attention/test_deepseek_v41_tilelang.py", *MODEL_TESTS], 5400)],
+            "--basetemp", "/c/pytest-tp3-levers-release", *LEVER_TESTS], 5400)],
         [],
+    ),
+    "next-candidate": (
+        NEXT,
+        "next-candidate's own tree: every test file the levers' bundles run, for the "
+        "failures that predate them there",
+        [],
+        [("the levers' test files on next-candidate", PYTEST + [
+            "--basetemp", "/c/pytest-tp3-levers-next-candidate", *LEVER_TESTS], 7200)],
+        [],
+    ),
+    "next-levers": (
+        "tp3-levers-next",
+        "the four levers on next-candidate, 0504-0507 as individual commits",
+        ["vllm/models/deepseek_v4_1/tilelang/moe.py",
+         "vllm/models/deepseek_v4_1/tilelang/indexer.py"],
+        [("the levers' test files", PYTEST + [
+            "--basetemp", "/c/pytest-tp3-levers-next-levers", *LEVER_TESTS], 7200),
+         ("prefill tiles benchmark", [
+             "benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py",
+             "--baseline", "/b/baseline/moe.py", "--gate"], 5400),
+         ("candidate ids against next-candidate's positions", [
+             "benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py",
+             "--baseline", "/b/baseline/indexer.py", "--gate"], 5400),
+         ("lane reservations by layer role", ["/b/lane_check.py"], 1800),
+         ("initcheck positive control: candidates without their count bound", [
+             "/b/initcheck_control.py", f"{SANITIZER_MOUNT}/compute-sanitizer", ROOT],
+          3600)],
+        ["lane_check.py", "initcheck_control.py"],
     ),
     "memory-cuts": (
         "memory-cuts",
@@ -180,13 +229,21 @@ def main() -> None:
     for name, (ref, what, baselines, steps, extras) in CHANGES.items():
         if only and name not in only:
             continue
-        if name != "release":
+        # next-candidate's tree passes the release's failing tests (bundles/next-candidate).
+        if name not in ("release", *ON_NEXT):
             steps = [without_release_failures(step) for step in steps]
         head = git(repo, "rev-parse", "--short=9", ref).strip()
-        status = [line for line in git(repo, "diff", "--name-status", BASE, ref).split("\n")
+        status = [line.split("\t") for line in
+                  git(repo, "diff", "--no-renames", "--name-status", BASE, ref).split("\n")
                   if line]
-        assert all(line.split("\t")[0] in ("A", "M") for line in status), status
-        changed = [line.split("\t")[-1] for line in status]
+        allowed = ("A", "M", "D") if name in ON_NEXT else ("A", "M")
+        assert all(kind in allowed for kind, _ in status), status
+        # A deleted package module is mounted as one that fails to import; a deleted test
+        # or benchmark is not run.
+        deleted = {path for kind, path in status if kind == "D"}
+        changed = [path for kind, path in status
+                   if kind != "D" or path.startswith("vllm/")]
+        parent = NEXT if name in ON_NEXT else BASE
         bundle = HERE / "bundles" / name
         # Files are overwritten in place, never deleted: a file this run would not write
         # (a path the branch no longer changes) stops it, for a person to remove.
@@ -210,10 +267,10 @@ def main() -> None:
                 target = bundle / path.replace("/", "_")
                 mounts.append([target.name, f"{ROOT}/{path}"])
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(show(repo, ref, path))
+            target.write_bytes(MISSING.encode() if path in deleted else show(repo, ref, path))
         for path in baselines:
             target = bundle / f"baseline_{Path(path).name}"
-            target.write_bytes(show(repo, BASE, path))
+            target.write_bytes(show(repo, parent, path))
             mounts.append([target.name, f"/b/baseline/{Path(path).name}"])
         for extra in extras:
             shutil.copy(HERE / extra, bundle / extra)
@@ -221,18 +278,25 @@ def main() -> None:
         shutil.copy(FIXTURES, bundle / "prepare_fixtures.py")
         (bundle / "run.py").write_text(RUN)
         (bundle / "steps.json").write_text(json.dumps(steps, indent=1) + "\n")
+        env = {
+            "HF_HUB_OFFLINE": "1",
+            "TILELANG_CACHE_DIR": f"/c/tilelang-tp3-levers-{name}",
+            "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+            "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+        }
+        if name in ON_NEXT:
+            # next-candidate has no kernel-family switch and imports no B12X package.
+            del env["VLLM_DS41_KERNEL_BACKEND"]
+            env["PYTHONPATH"] = "/b:/opt/spark-ds41f/candidate/vllm"
+            env["COMPUTE_SANITIZER"] = f"{SANITIZER_MOUNT}/compute-sanitizer"
+            mounts.append([SANITIZER, SANITIZER_MOUNT])
         candidate = {
             "description": (
                 f"{what} (vLLM {ref} {head}, {len(changed)} files over the "
                 f"release's {BASE}) on candidate 6's image: GPU tests, then the gated "
                 "benchmark or check."),
             "image": IMAGE,
-            "env": {
-                "HF_HUB_OFFLINE": "1",
-                "TILELANG_CACHE_DIR": f"/c/tilelang-tp3-levers-{name}",
-                "VLLM_DS41_KERNEL_BACKEND": "tilelang",
-                "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
-            },
+            "env": env,
             "workdir": "vllm",
             "argv": ["/b/run.py"],
             "verdict": "exit",
@@ -243,7 +307,7 @@ def main() -> None:
         arm_mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]]
         arm_mounts += [[f"{experiment}/bundles/{name}/overlay/{path}", f"{ROOT}/{path}", "ro"]
                        for path in package]
-        for shape, base in BASE_ARMS.items() if package else ():
+        for shape, base in BASE_ARMS.items() if package and name not in ON_NEXT else ():
             arm = {
                 "notes": (f"Candidate 6 ({shape}) with {what}: the package files of vLLM "
                           f"{ref} {head} mounted over the image "
