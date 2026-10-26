@@ -99,6 +99,9 @@ def main():
     parser.add_argument("--drafts", type=int, default=5)
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
+    parser.add_argument("--filled", action="store_true",
+                        help="fill uninitialized tensors (torch's deterministic mode), for "
+                             "token comparisons between processes; adds fill kernels")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -106,6 +109,11 @@ def main():
     import torch
 
     torch.cuda.init()
+    if args.filled:
+        # Not every tensor the TP1 dummy engine reads is written first: without this,
+        # two off runs give different tokens.
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
     if args.mode == "on":
         # The worker enables the mode again from these; the same arguments agree.
         os.environ["VLLM_DS41_IKET"] = args.iket
@@ -139,6 +147,8 @@ def main():
         max_parallel_prefills=1,
         async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
+        # The startup check wants this share free; run-iket's pool takes some.
+        gpu_memory_utilization=0.8,
         enable_prefix_caching=False,
         attention_backend="TILELANG",
         linear_backend="tilelang",
@@ -187,6 +197,7 @@ def main():
         "token_ids": list(measured.outputs[0].token_ids),
         "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
         "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
+        "filled": args.filled,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "text_overrides": TEXT_OVERRIDES,
         "drafts": args.drafts,

@@ -112,14 +112,11 @@ BUNDLES = {
     "step": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
-             "production recipe's kernels and graphs): off, on outside the profiler (four CTAs a "
-             "launch record ranges), on under run-iket, and nsys durations off",
+             "production recipe's kernels and graphs): on under run-iket (four CTAs a launch "
+             "record ranges), nsys durations off, and the decode-step table",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
-            ("decode steps, off", ["{python}", STEP, "off", "--out", "{out}/off"], 5400),
-            ("decode steps, on", ["{python}", STEP, "on", "--iket", "{out}/on/iket", "--ctas", "4",
-                                  "--out", "{out}/on"], 5400),
             # run-iket sizes its pool as if every launch of the run were in flight at
             # once (898 GB here: 16,894 launches, 5,016 timestamps a warp); the pool
             # is reused as launches finish, so a fixed one holds the step's.
@@ -157,6 +154,27 @@ BUNDLES = {
                                                 "shutil.copytree(src, sys.argv[1], ignore=shutil.ignore_patterns("
                                                 "'__pycache__', '*.so', 'perfetto_trace_pb2.py'))",
                                                 "{out}/iket-profiler"], 300)],
+    ),
+    "step-bits": dict(
+        ref=IKET,
+        what="decode steps end to end at TP1 with uninitialized tensors filled: off twice and on "
+             "(four CTAs a launch), and whether their tokens agree",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            ("decode steps, off, filled", ["{python}", STEP, "off", "--filled", "--out", "{out}/off"], 5400),
+            ("decode steps, off again, filled",
+             ["{python}", STEP, "off", "--filled", "--out", "{out}/off-again"], 5400),
+            ("decode steps, on, filled", ["{python}", STEP, "on", "--filled", "--iket", "{out}/on/iket",
+                                          "--ctas", "4", "--out", "{out}/on"], 5400),
+            ("tokens agree", ["{python}", "-c",
+                              "import json, sys; t = [json.load(open(p))['token_ids'] for p in sys.argv[1:]]; "
+                              "print(json.dumps({'off': t[0], 'off_again': t[1], 'on': t[2], "
+                              "'off_repeats': t[0] == t[1], 'on_equals_off': t[2] == t[0]})); "
+                              "sys.exit(0 if t[0] == t[1] == t[2] else 1)",
+                              "{out}/off/result.json", "{out}/off-again/result.json", "{out}/on/result.json"],
+             60),
+        ],
     ),
     "step-off": dict(
         ref=IKET,
