@@ -20,6 +20,8 @@ does (as retire-conditionals' bundles do), so nothing in the image reaches it.
   build in alternation (pdl_chain_ab.py), bits compared;
 - bundles/pdl-mechanism: the synthetic PDL benchmark and the traced layer
   (layer-c1.json, from critical_path.py --layer-sequence);
+- bundles/pdl-rows: the same A/B over pdl_rows.py, every row count the engine grid
+  judges with the shared expert beside the routed experts and inline;
 - bundles/pdl-sources: sources_cpu.py, every chain kernel lowered at its decode shapes
   without device compilation and checked as the plugin checks launched kernels;
 - pdl-tp4.json, pdl-tp4-dev.json (PDL) and base-tp4.json, base-tp4-dev.json (BASE):
@@ -256,14 +258,33 @@ def main() -> None:
         [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"]],
         "status",
     )
-    candidate = json.loads((chain / "candidate.json").read_text())
-    candidate["mounts"] += (
+    both_builds = (
         [[source(f, "base"), f"/b/base/{f}"] for f in base_package]
         + [[source(f), f"/b/pdl/{f}"] for f in pdl_package]
         + into_tree(pdl_extra)
     )
+    candidate = json.loads((chain / "candidate.json").read_text())
+    candidate["mounts"] += both_builds
     write_json(chain / "candidate.json", candidate)
     shutil.copyfile(HERE / "pdl_chain_ab.py", chain / "pdl_chain_ab.py")
+
+    # The chain at every row count the engine grid judges, with the shared expert beside
+    # the routed experts and inline.
+    by_rows = bundle(
+        "pdl-rows",
+        f"The decode layer's chain at the engine grid's rows (2-96), the shared expert on its side stream and "
+        f"inline, on next-candidate's build (vLLM {base} {base_commit}) and on vLLM {head} {commit}, five rounds "
+        "alternating (pdl_chain_ab.py running pdl_rows.py): time per layer warm and L2-cold, and every written "
+        "buffer's bits compared.",
+        ["/b/pdl_chain_ab.py", "5", "/b/pdl_rows.py"],
+        [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"], ["pdl_rows.py", "/b/pdl_rows.py"]],
+        "status",
+    )
+    candidate = json.loads((by_rows / "candidate.json").read_text())
+    candidate["mounts"] += both_builds
+    write_json(by_rows / "candidate.json", candidate)
+    for script in ("pdl_chain_ab.py", "pdl_rows.py"):
+        shutil.copyfile(HERE / script, by_rows / script)
 
     # The chain kernels' sources, lowered at their decode shapes.
     sources = bundle(
@@ -328,7 +349,8 @@ def main() -> None:
             },
         )
     print(
-        "wrote overlay/, overlay-base/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-sources, "
+        "wrote overlay/, overlay-base/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-rows, "
+        "bundles/pdl-sources, "
         "bundles/pdl-mechanism, "
         "pdl-tp4.json, pdl-tp4-dev.json, base-tp4.json, base-tp4-dev.json"
     )

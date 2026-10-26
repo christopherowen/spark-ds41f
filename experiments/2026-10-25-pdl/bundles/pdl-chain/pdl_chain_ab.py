@@ -2,7 +2,7 @@
 """The layer-chain benchmark on the base build and on the PDL build, in alternation
 on one GPU: time per layer and whether every buffer's bits agree.
 
-usage: pdl_chain_ab.py [ROUNDS]
+usage: pdl_chain_ab.py [ROUNDS [SCRIPT [ARGS...]]]
 
 Each build is the image's vLLM tree with package files in place: /tmp/pdl-tree/base/vllm
 holds symbolic links to the image's files with the base build's files (mounted under
@@ -11,11 +11,14 @@ holds symbolic links to the image's files with the base build's files (mounted u
 it changes over the base) copied over those. Each round runs
 benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py once per build, the base build's
 first in odd rounds and the PDL build's first in even rounds, each in a fresh process
-on the bundle's TileLang cache. A probe first confirms that each tree imports its own
-mHC module, chained only in the PDL build.
+on the bundle's TileLang cache. SCRIPT and its ARGS replace that benchmark (pdl_rows.py:
+every row count, the shared expert beside the routed experts and inline); it prints the
+same lines. A probe first confirms that each tree imports its own mHC module, chained
+only in the PDL build.
 
-Prints each run's lines, then one JSON line per shape (medians over rounds, the
-difference) and a {"bits": ...} line per shape. Exit status 0 only when every run
+Prints each run's lines (without their digests, which are compared here), then one
+JSON line per shape (medians over rounds, the difference, base - PDL in each round) and
+a {"bits": ...} line per shape. Exit status 0 only when every run
 succeeded, every output is finite, every replay gave its eager bits, and every
 buffer's digest is equal across builds and runs.
 """
@@ -73,10 +76,10 @@ def environment(tree: Path) -> dict:
     return env
 
 
-def run(tree: Path, label: str) -> list[dict]:
+def run(tree: Path, label: str, bench: list[str]) -> list[dict]:
     print(f"=== {label}", flush=True)
     process = subprocess.run(
-        [sys.executable, *BENCH],
+        [sys.executable, *bench],
         cwd=tree,
         env=environment(tree),
         stdout=subprocess.PIPE,
@@ -84,18 +87,22 @@ def run(tree: Path, label: str) -> list[dict]:
         text=True,
         timeout=5400,
     )
-    print(process.stdout[-6000:], flush=True)
+    lines = process.stdout.splitlines()
+    results = [json.loads(line) for line in lines if line.startswith('{"shape"')]
+    other = "\n".join(line for line in lines if not line.startswith('{"shape"'))
+    print(other[-3000:], flush=True)
+    for result in results:
+        print(
+            json.dumps({k: v for k, v in result.items() if k != "digests"}), flush=True
+        )
     if process.returncode:
         raise SystemExit(f"{label}: exit {process.returncode}")
-    return [
-        json.loads(line)
-        for line in process.stdout.splitlines()
-        if line.startswith('{"shape"')
-    ]
+    return results
 
 
 def main() -> int:
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+    bench = sys.argv[2:] or BENCH
     shutil.rmtree(TREES, ignore_errors=True)
     builds = {name: build_tree(name) for name in LAYERS}
     for name, tree in builds.items():
@@ -117,7 +124,7 @@ def main() -> int:
     for r in range(rounds):
         order = ("base", "pdl") if r % 2 == 0 else ("pdl", "base")
         for name in order:
-            results[name].append(run(builds[name], f"round {r + 1}: {name}"))
+            results[name].append(run(builds[name], f"round {r + 1}: {name}", bench))
     ok = True
     reference = results["base"][0]
     for i, want in enumerate(reference):
@@ -147,6 +154,10 @@ def main() -> int:
                 "pdl": round(pdl, 2),
                 "saved": round(base - pdl, 2),
                 "saved_percent": round(100 * (base - pdl) / base, 2),
+                "rounds_saved": [
+                    round(b[kind] - p[kind], 2)
+                    for b, p in zip(rows["base"], rows["pdl"])
+                ],
             }
         summary["finite_and_replays_equal"] = good
         print(json.dumps(summary), flush=True)
