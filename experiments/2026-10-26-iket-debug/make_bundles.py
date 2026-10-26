@@ -157,28 +157,35 @@ BUNDLES = {
     ),
     "step-bits": dict(
         ref=IKET,
-        what="decode steps end to end at TP1 with uninitialized tensors filled: off, and on with "
-             "no sampling, four CTAs a launch, and four CTAs and two iterations a loop; whether "
-             "their tokens agree",
+        what="decode steps end to end at TP1 with uninitialized tensors filled, at 512-token "
+             "chunks in a 1,024-token step: off twice, and on with no sampling, four CTAs a "
+             "launch, and four CTAs and two iterations a loop; whether their tokens and top-5 "
+             "logprobs agree exactly",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
-            ("decode steps, off, filled", ["{python}", STEP, "off", "--filled", "--out", "{out}/off"], 5400),
-            ("decode steps, on, filled, unsampled",
-             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on/iket", "--out", "{out}/on"], 5400),
-            ("decode steps, on, filled, CTAs sampled",
-             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on-ctas/iket", "--ctas", "4",
-              "--out", "{out}/on-ctas"], 5400),
-            ("decode steps, on, filled, CTAs and iterations sampled",
-             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on-iters/iket", "--ctas", "4",
-              "--iters", "2", "--out", "{out}/on-iters"], 5400),
-            ("tokens agree", ["{python}", "-c",
-                              "import json, sys; names = ['off', 'on', 'on_ctas', 'on_iters']; "
-                              "t = dict(zip(names, (json.load(open(p))['token_ids'] for p in sys.argv[1:]))); "
-                              "print(json.dumps({**t, **{n + '_equals_off': t[n] == t['off'] for n in names[1:]}})); "
-                              "sys.exit(0 if len({tuple(v) for v in t.values()}) == 1 else 1)",
-                              "{out}/off/result.json", "{out}/on/result.json", "{out}/on-ctas/result.json",
-                              "{out}/on-iters/result.json"], 60),
+            *(
+                (f"decode steps, {label}, filled",
+                 ["{python}", STEP, *mode, "--filled", "--batched", "1024", "--chunk", "512",
+                  "--out", f"{{out}}/{name}"], 5400)
+                for name, label, mode in (
+                    ("off", "off", ["off"]),
+                    ("off-again", "off again", ["off"]),
+                    ("on", "on, unsampled", ["on", "--iket", "{out}/on/iket"]),
+                    ("on-ctas", "on, CTAs sampled", ["on", "--iket", "{out}/on-ctas/iket", "--ctas", "4"]),
+                    ("on-iters", "on, CTAs and iterations sampled",
+                     ["on", "--iket", "{out}/on-iters/iket", "--ctas", "4", "--iters", "2"]),
+                )
+            ),
+            ("tokens and logprobs agree", ["{python}", "-c",
+                "import json, sys; names = ['off', 'off_again', 'on', 'on_ctas', 'on_iters']; "
+                "r = dict(zip(names, (json.load(open(p)) for p in sys.argv[1:]))); "
+                "same = {n: (r[n]['token_ids'], r[n]['logprobs']) == (r['off']['token_ids'], r['off']['logprobs']) "
+                "for n in names[1:]}; "
+                "print(json.dumps({'tokens': {n: r[n]['token_ids'] for n in names}, 'equal_to_off': same})); "
+                "sys.exit(0 if all(same.values()) else 1)",
+                *(f"{{out}}/{n}/result.json" for n in ("off", "off-again", "on", "on-ctas", "on-iters"))],
+             60),
         ],
     ),
     "step-off": dict(

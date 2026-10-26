@@ -6,66 +6,99 @@
    "/b/iket_step.py",
    "off",
    "--filled",
+   "--batched",
+   "1024",
+   "--chunk",
+   "512",
    "--out",
    "{out}/off"
   ],
   5400
  ],
  [
-  "decode steps, on, filled, unsampled",
+  "decode steps, off again, filled",
+  [
+   "{python}",
+   "/b/iket_step.py",
+   "off",
+   "--filled",
+   "--batched",
+   "1024",
+   "--chunk",
+   "512",
+   "--out",
+   "{out}/off-again"
+  ],
+  5400
+ ],
+ [
+  "decode steps, on, unsampled, filled",
   [
    "{python}",
    "/b/iket_step.py",
    "on",
-   "--filled",
    "--iket",
    "{out}/on/iket",
+   "--filled",
+   "--batched",
+   "1024",
+   "--chunk",
+   "512",
    "--out",
    "{out}/on"
   ],
   5400
  ],
  [
-  "decode steps, on, filled, CTAs sampled",
+  "decode steps, on, CTAs sampled, filled",
   [
    "{python}",
    "/b/iket_step.py",
    "on",
-   "--filled",
    "--iket",
    "{out}/on-ctas/iket",
    "--ctas",
    "4",
+   "--filled",
+   "--batched",
+   "1024",
+   "--chunk",
+   "512",
    "--out",
    "{out}/on-ctas"
   ],
   5400
  ],
  [
-  "decode steps, on, filled, CTAs and iterations sampled",
+  "decode steps, on, CTAs and iterations sampled, filled",
   [
    "{python}",
    "/b/iket_step.py",
    "on",
-   "--filled",
    "--iket",
    "{out}/on-iters/iket",
    "--ctas",
    "4",
    "--iters",
    "2",
+   "--filled",
+   "--batched",
+   "1024",
+   "--chunk",
+   "512",
    "--out",
    "{out}/on-iters"
   ],
   5400
  ],
  [
-  "tokens agree",
+  "tokens and logprobs agree",
   [
    "{python}",
    "-c",
-   "import json, sys; names = ['off', 'on', 'on_ctas', 'on_iters']; t = dict(zip(names, (json.load(open(p))['token_ids'] for p in sys.argv[1:]))); print(json.dumps({**t, **{n + '_equals_off': t[n] == t['off'] for n in names[1:]}})); sys.exit(0 if len({tuple(v) for v in t.values()}) == 1 else 1)",
+   "import json, sys; names = ['off', 'off_again', 'on', 'on_ctas', 'on_iters']; r = dict(zip(names, (json.load(open(p)) for p in sys.argv[1:]))); same = {n: (r[n]['token_ids'], r[n]['logprobs']) == (r['off']['token_ids'], r['off']['logprobs']) for n in names[1:]}; print(json.dumps({'tokens': {n: r[n]['token_ids'] for n in names}, 'equal_to_off': same})); sys.exit(0 if all(same.values()) else 1)",
    "{out}/off/result.json",
+   "{out}/off-again/result.json",
    "{out}/on/result.json",
    "{out}/on-ctas/result.json",
    "{out}/on-iters/result.json"

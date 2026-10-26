@@ -1,7 +1,7 @@
 """DS4.1 decode steps end to end on one GPU, for IKET traces.
 
-usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--model DIR] [--drafts N]
-                    [--tokens N]
+usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--filled]
+                    [--batched N] [--chunk N] [--model DIR] [--drafts N] [--tokens N]
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
@@ -15,10 +15,15 @@ are left out (``engram_layer_ids`` empty), and at TP1 nothing all-reduces.
 A warm request runs first. Then a TileLang marker kernel (``iket_step_marker``) brackets
 the measured request, a prefill and ``--tokens`` decode steps, so a trace's launches
 between the two markers are that request's. ``on`` enables the IKET mode before anything
-compiles; the worker's ``init_device`` finds it on (``VLLM_DS41_IKET``).
+compiles (``--ctas`` and ``--iters`` sample CTAs and loop iterations); the worker's
+``init_device`` finds it on (``VLLM_DS41_IKET``).
 
-Writes ``result.json`` to ``--out``: the measured request's token ids, the wall time of
-each request, the vLLM tree's IKET state and the config overrides.
+The dummy loader leaves integer weights uninitialized; they are zeroed here. More of what
+the dummy engine reads is never written, so to compare runs ``--filled`` also fills
+uninitialized tensors (torch's deterministic mode), which adds fill kernels.
+
+Writes ``result.json`` to ``--out``: the measured request's token ids and top-5 logprobs,
+the wall time of each request, the vLLM tree's IKET state and the config overrides.
 """
 
 import argparse
@@ -100,6 +105,8 @@ def main():
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
+    parser.add_argument("--batched", type=int, default=512, help="max_num_batched_tokens")
+    parser.add_argument("--chunk", type=int, default=256, help="long_prefill_token_threshold")
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
@@ -144,8 +151,8 @@ def main():
         # A small profile run keeps the startup's share of a trace small; prefill
         # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192),
         # with room in the step for the decode rows beside one.
-        max_num_batched_tokens=512,
-        long_prefill_token_threshold=256,
+        max_num_batched_tokens=args.batched,
+        long_prefill_token_threshold=args.chunk,
         max_parallel_prefills=1,
         async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
@@ -175,7 +182,8 @@ def main():
     )
     boot = time.monotonic() - started
     print(f"engine ready in {boot:.0f} s", flush=True)
-    greedy = SamplingParams(temperature=0.0, max_tokens=args.tokens, ignore_eos=True)
+    # The top-5 logprobs of each token compare runs more finely than the tokens.
+    greedy = SamplingParams(temperature=0.0, max_tokens=args.tokens, ignore_eos=True, logprobs=5)
     timings = []
     started = time.monotonic()
     llm.generate([PROMPTS[0]], SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True))
@@ -197,6 +205,10 @@ def main():
         "request_s": [round(t, 3) for t in timings],
         "prompt_tokens": len(measured.prompt_token_ids),
         "token_ids": list(measured.outputs[0].token_ids),
+        "logprobs": [{str(t): float(p.logprob) for t, p in sorted(step.items())}
+                     for step in measured.outputs[0].logprobs or []],
+        "batched": args.batched,
+        "chunk": args.chunk,
         "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
         "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
         "VLLM_DS41_IKET_ITERS": envs.VLLM_DS41_IKET_ITERS,

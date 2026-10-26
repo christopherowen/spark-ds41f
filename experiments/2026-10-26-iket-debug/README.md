@@ -241,16 +241,21 @@ What a whole-engine trace needed:
   stay exact.
   - Unsampled, the hot kernels alone wrote a 1.39 GB trace.json from 61 launches: the
     expert GEMMs' K loops put up to 36 iterations of ranges in every warp.
-- **A fixed IKET pool (`--context-buffer-size 8G`).** run-iket sizes its device pool as
-  if every launch of the run were in flight at once:
-  - the dry run saw 16,894 launches and 86 graph launches, mostly the engine's startup;
-  - its largest warp held 5,016 timestamps, which it reserves for every warp of every
-    instrumented launch;
-  - that came to 898 GB, and the run was killed.
+- **Bounded records (`VLLM_DS41_IKET_ITERS=2`).** run-iket's device pool is a bump
+  allocator for the whole process (`ContextBuffer::Allocate`). Every instrumented
+  launch reserves the run's largest per-warp record for each of its warps:
+  - The first engine trace's dry run saw 16,894 launches and 86 graph launches, mostly
+    the engine's startup. Its largest warp held 5,016 timestamps.
+  - The pool came to 898 GB, and the run was killed.
+  - With a fixed 8 GB pool, the run exhausted it during the encoder's profile run:
+    8.49 GB in, a 695 MB request failed.
 
-  The pool is reused as launches finish.
+  Ranges inside a loop now record in at most two iterations, evenly spread. With CTA
+  sampling, that bounds every warp's record and the pool sized from the dry run. The
+  run's 41 million TileLang warps cost about 20 GiB at 128 timestamps a warp.
 - **Room on the GPU.** The pool counts against vLLM's startup check, so the harness sets
-  `gpu_memory_utilization=0.8`. The KV pool is fixed by bytes.
+  `gpu_memory_utilization=0.6`. The KV pool is fixed by bytes. The profile run is kept
+  small: 256-token chunks in a 512-token step.
 - **Comparable runs.** vLLM's dummy loader leaves integer tensors uninitialized: the
   packed FP4 experts and their UE8M0 scales. The harness zeroes them. Even then, two off
   runs give different tokens, because more of what the TP1 dummy engine reads is never
@@ -276,11 +281,13 @@ What a serving trace on the cluster would take:
    alternative is a dry run of the same workload once, replayed with
    `--use-tracker-dir`. Both passes must run the same launches: run-iket assumes stable
    record counts between them.
-2. **Memory.** Size the pool by hand (`--context-buffer-size`), and lower
+2. **Memory.** The pool is one allocation for the whole process, so it grows with every
+   instrumented launch of the boot and the workload. Sample (`VLLM_DS41_IKET_CTAS`,
+   `VLLM_DS41_IKET_ITERS`), read the size the dry run computes, and lower
    `--kv-cache-memory-bytes` by it.
    - Serving leaves 5–7 GiB free a node, and dgx1's 5 GiB startup guard binds. The pool
      must come out of the KV budget, never out of the guard.
-   - Use `VLLM_DS41_IKET_CTAS` to keep records small.
+   - A long serving run does not fit at all. Trace a short, fixed workload.
 3. **Boot time.** The mode turns TileLang's caches off, so every rank compiles every
    kernel cold. The startup rendezvous waits for alive ranks; the heartbeat timeout only
    matters for a hung rank.
@@ -309,9 +316,10 @@ What a serving trace on the cluster would take:
 3. **vLLM's dummy loader leaves integer tensors uninitialized** (upstream; it zeroes them
    only on ROCm): DS4.1's packed FP4 experts and their UE8M0 scales. More of what the
    TP1 dummy engine reads is never written, so two dummy runs give different tokens.
-4. **run-iket's automatic pool sizing does not scale to an engine run** (NVIDIA's
-   tool). It reserves the run's largest warp record for every warp of every
-   instrumented launch, as if all were in flight. Set `--context-buffer-size`.
+4. **run-iket's pool does not scale to an engine run** (NVIDIA's tool). It is one
+   bump allocation for the whole process, and every warp of every instrumented launch
+   reserves the run's largest warp record. Sample, with `VLLM_DS41_IKET_CTAS` and
+   `VLLM_DS41_IKET_ITERS`, so that record stays small.
 
 ## Reading a trace
 
