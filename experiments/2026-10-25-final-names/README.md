@@ -52,7 +52,7 @@ Every remaining line belongs to a class below.
      every 0.25 s from the start command to ready (docs/lab.md). The loader spec below needs it.
      It does the `MemAvailable` part of one-off watchers such as
      `2026-10-23-next-release/memory/watch.sh` inside the lab.
-   - New arm key **`serve_options`** (branch `direct-loader`, stacked on this one): the value of
+   - New arm key **`serve_options`** (#594, branch `direct-loader`, after this pass): the value of
      a flag the base's `serve_args` passes once, so an arm that changes one serving option no
      longer copies the whole list (`set` replaces a list whole). The loader arms use it.
 3. **Upstreams.**
@@ -421,15 +421,17 @@ retiring B12X.
   - The "keep B12X" text in AGENTS.md and CONTRIBUTING.md.
 
   `liburing` stays: the Engram reader and the direct loader use it.
-- **spark-ds41f:** PR #594, branch `direct-loader`, stacked on #590 (`final-names`).
+- **spark-ds41f:** PR #594, branch `direct-loader`, rebased onto main after #590 merged
+  (c24c7217, 2026-10-26).
   - Records: this README, `loader/vllm` (patches and series), `bundles/`, the arms,
     `loader/kernel` and `loader/runs`.
   - Lab tooling: the arm key `serve_options` (scripts/recipe.py, tests/test_recipe.py,
     docs/lab.md).
-  - No recipe or image change. The recipe change above is made in the candidate.
-  - Its own commits merge cleanly with every open PR branch. It inherits #590's conflict with
-    main in `scripts/lab.py` and `tests/test_lab.py`, from main's 1025 deployment. #590
-    lands first.
+  - Release tests: `config/release-tests.json` gates the loader's three test files, and the
+    release bundle sets `DIRECT_IO_TEST_DIR=/c/direct-io-test` (scripts/release_tests.py,
+    tests/test_release_tests.py).
+  - No recipe or image change. The candidate's own arms carry the recipe change above.
+  - Its commits merge cleanly with every open PR branch.
 - **Verified on dgx4 (above):** the GPU tests, a one-rank load bit-identical to B12X's, and
   the plugin settings.
 - **Needs the cluster:** the serving boot A/B (loader-tp3/-tp4). It compares weight digests
