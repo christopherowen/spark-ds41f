@@ -260,6 +260,25 @@ BUNDLES = {
                 "{out}/dry"], 60),
         ],
     ),
+    # The c3/c8 NaN off the IKET branch (coordinator, 2026-10-26): next-candidate's head,
+    # and 1025's runtime tree (the image's 26382f5cf; its 0489-0490 change only tests).
+    **{name: dict(
+        ref=ref,
+        what=f"the c3/c8 NaN on {label}, IKET off: c3 eager with a non-finite hook on every "
+             f"module, c3 with the graphs, and c8's boot",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            ("off, TP4, c3, eager, nan hooks",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "3", "--eager", "--nan-hooks",
+              "--out", "{out}/c3-eager"], 1800),
+            ("off, TP4, c3, graphs",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "3", "--out", "{out}/c3"], 1800),
+            ("off, TP4, c8, graphs",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "8", "--out", "{out}/c8"], 1800),
+        ],
+    ) for name, ref, label in (("nan-next", "c579b3fe1", "next-candidate c579b3fe1"),
+                               ("nan-1025", BASE, "1025's tree (26382f5cf, no overlay)"))},
     "step-counts": dict(
         ref=IKET,
         what="which kernels' warps record past the static bound in the eager decode steps: one "
