@@ -658,6 +658,44 @@ The steady steps also sit idle about 111 µs between kernels. That is host time 
 per-step kernels (draft budget 22 µs, padding rows 16, CED requests 13, adaptive
 offsets 11, post-update 7). It is an engine-level lever.
 
+## A6: the DSpark Markov bias projection, five times a step
+
+The step table's vocab-wide BF16 GEMM (5 launches a step, 91% waiting on its weight
+stream) is the drafter's Markov bias projection. `markov_w2` is a BF16 `[vocab, 256]`
+weight; each draft projects the previous token's rank-256 embedding through it. It runs
+through the BF16 head's 16-row tile: `bf16_gemm` with a 64-wide N tile, K in one block,
+2 stages.
+
+At a rank's shard the weight fits L2: 16.5 MB at TP4 and 22.1 MB at TP3, in GB10's 24 MB.
+`markov_l2.py` times one row: once after a 128 MiB read evicts L2, then five drafts back
+to back with an argmax between, as drafting runs them. It also re-reads the weight five
+times with `stream_bound.py`'s ideal read kernel, which shows how fast L2 can serve it:
+**12.3 µs** for the TP4 shard (about 1.35 TB/s) and 20-25 µs for TP3's.
+
+**`bf16_rows_gemm`** (`c1-markov` 3544e79bb, bit-identical). For up to 16 rows, 96 CTAs
+stay resident (two on each SM). Each takes every 96th N tile and pipelines their K
+blocks one after another, so its copies run ahead across tiles. Each tile is cleared,
+gets `bf16_gemm`'s GEMMs over its K blocks in order, and is stored: every output has the
+same accumulation. A BF16 head runs its 16-row tile on it when its K is at most 512,
+it has at least 192 N tiles, and its weight fits L2.
+
+Drafts in µs (markov-l2-5 and markov-l2-rows-2, dgx2, the production head path):
+
+| shard | the head's 16-row tile | `bf16_rows_gemm` | a step |
+|---|---|---|---:|
+| TP4 (16.5 MB) | 101.4, 36.4, 28.7, 28.9, 28.7 | 109.6, 27.6, 16.3, 18.9, 18.5 | −33 µs (+0.1%) |
+| TP3 (22.1 MB) | 136.7, 57.0, 38.9, 39.1, 38.9 | 146.5, 62.5, 31.7, 35.0, 36.4 | +1.5 µs |
+
+**Dropped.** The head's tile already reads mostly from L2: 28.7 µs a draft at TP4,
+against the ideal read's 12.3. The persistent kernel closes most of that gap. But it
+streams the first draft from DRAM about 8 µs slower, so the step gains about 0.1% at
+TP4 and nothing at TP3.
+
+The first measurement went through the TileLang linear path instead (markov-l2-2 to
+-4, markov-l2-rows-1: `bf16_gemm`'s default 64-row tiles). There every draft took 69.5
+µs, and an `evict_last` prefetch changed only the first. That projection is not the one
+production runs.
+
 ## Runs on dgx1 and dgx2
 
 dgx1, 2026-10-26, and from 18:57 CET also dgx2, both with image
@@ -712,7 +750,13 @@ derived tables) are in `runs/`. The step runs keep their results, step diffs and
 | step-base-tp3-full-1, step-front-tp3-full-1 (dgx2) | 19:29, 19:39 | step tool, breakable off | pass: the front family −25 µs a step |
 | filled-base-tp3-1 (dgx2), filled-front-tp3-1 | 19:59 | two filled-memory runs each | all four: tokens equal, logprobs equal at 1-31 |
 | markov-l2-1 | 20:02 | markov-l2 | FAIL in 7 s: a plain namespace cannot be referenced weakly |
-| markov-l2-2 | 20:10 | markov-l2 | pass: drafts 2-5 stream the weight from DRAM at every shard |
+| markov-l2-2 | 20:10 | markov-l2 | pass, on the linear path: 69.5 µs a TP4 draft |
+| markov-l2-3 (dgx2) | 20:20 | markov-l2 | pass, linear path: an `evict_last` prefetch changes only the first draft |
+| markov-l2-4 (dgx2) | 20:29 | markov-l2 | pass, linear path: the ideal read re-reads the TP4 shard in 12.3 µs |
+| markov-tests-1 | 20:41 | markov-tests (linear route) | 40 passed: `bf16_rows_gemm` gives `bf16_gemm`'s bits |
+| markov-l2-rows-1 (dgx2) | 20:41 | markov-l2-rows (linear route) | pass: TP4 drafts 2-5 in 12-27 µs on the linear path |
+| markov-l2-5, markov-l2-rows-2 (dgx2) | 20:52 | markov-l2 on the production head path | pass: −33 µs a TP4 step, none at TP3; dropped |
+| markov-tests-2 | 20:52 | markov-tests (head route) | 72 passed: `bf16_gemm`'s and the head tile's bits, kernels source-checked |
 
 ## Files
 
