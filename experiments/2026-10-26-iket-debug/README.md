@@ -340,35 +340,72 @@ What a whole-engine trace needed:
   When the mode is off, no callback is registered, so every module is TileLang's own
   output.
 
-### Step 4 status: the trace waits for dgx4
+### Step 4 results: c1 decode steps at the ring's and the triangle's rank shapes (dgx3)
 
-dgx1-4 went down for re-cabling at 08:15 CET on 2026-10-26, before the decode-step trace
-ran. Run 27 (bundle `step` at spark-ds41f a1010216, vLLM 52862f2ca) was queued and
-withdrawn, never started. Everything it needs is in place and checked piece by piece:
-- with the CUDA graphs the dry run recommends 80 timestamps a warp, a 10.3 GB pool (run
-  26);
-- the hot kernels' capped run shows that sampled records fit their slots (run 25);
-- the harness now frees the engine's 53 GB before run-iket decodes at exit (run 26 ran
-  out there).
+dgx3, vLLM 734932a56, bundles `step-tp4-c1` (run 32) and `step-tp3-c1` (run 33).
+Receipts are in `runs/step-tp4-c1-32` and `runs/step-tp3-c1-33`: `tables.md` (the
+output), `table.json`, `step-diff.json`, and both runs' `result-*.json`.
+- **The request:** a 32-token prompt and 32 tokens, as one prefill and 16 decode steps
+  (dummy weights accept about 1.9 tokens a step).
+- **The grid:** after the request, nine runs of the engine grid's dummy step at the same
+  shape (one request, six verification rows), about the request's context.
+- Both are traced under IKET, and timed with nsys without it.
 
-Re-run with `make_bundles.py`'s `step` bundle once dgx4 is back. It traces, counts the
-records, takes nsys of off with and without the graphs, and writes the decode-step
-table and both nsys timelines.
+| a decode step (nsys, no IKET) | TP4 rank | TP3 rank |
+|---|---:|---:|
+| GPU busy, request | 14.04 ms | 15.13 ms |
+| GPU busy, the grid's step | 8.92 ms | 9.68 ms |
+| the grid's own timer (`engine_grid`): step / target / drafter | 10.25 / 2.27 / 6.78 ms | 10.84 / 2.69 / 6.98 ms |
 
-The production-mode reference, from nsys of off with the graphs (run 18,
-`runs/step-18/nsys-graphs-window.md`):
-- The measured request is a 32-token prompt and 8 tokens: 2,636 launches in 226 ms.
-  The GPU is busy 137 ms (61%).
-- Two dense segments of about 70 ms each, 97-99% busy: the prefill, and the one decode
-  step DSpark needs. With dummy weights every draft is accepted, so eight tokens take
-  two passes.
-- An 83 ms host gap separates them. The harness asks for top-5 logprobs; the gap is not
-  investigated.
-- At TP1 the packed BF16 vocabulary head dominates: 4.1 ms a launch, 32% of the GPU
-  time. Production at TP4 splits it four ways. Then come the FP8 linear GEMMs (22%),
-  the routed experts (17%) and the L2 prefetch (8%).
-- Without the graphs (`nsys-eager-window.md`, no adaptive verification): 2,066
-  launches in 190 ms, also 61% busy.
+The vocabulary head is whole at TP1: each launch is 4.0 ms, where a TP4 rank's quarter
+is about 1.0 ms. So the absolute steps above are long by about 3 ms (the target's
+head) plus 3 ms (the drafter's head), and the vocabulary-wide BF16 GEMM below is four
+times a rank's too. Every other kernel is at a rank's shapes.
+
+**Where a decode step's time goes** (IKET, 16 decode steps; spans a step, then the
+phase split of the launch's last recording warp; loop ranges are estimates, see
+Sampling above). TP4 rank:
+
+| kernel (grid) | launches | span a step | last warp: wait / load / compute | its longest wait |
+|---|---:|---:|---|---|
+| packed vocabulary head (1, 4040) | 2 | 8073 us | 59% / 32% / 10% | the block sync after its cp.async waits |
+| L2 prefetch (2) | 25 | 1588 us | load (a side stream; 87% overlapped) | |
+| BF16 GEMM (2020), vocabulary-wide (2020 x 64 = 129,280 rows: also whole at TP1) | 5 | 1328 us | 91% / 0% / 4% | its mbarrier wait |
+| routed gate-up GEMM (9, 30) | 8.6 | 714 us | 37% / 25% / 36% | the TMA weight tile's mbarrier |
+| routed down GEMM (40, 30) | 8.6 | 444 us | 14% / 20% / 0% | |
+| MXFP8 GEMMs (80, 64, 28, 36, 40) | 39 | 1425 us | 29-94% wait | `cp_async_wait`, then the sync after it |
+| mHC project streams (40) | 18 | 286 us | 17% / 37% / 17% | the block sync |
+
+TP3's is the same order, with larger routed GEMMs: the gate-up at 966 us a step, 58%
+of its last warp waiting.
+
+**What a decode step adds to the grid's step** (`step_diff.py`, nsys; "exposed" is time
+a kernel runs alone on the GPU, so on the step's critical path):
+
+| a decode step less the grid's | TP4 rank | TP3 rank | exposed |
+|---|---:|---:|---|
+| the target's verification head: a second packed-head launch the grid does not run | +4.04 ms | +3.99 ms | all |
+| the routed GEMMs (dummy rows reach 6 experts, the request's rows more) | +0.96 ms | +1.43 ms | 95% / 87% |
+| kernels only a request runs: sampler, sink rejection, verification, inputs | +0.17 ms | +0.16 ms | all |
+| the other per-layer kernels (mHC, router, sparse MLA, SwiGLU, combine, rope) | +0.13 ms | +0.21 ms | 31% / none |
+| kernels only the grid runs (its dummy fills) | -0.14 ms | -0.12 ms | |
+
+- **The verification head.** A request's decode step runs the packed head twice. The
+  target's runs on its verified rows, eagerly after the target's graph (`ced_copy_rows`,
+  the head, then `logits_rows`, `sink_cut`, `local_stats`, `verify`). The drafter's runs
+  inside its graph. The grid's dummy step runs only the drafter's.
+- **The request-only kernels** include the harness's top-5 logprobs (`token_ranks`,
+  `topk_log_softmax`, `topk_ids`: 96 us). Serving without logprobs leaves about 76 us:
+  sink rejection, rejection sampling, adaptive verification's statistics, inputs.
+- **Applied to #616's c1 gap** (TP4, 1025: 11.9 ms, of which routing explains about
+  5.3 ms and about 6.5 ms is unattributed GPU work), this accounts for:
+  - about 1.0 ms of the target's verification head at a TP4 rank's shard;
+  - about 0.08 ms of sampler and sink rejection, all on the critical path;
+  - about 0.6 ms of slower per-layer kernels over 43 layers, a third of it exposed.
+
+  That is 1.3-1.7 ms. The rest is not in a one-GPU step at these shapes. It must lie
+  in what this harness leaves out: Engram, the collectives with real peers, and the
+  request's real context.
 
 ## Tracing a multi-rank serving step later (not run)
 

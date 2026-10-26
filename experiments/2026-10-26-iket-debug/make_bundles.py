@@ -328,7 +328,7 @@ BUNDLES = {
             (f"off, TP4, c{requests}, eager, nan hooks",
              ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--eager",
               "--nan-hooks", "--out", f"{{out}}/tp4-c{requests}-eager"], 1800)
-            for requests in (3, 8)
+            for requests in (3,)
         ],
     ),
     "tests": dict(

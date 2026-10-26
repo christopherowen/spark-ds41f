@@ -134,9 +134,17 @@ def nan_hooks(worker):
                     and not bool(torch.isfinite(out).all()):
                 first.append(module.nan_name)
                 bad = (~torch.isfinite(out)).nonzero()
+                rows = sorted({int(r) for r in bad[:, 0].tolist()})
                 print(f"first non-finite output: {module.nan_name} ({type(module).__name__}) "
-                      f"shape {tuple(out.shape)}, {bad.shape[0]} values, first at "
-                      f"{bad[0].tolist()}", flush=True)
+                      f"shape {tuple(out.shape)}, {bad.shape[0]} values, rows {rows[0]}-{rows[-1]} "
+                      f"({len(rows)})", flush=True)
+                for i, x in enumerate(inputs):
+                    if isinstance(x, torch.Tensor) and x.is_floating_point() and x.dim() >= 2:
+                        sel = x[rows].float()
+                        print(f"  its input {i} {tuple(x.shape)} {x.dtype}, those rows: finite "
+                              f"{bool(torch.isfinite(sel).all())}, absmax {float(sel.abs().max()):.3g}, "
+                              f"all-zero rows {int((sel.abs().amax(dim=-1) == 0).sum())}; other rows' "
+                              f"absmax {float(x.float().abs().max()):.3g}", flush=True)
                 return
 
     for name, module in model.named_modules():
