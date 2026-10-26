@@ -187,6 +187,33 @@ BUNDLES = {
               for mode in ("eager", "graphs")),
         ],
     ),
+    "guards": dict(
+        ref=IKET,
+        what="why the dry run's per-warp maximum exceeds the warps' records under sampling: "
+             "the sampled hot kernels' SASS (which events ptxas predicated rather than "
+             "branched around) and a dry run's own log of its maximum",
+        env={"NVDISASM": "/opt/nvdisasm"},
+        mounts=[NVDISASM],
+        steps=[
+            ("hot kernels, on, sampled",
+             ["{python}", HOT, "on", "--iket", "{out}/on/iket", "--out", "{out}/on", "--iters", "1",
+              "--sample-ctas", "4", "--sample-iters", "1"], 3600),
+            ("SASS check, sampled", ["{python}", "/b/sass_check.py", "{out}/on/iket/sources", "{out}/sass",
+                                     "oneshot", "moe_grouped", "sparse_mla", "mhc_finalize", "moe_dispatch"],
+             1800),
+            ("dry run, debug log",
+             [*PROFILE, "{out}/dry", "--skip-run", "--log-level", "debug", "profile", "--keep",
+              "--postprocess", "none", "--", "{python}", HOT, "on", "--iket", "{out}/dry-run/iket",
+              "--out", "{out}/dry-run", "--iters", "3", "--sample-ctas", "4", "--sample-iters", "1"], 3600),
+            ("the dry run's maximum", ["{python}", "-c",
+                "import glob, sys\n"
+                "for p in sorted(glob.glob(sys.argv[1] + '/tracker/pid_*/smodel.injection.log')):\n"
+                "    for line in open(p, errors='replace'):\n"
+                "        if 'MaxTimestamp' in line or 'recommended' in line:\n"
+                "            print(p.split('/')[-2], line.rstrip()[:300])",
+                "{out}/dry"], 60),
+        ],
+    ),
     "step-counts": dict(
         ref=IKET,
         what="which kernels' warps record past the static bound in the eager decode steps: one "

@@ -10,8 +10,10 @@ an mbarrier ``SYNCS``) that comes before the event was stamped before that barri
 released its warp. ptxas keeps program order there; the hardware does not wait:
 a ``BAR.SYNC.DEFER_BLOCKING`` holds the warp only at its next memory access, so for
 each block barrier it also reports whether a memory instruction comes before the
-next timer read (the IKET mode's ``TL_IKET_SETTLE``). Prints, per kernel, the events,
-the hoisted ones and the unsettled barriers, and writes each ``.sass``.
+next timer read (the IKET mode's ``TL_IKET_SETTLE``). It also counts the events ptxas
+predicated (``@P PMTRIG``): a warp issues those whether or not its guard holds, where a
+branch skips the others. Prints, per kernel, the events, the predicated and the hoisted
+ones and the unsettled barriers, and writes each ``.sass``.
 """
 
 import json
@@ -56,11 +58,13 @@ def main():
                               text=True, capture_output=True, check=True).stdout
         (out / f"{path.stem}.sass").write_text(sass)
         code = instructions(sass)
-        events, hoisted = 0, []
+        events, hoisted, predicated = 0, [], []
         for i, (_, text) in enumerate(code):
             if not EVENT.search(text):
                 continue
             events += 1
+            if text.startswith("@"):
+                predicated.append(f"{code[i][0]:#06x} {text}")
             timer = next((j for j in range(i - 1, -1, -1) if TIMER.search(code[j][1])), None)
             if timer is None:
                 continue
@@ -81,11 +85,11 @@ def main():
                 if TIMER.search(code[j][1]):
                     unsettled.append(f"{address:#06x} -> {code[j][0]:#06x}")
                     break
-        report[path.stem] = {"events": events, "hoisted": hoisted, "barriers_settled": settled,
-                             "barriers_unsettled": unsettled}
-        print(f"{path.stem}: {events} events, {len(hoisted)} stamped before a barrier they follow; "
-              f"block barriers: {settled} meet memory first, {len(unsettled)} a timer read first "
-              f"{unsettled[:6]}")
+        report[path.stem] = {"events": events, "predicated": predicated, "hoisted": hoisted,
+                             "barriers_settled": settled, "barriers_unsettled": unsettled}
+        print(f"{path.stem}: {events} events, {len(predicated)} predicated {predicated[:3]}, "
+              f"{len(hoisted)} stamped before a barrier they follow; block barriers: {settled} "
+              f"meet memory first, {len(unsettled)} a timer read first {unsettled[:6]}")
         for item in hoisted[:12]:
             print("   ", json.dumps(item))
     (out / "sass_check.json").write_text(json.dumps(report, indent=1) + "\n")

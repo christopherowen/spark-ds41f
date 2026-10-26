@@ -1,0 +1,76 @@
+[
+ [
+  "hot kernels, on, sampled",
+  [
+   "{python}",
+   "/b/iket_hot.py",
+   "on",
+   "--iket",
+   "{out}/on/iket",
+   "--out",
+   "{out}/on",
+   "--iters",
+   "1",
+   "--sample-ctas",
+   "4",
+   "--sample-iters",
+   "1"
+  ],
+  3600
+ ],
+ [
+  "SASS check, sampled",
+  [
+   "{python}",
+   "/b/sass_check.py",
+   "{out}/on/iket/sources",
+   "{out}/sass",
+   "oneshot",
+   "moe_grouped",
+   "sparse_mla",
+   "mhc_finalize",
+   "moe_dispatch"
+  ],
+  1800
+ ],
+ [
+  "dry run, debug log",
+  [
+   "run-iket",
+   "--output-dir",
+   "{out}/dry",
+   "--skip-run",
+   "--log-level",
+   "debug",
+   "profile",
+   "--keep",
+   "--postprocess",
+   "none",
+   "--",
+   "{python}",
+   "/b/iket_hot.py",
+   "on",
+   "--iket",
+   "{out}/dry-run/iket",
+   "--out",
+   "{out}/dry-run",
+   "--iters",
+   "3",
+   "--sample-ctas",
+   "4",
+   "--sample-iters",
+   "1"
+  ],
+  3600
+ ],
+ [
+  "the dry run's maximum",
+  [
+   "{python}",
+   "-c",
+   "import glob, sys\nfor p in sorted(glob.glob(sys.argv[1] + '/tracker/pid_*/smodel.injection.log')):\n    for line in open(p, errors='replace'):\n        if 'MaxTimestamp' in line or 'recommended' in line:\n            print(p.split('/')[-2], line.rstrip()[:300])",
+   "{out}/dry"
+  ],
+  60
+ ]
+]
