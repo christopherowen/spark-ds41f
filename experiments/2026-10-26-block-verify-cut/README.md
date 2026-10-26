@@ -168,7 +168,12 @@ On the laptop: [exact_law.py](exact_law.py), in FP64.
 
 ## dgx4 runs
 
-Pending.
+Not run yet. dgx1-4 were powered off at 08:10 CET on 2026-10-26 for re-cabling, on the
+owner's instruction. No job of this experiment had been submitted. The runs wait until
+dgx4 is a test box again, or for a lab window: `cut-tests`, then `cut-bench`, with
+`scripts/lab.py kernel-local` from a checkout of this branch under
+`~/spark-lab/agents/block-verify-cut/`. `next-tests` runs only if a test fails, to tell
+whether the failure predates the branch.
 
 ## What the release comparison should expect
 
