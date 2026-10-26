@@ -8,17 +8,14 @@ where c1 decode kernels wait, what each wait is for, and what removing it is wor
 
 Rules, as for every study now: native weights and reference precision; temperature 0
 bit-identical; no serving overhead (IKET stays off in production); a ceiling for each
-idea from measured traces before building; GPU work on dgx4 through
-`scripts/lab.py kernel-local` only.
+idea from measured traces before building; GPU work through `scripts/lab.py
+kernel-local` only, on the node the coordinator assigns.
 
-**Status (2026-10-26, 09:30 CET):** the trace and prototype bundles have not run yet.
-dgx1-4 were powered off at 08:10 CET for re-cabling, and dgx4 now serves in the
-four-node production ring. The smoke bundle was queued at 08:35 and stopped before it
-started. Everything below that needs a GPU is prepared and waits for a test box:
-[What runs next](#what-runs-next). What is here comes from data that already exists:
-- rank 0's TP4 production traces (request-inventory-5);
-- the expert-rate bundle (#598);
-- IKET's hot-kernel traces (#610, run 5: TP3 shapes, 8 rows).
+**Where the runs happened.** dgx1-4 were powered off at 08:10 CET on 2026-10-26 for
+re-cabling, and the smoke bundle queued on dgx4 at 08:35 never started. While production
+waited for a cable that afternoon, the coordinator gave this study dgx1 alone. Every run
+below ran there from 13:50 CET, one bundle at a time under lab.py's GPU lock, from this
+branch's checkout in `~/spark-lab/agents/c1-iket/` ([Runs](#runs-on-dgx1)).
 
 ## The short answer so far
 
@@ -94,9 +91,22 @@ between builds mean equal bits.
 **Traces** (`make_bundles.py`, bundle `layer`), for each rank's shapes:
 1. the off build's times, as a CUDA graph;
 2. nsys of the graph and of eager launches, for absolute kernel times;
-3. run-iket with every kernel uninstrumented: exact warp lifetimes, per SM;
-4. run-iket with every kernel instrumented, K loops unsampled: the phase table
-   (IKET's `iket_table.py`).
+3. run-iket with every kernel instrumented, K loops unsampled: the phase table
+   (IKET's `iket_table.py`);
+4. warp lifetimes, per SM (bundles `lifetimes`, `lifetimes-stream`).
+
+Two things about run-iket, learned on the way:
+- It records warp lifetimes only for instrumented kernels. With every kernel skipped
+  its trace is empty (smoke run 2), and with only the combine instrumented it holds the
+  combine alone (smoke run 3).
+- So the lifetimes runs instrument everything, with one CTA a launch recording ranges
+  (`VLLM_DS41_IKET_CTAS=1`). Every warp's lifetime is recorded, and the other CTAs pass
+  a uniform branch at each event. In a persistent kernel the recording CTA runs slower
+  and becomes its tail, so the stream GEMM's lifetimes are not timings; the A/Bs are.
+
+**Validation.** The IKET build writes the same bits with the mode off and with it on and
+every kernel skipped (digest `51332953ab203838`, smoke run 2). Graph replays write eager
+launches' bits in every run.
 
 **Analysis:**
 - `cta_timeline.py` rebuilds from step 3 each launch's SM occupancy and, for the routed

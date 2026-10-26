@@ -201,10 +201,12 @@ BUNDLES = {
     ),
     "stages-ab": dict(
         ref=NEXT,
-        builds={"stages4": "c1-stages4", "stream48": STREAM, "stream48s4": "c1-stream-s4"},
+        builds={"stages4": "c1-stages4", "stream48": STREAM, "stream48s4": "c1-stream-s4",
+                "prologue": "c1-prologue"},
         what="one weight-stream variable an arm against next-candidate on the c1 layer harness, in "
-             "rotation, four rounds: the grid GEMMs at four stages, the stream GEMM on all 48 SMs, and "
-             "that at four stages; TP4 at 3 and 6 live rows, TP3 at 3",
+             "rotation, four rounds: the grid GEMMs at four stages, the stream GEMM on all 48 SMs, "
+             "that at four stages, and the grid GEMMs loading base words after the first stages; TP4 "
+             "at 3 and 6 live rows, TP3 at 3",
         steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4", "tp=4 live=3", "tp=4 live=6", "tp=3 live=3"],
                 14400)],
     ),
