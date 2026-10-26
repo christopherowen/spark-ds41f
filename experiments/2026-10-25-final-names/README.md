@@ -442,9 +442,10 @@ Queued only; nothing runs during the freeze.
 
 - **Prerequisite:** the vLLM branch `direct-loader` above. Its first commit is the weight
   digest.
-- **Arms:** `loader/make_arms.py ~/projects/vllm-ds41-tl-ports --shape tp3-triangle` (and
+- **Arms:** `loader/make_arms.py ~/projects/vllm-direct-loader --shape tp3-triangle` (and
   `tp4-ring`) writes the overlay bundles from that branch and three arms over the recipe at
-  that shape. The bundles and both shapes' arms are committed (from 6d5881d9c):
+  that shape. The bundles and both shapes' arms are committed (from 6d5881d9c). Their mounts
+  name `{checkout}`, as the recipe's cache mount does since #604:
   - `b12x-<tp>`: B12X's loader (`--load-format b12x`, `VLLM_PLUGINS=b12x_loader`), with the
     digest;
   - `direct-<tp>`: the direct loader, with the digest;

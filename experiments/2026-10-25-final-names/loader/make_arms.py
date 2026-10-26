@@ -76,7 +76,7 @@ def write_bundle(repo: Path, revision: str, name: str) -> list[str]:
 
 def mounts(recipe: dict, bundle: str, files: list[str]) -> list[list[str]]:
     """The recipe's own mounts (the cache), then the bundle's files over the image's tree."""
-    source = f"{{home}}/projects/spark-ds41f/{EXPERIMENT}/bundles/{bundle}/overlay"
+    source = f"{{checkout}}/{EXPERIMENT}/bundles/{bundle}/overlay"
     return [*recipe["container"]["mounts"],
             *([f"{source}/{path}", f"{SOURCE_ROOT}/{path}", "ro"] for path in files)]
 
