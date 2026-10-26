@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:25:48 +0100
+Subject: [PATCH 502/502] [DS4.1] No per-allocation KV zeroing: every cache
+ uses only written slots
+
+DeepSeek V4.1's reference zeroes each cache once, when it is built, and
+never between sequences: its kernels read only slots a sequence wrote (the
+indexer up to end_pos // ratio, the window by -1 indices, the compressor
+pooling only complete groups). vLLM instead zeroed every newly allocated
+block, because the compressors' FP32 rings beside the byte pages make the
+cache mixed-precision, and a reused block's stale bytes of another
+precision can decode to NaN.
+
+DS4.1's kernels follow the reference: windows start at the request's
+replay start (0501 for the drafter), the sparse MLA never loads a masked
+entry, the indexer stores no score past the visible positions (its last
+tile's stale rows are discarded), the compressor reads only a ring slot
+the request wrote. AttentionSpec.uses_only_written_slots states that no
+value of an unwritten slot reaches a result. Every DS4.1 cache declares
+it, and needs_kv_cache_zeroing skips mixed-precision caches whose layers
+all do. The scheduler then records no block ids and the runner builds no
+zeroer for DS4.1; the pool itself is still allocated zeroed. Mamba and
+undeclared caches keep zeroing, and VLLM_KV_CACHE_POISON still fills.
+
+The rings' blocks come from the shared pool, so excluding FP32 rings from
+the precision rule would be wrong for models whose readers do not bound
+their reads; the declaration is per cache.
+
+Tests: the rule with and without the declaration, Mamba and the poison
+check (CPU); every spec merge keeps it; DS4.1's own window, compressed,
+index and ring specs declare it and skip zeroing.
+---
+ tests/models/test_deepseek_v4_1_compressor.py | 62 +++++++++++++++++++
+ tests/v1/core/test_kv_cache_utils.py          | 41 ++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  7 +++
+ vllm/models/deepseek_v4_1/compressor.py       |  3 +
+ vllm/v1/kv_cache_interface.py                 | 39 +++++++++++-
+ 5 files changed, 149 insertions(+), 3 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index ddb9ad232..afcc748ad 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -24,6 +24,68 @@ def test_compressor_cache_rejects_duplicate_prefix_without_replacing_owner():
+     assert config.compilation_config.static_forward_context[other.prefix] is other
+ 
+ 
++@pytest.mark.cpu_test
++def test_v41_caches_skip_per_allocation_zeroing(monkeypatch):
++    """DeepSeek V4.1's byte pages (window, compressed latents, index keys) sit
++    beside the compressors' FP32 rings, and every one declares that no unwritten
++    slot reaches a result, as DeepSeek's reference reads only written slots: the
++    cache is mixed-precision yet needs no per-allocation zeroing (its pool starts
++    zeroed). The poison check still fills every new block."""
++    from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention, _Cache
++    from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
++    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
++
++    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    ratios = [0] * 43
++    ratios[2], ratios[20] = 2, 1
++    config = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=256, swa_block_size=None),
++        compilation_config=SimpleNamespace(static_forward_context={}),
++        model_config=SimpleNamespace(
++            hf_config=SimpleNamespace(
++                num_hidden_layers=40,
++                kv_source_layer_ids=[2, 20],
++                compress_ratios=ratios,
++            )
++        ),
++        speculative_config=None,
++    )
++    specs = {}
++    for layer in (0, 2, 20, 24, 40):  # target, KV sources, CED decoder, drafter
++        cache = _Cache(
++            config,
++            f"model.layers.{layer}.self_attn.swa_cache",
++            kind="swa",
++            window=128,
++            draft=layer >= 40,
++        )
++        specs[cache.prefix] = cache.get_kv_cache_spec(config)
++    for layer, ratio in ((2, 2), (20, 1)):
++        prefix = f"model.layers.{layer}.self_attn"
++        specs[prefix] = DeepseekV4Attention.get_kv_cache_spec(
++            SimpleNamespace(is_kv_source=True, compress_ratio=ratio), config
++        )
++        index = _Cache(config, f"{prefix}.indexer.k_cache", kind="index", ratio=ratio)
++        specs[index.prefix] = index.get_kv_cache_spec(config)
++    ring = CompressorStateCache(
++        config, "model.layers.2.self_attn.compressor.state_cache"
++    )
++    specs[ring.prefix] = ring.get_kv_cache_spec(config)
++
++    assert all(spec.uses_only_written_slots for spec in specs.values())
++    cache = KVCacheConfig(
++        num_blocks=4,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec([name], spec) for name, spec in specs.items()
++        ],
++    )
++    assert cache.has_mixed_precision_kv_cache
++    assert not cache.needs_kv_cache_zeroing
++    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    assert cache.needs_kv_cache_zeroing
++
++
+ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+     """Ring metadata emits a write only for rows with a valid worker slot. With
+     the runner's per-spec settings, a verify step past the ring capacity writes
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index e5fe6102d..a195321ab 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -5143,6 +5143,47 @@ def test_ds41_shaped_cache_zeroing_comes_from_the_fp32_compressor_ring():
+     ).needs_kv_cache_zeroing
+ 
+ 
++def test_caches_using_only_written_slots_skip_per_allocation_zeroing(monkeypatch):
++    """A mixed-precision cache whose layers all declare that no unwritten slot
++    reaches a result (DeepSeek V4.1, as its reference) needs no zeroing; one layer
++    without the declaration, or a Mamba layer, keeps it. The poison check still
++    fills."""
++    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    common = dict(num_kv_heads=1, head_size=1, uses_only_written_slots=True)
++    window = SlidingWindowMLASpec(
++        block_size=4, sliding_window=8, dtype=torch.uint8, **common
++    )
++    compressed = MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common)
++    ring = CircularBufferSpec(block_size=4, dtype=torch.float32, **common)
++    bounded = _zeroing_config(window=window, compressed=compressed, ring=ring)
++    assert bounded.has_mixed_precision_kv_cache
++    assert bounded.attention_uses_only_written_slots
++    assert not bounded.needs_kv_cache_zeroing
++
++    unbounded = replace(ring, uses_only_written_slots=False)
++    assert _zeroing_config(
++        window=window, compressed=compressed, ring=unbounded
++    ).needs_kv_cache_zeroing
++    mamba = MambaSpec(block_size=4, shapes=((4, 1),), dtypes=(torch.float32,))
++    assert _zeroing_config(window=window, ring=ring, mamba=mamba).needs_kv_cache_zeroing
++    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    assert bounded.needs_kv_cache_zeroing
++
++
++@pytest.mark.parametrize("bounded", [False, True])
++def test_written_slot_declaration_survives_group_merges(bounded):
++    """Each merge that rebuilds a spec field by field keeps the declaration."""
++    common = dict(num_kv_heads=1, head_size=1, uses_only_written_slots=bounded)
++    for spec in (
++        SlidingWindowMLASpec(
++            block_size=4, sliding_window=8, dtype=torch.uint8, **common
++        ),
++        MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common),
++        FullAttentionSpec(block_size=4, dtype=torch.bfloat16, **common),
++    ):
++        assert type(spec).merge([spec, spec]).uses_only_written_slots == bounded
++
++
+ def test_kv_cache_poison_forces_the_fill(monkeypatch):
+     """``VLLM_KV_CACHE_POISON`` runs the new-block fill for a cache that skips
+     zeroing (it fills with NaN bytes, never zeros)."""
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index b5c020525..c3608733b 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -278,6 +278,11 @@ class _Cache(nn.Module, AttentionLayerBase):
+         self.kv_cache = cache.view(cache.shape[0], -1)
+ 
+     def get_kv_cache_spec(self, config):
++        # No V4.1 kernel uses a slot its block's owner has not written, as in
++        # DeepSeek's reference: windows start at the request's replay start, the
++        # sparse MLA never loads a masked entry, the indexer stores no score past
++        # the visible positions (its last tile's stale rows are discarded), and
++        # the compressor reads only a slot it wrote. Reused blocks need no zeros.
+         common = dict(
+             block_size=self.block_size,
+             num_kv_heads=1,
+@@ -287,6 +292,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+             tokens_per_state=self.ratio,
+             cache_dtype_str="b12x_dsv41",
+             alignment=None,
++            uses_only_written_slots=True,
+         )
+         if self.kind == "swa":
+             boundary = ced_decoder_start(config.model_config.hf_config)
+@@ -644,6 +650,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             tokens_per_state=self.compress_ratio,
+             cache_dtype_str="b12x_dsv41",
+             alignment=None,
++            uses_only_written_slots=True,
+         )
+ 
+     def bind_kv_cache(self, cache):
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 13274662a..203131348 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -106,12 +106,15 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
+         self.kv_cache = cache.view(cache.shape[0], -1)
+ 
+     def get_kv_cache_spec(self, config):
++        # The gather reads a request's slot only after the request wrote it (an
++        # odd first position; every ring starts at an even one).
+         return CircularBufferSpec(
+             block_size=self.block_size,
+             num_kv_heads=1,
+             head_size=1024,
+             head_size_v=0,
+             dtype=torch.float32,
++            uses_only_written_slots=True,
+         )
+ 
+     def get_attn_backend(self):
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index be1d35f1a..48d2e9e33 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -507,6 +507,13 @@ class AttentionSpec(KVCacheSpec):
+     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+     dcp_replicated: bool = False
+     """Whether every DCP rank stores the complete KV cache for this layer."""
++    uses_only_written_slots: bool = False
++    """Whether no value of a slot unwritten in the block's current ownership
++    reaches a result of any kernel reading this cache: reads bounded to the
++    written positions, entries skipped by index (DeepSeek V4.1's reference does
++    both), or work on loaded stale rows discarded whole. A cache whose layers
++    all declare it needs no per-allocation zeroing: a reused block's stale
++    bytes, of whatever precision, never matter."""
+ 
+     def __post_init__(self):
+         if self.head_size_v is None:
+@@ -641,6 +648,7 @@ class FullAttentionSpec(AttentionSpec):
+             # non-causal so the engine core disables incompatible scheduling.
+             non_causal=any(spec.non_causal for spec in specs),
+             dcp_replicated=dcp_replicated.pop(),
++            uses_only_written_slots=specs[0].uses_only_written_slots,
+         )
+         for spec in specs:
+             for f in fields(AttentionSpec):
+@@ -755,6 +763,7 @@ class MLAAttentionSpec(FullAttentionSpec):
+                 spec.non_causal_multi_token_decode for spec in specs
+             ),
+             dcp_replicated=dcp_replicated_set.pop(),
++            uses_only_written_slots=specs[0].uses_only_written_slots,
+         )
+         for spec in specs:
+             for f in fields(AttentionSpec):
+@@ -811,6 +820,7 @@ class RSWASpec(FullAttentionSpec):
+             attention_chunk_size=base.attention_chunk_size,
+             non_causal=base.non_causal,
+             dcp_replicated=base.dcp_replicated,
++            uses_only_written_slots=base.uses_only_written_slots,
+             rswa_window=rswa_windows.pop(),
+         )
+ 
+@@ -1005,6 +1015,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
+         prefix_policy_set = {
+             (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
+         }
++        bounded_reads_set = {spec.uses_only_written_slots for spec in specs}
+         assert (
+             len(cache_dtype_str_set) == 1
+             and len(tokens_per_state_set) == 1
+@@ -1014,11 +1025,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
+             and len(dcp_replicated_set) == 1
+             and len(non_causal_set) == 1
+             and len(prefix_policy_set) == 1
++            and len(bounded_reads_set) == 1
+         ), (
+             "All attention layers in the same KV cache group must use the same "
+             "quantization method, tokens per state, model version, sliding "
+             "window size, retained token count, DCP replication mode, "
+-            "non-causal mode, and prefix policy."
++            "non-causal mode, prefix policy and written-slot use."
+         )
+         return cls(
+             block_size=specs[0].block_size,
+@@ -1037,6 +1049,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
+             non_causal_multi_token_decode=non_causal_set.pop(),
+             prefix_cache_enabled=specs[0].prefix_cache_enabled,
+             prefill_replay_window=specs[0].prefill_replay_window,
++            uses_only_written_slots=bounded_reads_set.pop(),
+         )
+ 
+     def is_uniform_with_collection(
+@@ -1292,6 +1305,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
+             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
+             non_causal=any(spec.non_causal for spec in specs),
+             dcp_replicated=dcp_replicated.pop(),
++            uses_only_written_slots=specs[0].uses_only_written_slots,
+         )
+         for spec in specs:
+             for f in fields(AttentionSpec):
+@@ -1697,6 +1711,20 @@ class KVCacheConfig:
+             )
+         return len(kv_cache_precisions) > 1
+ 
++    @property
++    def attention_uses_only_written_slots(self) -> bool:
++        """Whether every device attention layer declares that no value of a slot
++        unwritten in the block's current ownership reaches its kernels' results
++        (``AttentionSpec.uses_only_written_slots``)."""
++        specs = [
++            spec
++            for group in self.kv_cache_groups
++            if not group.host_resident
++            for spec in iter_layer_specs(group.kv_cache_spec)
++            if isinstance(spec, AttentionSpec)
++        ]
++        return bool(specs) and all(spec.uses_only_written_slots for spec in specs)
++
+     @property
+     def needs_kv_cache_zeroing(self) -> bool:
+         """Whether newly allocated KV cache blocks must be zeroed before use.
+@@ -1704,12 +1732,17 @@ class KVCacheConfig:
+         Required for Mamba layers, whose state is read before it is fully written
+         (#35219), and for mixed-precision caches, where a block reused across
+         groups can be reinterpreted under a different precision and decode stale
+-        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
++        bytes to NaN/Inf. Uniform-precision caches skip zeroing, and so do caches
++        whose readers use only written slots: their reused blocks' stale bytes
++        never reach a result. The pool itself starts zeroed either way.
+         ``VLLM_KV_CACHE_POISON`` (debug) runs the fill for every cache, with
+         NaN bytes in place of zeros.
+         """
+         return (
+             self.has_mamba_layers
+-            or self.has_mixed_precision_kv_cache
++            or (
++                self.has_mixed_precision_kv_cache
++                and not self.attention_uses_only_written_slots
++            )
+             or envs.VLLM_KV_CACHE_POISON
+         )

@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:52:01 +0100
+Subject: [PATCH 503/503] [DS4.1] Indexer scores read no key past the visible
+ positions
+
+DeepSeek V4.1's reference indexer reads index_k[:, : end_pos // ratio]
+and nothing past it. The TileLang score kernel loaded whole 64-row tiles,
+so the last tile's rows past a row's extent read keys and scale words of
+slots nobody had written (the rest of the last visible position's page),
+then discarded their scores at the store. Those rows' key and scale loads
+are now predicated off and they score zeros, which the store still drops.
+Only the loads are predicated: the page read stays unconditional, so a dense
+tile's addresses stay affine and its 32 loads a thread still issue together.
+The extent joins the bounds check TileLang already puts on each load; nvcc
+had unswitched the release's uniform form of that check into branches, and
+the per-row form compiles straight-line (127 registers; the release's 124).
+Candidate mode is unchanged: its source layer writes the list whole, -1
+padded, so rows past a list's length load position 0, which is visible, as
+a masked candidate does. Stored scores are bit for bit as before: rows are
+independent in the block-scaled MMA, and the rows that changed are the ones
+the store drops.
+
+Tests: compute-sanitizer's initcheck scores a cache written only at the
+visible positions (dense and by candidates, 128- and 256-row pages, extents
+inside a tile) and must report no read of the rest; skipped where no
+sanitizer is found (COMPUTE_SANITIZER names one). NaN bytes in every slot
+past the extent leave every stored score bit-identical.
+benchmark_deepseek_v41_indexer_bound.py times the kernel against the
+release's at 1M-context depths, dense and by candidates, after a
+bit-for-bit comparison, and gates on it being slower at no case.
+---
+ .../benchmark_deepseek_v41_indexer_bound.py   | 201 ++++++++++++++++++
+ .../attention/deepseek_v41_indexer_reads.py   | 120 +++++++++++
+ .../attention/test_deepseek_v41_tilelang.py   |  74 +++++++
+ vllm/models/deepseek_v4_1/attention.py        |   6 +-
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  34 ++-
+ 5 files changed, 425 insertions(+), 10 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
+ create mode 100644 tests/kernels/attention/deepseek_v41_indexer_reads.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py b/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
+new file mode 100644
+index 000000000..d3c7c104d
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired timing of DeepSeek-V4.1's indexer score kernel with its last tile bounded to
++the visible positions against the release's (``--baseline``, the release's
++``tilelang/indexer.py``), which loads that tile's rows past them.
++
++The bound predicates a dense row's key and scale loads past its extent off; addresses,
++the page read and the load count are the release's. Candidate mode is the release's
++kernel (its lists are -1 padded, so rows past a list load position 0), timed to show
++it. Cases are decode steps (6 rows: one stream's 1 + 5 drafts; 96: sixteen streams')
++at extents ending inside a tile, on the ratio-2 caches' 128-row pages and layer 20's
++256-row pages, up to a 1M-token context's 524,288 and 1,048,576 compressed positions.
++Candidate cases score a reindex layer's candidate list (``CANDIDATE_BLOCKS *
++CANDIDATE_BLOCK`` sorted positions with -1 padding, one masked) at the deepest
++extents.
++
++For each case both kernels first score the same inputs, compared bit for bit over the
++visible positions. CUDA graphs of 20 launches of each then run back to back on eight
++fresh inputs, alternating which goes first; the case's 95% interval comes from the
++eight per-input differences. The gate (``--gate``) is that the bounded kernel is
++slower at no case: no interval lies wholly above zero.
++"""
++
++import argparse
++import importlib.util
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import indexer
++
++DEVICE = "cuda"
++CALLS, INPUTS = 20, 8
++ROWS = {"c1": 6, "c16": 96}
++# (page size, planned width, visible positions): a 1M context's compressed positions
++# at ratio 2 (128-row pages) and 1 (256-row pages), at several depths.
++EXTENTS = [
++    (128, 524288, 4133),
++    (128, 524288, 65573),
++    (128, 524288, 524261),
++    (256, 1048576, 8229),
++    (256, 1048576, 1048549),
++]
++CANDIDATE_EXTENTS = [(128, 524288, 524261), (256, 1048576, 1048549)]
++T_95 = 2.365  # Student's t, 7 degrees of freedom
++
++
++def baseline_module(path: str):
++    package = "vllm.models.deepseek_v4_1.tilelang"
++    spec = importlib.util.spec_from_file_location(f"{package}._release_indexer", path)
++    module = importlib.util.module_from_spec(spec)
++    module.__package__ = package
++    spec.loader.exec_module(module)
++    return module
++
++
++def inputs(rows: int, page_size: int, width: int, extent: int, seed: int) -> list:
++    """Random MXFP4 bytes; every row reads the same pages in its own order."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    pages = -(-width // page_size)
++    nbytes = indexer.page_bytes(page_size)
++    pool = torch.randint(
++        0, 256, (pages, nbytes), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    pool[:, page_size * 64 :] = torch.randint(
++        120, 130, (pages, page_size * 4), generator=gen, device=DEVICE,
++        dtype=torch.uint8,
++    )  # fmt: skip
++    table = torch.stack(
++        [torch.randperm(pages, generator=gen, device=DEVICE) for _ in range(rows)]
++    ).to(torch.int32)
++    heads, dim = indexer.INDEX_HEADS, indexer.INDEX_DIM
++    q = torch.randint(
++        0, 256, (rows, heads, dim // 2), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    q_scales = torch.randint(
++        120, 130, (rows, heads, 4), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    weights = (torch.randn((rows, heads), generator=gen, device=DEVICE) / 64).bfloat16()
++    lengths = torch.full((rows,), extent, dtype=torch.int32, device=DEVICE)
++    active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
++    return [
++        q.view(torch.int8),
++        q_scales.view(torch.uint32).reshape(rows, -1),
++        weights,
++        pool.view(torch.int8),
++        pool.view(torch.uint32),
++        table,
++        lengths,
++        active,
++    ]
++
++
++def candidate_inputs(
++    rows: int, page_size: int, width: int, extent: int, seed: int
++) -> list:
++    """``inputs`` plus each row's candidate list: sorted visible positions, one of them
++    masked (-1), -1 padded, with lengths ending inside a tile."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed + 1)
++    span = indexer.CANDIDATE_BLOCKS * indexer.CANDIDATE_BLOCK
++    count = span - 3
++    chosen = torch.full((rows, span), -1, dtype=torch.int32, device=DEVICE)
++    for r in range(rows):
++        picked = torch.randperm(extent, generator=gen, device=DEVICE)[:count]
++        chosen[r, :count] = picked.sort().values.int()
++        chosen[r, count // 3] = -1
++    lengths = torch.tensor(
++        [count - 37 * r for r in range(rows)], dtype=torch.int32, device=DEVICE
++    )
++    return inputs(rows, page_size, width, extent, seed) + [chosen, lengths]
++
++
++def graph(score, args, scores) -> torch.cuda.CUDAGraph:
++    score(*args, scores)  # warm
++    torch.accelerator.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for _ in range(CALLS):
++            score(*args, scores)
++    return g
++
++
++def timed(g: torch.cuda.CUDAGraph) -> float:
++    start, end = (
++        torch.cuda.Event(enable_timing=True),
++        torch.cuda.Event(enable_timing=True),
++    )
++    start.record()
++    g.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 1e3 / CALLS  # us a launch
++
++
++def case(
++    release, rows: int, page_size: int, width: int, extent: int, candidates: bool
++) -> dict:
++    # Candidate plans score a list as wide as the candidate blocks; both kernels leave
++    # the same zeros past each row's length, so whole rows compare.
++    span = indexer.CANDIDATE_BLOCKS * indexer.CANDIDATE_BLOCK if candidates else width
++    compared = span if candidates else extent
++    bounded = indexer.IndexerV41Plan(span, page_size, candidates=candidates).score
++    unbounded = release.IndexerV41Plan(span, page_size, candidates=candidates).score
++    make = candidate_inputs if candidates else inputs
++    differences, times = [], {"bounded": [], "release": []}
++    for i in range(INPUTS):
++        args = make(rows, page_size, width, extent, seed=1000 * i + extent)
++        mine = torch.zeros((rows, span), dtype=torch.bfloat16, device=DEVICE)
++        theirs = torch.zeros_like(mine)
++        bounded(*args, mine)
++        unbounded(*args, theirs)
++        torch.accelerator.synchronize()
++        same = torch.equal(
++            mine[:, :compared].view(torch.int16), theirs[:, :compared].view(torch.int16)
++        )
++        assert same, (rows, extent, candidates)
++        graphs = {"bounded": graph(bounded, args, mine),
++                  "release": graph(unbounded, args, theirs)}  # fmt: skip
++        order = ("bounded", "release") if i % 2 == 0 else ("release", "bounded")
++        measured = {name: timed(graphs[name]) for name in order}
++        for name, value in measured.items():
++            times[name].append(value)
++        differences.append(measured["bounded"] - measured["release"])
++    mean = statistics.fmean(differences)
++    half = T_95 * statistics.stdev(differences) / math.sqrt(INPUTS)
++    return {
++        "rows": rows, "candidates": candidates, "page_size": page_size,
++        "extent": extent,
++        "bounded_us": statistics.median(times["bounded"]),
++        "release_us": statistics.median(times["release"]),
++        "difference_us": mean, "ci95_us": half,
++        "slower": mean - half > 0,
++    }  # fmt: skip
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--baseline", required=True, help="the release's indexer.py")
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    release = baseline_module(args.baseline)
++    results = []
++    cases = [(False, *e) for e in EXTENTS] + [(True, *e) for e in CANDIDATE_EXTENTS]
++    for name, rows in ROWS.items():
++        for candidates, page_size, width, extent in cases:
++            result = {
++                "case": name,
++                **case(release, rows, page_size, width, extent, candidates),
++            }
++            results.append(result)
++            print(json.dumps(result), flush=True)
++    slower = [r for r in results if r["slower"]]
++    print(json.dumps({"summary": "indexer read bound", "cases": len(results),
++                      "slower": len(slower)}), flush=True)  # fmt: skip
++    return 1 if args.gate and slower else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/kernels/attention/deepseek_v41_indexer_reads.py b/tests/kernels/attention/deepseek_v41_indexer_reads.py
+new file mode 100644
+index 000000000..9e4799bd6
+--- /dev/null
++++ b/tests/kernels/attention/deepseek_v41_indexer_reads.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The DeepSeek-V4.1 indexer's score kernel over an index cache whose slots past each
++row's visible positions were never written, for ``compute-sanitizer --tool
++initcheck``: the sanitizer reports a read of any of them.
++
++usage: compute-sanitizer --tool initcheck --error-exitcode 1 \\
++           python deepseek_v41_indexer_reads.py [--module PATH]
++
++Run with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1``, so every tensor is its own fresh
++allocation and its unwritten bytes stay uninitialized. Every input but the pool is
++written whole, and the scores are written before the kernel runs; the pool's keys and
++scale words are written only at the visible positions of each row's pages. The extents
++end inside a 64-row tile, on pages of 128 and 256 rows, in dense and candidate mode.
++``--module`` scores with another copy of ``tilelang/indexer.py`` (the release's, as a
++positive control: before its read bound it loads the last tile's rows past the extent).
++"""
++
++import argparse
++import importlib.util
++
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import indexer
++
++DEVICE = "cuda"
++# (page size, visible positions per row): extents inside a tile, a tile long, and past
++# several pages; rows of one case have different extents.
++CASES = [(128, (1, 37, 64, 300)), (256, (100, 1061, 4133))]
++
++
++def module(path: str | None):
++    if path is None:
++        return indexer
++    package = "vllm.models.deepseek_v4_1.tilelang"
++    spec = importlib.util.spec_from_file_location(f"{package}._release_indexer", path)
++    loaded = importlib.util.module_from_spec(spec)
++    loaded.__package__ = package
++    spec.loader.exec_module(loaded)
++    return loaded
++
++
++def run_case(mod, page_size: int, extents: tuple[int, ...], candidates: bool) -> None:
++    rows, heads, dim = len(extents), mod.INDEX_HEADS, mod.INDEX_DIM
++    gen = torch.Generator(device=DEVICE).manual_seed(page_size + rows)
++    logical = max(-(-e // page_size) for e in extents)
++    width = logical * page_size
++    pool_pages = logical * rows + 1
++    nbytes = mod.page_bytes(page_size)
++    # Never written but at the visible positions below (a fresh allocation).
++    pool = torch.empty((pool_pages, nbytes), dtype=torch.uint8, device=DEVICE)
++    page_table = (
++        torch.randperm(pool_pages - 1, generator=gen, device=DEVICE)[: logical * rows]
++        .add(1)
++        .view(rows, logical)
++        .to(torch.int32)
++    )
++    for r, extent in enumerate(extents):
++        positions = torch.arange(extent, device=DEVICE)
++        pages = page_table[r, positions // page_size].long()
++        offsets = positions % page_size
++        keys = torch.randint(
++            0, 256, (extent, dim // 2), generator=gen, device=DEVICE, dtype=torch.uint8
++        )
++        scales = torch.randint(
++            120, 130, (extent, 4), generator=gen, device=DEVICE, dtype=torch.uint8
++        )
++        for byte in range(dim // 2):
++            pool[pages, offsets * (dim // 2) + byte] = keys[:, byte]
++        for byte in range(4):
++            pool[pages, page_size * (dim // 2) + offsets * 4 + byte] = scales[:, byte]
++    q = torch.randint(
++        0, 256, (rows, heads, dim // 2), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    q_scales = torch.randint(
++        120, 130, (rows, heads, 4), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    weights = (torch.randn((rows, heads), generator=gen, device=DEVICE) / 64).bfloat16()
++    lengths = torch.tensor(extents, dtype=torch.int32, device=DEVICE)
++    active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
++    args = [
++        q.view(torch.int8),
++        q_scales.view(torch.uint32).reshape(rows, -1),
++        weights,
++        pool.view(torch.int8),
++        pool.view(torch.uint32),
++        page_table,
++        lengths,
++        active,
++    ]
++    if candidates:
++        # Ascending visible positions, some masked; the counts end inside a tile.
++        chosen = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
++        counts = []
++        for r, extent in enumerate(extents):
++            n = max(1, extent * 2 // 3)
++            picked = torch.randperm(extent, generator=gen, device=DEVICE)[:n]
++            chosen[r, :n] = picked.sort().values.to(torch.int32)
++            chosen[r, n // 2] = -1
++            counts.append(n)
++        args += [chosen, torch.tensor(counts, dtype=torch.int32, device=DEVICE)]
++    scores = torch.zeros((rows, width), dtype=torch.bfloat16, device=DEVICE)
++    plan = mod.IndexerV41Plan(width, page_size, candidates=candidates)
++    plan.score(*args, scores)
++    torch.accelerator.synchronize()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--module", default=None)
++    args = parser.parse_args()
++    mod = module(args.module)
++    for page_size, extents in CASES:
++        for candidates in (False, True):
++            run_case(mod, page_size, extents, candidates)
++    print("scored", len(CASES) * 2, "cases")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index c166f5a7b..e3181d6f6 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -8,6 +8,12 @@ The sparse MLA stores WO-A's input: its output rotated back and through
+ ``act_quant`` (``wo_input``), checked bit for bit on its own.
+ """
+ 
++import os
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
+ import pytest
+ import torch
+ 
+@@ -407,6 +413,74 @@ def test_indexer_candidates(page_size=64, rows=3, context=8192):
+     assert torch.equal(out, expected)
+ 
+ 
++def _compute_sanitizer() -> str | None:
++    path = os.environ.get("COMPUTE_SANITIZER") or shutil.which("compute-sanitizer")
++    if path is None and os.path.exists("/usr/local/cuda/bin/compute-sanitizer"):
++        path = "/usr/local/cuda/bin/compute-sanitizer"
++    return path
++
++
++def test_indexer_reads_only_visible_rows():
++    """No key or scale past a row's visible positions is read, as DeepSeek's reference
++    reads ``index_k[:, : end_pos // ratio]``: compute-sanitizer's initcheck scores a
++    cache written only at the visible positions, dense and by candidates, and reports
++    any read of the rest (deepseek_v41_indexer_reads.py)."""
++    sanitizer = _compute_sanitizer()
++    if sanitizer is None:
++        pytest.skip("compute-sanitizer not found (COMPUTE_SANITIZER names it)")
++    script = Path(__file__).with_name("deepseek_v41_indexer_reads.py")
++    run = subprocess.run(
++        [sanitizer, "--tool", "initcheck", "--error-exitcode", "1",
++         sys.executable, str(script)],
++        env={**os.environ, "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"},
++        capture_output=True,
++        text=True,
++        timeout=3600,
++    )  # fmt: skip
++    report = run.stdout + run.stderr
++    assert run.returncode == 0 and "ERROR SUMMARY: 0 errors" in report, report[-6000:]
++
++
++@pytest.mark.parametrize("page_size", [128, 256])
++def test_indexer_scores_ignore_rows_past_the_extent(page_size, rows=4, context=9000):
++    """NaN bytes in every slot past a row's extent (a UE8M0 scale of 0xFF) leave every
++    stored score bit-identical: no row past the extent reaches a result."""
++    inp = _index_inputs(rows, context, page_size)
++    inp["lengths"][:] = torch.tensor([37, 1061, 4133, 8999], device=DEVICE)
++    width = (context + page_size - 1) // page_size * page_size
++    # Disjoint pages, so one row's poisoned tail is no other row's visible key.
++    logical = width // page_size
++    inp["page_table"] = (
++        torch.randperm(inp["pool"].shape[0], generator=_gen(5), device=DEVICE)
++        [: rows * logical]
++        .view(rows, logical)
++        .to(torch.int32)
++    )
++    plan = IndexerV41Plan(width, page_size)
++    names = (
++        "q_packed",
++        "q_scales",
++        "weights",
++        "pool",
++        "page_table",
++        "lengths",
++        "active",
++    )
++    _, clean = plan.run(*(inp[k] for k in names))
++    clean = clean.clone()
++    extent = _dense_extent(inp, width)
++    for r in range(rows):
++        for position in range(extent[r], width):
++            page = int(inp["page_table"][r, position // page_size])
++            offset = position % page_size
++            inp["pool"][page, offset * 64 : offset * 64 + 64] = 0xFF
++            words = page_size * 64 + offset * 4
++            inp["pool"][page, words : words + 4] = 0xFF
++    _, poisoned = plan.run(*(inp[k] for k in names))
++    for r in range(rows):
++        assert torch.equal(poisoned[r, : extent[r]], clean[r, : extent[r]]), r
++
++
+ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+     inp = _index_inputs(rows, context, page_size)
+     width = (context + page_size - 1) // page_size * page_size
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index c3608733b..191d13ace 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -280,9 +280,9 @@ class _Cache(nn.Module, AttentionLayerBase):
+     def get_kv_cache_spec(self, config):
+         # No V4.1 kernel uses a slot its block's owner has not written, as in
+         # DeepSeek's reference: windows start at the request's replay start, the
+-        # sparse MLA never loads a masked entry, the indexer stores no score past
+-        # the visible positions (its last tile's stale rows are discarded), and
+-        # the compressor reads only a slot it wrote. Reused blocks need no zeros.
++        # sparse MLA never loads a masked entry, the indexer reads no key past the
++        # visible positions, and the compressor reads only a slot it wrote.
++        # Reused blocks need no zeros.
+         common = dict(
+             block_size=self.block_size,
+             num_kv_heads=1,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 19d0c3971..5e273fdbf 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -109,13 +109,15 @@ def indexer_score_v41(
+     - ``Lengths``: ``[rows]`` int32 positions per row;
+     - ``Active``: ``[1]`` int32 width cap;
+     - candidate mode: ``Candidates`` ``[rows, width]`` int32 positions and
+-      ``CandidateLengths`` ``[rows]``.
++      ``CandidateLengths`` ``[rows]``; its source layer writes the list whole,
++      ``-1`` padded.
+ 
+     Writes ``Scores`` (``[rows, width]`` BF16) up to each row's extent, ``-inf``
+     for masked candidates; entries past the extent are left unwritten and the
+-    top-k never reads them. Each row gets at most ``max_ctas`` CTAs, which loop
+-    over its live tiles, so the launch scales with the context in use rather
+-    than the planned width.
++    top-k never reads them. No key or scale is read past the visible positions
++    either.
++    Each row gets at most ``max_ctas`` CTAs, which loop over its live tiles, so
++    the launch scales with the context in use rather than the planned width.
+     """
+     assert page_size % block_P == 0 or candidates, (
+         "dense tiles must not straddle a page"
+@@ -143,6 +145,7 @@ def indexer_score_v41(
+         extent,
+         position,
+         slot_valid,
++        loads,
+         Scores,
+     ):
+         K_shared = T.alloc_shared([block_P, D], fp4)
+@@ -161,21 +164,36 @@ def indexer_score_v41(
+             W_shared[h] = T.cast(Weights[row, h], accum_dtype)
+         for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
+             p0 = (cta + i * ctas) * block_P
+-            # Invalid slots load a clamped, in-pool key and are masked at the end.
++            # No load reaches past the visible positions (DeepSeek's reference reads
++            # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
++            # (a dense row's rows past its extent) load no key or scale and score
++            # zeros, which the store drops. Only the key and scale loads are
++            # predicated: the page read stays unconditional, so a dense tile's
++            # addresses stay affine and its loads issue together. Every candidate
++            # row loads: a masked or padding candidate is position 0, which is
++            # visible, and its score is masked at the end.
+             for p, d in T.Parallel(block_P, D):
+                 pos = position(p0, p)
+                 page = T.min(
+                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
+                     pool_pages - 1,
+                 )
+-                K_shared[p, d] = KPool[page, (pos % page_size) * D + d]
++                K_shared[p, d] = T.if_then_else(
++                    loads(p0, p),
++                    KPool[page, (pos % page_size) * D + d],
++                    T.cast(0, fp4),
++                )
+             for p in T.Parallel(block_P):
+                 pos = position(p0, p)
+                 page = T.min(
+                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
+                     pool_pages - 1,
+                 )
+-                SFK_shared[p, 0] = KScale[page, scale_word0 + pos % page_size]
++                SFK_shared[p, 0] = T.if_then_else(
++                    loads(p0, p),
++                    KScale[page, scale_word0 + pos % page_size],
++                    T.cast(0, T.uint32),
++                )
+             T.mma_gemm_blockscaled(
+                 K_shared,
+                 Q_shared,
+@@ -236,6 +254,7 @@ def indexer_score_v41(
+                     extent,
+                     lambda p0, p: p0 + p,
+                     lambda p0, p: True,
++                    lambda p0, p: p0 + p < extent,
+                     Scores,
+                 )
+ 
+@@ -269,6 +288,7 @@ def indexer_score_v41(
+                 extent,
+                 lambda p0, p: T.max(Candidates[row, T.min(p0 + p, width - 1)], 0),
+                 lambda p0, p: Candidates[row, T.min(p0 + p, width - 1)] >= 0,
++                lambda p0, p: True,
+                 Scores,
+             )
+ 

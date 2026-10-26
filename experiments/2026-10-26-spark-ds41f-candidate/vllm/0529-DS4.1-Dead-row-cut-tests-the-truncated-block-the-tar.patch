@@ -1,0 +1,693 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:05:59 +0100
+Subject: [PATCH 529/529] [DS4.1] Dead-row cut tests: the truncated block, the
+ target's law, greedy as before
+
+With a dead-row cut and whatever the dead rows hold (random, a draft made
+certain or impossible, NaN, an infinite draft logit, noise at 1e4):
+
+- verification's and resampling's outputs are, bit for bit, those of the same
+  drafts with the drafts from each cut on as -1 placeholders;
+- rejection_sample commits for each sampled request what it commits with its
+  draft truncated at its cut, and for each greedy request what it committed
+  with its count capped at the cut plus one;
+- the committed tokens pass the chi-squared test against the target at every
+  position up to each cut; the positive control, the uncut scan capped after,
+  fails it with NaN dead rows (and differs from the truncated block bit for
+  bit with random ones);
+- a captured rejection_sample reads the cut on each replay, the sink's
+  candidates treat a draw at the cut as the bonus, and the step declares the
+  cut's kernels (and refuses block verification the TileLang kernels do not
+  serve).
+---
+ .../test_rejection_sampler_utils.py           | 205 ++++++++++-
+ .../v1/spec_decode/test_tilelang_rejection.py | 322 +++++++++++++++++-
+ tests/v1/worker/test_gpu_tilelang_sampling.py |  35 ++
+ 3 files changed, 542 insertions(+), 20 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index 0e0d761a7..8e6b86bc8 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -736,6 +736,75 @@ def test_block_verification_rejection_sample(
+         )
+ 
+ 
++@pytest.mark.parametrize("garbage", ["random", "nan"])
++def test_block_verification_with_dead_rows_keeps_the_target(garbage: str):
++    """With adaptive verification's dead-row cut, block verification of one-hot
++    drafts (the TileLang kernels) commits tokens distributed as the target at
++    every position up to the cut, whatever the rows past it hold (``garbage``):
++    each trial's rows past its cut (0 to 4 of 5 drafts live) are random or NaN, and
++    at every position the tokens of the trials that reach it pass the chi-squared
++    test, cut by cut.
++
++    The positive control: verifying every draft and capping the count at the cut
++    plus one afterwards (the cut left out of verification) fails it with NaN dead
++    rows. A NaN draft probability sets the threshold of the step before it to 1 and
++    the ratio after it back to 1, so every draft is accepted and the capped count
++    commits the drafts as they are. (With finite dead rows the capped count has the
++    truncated block's law: block verification reaches step i with probability p_i
++    whatever the later rows hold.)
++    """
++    torch.manual_seed(1017)
++    device = "cuda"
++    k = 5
++    num_trials = 2 * NARROW_NUM_TRIALS
++    tokens = torch.arange(NARROW_VOCAB_SIZE, device=device, dtype=torch.float32)
++    # A peaked target, so later positions are reached, and drafts centred one token
++    # off it (one-hot acceptance 0.25, total variation 0.35 from the target).
++    target_logits_1d = -0.8 * tokens
++    draft_logits_1d = -0.8 * (tokens - 1).abs()
++    inputs = _build_rejection_sample_inputs(
++        target_logits_1d, draft_logits_1d, k, temperature=1.0, num_trials=num_trials
++    )
++    inputs["draft_logits"] = None
++    cut = (torch.arange(num_trials, device=device) % k).to(torch.int32)
++    # Row j of a trial is draft j - 1's input: dead past the cut.
++    rows = inputs["target_logits"].view(num_trials, k + 1, NARROW_VOCAB_SIZE)
++    dead = torch.arange(k + 1, device=device)[None, :] > cut[:, None]
++    if garbage == "nan":
++        rows[dead] = float("nan")
++    else:
++        rows[dead] = 4 * torch.randn(int(dead.sum()), NARROW_VOCAB_SIZE, device=device)
++
++    sampled, num_sampled = rejection_sample(
++        **inputs,
++        num_speculative_steps=k,
++        use_block_verification=True,
++        dead_row_cut=cut,
++    )
++    assert (num_sampled <= cut + 1).all()
++    target_probs = torch.softmax(target_logits_1d, dim=0)
++    for c in range(k):
++        for pos in range(c + 1):
++            reached = (cut == c) & (num_sampled >= pos + 1)
++            _assert_distribution_match(
++                sampled[reached, pos],
++                target_probs,
++                device,
++                label=f"cut {c}, position {pos}",
++            )
++
++    if garbage == "nan":
++        capped_sampled, capped = rejection_sample(
++            **inputs, num_speculative_steps=k, use_block_verification=True
++        )
++        capped = torch.minimum(capped, cut + 1)
++        reached = (cut == 2) & (capped >= 1)
++        with pytest.raises(AssertionError, match="Chi-squared test failed"):
++            _assert_distribution_match(
++                capped_sampled[reached, 0], target_probs, device, label="capped"
++            )
++
++
+ @pytest.mark.parametrize("num_speculative_steps", [3, 5])
+ def test_block_verification_accepts_at_least_as_many(num_speculative_steps: int):
+     """
+@@ -1411,11 +1480,10 @@ def test_insert_resampled_caps_counts_at_the_dead_row_cut(blocks, index_dtype):
+         assert torch.equal(counts, expected_counts)
+ 
+ 
+-@pytest.mark.parametrize("temperature", [0.0, 1.0])
+-def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+-    """``rejection_sample(..., dead_row_cut=cut)`` is ``torch.minimum(num_sampled,
+-    cut + 1)`` of the uncapped verification, the written tokens unchanged, on the
+-    production path (block verification, one-hot drafts, FP32 draws)."""
++def _dead_row_inputs(temperature):
++    """Nine requests of five drafts on the production path's shapes (DeepSeek
++    V4.1's vocabulary), and cuts from none live to all of them and past them (a
++    request the draft combine does not clamp)."""
+     torch.manual_seed(5309)
+     inputs = _build_rejection_sample_inputs(
+         torch.randn(129280, device="cuda"),
+@@ -1425,10 +1493,20 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+         num_trials=9,
+     )
+     inputs["draft_logits"] = None
++    cut = torch.tensor([0, 1, 2, 3, 4, 5, 9, 2, 0], dtype=torch.int32, device="cuda")
++    return inputs, cut
++
++
++def test_greedy_rejection_sample_with_dead_row_cut_is_the_minimum():
++    """At temperature 0, ``rejection_sample(..., dead_row_cut=cut)`` is
++    ``torch.minimum(num_sampled, cut + 1)`` of verification without the cut, with
++    the same committed tokens, on the production path (block verification, one-hot
++    drafts, FP32 draws): greedy verification goes token by token, and the cut's row
++    gives its target argmax either way."""
++    inputs, cut = _dead_row_inputs(0.0)
+     sampled, num_sampled = rejection_sample(
+         **inputs, num_speculative_steps=5, use_block_verification=True
+     )
+-    cut = torch.tensor([0, 1, 2, 3, 4, 5, -1, 2, 0], dtype=torch.int32, device="cuda")
+     capped_sampled, capped = rejection_sample(
+         **inputs,
+         num_speculative_steps=5,
+@@ -1436,22 +1514,39 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+         dead_row_cut=cut,
+     )
+     assert torch.equal(capped, torch.minimum(num_sampled, cut + 1))
+-    # Both leave the columns past the uncapped count unwritten (``new_empty``), and
+-    # the cap moves no token: compare the written columns, which are the same.
+-    written = torch.arange(6, device="cuda")[None, :] < num_sampled[:, None]
+-    assert torch.equal(capped_sampled[written], sampled[written])
++    committed = torch.arange(6, device="cuda")[None, :] < capped[:, None]
++    assert torch.equal(capped_sampled[committed], sampled[committed])
+ 
+ 
+-@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
+-def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, watermark):
+-    """A step that can have dead rows declares the capped insertion beside the
+-    uncapped one, for every index dtype, before the cache freezes."""
++def test_sampled_rejection_sample_ends_each_block_at_its_dead_row_cut():
++    """At temperature 1, ``rejection_sample(..., dead_row_cut=cut)`` commits what
++    verification commits with the drafts from each request's cut on as -1
++    placeholders, which end a block: at most the cut plus one tokens."""
++    inputs, cut = _dead_row_inputs(1.0)
++    sampled, num_sampled = rejection_sample(
++        **inputs,
++        num_speculative_steps=5,
++        use_block_verification=True,
++        dead_row_cut=cut,
++    )
++    drafts = inputs["draft_sampled"].view(9, 6).clone()
++    drafts[torch.arange(6, device="cuda")[None, :] > cut[:, None]] = -1
++    expected, counts = rejection_sample(
++        **{**inputs, "draft_sampled": drafts.view(-1)},
++        num_speculative_steps=5,
++        use_block_verification=True,
++    )
++    assert torch.equal(num_sampled, counts)
++    assert (num_sampled <= cut + 1).all()
++    committed = torch.arange(6, device="cuda")[None, :] < counts[:, None]
++    assert torch.equal(sampled[committed], expected[committed])
++
++
++def _rejection_sampler_owner(monkeypatch, *, block, watermark=None, fp64=False):
++    """A RejectionSampler with just what ``register_warmups`` reads."""
+     from types import SimpleNamespace
+ 
+-    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+-    from vllm.models.deepseek_v4_1.tilelang import prepare
+     from vllm.v1.worker.gpu.spec_decode import rejection_sampler as module
+-    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
+ 
+     monkeypatch.setattr(
+         module,
+@@ -1461,9 +1556,23 @@ def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, water
+         ),
+     )
+     owner = module.RejectionSampler.__new__(module.RejectionSampler)
+-    owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
++    owner.sampler = SimpleNamespace(use_fp64_gumbel=fp64)
+     owner.num_speculative_steps = 5
+     owner.watermark_key = watermark
++    owner.use_block_verification = block
++    return owner
++
++
++@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
++def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, watermark):
++    """A step that can have dead rows and verifies draft by draft declares the
++    capped insertion beside the uncapped one, for every index dtype, before the
++    cache freezes."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
++
++    owner = _rejection_sampler_owner(monkeypatch, block=False, watermark=watermark)
+     registry = JitWarmupRegistry(None)
+     with registry.activate():
+         owner.register_warmups(
+@@ -1483,3 +1592,63 @@ def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, water
+         for limited in (False, True)
+     }
+     prepare.prepare_declared(registry)
++
++
++def test_dead_rows_with_block_verification_declare_the_cut(monkeypatch):
++    """Block verification ends each block at the dead-row cut instead of capping
++    the count after it: a step that can have dead rows declares the uncapped
++    insertion only, and verification and resampling with the cut."""
++    from types import SimpleNamespace
++
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.spec_decode import tilelang_rejection as tlr
++    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
++
++    owner = _rejection_sampler_owner(monkeypatch, block=True)
++    owner.sampler = SimpleNamespace(use_fp64_gumbel=False, logprobs_mode="raw_logprobs")
++    owner.synthetic_conditional_rates = None
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        owner.register_warmups(
++            logits=[(torch.float32, 129280)],
++            processed_logits=[(torch.float32, 129280)],
++            vocab_size=129280,
++            has_draft_logits=False,
++            dead_rows=True,
++        )
++    calls = prepare.declared_calls(registry)
++    inserts = {
++        (args[0], args[2], args[-1]) for f, args, _ in calls if f is insert_kernel
++    }
++    assert inserts == {(127, index, False) for index in ("int32", "int64")}
++    cuts = {
++        args[-1]
++        for f, args, _ in calls
++        if f is tlr.verify_kernel or f is tlr.resample_kernel
++    }
++    assert cuts == {False, True}
++
++
++@pytest.mark.parametrize(
++    "draft_logits,watermark,fp64",
++    [(True, None, False), (False, 42, False), (False, None, True)],
++)
++def test_dead_rows_refuse_block_verification_the_tilelang_kernels_do_not_serve(
++    monkeypatch, draft_logits, watermark, fp64
++):
++    """Block verification with draft logits, a watermark or FP64 draws runs as the
++    Triton kernels, which weigh every draft of a block against the rows after it:
++    with dead rows it is refused when the step's kernels are declared, before
++    anything is served."""
++    owner = _rejection_sampler_owner(
++        monkeypatch, block=True, watermark=watermark, fp64=fp64
++    )
++    with pytest.raises(ValueError, match="TileLang kernels"):
++        owner.register_warmups(
++            logits=[(torch.float32, 129280)],
++            processed_logits=[(torch.float32, 129280)],
++            vocab_size=129280,
++            has_draft_logits=draft_logits,
++            dead_rows=True,
++        )
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+index 9cfa47a6d..12f0bffee 100644
+--- a/tests/v1/spec_decode/test_tilelang_rejection.py
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -18,7 +18,11 @@ Cross-Entropy", Eq. 5):
+   within a few ULPs of its FP64 value over confident and unsure logs, where the
+   release's formula (1 - m and 1 - p of probabilities) is off by up to 1;
+ - the paper's z = [9, -9, -9] as a verified draft;
+-- a request's tokens do not depend on its batch or the run.
++- a request's tokens do not depend on its batch or the run;
++- with a dead-row cut, whatever the dead rows hold: verification and resampling
++  bit for bit those of the drafts with -1 placeholders from the cut on, a sampled
++  request's tokens those of its draft truncated at the cut, a greedy request's
++  those it committed with its count capped at the cut plus one.
+ 
+ Batches of requests with 0 to 5 drafts, -1 placeholders, mixed temperatures and
+ per-request seeds, and logits with ties, infinities and NaN."""
+@@ -414,7 +418,7 @@ def _triton_rejection_sample(logits, batch):
+     return sampled, num_sampled
+ 
+ 
+-def _rejection_sample(logits, batch):
++def _rejection_sample(logits, batch, dead_row_cut=None):
+     return rs.rejection_sample(
+         logits,
+         None,
+@@ -428,6 +432,7 @@ def _rejection_sample(logits, batch):
+         batch["seeds"],
+         STEPS,
+         use_block_verification=True,
++        dead_row_cut=dead_row_cut,
+     )
+ 
+ 
+@@ -1027,6 +1032,273 @@ def test_other_configurations_launch_triton(
+     assert num_sampled.shape == (batch["cu"].shape[0] - 1,)
+ 
+ 
++# --- Dead rows -----------------------------------------------------------------
++
++# The cut the draft combine stores for a request it does not clamp (no drafts, or
++# not decoding): its block (five drafts and the sampled token, eight) plus one.
++UNCLAMPED = 9
++# What a dead row's logits may hold, its input having skipped the routed MoE:
++# random values, the draft it verifies made certain or impossible, NaN everywhere,
++# an infinite draft logit, or noise far past the live rows' scale.
++GARBAGE = ("random", "certain", "impossible", "nan", "inf", "noise")
++
++
++def _cut(batch, seed):
++    """Each request's dead-row cut, as the draft combine stores it: its live drafts,
++    from none to all of them, or UNCLAMPED (some requests, and every request
++    without drafts)."""
++    g = torch.Generator().manual_seed(seed)
++    drafts = (batch["cu"][1:] - batch["cu"][:-1] - 1).tolist()
++    cut = [
++        UNCLAMPED
++        if n == 0 or r % 7 == 3
++        else int(torch.randint(n + 1, (1,), generator=g))
++        for r, n in enumerate(drafts)
++    ]
++    return torch.tensor(cut, dtype=torch.int32, device=DEVICE)
++
++
++def _dead_rows(batch, cut):
++    """The logits rows past each request's cut: the inputs of its dead drafts."""
++    cu = batch["cu"].tolist()
++    rows = [
++        row
++        for r, c in enumerate(cut.tolist())
++        for row in range(cu[r] + 1 + c, cu[r + 1])
++    ]
++    return torch.tensor(rows, dtype=torch.int64, device=DEVICE)
++
++
++def _rows_like(logits, rows):
++    """Uninitialized logits of ``rows`` rows, with ``logits``' dtype and row stride
++    (so the kernels take the same layout)."""
++    out = torch.empty((rows, logits.stride(0)), dtype=logits.dtype, device=DEVICE)
++    return out[:, : logits.shape[1]]
++
++
++def _garbage(logits, batch, cut, kind, seed):
++    """``logits`` with the dead rows' replaced by ``kind`` (GARBAGE); "certain",
++    "impossible" and "inf" set the logit of the draft each dead row verifies (the
++    next row's input; a request's last row verifies none)."""
++    out = _rows_like(logits, logits.shape[0])
++    out.copy_(logits)
++    dead = _dead_rows(batch, cut)
++    if dead.numel() == 0:
++        return out
++    if kind == "nan":
++        out[dead] = float("nan")
++        return out
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    scale = 1e4 if kind == "noise" else 4.0
++    noise = torch.randn(dead.numel(), logits.shape[1], generator=g, device=DEVICE)
++    out[dead] = (noise * scale).to(out.dtype)
++    value = {"certain": 80.0, "impossible": float("-inf"), "inf": float("inf")}
++    if kind in value:
++        ends = batch["cu"][1:].long() - 1
++        rows = dead[~torch.isin(dead, ends)]
++        drafts = batch["drafts"].long()[rows + 1]
++        out[rows[drafts >= 0], drafts[drafts >= 0]] = value[kind]
++    return out
++
++
++def _placeholders(batch, cut):
++    """``batch`` with each request's drafts from its cut on as -1 placeholders."""
++    drafts = batch["drafts"].clone()
++    drafts[_dead_rows(batch, cut)] = -1
++    return {**batch, "drafts": drafts}
++
++
++def _truncated(logits, batch, cut):
++    """``logits`` and ``batch`` without the rows past each request's cut: every
++    request's draft truncated at its cut, the rows at their stride."""
++    keep = torch.ones(logits.shape[0], dtype=torch.bool, device=DEVICE)
++    keep[_dead_rows(batch, cut)] = False
++    kept = _rows_like(logits, int(keep.sum()))
++    kept.copy_(logits[keep])
++    sizes = torch.minimum(batch["cu"][1:] - batch["cu"][:-1], cut + 1)
++    return kept, {
++        **batch,
++        "cu": torch.cat((sizes.new_zeros(1), sizes.cumsum(0))).to(torch.int32),
++        **{key: batch[key][keep] for key in ("expanded", "local", "drafts", "pos")},
++    }
++
++
++VERIFIED = ("cumulative ratios", "sampled tokens", "counts", "target lse", "draft lse")
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 20000, 2])
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("garbage", GARBAGE)
++def test_verify_ends_each_block_at_its_cut(dtype, vocab, case, garbage):
++    """With a dead-row cut, every output of verification, the elements it leaves
++    alone included, is that of the same drafts with each request's drafts from its
++    cut on as -1 placeholders, whatever the dead rows hold; no count passes its
++    cut."""
++    batch = _batch(_counts(96), "mixed", 41, vocab)
++    cut = _cut(batch, 41)
++    logits = _garbage(_logits(batch, vocab, dtype, case, 41), batch, cut, garbage, 41)
++    stats = _local_stats(logits, batch)
++    reqs = cut.shape[0]
++    ours, expected = (_verify_buffers(reqs, logits.shape[0]) for _ in range(2))
++    for out, drafts, dead_row_cut in (
++        (ours, batch["drafts"], cut),
++        (expected, _placeholders(batch, cut)["drafts"], None),
++    ):
++        cumulative, sampled, num_sampled, target_lse, draft_lse = out
++        tlr.verify(
++            sampled,
++            num_sampled,
++            target_lse,
++            draft_lse,
++            cumulative,
++            logits,
++            *stats,
++            drafts,
++            batch["cu"],
++            batch["idx_mapping"],
++            batch["temperature"],
++            batch["seeds"],
++            batch["pos"],
++            STEPS,
++            dead_row_cut,
++        )
++    for what, a, b in zip(VERIFIED, ours, expected):
++        _assert_same(a, b, what)
++    assert (ours[2] <= cut).all()
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000])
++@pytest.mark.parametrize("stride", STRIDES)
++@pytest.mark.parametrize("temps", ["sampled", "mixed"])
++def test_resample_draws_the_bonus_at_each_cut(dtype, vocab, stride, temps):
++    """With a dead-row cut, a request whose count reaches its cut draws its
++    truncated block's bonus, its row's target with no draft masked: every block
++    winner is that of the same drafts with the drafts from the cut on as -1
++    placeholders, for counts from none to every draft."""
++    batch = _batch(_counts(96), temps, 43, vocab)
++    cut = _cut(batch, 43)
++    logits = _logits(batch, vocab, dtype, "peaked", 43, stride)
++    drafts = batch["cu"][1:] - batch["cu"][:-1] - 1
++    order = torch.arange(drafts.shape[0], dtype=torch.int32, device=DEVICE)
++    num_sampled = (order * 5 % (drafts + 1)).to(torch.int32)
++    ours, expected = (_resample_buffers(drafts.shape[0], vocab) for _ in range(2))
++    for out, inputs, dead_row_cut in (
++        (ours, batch, cut),
++        (expected, _placeholders(batch, cut), None),
++    ):
++        tlr.resample(
++            *out,
++            logits,
++            num_sampled,
++            inputs["cu"],
++            inputs["expanded"],
++            inputs["drafts"],
++            inputs["temperature"],
++            inputs["seeds"],
++            inputs["pos"],
++            dead_row_cut,
++        )
++    _assert_same(ours[0], expected[0], "block argmax")
++    _assert_same(ours[1], expected[1], "block maximum")
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000])
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("garbage", GARBAGE)
++def test_rejection_sample_with_dead_rows_is_the_truncated_block(
++    dtype, vocab, case, garbage
++):
++    """rejection_sample with a dead-row cut commits for each sampled request, bit for
++    bit, what it commits with the request's draft truncated at its cut (the rows
++    past it left out), whatever the dead rows hold: its count and its tokens. No
++    count passes the cut plus one. (A greedy request whose drafts all match up to
++    its cut takes the cut's row's target argmax from verification, as it did before
++    the cut ended its block, where the truncated block's bonus takes resampling's:
++    the same token unless NaN logits split the two argmaxes' blocks, so greedy
++    requests are held to the capped count, below.)"""
++    batch = _batch(_counts(96), "mixed", 47, vocab)
++    cut = _cut(batch, 47)
++    clean = _logits(batch, vocab, dtype, case, 47)
++    logits = _garbage(clean, batch, cut, garbage, 47)
++    sampled, num_sampled = _rejection_sample(logits, batch, cut)
++    expected, counts = _rejection_sample(*_truncated(clean, batch, cut))
++    assert (num_sampled <= cut + 1).all()
++    greedy = batch["temperature"][batch["idx_mapping"].long()] == 0
++    assert (~greedy).any()
++    for r in (~greedy).nonzero()[:, 0].tolist():
++        n = int(counts[r])
++        assert int(num_sampled[r]) == n, (r, int(num_sampled[r]), n)
++        _assert_same(sampled[r, :n], expected[r, :n], f"request {r}'s tokens")
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("garbage", GARBAGE)
++def test_greedy_requests_commit_as_with_the_capped_count(dtype, case, garbage):
++    """A greedy request commits, bit for bit, what it committed when it verified
++    every draft and its count was capped at its cut plus one after: greedy
++    verification takes each row's target argmax in turn, so the cut's row gives
++    the same token either way and no dead row decides a live one."""
++    batch = _batch(_counts(96), "mixed", 53, VOCAB)
++    cut = _cut(batch, 53)
++    logits = _garbage(_logits(batch, VOCAB, dtype, case, 53), batch, cut, garbage, 53)
++    sampled, num_sampled = _rejection_sample(logits, batch, cut)
++    before, counts = _rejection_sample(logits, batch)
++    counts = torch.minimum(counts, cut + 1)
++    greedy = batch["temperature"][batch["idx_mapping"].long()] == 0
++    assert greedy.any()
++    for r in greedy.nonzero()[:, 0].tolist():
++        n = int(counts[r])
++        assert int(num_sampled[r]) == n, (r, int(num_sampled[r]), n)
++        _assert_same(sampled[r, :n], before[r, :n], f"greedy request {r}")
++
++
++def test_capping_after_the_scan_is_not_the_truncated_block():
++    """The positive control of the truncated-block tests: verifying every draft and
++    capping each count at its cut plus one afterwards commits other tokens or
++    counts than the truncated block for some sampled requests (the dead rows'
++    thresholds decide where a block ends), here with random dead rows."""
++    batch = _batch(_counts(480), "sampled", 61, VOCAB)
++    cut = _cut(batch, 61)
++    clean = _logits(batch, VOCAB, torch.float32, "peaked", 61)
++    logits = _garbage(clean, batch, cut, "random", 61)
++    sampled, counts = _rejection_sample(logits, batch)
++    counts = torch.minimum(counts, cut + 1)
++    expected, expected_counts = _rejection_sample(*_truncated(clean, batch, cut))
++    differ = 0
++    for r in range(cut.shape[0]):
++        n = int(expected_counts[r])
++        differ += int(counts[r]) != n or not torch.equal(
++            sampled[r, :n], expected[r, :n]
++        )
++    assert differ > 0
++
++
++def test_dead_row_cut_is_read_at_each_replay():
++    """A captured rejection_sample reads the cut on each replay: its tokens and
++    counts are an eager launch's with the replay's cut."""
++    batch = _batch(_counts(48), "mixed", 59, VOCAB)
++    logits = _logits(batch, VOCAB, torch.float32, "peaked", 59)
++    cut = _cut(batch, 59)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        _rejection_sample(logits, batch, cut)
++    torch.cuda.current_stream().wait_stream(side)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        sampled, num_sampled = _rejection_sample(logits, batch, cut)
++    for seed in (59, 60, 62):
++        cut.copy_(_cut(batch, seed))
++        graph.replay()
++        _assert_same_tokens(
++            (sampled, num_sampled), _rejection_sample(logits, batch, cut.clone())
++        )
++
++
+ # --- Preparation --------------------------------------------------------------
+ 
+ 
+@@ -1082,6 +1354,52 @@ def test_runner_declares_the_launched_calls():
+     prepare.prepare_declared(registry)
+ 
+ 
++@pytest.mark.parametrize("dead_rows", [False, True])
++def test_dead_rows_declare_the_cut_calls(dead_rows):
++    """A step that can have dead rows declares verification and resampling with a
++    dead-row cut (the steps that verify) beside the ones without (the warmup's,
++    which runs adaptive verification off); one that cannot declares none with a
++    cut. They compile."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        rs.register_rejection_sample_warmups(
++            logits=[(torch.float32, VOCAB)],
++            vocab_size=VOCAB,
++            num_speculative_steps=STEPS,
++            synthetic_mode=False,
++            use_block_verification=True,
++            use_fp64=False,
++            dead_rows=dead_rows,
++        )
++    drafts, idx, pos, _ = INDICES["runner"]
++    keys = {
++        cut: {
++            *(
++                (
++                    id(tlr.resample_kernel),
++                    tlr.resample_key(torch.float32, idx, drafts, pos, run, cut),
++                )
++                for run in tls._runs(torch.float32)
++            ),
++            (
++                id(tlr.verify_kernel),
++                tlr.verify_key(torch.float32, drafts, idx, pos, VOCAB, STEPS, cut),
++            ),
++        }
++        for cut in (False, True)
++    }
++    declared = _declared(registry)
++    assert keys[False] <= declared
++    if dead_rows:
++        assert keys[True] <= declared
++    else:
++        assert not keys[True] & declared
++    prepare.prepare_declared(registry)
++
++
+ @pytest.mark.parametrize(
+     "use_block_verification,synthetic_mode,use_fp64",
+     [(False, False, False), (False, True, False), (True, False, True)],
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index 7f4eb9f13..e7bb2942f 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -535,6 +535,41 @@ def test_sink_candidates_int32_positions():
+     )
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("case", CASES)
++def test_sink_candidates_with_dead_rows(dtype, case):
++    """With a dead-row cut, verification ended each request's block at its cut, so
++    a last draw at or past the cut was the block's bonus, which masked no draft:
++    the candidates are those of the same drafts with each request's drafts from its
++    cut on as -1 placeholders."""
++    counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
++    width, slots = 6, 16
++    cu, num_sampled, drafts, sampled, mapping = _batch(counts, width, slots, 3)
++    rows = int(cu[-1])
++    logits = _logits(rows, _stride(VOCAB, STRIDES[0]), dtype, case, 3)
++    _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 3)
++    pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
++    # Cuts from none live to all of a request's drafts, and past them.
++    cut = torch.tensor(
++        [min(i % 4, c - 1) if i % 5 else 9 for i, c in enumerate(counts)],
++        dtype=torch.int32,
++        device=DEVICE,
++    )
++    placeholders = drafts.clone()
++    for r, c in enumerate(cut.tolist()):
++        start, end = int(cu[r]), int(cu[r + 1])
++        placeholders[start + 1 + c : end] = -1
++    ours, expected = (
++        tls.sink_candidates(
++            logits, VOCAB, cu, num_sampled, sampled, d, mapping, temperature,
++            seeds, pos, 4, True, dead_cut,
++        )
++        for d, dead_cut in ((drafts, cut), (placeholders, None))
++    )  # fmt: skip
++    _assert_same(ours[0], expected[0], "candidate values")
++    _assert_same(ours[1], expected[1], "candidate indices")
++
++
+ def _check_sink_candidates(
+     dtype, vocab, stride, case, num_candidates, mask_rejected_draft, pos_dtype
+ ):

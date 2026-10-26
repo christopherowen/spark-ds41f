@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:12:16 +0100
+Subject: [PATCH 515/515] [DS4.1] Live-page tables: the page loop keeps its
+ unrolled trip count
+
+dgx4's first kernel bundle (2026-10-25 19:08 CET) timed decode_metadata
+over each row's live pages at 1.4-1.9 us against 3.2-4.1 us at 4K-64K
+contexts, and at 38 us against 1,405 us on a 16K prefill chunk, but at
+6.7 us against 3.2 us at a full 1M context. The page loop had taken the
+live pages' count as its bound, so it no longer unrolled, and a long
+row's 32 table loads ran one after another. It keeps the table width's
+trip count again, with the live pages as the predicate: a long context's
+loads overlap as before, and past the live pages an iteration is a
+compare.
+
+The same run's two test fixes are already in this branch's ported tests
+(the live-page commit): no step must have a live page, and the main rows
+hold the step's requests in reverse and -1 past them, never a flipped
+uninitialized buffer.
+---
+ vllm/models/deepseek_v4_1/tilelang/metadata.py | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 2418c2155..c8dbe8286 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -275,9 +275,12 @@ def decode_metadata_kernel(
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
+     # Blocks as wide as the window part; the page part loops over the row's live
+-    # pages (idle threads cost the prefill rows' blocks).
++    # pages (idle threads cost the prefill rows' blocks). The loop keeps the table
++    # width's trip count, so it unrolls and a long context's loads overlap; past the
++    # live pages an iteration is a compare.
+     threads, per_thread = _threads(width)
+     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
++    main_per_thread = (main_width + threads - 1) // threads
+ 
+     @T.prim_func
+     def metadata_decode(
+@@ -314,7 +317,7 @@ def decode_metadata_kernel(
+                 )
+                 if req < 0:
+                     live = 0
+-                for k in T.serial(T.ceildiv(live, threads)):
++                for k in T.serial(main_per_thread):
+                     col = k * threads + tx
+                     if col < live:
+                         page_id = main_table[req, col]

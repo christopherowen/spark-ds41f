@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:01:06 +0100
+Subject: [PATCH 523/523] [DS4.1] PDL source check: import tilelang.jit.kernel
+ by name (tilelang.jit is also the decorator)
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index a0e44df01..f372c22b5 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -118,10 +118,14 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+ 
+ 
+ def pytest_configure(config):
+-    import tilelang.jit.kernel as kernel_module
++    import importlib
+ 
+     from vllm.models.deepseek_v4_1.tilelang import pdl
+ 
++    # ``tilelang.jit`` is also the decorator tilelang re-exports, so the module is
++    # imported by name.
++    kernel_module = importlib.import_module("tilelang.jit.kernel")
++
+     pdl.tile_kernels()
+     launch = kernel_module.JITKernel.__call__
+ 

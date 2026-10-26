@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 00:15:25 +0100
+Subject: [PATCH 512/512] Tests: the window reference bounds draft rows by the
+ replay start too
+
+0501 bounded draft windows by CED's replay start in the Triton _chunk and the
+TileLang chunk, and added the (draft, replay) case to test_chunk and
+test_decode_metadata_equals_chunk_and_pages. After the Triton originals went,
+those tests compare TileLang with the torch _ref_chunk, whose draft branch had
+no replay bound: the new case compared TileLang's bounded draft windows with
+unbounded ones. The reference now applies the bound to every row, as 0501's
+Triton _chunk did; checked on the CPU against a transliteration of that kernel
+(80 cases, the draft-replay ones included; the old reference fails the first).
+---
+ tests/kernels/test_deepseek_v41_tilelang_metadata.py | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 3b97390d2..985b65f5d 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -105,7 +105,8 @@ def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
+     """Rows ``offset:offset + rows``: each row's window of physical SWA slots (-1 in
+     holes and past its length), its length (clamped to ``width``; 0 when its
+     request or position is invalid) and its indexed length (visible, at most 512).
+-    A draft row's window is its request's: prefix plus the request's rows."""
++    A draft row's window is its request's: prefix plus the request's rows. With
++    ``replay_start``, every window starts no earlier than its request's."""
+     pos, reqs, table, visible, qsl, request_positions = _host(
+         pos, reqs, table, visible, qsl, request_positions
+     )
+@@ -117,12 +118,11 @@ def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
+         first, end = qsl[r] * valid, qsl[r + 1] * valid
+         prefix = request_positions[r] * valid
+         start = (prefix - window).clamp(min=0)
+-        length = prefix + end - first - start
+     else:
+         start = (p + 1 - window).clamp(min=0)
+-        if replay_start is not None:
+-            start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
+-        length = p + 1 - start
++    if replay_start is not None:
++        start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
++    length = prefix + end - first - start if draft else p + 1 - start
+     length = torch.where(valid, length.clamp(0, width), 0)
+     col = torch.arange(width)
+     logical = start[:, None] + col

@@ -1,0 +1,1499 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:02:36 +0100
+Subject: [PATCH 510/510] [DS4.1] mHC finalize writes its output's MXFP8 cast;
+ the projections it feeds stop casting
+
+Every TileLang decode layer cast the same BF16 rows three times with
+TileKernels' per_token_cast: the attention entry's output for the fused
+Q-A/KV projection, and the FFN entry's output twice, for the shared expert's
+gate/up and for the routed experts. mHC finalize holds those rows in
+registers when it writes them, so it now writes their cast in the same
+launch: per 32 columns (four adjacent lanes, two lane shuffles for the
+block's amax) the E4M3 bytes and the UE8M0 byte, by _reference_cast's
+arithmetic (gemm.cast_block_mxfp8), which is per_token_cast's byte for byte.
+
+The entry returns the cast as a sixth output (linear.MXFP8Rows, padded to
+whole decode tiles)
+and the decoder layer hands it to the sublayer for the call
+(kernels.mxfp8_inputs). The projections it feeds are marked
+tilelang_mxfp8_input and cast nothing: one that gets no cast, or another
+tensor's, fails rather than casting; a split-K projection cannot be marked.
+The routed experts read it the same way (TileLangExperts, plan.run takes
+MXFP8Rows), and their workspace loses the tokens' copy.
+
+Rows regrouped after the entry are cast once by per_token_cast
+(linear.cast_mxfp8): a CED boundary's compact rows, and prefill SP's
+gathered rows (attention's with a compressor, and the FFN's, which the
+release cast twice). The decoder layer declares that cast (_warm_casts);
+the MoE plan no longer warms one.
+
+Ceiling (c1 decode profile, inventory 5): about 0.5% at c1 for the entries'
+casts, of 1.3% for every per_token_cast launch.
+
+Tests: every entry test also checks the cast against per_token_cast of the
+y it wrote, plus scale regimes (zero, below the 1e-4 floor, above 448,
+powers of two), both finalize widths, a NaN token and the regrouped rows'
+cast; a marked projection gives the self-casting one's bits at decode and
+prefill sizes and fails without its cast; the MoE tests hand the plan its
+MXFP8 rows. Benchmark (gated): finalize with the cast against the release's
+finalize and the casts it replaces, decode entries and an SP prefill layer.
+---
+ .../benchmark_deepseek_v41_mhc_cast.py        | 290 ++++++++++++++++++
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  40 ++-
+ .../test_deepseek_v41_tilelang_linear.py      |  54 ++++
+ .../kernels/test_deepseek_v41_tilelang_mhc.py | 127 +++++++-
+ tests/models/test_deepseek_v4_1_ced_model.py  |   4 +
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   4 +
+ .../layers/fused_moe/tilelang.py              |  29 +-
+ vllm/models/deepseek_v4_1/attention.py        |   8 +-
+ vllm/models/deepseek_v4_1/kernels.py          |  21 ++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  39 ++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  22 ++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 121 +++++++-
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  66 +++-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  51 +--
+ 14 files changed, 801 insertions(+), 75 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_mhc_cast.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_mhc_cast.py b/benchmarks/kernels/benchmark_deepseek_v41_mhc_cast.py
+new file mode 100644
+index 000000000..bdc16e10d
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_mhc_cast.py
+@@ -0,0 +1,290 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired timing of DeepSeek-V4.1's mHC finalize writing the sublayer input's MXFP8
++cast (``linear.MXFP8Rows``) against the release's finalize (``--baseline``, its
++``mhc.py``) followed by the separate casts the cast replaces (TileKernels'
++``per_token_cast``), at serving token counts. Four BF16 streams of 5,120.
++
++The sequences, as a TP4 forward runs them:
++
++- decode attention entry: the finalize, then one cast (attention's fused Q-A/KV);
++- decode FFN entry: the finalize, then two casts of the same rows (the shared
++  expert's gate/up and the routed experts);
++- prefill SP layer: both entries on one rank's quarter of a 16K chunk, and the casts
++  of the gathered chunk the layer still needs: attention's fused Q-A/KV of the
++  gathered rows (a compressor layer) and the FFN's (once, where the release cast the
++  same rows twice).
++
++Each case is measured on eight fresh inputs. On each, the outputs are first checked:
++the new finalize's ``y`` equals the release's bit for bit, and its cast equals
++``per_token_cast`` of that ``y`` byte for byte. Then CUDA graphs of 100 sequences of
++each run back to back, alternating which goes first; the case's 95% interval comes
++from the eight per-input differences. The gate (``--gate``) is that the new
++sequences are not slower in any case.
++"""
++
++import argparse
++import importlib.util
++import json
++import math
++import statistics
++
++import tile_kernels
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import mhc
++from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words
++from vllm.models.deepseek_v4_1.tilelang.linear import mxfp8_rows
++
++HIDDEN, STREAMS = 5120, 4
++RMS_EPS, HC_EPS, ITERATIONS = 1e-6, 1e-6, 20
++CASES = {
++    "decode c1 attention": ("attention", 4),
++    "decode c1 FFN": ("ffn", 4),
++    "decode c4 attention": ("attention", 24),
++    "decode c4 FFN": ("ffn", 24),
++    "decode c16 attention": ("attention", 96),
++    "decode c16 FFN": ("ffn", 96),
++    "prefill SP layer": ("sp", 4096),
++}
++SP_WORLD = 4
++
++
++def baseline_module(path: str, name: str):
++    """The release's copy of a TileLang module, under ``name`` in the same package:
++    its relative imports resolve to the package's other modules, and the custom ops
++    it defines stay the package's (their names are registered already)."""
++
++    def unregistered(*args, **kwargs):
++        def define(function):
++            function.register_fake = lambda fake: fake
++            return function
++
++        return define
++
++    package = "vllm.models.deepseek_v4_1.tilelang"
++    spec = importlib.util.spec_from_file_location(f"{package}.{name}", path)
++    module = importlib.util.module_from_spec(spec)
++    module.__package__ = package
++    original, torch.library.custom_op = torch.library.custom_op, unregistered
++    try:
++        spec.loader.exec_module(module)
++    finally:
++        torch.library.custom_op = original
++    return module
++
++
++class Entry:
++    """One sublayer entry's finalize inputs (the projection partials of real streams),
++    with both builds' outputs."""
++
++    def __init__(self, release, tokens: int, generator):
++        def randn(*shape, scale=1.0):
++            return torch.randn(*shape, generator=generator, device="cuda") * scale
++
++        residual = randn(tokens, STREAMS * HIDDEN).bfloat16()
++        fn = randn(mhc.MIXES, STREAMS * HIDDEN, scale=0.02)
++        incoming = torch.softmax(randn(tokens, STREAMS), dim=-1) + HC_EPS
++        splits = HIDDEN // mhc.BLOCK_H
++        self.P = torch.empty((splits, tokens, 1, mhc.MIXES), device="cuda")
++        self.S = torch.empty((splits, tokens, 1), device="cuda")
++        self.C = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
++        self.Q = torch.empty((splits, tokens), device="cuda")
++        comb = torch.empty((tokens, STREAMS, STREAMS), device="cuda")
++        mhc.project_streams(HIDDEN, "pre", block_M=mhc.BLOCK_M)(
++            self.C.unsqueeze(0), residual, incoming, comb, incoming, fn, residual,
++            self.P, self.S, self.C, self.Q,
++        )  # fmt: skip
++        self.scale = randn(3, scale=0.1) + 1.0
++        self.base = randn(mhc.MIXES, scale=0.1)
++        self.weight = (randn(HIDDEN, scale=0.1) + 1.0).bfloat16()
++        self.mixes = {
++            name: (
++                torch.empty((tokens, STREAMS), device="cuda"),
++                torch.empty((tokens, STREAMS, STREAMS), device="cuda"),
++                torch.empty((tokens, STREAMS), device="cuda"),
++                torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda"),
++            )
++            for name in ("new", "release")
++        }
++        rows = mxfp8_rows(tokens)
++        self.yq = torch.empty((rows, HIDDEN), dtype=torch.float8_e4m3fn, device="cuda")
++        self.ysf = torch.empty(
++            (rows, 4 * scale_words(HIDDEN)), dtype=torch.uint8, device="cuda"
++        )
++        key = (HIDDEN, STREAMS * HIDDEN, RMS_EPS, HC_EPS, ITERATIONS, RMS_EPS)
++        self.new_kernel = mhc.finalize(*key)
++        self.release_kernel = release.finalize(*key)
++        self.tokens = tokens
++
++    def new(self) -> None:
++        post, comb, pre_out, y = self.mixes["new"]
++        self.new_kernel(
++            self.P, self.S, self.C, self.Q, self.scale, self.base, self.weight,
++            post, comb, pre_out, y, self.yq, self.ysf,
++        )  # fmt: skip
++
++    def release(self) -> None:
++        post, comb, pre_out, y = self.mixes["release"]
++        self.release_kernel(
++            self.P, self.S, self.C, self.Q, self.scale, self.base, self.weight,
++            post, comb, pre_out, y,
++        )  # fmt: skip
++
++    def check(self) -> None:
++        self.new()
++        self.release()
++        torch.cuda.synchronize()
++        for new, old in zip(self.mixes["new"], self.mixes["release"]):
++            if not torch.equal(new, old):
++                raise SystemExit(f"{self.tokens} tokens: finalize outputs differ")
++        values, scales = Cast(self.mixes["release"][3]).run_once()
++        live = self.tokens
++        if not (
++            torch.equal(self.yq[:live].view(torch.uint8), values.view(torch.uint8))
++            and torch.equal(self.ysf[:live], scales)
++        ):
++            raise SystemExit(f"{self.tokens} tokens: cast differs from per_token_cast")
++
++
++class Cast:
++    """TileKernels' ``per_token_cast`` of BF16 rows into a projection's buffers."""
++
++    def __init__(self, rows: torch.Tensor):
++        tokens = rows.shape[0]
++        self.rows = rows
++        self.values = torch.empty(
++            (tokens, HIDDEN), dtype=torch.float8_e4m3fn, device="cuda"
++        )
++        self.scales = torch.empty(
++            (tokens, 4 * scale_words(HIDDEN)), dtype=torch.uint8, device="cuda"
++        )
++
++    def __call__(self) -> None:
++        tile_kernels.quant.per_token_cast(
++            self.rows, "e4m3", 32, round_sf=True, use_packed_ue8m0=True,
++            out=(self.values, self.scales),
++        )  # fmt: skip
++
++    def run_once(self):
++        self()
++        torch.cuda.synchronize()
++        return self.values, self.scales
++
++
++def sequences(release, kind: str, tokens: int, seed: int):
++    """The new and the release sequence of one case, after checking their outputs."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    if kind != "sp":
++        entry = Entry(release, tokens, generator)
++        entry.check()
++        casts = [
++            Cast(entry.mixes["release"][3])
++            for _ in range(1 if kind == "attention" else 2)
++        ]
++
++        def new():
++            entry.new()
++
++        def old():
++            entry.release()
++            for cast in casts:
++                cast()
++
++        return new, old
++    # One rank's rows of each entry; the layer's gathered rows (the other ranks'
++    # entries ran elsewhere).
++    entries = [Entry(release, tokens, generator) for _ in ("attention", "ffn")]
++    for entry in entries:
++        entry.check()
++    gathered = torch.randn(
++        (SP_WORLD * tokens, HIDDEN), generator=generator, device="cuda"
++    ).bfloat16()
++    attention, ffn = Cast(gathered), Cast(gathered)
++    shared, routed = Cast(gathered), Cast(gathered)
++
++    def new():
++        entries[0].new()
++        attention()
++        entries[1].new()
++        ffn()
++
++    def old():
++        entries[0].release()
++        attention()
++        entries[1].release()
++        shared()
++        routed()
++
++    return new, old
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 10  # ms / 100 sequences to microseconds
++
++
++def measure(release, kind: str, tokens: int, samples: int = 8) -> dict:
++    new_us, old_us, differences = [], [], []
++    for sample in range(samples):
++        new_call, old_call = sequences(release, kind, tokens, sample)
++        new, old = graph(new_call), graph(old_call)
++        pair = (new, old) if sample % 2 == 0 else (old, new)
++        times = {id(capture): elapsed(capture) for capture in pair}
++        new_us.append(times[id(new)])
++        old_us.append(times[id(old)])
++        differences.append(times[id(new)] - times[id(old)])
++        del new, old, pair
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(samples)  # t(7), 95%
++    return {
++        "tokens": tokens,
++        "finalize_cast_us": statistics.median(new_us),
++        "release_us": statistics.median(old_us),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--baseline",
++        required=True,
++        help="the release's vllm/models/deepseek_v4_1/tilelang/mhc.py",
++    )
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    release = baseline_module(args.baseline, "mhc_release")
++    results = {
++        name: measure(release, kind, tokens) for name, (kind, tokens) in CASES.items()
++    }
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        slower = [name for name, case in results.items() if case["interval_us"][0] > 0]
++        if slower:
++            raise SystemExit(f"finalize with the cast slower at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 97b84c748..53c6eac26 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -26,7 +26,10 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+     pack_scale_codes,
+     pack_scale_words,
+ )
+-from vllm.models.deepseek_v4_1.tilelang.linear import _calls  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
++    _calls,
++    cast_mxfp8,
++)
+ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+     MoeDispatchV41Plan,
+     MoeExpertsV41Plan,
+@@ -38,9 +41,6 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+     workspace_bytes,
+ )
+ 
+-# Declaring a plan warms TileKernels' token cast for the scheduler's batch buckets.
+-pytestmark = pytest.mark.usefixtures("default_vllm_config")
+-
+ DEVICE = "cuda"
+ E2M1 = (
+     0.0,
+@@ -140,7 +140,7 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
+         dtype=torch.uint8,
+         device=DEVICE,
+     )
+-    plan.run(x, ids, route_weights, weights, out, workspace)
++    plan.run(cast_mxfp8(x), ids, route_weights, weights, out, workspace)
+     ref = _reference(x, ids, route_weights, w13, w2, intermediate)
+     scale = ref.abs().max().item()
+     torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-2 * scale)
+@@ -148,7 +148,13 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
+     # A token's output does not depend on the rest of the batch.
+     for r in {0, rows - 1}:
+         solo = torch.empty_like(x[r : r + 1])
+-        plan.run(x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo)
++        plan.run(
++            cast_mxfp8(x[r : r + 1]),
++            ids[r : r + 1],
++            route_weights[r : r + 1],
++            weights,
++            solo,
++        )
+         assert torch.equal(solo[0], out[r]), f"row {r} changed with batch composition"
+ 
+ 
+@@ -175,13 +181,17 @@ def test_moe_experts_fp32_output(
+     for dtype, plan in plans.items():
+         assert plan.out_dtype == dtype
+         outs[dtype] = torch.empty((rows, hidden), dtype=dtype, device=DEVICE)
+-        plan.run(x, ids, route_weights, weights, outs[dtype])
++        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[dtype])
+     assert torch.equal(outs[torch.float32].bfloat16(), outs[torch.bfloat16])
+     assert not torch.equal(outs[torch.float32], outs[torch.bfloat16].float())
+     for r in {0, rows - 1}:
+         solo = torch.empty((1, hidden), dtype=torch.float32, device=DEVICE)
+         plans[torch.float32].run(
+-            x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo
++            cast_mxfp8(x[r : r + 1]),
++            ids[r : r + 1],
++            route_weights[r : r + 1],
++            weights,
++            solo,
+         )
+         assert torch.equal(solo[0], outs[torch.float32][r])
+ 
+@@ -204,16 +214,17 @@ def test_moe_experts_fold_shared(
+     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+     shared = (torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)).bfloat16()
+     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++    tokens = cast_mxfp8(x)
+     wide = torch.empty((rows, hidden), dtype=torch.float32, device=DEVICE)
+-    plan.run(x, ids, route_weights, weights, wide)
++    plan.run(tokens, ids, route_weights, weights, wide)
+     folded = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
+-    plan.run(x, ids, route_weights, weights, folded, shared=shared)
++    plan.run(tokens, ids, route_weights, weights, folded, shared=shared)
+     assert torch.equal(folded, (shared + wide).to(torch.bfloat16))  # all-reduce path
+     buffer = torch.empty_like(folded)
+     torch.add(shared, wide, out=buffer)  # reduce-scatter buffer
+     assert torch.equal(folded, buffer)
+     with pytest.raises(AssertionError):
+-        plan.run(x, ids, route_weights, weights, folded)  # BF16 out needs the shared
++        plan.run(tokens, ids, route_weights, weights, folded)  # BF16 needs the shared
+ 
+ 
+ @pytest.mark.parametrize("rows", [1, 12, 96])
+@@ -233,8 +244,9 @@ def test_moe_experts_fold_deferred_shared(
+     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+     source = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)
+     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++    tokens = cast_mxfp8(x)
+     direct = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
+-    plan.run(x, ids, route_weights, weights, direct, shared=source.bfloat16())
++    plan.run(tokens, ids, route_weights, weights, direct, shared=source.bfloat16())
+ 
+     side, ready = torch.cuda.Stream(), torch.cuda.Event()
+     side.wait_stream(torch.cuda.current_stream())
+@@ -249,7 +261,7 @@ def test_moe_experts_fold_deferred_shared(
+         return shared
+ 
+     deferred = torch.empty_like(direct)
+-    plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
++    plan.run(tokens, ids, route_weights, weights, deferred, shared=resolve)
+     assert calls == [1]
+     assert torch.equal(deferred, direct)
+ 
+@@ -264,7 +276,7 @@ def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
+ 
+     def run(tokens):
+         out = torch.empty_like(tokens)
+-        plan.run(tokens, ids, route_weights, weights, out)
++        plan.run(cast_mxfp8(tokens), ids, route_weights, weights, out)
+         return out
+ 
+     return run, x, ids, route_weights, w13, w2, intermediate
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index b82662b29..d15eba720 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -294,6 +294,60 @@ def test_block32_rows(default_vllm_config, n=1792, k=5120, start=1280):
+         TileLangBlock32Rows(layer, start + 16)
+ 
+ 
++# Attention's fused Q-A/KV (1792 x 5120 at TP4) and the shared expert's gate/up
++# (1152 x 5120) read their input's MXFP8 cast from the mHC entry that wrote it.
++@pytest.mark.parametrize("n, k", [(1792, 5120), (1152, 5120)])
++def test_block32_reads_its_producers_cast(default_vllm_config, n, k):
++    """A projection marked ``tilelang_mxfp8_input`` gives, from the cast handed over
++    with its input (``provide_mxfp8``), the bits it gives casting the input itself:
++    decode tiles over the padded rows and prefill GEMMs over the live rows. Without
++    a cast, or with another tensor's, it fails rather than casting."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangBlock32Rows,
++        cast_mxfp8,
++        provide_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, _ = _block32_weight(n, k, 6)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    casting = TileLangBlock32Rows(layer, 0)
++    casting.declare_kernels()
++    fed = TileLangBlock32Rows(layer, 0)
++    fed.tilelang_mxfp8_input = True
++    fed.declare_kernels()
++    x = torch.randn((300, k), generator=_gen(8), device=DEVICE).bfloat16()
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for count in (1, 7, 16, 17, 64, 65, 96, 128, 129, 300):
++            rows = x[:count]
++            expected = casting(rows)
++            with provide_mxfp8(cast_mxfp8(rows)):
++                assert torch.equal(fed(rows), expected), f"rows={count}"
++            with pytest.raises(RuntimeError):
++                fed(rows)
++            with provide_mxfp8(cast_mxfp8(rows.clone())), pytest.raises(RuntimeError):
++                fed(rows)
++
++
++def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
++    """A split-K projection's decode scratch is its own: marking it is refused."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
++
++    weight, exps, _ = _block32_weight(1792, 5120, 6)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    narrow = TileLangBlock32Rows(layer, 1280)  # 512 x 5120: splits K
++    narrow.tilelang_mxfp8_input = True
++    with pytest.raises(ValueError):
++        narrow.declare_kernels()
++
++
+ # The router splits K eight ways; (100, 200) cannot split.
+ @pytest.mark.parametrize("n, k", [(384, 5120), (100, 200)])
+ @pytest.mark.parametrize("rows", [7, 65])
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 57c2433f4..57cf6ec67 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -35,6 +35,8 @@ from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
+     RankOrderParts,
+ )
++from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang.linear import mxfp8_rows  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
+     BLOCK_H,
+     MIXES,
+@@ -110,9 +112,47 @@ def _close_bf16(actual, expected, ulps=1):
+     )
+ 
+ 
++def _per_token_cast(y):
++    """TileKernels' MXFP8 cast of BF16 rows, as the projections cast their input
++    before the entry wrote it: E4M3 bytes and packed UE8M0 bytes, whole words a row."""
++    rows, hidden = y.shape
++    values = torch.empty((rows, hidden), dtype=torch.float8_e4m3fn, device=DEVICE)
++    scales = torch.empty(
++        (rows, 4 * scale_words(hidden)), dtype=torch.uint8, device=DEVICE
++    )
++    tile_kernels.quant.per_token_cast(
++        y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True, out=(values, scales)
++    )
++    return values, scales
++
++
++def _assert_bytes_equal(actual, expected, what=""):
++    actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
++    assert actual.shape == expected.shape
++    differ = actual != expected
++    if differ.any():
++        where = differ.nonzero()[:4].tolist()
++        raise AssertionError(
++            f"{what}{int(differ.sum())} of {differ.numel()} bytes differ; first at "
++            f"{where}"
++        )
++
++
++def _assert_cast(cast, y, what=""):
++    """An entry's ``MXFP8Rows`` hold ``per_token_cast``'s bytes of the ``y`` it wrote,
++    in buffers of whole decode tiles."""
++    tokens = y.shape[0]
++    assert cast.rows is y
++    assert cast.values.shape == (mxfp8_rows(tokens), y.shape[1])
++    assert cast.scales.shape == (mxfp8_rows(tokens), 4 * scale_words(y.shape[1]))
++    values, scales = _per_token_cast(y)
++    _assert_bytes_equal(cast.values[:tokens], values, f"{what}E4M3: ")
++    _assert_bytes_equal(cast.scales[:tokens], scales, f"{what}scales: ")
++
++
+ def _check(actual, expected, tokens):
+     post, comb, y, pre = expected
+-    residual_out, a_post, a_comb, a_y, a_pre = actual
++    residual_out, a_post, a_comb, a_y, a_pre, a_cast = actual
+     assert residual_out.shape == (tokens, 4, HIDDEN)
+     # The projection runs on TF32 tensor cores, as in DeepGEMM.
+     torch.testing.assert_close(a_post, post, atol=2e-3, rtol=0)
+@@ -121,6 +161,7 @@ def _check(actual, expected, tokens):
+     # y takes no projection. The collapse is rounded to BF16 before the norm,
+     # so an ulp of difference there can become two in y.
+     _close_bf16(a_y, y, ulps=2)
++    _assert_cast(a_cast, a_y)
+ 
+ 
+ @pytest.mark.parametrize("tokens", [1, 7, 16, 33, 64, 200])
+@@ -162,8 +203,10 @@ def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
+     actual = mhc.post_pre(
+         RankOrderParts(parts), residual, post, comb, fn, scale, base, weight, incoming
+     )
+-    for a, b in zip(actual, expected):
++    for a, b in zip(actual[:5], expected[:5]):
+         assert torch.equal(a, b)
++    _assert_bytes_equal(actual[5].values[:tokens], expected[5].values[:tokens])
++    _assert_bytes_equal(actual[5].scales[:tokens], expected[5].scales[:tokens])
+     assert torch.equal(
+         mhc.post(RankOrderParts(parts), residual, post, comb),
+         mhc.post(summed, residual, post, comb),
+@@ -186,13 +229,24 @@ def test_first_layer_broadcast_matches_expanded(mhc):
+ def test_rows_independent_of_batch(mhc):
+     residual, fn, scale, base, weight, incoming = _inputs(130, seed=9)
+     full = mhc.pre(residual, fn, scale, base, weight, incoming)
++
++    def same(part, rows):
++        for a, b in zip(part[1:5], full[1:5]):
++            assert torch.equal(a, b[rows]), rows
++        cast, whole = part[5], full[5]
++        n = cast.rows.shape[0]
++        _assert_bytes_equal(cast.values[:n], whole.values[rows], f"{rows}: ")
++        _assert_bytes_equal(cast.scales[:n], whole.scales[rows], f"{rows}: ")
++
+     for rows in (1, 2, 7, 16, 17, 33, 64):
+-        part = mhc.pre(residual[:rows], fn, scale, base, weight, incoming[:rows])
+-        for a, b in zip(part[1:], full[1:]):
+-            assert torch.equal(a, b[:rows]), rows
+-    part = mhc.pre(residual[70:71], fn, scale, base, weight, incoming[70:71])
+-    for a, b in zip(part[1:], full[1:]):
+-        assert torch.equal(a, b[70:71])
++        same(
++            mhc.pre(residual[:rows], fn, scale, base, weight, incoming[:rows]),
++            slice(0, rows),
++        )
++    same(
++        mhc.pre(residual[70:71], fn, scale, base, weight, incoming[70:71]),
++        slice(70, 71),
++    )
+ 
+ 
+ def test_pre_nan_token(mhc):
+@@ -201,7 +255,9 @@ def test_pre_nan_token(mhc):
+     token."""
+     tokens, t = 33, 7
+     residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=11)
+-    clean = [a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)]
++    clean = [
++        a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)[:5]
++    ]
+     residual = residual.clone()
+     residual[t, 2, 100] = NAN
+     actual = mhc.pre(residual, fn, scale, base, weight, incoming)
+@@ -210,6 +266,59 @@ def test_pre_nan_token(mhc):
+         assert_other_rows_equal(got, before, [t], f"{name}: ")
+ 
+ 
++# The entries' MXFP8 cast of y, for the sublayer's block-32 projections: TileKernels'
++# per_token_cast's bytes (E4M3 and packed UE8M0), which the projections no longer write.
++
++
++@pytest.mark.parametrize("first", [False, True])
++@pytest.mark.parametrize("tokens", [1, 6, 64, 65, 96, 129, 300, 2048])
++def test_entry_cast_is_per_token_cast(mhc, tokens, first):
++    """At decode and prefill sizes (decode sizes in whole tiles), from both finalize
++    widths (the first layer's broadcast, four streams), and in every scale regime the
++    norm weight gives y: zeroed blocks (the 1e-4 amax floor), blocks far below it,
++    blocks above 448 (positive exponents) and block maxima a power of two apart."""
++    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=1300 + tokens)
++    weight[:64] = 0.0
++    weight[64:128] = 1e-30
++    weight[128:192] *= 4096.0
++    weight[192:256] = 2.0 ** torch.arange(-16, 48, device=DEVICE, dtype=torch.float32)
++    if first:
++        embedding = residual[:, 0].contiguous()
++        broadcast = fn.view(MIXES, 4, HIDDEN).sum(1)
++        out = mhc.pre(embedding, broadcast, scale, base, weight, None)
++    else:
++        out = mhc.pre(residual, fn, scale, base, weight, incoming)
++    _assert_cast(out[5], out[3])
++
++
++def test_entry_cast_of_a_nan_token(mhc):
++    """A NaN token's y row casts as per_token_cast casts it; no other row moves."""
++    tokens, t = 33, 7
++    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=17)
++    clean = mhc.pre(residual, fn, scale, base, weight, incoming)
++    residual = residual.clone()
++    residual[t, 2, 100] = NAN
++    actual = mhc.pre(residual, fn, scale, base, weight, incoming)
++    assert_rows_nan(actual[3], [t])
++    _assert_cast(actual[5], actual[3])
++    others = [r for r in range(tokens) if r != t]
++    for name in ("values", "scales"):
++        _assert_bytes_equal(
++            getattr(actual[5], name).view(torch.uint8)[others],
++            getattr(clean[5], name).view(torch.uint8)[others],
++            f"{name}: ",
++        )
++
++
++@pytest.mark.parametrize("tokens", [1, 70, 300])
++def test_cast_rows_is_per_token_cast(mhc, tokens):
++    """Rows regrouped after their entry (a CED boundary's compact rows, prefill SP's
++    gathered rows) are cast by per_token_cast into the same padded buffers."""
++    _, state, _, _ = _post_inputs(tokens, seed=1400 + tokens)
++    rows = state[:, 1].contiguous()
++    _assert_cast(mhc.cast_rows(rows), rows)
++
++
+ @pytest.mark.parametrize("block_M", [16, 32])
+ def test_project_streams_partials(block_M):
+     tokens, k, splits = 37, 4 * HIDDEN, HIDDEN // BLOCK_H
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 9debe2a21..80e7b3449 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -175,11 +175,15 @@ class _Mix:
+             torch.eye(4).expand(rows, 4, 4),
+             residual[:, 0, :],
+             mix,
++            None,  # no MXFP8 cast: the stand-in projections take any rows
+         )
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+         return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+ 
++    def cast_rows(self, rows):
++        return None
++
+ 
+ class _Attention(nn.Module):
+     def __init__(self, index, shared, rows):
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index ff6d67296..61014e26a 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -412,11 +412,15 @@ class _Mix:
+             torch.eye(4).expand(rows, 4, 4),
+             residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5,
+             mix,
++            None,  # no MXFP8 cast: the stand-in projections take any rows
+         )
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+         return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+ 
++    def cast_rows(self, rows):
++        return None
++
+ 
+ def _partial(world, rows, result):
+     """This rank's zero-padded TP share of ``result``, reduce-scattered."""
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 6b96eb6cf..df55a0c08 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -5,13 +5,14 @@
+ One layer runs, all from the modular kernel's workspace:
+ 
+ 1. dispatch: routes grouped by expert in the contiguous grouped-GEMM layout;
+-2. MXFP8 cast of the tokens (TileKernels ``per_token_cast``);
+-3. grouped gate/up GEMM over the dispatched rows, gathering tokens with
+-   ``cp.async`` from tile-major expert weights;
+-4. SwiGLU with DeepSeek's clamp, the route weight and the MXFP8 cast of the
+-   down projection's input, fused (TileKernels);
+-5. grouped down GEMM;
+-6. combine: each token's expert outputs summed in slot order in FP32.
++2. grouped gate/up GEMM over the dispatched rows, gathering the tokens' MXFP8
++   rows with ``cp.async`` from tile-major expert weights; the kernel that produced
++   the tokens wrote that cast (the mHC entry, ``linear.MXFP8Rows``) and hands it
++   over for the call (``linear.provide_mxfp8``);
++3. SwiGLU with DeepSeek's clamp, the route weight and the MXFP8 cast of the
++   down projection's input, fused (TileKernels' arithmetic);
++4. grouped down GEMM;
++5. combine: each token's expert outputs summed in slot order in FP32.
+ 
+ Route weights are applied before the down projection, as DeepSeek does. No
+ step uses atomics on results, so a token's output does not depend on the
+@@ -51,6 +52,12 @@ def _kernels():
+     return moe
+ 
+ 
++def _provided_mxfp8(hidden_states: torch.Tensor):
++    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
++
++    return provided_mxfp8(hidden_states)
++
++
+ def _output_dtype() -> torch.dtype:
+     from vllm.models.deepseek_v4_1.kernels import moe_output_dtype
+ 
+@@ -289,7 +296,13 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             assert self.combine_addend is not None, "the shared output must be given"
+             shared = self.combine_addend
+         self._plan.run(
+-            hidden_states, topk_ids, topk_weights, weights, output, workspace, shared
++            _provided_mxfp8(hidden_states),
++            topk_ids,
++            topk_weights,
++            weights,
++            output,
++            workspace,
++            shared,
+         )
+ 
+     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index b9512167d..d5cf952ce 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -783,11 +783,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             hidden_states = None
+             rows = sp_rows.num_tokens
+         else:
++            gathered = None
+             if sp_rows is not None:
+-                # Sequence-parallel prefill: attention runs on every row.
++                # Sequence-parallel prefill: attention runs on every row, and the
++                # projection reads the gathered rows' MXFP8 cast.
+                 hidden_states = sp_rows.gather(hidden_states)
++                gathered = kernels.cast_mxfp8(hidden_states)
+             rows = hidden_states.shape[0]
+-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++            with kernels.mxfp8_inputs(gathered):
++                qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+             qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index d720def9d..9ccc93676 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -7,6 +7,8 @@ checks that explicit attention, linear and MoE backends name it. Model code asks
+ this module for the implementation of each component instead of naming it.
+ """
+ 
++import contextlib
++
+ import torch
+ from torch import nn
+ 
+@@ -65,6 +67,25 @@ def mhc(config) -> nn.Module:
+     return TileKernelsMHC(config)
+ 
+ 
++def cast_mxfp8(rows: torch.Tensor):
++    """The MXFP8 cast of rows regrouped after their producer (``linear.MXFP8Rows``),
++    for projections that read their input's cast."""
++    from .tilelang.linear import cast_mxfp8
++
++    return cast_mxfp8(rows)
++
++
++def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
++    """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
++    from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
++    (the model tests' mHC stand-ins return no cast)."""
++    if rows is None:
++        return contextlib.nullcontext()
++    from .tilelang.linear import provide_mxfp8
++
++    return provide_mxfp8(rows)
++
++
+ def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
+     from .tilelang.norm import TileLangRMSNorm
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index be9eb0ad0..71b3fc620 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -163,6 +163,11 @@ class DeepseekV4DecoderLayer(nn.Module):
+             shared.act_fn = kernels.shared_expert_activation(
+                 shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
+             )
++        # The mHC entries write these projections' MXFP8 input (the routed
++        # experts' too): ``forward`` hands it over and they cast nothing.
++        self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
++        if shared is not None:
++            shared.gate_up_proj.tilelang_mxfp8_input = True
+ 
+         # A CED decoder layer routes the compact decoder rows, whose padding
+         # mask differs from the step's. Tag its router by layer, never by the
+@@ -225,11 +230,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+         )
+ 
+     def declare_kernels(self) -> None:
+-        """Declare the MoE router's kernels (a router is not a module)."""
++        """Declare the MoE router's kernels (a router is not a module) and the MXFP8
++        cast of the rows a forward regroups after the mHC entry that cast them
++        (CED's compact rows, prefill SP's gathered rows)."""
++        from ..tilelang import prepare
++        from ..tilelang.linear import _warm_casts
++
+         router = getattr(self.ffn.experts, "router", None)
+         declare = getattr(router, "declare_kernels", None)
+         if declare is not None:
+             declare()
++        prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+ 
+     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+@@ -313,7 +324,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 sp_rows=sp_rows,
+             )
+         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
+-        residual, post_mix, res_mix, x, attn_pre = self.mhc.pre(
++        # x_q: x's MXFP8 cast for the sublayer's projections.
++        residual, post_mix, res_mix, x, attn_pre, x_q = self.mhc.pre(
+             residual,
+             fn,
+             self.hc_attn_scale,
+@@ -330,6 +342,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+             # residual updates and experts only need the selected replay rows.
+             global_kv_ready = self.attn.prepare_global_kv(positions, x)
+             x = gather_rows(x, ced_indices)
++            x_q = self.mhc.cast_rows(x)
+             residual = gather_rows(residual, ced_indices)
+             post_mix = gather_rows(post_mix, ced_indices)
+             res_mix = gather_rows(res_mix, ced_indices)
+@@ -338,14 +351,15 @@ class DeepseekV4DecoderLayer(nn.Module):
+             if input_ids is not None:
+                 input_ids = gather_rows(input_ids, ced_indices)
+         if sp_rows is None:
+-            x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++            with kernels.mxfp8_inputs(x_q):
++                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+         else:
+             # SP: attention gathers every row and reduce-scatters its output.
+-            with sp_prefill.activate(sp_rows):
++            with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
+                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+-        residual, post_mix, res_mix, x, ffn_pre = self.mhc.post_pre(
++        residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
+             x,
+             residual,
+             post_mix,
+@@ -357,15 +371,18 @@ class DeepseekV4DecoderLayer(nn.Module):
+             attn_pre,
+         )
+         if sp_rows is None:
+-            x = self.ffn(x, input_ids)
++            with kernels.mxfp8_inputs(x_q):
++                x = self.ffn(x, input_ids)
+         else:
+             # SP: route every row; the TP partial sum is reduce-scattered.
+             with sp_prefill.activate(sp_rows):
+-                x = self.ffn(
+-                    sp_rows.gather(x),
+-                    input_ids,
+-                    reduce_scatter_rows=sp_rows.padded_rows,
+-                )
++                rows = sp_rows.gather(x)
++                with kernels.mxfp8_inputs(self.mhc.cast_rows(rows)):
++                    x = self.ffn(
++                        rows,
++                        input_ids,
++                        reduce_scatter_rows=sp_rows.padded_rows,
++                    )
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+         return x, residual, post_mix, res_mix, ffn_pre
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index e5c3f07e9..32e61eb7a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -355,6 +355,28 @@ def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
+         )
+ 
+ 
++@T.macro
++def cast_block_mxfp8(values, quantized, count, amax, Q, S, row, col):
++    """One thread's share of a 32-value block in registers through ``_reference_cast``'s
++    arithmetic: ``values[0:count]`` (FP32 copies of BF16 values) are columns ``col`` on
++    of output row ``row``, ``amax`` the whole block's (the caller reduces it across the
++    block's threads). Their E4M3 bytes go through ``quantized`` (local, ``count``
++    long) to ``Q`` and, from the thread whose columns start the block, the UE8M0 byte
++    to ``S``: the bytes ``per_token_cast`` writes. A producer whose output is in
++    registers writes its consumers' MXFP8 input with it."""
++    bits = T.reinterpret(
++        T.max(amax, T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32
++    )
++    exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
++    inv = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
++    if col % 32 == 0:
++        S[row, col // 32] = T.Cast(T.uint8, exponent + 127)
++    for v in T.vectorized(count):
++        quantized[v] = T.Cast(T.float8_e4m3fn, values[v] * inv)
++    for v in T.vectorized(count):
++        Q[row, col + v] = quantized[v]
++
++
+ @tilelang.jit
+ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128):
+     """``splitk_reduce`` to BF16, then the reference's activation cast: E4M3 ``Q`` and
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 77f601795..9ef4555e7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -12,10 +12,17 @@ each row's accumulation order fixed, so results do not depend on the batch.
+ 
+ The kernels run inside custom ops, which keeps them opaque to torch.compile,
+ and borrow activation scratch from vLLM's workspace.
++
++A projection marked ``tilelang_mxfp8_input`` casts nothing: the kernel that
++produced its input wrote the cast too (``MXFP8Rows``; the mHC entries do, for the
++sublayer's first projections), and hands it over for the call
++(``provide_mxfp8``).
+ """
+ 
++import contextlib
+ import functools
+ import math
++from typing import NamedTuple
+ from weakref import WeakValueDictionary
+ 
+ import torch
+@@ -86,6 +93,90 @@ def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
+     )
+ 
+ 
++# A producer writes a projection's MXFP8 input in whole DECODE_ROWS tiles up to the
++# widest decode row bound (WIDE_DECODE: 128 rows), so each 16-, 32- or 64-row decode
++# tile reads in bounds; past it, the prefill GEMMs read the live rows alone.
++MXFP8_DECODE_ROWS = max(max(wide) for wide in WIDE_DECODE.values())
++
++
++def mxfp8_rows(rows: int) -> int:
++    """Rows a producer writes for ``rows`` rows of a projection's MXFP8 input."""
++    if rows > MXFP8_DECODE_ROWS:
++        return rows
++    return -(-rows // DECODE_ROWS) * DECODE_ROWS
++
++
++class MXFP8Rows(NamedTuple):
++    """BF16 activation rows beside their MXFP8 cast, as block-32 projections read it.
++
++    ``values`` (E4M3) and ``scales`` (packed UE8M0 bytes, ``4 * scale_words(K)`` a row)
++    hold ``per_token_cast``'s bytes of ``rows`` in their first ``rows.shape[0]`` rows,
++    padded to ``mxfp8_rows`` rows that no GEMM stores."""
++
++    rows: torch.Tensor
++    values: torch.Tensor
++    scales: torch.Tensor
++
++
++def empty_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
++    """Unwritten MXFP8 buffers for ``rows`` (BF16 ``[M, K]``), for their producer."""
++    m, k = rows.shape
++    padded = mxfp8_rows(m)
++    return MXFP8Rows(
++        rows,
++        torch.empty((padded, k), dtype=torch.float8_e4m3fn, device=rows.device),
++        torch.empty(
++            (padded, 4 * scale_words(k)), dtype=torch.uint8, device=rows.device
++        ),
++    )
++
++
++def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
++    """``rows``' MXFP8 cast by TileKernels' ``per_token_cast``: the producer of rows
++    regrouped after the kernel that wrote their cast (a CED boundary's compact rows,
++    prefill SP's gathered rows). ``_warm_casts`` of their width declares it."""
++    out = empty_mxfp8(rows)
++    m = rows.shape[0]
++    if m:
++        _tile_kernels().quant.per_token_cast(
++            rows,
++            "e4m3",
++            SF_BLOCK,
++            round_sf=True,
++            use_packed_ue8m0=True,
++            out=(out.values[:m], out.scales[:m]),
++        )
++    return out
++
++
++# The MXFP8 rows handed to the projections of the calls in progress, innermost last.
++_PROVIDED: list[MXFP8Rows] = []
++
++
++@contextlib.contextmanager
++def provide_mxfp8(rows: MXFP8Rows):
++    """Hand ``rows`` to the projections that read their input's cast from its producer
++    (``tilelang_mxfp8_input``) for the calls inside: the sublayer the rows feed."""
++    _PROVIDED.append(rows)
++    try:
++        yield
++    finally:
++        _PROVIDED.pop()
++
++
++def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
++    """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
++    holder keeps them alive, so no other tensor can be at that address. A projection
++    whose input arrives without its cast fails here: it has no cast of its own."""
++    for rows in reversed(_PROVIDED):
++        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
++            return rows
++    raise RuntimeError(
++        f"no MXFP8 cast was handed over for these {tuple(x.shape)} rows: the "
++        "projection reads its input's cast from the input's producer (provide_mxfp8)"
++    )
++
++
+ # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+ # row in twice the time of a 16-row tile; every height gives the same
+ # partials bit for bit, so each row count takes the smallest tile that fits.
+@@ -152,6 +243,10 @@ def _block32_linear(
+     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
+     x = x.reshape(-1, k)
+     rows = x.shape[0]
++    if layer.tilelang_mxfp8_input:
++        provided = provided_mxfp8(x)
++        _block32_gemm(layer, provided.values, provided.scales, out.view(rows, n), rows)
++        return
+     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+         _block32_split(layer, x, out.view(rows, n), scratch)
+         return
+@@ -169,9 +264,12 @@ def _block32_linear(
+ 
+ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+     """The GEMM of a block-32 projection without split-K on its MXFP8 activations
+-    (``_activation_specs`` buffers, the first ``rows`` rows live)."""
++    (``_activation_specs`` buffers or a producer's ``MXFP8Rows``, the first ``rows``
++    rows live)."""
+     if rows > layer.tilelang_decode_rows:
+         gemm = layer.tilelang_prefill
++        # A producer pads rows that another projection's decode tiles read.
++        xq, sf = xq[:rows], sf[:rows]
+     else:
+         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+     gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+@@ -347,7 +445,9 @@ def _warm_casts(k: int) -> None:
+ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
+     register it for the custom op, and declare its kernels. ``cast=False``: the
+-    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches."""
++    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches.
++    A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
++    producer (``provide_mxfp8``) and casts nothing either."""
+     n, k = layer.weight.shape
+     kernels = _block32_kernels(n, k, groups)
+     layer.tilelang_groups = groups
+@@ -357,6 +457,15 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     layer.tilelang_shards = split["shards"] if split else 1
+     if split:
+         layer.tilelang_split_rows = split["rows"]
++    layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
++    if layer.tilelang_mxfp8_input:
++        heights = {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
++        if split or groups != 1 or any(DECODE_ROWS % height for height in heights):
++            # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
++            raise ValueError(
++                f"the ({n}, {k}) projection cannot read a producer's MXFP8 rows"
++            )
++        cast = False
+     layer.tilelang_key = id(layer)
+     _LAYERS[layer.tilelang_key] = layer
+ 
+@@ -401,6 +510,8 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+         _block32_scale_words(layer)
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
++        if getattr(layer, "tilelang_mxfp8_input", False):
++            return 0  # its producer writes the activations
+         return _spec_bytes(
+             _activation_specs(
+                 num_tokens, layer.weight.shape[1], layer.tilelang_decode_rows
+@@ -675,10 +786,16 @@ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None
+ 
+ 
+ __all__ = [
++    "MXFP8Rows",
+     "TileLangBlock32Rows",
+     "TileLangFP8LinearMethod",
+     "TileLangLinearMethod",
+     "TileLangScaledLinearMethod",
+     "TileLangSplitLinearMethod",
++    "cast_mxfp8",
++    "empty_mxfp8",
++    "mxfp8_rows",
+     "project_parts",
++    "provide_mxfp8",
++    "provided_mxfp8",
+ ]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 17b4eb8d4..a29c46849 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -36,7 +36,11 @@ entry:
+   results do not depend on the batch.
+ - ``finalize``: per token, TileKernels' fused reduce, RMS, mix split and
+   Sinkhorn (``mhc_pre_big_fuse``), emitting the new pre-mix, beside the
+-  collapse's RMSNorm with the sublayer's weight.
++  collapse's RMSNorm with the sublayer's weight, which it also writes as the
++  MXFP8 input of the sublayer's block-32 projections (``linear.MXFP8Rows``,
++  ``per_token_cast``'s bytes): the entry returns it, and the projections that read
++  the sublayer input (attention's fused Q-A/KV, the shared expert's gate/up, the
++  routed experts) no longer cast it themselves.
+ """
+ 
+ from functools import cache
+@@ -51,6 +55,12 @@ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
++from vllm.models.deepseek_v4_1.tilelang.linear import (
++    MXFP8Rows,
++    cast_mxfp8,
++    empty_mxfp8,
++)
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     retain_cuda_graph_capture_resource,
+@@ -294,12 +304,23 @@ def finalize(
+ ):
+     """One token per CTA: warp 0 turns the projection partials into the new
+     pre-mix, the post-mix and the Sinkhorn combination (TileKernels'
+-    ``mhc_pre_big_fuse``); the other warps RMS-normalize the collapse."""
++    ``mhc_pre_big_fuse``); the other warps RMS-normalize the collapse into ``y``
++    and write its MXFP8 cast for the sublayer's projections, ``per_token_cast``'s
++    bytes: E4M3 ``yq`` and a UE8M0 byte per 32 columns in ``ysf``.
++
++    A worker holds eight adjacent columns of ``y``, so four adjacent lanes hold a
++    32-column block; two lane shuffles give them the block's amax. ``yq`` and ``ysf``
++    may have more rows than ``y`` (the projections' whole decode tiles); those rows
++    are not written."""
+     assert hidden_size % VEC == 0
+     splits = hidden_size // block_H
+     chunks = hidden_size // VEC
+     workers = threads - 32
+-    M = T.dynamic("M")
++    # Every warp's lanes take part in a step or none do, so the shuffles of a step's
++    # blocks are warp-uniform; a block's four lanes sit in one warp.
++    assert chunks % 32 == 0 and workers % 32 == 0
++    sf_width = 4 * scale_words(hidden_size)
++    M, Mq = T.dynamic("M, Mq")
+ 
+     @T.prim_func
+     def mhc_finalize(
+@@ -314,6 +335,8 @@ def finalize(
+         comb: T.Tensor((M, MULT, MULT), T.float32),
+         pre_out: T.Tensor((M, MULT), T.float32),
+         y: T.Tensor((M, hidden_size), T.bfloat16),
++        yq: T.Tensor((Mq, hidden_size), T.float8_e4m3fn),
++        ysf: T.Tensor((Mq, sf_width), T.uint8),
+     ):
+         with T.Kernel(M, threads=threads) as pid:
+             tx = T.get_thread_binding()
+@@ -321,7 +344,10 @@ def finalize(
+             xv = T.alloc_local((VEC,), T.bfloat16)
+             wv = T.alloc_local((VEC,), T.bfloat16)
+             yv = T.alloc_local((VEC,), T.bfloat16)
++            xf = T.alloc_local((VEC,), T.float32)
++            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
+             total = T.alloc_local((1,), T.float32)
++            amax = T.alloc_local((1,), T.float32)
+ 
+             if tx < 32:
+                 # Reduce the split partials; RMS over the flattened streams.
+@@ -376,7 +402,8 @@ def finalize(
+                 for j, k in T.Parallel(MULT, MULT):
+                     comb[pid, j, k] = cm[j, k]
+             else:
+-                # RMSNorm of the collapse, with the sublayer's weight.
++                # RMSNorm of the collapse, with the sublayer's weight, and its MXFP8
++                # cast.
+                 worker = tx - 32
+                 total[0] = 0
+                 for i_split in T.serial(splits):
+@@ -398,6 +425,15 @@ def finalize(
+                             )
+                         for v in T.vectorized(VEC):
+                             y[pid, chunk * VEC + v] = xv[v]
++                        amax[0] = T.float32(0)
++                        for v in T.unroll(VEC):
++                            xf[v] = T.Cast(T.float32, xv[v])
++                            amax[0] = T.max(amax[0], T.abs(xf[v]))
++                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
++                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
++                        cast_block_mxfp8(
++                            xf, xq, VEC, amax[0], yq, ysf, pid, chunk * VEC
++                        )
+ 
+     return mhc_finalize
+ 
+@@ -638,7 +674,7 @@ def _collapse(hidden: int, column: int = -1):
+ 
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_mhc_pre",
+-    mutates_args=("residual_out", "y", "post", "comb", "pre_out"),
++    mutates_args=("residual_out", "y", "y_q", "y_sf", "post", "comb", "pre_out"),
+ )
+ def _mhc_pre(
+     residual: torch.Tensor,
+@@ -649,6 +685,8 @@ def _mhc_pre(
+     pre: torch.Tensor,
+     residual_out: torch.Tensor | None,
+     y: torch.Tensor,
++    y_q: torch.Tensor,
++    y_sf: torch.Tensor,
+     post: torch.Tensor,
+     comb: torch.Tensor,
+     pre_out: torch.Tensor,
+@@ -703,7 +741,7 @@ def _mhc_pre(
+         Q,
+     )
+     _finalize(hidden, k, rms_eps, hc_eps, iterations)(
+-        P, S, C, Q, scale, base, norm, post, comb, pre_out, y
++        P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
+     )
+ 
+ 
+@@ -717,6 +755,8 @@ def _mhc_pre_fake(
+     pre,
+     residual_out,
+     y,
++    y_q,
++    y_sf,
+     post,
+     comb,
+     pre_out,
+@@ -892,6 +932,9 @@ class TileKernelsMHC(nn.Module):
+         previous_post=None,
+         previous_comb=None,
+     ):
++        """A sublayer entry: ``(streams, post-mix, combination, y, new pre-mix,
++        y_mxfp8)``. ``y`` is the sublayer's normalized input and ``y_mxfp8`` its MXFP8
++        cast (``linear.MXFP8Rows``), which the sublayer's block-32 projections read."""
+         tokens, device = int(residual.shape[0]), residual.device
+         if isinstance(previous_output, RankOrderParts):
+             # Added inside the projection kernel, in rank order.
+@@ -907,6 +950,7 @@ class TileKernelsMHC(nn.Module):
+             )
+         )
+         y = torch.empty((tokens, self.hidden_size), dtype=residual.dtype, device=device)
++        y_mxfp8 = empty_mxfp8(y)
+         post = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
+         comb = torch.empty((tokens, MULT, MULT), dtype=torch.float32, device=device)
+         pre_out = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
+@@ -919,6 +963,8 @@ class TileKernelsMHC(nn.Module):
+             pre,
+             residual_out,
+             y,
++            y_mxfp8.values,
++            y_mxfp8.scales,
+             post,
+             comb,
+             pre_out,
+@@ -929,7 +975,7 @@ class TileKernelsMHC(nn.Module):
+             previous_post,
+             previous_comb,
+         )
+-        return residual if unchanged else residual_out, post, comb, y, pre_out
++        return residual if unchanged else residual_out, post, comb, y, pre_out, y_mxfp8
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+         return self.pre(
+@@ -951,6 +997,12 @@ class TileKernelsMHC(nn.Module):
+         _mhc_post(x, residual, post, comb, out)
+         return out
+ 
++    @staticmethod
++    def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
++        """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
++        compact rows, prefill SP's gathered rows), for the projections that read it."""
++        return cast_mxfp8(rows)
++
+     def collapse(
+         self,
+         state: torch.Tensor,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 6145c211d..5a103ad03 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -54,7 +54,7 @@ from .gemm import (
+     pack_scale_codes,
+     scale_words,
+ )
+-from .linear import _calls, _launch, _warm_casts
++from .linear import MXFP8Rows, _calls, _launch
+ 
+ # Routes handled by one CTA of the dispatch kernels.
+ _CHUNK = 512
+@@ -1139,11 +1139,13 @@ class MoeExpertsV41Plan:
+ 
+     Expert weights come from ``prepare_weights``: ``w13`` (``[E, 2I, H / 2]``
+     packed E2M1, gate rows first) and ``w2`` (``[E, H, I / 2]``), each with
+-    its UE8M0 bytes, become tile-major. The fused SwiGLU (``moe_swiglu_cast``:
+-    DeepSeek's clamp, route weight before the down projection, MXFP8 cast) runs
+-    between the GEMMs. The plan holds no buffers; ``workspace_specs(rows)``
+-    lists one call's scratch. Its owner calls ``declare_kernels()`` when
+-    preparing kernels; ``run`` launches the kernels it binds.
++    its UE8M0 bytes, become tile-major. The tokens arrive cast to MXFP8 by the
++    kernel that produced them (``linear.MXFP8Rows``: the mHC entry). The fused
++    SwiGLU (``moe_swiglu_cast``: DeepSeek's clamp, route weight before the down
++    projection, MXFP8 cast) runs between the GEMMs. The plan holds no buffers;
++    ``workspace_specs(rows)`` lists one call's scratch. Its owner calls
++    ``declare_kernels()`` when preparing kernels; ``run`` launches the kernels it
++    binds.
+     """
+ 
+     def __init__(
+@@ -1216,8 +1218,7 @@ class MoeExpertsV41Plan:
+ 
+     def declare_kernels(self) -> None:
+         """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
+-        kernels, stored on the plans once prepared, and warm TileKernels' MXFP8
+-        cast of the tokens for each batch bucket a step can launch."""
++        kernels, stored on the plans once prepared."""
+ 
+         def calls() -> list[prepare.TileLangCall]:
+             out = _calls(self.kernels())
+@@ -1231,7 +1232,7 @@ class MoeExpertsV41Plan:
+             for dispatch in self.dispatch.values():
+                 dispatch.bind()
+ 
+-        prepare.declare(calls, bind=bind, warm=lambda: _warm_casts(self.hidden))
++        prepare.declare(calls, bind=bind)
+ 
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+         """Per GEMM ``(tiles, tails, scale codes, row bases)`` from E2M1 weights and
+@@ -1260,42 +1261,48 @@ class MoeExpertsV41Plan:
+         hidden, inter = self.hidden, self.intermediate
+         return (
+             *dispatch.workspace_specs(rows),
+-            ((rows, hidden), torch.float8_e4m3fn),  # tokens, MXFP8
+-            ((rows, 4 * scale_words(hidden)), torch.uint8),
+             ((layout_rows, 2 * inter), torch.bfloat16),  # gate/up output
+             ((layout_rows, inter), torch.float8_e4m3fn),  # down input, MXFP8
+             ((layout_rows, 4 * scale_words(inter)), torch.uint8),
+             ((layout_rows, hidden), torch.bfloat16),  # down output
+         )
+ 
+-    def run(self, x, topk_ids, topk_weights, weights, out, workspace=None, shared=None):
++    def run(
++        self,
++        x: MXFP8Rows,
++        topk_ids,
++        topk_weights,
++        weights,
++        out,
++        workspace=None,
++        shared=None,
++    ):
+         """``out[t] = sum_k w[t, k] * down_e(swiglu(gate_up_e(x[t]))) (+ shared[t])``.
+ 
+-        ``e`` is the token's k-th expert. ``weights`` comes from
+-        ``prepare_weights``; ``workspace`` is a byte buffer of at least
++        ``e`` is the token's k-th expert. ``x`` is the tokens' MXFP8 rows, as their
++        producer wrote them. ``weights`` comes from ``prepare_weights``;
++        ``workspace`` is a byte buffer of at least
+         ``workspace_bytes(workspace_specs(rows))``. ``shared`` (BF16 rows) is added
+         to the FP32 sum before the one rounding to ``out``'s dtype; a callable
+         ``shared`` is called just before the combine launch (it may wait for
+         another stream) and returns those rows.
+         """
+-        rows = x.shape[0]
++        rows = topk_ids.shape[0]
+         dispatch = self.dispatch[topk_ids.dtype]
+         specs = self.workspace_specs(rows, topk_ids.dtype)
+         if workspace is None:
+             workspace = torch.empty(
+-                workspace_bytes(specs), dtype=torch.uint8, device=x.device
++                workspace_bytes(specs), dtype=torch.uint8, device=x.values.device
+             )
+         buffers = carve(workspace, specs)
+         count = len(dispatch.workspace_specs(rows))
+-        xq, x_sf, h, hq, h_sf, y = buffers[count:]
++        h, hq, h_sf, y = buffers[count:]
+         gate_up, down = weights
+         layout = dispatch.dispatch(topk_ids, topk_weights, buffers[:count])
+-        self.tk.quant.per_token_cast(
+-            x, "e4m3", SF_BLOCK, round_sf=True, use_packed_ue8m0=True, out=(xq, x_sf)
+-        )
+         order, tile_expert = layout["order"], layout["tile_expert"]
+-        x_words, h_words = x_sf.view(torch.uint32), h_sf.view(torch.uint32)
+-        self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
++        # The gather reads the live rows only; padding rows past them are not read.
++        x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
++        self.gate_up(x.values, x_words, *_present(gate_up), order, tile_expert, h)
+         self.swiglu(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+         self.down(hq, h_words, *_present(down), order, tile_expert, y)
+         if callable(shared):

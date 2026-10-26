@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:43:03 +0100
+Subject: [PATCH 532/532] [DS4.1] Rejection-sampler benchmark: a fixed
+ release's block sums bit for bit
+
+Against a release with Barron et al.'s fix (next-candidate's), the block sums
+leave the maximum's column out as ours do, so the check that adds it back
+(Triton's arithmetic) failed every local_stats case. They are compared bit for
+bit there.
+---
+ .../kernels/benchmark_tilelang_rejection.py     | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_rejection.py b/benchmarks/kernels/benchmark_tilelang_rejection.py
+index bdd915362..a9ef06c48 100644
+--- a/benchmarks/kernels/benchmark_tilelang_rejection.py
++++ b/benchmarks/kernels/benchmark_tilelang_rejection.py
+@@ -18,7 +18,8 @@ timed replay, and are compared before anything is timed, the elements the kernel
+ leave alone included: bit for bit where the arithmetic is shared (argmaxes, maxima,
+ sampled tokens, resampling), and where the TileLang kernels follow Barron et al.'s
+ fix within the baseline's rounding: a block sum without its maximum's column plus 1
+-is the baseline's, the cumulative log ratios within 5e-5 (the baseline rounds them
++is the baseline's (a release with the fix leaves the column out too, so its sums are
++compared bit for bit), the cumulative log ratios within 5e-5 (the baseline rounds them
+ at the magnitude of the maximum logit), and at most one request in twenty may take
+ another count (a draw between the two thresholds). Both see the same tensor
+ addresses.
+@@ -326,6 +327,8 @@ class Triton:
+     """The Triton kernels the TileLang ones replaced."""
+ 
+     name = "triton"
++    # A block sum of Triton's includes the column holding the block's maximum.
++    sums_without_maximum = False
+ 
+     def local_stats(self, x, out):
+         triton_local_stats(x, out)
+@@ -350,6 +353,9 @@ class Release:
+         spec = importlib.util.spec_from_file_location("release_rejection", path)
+         self.module = importlib.util.module_from_spec(spec)
+         spec.loader.exec_module(self.module)
++        # A release with Barron et al.'s fix leaves the maximum's column out of a
++        # block sum, as ours does (its header's vllm_others); one before it does not.
++        self.sums_without_maximum = "vllm_others" in self.module._HEADER
+ 
+     def local_stats(self, x, out):
+         self.module.compute_local_stats(
+@@ -533,7 +539,7 @@ def make_case(kind, rows, dtype, temps, seed, count, baseline, dead_rows=False):
+     return reset, invoke, lambda index: buffers[index], nodes
+ 
+ 
+-def differences(kind, actual, expected):
++def differences(kind, actual, expected, baseline):
+     """What the outputs may not differ in (see the module docstring): a list of
+     ``(what, indices)``, empty when they agree."""
+     found = []
+@@ -561,7 +567,10 @@ def differences(kind, actual, expected):
+         empty = written & (expected[2] == 0)
+         same("empty blocks", actual[2][empty], expected[2][empty])
+         live = written & (expected[2] > 0)
+-        close("block sums", actual[2] + 1, expected[2], live, 1e-5, 0)
++        if baseline.sums_without_maximum:
++            same("block sums", actual[2][live], expected[2][live])
++        else:
++            close("block sums", actual[2] + 1, expected[2], live, 1e-5, 0)
+     elif kind == "verify":
+         same("sampled", actual[1], expected[1])
+         same("draft lse", actual[4], expected[4])
+@@ -657,7 +666,7 @@ def measure(kind, rows, dtype_name, temps, seed, baseline, dead_rows=False):
+             invoke(0, True, placeholders=True)
+             found += identical(actual, output(0))
+         else:
+-            found = differences(kind, output(0), expected)
++            found = differences(kind, output(0), expected, baseline)
+         if found:
+             print(json.dumps({"sample": sample, "differences": found}), flush=True)
+             raise RuntimeError(

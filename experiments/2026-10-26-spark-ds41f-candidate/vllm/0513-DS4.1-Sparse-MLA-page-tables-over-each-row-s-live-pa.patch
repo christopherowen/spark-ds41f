@@ -1,0 +1,848 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 14:56:41 +0100
+Subject: [PATCH 513/513] [DS4.1] Sparse-MLA page tables over each row's live
+ pages
+
+At --max-model-len 1M and 256-token blocks the decode metadata wrote every
+one of a row's 4,096 page-table columns, 32 loop iterations a thread in
+12 CTAs at a decode step (15 us of a 6-row call), and 268 MB a layer at a
+16K-row prefill chunk (483 us a call). A row's readers reach only the
+pages of its visible entries: the sparse MLA's kept lanes and the
+indexer's tiles look up positions below the row's visible length, and a
+masked lane's lookup is clamped into the table and discarded.
+
+decode_metadata and pages now write those columns alone (ceil(visible /
+page), at most the table's width; none for a row without a request), and
+leave the rest of the buffer as it was. Profiled ceiling (request
+inventory 5, TP4 ring, rank 0): metadata_decode is 0.70% of a c1 decode
+step, 0.41% at c8 and 1.20% of a 15K-token prefill; metadata_pages 0.10%
+of a c1 step.
+
+Tests: both kernels equal the torch references on every live column and
+leave the others untouched; the indexer (dense and candidates) and every sparse-MLA
+route keep their bits with every dead column poisoned and the masked lanes
+pointed into them. benchmark_deepseek_v41_metadata_pages.py times both
+against the replaced kernels (kept as they were at 26382f5cf), gated. The compressor
+test's page-table check passes its visible lengths, every column live.
+---
+ .../benchmark_deepseek_v41_metadata_pages.py  | 327 ++++++++++++++++++
+ .../attention/test_deepseek_v41_tilelang.py   | 105 ++++++
+ .../test_deepseek_v41_tilelang_metadata.py    |  57 ++-
+ tests/models/test_deepseek_v4_1_compressor.py |  14 +-
+ vllm/models/deepseek_v4_1/attention.py        |  11 +-
+ .../models/deepseek_v4_1/tilelang/metadata.py |  81 +++--
+ 6 files changed, 552 insertions(+), 43 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_metadata_pages.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_metadata_pages.py b/benchmarks/kernels/benchmark_deepseek_v41_metadata_pages.py
+new file mode 100644
+index 000000000..cdd8ebdff
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_metadata_pages.py
+@@ -0,0 +1,327 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of DeepSeek-V4.1's sparse-MLA page tables over each row's
++live pages (``tilelang.metadata``'s ``decode_metadata`` and ``pages``) against the
++kernels they replace, which wrote every column of the table.
++
++At ``--max-model-len`` 1M and 256-token blocks a page table has 4,096 columns; a
++row reads the pages of its visible entries. The replaced kernels are kept here as
++they were at vLLM 26382f5cf (``_baseline_*``). Shapes: decode steps of one and 16
++requests (1 + 5 drafted rows each) at 4K, 64K and 1M-token contexts, and a
++16,384-row prefill chunk at the start of a prompt and 48K into it; both main page
++sizes (256 entries at ratio 1, 128 at ratio 2); for ``pages``, the indexer's decode
++chunk and a 256-row prefill chunk.
++
++Each shape is measured on eight fresh inputs. On each, both kernels' outputs are
++first checked: the window metadata equal, the page tables equal on every live
++column. Then CUDA graphs of 100 calls of both run back to back, alternating which
++goes first, and the shape's 95% interval comes from the eight per-input
++differences. The gate (``--gate``) is that neither kernel is slower at any shape
++(the interval's lower bound above zero).
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import metadata
++from vllm.models.deepseek_v4_1.tilelang.metadata import _PASS, _threads, _window_macro
++
++DEVICE = "cuda"
++CALLS = 100
++BLOCK_TOKENS = 256
++MAIN_WIDTH = (1 << 20) // BLOCK_TOKENS  # 1M-token max_model_len
++WINDOW = SWA_WIDTH = 128
++SWA_PAGE = BLOCK_TOKENS  # the window part reads the same table
++DRAFT_ROWS = 6
++
++# name: (requests, rows a request, context tokens at the step's last row)
++DECODE = {
++    "c1 4K": (1, DRAFT_ROWS, 4096),
++    "c1 64K": (1, DRAFT_ROWS, 65536),
++    "c1 1M": (1, DRAFT_ROWS, 1 << 20),
++    "c16 4K": (16, DRAFT_ROWS, 4096),
++    "c16 64K": (16, DRAFT_ROWS, 65536),
++    "prefill 16K": (1, 16384, 16384),
++    "prefill 48K-64K": (1, 16384, 65536),
++}
++PAGES = {
++    "decode c1 64K": (1, DRAFT_ROWS, 65536),
++    "decode c16 64K": (16, DRAFT_ROWS, 65536),
++    "prefill 256 rows at 64K": (1, 256, 65536),
++}
++
++
++@tilelang.jit(pass_configs=_PASS)
++def _baseline_decode_metadata_kernel(
++    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
++):
++    """``decode_metadata_kernel`` at 26382f5cf: every main page-table column."""
++    rows = T.dynamic("rows")
++    src_rows = T.dynamic("src_rows")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++    main_src_rows = T.dynamic("main_src_rows")
++    main_rows = T.dynamic("main_rows")
++    main_cols = T.dynamic("main_cols")
++    main_stride = T.dynamic("main_stride")
++    req_count = T.dynamic("req_count")
++    starts_len = T.dynamic("starts_len")
++    replay_len = T.dynamic("replay_len")
++    threads, per_thread = _threads(width)
++    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
++    main_per_thread = (main_width + threads - 1) // threads
++
++    @T.prim_func
++    def metadata_decode(
++        positions: T.Tensor((src_rows,), T.int64),
++        reqs: T.Tensor((src_rows,), T.int32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        swa: T.Tensor((rows, width), T.int32),
++        lengths: T.Tensor((rows,), T.int32),
++        top_lengths: T.Tensor((rows,), T.int32),
++        visible: T.Tensor((src_rows,), T.int32),
++        starts: T.Tensor((starts_len,), T.int32),
++        request_positions: T.Tensor((req_count,), T.int64),
++        replay_start: T.Tensor((replay_len,), T.int64),
++        main_reqs: T.Tensor((main_src_rows,), T.int32),
++        main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
++        main_pages: T.Tensor((rows, main_width), T.int32),
++        offset: T.int32,
++        main_read_width: T.int32,
++    ):
++        with T.Kernel(rows, 2, threads=threads) as (row, part):
++            tx = T.get_thread_binding()
++            info = T.alloc_local((2,), T.int64)
++            if part == 0:
++                window_row(
++                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
++                    visible, starts, request_positions, replay_start, offset,
++                )  # fmt: skip
++            else:
++                req = main_reqs[offset + row]
++                for k in T.serial(main_per_thread):
++                    col = k * threads + tx
++                    if col < main_width:
++                        page_id = T.if_then_else(
++                            (req >= 0) & (col < main_read_width),
++                            main_table[req, col],
++                            -1,
++                        )
++                        main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++
++    return metadata_decode
++
++
++@tilelang.jit(pass_configs=_PASS)
++def _baseline_pages_kernel(width: int):
++    """``pages_kernel`` at 26382f5cf: every column."""
++    rows = T.dynamic("rows")
++    src_rows = T.dynamic("src_rows")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++
++    @T.prim_func
++    def metadata_pages(
++        reqs: T.Tensor((src_rows,), T.int32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        out: T.Tensor((rows, width), T.int32),
++        offset: T.int32,
++        read_width: T.int32,
++    ):
++        with T.Kernel(rows, T.ceildiv(width, 128), threads=128) as (row, cb):
++            col = cb * 128 + T.get_thread_binding()
++            if col < width:
++                req = reqs[offset + row]
++                page_id = T.if_then_else(
++                    (req >= 0) & (col < read_width), table[req, col], -1
++                )
++                out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++
++    return metadata_pages
++
++
++def _step(requests: int, rows_each: int, context: int, ratio: int, seed: int):
++    """One step's per-row metadata, as the builders leave it: ``rows_each`` rows a
++    request ending at position ``context - 1``, each row's visible entries at the
++    compression ratio, and every request's block table."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    rows = requests * rows_each
++    row = torch.arange(rows, device=DEVICE)
++    req = (row // rows_each).to(torch.int32)
++    pos = (context - rows_each + row % rows_each).to(torch.int64)
++    visible = ((pos + 1) // ratio).to(torch.int32)
++    starts = torch.arange(0, rows + 1, rows_each, dtype=torch.int32, device=DEVICE)
++    table = torch.randint(
++        1, 1 << 20, (16, MAIN_WIDTH), generator=gen, device=DEVICE, dtype=torch.int32
++    )
++    table[:, 7] = 0  # a hole
++    return dict(
++        rows=rows,
++        pos=pos,
++        req=req,
++        visible=visible,
++        starts=starts,
++        request_positions=pos[::rows_each].contiguous(),
++        table=table,
++    )
++
++
++def _live_mask(step, page: int, width: int) -> torch.Tensor:
++    live = (step["visible"].long() + page - 1) // page
++    cols = torch.arange(width, device=DEVICE)
++    return cols[None, :] < live.clamp_max(width)[:, None]
++
++
++def decode_case(rows_each, requests, context, main_page, seed):
++    """Both decode-metadata kernels on one step, each with its outputs."""
++    step = _step(requests, rows_each, context, BLOCK_TOKENS // main_page, seed)
++    rows = step["rows"]
++
++    def outputs():
++        return (
++            torch.full((rows, SWA_WIDTH), 7, dtype=torch.int32, device=DEVICE),
++            torch.full((rows,), 7, dtype=torch.int32, device=DEVICE),
++            torch.full((rows,), 7, dtype=torch.int32, device=DEVICE),
++            torch.full((rows, MAIN_WIDTH), 7, dtype=torch.int32, device=DEVICE),
++        )
++
++    ours_out, theirs_out = outputs(), outputs()
++    common = (
++        step["pos"], step["req"], step["table"], *ours_out[:3], step["visible"],
++        step["starts"], step["request_positions"],
++    )  # fmt: skip
++
++    def ours():
++        metadata.decode_metadata(
++            *common, step["req"], step["table"], ours_out[3], 0, rows, MAIN_WIDTH,
++            page=SWA_PAGE, window=WINDOW, draft=False, main_page=main_page,
++        )  # fmt: skip
++
++    baseline = _baseline_decode_metadata_kernel(
++        SWA_PAGE, WINDOW, SWA_WIDTH, False, False, MAIN_WIDTH
++    )
++
++    def theirs():
++        baseline(
++            step["pos"], step["req"], step["table"], *theirs_out[:3], step["visible"],
++            step["starts"], step["request_positions"], step["request_positions"],
++            step["req"], step["table"], theirs_out[3], 0, MAIN_WIDTH,
++        )  # fmt: skip
++
++    def check():
++        for a, b in zip(ours_out[:3], theirs_out[:3]):
++            if not torch.equal(a, b):
++                raise SystemExit("decode metadata: the window metadata differ")
++        live = _live_mask(step, main_page, MAIN_WIDTH)
++        if not torch.equal(ours_out[3][live], theirs_out[3][live]):
++            raise SystemExit("decode metadata: a live page differs")
++
++    return ours, theirs, check
++
++
++def pages_case(rows_each, requests, context, page, seed):
++    """Both index page-table kernels on one indexer chunk."""
++    step = _step(requests, rows_each, context, BLOCK_TOKENS // page, seed)
++    rows = step["rows"]
++    ours_out = torch.full((rows, MAIN_WIDTH), 7, dtype=torch.int32, device=DEVICE)
++    theirs_out = torch.full_like(ours_out, 7)
++    baseline = _baseline_pages_kernel(MAIN_WIDTH)
++
++    def ours():
++        metadata.pages(
++            step["req"], step["visible"], step["table"], ours_out, 0, rows, MAIN_WIDTH,
++            page=page,
++        )  # fmt: skip
++
++    def theirs():
++        baseline(step["req"], step["table"], theirs_out, 0, MAIN_WIDTH)
++
++    def check():
++        live = _live_mask(step, page, MAIN_WIDTH)
++        if not torch.equal(ours_out[live], theirs_out[live]):
++            raise SystemExit("pages: a live page differs")
++
++    return ours, theirs, check
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(CALLS):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 1000 / CALLS  # microseconds a call
++
++
++def measure(make, args, samples: int = 8) -> dict:
++    ours_us, theirs_us, differences = [], [], []
++    for sample in range(samples):
++        ours_call, theirs_call, check = make(*args, seed=sample)
++        ours_call()
++        theirs_call()
++        torch.cuda.synchronize()
++        check()
++        ours, theirs = graph(ours_call), graph(theirs_call)
++        pair = (ours, theirs) if sample % 2 == 0 else (theirs, ours)
++        times = {id(capture): elapsed(capture) for capture in pair}
++        ours_us.append(times[id(ours)])
++        theirs_us.append(times[id(theirs)])
++        differences.append(times[id(ours)] - times[id(theirs)])
++        del ours, theirs, pair
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(samples)  # t(7), 95%
++    return {
++        "live_pages_us": statistics.median(ours_us),
++        "every_column_us": statistics.median(theirs_us),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    results = {}
++    for main_page in (256, 128):
++        for name, (requests, rows_each, context) in DECODE.items():
++            results[f"decode_metadata page {main_page} {name}"] = measure(
++                decode_case, (rows_each, requests, context, main_page)
++            )
++    for name, (requests, rows_each, context) in PAGES.items():
++        results[f"pages {name}"] = measure(
++            pages_case, (rows_each, requests, context, 128)
++        )
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        slower = [name for name, r in results.items() if r["interval_us"][0] > 0]
++        if slower:
++            raise SystemExit(f"live-page tables slower at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index e3181d6f6..cdeca86ad 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -512,6 +512,75 @@ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+     assert torch.equal(counts, block_counts)
+ 
+ 
++def _poison_past_live(page_table, lengths, page_size, seed=11):
++    """``page_table`` with every column past each row's live pages (those holding its
++    first ``lengths`` positions, all the TileLang metadata writes) set to page ids no
++    pool holds, negative ones among them."""
++    live = (lengths.long().clamp_min(0) + page_size - 1) // page_size
++    cols = torch.arange(page_table.shape[1], device=DEVICE)
++    past = cols[None, :] >= live[:, None]
++    assert past.any(), "no column to poison"
++    garbage = torch.randint(
++        -(2**31),
++        2**31 - 1,
++        page_table.shape,
++        generator=_gen(seed),
++        device=DEVICE,
++        dtype=torch.int32,
++    )
++    return torch.where(past, garbage, page_table)
++
++
++@pytest.mark.parametrize("candidates", [False, True])
++def test_indexer_reads_only_live_pages(candidates, page_size=64, rows=4, context=9000):
++    """The TileLang metadata writes a row's index page table only over the pages of
++    its first ``lengths`` positions (``tilelang.metadata.pages``). The indexer looks
++    up no other column: with every other column poisoned, the scores and the
++    selections keep their bits."""
++    inp = _index_inputs(rows, context, page_size)
++    inp["lengths"] = torch.tensor(
++        [1, 700, 3001, context], dtype=torch.int32, device=DEVICE
++    )
++    keys = (
++        "q_packed",
++        "q_scales",
++        "weights",
++        "pool",
++        "page_table",
++        "lengths",
++        "active",
++    )
++    extra: tuple = ()
++    if candidates:
++        width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++        gen = _gen(7)
++        candidate_lengths = torch.tensor(
++            [1, 600, 2048, 4096], dtype=torch.int32, device=DEVICE
++        )
++        candidates_in = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
++        for r in range(rows):
++            n = int(candidate_lengths[r])
++            chosen = torch.randperm(
++                int(inp["lengths"][r]), generator=gen, device=DEVICE
++            )[:n]
++            candidates_in[r, :n] = chosen.sort().values.to(torch.int32)
++        candidates_in[2, 5] = -1  # a masked candidate looks up column 0
++        extra = (candidates_in, candidate_lengths)
++        extent = candidate_lengths.clamp(0, width).tolist()
++    else:
++        width = (context + page_size - 1) // page_size * page_size
++        extent = _dense_extent(inp, width)
++    plan = IndexerV41Plan(width, page_size, candidates=candidates)
++    clean_out, clean_scores = plan.run(*(inp[k] for k in keys), *extra)
++    inp["page_table"] = _poison_past_live(inp["page_table"], inp["lengths"], page_size)
++    out, scores = plan.run(*(inp[k] for k in keys), *extra)
++    for r in range(rows):
++        assert torch.equal(scores[r, : extent[r]], clean_scores[r, : extent[r]]), (
++            f"row {r} looked up a page past its live pages"
++        )
++    assert torch.equal(out, clean_out)
++
++
+ def _tie_scores(rows, width, seed=3):
+     # Few distinct values force large ties at every selection threshold.
+     gen = _gen(seed)
+@@ -815,6 +884,42 @@ def test_sparse_mla_reads_only_selected_records(idx_width, heads=16, rows=6):
+         assert torch.equal(out, clean[kernel]), f"{kernel} read an unselected record"
+ 
+ 
++@pytest.mark.parametrize("heads", [16, 24])
++def test_sparse_mla_reads_only_live_pages(heads, rows=6):
++    """The TileLang metadata writes a row's indexed page table only over the pages of
++    its visible entries (``tilelang.metadata.decode_metadata``), which hold every
++    position the row selects. The sparse MLA looks up no other column for a lane it
++    keeps: with every other column poisoned and each list pointing past its length
++    into them, every route keeps the clean bits."""
++    case = _mla_case(512, heads, rows)
++    page, width = case["idx_page"], case["idx_logical"].shape[1]
++    gen = _gen(13)
++    visible = [1, 130, 700, 1500, 2600, 4096][:rows]
++    logical = torch.full_like(case["idx_logical"], -1)
++    lengths = torch.zeros_like(case["idx_len"])
++    for r, seen in enumerate(visible):
++        n = min(seen, width, 1 + r * 97)
++        logical[r, :n] = torch.randperm(seen, generator=gen, device=DEVICE)[:n].to(
++            torch.int32
++        )
++        lengths[r] = n
++    case.update(idx_logical=logical, idx_len=lengths)
++    clean = _mla_run(case)
++    seen = torch.tensor(visible, dtype=torch.int32, device=DEVICE)
++    case["table"] = _poison_past_live(case["table"], seen, page)
++    # Lanes past each list's length look up the first poisoned column (a row whose
++    # pages are all live keeps its -1 lanes).
++    live = (seen.long() + page - 1) // page
++    lanes = torch.arange(width, device=DEVICE)[None, :]
++    past = lanes >= lengths[:, None]
++    dead = (live[:, None] * page + lanes % page).to(torch.int32)
++    poisoned = torch.where(
++        past & (live[:, None] < case["table"].shape[1]), dead, logical
++    )
++    for kernel, out in _mla_run(case, idx_logical=poisoned).items():
++        assert torch.equal(out, clean[kernel]), f"{kernel} looked up a dead page"
++
++
+ def test_sparse_mla_selected_nan_reaches_its_rows(heads=16, rows=6):
+     """A NaN in a selected key makes every head of each row that selects it NaN, as
+     in the reference's softmax, and leaves the other rows' bits alone."""
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 985b65f5d..bda58fe95 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -1,7 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek-V4.1 TileLang sparse-MLA metadata against torch references of its
+-contracts, exactly: every row a launch writes, and the rows it must leave alone."""
++contracts, exactly: every row a launch writes, and the rows it must leave alone.
++
++The page tables equal the references over each row's live pages (those of its
++visible entries); their other columns keep what the buffer held."""
+ 
+ from types import SimpleNamespace
+ 
+@@ -156,6 +159,26 @@ def _rows_equal(actual, expected, rows, sentinel=7):
+     assert bool((actual[rows:] == sentinel).all())
+ 
+ 
++def _live_columns(reqs, visible, offset, rows, page, read_width, width):
++    """Each of ``rows`` rows' live page-table columns: the pages of its visible
++    entries, at most the table's width, none for a row without a request."""
++    reqs, visible = _host(reqs, visible)
++    row = torch.arange(rows) + offset
++    live = (visible[row].clamp(min=0) + page - 1) // page
++    live = live.clamp(max=min(read_width, width))
++    return torch.where(reqs[row] >= 0, live, 0)
++
++
++def _live_equal(actual, expected, live, rows, sentinel=7):
++    """``actual`` equals the reference on each of its first rows' ``live``
++    columns, and every other element is untouched."""
++    actual = actual.cpu().long()
++    inside = torch.zeros_like(actual, dtype=torch.bool)
++    inside[:rows] = torch.arange(actual.shape[1])[None, :] < live[:, None]
++    assert torch.equal(actual[:rows][inside[:rows]], expected[inside[:rows]])
++    assert bool((actual[~inside] == sentinel).all())
++
++
+ @pytest.mark.parametrize("lengths", STEPS)
+ def test_requests(lengths):
+     s, nr, nt = _step(lengths, seed=len(lengths))
+@@ -231,26 +254,32 @@ def test_chunk(lengths, draft, replay, width):
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+ @pytest.mark.parametrize("width, read_width", [(128, COLS), (256, 30), (40, 40)])
+-def test_pages(lengths, width, read_width):
++@pytest.mark.parametrize("page", [64, 128])
++def test_pages(lengths, width, read_width, page):
+     s, nr, nt = _step(lengths, seed=width + read_width)
+-    _, reqs, _ = _token_metadata(s, nr, nt, 64)
++    _, reqs, visible = _token_metadata(s, nr, nt, 64)
+     rows, offset = min(nt, 500), 2 if nt > 4 else 0
+     rows = min(rows, nt - offset)
+     out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+-    metadata.pages(reqs, s["table"], out, offset, rows, read_width)
++    metadata.pages(reqs, visible, s["table"], out, offset, rows, read_width, page=page)
+     expected = _ref_pages(reqs, s["table"], offset, rows, width, read_width)
+-    _rows_equal(out, expected, rows)
++    live = _live_columns(reqs, visible, offset, rows, page, read_width, width)
++    _live_equal(out, expected, live, rows)
+ 
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+ @pytest.mark.parametrize(
+     "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
+ )
+-def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
++@pytest.mark.parametrize("main_page", [64, 128])
++def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay, main_page):
+     page, window, width, main_width = 64, 128, 128, 256
+     s, nr, nt = _step(lengths, seed=7 + 3 * draft + replay)
+     pos, reqs, visible = _token_metadata(s, nr, nt, page)
+-    main_reqs = torch.flip(reqs, (0,)).contiguous()
++    # The main rows' requests differ from the window rows' (the step's rows in
++    # reverse); every row has a written request or -1, as a builder leaves them.
++    main_reqs = torch.full_like(reqs, -1)
++    main_reqs[:nt] = torch.flip(reqs[:nt], (0,))
+     request_positions = torch.randint(-5, 900, (R,), device=DEVICE)
+     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
+     rows, offset = min(nt, 600), 3 if nt > 10 else 0
+@@ -263,18 +292,20 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
+         pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+         request_positions, main_reqs, s["table"], main_pages, offset, rows,
+         s["table"].shape[1], page=page, window=window, draft=draft,
+-        replay_start=replay_start,
++        main_page=main_page, replay_start=replay_start,
+     )  # fmt: skip
+     expected = _ref_chunk(
+         pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
+         width, page, window, draft, replay_start,
+-    ) + (
+-        _ref_pages(
+-            main_reqs, s["table"], offset, rows, main_width, s["table"].shape[1]
+-        ),
+     )  # fmt: skip
+-    for actual, reference in zip((swa, lengths_out, top, main_pages), expected):
++    for actual, reference in zip((swa, lengths_out, top), expected):
+         _rows_equal(actual, reference, rows)
++    read_width = s["table"].shape[1]
++    pages = _ref_pages(main_reqs, s["table"], offset, rows, main_width, read_width)
++    live = _live_columns(
++        main_reqs, visible, offset, rows, main_page, read_width, main_width
++    )
++    _live_equal(main_pages, pages, live, rows)
+ 
+ 
+ @torch.inference_mode()
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index a6e9afb37..066c44382 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -406,10 +406,20 @@ def test_compressor_rejection_reorder_padding_and_page_boundaries(
+             expected += [-1] * (16 - len(expected))
+             assert sparse[0].tolist() == expected
+ 
+-        # Compressed/index page tables use the same null-block convention.
++        # Compressed/index page tables use the same null-block convention. A row
++        # writes only its live pages; here every column is live (``width`` visible
++        # entries, one a page).
+         pages = torch.empty((1, width), device=device, dtype=torch.int32)
++        visible = torch.full_like(candidate.state.req_id_per_token, width)
+         tl_metadata.pages(
+-            candidate.state.req_id_per_token, candidate.table, pages, 0, 1, width
++            candidate.state.req_id_per_token,
++            visible,
++            candidate.table,
++            pages,
++            0,
++            1,
++            width,
++            page=1,
+         )
+         expected_pages = list(range(1, width + 1))
+         expected_pages[1] = -1
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d5cf952ce..637e72a76 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -592,7 +592,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.compress_ratio:
+                 calls.append(
+                     prepare.call(
+-                        tl_metadata.decode_metadata_kernel, *args, self._main_width
++                        tl_metadata.decode_metadata_kernel,
++                        *args,
++                        self._main_width,
++                        self._main_page,
+                     )
+                 )
+             else:
+@@ -603,7 +606,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self._short_index_shape is not None:
+                 widths.add(self._short_index_shape[1])
+             calls.extend(
+-                prepare.call(tl_metadata.pages_kernel, width) for width in widths
++                prepare.call(tl_metadata.pages_kernel, width, self._index_page)
++                for width in widths
+             )
+         # Each group's metadata builder: its spec as the KV-cache spec code makes
+         # it, for the scheduler's requests.
+@@ -1005,11 +1009,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+                     tl_metadata.pages(
+                         im.req_id_per_token,
++                        im.cache_lengths,
+                         im.block_table,
+                         index_pages,
+                         row,
+                         count,
+                         min(im.block_table.shape[1], index_width),
++                        page=self._index_page,
+                     )
+                     candidate_args = {}
+                     if self.layer_id == self.candidate_source_layer:
+@@ -1225,6 +1231,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 0,
+                 rows,
+                 main.block_table.shape[1],
++                main_page=self._main_page,
+                 **window,
+             )
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 85966cc2f..72e453eef 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -13,7 +13,13 @@ including which rows each launch writes:
+   their contents).
+ - ``chunk``: per row its sliding-window page indices (-1 holes), window length and
+   top-k length.
+-- ``pages``: per row its request's page table, block 0 and holes as -1.
++- ``pages``: per row its request's page table, block 0 and holes as -1, over the
++  pages of the row's visible entries only. The Triton kernel it replaced wrote every
++  column; at a 1M-token context that is 4,096 a row, where a row reads
++  ``ceil(visible / page)``: the sparse MLA's indexed lanes and the indexer's tiles
++  look up only positions below the row's visible length, and a masked lane's lookup
++  is discarded (``test_sparse_mla_reads_only_live_pages``,
++  ``test_indexer_reads_only_live_pages``). Columns past them keep their contents.
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -197,6 +203,12 @@ def _window_macro(page, window, width, draft, replay, threads, per_thread):
+     return window_row
+ 
+ 
++def _live_pages(visible, page: int, read_width):
++    """The page-table columns a row's readers reach: the pages holding its
++    ``visible`` entries (``page`` a page), at most ``read_width``."""
++    return T.min((T.max(visible, 0) + page - 1) // page, read_width)
++
++
+ def _threads(width: int) -> tuple[int, int]:
+     threads = min(256, max(32, (width + 31) // 32 * 32))
+     return threads, (width + threads - 1) // threads
+@@ -242,11 +254,17 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def decode_metadata_kernel(
+-    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
++    page: int,
++    window: int,
++    width: int,
++    draft: bool,
++    replay: bool,
++    main_width: int,
++    main_page: int,
+ ):
+     """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+     of each row: the window metadata and the main page table (block 0 and holes as
+-    -1)."""
++    -1) over the pages of the row's ``visible`` entries (``main_page`` a page)."""
+     rows = T.dynamic("rows")
+     src_rows = T.dynamic("src_rows")
+     table_rows = T.dynamic("table_rows")
+@@ -259,11 +277,10 @@ def decode_metadata_kernel(
+     req_count = T.dynamic("req_count")
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
+-    # Blocks as wide as the window part; the page part loops (idle threads cost the
+-    # prefill rows' blocks).
++    # Blocks as wide as the window part; the page part loops over the row's live
++    # pages (idle threads cost the prefill rows' blocks).
+     threads, per_thread = _threads(width)
+     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+-    main_per_thread = (main_width + threads - 1) // threads
+ 
+     @T.prim_func
+     def metadata_decode(
+@@ -287,6 +304,7 @@ def decode_metadata_kernel(
+         with T.Kernel(rows, 2, threads=threads) as (row, part):
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
++            live = T.alloc_var(T.int32)  # the page part's columns
+             if part == 0:
+                 window_row(
+                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+@@ -294,21 +312,24 @@ def decode_metadata_kernel(
+                 )  # fmt: skip
+             else:
+                 req = main_reqs[offset + row]
+-                for k in T.serial(main_per_thread):
++                live = _live_pages(
++                    visible[offset + row], main_page, T.min(main_read_width, main_width)
++                )
++                if req < 0:
++                    live = 0
++                for k in T.serial(T.ceildiv(live, threads)):
+                     col = k * threads + tx
+-                    if col < main_width:
+-                        page_id = T.if_then_else(
+-                            (req >= 0) & (col < main_read_width),
+-                            main_table[req, col],
+-                            -1,
+-                        )
++                    if col < live:
++                        page_id = main_table[req, col]
+                         main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+ 
+     return metadata_decode
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def pages_kernel(width: int):
++def pages_kernel(width: int, page: int):
++    """Each row's page table over the pages of its ``lengths`` entries (``page`` a
++    page)."""
+     rows = T.dynamic("rows")
+     src_rows = T.dynamic("src_rows")
+     table_rows = T.dynamic("table_rows")
+@@ -318,6 +339,7 @@ def pages_kernel(width: int):
+     @T.prim_func
+     def metadata_pages(
+         reqs: T.Tensor((src_rows,), T.int32),
++        lengths: T.Tensor((src_rows,), T.int32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+         out: T.Tensor((rows, width), T.int32),
+         offset: T.int32,
+@@ -325,12 +347,11 @@ def pages_kernel(width: int):
+     ):
+         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
+             col = cb * _BLOCK + T.get_thread_binding()
+-            if col < width:
+-                req = reqs[offset + row]
+-                page_id = T.if_then_else(
+-                    (req >= 0) & (col < read_width), table[req, col], -1
+-                )
++            req = reqs[offset + row]
++            live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
++            if (req >= 0) & (col < live):
+                 # vLLM reserves physical block zero; page tables use -1 for holes.
++                page_id = table[req, col]
+                 out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+ 
+     return metadata_pages
+@@ -374,12 +395,15 @@ def chunk(
+ def decode_metadata(
+     positions, reqs, table, swa, lengths, top_lengths, visible, starts,
+     request_positions, main_reqs, main_table, main_pages, offset: int, rows: int,
+-    main_read_width: int, *, page: int, window: int, draft: bool, replay_start=None,
++    main_read_width: int, *, page: int, window: int, draft: bool, main_page: int,
++    replay_start=None,
+ ) -> None:  # fmt: skip
+-    """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch."""
++    """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch; a row's
++    main page table covers the pages of its ``visible`` entries, ``main_page`` a page
++    (its other columns keep their contents)."""
+     width, main_width = swa.shape[1], main_pages.shape[1]
+     replay = replay_start is not None
+-    decode_metadata_kernel(page, window, width, draft, replay, main_width)(
++    decode_metadata_kernel(page, window, width, draft, replay, main_width, main_page)(
+         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+         visible, starts, request_positions,
+         replay_start if replay_start is not None else request_positions, main_reqs,
+@@ -387,10 +411,15 @@ def decode_metadata(
+     )  # fmt: skip
+ 
+ 
+-def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
+-    """Page tables for ``rows`` rows from source row ``offset``; ``out`` is
+-    ``[*, width]`` and columns at or past ``read_width`` are -1."""
+-    pages_kernel(out.shape[1])(reqs, table, out[:rows], offset, read_width)
++def pages(
++    reqs, lengths, table, out, offset: int, rows: int, read_width: int, *, page: int
++) -> None:
++    """Page tables for ``rows`` rows from source row ``offset``, over the pages of
++    each row's ``lengths`` entries (``page`` a page; ``out`` is ``[*, width]``, its
++    other columns keep their contents)."""
++    pages_kernel(out.shape[1], page)(
++        reqs, lengths, table, out[:rows], offset, read_width
++    )
+ 
+ 
+ __all__ = [

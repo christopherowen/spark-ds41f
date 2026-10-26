@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:10:56 +0100
+Subject: [PATCH 498/498] Model loading: a weight digest on every rank
+ (SPARK_DS41F_WEIGHT_DIGEST)
+
+A debug check for comparing checkpoint loaders. With
+SPARK_DS41F_WEIGHT_DIGEST=1, BaseModelLoader.load_model hashes every
+parameter's bytes in name order (a shared parameter once) right after
+load_weights, before post-load processing turns them into kernel layouts,
+and each rank logs
+
+  weight digest rank <rank> <sha256> <model class>: <n> parameters, ...
+
+A speculative model loads through the same loader and logs its own line.
+The bytes pass through one 64 MiB host buffer; the CPU's SHA-256 adds some
+tens of seconds to a DS4.1 rank's start. Unset (production), it reads the
+variable once at import and does nothing else.
+
+Tests (no GPU): name order at any staging size, strided parameters in
+logical order, FP8/BF16/bool/0-d parameters, one flipped bit, meta
+parameters refused, the logged line matched by the lab's loader report,
+and the digest's place between loading and processing.
+---
+ .../model_loader/test_weight_digest.py        | 140 ++++++++++++++++++
+ .../model_loader/base_loader.py               |   4 +
+ .../model_loader/weight_digest.py             |  74 +++++++++
+ 3 files changed, 218 insertions(+)
+ create mode 100644 tests/model_executor/model_loader/test_weight_digest.py
+ create mode 100644 vllm/model_executor/model_loader/weight_digest.py
+
+diff --git a/tests/model_executor/model_loader/test_weight_digest.py b/tests/model_executor/model_loader/test_weight_digest.py
+new file mode 100644
+index 000000000..181395229
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_weight_digest.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The weight digest (SPARK_DS41F_WEIGHT_DIGEST): every parameter's bytes in name
++order whatever the layout or staging size, logged in the line the lab's loader report
++reads, and taken after loading, before post-load processing. Needs no GPU."""
++
++import hashlib
++from types import SimpleNamespace
++
++import pytest
++import regex as re
++import torch
++
++from vllm.model_executor.model_loader import base_loader, weight_digest
++
++# experiments/2026-10-25-final-names/loader/loader_report.py in spark-ds41f.
++REPORT = re.compile(r"weight digest (?:rank (\d+) )?([0-9a-f]{64})")
++
++
++def _model() -> torch.nn.Module:
++    model = torch.nn.Module()
++    model.b = torch.nn.Linear(24, 40)
++    model.a = torch.nn.Module()
++    model.a.scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
++    codes = torch.arange(96, dtype=torch.uint8).reshape(8, 12)
++    model.a.codes = torch.nn.Parameter(
++        codes.view(torch.float8_e4m3fn), requires_grad=False
++    )
++    model.c = torch.nn.Parameter(
++        torch.arange(60, dtype=torch.float32).reshape(6, 10).to(torch.bfloat16),
++        requires_grad=False,
++    )
++    model.mask = torch.nn.Parameter(torch.arange(9) % 2 == 0, requires_grad=False)
++    model.shared = model.b.weight  # the same parameter under a later name
++    return model
++
++
++def _expected(model: torch.nn.Module) -> str:
++    digest = hashlib.sha256()
++    for _, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
++        flat = parameter.detach().contiguous().reshape(-1).view(torch.uint8)
++        digest.update(flat.numpy().tobytes())
++    return digest.hexdigest()
++
++
++@pytest.mark.parametrize("staging_bytes", [1, 7, 64, 1 << 20])
++def test_digest_is_every_parameter_in_name_order_at_any_staging_size(staging_bytes):
++    model = _model()
++    sha256, count, total = weight_digest.weight_digest(model, staging_bytes)
++    assert sha256 == _expected(model)
++    assert count == 6  # model.shared is model.b.weight
++    assert total == sum(p.numel() * p.element_size() for p in model.parameters())
++
++
++def test_strided_parameters_hash_their_logical_order():
++    model = torch.nn.Module()
++    backing = torch.arange(12 * 34, dtype=torch.float32).reshape(12, 34)
++    model.weight = torch.nn.Parameter(backing.t()[3:30], requires_grad=False)
++    assert not model.weight.is_contiguous()
++    expected = hashlib.sha256(
++        model.weight.detach().contiguous().numpy().tobytes()
++    ).hexdigest()
++    for staging_bytes in (4, 48, 200, 1 << 16):
++        assert weight_digest.weight_digest(model, staging_bytes)[0] == expected
++
++
++def test_one_changed_byte_changes_the_digest():
++    model = _model()
++    before = weight_digest.weight_digest(model)[0]
++    with torch.no_grad():
++        model.c.view(torch.int16)[5, 3] ^= 1
++    assert weight_digest.weight_digest(model)[0] != before
++
++
++def test_meta_parameters_are_refused():
++    with torch.device("meta"):
++        model = torch.nn.Linear(4, 4)
++    with pytest.raises(RuntimeError, match="bias has no storage after loading"):
++        weight_digest.weight_digest(model)
++
++
++def test_the_logged_line_is_the_one_the_loader_report_reads(monkeypatch):
++    lines = []
++    monkeypatch.setattr(
++        weight_digest.logger,
++        "info",
++        lambda message, *args: lines.append(message % args),
++    )
++    model = _model()
++    weight_digest.log_weight_digest(model)
++    assert len(lines) == 1
++    found = REPORT.search(lines[0])
++    assert found and found.group(1) == "0" and found.group(2) == _expected(model)
++    assert " Module: 6 parameters, " in lines[0]
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_load_model_digests_after_loading_and_before_processing(monkeypatch, enabled):
++    events = []
++
++    class Loader(base_loader.BaseModelLoader):
++        def download_model(self, model_config):
++            pass
++
++        def create_model(self, vllm_config, model_config, prefix=""):
++            return torch.nn.Linear(4, 4)
++
++        def load_weights(self, model, model_config):
++            events.append("load")
++
++    monkeypatch.setattr(weight_digest, "ENABLED", enabled)
++    monkeypatch.setattr(
++        weight_digest, "log_weight_digest", lambda model: events.append("digest")
++    )
++    monkeypatch.setattr(
++        base_loader,
++        "process_weights_after_loading",
++        lambda *args: events.append("process"),
++    )
++    config = SimpleNamespace(
++        device_config=SimpleNamespace(device="cpu"),
++        load_config=SimpleNamespace(device=None),
++    )
++    Loader(SimpleNamespace()).load_model(config, SimpleNamespace(dtype=torch.float32))
++    assert events == (["load", "digest", "process"] if enabled else ["load", "process"])
++
++
++def test_only_the_value_1_turns_the_digest_on(monkeypatch):
++    import importlib
++
++    try:
++        for value, enabled in ((None, False), ("0", False), ("", False), ("1", True)):
++            if value is None:
++                monkeypatch.delenv("SPARK_DS41F_WEIGHT_DIGEST", raising=False)
++            else:
++                monkeypatch.setenv("SPARK_DS41F_WEIGHT_DIGEST", value)
++            assert importlib.reload(weight_digest).ENABLED is enabled
++    finally:
++        monkeypatch.undo()
++        importlib.reload(weight_digest)
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 5b4a3d961..8e147ec8e 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -9,6 +9,7 @@ import vllm.envs as envs
+ from vllm.config import ModelConfig, VllmConfig
+ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
++from vllm.model_executor.model_loader import weight_digest
+ from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+ from vllm.model_executor.model_loader.utils import (
+     initialize_model,
+@@ -73,6 +74,9 @@ class BaseModelLoader(ABC):
+ 
+             logger.debug("Loading weights on %s ...", load_device)
+             self.load_weights(model, model_config)
++            if weight_digest.ENABLED:
++                # The loader's bytes, before processing turns them into kernel layouts.
++                weight_digest.log_weight_digest(model)
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+diff --git a/vllm/model_executor/model_loader/weight_digest.py b/vllm/model_executor/model_loader/weight_digest.py
+new file mode 100644
+index 000000000..d28abbbe1
+--- /dev/null
++++ b/vllm/model_executor/model_loader/weight_digest.py
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A SHA-256 of the loaded parameters: the check that two loaders load the same bits.
++
++With ``SPARK_DS41F_WEIGHT_DIGEST=1`` every rank logs, once its loader has filled the
++parameters and before post-load processing turns them into kernel layouts::
++
++    weight digest rank <rank> <sha256> <model class>: <n> parameters, <GB> GB in <s> s
++
++The hash covers every parameter's bytes in name order, a shared parameter once under
++its first name, so a rank whose digest is equal across loaders and boots holds the
++same weights. A speculative model loads through the same loader and logs its own line.
++The bytes pass through one 64 MiB host buffer and the CPU hashes them at a few GB/s,
++so a DS4.1 rank starts some tens of seconds later. Production leaves the variable
++unset, which adds no work at all.
++"""
++
++import hashlib
++import os
++import time
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENABLED = os.environ.get("SPARK_DS41F_WEIGHT_DIGEST", "0") == "1"
++_STAGING_BYTES = 64 << 20
++
++
++def weight_digest(
++    model: torch.nn.Module, staging_bytes: int = _STAGING_BYTES
++) -> tuple[str, int, int]:
++    """The SHA-256 of ``model``'s parameter bytes in name order, with the number of
++    parameters and of bytes hashed."""
++    digest = hashlib.sha256()
++    # Touched before the first copy, so no copy writes into unfaulted host pages.
++    staging = torch.zeros(staging_bytes, dtype=torch.uint8)
++    count = total = 0
++    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
++        tensor = parameter.detach()
++        if tensor.is_meta:
++            raise RuntimeError(f"weight digest: {name} has no storage after loading")
++        rows = tensor.reshape(1) if tensor.dim() == 0 else tensor
++        row_bytes = rows[0].numel() * rows.element_size() if rows.shape[0] else 0
++        step = max(1, staging_bytes // max(row_bytes, 1))
++        for start in range(0, rows.shape[0], step):
++            # A view of a contiguous parameter; at most one staging buffer (or one
++            # row) of temporary device memory for a strided one.
++            chunk = rows[start : start + step].contiguous().view(-1).view(torch.uint8)
++            for offset in range(0, chunk.numel(), staging_bytes):
++                part = chunk[offset : offset + staging_bytes]
++                host = staging[: part.numel()]
++                host.copy_(part)
++                digest.update(host.numpy())
++        count += 1
++        total += tensor.numel() * tensor.element_size()
++    return digest.hexdigest(), count, total
++
++
++def log_weight_digest(model: torch.nn.Module) -> None:
++    started = time.perf_counter()
++    sha256, count, total = weight_digest(model)
++    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++    logger.info(
++        "weight digest rank %d %s %s: %d parameters, %.2f GB in %.1f s",
++        rank,
++        sha256,
++        type(model).__name__,
++        count,
++        total / 1e9,
++        time.perf_counter() - started,
++    )

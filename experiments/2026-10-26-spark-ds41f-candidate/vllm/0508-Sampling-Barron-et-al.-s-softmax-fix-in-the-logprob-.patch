@@ -1,0 +1,2493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:14:56 +0100
+Subject: [PATCH 508/508] Sampling: Barron et al.'s softmax fix in the logprob
+ and verification kernels
+
+"A Fix for Softmax and Cross-Entropy" (Barron, Gnanapragasam, Tschannen): a
+log-softmax that adds the maximum's exp(0) = 1 into its sum rounds the sum to 1
+once the other columns add less than half an FP32 ULP of 1 (a margin past 16.6
+nats), and the top token's log probability to exactly 0. Eq. 5 leaves the maximum
+out: logsoftmax = (z - max, exactly 0 at the maximum) - log1p(S), S the others'
+sum of exp(z - max).
+
+- tilelang_logprob.topk_log_softmax (every logprob served: sampled tokens, top-k,
+  prompt logprobs, verified tokens, the sink's alternates): S over the columns that
+  are not the maximum, the maximum's further ties counted exactly, log1p(S). The
+  release's sum also lost each 1024-column block added after the maximum's below
+  2^-24, so confident tokens' log probabilities sat on a 2^-23 grid, 30-100% off
+  at margins of 12-16 depending on where the argmax sits in the vocabulary.
+  A row now takes 1024 threads with two vector loads each a step (the release took
+  128 threads in Triton's layout, latency-bound at a few rows), and the maximum's
+  pass reads the row last step first so the sum starts on the steps still in L2.
+- tilelang_rejection (block verification of sampled requests): the block sums
+  leave the block maximum's column out, verify adds them back except the row
+  maximum's block, and the draft's log probability is its shifted logit minus
+  log1p(S) instead of logit - (max + log(sum)), which rounded at the magnitude of
+  the maximum logit. The acceptance threshold p (1 - m) / (1 - p m) takes both
+  complements from expm1 of the logs, each step's on its own thread (its
+  cumulative ratio folded in the serial loop's order); the release's 1 - m and
+  p (1 - m) + 1 - p of probabilities near 1 cancelled, off by up to 1.
+- The Eq. 5 helpers are branch-free PTX: behind a C conditional, nvcc predicated
+  the exponential.
+
+Greedy verification, the uniform draws, resampling and insertion are unchanged
+bit for bit. Temperature-0 tokens are unchanged; logprob values move by up to a
+few 1e-6 (exact where they were 0). Seeded sampled tokens move only where a draw
+falls between the old and new thresholds.
+
+Tests compare against FP64 references (Eq. 5, and block verification over the
+kernels' blocks): within rounding bounds everywhere, never further from the
+reference than the release's arithmetic beyond rounding, the paper's z = [9, -9,
+-9], margins 4-100 around the cliff, whole and partial steps of the new layout,
+batch invariance and determinism. The benchmarks take --baseline DIR to time
+against the release's TileLang modules: on dgx4 the logprob kernel is 35% faster
+than the release's at 1-16 rows and level at 96, verification level throughout.
+---
+ .../benchmark_tilelang_logprob_softmax.py     |  65 ++-
+ .../kernels/benchmark_tilelang_rejection.py   | 231 +++++++--
+ .../v1/spec_decode/test_tilelang_rejection.py | 463 ++++++++++++++++--
+ .../test_gpu_tilelang_logprob_softmax.py      | 231 +++++++--
+ vllm/v1/worker/gpu/sample/logprob.py          |   7 +-
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 397 ++++++++-------
+ .../spec_decode/rejection_sampler_utils.py    |   5 +-
+ .../gpu/spec_decode/tilelang_rejection.py     | 340 ++++++++-----
+ 8 files changed, 1288 insertions(+), 451 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py b/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
+index 8a4d79578..328af7e5c 100644
+--- a/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
++++ b/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
+@@ -1,24 +1,32 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Paired per-call timing of the TileLang log-softmax of selected tokens
+-(``tilelang_logprob.topk_log_softmax``) against the Triton kernel it replaces
+-(``logprob._topk_log_softmax_kernel``, launched as production launched it), at
++(``tilelang_logprob.topk_log_softmax``, Barron et al.'s fix) against a baseline at
+ DeepSeek V4.1's logprob shapes: one request, sixteen and 96 rows of FP32 and bf16
+ logits (129280 columns of the LM head's 131072-wide rows), one requested token (the
+-sampled one) and twenty.
++sampled one) and twenty. The baseline is the Triton kernel the TileLang port
++replaced (``logprob._topk_log_softmax_kernel``, launched as production launched it),
++or with ``--baseline DIR`` the release's TileLang kernel: ``DIR`` holds the
++release's ``tilelang_logprob.py`` and ``tilelang_rejection.py`` (whose header the
++former reads), loaded beside the installed modules.
+ 
+ Each case is measured on eight fresh inputs; on each, CUDA graphs of 100 calls of
+ both run back to back, alternating which goes first, and the case's 95% interval
+ comes from the eight per-input differences. The gate (``--gate``) is that the
+ TileLang kernel is never slower (the interval's lower bound above zero). Before
+-timing, each pair's outputs are compared bit for bit.
++timing, each pair's outputs are compared: the baseline's arithmetic is not the fix's,
++so within 1e-5 relative and 1e-6 absolute (the collapsed log probabilities of the
++baseline are 0 where the fix's are about -1e-8), NaN where the other is.
+ """
+ 
+ import argparse
++import importlib.util
+ import json
+ import math
+ import statistics
++import sys
+ from collections.abc import Callable
++from pathlib import Path
+ 
+ import torch
+ 
+@@ -31,6 +39,28 @@ PADDED = 131072
+ SHAPES = {"1 request": 1, "16 rows": 16, "96 rows": 96}
+ DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+ TOPKS = (1, 20)
++REJECTION = "vllm.v1.worker.gpu.spec_decode.tilelang_rejection"
++
++
++def load_release(directory: str):
++    """The release's ``tilelang_logprob`` from ``directory``, importing the release's
++    ``tilelang_rejection`` from there too (both under names of their own; the
++    installed modules are left as they were)."""
++
++    def load(name: str, path: Path):
++        spec = importlib.util.spec_from_file_location(name, path)
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module
++
++    root = Path(directory)
++    rejection = load("release_tilelang_rejection", root / "tilelang_rejection.py")
++    installed = sys.modules[REJECTION]
++    sys.modules[REJECTION] = rejection
++    try:
++        return load("release_tilelang_logprob", root / "tilelang_logprob.py")
++    finally:
++        sys.modules[REJECTION] = installed
+ 
+ 
+ def graph(function: Callable[[], None]) -> torch.cuda.CUDAGraph:
+@@ -57,8 +87,8 @@ def elapsed(capture: torch.cuda.CUDAGraph) -> float:
+     return begin.elapsed_time(end) * 1000 / CALLS
+ 
+ 
+-def case(dtype: torch.dtype, rows: int, topk: int, seed: int):
+-    """(Triton call, TileLang call, outputs to compare) on fresh inputs."""
++def case(dtype: torch.dtype, rows: int, topk: int, seed: int, release):
++    """(baseline call, TileLang call, outputs to compare) on fresh inputs."""
+     gen = torch.Generator(device=DEVICE).manual_seed(seed)
+     # The LM head's padded rows, the real vocabulary in view.
+     backing = torch.randn(rows, PADDED, generator=gen, device=DEVICE) * 4
+@@ -68,6 +98,9 @@ def case(dtype: torch.dtype, rows: int, topk: int, seed: int):
+     actual = torch.empty(rows, topk, device=DEVICE)
+ 
+     def reference():
++        if release is not None:
++            release.topk_log_softmax(logits, ids, expected)
++            return
+         logprob._topk_log_softmax_kernel[(rows,)](
+             expected,
+             logits,
+@@ -85,16 +118,17 @@ def case(dtype: torch.dtype, rows: int, topk: int, seed: int):
+     return reference, candidate, lambda: (expected, actual)
+ 
+ 
+-def measure(dtype: torch.dtype, rows: int, topk: int, samples: int) -> dict:
++def measure(dtype: torch.dtype, rows: int, topk: int, samples: int, release) -> dict:
+     ours, theirs = [], []
+     for sample in range(samples):
+-        reference, candidate, outputs = case(dtype, rows, topk, 7919 + sample)
++        reference, candidate, outputs = case(dtype, rows, topk, 7919 + sample, release)
+         reference()
+         candidate()
+         expected, actual = outputs()
+-        if not torch.equal(expected.view(torch.int32), actual.view(torch.int32)):
++        if not torch.allclose(actual, expected, rtol=1e-5, atol=1e-6, equal_nan=True):
+             raise SystemExit(
+-                f"{dtype} at {rows} rows, {topk} tokens: outputs differ from Triton's"
++                f"{dtype} at {rows} rows, {topk} tokens: outputs differ from the "
++                "baseline's beyond its rounding"
+             )
+         a, b = graph(candidate), graph(reference)
+         order = (a, b) if sample % 2 == 0 else (b, a)
+@@ -108,8 +142,9 @@ def measure(dtype: torch.dtype, rows: int, topk: int, samples: int) -> dict:
+         "dtype": str(dtype).removeprefix("torch."),
+         "rows": rows,
+         "topk": topk,
++        "baseline": "release" if release is not None else "triton",
+         "tilelang_us": statistics.median(ours),
+-        "triton_us": statistics.median(theirs),
++        "baseline_us": statistics.median(theirs),
+         "difference_us": mean,
+         "interval_us": [mean - half, mean + half],
+         "slower": mean - half > 0,
+@@ -120,12 +155,18 @@ def main() -> None:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--gate", action="store_true")
+     parser.add_argument("--samples", type=int, default=8)
++    parser.add_argument(
++        "--baseline",
++        metavar="DIR",
++        help="the release's tilelang_logprob.py and tilelang_rejection.py",
++    )
+     args = parser.parse_args()
++    release = load_release(args.baseline) if args.baseline else None
+     results = []
+     for dtype in DTYPES.values():
+         for name, rows in SHAPES.items():
+             for topk in TOPKS:
+-                result = measure(dtype, rows, topk, args.samples)
++                result = measure(dtype, rows, topk, args.samples, release)
+                 result["shape"] = name
+                 results.append(result)
+                 print(json.dumps(result), flush=True)
+diff --git a/benchmarks/kernels/benchmark_tilelang_rejection.py b/benchmarks/kernels/benchmark_tilelang_rejection.py
+index a5b8cb8a0..558df0c93 100644
+--- a/benchmarks/kernels/benchmark_tilelang_rejection.py
++++ b/benchmarks/kernels/benchmark_tilelang_rejection.py
+@@ -1,21 +1,31 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Paired CUDA graph timings of the TileLang rejection sampler against the Triton
+-kernels it replaces, in production's configuration: one-hot drafts, block
+-verification, FP32 draws, DeepSeek V4.1's vocabulary and five draft steps.
++"""Paired CUDA graph timings of the TileLang rejection sampler against a baseline,
++in production's configuration: one-hot drafts, block verification, FP32 draws,
++DeepSeek V4.1's vocabulary and five draft steps. The baseline is the Triton kernels
++the TileLang ones replaced, or with ``--baseline DIR`` the release's TileLang kernels
++(``DIR`` holds the release's ``tilelang_rejection.py``, loaded beside the installed
++module).
+ 
+ ``rejection_sample`` times the whole verification: ``rejection_sample`` itself
+-(TileLang's three kernels) against the four Triton kernels they replace, both with
+-the shared insertion; ``local_stats``, ``verify`` (against the cumulative-ratio and
+-rejection kernels together) and ``resample`` time one step each, from inputs the
+-steps before it computed once with Triton. Every graph node has its own inputs and
+-outputs, so no call reads logits another left in L2. Outputs start at a sentinel,
+-reset outside the timed replay, and the two implementations must agree bit for bit
+-before anything is timed, the elements they leave alone included. Both see the same
+-tensor addresses.
++(TileLang's three kernels) against the baseline's, both with the shared insertion;
++``local_stats``, ``verify`` (against the cumulative-ratio and rejection kernels
++together) and ``resample`` time one step each, from inputs the steps before it
++computed once: each implementation's own block statistics for ``verify``, Triton's
++verification for ``resample``. Every graph node has its own inputs and outputs, so no
++call reads logits another left in L2. Outputs start at a sentinel, reset outside the
++timed replay, and are compared before anything is timed, the elements the kernels
++leave alone included: bit for bit where the arithmetic is shared (argmaxes, maxima,
++sampled tokens, resampling), and where the TileLang kernels follow Barron et al.'s
++fix within the baseline's rounding: a block sum without its maximum's column plus 1
++is the baseline's, the cumulative log ratios within 5e-5 (the baseline rounds them
++at the magnitude of the maximum logit), and at most one request in twenty may take
++another count (a draw between the two thresholds). Both see the same tensor
++addresses.
+ """
+ 
+ import argparse
++import importlib.util
+ import json
+ import math
+ import statistics
+@@ -25,6 +35,7 @@ import triton
+ 
+ from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as rs
+ from vllm.v1.worker.gpu.spec_decode import tilelang_rejection as candidate
++from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+ 
+ VOCAB = 129280
+ STEPS = 5
+@@ -288,7 +299,93 @@ def tilelang_rejection_sample(x):
+     )
+ 
+ 
+-def make_case(kind, rows, dtype, temps, seed, count):
++class Triton:
++    """The Triton kernels the TileLang ones replaced."""
++
++    name = "triton"
++
++    def local_stats(self, x, out):
++        triton_local_stats(x, out)
++
++    def verify(self, x, stats, out):
++        triton_verify(x, stats, out)
++
++    def resample(self, x, verified, out):
++        triton_resample(x, verified, out)
++
++    def rejection_sample(self, x):
++        return triton_rejection_sample(x)
++
++
++class Release:
++    """The release's TileLang kernels, from its ``tilelang_rejection.py``."""
++
++    name = "release"
++
++    def __init__(self, directory):
++        path = f"{directory}/tilelang_rejection.py"
++        spec = importlib.util.spec_from_file_location("release_rejection", path)
++        self.module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(self.module)
++
++    def local_stats(self, x, out):
++        self.module.compute_local_stats(
++            *out, x["logits"], x["expanded"], x["local"], x["temperature"], STEPS
++        )
++
++    def verify(self, x, stats, out):
++        cumulative, sampled, num_sampled, target_lse, draft_lse = out
++        self.module.verify(
++            sampled,
++            num_sampled,
++            target_lse,
++            draft_lse,
++            cumulative,
++            x["logits"],
++            *stats,
++            x["drafts"],
++            x["cu"],
++            x["idx_mapping"],
++            x["temperature"],
++            x["seeds"],
++            x["pos"],
++            STEPS,
++        )
++
++    def resample(self, x, verified, out):
++        self.module.resample(
++            *out,
++            x["logits"],
++            verified[2],
++            x["cu"],
++            x["expanded"],
++            x["drafts"],
++            x["temperature"],
++            x["seeds"],
++            x["pos"],
++        )
++
++    def rejection_sample(self, x):
++        """rejection_sample's TileLang branch with the release's kernels."""
++        sampled, num_sampled, ids, values = self.module.verify_and_resample(
++            x["logits"],
++            x["drafts"],
++            x["cu"],
++            x["pos"],
++            x["idx_mapping"],
++            x["expanded"],
++            x["local"],
++            x["temperature"],
++            x["seeds"],
++            STEPS,
++        )
++        insert_resampled(
++            sampled, num_sampled, ids, values, x["cu"], x["expanded"], x["temperature"]
++        )
++        return sampled, num_sampled
++
++
++def make_case(kind, rows, dtype, temps, seed, count, baseline):
+     """``reset``, ``invoke(index, ours)`` and ``output(index)`` for ``count`` graph
+     nodes, each with its own inputs and outputs."""
+     nodes = [make_inputs(rows, dtype, temps, seed * 1000 + i) for i in range(count)]
+@@ -297,7 +394,7 @@ def make_case(kind, rows, dtype, temps, seed, count):
+         results = [None] * count
+ 
+         def invoke(index, ours):
+-            run = tilelang_rejection_sample if ours else triton_rejection_sample
++            run = tilelang_rejection_sample if ours else baseline.rejection_sample
+             results[index] = run(nodes[index])
+ 
+         def output(index):
+@@ -309,10 +406,24 @@ def make_case(kind, rows, dtype, temps, seed, count):
+ 
+         return lambda: None, invoke, output
+ 
+-    # The steps before the timed one, once, with Triton.
++    # The steps before the timed one, once: Triton's verification for resampling;
++    # each implementation's own block statistics for verification (the TileLang
++    # block sums leave the maximum's column out).
+     for x in nodes:
+         x["stats"] = stats_buffers(x)
+         triton_local_stats(x, x["stats"])
++        if kind == "verify":
++            x["baseline_stats"] = stats_buffers(x)
++            baseline.local_stats(x, x["baseline_stats"])
++            x["our_stats"] = stats_buffers(x)
++            candidate.compute_local_stats(
++                *x["our_stats"],
++                x["logits"],
++                x["expanded"],
++                x["local"],
++                x["temperature"],
++                STEPS,
++            )
+         if kind == "resample":
+             x["verified"] = verify_buffers(x)
+             triton_verify(x, x["stats"], x["verified"])
+@@ -341,7 +452,7 @@ def make_case(kind, rows, dtype, temps, seed, count):
+                     STEPS,
+                 )
+             else:
+-                triton_local_stats(x, out)
++                baseline.local_stats(x, out)
+         elif kind == "verify":
+             if ours:
+                 cumulative, sampled, num_sampled, target_lse, draft_lse = out
+@@ -352,7 +463,7 @@ def make_case(kind, rows, dtype, temps, seed, count):
+                     draft_lse,
+                     cumulative,
+                     x["logits"],
+-                    *x["stats"],
++                    *x["our_stats"],
+                     x["drafts"],
+                     x["cu"],
+                     x["idx_mapping"],
+@@ -362,7 +473,7 @@ def make_case(kind, rows, dtype, temps, seed, count):
+                     STEPS,
+                 )
+             else:
+-                triton_verify(x, x["stats"], out)
++                baseline.verify(x, x["baseline_stats"], out)
+         elif ours:
+             candidate.resample(
+                 *out,
+@@ -376,11 +487,57 @@ def make_case(kind, rows, dtype, temps, seed, count):
+                 x["pos"],
+             )
+         else:
+-            triton_resample(x, x["verified"], out)
++            baseline.resample(x, x["verified"], out)
+ 
+     return reset, invoke, lambda index: buffers[index]
+ 
+ 
++def differences(kind, actual, expected):
++    """What the outputs may not differ in (see the module docstring): a list of
++    ``(what, indices)``, empty when they agree."""
++    found = []
++
++    def same(what, a, b):
++        if not torch.equal(bits(a), bits(b)):
++            found.append((what, (bits(a) != bits(b)).nonzero()[:8].tolist()))
++
++    def close(what, a, b, where, rtol, atol):
++        bad = where & ~((a - b).abs() <= atol + rtol * b.abs())
++        if bad.any():
++            found.append((what, bad.nonzero()[:8].tolist()))
++
++    def counts(a, b):
++        if (a != b).sum().item() * 20 > a.numel():
++            found.append(("counts", (a != b).nonzero()[:8].tolist()))
++        return a == b
++
++    if kind == "local_stats":
++        same("argmax", actual[0], expected[0])
++        same("maximum", actual[1], expected[1])
++        written = expected[2] != -7
++        same("written", actual[2] != -7, written)
++        same("rows left alone", actual[2][~written], expected[2][~written])
++        empty = written & (expected[2] == 0)
++        same("empty blocks", actual[2][empty], expected[2][empty])
++        live = written & (expected[2] > 0)
++        close("block sums", actual[2] + 1, expected[2], live, 1e-5, 0)
++    elif kind == "verify":
++        same("sampled", actual[1], expected[1])
++        same("draft lse", actual[4], expected[4])
++        written = expected[0] != -7
++        same("cumulative written", actual[0] != -7, written)
++        close("cumulative", actual[0], expected[0], written, 0, 5e-5)
++        equal = counts(actual[2], expected[2])
++        close("target lse", actual[3], expected[3], equal, 2e-5, 2e-5)
++    elif kind == "rejection_sample":
++        equal = counts(actual[0], expected[0])
++        same("tokens", actual[1][equal], expected[1][equal])
++    else:
++        for what, a, b in zip(("ids", "values"), actual, expected):
++            same(what, a, b)
++    return found
++
++
+ def bits(t):
+     return t.view(torch.int32) if t.dtype == torch.float32 else t
+ 
+@@ -409,38 +566,21 @@ def elapsed(graph, reset, count):
+     return begin.elapsed_time(end) * 1000 / count
+ 
+ 
+-def measure(kind, rows, dtype_name, temps, seed):
++def measure(kind, rows, dtype_name, temps, seed, baseline):
+     count = 8
+     ours, theirs = [], []
+     for sample in range(8):
+         reset, invoke, output = make_case(
+-            kind, rows, DTYPES[dtype_name], temps, seed + sample, count
++            kind, rows, DTYPES[dtype_name], temps, seed + sample, count, baseline
+         )
+         reset()
+         invoke(0, False)
+         expected = [value.clone() for value in output(0)]
+         reset()
+         invoke(0, True)
+-        for actual, target in zip(output(0), expected):
+-            if torch.equal(bits(actual), bits(target)):
+-                continue
+-            indices = (bits(actual) != bits(target)).nonzero()[:8]
+-            print(
+-                json.dumps(
+-                    {
+-                        "sample": sample,
+-                        "differences": [
+-                            [
+-                                index.tolist(),
+-                                actual[tuple(index)].item(),
+-                                target[tuple(index)].item(),
+-                            ]
+-                            for index in indices
+-                        ],
+-                    }
+-                ),
+-                flush=True,
+-            )
++        found = differences(kind, output(0), expected)
++        if found:
++            print(json.dumps({"sample": sample, "differences": found}), flush=True)
+             raise RuntimeError(
+                 f"outputs differ: {kind} rows={rows} {dtype_name} {temps}"
+             )
+@@ -461,12 +601,13 @@ def measure(kind, rows, dtype_name, temps, seed):
+         rows=rows,
+         dtype=dtype_name,
+         temperatures=temps,
++        baseline=baseline.name,
+         tilelang_us=statistics.median(ours),
+-        triton_us=statistics.median(theirs),
++        baseline_us=statistics.median(theirs),
+         interval_us=[mean - half, mean + half],
+         slower=mean - half > 0,
+         tilelang_samples_us=ours,
+-        triton_samples_us=theirs,
++        baseline_samples_us=theirs,
+     )
+     print(json.dumps(result), flush=True)
+     return result
+@@ -480,7 +621,11 @@ def main():
+     parser.add_argument("--rows", default="1,6,16,48,96")
+     parser.add_argument("--dtypes", default="float32,bfloat16")
+     parser.add_argument("--temperatures", default="sampled,mixed")
++    parser.add_argument(
++        "--baseline", metavar="DIR", help="the release's tilelang_rejection.py"
++    )
+     args = parser.parse_args()
++    baseline = Release(args.baseline) if args.baseline else Triton()
+     cases = [
+         (kind, rows, dtype, temps)
+         for kind in args.kernels.split(",")
+@@ -488,7 +633,7 @@ def main():
+         for temps in args.temperatures.split(",")
+         for rows in map(int, args.rows.split(","))
+     ]
+-    results = [measure(*case, args.seed) for case in cases]
++    results = [measure(*case, args.seed, baseline) for case in cases]
+     failed = [
+         (r["kernel"], r["rows"], r["dtype"], r["temperatures"])
+         for r in results
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+index 23eed97e3..9cfa47a6d 100644
+--- a/tests/v1/spec_decode/test_tilelang_rejection.py
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -1,13 +1,30 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """The TileLang rejection sampler (``spec_decode.tilelang_rejection``) against the
+-Triton kernels it replaces, bit for bit: each kernel's outputs (floats compared as
+-bit patterns, including the elements a launch leaves alone) and
+-``rejection_sample``'s tokens and counts against the Triton launches', on batches of
+-requests with 0 to 5 drafts, -1 placeholders, mixed temperatures and per-request
+-seeds, and logits with ties, infinities and NaN."""
++Triton kernels it replaces, and against FP64 references of the probabilities it
++computes by Barron, Gnanapragasam and Tschannen's fix ("A Fix for Softmax and
++Cross-Entropy", Eq. 5):
++
++- bit for bit where the arithmetic is the Triton kernels': the greedy rows' block
++  argmaxes, every block maximum, the sampled tokens, greedy requests' counts, the
++  draft log-sum-exps, the elements a launch leaves alone, resampling and the
++  insertion of the resampled token;
++- within their rounding bounds of FP64 references that follow the kernels' blocks
++  (NaN and infinite logits included): the sampled rows' block sums of the other
++  columns' exponentials, the cumulative log ratios and the rejected rows'
++  log-sum-exps;
++- block verification's decisions equal the FP64 reference's from the same uniform
++  draws wherever no draw is within 1e-4 of its threshold, and the threshold itself
++  within a few ULPs of its FP64 value over confident and unsure logs, where the
++  release's formula (1 - m and 1 - p of probabilities) is off by up to 1;
++- the paper's z = [9, -9, -9] as a verified draft;
++- a request's tokens do not depend on its batch or the run.
++
++Batches of requests with 0 to 5 drafts, -1 placeholders, mixed temperatures and
++per-request seeds, and logits with ties, infinities and NaN."""
+ 
+ import itertools
++import math
+ 
+ import pytest
+ import torch
+@@ -15,7 +32,10 @@ import torch
+ triton = pytest.importorskip("triton")
+ pytest.importorskip("tilelang")
+ 
++from vllm.tilelang_utils import T, tilelang  # noqa: E402
++from vllm.triton_utils import tl  # noqa: E402
+ from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
++from vllm.v1.worker.gpu.sample.gumbel import spec_step_seed, tl_rand32  # noqa: E402
+ from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as rs  # noqa: E402
+ from vllm.v1.worker.gpu.spec_decode import tilelang_rejection as tlr  # noqa: E402
+ 
+@@ -27,6 +47,14 @@ DEVICE = torch.device("cuda")
+ VOCAB = 129280  # DeepSeek V4.1
+ STEPS = 5  # DSpark's num_speculative_steps
+ SLOTS = 160
++# A sum of the other columns' exponentials within this of its value (the
++# exponentials' and the sums' roundings: tests/v1/worker/
++# test_gpu_tilelang_logprob_softmax.py), and a subnormal a column for the ones that
++# are subnormal.
++S_RELATIVE = 2e-5
++SUBNORMAL = 2.0**-149
++# A draw this close to its threshold is not decided by the reference.
++BORDER = 1e-4
+ 
+ 
+ def _bits(x: torch.Tensor) -> torch.Tensor:
+@@ -42,10 +70,23 @@ def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
+     raise AssertionError(
+         f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
+         f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
+-        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
++        f"expected {[theirs[tuple(i)].item() for i in first]}"
+     )
+ 
+ 
++def _ulp(x: float) -> float:
++    """The FP32 ULP at |x| (finite): FP64's times 2^29, at least a subnormal."""
++    return max(math.ulp(abs(x)) * 2.0**29, SUBNORMAL)
++
++
++def _assert_close(ours: float, ref: float, bound: float, what: str) -> None:
++    """Equal NaN and infinities, else within ``bound``."""
++    if math.isnan(ref) or math.isinf(ref):
++        assert (math.isnan(ours) and math.isnan(ref)) or ours == ref, (what, ours, ref)
++        return
++    assert abs(ours - ref) <= bound, (what, ours, ref, bound)
++
++
+ # --- Batches ------------------------------------------------------------------
+ 
+ 
+@@ -390,9 +431,197 @@ def _rejection_sample(logits, batch):
+     )
+ 
+ 
++# --- FP64 references ------------------------------------------------------------
++
++
++def _block_sums(logits):
++    """``local_stats``' sampled-row statistics in FP64: per 8192-column block (the
++    columns past the row -inf) the maximum, NaN ignored (NaN for a block of NaN
++    only), and the sum of exp(x - maximum) over the block's columns but one holding
++    the maximum: the others plus exp(0) for each further tie (NaN for an infinite
++    maximum's), 0 unless the maximum is above -inf."""
++    rows, vocab = logits.shape
++    blocks = -(-vocab // tlr.STATS_BLOCK)
++    v = torch.full(
++        (rows, blocks * tlr.STATS_BLOCK),
++        float("-inf"),
++        dtype=torch.float64,
++        device=DEVICE,
++    )
++    v[:, :vocab] = logits.float().double()
++    v = v.view(rows, blocks, tlr.STATS_BLOCK)
++    nan = torch.isnan(v)
++    m = torch.where(nan, float("-inf"), v).amax(dim=2)
++    m = torch.where(nan.all(dim=2), float("nan"), m)
++    tie = v == m[..., None]
++    ties = tie.sum(dim=2).double()
++    terms = torch.where(tie, 0.0, torch.exp(v - m[..., None]))
++    s = terms.sum(dim=2) + torch.where(ties > 1, (ties - 1) * torch.exp(m - m), 0.0)
++    return m, torch.where(m > float("-inf"), s, 0.0)
++
++
++def _rows(logits):
++    """Each row's maximum and S as ``verify`` forms them from the block sums, in
++    FP64: the maximum over Triton's padded lanes (NaN ignored; NaN if every lane is
++    NaN), S the block sums rescaled to it, each with its left-out column back
++    (1 + sum), except the first block holding it; NaN for two or more columns that
++    are all -inf. Python lists."""
++    vocab = logits.shape[1]
++    m, s = _block_sums(logits)
++    lanes = tlr._padded_blocks(vocab)
++    pad = lanes - m.shape[1]
++    m = torch.nn.functional.pad(m, (0, pad), value=float("-inf"))
++    s = torch.nn.functional.pad(s, (0, pad), value=0.0)
++    nan = torch.isnan(m)
++    top = torch.where(nan, float("-inf"), m).amax(dim=1, keepdim=True)
++    top = torch.where(nan.all(dim=1, keepdim=True), float("nan"), top)
++    holds = m == top
++    first = torch.where(holds.any(dim=1), holds.int().argmax(dim=1), lanes)
++    lane = torch.arange(lanes, device=DEVICE)
++    terms = torch.where(lane == first[:, None], s, torch.exp(m - top) * (1 + s))
++    total = terms.sum(dim=1, keepdim=True)
++    if vocab > 1:
++        total = torch.where(top == float("-inf"), float("nan"), total)
++    return top[:, 0].tolist(), total[:, 0].tolist()
++
++
++def _log_prob(logits, rows, row: int, token: int) -> tuple[float, float]:
++    """The FP64 log probability of ``token`` at ``row`` (Eq. 5: the shifted logit,
++    exactly 0 at the maximum, minus log1p(S)) and the bound of the kernel's error on
++    it (0 where it is not finite)."""
++    top, total = rows
++    z = logits[row, token].float().item()
++    m, s = top[row], total[row]
++    shifted = 0.0 if z == m else z - m
++    lse = math.log1p(s)
++    value = shifted - lse
++    if not math.isfinite(value):
++        return value, 0.0
++    bound = (
++        0.5 * _ulp(shifted)
++        + _ulp(value)
++        + _ulp(lse)
++        + S_RELATIVE * s / (1 + s)
++        + logits.shape[1] * SUBNORMAL
++    )
++    return value, bound
++
++
++def _threshold(log_p: float, log_m: float) -> float:
++    """Block verification's threshold p (1 - m) / (1 - p m) in FP64; 1 where the
++    denominator is not positive."""
++    denom = -math.expm1(log_p + log_m)
++    if not denom > 0:
++        return 1.0
++    return math.exp(log_p) * -math.expm1(log_m) / denom
++
++
++def _verify_reference(logits, batch, uniforms):
++    """Each sampled request's verification in FP64: its cumulative log ratios with
++    their bounds, the count block verification accepts from the uniform draws
++    (None where a draw is within BORDER of its threshold) and its first rejected
++    row (None when every draft is accepted)."""
++    rows = _rows(logits)
++    cu = batch["cu"].tolist()
++    drafts = batch["drafts"].long().tolist()
++    temps = batch["temperature"][batch["idx_mapping"].long()].tolist()
++    draws = uniforms.tolist()
++    out = {}
++    for r in range(len(cu) - 1):
++        if temps[r] == 0:
++            continue
++        start = cu[r]
++        num_drafts = cu[r + 1] - start - 1
++        log_p, bound = 0.0, 0.0
++        cumulative = []
++        accepted, decided, verifying = 0, True, True
++        for i in range(num_drafts):
++            draft = drafts[start + i + 1]
++            if draft >= 0:
++                log_m, error = _log_prob(logits, rows, start + i, draft)
++                step = log_p + log_m
++                # min.f32: a NaN sum gives 0.
++                log_p = 0.0 if math.isnan(step) else min(step, 0.0)
++                bound = 0.0 if math.isnan(step) else bound + error + _ulp(log_p)
++            cumulative.append((log_p, bound))
++            verifying = verifying and draft >= 0
++            if verifying:
++                nxt = drafts[start + i + 2] if i + 1 < num_drafts else -1
++                if nxt >= 0:
++                    log_next, _ = _log_prob(logits, rows, start + i + 1, nxt)
++                    h = _threshold(log_p, log_next)
++                else:
++                    h = math.exp(log_p)
++                if abs(draws[start + i] - h) <= BORDER:
++                    decided = False
++                if draws[start + i] <= h:
++                    accepted = i + 1
++        rejected = start + accepted if accepted < num_drafts else None
++        out[r] = (cumulative, accepted if decided else None, rejected)
++    return out, rows
++
++
++@triton.jit
++def _uniforms_kernel(out_ptr, cu_ptr, idx_ptr, seeds_ptr, pos_ptr):
++    req = tl.program_id(0)
++    start = tl.load(cu_ptr + req)
++    end = tl.load(cu_ptr + req + 1)
++    seed = tl.load(seeds_ptr + tl.load(idx_ptr + req).to(tl.int64))
++    for i in range(end - start):
++        pos = tl.load(pos_ptr + start + i)
++        u = tl_rand32(spec_step_seed(seed, i), pos, includes_zero=False)
++        tl.store(out_ptr + start + i, u)
++
++
++def _uniforms(batch, rows: int) -> torch.Tensor:
++    """Each logits row's draw, as ``_rejection_kernel`` draws it: tl_rand32 at
++    spec_step_seed(seed, step) and the row's position, the step its place in its
++    request."""
++    out = torch.full((rows,), float("nan"), device=DEVICE)
++    reqs = batch["cu"].shape[0] - 1
++    if reqs:
++        _uniforms_kernel[(reqs,)](
++            out, batch["cu"], batch["idx_mapping"], batch["seeds"], batch["pos"]
++        )
++    return out
++
++
+ # --- Each kernel --------------------------------------------------------------
+ 
+ 
++def _local_stats(logits, batch):
++    ours = _stats_buffers(*logits.shape)
++    tlr.compute_local_stats(
++        *ours,
++        logits,
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        STEPS,
++    )
++    return ours
++
++
++def _assert_local_stats(ours, theirs, logits):
++    """Argmaxes and maxima bit for bit, the same elements written, and each written
++    block sum within its bound of the FP64 reference."""
++    _assert_same(ours[0], theirs[0], "argmax")
++    _assert_same(ours[1], theirs[1], "maximum")
++    written = theirs[2] != -7
++    _assert_same(ours[2][~written], theirs[2][~written], "rows left alone")
++    _, s = _block_sums(logits)
++    ref, got = s[written], ours[2][written].double()
++    nan = torch.isnan(ref)
++    assert torch.equal(torch.isnan(got), nan), "NaN block sums"
++    bound = S_RELATIVE * ref.abs() + tlr.STATS_BLOCK * SUBNORMAL
++    error = (got - ref).abs()
++    bad = ~nan & ~(error <= bound)
++    assert not bad.any(), (
++        f"{int(bad.sum())} block sums outside their bound: ours "
++        f"{got[bad][:5].tolist()}, reference {ref[bad][:5].tolist()}"
++    )
++
++
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("vocab", [VOCAB, 1000, 8193])
+ @pytest.mark.parametrize("stride", STRIDES)
+@@ -402,42 +631,24 @@ def test_local_stats(dtype, vocab, stride, case, rows):
+     """The block statistics of greedy and sampled rows; bonus rows left alone."""
+     batch = _batch(_counts(rows), "mixed", rows, vocab)
+     logits = _logits(batch, vocab, dtype, case, rows, stride)
+-    theirs = _triton_local_stats(logits, batch)
+-    ours = _stats_buffers(rows, vocab)
+-    tlr.compute_local_stats(
+-        *ours,
+-        logits,
+-        batch["expanded"],
+-        batch["local"],
+-        batch["temperature"],
+-        STEPS,
++    _assert_local_stats(
++        _local_stats(logits, batch), _triton_local_stats(logits, batch), logits
+     )
+-    for name, a, b in zip(("argmax", "maximum", "sum of exponentials"), ours, theirs):
+-        _assert_same(a, b, name)
+ 
+ 
+ @pytest.mark.parametrize("indices", INDICES)
+ def test_local_stats_index_dtypes(indices):
+     batch = _batch(_counts(37), "mixed", 3, VOCAB, indices)
+     logits = _logits(batch, VOCAB, torch.float32, "special", 3)
+-    theirs = _triton_local_stats(logits, batch)
+-    ours = _stats_buffers(logits.shape[0], VOCAB)
+-    tlr.compute_local_stats(
+-        *ours,
+-        logits,
+-        batch["expanded"],
+-        batch["local"],
+-        batch["temperature"],
+-        STEPS,
++    _assert_local_stats(
++        _local_stats(logits, batch), _triton_local_stats(logits, batch), logits
+     )
+-    for name, a, b in zip(("argmax", "maximum", "sum of exponentials"), ours, theirs):
+-        _assert_same(a, b, name)
+ 
+ 
+ def _verified(logits, batch):
+-    """Both implementations' verification outputs from Triton's block statistics."""
+-    stats = _triton_local_stats(logits, batch)
+-    theirs = _triton_verify(logits, stats, batch)
++    """The TileLang verification from its own block statistics, and Triton's from
++    Triton's."""
++    theirs = _triton_verify(logits, _triton_local_stats(logits, batch), batch)
+     ours = _verify_buffers(batch["cu"].shape[0] - 1, logits.shape[0])
+     cumulative, sampled, num_sampled, target_lse, draft_lse = ours
+     tlr.verify(
+@@ -447,7 +658,7 @@ def _verified(logits, batch):
+         draft_lse,
+         cumulative,
+         logits,
+-        *stats,
++        *_local_stats(logits, batch),
+         batch["drafts"],
+         batch["cu"],
+         batch["idx_mapping"],
+@@ -459,7 +670,52 @@ def _verified(logits, batch):
+     return ours, theirs
+ 
+ 
+-VERIFIED = ("cumulative log ratio", "sampled", "num_sampled", "target lse", "draft lse")
++def _assert_verified(ours, theirs, logits, batch):
++    """Triton's bits for the sampled tokens, the draft log-sum-exps, the elements
++    left alone and every greedy request's outputs; each sampled request's cumulative
++    log ratios within their bounds of the FP64 reference, its count the reference's
++    wherever no draw is within BORDER of its threshold, and the rejected row's
++    log-sum-exp within its bound. Returns how many sampled requests were decided."""
++    cumulative, sampled, num_sampled, target_lse, draft_lse = ours
++    _assert_same(sampled, theirs[1], "sampled tokens")
++    _assert_same(draft_lse, theirs[4], "draft lse")
++    left = theirs[0] == -7
++    _assert_same(cumulative[left], theirs[0][left], "cumulative rows left alone")
++    greedy = batch["temperature"][batch["idx_mapping"].long()] == 0
++    _assert_same(num_sampled[greedy], theirs[2][greedy], "greedy counts")
++    _assert_same(target_lse[greedy], theirs[3][greedy], "greedy lse")
++    reference, (top, total) = _verify_reference(
++        logits, batch, _uniforms(batch, logits.shape[0])
++    )
++    cu = batch["cu"].tolist()
++    counts = num_sampled.tolist()
++    decided = 0
++    for r, (steps, accepted, rejected) in reference.items():
++        for i, (log_p, bound) in enumerate(steps):
++            _assert_close(
++                cumulative[cu[r] + i].item(), log_p, bound, f"request {r} step {i}"
++            )
++        if accepted is None:
++            continue
++        decided += 1
++        assert counts[r] == accepted, (r, counts[r], accepted)
++        lse = target_lse[r].item()
++        if rejected is None:
++            assert lse == 0.0, (r, lse)
++            continue
++        m, s = top[rejected], total[rejected]
++        softplus = math.log1p(s)
++        ref = m + softplus
++        bound = 0.0
++        if math.isfinite(ref):
++            bound = (
++                _ulp(ref)
++                + _ulp(softplus)
++                + S_RELATIVE * s / (1 + s)
++                + logits.shape[1] * SUBNORMAL
++            )
++        _assert_close(lse, ref, bound, f"request {r}'s rejected row")
++    return decided, len(reference)
+ 
+ 
+ # Vocabularies of 16 blocks (DeepSeek V4.1's), of 9, 3 and 2 (padded to 16, 4 and 2)
+@@ -475,14 +731,41 @@ def test_verify(dtype, vocab, case, temps, indices):
+     batch = _batch(_counts(96), temps, 7, vocab, indices)
+     logits = _logits(batch, vocab, dtype, case, 7)
+     ours, theirs = _verified(logits, batch)
+-    for name, a, b in zip(VERIFIED, ours, theirs):
+-        _assert_same(a, b, name)
++    decided, sampled = _assert_verified(ours, theirs, logits, batch)
++    assert decided >= 0.9 * sampled, (decided, sampled)
+     if case == "peaked" and vocab > 2:
+         drafts = (batch["cu"][1:] - batch["cu"][:-1] - 1).long()
+-        counts = theirs[2].long()
++        counts = ours[2].long()
+         assert (counts > 0).any() and (counts < drafts).any()
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_paper_example_as_a_draft(dtype):
++    """Two drafts of the top token of z = [9, -9, -9]: each step's log probability
++    is -log1p(2 e^-18) = -3.046e-8, so the cumulative log ratios are -3.046e-8 and
++    -6.092e-8, where the release's were exactly 0 (and its threshold, from
++    1 - m = 0 and 1 - p = 0, the not-positive denominator's 1 instead of about
++    one half)."""
++    batch = {
++        "cu": torch.tensor([0, 3], dtype=torch.int32, device=DEVICE),
++        "idx_mapping": torch.tensor([4], device=DEVICE),
++        "expanded": torch.tensor([4, 4, 4], device=DEVICE),
++        "local": torch.tensor([0, 1, 2], dtype=torch.int32, device=DEVICE),
++        "drafts": torch.tensor([2, 0, 0], dtype=torch.int32, device=DEVICE),
++        "temperature": torch.ones(SLOTS, device=DEVICE),
++        "seeds": torch.arange(SLOTS, device=DEVICE),
++        "pos": torch.tensor([5, 6, 7], device=DEVICE),
++    }
++    logits = torch.tensor([[9.0, -9.0, -9.0]] * 3, device=DEVICE).to(dtype)
++    ours, theirs = _verified(logits, batch)
++    _assert_verified(ours, theirs, logits, batch)
++    step = -math.log1p(2 * math.exp(-18.0))
++    for i in range(2):
++        got = ours[0][i].item()
++        assert abs(got - (i + 1) * step) <= S_RELATIVE * (i + 1) * abs(step), got
++        assert theirs[0][i].item() == 0.0
++
++
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049])
+ @pytest.mark.parametrize("stride", STRIDES)
+@@ -536,6 +819,62 @@ def test_resample_index_dtypes():
+     _assert_same(ours[1], theirs[1], "block maximum")
+ 
+ 
++@tilelang.jit(pass_configs=tls._PASS)
++def _threshold_kernel(threads: int):
++    n = T.dynamic("n")
++
++    @T.prim_func
++    def thresholds(
++        log_p: T.Tensor((n,), T.float32),
++        log_m: T.Tensor((n,), T.float32),
++        out: T.Tensor((n,), T.float32),
++    ):
++        with T.Kernel(T.ceildiv(n, threads), threads=threads) as block:
++            T.import_source(tlr._HEADER)
++            i = block * threads + T.get_thread_binding()
++            if i < n:
++                out[i] = T.call_extern(
++                    "float32", "vllm_block_threshold", log_p[i], log_m[i]
++                )
++
++    return thresholds
++
++
++# Logs of probabilities from certain to unlikely: the release's formula broke in the
++# confident ones, where 1 - m and 1 - p cancel or are exactly 0.
++LOGS = (0.0, -1e-12, -1e-9, -3e-8, -6e-8, -1e-7, -3e-7, -1e-6, -1e-5, -1e-4, -1e-3,
++        -0.01, -0.1, -0.7, -3.0, -20.0, float("-inf"))  # fmt: skip
++
++
++def test_block_threshold():
++    """``vllm_block_threshold`` over every pair of LOGS (and a NaN next draft)
++    within a few ULPs of its FP64 value (the prefix ratio's exponential within
++    1.4e-7 |log p| + 2^-22, two expm1 and a quotient); the release's formula, which
++    took 1 - m and p (1 - m) + 1 - p of the probabilities, emulated in FP32, is off
++    by up to 1 on the same grid."""
++    pairs = [(p, m) for p in LOGS for m in (*LOGS, float("nan"))]
++    log_p = torch.tensor([p for p, _ in pairs], device=DEVICE)
++    log_m = torch.tensor([m for _, m in pairs], device=DEVICE)
++    out = torch.full_like(log_p, -7.0)
++    _threshold_kernel(128)(log_p, log_m, out)
++    worst_release = 0.0
++    for k, (lp, lm) in enumerate(zip(log_p.tolist(), log_m.tolist())):
++        ref = _threshold(lp, lm)
++        bound = (1.4e-7 * abs(lp) + 1e-6) * ref if math.isfinite(lp) else 0.0
++        _assert_close(out[k].item(), ref, bound, f"threshold at {lp}, {lm}")
++        if math.isnan(lm):
++            continue
++        # The release: vllm_block_threshold(exp(log_p), exp(log_m)) in FP32.
++        p = torch.tensor(lp).exp().float()
++        m = torch.tensor(lm).exp().float()
++        rest = 1 - m
++        residual = p * rest
++        denom = (p.double() * rest.double() + 1).float() - p
++        release = (residual / denom).item() if denom > 0 else 1.0
++        worst_release = max(worst_release, abs(release - ref))
++    assert worst_release >= 0.4, worst_release
++
++
+ # --- rejection_sample ---------------------------------------------------------
+ 
+ 
+@@ -547,14 +886,48 @@ def _assert_same_tokens(ours, theirs):
+         _assert_same(sampled[r, :n], expected[r, :n], f"request {r}'s tokens")
+ 
+ 
++def _expected_tokens(logits, batch):
++    """rejection_sample's tokens and counts from the TileLang verification (which
++    ``test_verify`` holds to the FP64 reference), resampled and inserted by the
++    Triton kernels, whose arithmetic the TileLang ones are bit for bit."""
++    verified, _ = _verified(logits, batch)
++    _, sampled, num_sampled, _, _ = verified
++    ids, values = _triton_resample(logits, num_sampled, batch, verified)
++    rs._insert_resampled_kernel[(num_sampled.shape[0],)](
++        sampled,
++        sampled.stride(0),
++        num_sampled,
++        ids,
++        ids.stride(0),
++        values,
++        values.stride(0),
++        ids.shape[1],
++        batch["cu"],
++        batch["expanded"],
++        batch["temperature"],
++        PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(ids.shape[1]),
++    )
++    return sampled, num_sampled
++
++
++def _assert_greedy_as_triton(ours, logits, batch):
++    """Greedy requests take the Triton launches' tokens and counts."""
++    expected, counts = _triton_rejection_sample(logits, batch)
++    greedy = (batch["temperature"][batch["idx_mapping"].long()] == 0).tolist()
++    for r, is_greedy in enumerate(greedy):
++        if is_greedy:
++            n = int(counts[r])
++            assert int(ours[1][r]) == n
++            _assert_same(ours[0][r, :n], expected[r, :n], f"greedy request {r}")
++
++
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("vocab", [VOCAB, 1000, 8193])
+ @pytest.mark.parametrize("stride", STRIDES)
+ @pytest.mark.parametrize("case", CASES)
+ @pytest.mark.parametrize("rows", [1, 16, 96])
+ def test_rejection_sample(monkeypatch, dtype, vocab, stride, case, rows):
+-    """rejection_sample's tokens and counts, through the TileLang kernels, against
+-    the Triton launches."""
++    """rejection_sample's tokens and counts, through the TileLang kernels."""
+     launched = []
+ 
+     def tilelang(*args, **kwargs):
+@@ -566,7 +939,8 @@ def test_rejection_sample(monkeypatch, dtype, vocab, stride, case, rows):
+     logits = _logits(batch, vocab, dtype, case, 17 + rows, stride)
+     ours = _rejection_sample(logits, batch)
+     assert launched
+-    _assert_same_tokens(ours, _triton_rejection_sample(logits, batch))
++    _assert_same_tokens(ours, _expected_tokens(logits, batch))
++    _assert_greedy_as_triton(ours, logits, batch)
+ 
+ 
+ @pytest.mark.parametrize("indices", INDICES)
+@@ -574,16 +948,19 @@ def test_rejection_sample(monkeypatch, dtype, vocab, stride, case, rows):
+ def test_rejection_sample_index_dtypes(indices, temps):
+     batch = _batch(_counts(48), temps, 19, VOCAB, indices)
+     logits = _logits(batch, VOCAB, torch.float32, "peaked", 19)
+-    _assert_same_tokens(
+-        _rejection_sample(logits, batch), _triton_rejection_sample(logits, batch)
+-    )
++    ours = _rejection_sample(logits, batch)
++    _assert_same_tokens(ours, _expected_tokens(logits, batch))
++    _assert_greedy_as_triton(ours, logits, batch)
+ 
+ 
+ def test_rejection_sample_rows_do_not_depend_on_the_batch():
+-    """A request's tokens are those it gets alone."""
++    """A request's tokens are those it gets alone, and the same on every run."""
+     batch = _batch(_counts(48), "mixed", 23, VOCAB)
+     logits = _logits(batch, VOCAB, torch.float32, "peaked", 23)
+     whole, counts = _rejection_sample(logits, batch)
++    again, again_counts = _rejection_sample(logits, batch)
++    _assert_same(again_counts, counts, "second run's counts")
++    _assert_same_tokens((again, again_counts), (whole, counts))
+     cu = batch["cu"]
+     for r in (0, 3, cu.shape[0] - 2):
+         start, end = int(cu[r]), int(cu[r + 1])
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 17aa46172..c1ae68722 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -1,15 +1,31 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""``tilelang_logprob.topk_log_softmax`` against the Triton kernel it replaces,
+-``logprob._topk_log_softmax_kernel`` launched as production launched it, bit for bit
+-(outputs compared as FP32 bit patterns): FP32 and bf16 logits; rows at 16-byte
+-addresses and strides (Triton's 16-byte runs), at an odd stride and at a base past
+-16 bytes (one element a thread); the DeepSeek V4.1 vocabulary, a tensor-parallel
+-shard and odd widths; 0 to 2100 requested tokens; rows of infinities, NaN, ties,
+-signed zeros, extreme and subnormal magnitudes, and exponentials that underflow to
+-subnormals. Then the call sites: ``compute_token_logprobs`` and
+-``compute_topk_scores`` launch the TileLang kernel only, a CUDA graph replays it,
+-and the runner declares the calls it launches."""
++"""``tilelang_logprob.topk_log_softmax`` against an FP64 reference of Barron,
++Gnanapragasam and Tschannen's log-softmax ("A Fix for Softmax and Cross-Entropy",
++Eq. 5) on the same logits, and against today's arithmetic, the Triton kernel
++``logprob._topk_log_softmax_kernel`` launched as production launched it (the
++release's TileLang port matched it bit for bit):
++
++- every output within its rounding bound of the reference (the shifted logit's and
++  the output's rounding, an ULP of the log-sum-exp, the sum's relative error and,
++  for sums in FP32's subnormal range, an absolute subnormal per column), with the
++  reference's NaN and infinities;
++- never further from the reference than today's output beyond that rounding;
++- exact where today's collapses: the paper's z = [9, -9, -9], and margins of the
++  top logit over the others' log-sum-exp from 4 to 100 nats around FP32's cliff at
++  16.6, the maximum at the row's first, middle and last column (today's sum loses
++  the blocks added after the maximum's);
++- a row's bits do not depend on its batch or the run.
++
++FP32 and bf16 logits; rows at 16-byte addresses and strides (Triton's 16-byte runs),
++at an odd stride and at a base past 16 bytes (one element a thread); the DeepSeek
++V4.1 vocabulary, a tensor-parallel shard, odd widths and whole steps of the kernel's
++reads; 0 to 2100 requested tokens; rows of infinities, NaN, ties, signed zeros,
++extreme and subnormal magnitudes, and exponentials that underflow to subnormals. Then the call sites:
++``compute_token_logprobs`` and ``compute_topk_scores`` launch the TileLang kernel
++only, a CUDA graph replays it, and the runner declares the calls it launches."""
++
++import math
+ 
+ import pytest
+ import torch
+@@ -40,6 +56,17 @@ CASES = ("random", "wide", "ties", "peaked", "special")
+ # What the padding past each row holds: a read of it would win the maximum.
+ PAD = 1.0e4
+ SENTINEL = 12345.0
++# The sum of the other columns' exponentials, S, within this of its value: each
++# exponential within 1.4e-7 |x - max| + 2^-22 of its own (the shift's and the
++# log2(e) product's roundings, log2(e) in FP32, ex2.approx): 1.1e-5 at the 75 nats
++# the margins test reaches; then the blocked sum's roundings (the CPU emulation in
++# experiments/2026-10-25-softmax-fix measures about 1e-6). Columns whose
++# exponentials are subnormal add up to one subnormal each.
++S_RELATIVE = 2e-5
++SUBNORMAL = 2.0**-149
++# Today's sum and this one round independently: the allowance for this one's error
++# over today's.
++S_ALLOWANCE = 4e-6
+ 
+ 
+ def _bits(x: torch.Tensor) -> torch.Tensor:
+@@ -59,7 +86,7 @@ def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
+     raise AssertionError(
+         f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
+         f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
+-        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
++        f"expected {[theirs[tuple(i)].item() for i in first]}"
+     )
+ 
+ 
+@@ -158,10 +185,11 @@ def _ids(values: torch.Tensor, topk: int, seed: int) -> torch.Tensor:
+     return ids
+ 
+ 
+-# --- The two launches ----------------------------------------------------------
++# --- The launches and the reference ---------------------------------------------
+ 
+ 
+ def _triton(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    """Today's arithmetic."""
+     rows, vocab = logits.shape
+     out = torch.full((rows, ids.shape[1]), SENTINEL, device=DEVICE)
+     logprob._topk_log_softmax_kernel[(rows,)](
+@@ -183,25 +211,103 @@ def _tilelang(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
++def _reference(logits: torch.Tensor, ids: torch.Tensor):
++    """Eq. 5 in FP64 on the kernel's FP32 view of ``logits``: with M the row's
++    maximum (NaN ignored), S the sum of exp(x - M) over the columns that are not M,
++    plus exp(M - M) for each of M's ties but one, the requested tokens' log
++    probabilities ``shifted - log1p(S)`` (``shifted`` exactly 0 at M). Returns them,
++    their shifted logits, and each row's S and log1p(S) ([rows, 1])."""
++    v = logits.float().double()
++    m = torch.where(torch.isnan(v), float("-inf"), v).amax(dim=1, keepdim=True)
++    tie = v == m
++    ties = tie.sum(dim=1, keepdim=True).double()
++    terms = torch.where(tie, torch.zeros_like(v), torch.exp(v - m))
++    extra = torch.where(ties > 1, (ties - 1) * torch.exp(m - m), torch.zeros_like(m))
++    s = terms.sum(dim=1, keepdim=True) + extra
++    lse = torch.log1p(s)
++    picked = v.gather(1, ids.long())
++    shifted = torch.where(picked == m, torch.zeros_like(picked), picked - m)
++    return shifted - lse, shifted, s, lse
++
++
++def _ulp(x: torch.Tensor) -> torch.Tensor:
++    """The FP32 ULP at |x| (FP64)."""
++    a = x.abs().float()
++    return (torch.nextafter(a, torch.full_like(a, float("inf"))) - a).double()
++
++
++def _assert_accurate(ours, theirs, logits, ids, what: str):
++    """``ours`` against the reference: its NaN and infinities, every finite output
++    within its rounding bound, and never further from it than today's output
++    (``theirs``) beyond the two sums' independent roundings. Returns the reference
++    and each output's S (for the callers' own checks)."""
++    vocab = logits.shape[1]
++    ref, shifted, s, lse = _reference(logits, ids)
++    s, lse = s.expand_as(ref), lse.expand_as(ref)
++    expect = ref.float()
++    nan = torch.isnan(expect)
++    if not torch.equal(torch.isnan(ours), nan):
++        at = (torch.isnan(ours) != nan).nonzero()[:5].tolist()
++        raise AssertionError(f"{what}: NaN where the reference has none or the "
++                             f"reverse, at {at}")  # fmt: skip
++    inf = torch.isinf(expect)
++    _assert_same(ours[inf], expect[inf], f"{what}: infinities")
++    finite = ~nan & ~inf
++    error = (ours.double() - ref).abs()
++    floor = vocab * SUBNORMAL
++    bound = (
++        0.5 * _ulp(shifted) + _ulp(ref) + _ulp(lse) + S_RELATIVE * s / (1 + s) + floor
++    )
++    bad = finite & ~(error <= bound)
++    if bad.any():
++        at = bad.nonzero()[:5].tolist()
++        raise AssertionError(
++            f"{what}: {int(bad.sum())} outputs outside their bound, first at {at}: "
++            f"ours {[ours[tuple(i)].item() for i in at]}, reference "
++            f"{[ref[tuple(i)].item() for i in at]}, bound "
++            f"{[bound[tuple(i)].item() for i in at]}"
++        )
++    today = finite & torch.isfinite(theirs)
++    allowance = _ulp(ref) + _ulp(lse) + S_ALLOWANCE * s / (1 + s) + floor
++    worse = today & ~(error <= (theirs.double() - ref).abs() + allowance)
++    if worse.any():
++        at = worse.nonzero()[:5].tolist()
++        raise AssertionError(
++            f"{what}: {int(worse.sum())} outputs further from the reference than "
++            f"today's, first at {at}: ours {[ours[tuple(i)].item() for i in at]}, "
++            f"today's {[theirs[tuple(i)].item() for i in at]}, reference "
++            f"{[ref[tuple(i)].item() for i in at]}"
++        )
++    return ref, s
++
++
+ def _check(logits: torch.Tensor, ids: torch.Tensor, what: str) -> torch.Tensor:
+     before = logits.clone()
+     ours = _tilelang(logits, ids)
+     theirs = _triton(logits, ids)
+-    _assert_same(ours, theirs, what)
+     _assert_same(logits, before, f"{what}: logits")
++    _assert_accurate(ours, theirs, logits, ids, what)
+     return ours
+ 
+ 
+-# --- Bits ---------------------------------------------------------------------
++# --- Accuracy -----------------------------------------------------------------
++
++
++# Besides DeepSeek V4.1's widths and odd ones, whole steps with no guarded one: a
++# step is 1024 threads x 2 loads x a run of 1 (2048 columns), 4 FP32 (8192) or 8
++# bf16 (16384).
++STEPS = (2048, 8192, 16384)
+ 
+ 
+ @pytest.mark.parametrize("case", CASES)
+ @pytest.mark.parametrize(
+-    "vocab", [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391], ids=lambda v: f"v{v}"
++    "vocab",
++    [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391, *STEPS],
++    ids=lambda v: f"v{v}",
+ )
+ @pytest.mark.parametrize("layout", LAYOUTS)
+ @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+-def test_log_softmax_matches_triton(dtype, layout, vocab, case):
++def test_log_softmax_matches_fp64(dtype, layout, vocab, case):
+     """A sampled token and twenty logprobs a row."""
+     values = _values(12, vocab, case, seed=vocab + len(case))
+     logits = _logits(values, dtype, layout)
+@@ -230,24 +336,80 @@ def test_batch_sizes(dtype, rows):
+     _check(logits, _ids(values, 21, rows), f"{dtype} {rows} rows")
+ 
+ 
+-@pytest.mark.parametrize("vocab", [1024, 8192], ids=lambda v: f"v{v}")
+ @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+-def test_layout_decides_the_bits(dtype, vocab):
+-    """The tests see the layout: on 16-byte rows the one-element layout adds the
+-    exponentials in another order, and some log probability differs from Triton's
+-    (one block: the guarded chunk; eight: one chunk of vector loads). Few blocks,
+-    so a block sum's last bits reach the row's."""
+-    values = _values(256, vocab, "random", seed=5)
++def test_paper_example(dtype):
++    """z = [9, -9, -9]: the top token's log probability is -log1p(2 e^-18) =
++    -3.046e-8, its complement 1 - p = 3.046e-8; today's is exactly 0 (so 1 - p
++    is 0). The others' -18 - 3e-8 rounds to -18 in FP32 either way."""
++    logits = _logits(torch.tensor([[9.0, -9.0, -9.0]], device=DEVICE), dtype, "aligned")
++    ids = torch.tensor([[0, 1, 2]], device=DEVICE)
++    ours = _tilelang(logits, ids)
++    theirs = _triton(logits, ids)
++    _assert_accurate(ours, theirs, logits, ids, f"paper example {dtype}")
++    others = 2 * math.exp(-18.0)
++    expected = -math.log1p(others)
++    assert abs(ours[0, 0].item() - expected) <= S_RELATIVE * abs(expected)
++    complement = -torch.expm1(ours[0, :1]).item()
++    assert abs(complement - others / (1 + others)) <= S_RELATIVE * complement
++    assert theirs[0, 0].item() == 0.0
++    assert ours[0, 1].item() == ours[0, 2].item() == -18.0
++
++
++# Margins of the top logit over the others' log-sum-exp, nats: FP32's cliff
++# (2^-24, 16.6) inside; past about 75 here the largest of the other exponentials
++# turn subnormal, past 87.3 S itself, and past about 103 it underflows (the
++# reference's log probability is then below FP32's smallest subnormal too).
++MARGINS = (4, 8, 10, 12, 13, 14, 15, 16, 16.3, 16.6, 16.9, 17.5, 18, 20, 25, 30,
++           36.7, 40, 50, 60, 70, 80, 87, 90, 95, 100)  # fmt: skip
++
++
++@pytest.mark.parametrize("column", ["first", "middle", "last"])
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_margins_around_the_cliff(dtype, column):
++    """The top token's log probability, -log1p(S) = -S (1 - S / 2 ...), from margin
++    4 to 100, the maximum at the row's first, middle or last column: within
++    S_RELATIVE of the reference while S is at least a normal FP32 number a column
++    (its subnormal terms then add at most 2^-24 of it), and within a subnormal a
++    column below that (``_assert_accurate``). Today's is exactly 0 once S is below
++    2^-25, wherever the maximum sits; short of that its sum loses each block added
++    after the maximum's block below half an ULP of 1, so its error depends on the
++    column: never better than ours."""
++    g = torch.Generator(device=DEVICE).manual_seed(16)
++    others = torch.randn(VOCAB, generator=g, device=DEVICE) * 2
++    lse = torch.logsumexp(others.double(), 0).item()
++    col = {"first": 0, "middle": VOCAB // 2, "last": VOCAB - 1}[column]
++    values = others.repeat(len(MARGINS), 1)
++    values[:, col] = torch.tensor([lse + m for m in MARGINS], device=DEVICE)
+     logits = _logits(values, dtype, "aligned")
+-    ids = _ids(values, 21, 5)
++    ids = torch.full((len(MARGINS), 1), col, dtype=torch.int64, device=DEVICE)
++    ours = _tilelang(logits, ids)
+     theirs = _triton(logits, ids)
+-    _assert_same(_tilelang(logits, ids), theirs, "vector layout")
+-    other = torch.full_like(theirs, SENTINEL)
+-    tls._kernel(
+-        tilelang_logprob.topk_log_softmax_kernel,
+-        *tilelang_logprob.topk_log_softmax_key(dtype, 1),
+-    )(other, logits, ids, ids[:1].view(torch.bool))
+-    assert not torch.equal(_bits(other), _bits(theirs))
++    ref, s = _assert_accurate(ours, theirs, logits, ids, f"margins {dtype} {column}")
++    assert torch.equal(ids[:, 0], logits.float().argmax(dim=1))
++    normal = s[:, 0] >= VOCAB * 2.0**-126
++    assert normal.sum() >= 20
++    relative = ((ours[:, 0].double() - ref[:, 0]) / ref[:, 0]).abs()
++    assert (relative[normal] <= S_RELATIVE).all(), relative[normal].max().item()
++    assert (ours[normal, 0] < 0).all()
++    tiny = s[:, 0] < 2.0**-25
++    assert tiny.any() and (theirs[tiny, 0] == 0).all()
++    assert (ours[tiny & normal, 0] < 0).all()
++
++
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_rows_do_not_depend_on_the_batch_or_the_run(dtype):
++    """Batch invariance and determinism: a row's bits are those it gets alone, and
++    the same on every launch."""
++    values = _values(96, VOCAB, "peaked", seed=96)
++    values[48:] = _values(48, VOCAB, "random", seed=97)
++    logits = _logits(values, dtype, "aligned")
++    ids = _ids(values, 21, 96)
++    whole = _tilelang(logits, ids)
++    _assert_same(_tilelang(logits, ids), whole, "second launch")
++    for r in (0, 1, 47, 48, 95):
++        alone = _tilelang(logits[r : r + 1], ids[r : r + 1])
++        _assert_same(alone, whole[r : r + 1], f"row {r} alone")
++    _assert_same(_tilelang(logits[40:60], ids[40:60]), whole[40:60], "rows 40-59")
+ 
+ 
+ @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@@ -275,7 +437,7 @@ def test_compute_token_logprobs_launches_tilelang(dtype, monkeypatch):
+     values = _values(5, VOCAB, "random", seed=11)
+     logits = _logits(values, dtype, "aligned")
+     ids = _ids(values, 21, 11)
+-    expected = _triton(logits, ids)
++    expected = _check(logits, ids, f"{dtype} token logprobs")
+     calls = []
+     launch = tilelang_logprob.topk_log_softmax
+ 
+@@ -309,9 +471,10 @@ def test_compute_topk_scores(dtype, num_logprobs):
+     sampled = torch.randint(VOCAB, (6,), generator=g, device=DEVICE)
+     result = logprob.compute_topk_scores(logits, num_logprobs, sampled)
+     assert result.logprob_token_ids.shape == (6, 1 + num_logprobs)
++    ids = result.logprob_token_ids.contiguous()
+     _assert_same(
+         result.logprobs,
+-        _triton(logits, result.logprob_token_ids.contiguous()),
++        _check(logits, ids, f"topk scores {num_logprobs}"),
+         f"topk scores {num_logprobs}",
+     )
+ 
+@@ -335,7 +498,7 @@ def test_cuda_graph_replay():
+     ids.copy_(_ids(fresh, 21, 4))
+     out.fill_(SENTINEL)
+     graph.replay()
+-    _assert_same(out, _triton(logits, ids), "graph replay")
++    _assert_same(out, _check(logits, ids, "graph replay"), "graph replay")
+ 
+ 
+ # --- Preparation --------------------------------------------------------------
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index 88a4d88a9..39104e0fd 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -16,9 +16,10 @@ from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_ids
+ _MAX_TOPK_BLOCK = 1024
+ 
+ 
+-# The reference the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``) is
+-# tested against, launched as production launched it (BLOCK_SIZE=1024,
+-# TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no longer launches it.
++# The arithmetic the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``)
++# fixed, which its tests measure it against, launched as production launched it
++# (BLOCK_SIZE=1024, TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no
++# longer launches it.
+ @triton.jit(do_not_specialize=["topk"])
+ def _topk_log_softmax_kernel(
+     output_ptr,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 7fe3bf0be..12ddaf532 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -4,36 +4,41 @@
+ 
+ - ``token_ranks``: each row's selected-token rank, ties included
+   (``logprob._ranks_kernel`` without its phantom padding columns)
+-- ``topk_log_softmax``: ``logprob._topk_log_softmax_kernel``, bit for bit, NaN and
+-  infinite logits included (the Triton kernel stays importable as the tests'
+-  reference)
+-
+-``topk_log_softmax``'s arithmetic is Triton 3.7.1's for sm_121a, read from the PTX
+-and SASS of the image's cached specializations (FP32: cache entry
+-KYOO2UC5JP6EBVTSY75OOJE5ZXFRIGKV6WFOJYRUR4SAK4V3UBDQ, bf16:
+-I3S7WK7AC43HFSJJKZZRSDS4GPL6K6SRZ4CZBOPEA2EPC5RXPGNQ, both with 16-byte logits and
+-a row stride of 16 elements):
++- ``topk_log_softmax``: the log-softmax at the selected tokens by Barron,
++  Gnanapragasam and Tschannen's fix ("A Fix for Softmax and Cross-Entropy", Eq. 5),
++  in place of ``logprob._topk_log_softmax_kernel``'s arithmetic (the Triton kernel
++  stays importable as the tests' baseline)
++
++The Triton kernel sums every column's ``exp(logit - max_val)``, the maximum's
++``exp(0) = 1`` among them, and returns ``(logit - max_val) - log(sum)``. Once the
++other columns add less than half an FP32 ULP of 1 (2^-24: a margin past 16.6 nats)
++the sum rounds to 1 and the top token's log probability to exactly 0; short of
++that, every block added after the maximum's is rounded against 1, losing what it
++holds below 2^-24, and the log probability lands on a multiple of 2^-23. The sum
++here leaves the maximum out (S), so no 1 absorbs it, and the log-sum-exp past the
++maximum is log1p(S):
+ 
+ - ``max_val`` is ``max.f32`` (a NaN gives way) of every logit and -inf, so any
+-  order gives it: here each thread folds its columns of every block, the row read
+-  last block first, and the block reduces once (``_block_reduce``). Triton reduces
+-  each 1024-column block in turn, three barriers a block. (The PTX ISA orders -0
+-  below +0; were the sign of a zero maximum to depend on the order, it could not
+-  reach an output: two zero maxima add 2 to ``se``, so ``lse`` is not 0.)
+-- ``se`` is the blocks' sums of ``tl.exp(logit - max_val)`` added to 0 in block
+-  order. ``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with
+-  log2(e) (``vllm_exp_from``); a column past the row adds 0. A block's sum is
+-  Triton's: a thread adds its eight exponentials in register order (``_element``:
+-  Triton 3.7.1 lays the block out by the load's specialization, ``_triton_run``),
+-  the warp adds at XOR distances 16 to 1, and the warps' sums ``w`` combine as
+-  threads 0-3 do, ``(w0 + w2) + (w1 + w3)``. Here a chunk of eight blocks is
+-  loaded at once and its sums cross the warps through one barrier.
+-- ``lse`` is libdevice's ``__nv_logf`` as Triton bundles it
+-  (``vllm_control_log``), and a token's log probability ``(logit - max_val) -
+-  lse``, each rounded.
+-
+-Every add, product and difference is the header's, rounded to nearest as Triton
+-writes it (nvcc would contract them otherwise).
++  order gives it: a block of 1024 threads takes the row, last step first, each
++  thread folding its columns into one maximum a load, then the block
++  (``_row_reduce``). The sum then reads the row from its first step, the last
++  read: at a batch's rows, the steps still in L2.
++- ``S`` is the sum of ``exp(logit - max_val)`` over the columns that are not the
++  maximum, and of the maximum's ties all but one, ``exp(max_val - max_val)`` each
++  (``vllm_others``: 1, or NaN for an infinite maximum, as the paper's z - z_max).
++  ``exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with log2(e)
++  (``vllm_other_exp``); a column past the row adds 0. A thread adds the columns of
++  each of its two loads a step, in order, to that load's sum, step after step, and
++  folds the two in load order; the warp adds at XOR distances 16 to 1, and every
++  thread adds the 32 warps' sums in warp order. The ties are counted exactly in
++  FP32 the same way.
++- ``lse`` is CUDA's ``log1pf(S)`` (libdevice, within an ULP), the paper's
++  softplus(-m), and a token's log probability ``shifted - lse``, ``shifted`` its
++  ``logit - max_val``, exactly 0 at the maximum (``vllm_shifted``).
++
++A row's outputs depend on its own logits only, in a fixed order: the same bits in
++any batch and on every run. Every add, product and difference is the header's,
++rounded to nearest (nvcc would contract them otherwise).
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -46,18 +51,13 @@ import torch
+ 
+ from vllm.v1.worker.gpu.sample import tilelang_sampling
+ from vllm.v1.worker.gpu.sample.tilelang_sampling import (
+-    _THREADS,
+     _call,
+-    _element,
+     _kernel,
+     _runs,
+     _triton_run,
+     declare,
+ )
+-from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
+-    _HEADER,
+-    _block_reduce,
+-)
++from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import _HEADER
+ 
+ _PASS = {
+     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+@@ -153,135 +153,118 @@ def token_ranks(
+ 
+ # --- Log probabilities of the selected tokens -----------------------------------
+ 
+-# logprob._topk_log_softmax_kernel's BLOCK_SIZE and TOPK_BLOCK_SIZE, at Triton's
+-# default four warps (_THREADS).
+-SOFTMAX_BLOCK = 1024
+-_SOFTMAX_PER_THREAD = SOFTMAX_BLOCK // _THREADS
+-# Vocabulary blocks a thread loads before it reduces them: a chunk.
+-_SOFTMAX_UNROLL = 8
+-_SOFTMAX_CHUNK = SOFTMAX_BLOCK * _SOFTMAX_UNROLL
+-
+-
+-def _softmax_column(block, j: int, tx, run: int):
+-    """The column of thread ``tx``'s ``j``-th element of vocabulary block ``block``
+-    in Triton's layout (``_element``)."""
+-    return block * SOFTMAX_BLOCK + _element(j, tx, run)
++# A row's block of threads, and the vector loads a thread issues a step: 2048 runs
++# in flight a row, so one row (a decode step's single request) is not a few warps'
++# round trips to memory one after another. Two loads keep it within 64 registers,
++# which 1024 threads allow (dgx4, image -next-5: 1024 x 2 was level with the
++# release's kernel at 96 rows and 35% faster at 1 to 16; 512 x 4 and 256 x 4 were
++# slower at 96 FP32 rows, and 1024 x 4 spills).
++_SOFTMAX_THREADS = 1024
++_SOFTMAX_WARPS = _SOFTMAX_THREADS // 32
++_SOFTMAX_LOADS = 2
+ 
+ 
+ def _masked(value, column, vocab, guarded: bool, other):
+-    """``value``, or ``other`` where a guarded block's ``column`` is past the row."""
++    """``value``, or ``other`` where a guarded step's ``column`` is past the row."""
+     if guarded:
+         return T.if_then_else(column < vocab, value, other)
+     return value
+ 
+ 
++@T.macro
++def _row_reduce(value, partial, tx, combine):
++    """Every thread's ``value[0]`` becomes the block's: lanes at XOR distances 16 to
++    1, then each warp's in warp order, every thread combining them alike.
++    ``combine`` is the header's ``vllm_max`` or ``vllm_add``; ``partial`` holds one
++    value a warp and serves this reduction only."""
++    for distance in (16, 8, 4, 2, 1):
++        value[0] = T.call_extern(
++            "float32", combine, value[0], T.shfl_xor(value[0], distance)
++        )
++    if tx % 32 == 0:
++        partial[tx // 32] = value[0]
++    T.sync_threads()
++    value[0] = partial[0]
++    for w in tuple(range(1, _SOFTMAX_WARPS)):
++        value[0] = T.call_extern("float32", combine, value[0], partial[w])
++
++
+ @tilelang.jit(pass_configs=tilelang_sampling._PASS)
+ def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+-    """``_topk_log_softmax_kernel`` (BLOCK_SIZE and TOPK_BLOCK_SIZE 1024, four
+-    warps): one block of 128 threads a row, whose ``topk`` selected tokens' log
+-    probabilities it writes; with ``masked``, -inf where ``valid`` is false (the
+-    custom-ids path's ``masked_fill``, in the same store; unmasked, ``valid`` is
+-    not read). A thread holds its eight columns of each 1024-column
+-    block in runs of ``run`` (``_triton_run``); chunks of eight whole blocks load
+-    their runs as vectors (the launch checked the alignment), and the row's last
+-    chunk loads each column clamped to the row, the columns past it masked."""
++    """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
++    threads a row, whose ``topk`` selected tokens' log probabilities it writes;
++    with ``masked``, -inf where ``valid`` is false (the custom-ids path's
++    ``masked_fill``, in the same store; unmasked, ``valid`` is not read). The row is
++    read twice in steps of ``1024 * 2 * run`` columns: a thread loads two runs of
++    ``run`` columns (one vector each; the launch checked the alignment), runs
++    ``1024 * run`` apart, and the row's last step loads each column clamped to the
++    row, the columns past it masked."""
+     rows, vocab, topk = T.dynamic("rows, vocab, topk")
+     logits_stride = T.dynamic("logits_stride", "int64")
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+-    per = _SOFTMAX_PER_THREAD
+-    unroll = _SOFTMAX_UNROLL
++    threads = _SOFTMAX_THREADS
++    loads = _SOFTMAX_LOADS
++    per = loads * run
++    span = threads * per
++
++    def column(step, j, tx):
++        """The column of thread ``tx``'s ``j``-th element of step ``step``."""
++        return step * span + (j // run) * (threads * run) + tx * run + j % run
+ 
+     @T.macro
+-    def load_blocks(logits, raw, row, block0, tx, guarded):
+-        """The thread's columns of blocks ``block0`` to ``block0 + unroll - 1``,
+-        block ``u``'s at ``raw[u * per:]`` in register order."""
+-        for u in tuple(range(unroll)):
++    def load(logits, raw, row, step, tx, guarded):
++        """The thread's elements of step ``step``, load ``u``'s at ``raw[u * run:]``."""
++        for u in tuple(range(loads)):
++            col0 = column(step, u * run, tx)
+             if guarded:
+-                for j in tuple(range(per)):
+-                    raw[u * per + j] = logits[
+-                        row, T.min(_softmax_column(block0 + u, j, tx, run), vocab - 1)
+-                    ]
++                for k in tuple(range(run)):
++                    raw[u * run + k] = logits[row, T.min(col0 + k, vocab - 1)]
+             elif run == 1:
+-                for j in tuple(range(per)):
+-                    raw[u * per + j] = logits[
+-                        row, _softmax_column(block0 + u, j, tx, run)
+-                    ]
++                raw[u] = logits[row, col0]
+             else:
+-                for r in tuple(range(per // run)):
+-                    col0 = _softmax_column(block0 + u, r * run, tx, run)
+-                    for k in T.vectorized(run):
+-                        raw[u * per + r * run + k] = logits[row, col0 + k]
++                for k in T.vectorized(run):
++                    raw[u * run + k] = logits[row, col0 + k]
+ 
+     @T.macro
+-    def max_blocks(raw, peak, best, block0, tx, guarded):
+-        """Fold the loaded blocks into the thread's maximum ``best[0]``; a column
++    def fold_max(raw, peak, step, tx, guarded):
++        """Fold the step's elements into the thread's maxima, one a load; a column
+         past the row is -inf."""
+-        for u in tuple(range(unroll)):
+-            for j in tuple(range(per)):
+-                value = _masked(
+-                    T.cast(raw[u * per + j], T.float32),
+-                    _softmax_column(block0 + u, j, tx, run),
+-                    vocab,
+-                    guarded,
+-                    -T.infinity(T.float32),
+-                )
+-                if j == 0:
+-                    peak[u] = value
+-                else:
+-                    peak[u] = T.call_extern("float32", "vllm_max", peak[u], value)
+-        for u in tuple(range(unroll)):
+-            best[0] = T.call_extern("float32", "vllm_max", best[0], peak[u])
++        for j in tuple(range(per)):
++            value = _masked(
++                T.cast(raw[j], T.float32),
++                column(step, j, tx),
++                vocab,
++                guarded,
++                -T.infinity(T.float32),
++            )
++            peak[j // run] = T.call_extern("float32", "vllm_max", peak[j // run], value)
+ 
+     @T.macro
+-    def sum_blocks(raw, total, sums, se, maximum, block0, buf, blocks, tx, guarded):
+-        """Add the loaded blocks' sums of exponentials to ``se[0]`` in block order,
+-        each block's summed as Triton sums it (``_block_reduce`` with ``vllm_add``,
+-        the blocks' warp sums crossing in one barrier through ``sums[buf]``); a
+-        column past the row adds 0, a block past it nothing."""
+-        for u in tuple(range(unroll)):
+-            for j in tuple(range(per)):
+-                term = _masked(
+-                    T.call_extern(
+-                        "float32",
+-                        "vllm_exp_from",
+-                        T.cast(raw[u * per + j], T.float32),
+-                        maximum,
+-                    ),
+-                    _softmax_column(block0 + u, j, tx, run),
+-                    vocab,
+-                    guarded,
+-                    T.float32(0),
+-                )
+-                if j == 0:
+-                    total[u] = term
+-                else:
+-                    total[u] = T.call_extern("float32", "vllm_add", total[u], term)
+-        for distance in (16, 8, 4, 2, 1):
+-            for u in tuple(range(unroll)):
+-                total[u] = T.call_extern(
+-                    "float32", "vllm_add", total[u], T.shfl_xor(total[u], distance)
+-                )
+-        if tx % 32 == 0:
+-            for u in tuple(range(unroll)):
+-                sums[buf, u, tx // 32] = total[u]
+-        T.sync_threads()
+-        # Threads 0-3 add the warps' sums at XOR distances 2 and 1; every thread
+-        # takes thread 0's.
+-        for u in tuple(range(unroll)):
+-            block_sum = T.call_extern(
+-                "float32",
+-                "vllm_add",
+-                T.call_extern("float32", "vllm_add", sums[buf, u, 0], sums[buf, u, 2]),
+-                T.call_extern("float32", "vllm_add", sums[buf, u, 1], sums[buf, u, 3]),
++    def fold_sum(raw, total, tally, maximum, step, tx, guarded):
++        """Add the step's other columns' exponentials to the thread's sums, one a
++        load, each load's columns in order, and count the maximum's columns; a
++        column past the row adds 0."""
++        for j in tuple(range(per)):
++            value = T.cast(raw[j], T.float32)
++            col = column(step, j, tx)
++            term = _masked(
++                T.call_extern("float32", "vllm_other_exp", value, maximum),
++                col,
++                vocab,
++                guarded,
++                T.float32(0),
+             )
+-            if guarded:
+-                se[0] = T.if_then_else(
+-                    block0 + u < blocks,
+-                    T.call_extern("float32", "vllm_add", se[0], block_sum),
+-                    se[0],
+-                )
+-            else:
+-                se[0] = T.call_extern("float32", "vllm_add", se[0], block_sum)
++            tie = _masked(
++                T.call_extern("float32", "vllm_tie", value, maximum),
++                col,
++                vocab,
++                guarded,
++                T.float32(0),
++            )
++            total[j // run] = T.call_extern(
++                "float32", "vllm_add", total[j // run], term
++            )
++            tally[j // run] = T.call_extern("float32", "vllm_add", tally[j // run], tie)
+ 
+     @T.prim_func
+     def topk_log_softmax(
+@@ -290,83 +273,89 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+         token_ids: T.Tensor((rows, topk), T.int64),
+         valid: T.Tensor((valid_rows, valid_cols), T.bool),
+     ):
+-        with T.Kernel(rows, threads=_THREADS) as row:
++        with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+-            raw = T.alloc_local((unroll * per,), logits_dtype)
+-            peak = T.alloc_local((unroll,), T.float32)
+-            total = T.alloc_local((unroll,), T.float32)
++            raw = T.alloc_local((per,), logits_dtype)
++            peak = T.alloc_local((loads,), T.float32)
++            total = T.alloc_local((loads,), T.float32)
++            tally = T.alloc_local((loads,), T.float32)
+             best = T.alloc_local((1,), T.float32)
+             se = T.alloc_local((1,), T.float32)
+-            tokens = T.alloc_local((per,), T.int64)
+-            picked = T.alloc_local((per,), T.float32)
+-            partial = T.alloc_shared((_THREADS // 32,), T.float32)
+-            row_max = T.alloc_shared((1,), T.float32)
+-            # Two chunks' warp sums: a chunk writes one while the last is read.
+-            sums = T.alloc_shared((2, unroll, _THREADS // 32), T.float32)
++            ties = T.alloc_local((1,), T.float32)
++            max_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.float32)
++            sum_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.float32)
++            tie_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.float32)
+             if run > 1:
+                 # The launch checked it: a 16-byte base and a stride of 16 elements.
+                 T.assume(logits_stride % 16 == 0)
+ 
+-            blocks = T.ceildiv(vocab, SOFTMAX_BLOCK)
+-            # Whole chunks; the rest of the row (up to eight blocks, the last of
+-            # them partial) is the guarded chunk.
+-            full = vocab // _SOFTMAX_CHUNK
+-
+-            # max_val, the row read last block first: the sum then starts on the
+-            # blocks most recently read.
+-            best[0] = -T.infinity(T.float32)
+-            if full * unroll < blocks:
+-                load_blocks(logits, raw, row, full * unroll, tx, True)
+-                max_blocks(raw, peak, best, full * unroll, tx, True)
++            # Whole steps; the rest of the row is the guarded step.
++            full = vocab // span
++            guarded = full * span < vocab
++
++            # max_val, the row read last step first (NaN gives way, so any order
++            # gives it): the sum then starts on the steps most recently read, still
++            # in L2 at a batch's rows.
++            for u in tuple(range(loads)):
++                peak[u] = -T.infinity(T.float32)
++            if guarded:
++                load(logits, raw, row, full, tx, True)
++                fold_max(raw, peak, full, tx, True)
++            for step in T.serial(full):
++                load(logits, raw, row, full - 1 - step, tx, False)
++                fold_max(raw, peak, full - 1 - step, tx, False)
++            best[0] = peak[0]
++            for u in tuple(range(1, loads)):
++                best[0] = T.call_extern("float32", "vllm_max", best[0], peak[u])
++            _row_reduce(best, max_partial, tx, "vllm_max")
++            maximum = T.alloc_var(T.float32, init=best[0])
++
++            # S: the other columns' exponentials, a thread's sums in step order,
++            # folded in load order, then the block's; and the maximum's ties.
++            for u in tuple(range(loads)):
++                total[u] = T.float32(0)
++                tally[u] = T.float32(0)
+             for step in T.serial(full):
+-                load_blocks(logits, raw, row, (full - 1 - step) * unroll, tx, False)
+-                max_blocks(raw, peak, best, (full - 1 - step) * unroll, tx, False)
+-            _block_reduce(best, partial, tx, "vllm_max")
+-            if tx == 0:
+-                row_max[0] = best[0]
+-            T.sync_threads()
+-            maximum = T.alloc_var(T.float32, init=row_max[0])
+-
+-            # se, in block order.
+-            se[0] = T.float32(0)
+-            for chunk in T.serial(full):
+-                load_blocks(logits, raw, row, chunk * unroll, tx, False)
+-                sum_blocks(raw, total, sums, se, maximum, chunk * unroll, chunk % 2,
+-                           blocks, tx, False)  # fmt: skip
+-            if full * unroll < blocks:
+-                load_blocks(logits, raw, row, full * unroll, tx, True)
+-                sum_blocks(raw, total, sums, se, maximum, full * unroll, full % 2,
+-                           blocks, tx, True)  # fmt: skip
++                load(logits, raw, row, step, tx, False)
++                fold_sum(raw, total, tally, maximum, step, tx, False)
++            if guarded:
++                load(logits, raw, row, full, tx, True)
++                fold_sum(raw, total, tally, maximum, full, tx, True)
++            se[0] = total[0]
++            ties[0] = tally[0]
++            for u in tuple(range(1, loads)):
++                se[0] = T.call_extern("float32", "vllm_add", se[0], total[u])
++                ties[0] = T.call_extern("float32", "vllm_add", ties[0], tally[u])
++            _row_reduce(se, sum_partial, tx, "vllm_add")
++            _row_reduce(ties, tie_partial, tx, "vllm_add")
++            # The log-sum-exp past the maximum, log1p(S).
+             lse = T.alloc_var(
+-                T.float32, init=T.call_extern("float32", "vllm_control_log", se[0])
++                T.float32,
++                init=T.call_extern(
++                    "float32",
++                    "vllm_softplus",
++                    T.call_extern("float32", "vllm_others", se[0], ties[0], maximum),
++                ),
+             )
+ 
+-            # The selected tokens, 1024 at a time: the ids (clamped to the last),
+-            # then their logits, then the stores of the requested ones. Row offsets
+-            # are 64-bit, as Triton's req_idx * topk.
++            # The selected tokens, 1024 at a time. Row offsets are 64-bit.
+             row64 = T.cast(row, T.int64)
+-            for c in T.serial(T.ceildiv(topk, SOFTMAX_BLOCK)):
+-                for u in tuple(range(per)):
+-                    tokens[u] = token_ids[
+-                        row64, T.min(c * SOFTMAX_BLOCK + u * _THREADS + tx, topk - 1)
+-                    ]
+-                for u in tuple(range(per)):
+-                    picked[u] = T.cast(logits[row, tokens[u]], T.float32)
+-                for u in tuple(range(per)):
+-                    if c * SOFTMAX_BLOCK + u * _THREADS + tx < topk:
+-                        col = c * SOFTMAX_BLOCK + u * _THREADS + tx
+-                        value = T.call_extern(
+-                            "float32",
+-                            "vllm_sub",
+-                            T.call_extern("float32", "vllm_sub", picked[u], maximum),
+-                            lse,
++            for c in T.serial(T.ceildiv(topk, threads)):
++                col = c * threads + tx
++                if col < topk:
++                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
++                    value = T.call_extern(
++                        "float32",
++                        "vllm_sub",
++                        T.call_extern("float32", "vllm_shifted", picked, maximum),
++                        lse,
++                    )
++                    if masked:
++                        value = T.if_then_else(
++                            valid[row64, col], value, -T.infinity(T.float32)
+                         )
+-                        if masked:
+-                            value = T.if_then_else(
+-                                valid[row64, col], value, -T.infinity(T.float32)
+-                            )
+-                        output[row64, col] = value
++                    output[row64, col] = value
+ 
+     return topk_log_softmax
+ 
+@@ -402,8 +391,8 @@ def topk_log_softmax(
+     output: torch.Tensor,  # [rows, topk], FP32, contiguous
+     valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
+ ) -> None:
+-    """``_topk_log_softmax_kernel``'s launch: each row's log-softmax at its
+-    ``token_ids``, into ``output``."""
++    """Each row's log-softmax (Eq. 5) at its ``token_ids``, into ``output``: the
++    launch ``_topk_log_softmax_kernel`` took."""
+     if logits.shape[0] == 0 or token_ids.shape[1] == 0:
+         return
+     kernel = _kernel(
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index bdeb06918..7314f3e45 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1350,8 +1350,9 @@ def rejection_sample(
+         and not use_fp64
+     ):
+         # One-hot drafts, block verification and FP32 draws, without watermark,
+-        # run as TileLang kernels (tilelang_rejection), the contract of the Triton
+-        # kernels below, which serve every other configuration.
++        # run as TileLang kernels (tilelang_rejection): the Triton kernels below
++        # with the softmax fixed in their probabilities. Those serve every other
++        # configuration.
+         sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
+             verify_and_resample(
+                 target_logits,
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+index 040686025..dae6e56fd 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -2,10 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TileLang kernels of the V2 runner's rejection sampler, for production's
+ verification: one-hot (greedy) drafts, block verification, FP32 draws and no
+-watermark. Each kernel is the contract of the Triton kernels it replaces in
+-``rejection_sampler_utils``, bit for bit, NaN and infinite logits included, and
++watermark. Each kernel replaces Triton kernels of ``rejection_sampler_utils`` and
+ writes the elements they write and no others (the Triton kernels stay importable
+-as the tests' reference and serve every other configuration):
++as the tests' baseline and serve every other configuration):
+ 
+ - ``local_stats``: ``_compute_local_logits_stats_kernel`` without draft logits
+ - ``verify``: ``_compute_cumulative_log_p_kernel`` without draft logits and
+@@ -15,24 +14,43 @@ as the tests' reference and serve every other configuration):
+ ``rejection_sample`` inserts the resampled token, as for every configuration
+ (``tilelang_resampled``).
+ 
+-The arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX and SASS:
+-``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with log2(e),
+-``tl.log`` libdevice's ``__nv_logf`` as Triton bundles it (``vllm_control_log``),
+-``/`` is ``div.full.f32``, and every add, product and FMA rounds to nearest as the
+-header writes it (nvcc would contract them otherwise). The random stream, the Gumbel
+-noise and the argmax order are ``tilelang_sampling``'s.
++The argmaxes, maxima, uniform draws, greedy verification and resampling are the
++Triton kernels' bit for bit, NaN and infinite logits included. The probabilities
++follow Barron, Gnanapragasam and Tschannen's fix ("A Fix for Softmax and
++Cross-Entropy", Eq. 5), which Triton's arithmetic lacks. With M a row's maximum and
++S the sum of exp(z - M) over its other columns, the log-softmax is the shifted
++logit z - M (exactly 0 at the maximum) minus log1p(S). Triton sums every column, the
++maximum's exp(0) = 1 among them, and subtracts M + log(sum) from the logit: the sum
++rounds to 1 once S is below half an FP32 ULP of 1 (a margin past 16.6 nats), every
++block added after the maximum's loses what it holds below that half ULP, and
++M + log(sum) rounds at the magnitude of M (an ULP of 32 is 3.8e-6), so a confident
++draft's log probability came out 0 or a few ULPs of M off. Block verification's
++threshold then took 1 - m and 1 - p of probabilities near 1, which cancel. Here:
++
++- ``local_stats``: a sampled row's block sum leaves out one column holding the
++  block's maximum (its other ties add exp(0) each, ``vllm_others``).
++- ``verify``: a step's S is the block sums rescaled to the row's maximum, each with
++  its left-out column back (1 + sum), except the first block that holds the row's
++  maximum; the draft's log probability is its shifted logit minus log1p(S), the
++  rejected row's log-sum-exp M + log1p(S); the threshold p (1 - m) / (1 - p m)
++  takes both complements from ``expm1`` of the logs (``vllm_block_threshold``).
++
++The rest of the arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX
++and SASS: ``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with
++log2(e), and every add, product and FMA rounds to nearest as the header writes it
++(nvcc would contract them otherwise). ``log1p`` and ``expm1`` are CUDA's (libdevice,
++within an ULP; these kernels compile without fast math). The random stream, the
++Gumbel noise and the argmax order are ``tilelang_sampling``'s.
+ 
+ A vocabulary block's statistics (8192 columns, four warps) follow Triton's layout
+ (``_triton_run``): a thread holds 64 elements, sums their exponentials in register
+-order, then the warp sums at XOR distances 16 to 1 and threads 0-3 at 2 and 1. The
+-maxima ignore NaN, so any order gives them; the argmax is the Gumbel sampler's.
++order, then the warp sums at XOR distances 16 to 1 and threads 0-3 at 2 and 1; its
++count of the maximum's ties (exact in FP32) reduces the same way. The maxima ignore
++NaN, so any order gives them; the argmax is the Gumbel sampler's.
+ 
+-A row's log-sum-exp over its blocks (``_compute_global_logsumexp``) runs on one warp
+-in Triton, the blocks padded to a power of two, block ``k`` at lanes ``k`` and
+-``k + padded`` (and so on), reduced at XOR distances ``padded / 2`` to 1. LLVM fuses
+-the first level's product into an FMA: lane 0 adds its own product unrounded to its
+-partner's rounded one, so lanes reach different sums, and lane 0, which stores, is
+-the contract. Here ``padded`` lanes take a row, the first of them as Triton's lane 0.
++A row's S over its blocks runs on ``padded`` lanes, Triton's padded block count (a
++power of two, at most one warp): lane ``k`` takes block ``k``, its term rounded,
++reduced at XOR distances ``padded / 2`` to 1 (every lane reaches the same sum).
+ 
+ Every comparison NaN decides is made in the header: TVM's simplifier rewrites
+ ``a <= b`` as ``!(b < a)``, which a NaN flips.
+@@ -45,7 +63,7 @@ from collections.abc import Sequence
+ import torch
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample import tilelang_controls, tilelang_sampling
++from vllm.v1.worker.gpu.sample import tilelang_sampling
+ from vllm.v1.worker.gpu.sample.tilelang_sampling import (
+     _DTYPES,
+     _PASS,
+@@ -78,8 +96,6 @@ _MAX_LANES = 32
+ _HEADER = (
+     # Philox, the Gumbel noise and the argmax combine.
+     tilelang_sampling._HEADER
+-    # vllm_control_log: tl.log, Triton's bundled libdevice __nv_logf.
+-    + tilelang_controls._HEADER
+     + r"""
+ // tl.exp of an FP32 value: the product with log2(e), then ex2.approx.f32 without
+ // flush-to-zero (ptxas keeps subnormal results).
+@@ -112,11 +128,6 @@ __device__ __forceinline__ float vllm_mul(float a, float b) {
+   asm("mul.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+   return c;
+ }
+-__device__ __forceinline__ float vllm_fma(float a, float b, float c) {
+-  float d;
+-  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+-  return d;
+-}
+ // max.f32: a NaN gives way to the other operand.
+ __device__ __forceinline__ float vllm_max(float a, float b) {
+   float c;
+@@ -129,11 +140,89 @@ __device__ __forceinline__ float vllm_exp_from(float x, float m) {
+   return vllm_exp(vllm_sub(x, m));
+ }
+ 
+-// A row's log-sum-exp from its maximum and its rescaled sum: m + log(s).
+-__device__ __forceinline__ float vllm_lse(float m, float s) {
+-  return vllm_add(m, vllm_control_log(s));
++// expm1 within an ULP: CUDA's (libdevice), compiled without fast math.
++__device__ __forceinline__ float vllm_expm1(float x) { return expm1f(x); }
++
++// Barron, Gnanapragasam and Tschannen's log-softmax ("A Fix for Softmax and
++// Cross-Entropy", Eq. 5), from a row's maximum m. These compute every value and
++// select, in PTX: a C conditional lets nvcc predicate the exponential instead,
++// which costs a column several instructions.
++//
++// A logit's shift x - m, exactly 0 where x is the maximum (an infinite one
++// included).
++__device__ __forceinline__ float vllm_shifted(float x, float m) {
++  float y;
++  asm("{\n"
++      ".reg .pred tie;\n"
++      ".reg .b32 d;\n"
++      "sub.rn.f32 d, %1, %2;\n"
++      "setp.eq.f32 tie, %1, %2;\n"
++      "selp.f32 %0, 0f00000000, d, tie;\n"
++      "}"
++      : "=f"(y)
++      : "f"(x), "f"(m));
++  return y;
++}
++
++// tl.exp(x - m) of a column that is not the maximum (NaN is not), 0 for one that is.
++__device__ __forceinline__ float vllm_other_exp(float x, float m) {
++  float y;
++  asm("{\n"
++      ".reg .pred tie;\n"
++      ".reg .b32 t, e;\n"
++      "sub.rn.f32 t, %1, %2;\n"
++      "mul.rn.f32 t, t, 0f3FB8AA3B;\n"
++      "ex2.approx.f32 e, t;\n"
++      "setp.eq.f32 tie, %1, %2;\n"
++      "selp.f32 %0, 0f00000000, e, tie;\n"
++      "}"
++      : "=f"(y)
++      : "f"(x), "f"(m));
++  return y;
++}
++
++// 1 for a column holding the maximum, else 0: its ties, counted exactly in FP32.
++__device__ __forceinline__ float vllm_tie(float x, float m) {
++  float y;
++  asm("set.eq.f32.f32 %0, %1, %2;" : "=f"(y) : "f"(x), "f"(m));
++  return y;
+ }
+ 
++// int: x is the maximum m.
++__device__ __forceinline__ int vllm_is_max(float x, float m) {
++  int y;
++  asm("{\n"
++      ".reg .pred tie;\n"
++      "setp.eq.f32 tie, %1, %2;\n"
++      "selp.s32 %0, 1, 0, tie;\n"
++      "}"
++      : "=r"(y)
++      : "f"(x), "f"(m));
++  return y;
++}
++
++// S, the others' sum: the columns that are not the maximum (sum), and of the
++// maximum's ``ties`` all but one, exp(m - m) each (1; NaN for an infinite maximum,
++// as the paper's z - z_max).
++__device__ __forceinline__ float vllm_others(float sum, float ties, float m) {
++  return ties > 1.0f
++             ? vllm_add(sum, vllm_mul(vllm_sub(ties, 1.0f), vllm_exp_from(m, m)))
++             : sum;
++}
++
++// A row's S from its block sums: NaN where its two or more columns are all -inf
++// (the paper's z - z_max is -inf - -inf there, as in ``vllm_others``), which the
++// block sums cannot tell, since a block whose maximum is -inf sums to 0.
++__device__ __forceinline__ float vllm_row_others(float others, float m, int columns) {
++  return (m == __uint_as_float(0xff800000u) && columns > 1)
++             ? __uint_as_float(0x7fffffffu)
++             : others;
++}
++
++// The log-sum-exp past the maximum, softplus(-margin) = log1p(S): CUDA's log1pf
++// (libdevice, within an ULP).
++__device__ __forceinline__ float vllm_softplus(float others) { return log1pf(others); }
++
+ // A sampled row's block sum of exponentials, kept while the block's maximum is
+ // above -inf (a NaN maximum is not), else 0.
+ __device__ __forceinline__ float vllm_live_sum(float m, float s) {
+@@ -180,25 +269,17 @@ __device__ __forceinline__ float vllm_uniform(unsigned int word) {
+ }
+ 
+ // Block verification's acceptance threshold for a one-hot draft followed by a valid
+-// one, from the prefix's joint ratio p and the next draft's target probability m:
+-// the residual mass p * (1 - m) over residual + 1 - p, which Triton contracts to
+-// fma(p, 1 - m, 1) - p; div.full.f32, and 1 where that is not positive.
+-__device__ __forceinline__ float vllm_block_threshold(float p, float m) {
+-  float h;
+-  asm("{\n"
+-      ".reg .pred positive;\n"
+-      ".reg .b32 rest, residual, denom, ratio;\n"
+-      "sub.rn.f32 rest, 0f3F800000, %2;\n"
+-      "mul.rn.f32 residual, %1, rest;\n"
+-      "fma.rn.f32 denom, %1, rest, 0f3F800000;\n"
+-      "sub.rn.f32 denom, denom, %1;\n"
+-      "setp.gt.f32 positive, denom, 0f00000000;\n"
+-      "div.full.f32 ratio, residual, denom;\n"
+-      "selp.f32 %0, ratio, 0f3F800000, positive;\n"
+-      "}"
+-      : "=f"(h)
+-      : "f"(p), "f"(m));
+-  return h;
++// one, from the logs of the prefix's joint ratio p and of the next draft's target
++// probability m: the residual mass p (1 - m) over residual + 1 - p, which is
++// 1 - p m. Both complements are -expm1 of a log, never 1 - x of a probability near
++// 1, where it cancels (1 - m was 0 once m rounded to 1); the quotient is IEEE's,
++// and the threshold 1 where the denominator is not positive (p = m = 1, or NaN).
++__device__ __forceinline__ float vllm_block_threshold(float log_p, float log_m) {
++  const float residual = vllm_mul(vllm_exp(log_p), -vllm_expm1(log_m));
++  const float denom = -vllm_expm1(vllm_add(log_p, log_m));
++  float ratio;
++  asm("div.rn.f32 %0, %1, %2;" : "=f"(ratio) : "f"(residual), "f"(denom));
++  return denom > 0.0f ? ratio : 1.0f;
+ }
+ 
+ // u <= h, ordered: a NaN threshold accepts nothing.
+@@ -243,10 +324,11 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run:
+     threads per ``(logits row, vocabulary block of 8192)``; rows at a bonus position
+     (``expanded_local_pos >= num_speculative_steps``) are left alone. A greedy row
+     stores its block's argmax (global, int64) and maximum, a sampled row its block's
+-    maximum and the sum of ``exp(logit - maximum)`` (0 unless the maximum is above
+-    -inf). A thread's 64 elements come in runs of ``run`` (``_triton_run``), all
+-    loaded with the request's state index: Triton loads them once the temperature is
+-    known, a round trip later."""
++    maximum and the sum of ``exp(logit - maximum)`` over its columns but one holding
++    the maximum (``vllm_others``; 0 unless the maximum is above -inf). A thread's 64
++    elements come in runs of ``run`` (``_triton_run``), all loaded with the request's
++    state index: Triton loads them once the temperature is known, a round trip
++    later."""
+     rows, vocab, blocks = T.dynamic("rows, vocab, blocks")
+     # Inputs may be longer than the batch: each has its own length.
+     idx_len, step_len, temp_len = T.dynamic("idx_len, step_len, temp_len")
+@@ -275,9 +357,11 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run:
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
+             total = T.alloc_local((1,), T.float32)
++            ties = T.alloc_local((1,), T.float32)
+             partial = T.alloc_shared((_WARPS,), T.float32)
+             partial_index = T.alloc_shared((_WARPS,), T.int32)
+             partial_sum = T.alloc_shared((_WARPS,), T.float32)
++            partial_ties = T.alloc_shared((_WARPS,), T.float32)
+             maximum = T.alloc_shared((1,), T.float32)
+             if run > 1:
+                 # The launch checked it: a 16-byte base and a stride of 16 elements.
+@@ -325,24 +409,38 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run:
+                         maximum[0] = best[0]
+                     T.sync_threads()
+                     best[0] = maximum[0]
+-                    # The exponentials in register order, the first two added first.
++                    # The other columns' exponentials in register order, the first
++                    # two added first; the maximum's columns counted.
+                     total[0] = T.call_extern(
+-                        "float32", "vllm_exp_from", values[0], best[0]
++                        "float32", "vllm_other_exp", values[0], best[0]
+                     )
++                    ties[0] = T.call_extern("float32", "vllm_tie", values[0], best[0])
+                     for j in T.unroll(1, _STATS_PER_THREAD):
+                         total[0] = T.call_extern(
+                             "float32",
+                             "vllm_add",
+                             total[0],
+                             T.call_extern(
+-                                "float32", "vllm_exp_from", values[j], best[0]
++                                "float32", "vllm_other_exp", values[j], best[0]
+                             ),
+                         )
++                        ties[0] = T.call_extern(
++                            "float32",
++                            "vllm_add",
++                            ties[0],
++                            T.call_extern("float32", "vllm_tie", values[j], best[0]),
++                        )
+                     _block_reduce(total, partial_sum, tx, "vllm_add")
++                    _block_reduce(ties, partial_ties, tx, "vllm_add")
+                     if tx == 0:
+                         local_max[t, blk] = best[0]
+                         local_sumexp[t, blk] = T.call_extern(
+-                            "float32", "vllm_live_sum", best[0], total[0]
++                            "float32",
++                            "vllm_live_sum",
++                            best[0],
++                            T.call_extern(
++                                "float32", "vllm_others", total[0], ties[0], best[0]
++                            ),
+                         )
+ 
+     return local_stats
+@@ -410,8 +508,9 @@ def verify_kernel(
+     + 1). Each draft step takes ``lanes`` threads, one a vocabulary block: they load
+     its statistics, its draft and the draft's target logit at once, every load at an
+     index that exists whatever the masks say, the masks as selects, and reduce them
+-    to the step's log-sum-exp and the draft's log probability (as Triton's lane 0),
+-    the greedy step's target argmax, and the step's uniform draw. Thread 0 then runs
++    to the step's log-sum-exp and the draft's log probability (the paper's Eq. 5),
++    the greedy step's target argmax, and the step's uniform draw; each step's first
++    thread then folds its cumulative log ratio and threshold. Thread 0 then runs
+     both kernels' loops over the drafts from shared memory, where Triton's take two
+     or three dependent round trips to memory a step. The step's cumulative log ratio
+     is stored as the cumulative kernel stores it, for sampled requests only; the
+@@ -461,6 +560,7 @@ def verify_kernel(
+             step = tx // lanes
+             block = tx % lanes
+             row_max = T.alloc_local((1,), T.float32)
++            first = T.alloc_local((1,), T.int32)
+             total = T.alloc_local((1,), T.float32)
+             best = T.alloc_local((1,), T.float32)
+             best_index = T.alloc_local((1,), T.int32)
+@@ -471,6 +571,8 @@ def verify_kernel(
+             uniform_s = T.alloc_shared((groups,), T.float32)
+             draft_s = T.alloc_shared((groups,), T.int64)
+             target_s = T.alloc_shared((groups,), T.int64)
++            cumulative_s = T.alloc_shared((groups,), T.float32)
++            threshold_s = T.alloc_shared((groups,), T.float32)
+ 
+             start = T.alloc_var(T.int32, init=cu_num_logits[req])
+             end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
+@@ -502,36 +604,44 @@ def verify_kernel(
+                 init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
+             )
+ 
+-            # _compute_global_logsumexp: the blocks' maximum, then their sums
+-            # rescaled to it, the first level's product fused into its add.
++            # The step's S: the blocks' maximum, the first block holding it (a NaN
++            # maximum holds none), then the block sums rescaled to it, each with its
++            # left-out column back (1 + sum) except the first block's.
+             row_max[0] = maximum
+             for distance in _distances(lanes):
+                 row_max[0] = T.call_extern(
+                     "float32", "vllm_max", row_max[0], T.shfl_xor(row_max[0], distance)
+                 )
+-            scale = T.alloc_var(
+-                T.float32,
+-                init=T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
++            first[0] = T.if_then_else(
++                T.call_extern("int32", "vllm_is_max", maximum, row_max[0]) != 0,
++                block,
++                lanes,
+             )
+-            if lanes == 1:
+-                total[0] = T.call_extern("float32", "vllm_mul", scale, sumexp)
+-            else:
+-                total[0] = T.call_extern(
++            for distance in _distances(lanes):
++                first[0] = T.min(first[0], T.shfl_xor(first[0], distance))
++            total[0] = T.if_then_else(
++                block == first[0],
++                sumexp,
++                T.call_extern(
+                     "float32",
+-                    "vllm_fma",
+-                    scale,
+-                    sumexp,
+-                    T.shfl_xor(
+-                        T.call_extern("float32", "vllm_mul", scale, sumexp), lanes // 2
+-                    ),
++                    "vllm_mul",
++                    T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
++                    T.call_extern("float32", "vllm_add", T.float32(1), sumexp),
++                ),
++            )
++            for distance in _distances(lanes):
++                total[0] = T.call_extern(
++                    "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
+                 )
+-                for distance in _distances(lanes)[1:]:
+-                    total[0] = T.call_extern(
+-                        "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
+-                    )
+-            lse = T.alloc_var(
++            softplus = T.alloc_var(
+                 T.float32,
+-                init=T.call_extern("float32", "vllm_lse", row_max[0], total[0]),
++                init=T.call_extern(
++                    "float32",
++                    "vllm_softplus",
++                    T.call_extern(
++                        "float32", "vllm_row_others", total[0], row_max[0], vocab
++                    ),
++                ),
+             )
+ 
+             # _compute_global_target_argmax: NaN maxima count as -inf, and the lower
+@@ -550,18 +660,51 @@ def verify_kernel(
+                 False,
+             )
+             if block == 0:
+-                lse_s[step] = lse
+-                log_prob_s[step] = T.call_extern("float32", "vllm_sub", logit, lse)
++                lse_s[step] = T.call_extern("float32", "vllm_add", row_max[0], softplus)
++                log_prob_s[step] = T.call_extern(
++                    "float32",
++                    "vllm_sub",
++                    T.call_extern("float32", "vllm_shifted", logit, row_max[0]),
++                    softplus,
++                )
+                 uniform_s[step] = T.call_extern("float32", "vllm_uniform", word)
+                 draft_s[step] = draft
+                 target_s[step] = target
+             T.sync_threads()
+ 
++            # Each step's cumulative log ratio and block verification's threshold at
++            # once: the step's first thread folds the steps through it in order,
++            # with a -1 placeholder leaving the ratio as it was, so the bits are a
++            # serial loop's. The threshold is the prefix's joint ratio, or that of
++            # the residual mass when a valid draft follows (from the logs of the
++            # ratio and of the next step's draft probability).
++            if block == 0:  # noqa: SIM102
++                if step < steps:
++                    log_p = T.alloc_var(T.float32, init=T.float32(0))
++                    for k in tuple(range(steps)):
++                        if k <= step:
++                            log_p = T.if_then_else(
++                                draft_s[k] >= 0,
++                                T.call_extern(
++                                    "float32", "vllm_log_ratio", log_p, log_prob_s[k]
++                                ),
++                                log_p,
++                            )
++                    cumulative_s[step] = log_p
++                    after = T.alloc_var(T.int32, init=T.min(step + 1, steps - 1))
++                    threshold_s[step] = T.if_then_else(
++                        (step + 1 < steps) & (draft_s[after] >= 0),
++                        T.call_extern(
++                            "float32", "vllm_block_threshold", log_p, log_prob_s[after]
++                        ),
++                        T.call_extern("float32", "vllm_exp", log_p),
++                    )
++            T.sync_threads()
++
+             if tx == 0:
+                 greedy = T.alloc_var(
+                     T.int32, init=T.cast(temp == T.float32(0), T.int32)
+                 )
+-                log_p = T.alloc_var(T.float32, init=T.float32(0))
+                 accepted = T.alloc_var(T.int64, init=T.int64(0))
+                 verifying = T.alloc_var(T.int32, init=1)
+                 for i in tuple(range(steps)):
+@@ -570,16 +713,9 @@ def verify_kernel(
+                         valid = T.cast(drafted >= 0, T.int32)
+                         token = T.max(drafted, T.int64(0))
+                         if greedy == 0:
+-                            # The cumulative ratio, which a -1 placeholder leaves
+-                            # as it was; a placeholder ends verification.
+-                            log_p = T.if_then_else(
+-                                valid != 0,
+-                                T.call_extern(
+-                                    "float32", "vllm_log_ratio", log_p, log_prob_s[i]
+-                                ),
+-                                log_p,
+-                            )
+-                            cumulative[start + i] = log_p
++                            # The cumulative ratio; a placeholder ends
++                            # verification.
++                            cumulative[start + i] = cumulative_s[i]
+                             verifying = verifying & valid
+                         if verifying != 0:
+                             if greedy != 0:
+@@ -595,30 +731,14 @@ def verify_kernel(
+                                 accepted = accepted + T.cast(hit, T.int64)
+                                 verifying = hit
+                             else:
+-                                # Block verification: the prefix's joint ratio,
+-                                # or the threshold of the residual mass when a
+-                                # valid draft follows (its log probability is the
+-                                # next step's).
+-                                threshold = T.alloc_var(
+-                                    T.float32,
+-                                    init=T.call_extern("float32", "vllm_exp", log_p),
+-                                )
+-                                if i + 1 < steps:  # noqa: SIM102
+-                                    if draft_s[i + 1] >= 0:
+-                                        threshold = T.call_extern(
+-                                            "float32",
+-                                            "vllm_block_threshold",
+-                                            threshold,
+-                                            T.call_extern(
+-                                                "float32", "vllm_exp", log_prob_s[i + 1]
+-                                            ),
+-                                        )
++                                # Block verification: the last step whose draw is
++                                # at most its threshold ends the accepted block.
+                                 accepted = T.if_then_else(
+                                     T.call_extern(
+                                         "int32",
+                                         "vllm_at_most",
+                                         uniform_s[i],
+-                                        threshold,
++                                        threshold_s[i],
+                                     )
+                                     != 0,
+                                     T.int64(i + 1),

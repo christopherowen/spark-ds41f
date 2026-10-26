@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:43:02 +0100
+Subject: [PATCH 531/531] [DS4.1] Insert-port test: block verification passes
+ the insertion no dead-row cut
+
+The test's stand-in for insert_resampled took the cut as a required argument;
+the TileLang path no longer passes one (its blocks end at the cut).
+---
+ tests/v1/spec_decode/test_rejection_sampler_utils.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index 8e6b86bc8..ca31d4373 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -1311,8 +1311,8 @@ def test_ds41f_verification_emits_same_tokens_with_insert_port(
+     from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
+     from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+ 
+-    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
+-        # rejection_sample passes its dead-row cut, None without one.
++    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut=None):
++        # Block verification ends its blocks at a dead-row cut and passes none.
+         assert dead_row_cut is None
+         utils._insert_resampled_kernel[(counts.numel(),)](
+             sampled,

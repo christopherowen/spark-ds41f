@@ -1,0 +1,1116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:18:33 +0100
+Subject: [PATCH 511/511] [DS4.1] SP prefill MoE: the combine writes the
+ exchange slots and the exchange runs under it
+
+Each sequence-parallel layer's MoE combine (the shared expert folded in) wrote
+its whole output, then the runner's reduce-scatter hook copied every rank's
+block into the exchange's send and parts slots: 157 MB a layer at a
+15,395-token prompt, 80 copies of 39.4 MB at 345 us each, 1.29% of the
+prefill step (request inventory 5, TP4 ring, rank 0). The exchange then ran
+with nothing beside it: 7.74% of the step.
+
+When the model's hook is installed, the runner asks the TileLang experts to
+defer their folded combine: apply launches the dispatch, the cast, both
+GEMMs and the SwiGLU, and keeps the combine as combine(start, stop, out).
+The hook's writer is that combine, so each block goes straight into its slot,
+one launch a block and slice; a token's sum reads only its own routes, so
+every row keeps its bits. The pad rows are still TileLang's zeros. The copy
+writer is gone: the hook requires the deferred combine.
+
+Block by block, _project_exchange writes the other ranks' blocks of a slice,
+starts that slice's exchange on the side stream, then writes this rank's own
+block under it. The MoE output is exchanged in moe_slices(T) slices, one a
+4,096 tokens (three at the 15K prompt and at the TP4 recipe's 16,288-token
+long-prefill chunk, four at a full 16,384-row step), so the combine after the
+first slice's other blocks runs beside the exchange. WO's two
+slices take the same order: each exchange starts a block earlier. The same
+rows land in the same slots and the exchange only moves them, so the parts
+are bit for bit the old ones.
+
+Ceilings (the fusion survey, same traces): the copies 1.31% of the prefill,
+the exchange under the combine and the copies 6.32%.
+
+Tests: the deferred combine, piece by piece into separate buffers, equals the
+one combine for the BF16, FP32 and folded kernels, a callable shared addend
+called once by run; the hook with the real combine sends each other rank's
+block and keeps this rank's with the copies' bits, pad rows from TileLang's
+fill, at one to twelve slices; each slice is exchanged after the other ranks'
+blocks of it and before this rank's own (the generic writer too); the runner
+defers only a folded combine bound for the hook, hands it over and resets the
+experts' state; the experts defer only a folded combine.
+benchmark_deepseek_v41_moe_exchange.py times the combine into the slots
+against the combine and copies (the exchange stubbed), gated, at TP4 and TP3.
+---
+ .../benchmark_deepseek_v41_moe_exchange.py    | 205 ++++++++++++++++++
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  54 +++++
+ ..._deepseek_v41_sp_project_reduce_scatter.py | 191 ++++++++++++++--
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 176 +++++++++++++++
+ .../layers/fused_moe/runner/moe_runner.py     |  37 +++-
+ .../layers/fused_moe/tilelang.py              |  14 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  81 ++++---
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  37 +++-
+ 8 files changed, 724 insertions(+), 71 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_moe_exchange.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_moe_exchange.py b/benchmarks/kernels/benchmark_deepseek_v41_moe_exchange.py
+new file mode 100644
+index 000000000..229c62f06
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_moe_exchange.py
+@@ -0,0 +1,205 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired timing of a sequence-parallel prefill layer's MoE output on its way into
++the exchange buffers: the experts' deferred combine writing each rank's block
++straight into its send or parts slot (``sp_prefill._project_exchange``, in
++``moe_slices`` slices, the other ranks' blocks first), against vLLM 26382f5cf's
++path, one combine into the whole output and a device copy of each rank's block
++into its slot (``theirs`` below).
++
++Request inventory 5's 15,395-token prompt paid 80 of those copies at TP4, 39.4 MB
++and 345 us each: 1.29% of its prefill step. The exchange needs every rank and is
++stubbed here; how much of it the combine now hides is measured on the cluster, by
++the spark-ds41f experiment's profile arms. This measures what one rank's GPU does
++around the exchanges: a combine launch per block and slice against the one combine
++and the copies.
++
++Shapes: the TP4 recipe's 16,384-token chunk, inventory 5's prompt and an 8,192-token
++chunk at TP4, and the prompt at TP3; rank 0 and the last rank (whose block holds the
++pad rows). DS4.1 Flash routing (384 experts, 6 a token, hidden 5120): random routes
++in the dispatch layout, random BF16 expert outputs, the shared expert's output folded
++in (the FP32 combine's BF16 fold kernel, as production runs it).
++
++Each shape is measured on eight fresh inputs. On each, both paths' slots are first
++checked bit for bit. Then ``CALLS`` calls of each run back to back, alternating which
++goes first, timed with CUDA events (device time: the prefill path runs eagerly, its
++launches hidden under milliseconds of device work). The shape's 95% interval comes
++from the eight per-input differences. The gate (``--gate``) is that the new path is
++slower at no shape (the interval's lower bound above zero). One slice (the blocks
++alone, no slicing) is reported beside it.
++"""
++
++import argparse
++import json
++import math
++import statistics
++from functools import partial
++from types import SimpleNamespace
++
++import torch
++
++from vllm.models.deepseek_v4_1 import sp_prefill
++from vllm.models.deepseek_v4_1.tilelang import collectives, columns
++from vllm.models.deepseek_v4_1.tilelang.moe import (
++    MoeDispatchV41Plan,
++    carve,
++    workspace_bytes,
++)
++
++DEVICE = "cuda"
++CALLS = 10
++SAMPLES = 8
++HIDDEN, EXPERTS, TOPK, BLOCK_M = 5120, 384, 6, 32
++# name: (tokens, world, rank)
++SHAPES = {
++    "TP4 16,384 rank 0": (16384, 4, 0),
++    "TP4 15,395 rank 0": (15395, 4, 0),
++    "TP4 15,395 rank 3": (15395, 4, 3),
++    "TP4 8,192 rank 0": (8192, 4, 0),
++    "TP3 15,395 rank 0": (15395, 3, 0),
++    "TP3 15,395 rank 2": (15395, 3, 2),
++}
++
++
++def _stub_exchange(record=None):
++    """The TP group and ``exchange_into`` stubbed: the exchange does nothing, or
++    records the chunks it would send."""
++    sp_prefill.get_tp_group = lambda: SimpleNamespace(
++        device_communicator=SimpleNamespace(pynccl_comm=None)
++    )
++
++    def exchange_into(comm, chunks, parts, rank, world):
++        if record is not None:
++            record.append(chunks.clone())
++
++    collectives.exchange_into = exchange_into
++
++
++def case(plan, tokens, world, rank, seed):
++    """One layer's routed outputs and both paths into its exchange slots."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    scores = torch.rand((tokens, EXPERTS), generator=g, device=DEVICE)
++    ids = scores.argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
++    weights = torch.rand((tokens, TOPK), generator=g, device=DEVICE) + 0.1
++    specs = plan.workspace_specs(tokens)
++    scratch = torch.empty(workspace_bytes(specs), dtype=torch.uint8, device=DEVICE)
++    layout = plan.dispatch(ids, weights, carve(scratch, specs))
++    y = torch.randn(
++        (plan.tiles(tokens) * BLOCK_M, HIDDEN), generator=g, device=DEVICE
++    ).bfloat16()
++    shared = torch.randn((tokens, HIDDEN), generator=g, device=DEVICE).bfloat16()
++    rows = sp_prefill.SPRows(tokens, world, rank, unreduced=True)
++    local = rows.local_rows
++    whole = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++    send = torch.empty((world, local, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++    parts = torch.empty_like(send)
++
++    def theirs():
++        """26382f5cf: the combine into the whole output, then each block copied
++        into its slot (the runner's ``write``), pad rows zeroed."""
++        plan.combine(y, layout, whole, shared=shared)
++        for owner in range(world):
++            dest = parts if owner == rank else send
++            start = owner * local
++            real = max(0, min(local, tokens - start))
++            if real:
++                dest[owner, :real].copy_(whole[start : start + real])
++            columns.zero_(dest[owner, real:])
++
++    def combine(start, stop, out):
++        plan.combine(y, layout, out, shared=shared, start=start, stop=stop)
++
++    def ours(slices=None):
++        return rows.project_reduce_scatter(
++            combine,
++            (HIDDEN,),
++            torch.bfloat16,
++            torch.device(DEVICE),
++            slices=sp_prefill.moe_slices(tokens) if slices is None else slices,
++            per_block=True,
++        )
++
++    def check():
++        record = []
++        _stub_exchange(record)
++        theirs()
++        ours_parts = ours()
++        torch.cuda.synchronize()
++        _stub_exchange()
++        ours_send = torch.cat(record, dim=1)
++        if not torch.equal(ours_parts[rank], parts[rank]):
++            raise SystemExit("this rank's part differs from the copied block")
++        for owner in range(world):
++            if owner != rank and not torch.equal(ours_send[owner], send[owner]):
++                raise SystemExit(f"rank {owner}'s send slot differs")
++
++    return theirs, ours, check
++
++
++def device_us(function) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    torch.cuda.synchronize()
++    start.record()
++    for _ in range(CALLS):
++        function()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 1000 / CALLS
++
++
++def interval(differences):
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    return mean, [mean - half, mean + half]
++
++
++def measure(plan, tokens, world, rank) -> dict:
++    times = {"theirs": [], "ours": [], "one slice": []}
++    for sample in range(SAMPLES):
++        theirs, ours, check = case(plan, tokens, world, rank, seed=sample)
++        check()
++        paths = {"theirs": theirs, "ours": ours, "one slice": partial(ours, 1)}
++        for function in paths.values():
++            function()  # warm
++        order = list(paths) if sample % 2 == 0 else list(reversed(paths))
++        for name in order:
++            times[name].append(device_us(paths[name]))
++        del theirs, ours, check, paths
++        torch.cuda.empty_cache()
++    result = {
++        "slices": sp_prefill.moe_slices(tokens),
++        "copies_and_combine_us": statistics.median(times["theirs"]),
++        "combine_into_slots_us": statistics.median(times["ours"]),
++        "one_slice_us": statistics.median(times["one slice"]),
++    }
++    for name, key in (("ours", "difference"), ("one slice", "one_slice_difference")):
++        mean, bounds = interval([a - b for a, b in zip(times[name], times["theirs"])])
++        result[f"{key}_us"] = mean
++        result[f"{key}_interval_us"] = bounds
++    return result
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    plan = MoeDispatchV41Plan(
++        EXPERTS, TOPK, BLOCK_M, HIDDEN, torch.int32, out_dtype=torch.float32
++    )
++    plan.bind()
++    _stub_exchange()
++    results = {name: measure(plan, *shape) for name, shape in SHAPES.items()}
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        slower = [
++            name
++            for name, result in results.items()
++            if result["difference_interval_us"][0] > 0
++        ]
++        if slower:
++            raise SystemExit(f"combine into the slots slower at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 53c6eac26..d613ab736 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -266,6 +266,60 @@ def test_moe_experts_fold_deferred_shared(
+     assert torch.equal(deferred, direct)
+ 
+ 
++@pytest.mark.parametrize("rows", [1, 12, 300])
++@pytest.mark.parametrize(
++    "plan_dtype, out_dtype, fold",
++    [
++        (torch.bfloat16, torch.bfloat16, False),
++        (torch.float32, torch.float32, False),
++        (torch.float32, torch.bfloat16, True),  # the shared expert folded in
++    ],
++)
++def test_moe_experts_deferred_combine_has_the_combine_bits(
++    rows, plan_dtype, out_dtype, fold, hidden=384, intermediate=576, num_experts=32
++):
++    """Without an output the plan launches everything but the combine and returns
++    it: the rows combined piece by piece, each piece a launch into its own buffer
++    (the SP exchange's slots), carry the bits of the one combine into the whole
++    output. A callable shared addend is called once, by ``run``."""
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
++    topk = 6
++    plan = _plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
++        out_dtype=plan_dtype,
++    )  # fmt: skip
++    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
++    shared = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++    whole = torch.empty((rows, hidden), dtype=out_dtype, device=DEVICE)
++    tokens = cast_mxfp8(x)
++    plan.run(
++        tokens, ids, route_weights, weights, whole, shared=shared if fold else None
++    )
++    calls = []
++
++    def resolve():
++        calls.append(1)
++        return shared
++
++    combine = plan.run(
++        tokens, ids, route_weights, weights, None, shared=resolve if fold else None
++    )
++    assert calls == ([1] if fold else [])
++    cuts = sorted({0, rows // 3, rows // 2 + 1, rows - 1, rows})
++    pieces = []
++    for start, stop in zip(cuts, cuts[1:]):
++        piece = torch.full(
++            (stop - start, hidden), float("nan"), dtype=out_dtype, device=DEVICE
++        )
++        combine(start, stop, piece)
++        pieces.append(piece)
++    assert torch.equal(torch.cat(pieces), whole)
++    assert calls == ([1] if fold else [])
++
++
+ def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
+     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index b7902f837..1a2c9c424 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -59,6 +59,57 @@ def test_wo_slices():
+     assert sp_prefill.wo_slices(2048) == 2
+ 
+ 
++def test_moe_slices():
++    assert sp_prefill.moe_slices(205) == 1
++    assert sp_prefill.moe_slices(8191) == 1
++    assert sp_prefill.moe_slices(8192) == 2
++    assert sp_prefill.moe_slices(15395) == 3  # request inventory 5's prompt
++    assert sp_prefill.moe_slices(16288) == 3  # the TP4 recipe's long-prefill chunk
++    assert sp_prefill.moe_slices(16384) == 4  # a full step of its token budget
++
++
++def _fake_exchange(monkeypatch, rank, world, own_rows, events=None):
++    """The TP group and ``exchange_into`` faked for one rank: each call's chunks are
++    cloned as sent, and every other rank's partial of this rank's rows is stood in
++    by this rank's own (``own_rows``, ``(L, ...)``), delivered on the exchange's
++    stream; the slice comes from the parts' row offset. Returns the sent clones."""
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1.tilelang import collectives
++
++    group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
++    monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
++    sent = []
++
++    def exchange_into(comm, chunks, parts, r, w):
++        assert (comm, r, w) == ("comm", rank, world)
++        lo = parts.storage_offset() // parts.stride(1)
++        hi = lo + parts.shape[1]
++        if events is not None:
++            events.append(("exchange", lo, hi))
++        sent.append(chunks.clone())
++        for peer in range(world):
++            if peer != rank:
++                parts[peer].copy_(own_rows[lo:hi])
++
++    monkeypatch.setattr(collectives, "exchange_into", exchange_into)
++    return sent
++
++
++def _assert_exchanged_under_own_block(events, rank, world, local, tokens):
++    """Every slice's exchange comes after the other ranks' projected rows of it and
++    before this rank's own."""
++    for kind, lo, hi in events:
++        if kind != "exchange":
++            continue
++        at = events.index((kind, lo, hi))
++        for owner in range(world):
++            start, stop = owner * local + lo, min(owner * local + hi, tokens)
++            if stop > start:
++                index = events.index(("project", start, stop))
++                assert (index > at) == (owner == rank), (owner, lo, hi)
++
++
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+ @pytest.mark.parametrize("rank", [0, 2, 3])
+ @pytest.mark.parametrize("slices", [1, 2, 3])
+@@ -68,37 +119,31 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+     rank's own block in its slot of the parts (the other ranks stood in by
+     copies of it). Only real rows are projected; the pad rows of the last rank's
+     block are zeroed by TileLang's fill (never torch's), so the parts and their
+-    sums are the zero-padded projection's, pad rows included."""
+-    from types import SimpleNamespace
+-
++    sums are the zero-padded projection's, pad rows included. Block by block, a
++    slice is exchanged once the other ranks' blocks of it are projected and
++    before this rank's own is."""
+     from vllm.models.deepseek_v4_1.tilelang import collectives
+ 
+     world = 4
+     rows = sp_prefill.SPRows(
+         num_tokens=tokens, world_size=world, rank=rank, unreduced=True
+     )
+-    group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
+-    monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
++    local = rows.local_rows
++    source = torch.randn(tokens, 8, device="cuda")
++    padded = torch.zeros(rows.padded_rows, 8, device="cuda")
++    padded[:tokens] = source
++    blocks = padded.view(world, local, 8)
++    events = []
++    sent = _fake_exchange(monkeypatch, rank, world, blocks[rank], events)
+ 
+     def refuse(self, *args, **kwargs):
+         raise AssertionError("a pad row was zeroed by torch")
+ 
+     monkeypatch.setattr(torch.Tensor, "zero_", refuse)
+-    sent = []
+-
+-    def exchange_into(comm, chunks, parts, r, w):
+-        assert (comm, r, w) == ("comm", rank, world)
+-        sent.append(chunks.clone())
+-        for peer in range(world):
+-            if peer != rank:
+-                parts[peer].copy_(parts[rank])
+-
+-    monkeypatch.setattr(collectives, "exchange_into", exchange_into)
+-    source = torch.randn(tokens, 8, device="cuda")
+-    calls, order = [], []
++    order = []
+ 
+     def project(start, stop, out):
+-        calls.append((start, stop))
++        events.append(("project", start, stop))
+         out.copy_(source[start:stop])
+ 
+     parts = rows.project_reduce_scatter(
+@@ -107,17 +152,19 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+         source.dtype,
+         source.device,
+         slices=slices,
+-        then=lambda: order.append(len(calls)),
++        then=lambda: order.append(len(events)),
+         per_block=per_block,
+     )
+     torch.cuda.synchronize()
+     monkeypatch.undo()
++    calls = [(start, stop) for kind, start, stop in events if kind == "project"]
+     if slices == 1 and not per_block:
+         assert calls == [(0, tokens)]  # one projection
+-    padded = torch.zeros(rows.padded_rows, 8, device="cuda")
+-    padded[:tokens] = source
+-    blocks = padded.view(world, rows.local_rows, 8)
+-    local = rows.local_rows
++        assert events[-1] == ("exchange", 0, local)
++        assert order == [len(events) - 1]  # then() before the exchange
++    else:
++        _assert_exchanged_under_own_block(events, rank, world, local, tokens)
++        assert order == [len(events)]  # then() after the last projection
+     assert parts.shape == (world, local, 8)
+     for peer in range(world):
+         assert torch.equal(parts[peer], blocks[rank])
+@@ -127,13 +174,109 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+             assert torch.equal(sent[peer], blocks[peer])
+     projected = sorted(i for start, stop in calls for i in range(start, stop))
+     assert projected == list(range(tokens))
+-    assert order == [len(calls)]
+     total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
+     assert torch.equal(total, collectives.rank_order_sum(list(parts)))
+     zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
+     assert torch.equal(total, zero_padded)
+ 
+ 
++def _moe_case(tokens, hidden=384, intermediate=576, num_experts=32, topk=6):
++    """A V4.1 TileLang MoE plan with the FP32 combine the shared expert folds into,
++    its prepared weights, and one forward's tokens, routes and shared output."""
++    from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan
++
++    gen = torch.Generator(device="cuda").manual_seed(0)
++
++    def experts(n, k):  # packed E2M1 [E, n, k / 2] and UE8M0 [E, n, k / 32]
++        packed = torch.randint(
++            0, 256, (num_experts, n, k // 2), generator=gen, device="cuda"
++        ).to(torch.uint8)
++        exps = torch.randint(
++            118, 122, (num_experts, n, k // 32), generator=gen, device="cuda"
++        ).to(torch.uint8)
++        return packed, exps
++
++    plan = MoeExpertsV41Plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=10.0,
++        out_dtype=torch.float32,
++    )  # fmt: skip
++    plan.declare_kernels()
++    weights = plan.prepare_weights(
++        *experts(2 * intermediate, hidden), *experts(hidden, intermediate)
++    )
++    x = torch.randn((tokens, hidden), generator=gen, device="cuda") * 0.5
++    shared = torch.randn((tokens, hidden), generator=gen, device="cuda")
++    scores = torch.rand((tokens, num_experts), generator=gen, device="cuda")
++    ids = scores.argsort(dim=1)[:, :topk].to(torch.int32).contiguous()
++    route_weights = torch.rand((tokens, topk), generator=gen, device="cuda") + 0.1
++    return plan, weights, x.bfloat16(), shared.bfloat16(), ids, route_weights
++
++
++@pytest.mark.parametrize("tokens", [37, 205])
++@pytest.mark.parametrize("rank", [0, 3])
++@pytest.mark.parametrize("slice_tokens", [4096, 64, 16])
++def test_moe_combine_writes_the_exchange_slots(
++    monkeypatch, default_vllm_config, tokens, rank, slice_tokens
++):
++    """The MoE runner's reduce-scatter hook, given the experts' deferred combine
++    (shared expert folded in), has it write the exchange slots block by block and
++    slice by slice: each other rank's block into its send slot and this rank's into
++    its part carry the bits the one combine into the whole output gave, which the
++    copies moved there before. Pad rows are TileLang's zeros, and each slice is
++    exchanged before this rank's own block of it is combined."""
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_device_capability_family(120):
++        pytest.skip("TileLang V4.1 kernels target SM120/SM121")
++    pytest.importorskip("tilelang")
++    pytest.importorskip("tile_kernels")
++    from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
++
++    world, hidden = 4, 384
++    plan, weights, x, shared, ids, route_weights = _moe_case(tokens, hidden)
++    whole = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
++    x_q = cast_mxfp8(x)  # the experts read their tokens' cast (mHC finalize's)
++    plan.run(x_q, ids, route_weights, weights, whole, shared=shared)
++    combine = plan.run(x_q, ids, route_weights, weights, None, shared=shared)
++
++    rows = sp_prefill.SPRows(
++        num_tokens=tokens, world_size=world, rank=rank, unreduced=True
++    )
++    local = rows.local_rows
++    padded = torch.zeros(
++        (rows.padded_rows, hidden), dtype=torch.bfloat16, device="cuda"
++    )
++    padded[:tokens] = whole
++    blocks = padded.view(world, local, hidden)
++    events = []
++    sent = _fake_exchange(monkeypatch, rank, world, blocks[rank], events)
++    monkeypatch.setattr(sp_prefill, "MOE_SLICE_TOKENS", slice_tokens)
++    slices = sp_prefill.moe_slices(tokens)
++
++    def refuse(self, *args, **kwargs):
++        raise AssertionError("a pad row was zeroed by torch")
++
++    monkeypatch.setattr(torch.Tensor, "zero_", refuse)
++
++    def project(start, stop, out):
++        events.append(("project", start, stop))
++        combine(start, stop, out)
++
++    with sp_prefill.activate(rows):
++        parts = sp_prefill.project_reduce_scatter_current(
++            project, tokens, rows.padded_rows, (hidden,), torch.bfloat16, x.device
++        )
++    torch.cuda.synchronize()
++    monkeypatch.undo()
++    assert sum(kind == "exchange" for kind, _, _ in events) == slices
++    _assert_exchanged_under_own_block(events, rank, world, local, tokens)
++    assert torch.equal(parts[rank], blocks[rank])
++    sent = torch.cat(sent, dim=1)
++    for peer in range(world):
++        if peer != rank:
++            assert torch.equal(sent[peer], blocks[peer])
++
++
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+ @pytest.mark.parametrize("world", [3, 4])
+ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 61014e26a..555d575fe 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -293,6 +293,182 @@ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatc
+         )
+ 
+ 
++def _hook_runner(events):
++    """A runner's attributes for ``_reduce_scatter_final_output`` with the model's
++    reduce-scatter hook installed (it records its call and fires ``then``)."""
++
++    def reduce(write, rows, padded_rows, row_shape, dtype, device, then):
++        events.append(("reduce", write, rows, padded_rows, tuple(row_shape), dtype))
++        then()
++        return "parts"
++
++    return dict(
++        moe_config=SimpleNamespace(
++            is_sequence_parallel=False,
++            skip_final_all_reduce=False,
++            in_dtype=torch.bfloat16,
++        ),
++        router=object(),
++        _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
++        _sp_project_reduce_scatter_hook=reduce,
++    )
++
++
++def test_moe_reduce_scatter_hook_writes_with_the_deferred_combine():
++    """The model's hook gets the experts' deferred combine as its writer, and
++    nothing reads the unwritten output; without a deferred combine it refuses."""
++    from vllm.model_executor.layers.fused_moe.runner import moe_runner
++
++    events = []
++    runner = SimpleNamespace(**_hook_runner(events))
++    unwritten = torch.empty((10, 2), dtype=torch.bfloat16)
++
++    def combine(start, stop, out):
++        raise AssertionError("only the hook calls the combine")
++
++    output = moe_runner.MoERunner._reduce_scatter_final_output(
++        runner, None, unwritten, 12, None, False, combine
++    )
++    assert output == "parts"
++    assert events == [
++        ("reduce", combine, 10, 12, (2,), torch.bfloat16),
++        ("hook", 10),
++    ]
++    with pytest.raises(NotImplementedError):
++        moe_runner.MoERunner._reduce_scatter_final_output(
++            runner, None, unwritten, 12, None, False
++        )
++
++
++def test_moe_runner_defers_a_folded_combine_to_the_hook(monkeypatch):
++    """A folded SP forward with the hook installed asks the experts to defer their
++    combine inside the MoE op, hands that combine to the hook, and resets the
++    experts' call state after the op; without the hook nothing is deferred."""
++    from vllm.model_executor.layers.fused_moe.runner import moe_runner
++
++    monkeypatch.setattr(
++        moe_runner, "tensor_model_parallel_reduce_scatter", lambda states, dim: "rs"
++    )
++    runner_cls = moe_runner.MoERunner
++    events = []
++    experts = SimpleNamespace(
++        fold_shared=False, combine_addend=None, defer_combine=False,
++        deferred_combine=None,
++    )  # fmt: skip
++    seen = []
++
++    def combine(start, stop, out):
++        raise AssertionError("only the hook calls the combine")
++
++    def entry(hidden, logits, shared_in, ids, name, unpadded, dtype):
++        seen.append((experts.fold_shared, experts.defer_combine))
++        if experts.defer_combine:
++            experts.deferred_combine = combine
++        experts.combine_addend = "shared rows"
++        return torch.zeros_like(hidden), torch.empty_like(hidden)
++
++    class Runner:
++        forward = runner_cls.forward
++        apply_routed_input_transform = runner_cls.apply_routed_input_transform
++        _maybe_pad_hidden_states = runner_cls._maybe_pad_hidden_states
++        _maybe_reduce_routed_output_before_transform = (
++            runner_cls._maybe_reduce_routed_output_before_transform
++        )
++        _maybe_reduce_shared_expert_output = (
++            runner_cls._maybe_reduce_shared_expert_output
++        )
++        _maybe_apply_routed_scale_to_output = (
++            runner_cls._maybe_apply_routed_scale_to_output
++        )
++        apply_routed_output_transform = runner_cls.apply_routed_output_transform
++        _reduce_scatter_final_output = runner_cls._reduce_scatter_final_output
++
++    runner = Runner()
++    for name, value in _hook_runner(events).items():
++        setattr(runner, name, value)
++    runner.moe_config.hidden_dim = 2
++    runner.routed_input_transform = runner.routed_output_transform = None
++    runner.routed_scaling_factor = 1.0
++    runner._shared_experts = object()
++    runner._quant_method = SimpleNamespace(
++        skip_forward_padding=True, has_unpadded_output=False, output_dtype=None
++    )
++    runner._fused_output_is_reduced = False
++    runner._shared_output_fold = lambda shared_in: experts
++    runner._forward_entry = entry
++    runner._encode_layer_name = lambda: "layer"
++    hidden = torch.ones((10, 2), dtype=torch.bfloat16)
++    assert runner.forward(hidden, hidden, reduce_scatter_rows=12) == "parts"
++    assert seen == [(True, True)]
++    assert events == [
++        ("reduce", combine, 10, 12, (2,), torch.bfloat16),
++        ("hook", 10),
++    ]
++    assert vars(experts) == dict(
++        fold_shared=False, combine_addend=None, defer_combine=False,
++        deferred_combine=None,
++    )  # fmt: skip
++    del runner._sp_project_reduce_scatter_hook
++    assert runner.forward(hidden, hidden, reduce_scatter_rows=12) == "rs"
++    assert seen[-1] == (True, False)
++
++
++def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
++    """With ``defer_combine`` the TileLang experts run their plan without an output
++    (everything but the combine), leave ``output`` unwritten and keep the plan's
++    deferred combine; an unfolded call is never deferred."""
++    from vllm.model_executor.layers.fused_moe import tilelang as tilelang_experts
++    from vllm.model_executor.layers.fused_moe.tilelang import TileLangExperts
++
++    # The tokens' cast comes from the mHC entry; the stand-in plan reads none.
++    monkeypatch.setattr(tilelang_experts, "_provided_mxfp8", lambda rows: rows)
++    runs = []
++
++    def run(x, ids, weights, gemm_weights, out, workspace, shared):
++        runs.append((out, shared))
++        return "combine" if out is None else out
++
++    experts = SimpleNamespace(
++        _plan=SimpleNamespace(run=run),
++        _tails=(None, None),
++        _bases=(None, None),
++        w1_scale=None,
++        w2_scale=None,
++        fold_shared=True,
++        combine_addend="shared rows",
++        defer_combine=True,
++        deferred_combine=None,
++    )
++    output = torch.full((4, 2), float("nan"), dtype=torch.bfloat16)
++    call = dict(
++        output=output,
++        hidden_states=torch.zeros((4, 2), dtype=torch.bfloat16),
++        w1=None,
++        w2=None,
++        topk_weights=torch.zeros((4, 6)),
++        topk_ids=torch.zeros((4, 6), dtype=torch.int32),
++        activation=None,
++        global_num_experts=32,
++        expert_map=None,
++        a1q_scale=None,
++        a2_scale=None,
++        workspace13=None,
++        workspace2=torch.zeros(16, dtype=torch.bfloat16),
++        expert_tokens_meta=None,
++        apply_router_weight_on_input=False,
++    )
++    TileLangExperts.apply(experts, **call)
++    assert runs == [(None, "shared rows")]
++    assert experts.deferred_combine == "combine"
++    assert output.isnan().all()
++    experts.defer_combine, experts.deferred_combine = False, None
++    TileLangExperts.apply(experts, **call)
++    assert runs[-1] == (output, "shared rows") and experts.deferred_combine is None
++    experts.fold_shared, experts.defer_combine = False, True
++    with pytest.raises(AssertionError):
++        TileLangExperts.apply(experts, **call)
++
++
+ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+     # Engram's geometry and token map are b12x's; its gate is TileLang's.
+     pytest.importorskip("b12x")
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index c4eea9ff9..de0b66bce 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -575,12 +575,16 @@ class MoERunner(MoERunnerInterface):
+         padded_rows: int,
+         trunc_size: int | None,
+         output_is_reduced: bool,
++        combine: Callable[[int, int, torch.Tensor], None] | None = None,
+     ) -> torch.Tensor:
+         """Sequence-parallel replacement for the late all-reduce.
+ 
+         The combined output is written into a ``padded_rows`` buffer whose
+         trailing rows are zero and reduce-scattered along dim 0, so TP rank r
+         receives rows ``[r * padded_rows // tp, (r + 1) * padded_rows // tp)``.
++        ``combine(start, stop, out)`` is the experts' deferred combine (shared
++        output folded in): ``fused_output`` is then unwritten, and the model's
++        reduce-scatter hook has the combine write its buffers' rows itself.
+         """
+         if (
+             output_is_reduced
+@@ -603,24 +607,20 @@ class MoERunner(MoERunnerInterface):
+         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+         # A model-installed replacement for the buffer and reduce-scatter below:
+         # hook(write, rows, padded_rows, row_shape, dtype, device, then), where
+-        # write(start, stop, out) fills rows start:stop of the combined output.
++        # write(start, stop, out) fills rows start:stop of the combined output:
++        # the deferred combine, writing straight into the hook's buffers.
+         _reduce = getattr(self, "_sp_project_reduce_scatter_hook", None)
+         if _reduce is not None:
+             if trunc_size is not None:
+                 raise NotImplementedError(
+                     "MoE reduce-scatter hook with a trimmed output"
+                 )
+-
+-            def write(start: int, stop: int, out: torch.Tensor) -> None:
+-                if shared_output is None:
+-                    out.copy_(fused_output[start:stop])
+-                else:
+-                    torch.add(
+-                        shared_output[start:stop], fused_output[start:stop], out=out
+-                    )
+-
++            if combine is None:
++                raise NotImplementedError(
++                    "MoE reduce-scatter hook needs the experts' deferred combine"
++                )
+             return _reduce(
+-                write,
++                combine,
+                 rows,
+                 padded_rows,
+                 fused_output.shape[1:],
+@@ -922,8 +922,17 @@ class MoERunner(MoERunnerInterface):
+             if og_hidden_dim_pre_xform is None and og_hidden_dim_post_xform is None
+             else None
+         )
++        # A folded combine bound for the model's sequence-parallel exchange is left
++        # to the exchange, which has it write each destination's rows in place.
++        defer = (
++            fold is not None
++            and reduce_scatter_rows is not None
++            and getattr(self, "_sp_project_reduce_scatter_hook", None) is not None
++        )
++        combine = None
+         if fold is not None:
+             fold.fold_shared = True
++            fold.defer_combine = defer
+         try:
+             result = self._forward_entry(
+                 hidden_states,
+@@ -936,10 +945,15 @@ class MoERunner(MoERunnerInterface):
+                 else 0,
+                 self._quant_method.output_dtype,
+             )
++            if defer:
++                combine = fold.deferred_combine
++                assert combine is not None, "the experts did not defer their combine"
+         finally:
+             if fold is not None:
+                 fold.fold_shared = False
+                 fold.combine_addend = None
++                fold.defer_combine = False
++                fold.deferred_combine = None
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+@@ -1022,6 +1036,7 @@ class MoERunner(MoERunnerInterface):
+                 reduce_scatter_rows,
+                 og_hidden_dim_post_xform,
+                 fused_output_is_reduced,
++                combine,
+             )
+         if shared_output is not None:
+             result = (
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index df55a0c08..dd761151c 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -164,6 +164,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+     # The plan resolves a callable addend just before its combine launch, so an
+     # aux-stream shared expert overlaps the routed experts' GEMMs.
+     folds_deferred_shared_output: bool = True
++    # Set by the MoE runner around one folded call whose output goes straight into
++    # a sequence-parallel exchange: ``apply`` leaves ``output`` unwritten and keeps
++    # the combine as ``deferred_combine(start, stop, out)``, which writes the
++    # output's rows ``start:stop`` into ``out`` (the exchange's blocks).
++    defer_combine: bool = False
++    deferred_combine: Callable[[int, int, torch.Tensor], None] | None = None
+ 
+     @property
+     def folds_shared_output(self) -> bool:
+@@ -295,15 +301,19 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         if self.fold_shared:
+             assert self.combine_addend is not None, "the shared output must be given"
+             shared = self.combine_addend
+-        self._plan.run(
++        if self.defer_combine:
++            assert self.fold_shared, "only a folded combine is deferred"
++        combine = self._plan.run(
+             _provided_mxfp8(hidden_states),
+             topk_ids,
+             topk_weights,
+             weights,
+-            output,
++            None if self.defer_combine else output,
+             workspace,
+             shared,
+         )
++        if self.defer_combine:
++            self.deferred_combine = combine
+ 
+     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+         raise NotImplementedError("LoRA is not supported for TileLangExperts")
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index c4764df05..e24cc2912 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -79,6 +79,9 @@ hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
+ rank order as it loads them, the same arithmetic and the same bits as the
+ rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
+ projected into the buffers; the pad rows of the last rank's block are zeroed.
++The MoE combine (shared expert folded in) is that projection: it writes each
++rank's block straight into its slot, the other ranks' first, and the exchange of
++each slice runs under the combine of this rank's block and of the next slice.
+ """
+ 
+ from collections.abc import Iterator
+@@ -258,11 +261,13 @@ class SPRows:
+ 
+         With ``unreduced`` rows the result is every rank's unreduced partial of
+         this rank's rows instead, ``(N, L, *row_shape)``; see "Unreduced results".
+-        In one slice, ``per_block`` writes each rank's block with its own call,
+-        this rank's straight into its slot (for writers that cost nothing per
+-        call, such as an elementwise sum); otherwise one call writes every row
+-        and this rank's block is copied into its slot (a projection reads its
+-        weights once).
++        Block by block (``per_block``, or ``slices`` > 1), each rank's block is
++        written with its own call, this rank's straight into its slot, and each
++        slice's exchange starts on the side stream once the other ranks' blocks
++        are written, under this rank's own and the next slice (for writers that
++        cost nothing per call, such as the MoE combine). Otherwise one call
++        writes every row and this rank's block is copied into its slot (a
++        projection reads its weights once).
+         """
+         if self.unreduced:
+             return self._project_exchange(
+@@ -309,9 +314,10 @@ class SPRows:
+     ):
+         """``project_reduce_scatter`` without the sum: each rank's block goes into
+         its slot of one send buffer, this rank's own straight into its slot of
+-        the parts, and the chunks are exchanged into the parts; with ``slices``
+-        > 1 each slice is exchanged on the side stream while the next is
+-        projected."""
++        the parts, and the chunks are exchanged into the parts. Block by block,
++        each slice is exchanged on the side stream once the other ranks' blocks
++        of it are projected, while this rank's own block and the next slice
++        are."""
+         from vllm.models.deepseek_v4_1.tilelang import columns
+         from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
+ 
+@@ -329,32 +335,32 @@ class SPRows:
+                 then()
+             exchange_into(comm, send, parts, self.rank, world)
+             return parts
++
++        def write(owner, lo, hi):
++            dest = parts if owner == self.rank else send
++            start, stop = owner * local + lo, owner * local + hi
++            real = max(0, min(stop, tokens) - start)
++            if real:
++                project(start, start + real, dest[owner, lo : lo + real])
++            columns.zero_(dest[owner, lo + real : hi])
++
+         bounds = [local * i // slices for i in range(slices + 1)]
+         main = torch.cuda.current_stream(device)
+-        side = _side_stream(device) if slices > 1 else None
++        side = _side_stream(device)
+         for lo, hi in zip(bounds, bounds[1:]):
+             if hi == lo:
+                 continue
+             for owner in range(world):
+-                dest = parts if owner == self.rank else send
+-                start, stop = owner * local + lo, owner * local + hi
+-                real = max(0, min(stop, tokens) - start)
+-                if real:
+-                    project(start, start + real, dest[owner, lo : lo + real])
+-                columns.zero_(dest[owner, lo + real : hi])
+-            if side is not None:
+-                side.wait_stream(main)
+-                with torch.cuda.stream(side):
+-                    exchange_into(
+-                        comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world
+-                    )
++                if owner != self.rank:
++                    write(owner, lo, hi)
++            side.wait_stream(main)
++            with torch.cuda.stream(side):
++                exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
++            write(self.rank, lo, hi)
+         if then is not None:
+             then()
+-        if side is None:
+-            exchange_into(comm, send, parts, self.rank, world)
+-        else:
+-            # send and parts are freed only after this wait, on this stream.
+-            main.wait_stream(side)
++        # send and parts are freed only after this wait, on this stream.
++        main.wait_stream(side)
+         return parts
+ 
+ 
+@@ -368,6 +374,17 @@ def wo_slices(num_tokens: int) -> int:
+     return 2 if num_tokens >= WO_SLICE_TOKENS else 1
+ 
+ 
++# The MoE output is exchanged in one slice per this many tokens: each slice's
++# exchange runs under the combine of the next. A slice's message to a peer is at
++# least 1,024 rows at TP4, so an exchange's fixed cost stays small beside it.
++MOE_SLICE_TOKENS = 4096
++
++
++def moe_slices(num_tokens: int) -> int:
++    """Slices of a sequence-parallel MoE output exchange of ``num_tokens`` tokens."""
++    return max(1, num_tokens // MOE_SLICE_TOKENS)
++
++
+ # Results of sequence-parallel steps stay unreduced where the TP group's
+ # reduce-scatter is the rank-order one (see "Unreduced results"): the TileLang
+ # family on the RoCE policy.
+@@ -400,7 +417,9 @@ def project_reduce_scatter_current(
+     project, rows, padded_rows, row_shape, dtype, device, then=None
+ ) -> torch.Tensor:
+     """The MoE runner's reduce-scatter hook: ``project_reduce_scatter`` over the
+-    rows of the active SP forward (``activate``)."""
++    rows of the active SP forward (``activate``). ``project`` is the experts'
++    combine, so each block is combined straight into its exchange slot, and the
++    exchange runs in ``moe_slices`` slices under the rest of the combine."""
+     sp = current()
+     if sp is None or sp.num_tokens != rows or sp.padded_rows != padded_rows:
+         raise RuntimeError(
+@@ -408,7 +427,13 @@ def project_reduce_scatter_current(
+             f"forward ({sp})"
+         )
+     return sp.project_reduce_scatter(
+-        project, row_shape, dtype, device, then=then, per_block=True
++        project,
++        row_shape,
++        dtype,
++        device,
++        slices=moe_slices(rows),
++        then=then,
++        per_block=True,
+     )
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 5a103ad03..a43cb7525 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -542,14 +542,20 @@ class MoeDispatchV41Plan:
+             )
+         return layout
+ 
+-    def combine(self, y, layout, out, topk_weights=None, shared=None):
+-        """Sum each token's expert outputs into ``out``.
++    def combine(
++        self, y, layout, out, topk_weights=None, shared=None, start=0, stop=None
++    ):
++        """Sum each token's expert outputs into ``out``: tokens ``start:stop`` (every
++        token by default) into ``out``'s rows.
+ 
+         Pass ``topk_weights`` only if the experts did not apply them. A BF16 ``out``
+         of a plan with a wider output dtype takes ``shared``: the routes' FP32 sum
+-        plus the shared output, rounded once.
++        plus the shared output, rounded once. A token's sum reads only its own
++        routes, so its row has the same bits however the tokens are split.
+         """
+-        rows = layout["route_pos"].shape[0]
++        route_pos = layout["route_pos"]
++        rows = route_pos.shape[0]
++        stop = rows if stop is None else stop
+         weights = (
+             layout["layout_weights"][: rows * self.topk].view(rows, self.topk)
+             if topk_weights is None
+@@ -565,7 +571,13 @@ class MoeDispatchV41Plan:
+                 (shared is not None, topk_weights is not None)
+             ]
+         # Without a shared input the kernel never reads it: any BF16 rows do.
+-        kernel(y, layout["route_pos"], weights, y if shared is None else shared, out)
++        kernel(
++            y,
++            route_pos[start:stop],
++            weights[start:stop],
++            y if shared is None else shared[start:stop],
++            out,
++        )
+         return out
+ 
+ 
+@@ -1286,6 +1298,13 @@ class MoeExpertsV41Plan:
+         to the FP32 sum before the one rounding to ``out``'s dtype; a callable
+         ``shared`` is called just before the combine launch (it may wait for
+         another stream) and returns those rows.
++
++        With ``out`` None the combine is not launched: the result is
++        ``combine(start, stop, rows_out)``, which writes the output's rows
++        ``start:stop`` into ``rows_out`` (in the dtype ``out`` would have) with one
++        launch, the same bits however the rows are split. It reads ``workspace``
++        and ``shared`` (a callable one is still called here), which must stay
++        unchanged until its last call.
+         """
+         rows = topk_ids.shape[0]
+         dispatch = self.dispatch[topk_ids.dtype]
+@@ -1307,7 +1326,13 @@ class MoeExpertsV41Plan:
+         self.down(hq, h_words, *_present(down), order, tile_expert, y)
+         if callable(shared):
+             shared = shared()
+-        return dispatch.combine(y, layout, out, shared=shared)
++        if out is not None:
++            return dispatch.combine(y, layout, out, shared=shared)
++
++        def combine(start, stop, rows_out):
++            dispatch.combine(y, layout, rows_out, shared=shared, start=start, stop=stop)
++
++        return combine
+ 
+ 
+ def _present(weights):

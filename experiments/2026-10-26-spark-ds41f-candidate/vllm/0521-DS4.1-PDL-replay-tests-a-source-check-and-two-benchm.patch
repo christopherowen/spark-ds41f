@@ -1,0 +1,1034 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:46:55 +0100
+Subject: [PATCH 521/521] [DS4.1] PDL: replay tests, a source check and two
+ benchmarks
+
+- test_deepseek_v41_tilelang_pdl: a reader that loads before its wait sees a
+  slow producer's buffer unwritten inside a CUDA graph (the edges are
+  programmatic) and a waiting reader never does; one decode layer's chain,
+  every intermediate poisoned with NaN before each graph replay, gives its
+  eager bits on every replay; TileKernels' switch is on.
+- deepseek_v41_pdl_sources (pytest plugin): every kernel the DS4.1 kernel
+  tests launch is checked in its CUDA source; chain kernels wait outside any
+  block before naming a pointer parameter and trigger after, warp-specialized
+  GEMMs have no PDL.
+- deepseek_v41_pdl_chains: the layer chain at TP4's shapes (mHC entries with
+  their MXFP8 casts, Q-A/KV on the attention entry's cast, q norm, Q-B,
+  WO-A/WO-B, the shared expert on its own stream and the routed experts on the
+  FFN entry's cast, combine; 20 kernels), built only on APIs that predate PDL.
+- benchmark_deepseek_v41_pdl_chain: the chain in CUDA graphs, warm and
+  L2-cold, with digests of every buffer, to compare builds with and without
+  PDL.
+- benchmark_deepseek_v41_pdl_mechanism: synthetic dependent kernels in four
+  launch modes, a fork/join, and a replay of one traced decode layer.
+---
+ .../benchmark_deepseek_v41_pdl_chain.py       | 103 ++++++
+ .../benchmark_deepseek_v41_pdl_mechanism.py   | 198 ++++++++++
+ tests/kernels/deepseek_v41_pdl_chains.py      | 347 ++++++++++++++++++
+ tests/kernels/deepseek_v41_pdl_sources.py     | 160 ++++++++
+ .../kernels/test_deepseek_v41_tilelang_pdl.py | 159 ++++++++
+ 5 files changed, 967 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_pdl_mechanism.py
+ create mode 100644 tests/kernels/deepseek_v41_pdl_chains.py
+ create mode 100644 tests/kernels/deepseek_v41_pdl_sources.py
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_pdl.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py b/benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py
+new file mode 100644
+index 000000000..752cbede2
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py
+@@ -0,0 +1,103 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One DeepSeek-V4.1 decode layer's kernel chain in a CUDA graph: time and bits.
++
++The chain is ``tests/kernels/deepseek_v41_pdl_chains.LayerChain``: the layer without
++its attention core, router and all-reduces, 20 kernels, at a decode step's rows (one
++stream, eight mixed streams, eight streams of six rows). Each shape's graph holds
++``--layers`` copies of the chain back to back, as a forward replays layer after layer.
++
++Per shape it prints one JSON line: the median microseconds per layer over
++``--replays`` replays, warm (the previous replay's weights partly in L2) and cold
++(L2 evicted by a 128 MiB read before each replay), and a digest of every buffer the
++chain writes. Run it on two builds, the one without PDL and the one with it, and
++compare: the digests must be equal (PDL changes no arithmetic) and the difference in
++time is what PDL recovers on this chain. ``pdl_chain_ab.py`` in the experiment's
++kernel bundle runs both builds in alternation on one GPU.
++"""
++
++import argparse
++import json
++import statistics
++
++import torch
++
++from tests.kernels.deepseek_v41_pdl_chains import ROWS, LayerChain
++from vllm.config import VllmConfig, set_current_vllm_config
++
++DEVICE = "cuda"
++
++
++def graph(fn, layers: int) -> torch.cuda.CUDAGraph:
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        fn()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for _ in range(layers):
++            fn()
++    return g
++
++
++def replay_us(g: torch.cuda.CUDAGraph, evict: torch.Tensor | None) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    stop = torch.cuda.Event(enable_timing=True)
++    if evict is not None:
++        evict.max()
++    start.record()
++    g.replay()
++    stop.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(stop) * 1000
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--shapes", default=",".join(ROWS))
++    ap.add_argument("--layers", type=int, default=4)
++    ap.add_argument("--replays", type=int, default=50)
++    ap.add_argument("--seed", type=int, default=0)
++    args = ap.parse_args()
++    evict = torch.ones(128 << 20, dtype=torch.uint8, device=DEVICE).view(torch.int32)
++    with set_current_vllm_config(VllmConfig()):
++        for name in args.shapes.split(","):
++            chain = LayerChain(ROWS[name], seed=args.seed)
++            chain.run()
++            torch.cuda.synchronize()
++            eager = chain.digests()
++            g = graph(chain.run, args.layers)
++            for _ in range(3):
++                replay_us(g, None)
++            warm = [replay_us(g, None) / args.layers for _ in range(args.replays)]
++            cold = [replay_us(g, evict) / args.layers for _ in range(args.replays)]
++            replayed = chain.digests()
++            print(
++                json.dumps(
++                    {
++                        "shape": name,
++                        "rows": ROWS[name],
++                        "layers": args.layers,
++                        "warm_us": round(statistics.median(warm), 2),
++                        "cold_us": round(statistics.median(cold), 2),
++                        "warm_p10_p90": [
++                            round(x, 2) for x in statistics.quantiles(warm, n=10)[::8]
++                        ],
++                        "cold_p10_p90": [
++                            round(x, 2) for x in statistics.quantiles(cold, n=10)[::8]
++                        ],
++                        "finite": bool(torch.isfinite(chain.out).all()),
++                        "replay_equals_eager": replayed == eager,
++                        "digests": replayed,
++                    }
++                ),
++                flush=True,
++            )
++            del g, chain
++            torch.cuda.empty_cache()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_pdl_mechanism.py b/benchmarks/kernels/benchmark_deepseek_v41_pdl_mechanism.py
+new file mode 100644
+index 000000000..c9a63ee78
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_pdl_mechanism.py
+@@ -0,0 +1,198 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""What programmatic dependent launch recovers per kernel boundary on this GPU, in
++CUDA graphs, with synthetic kernels.
++
++Every kernel reads a word its predecessor wrote (all CTAs) and writes one its
++successor reads, so each depends on the one before it. Launch modes:
++
++- ``plain``: no PDL, each kernel launches when its predecessor completes;
++- ``wait``: ``griddepcontrol.wait`` first, no trigger (launch as the predecessor's
++  CTAs exit);
++- ``chain``: wait, then ``launch_dependents`` (``pdl.chain()``, the serving kernels');
++- ``late``: wait first, trigger after the store (TileKernels' placement).
++
++1. Boundaries: chains of ``--depth`` kernels of one shape (1, 6, 48 and 192 CTAs;
++   no work, about 2 us and about 10 us of it), median microseconds per kernel in
++   each mode.
++2. Join: A on the main stream, B forked to a side stream, C on the main stream after
++   both (``moe_combine``'s shape), C plain and chained.
++3. The traced layer (``--layer``, from ``critical_path.py --layer-sequence``): one
++   decode layer's critical path at one stream, each kernel a spin of its traced CTAs,
++   threads and duration, replayed plain and with every kernel that serving chains
++   chained (the all-reduces and warp-specialized GEMMs stay plain). The difference is
++   the launch time PDL removes from that sequence, without the prologue overlap of
++   real kernels.
++
++One JSON line per measurement.
++"""
++
++import argparse
++import json
++import statistics
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import pdl
++
++DEVICE = "cuda"
++SLOTS = 1 << 16
++MODES = ("plain", "wait", "chain", "late")
++_PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++
++
++@tilelang.jit(pass_configs=_PASS)
++def spin(ctas: int, threads: int, iters: int, mode: str):
++    """Read ``token[k]``, ``iters`` FMA steps per thread, write ``token[k + 1]``."""
++
++    @T.prim_func
++    def pdl_spin(token: T.Tensor((SLOTS,), T.float32), k: T.int32):
++        with T.Kernel(ctas, threads=threads) as bx:
++            if mode == "chain":
++                pdl.chain()
++            elif mode != "plain":
++                T.pdl_sync()
++            tx = T.get_thread_binding()
++            acc = T.alloc_var(T.float32, init=token[k])
++            for _ in T.serial(iters):
++                acc = acc * 0.999999 + 1e-6
++            if bx == 0 and tx == 0:
++                token[k + 1] = acc
++            if mode == "late":
++                T.pdl_trigger()
++
++    return pdl_spin
++
++
++def graph(fn) -> torch.cuda.CUDAGraph:
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        fn()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        fn()
++    return g
++
++
++def timed(g: torch.cuda.CUDAGraph, replays: int) -> float:
++    """Median microseconds per replay."""
++    times = []
++    for _ in range(replays + 3):
++        start = torch.cuda.Event(enable_timing=True)
++        stop = torch.cuda.Event(enable_timing=True)
++        start.record()
++        g.replay()
++        stop.record()
++        torch.cuda.synchronize()
++        times.append(start.elapsed_time(stop) * 1000)
++    return statistics.median(times[3:])
++
++
++def iters_for(ctas: int, threads: int, us: float, token: torch.Tensor) -> int:
++    """FMA steps that make one ``plain`` kernel of this shape take about ``us``."""
++    if us <= 0:
++        return 1
++
++    def alone(iters: int) -> float:
++        kernel = spin(ctas, threads, iters, "plain")
++        one = timed(graph(lambda: kernel(token, 0)), 10)
++        ten = timed(graph(lambda: [kernel(token, i) for i in range(10)]), 10)
++        return (ten - one) / 9
++
++    low, high = alone(1), alone(4096)
++    return max(1, round(1 + (us - low) / max(high - low, 1e-3) * 4095))
++
++
++def chain_of(kernels, token):
++    def run():
++        for i, kernel in enumerate(kernels):
++            kernel(token, i)
++
++    return run
++
++
++def boundaries(args, token):
++    for ctas in (1, 6, 48, 192):
++        for work in (0.0, 2.0, 10.0):
++            iters = iters_for(ctas, 128, work, token)
++            row = {"test": "boundary", "ctas": ctas, "work_us": work, "iters": iters}
++            for mode in MODES:
++                kernel = spin(ctas, 128, iters, mode)
++                g = graph(chain_of([kernel] * args.depth, token))
++                row[mode] = round(timed(g, args.replays) / args.depth, 3)
++            row["saved_us"] = round(row["plain"] - row["chain"], 3)
++            print(json.dumps(row), flush=True)
++
++
++def join(args, token):
++    """A -> (B on a side stream) -> C, C after both."""
++    iters = iters_for(48, 128, 10.0, token)
++    a = spin(48, 128, iters, "chain")
++    b = spin(6, 128, iters, "plain")
++    side = torch.cuda.Stream()
++    row = {"test": "join", "ctas": 48, "work_us": 10.0}
++    for mode in ("plain", "chain"):
++        c = spin(48, 128, iters, mode)
++
++        def run(c=c):
++            for layer in range(args.depth):
++                k = 4 * layer
++                a(token, k)
++                side.wait_stream(torch.cuda.current_stream())
++                with torch.cuda.stream(side):
++                    b(token, k + 1)
++                torch.cuda.current_stream().wait_stream(side)
++                c(token, k + 2)
++
++        row[mode] = round(timed(graph(run), args.replays) / args.depth, 3)
++    row["saved_us"] = round(row["plain"] - row["chain"], 3)
++    print(json.dumps(row), flush=True)
++
++
++def traced_layer(args, token):
++    with open(args.layer) as handle:
++        sequence = json.load(handle)
++    iters = {}
++    for entry in sequence["kernels"]:
++        key = (entry["ctas"], entry["threads"], entry["us"])
++        if key not in iters:
++            iters[key] = iters_for(*key, token)
++    row = {"test": "traced layer", "source": sequence["source"],
++           "kernels": len(sequence["kernels"]),
++           "traced_us": sequence["path_us"]}  # fmt: skip
++    for mode in ("plain", "chain"):
++        kernels = [
++            spin(
++                e["ctas"],
++                e["threads"],
++                iters[(e["ctas"], e["threads"], e["us"])],
++                "chain" if mode == "chain" and e["pdl"] else "plain",
++            )
++            for e in sequence["kernels"]
++        ]
++        row[mode] = round(timed(graph(chain_of(kernels, token)), args.replays), 2)
++    row["saved_us"] = round(row["plain"] - row["chain"], 2)
++    row["saved_percent_of_layer"] = round(100 * row["saved_us"] / row["plain"], 2)
++    print(json.dumps(row), flush=True)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--depth", type=int, default=64)
++    ap.add_argument("--replays", type=int, default=30)
++    ap.add_argument("--layer", help="one layer's critical path (critical_path.py)")
++    args = ap.parse_args()
++    token = torch.zeros(SLOTS, dtype=torch.float32, device=DEVICE)
++    boundaries(args, token)
++    join(args, token)
++    if args.layer:
++        traced_layer(args, token)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/deepseek_v41_pdl_chains.py b/tests/kernels/deepseek_v41_pdl_chains.py
+new file mode 100644
+index 000000000..ba99599b6
+--- /dev/null
++++ b/tests/kernels/deepseek_v41_pdl_chains.py
+@@ -0,0 +1,347 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One DeepSeek-V4.1 decode layer's kernel chain at TP4's shapes, for the PDL test
++and benchmark (``vllm/models/deepseek_v4_1/tilelang/pdl.py``).
++
++``LayerChain(rows)`` builds the layer's kernels on random weights; ``run()``
++launches them in order, each kernel reading what the one before it wrote:
++
++- the attention entry: mHC ``post_pre`` (the previous FFN output folded into the
++  streams) and its finalize, which also writes its output's MXFP8 cast;
++- the fused Q-A/KV projection's GEMM on that cast, the q latent's RMSNorm, Q-B
++  (cast, GEMM);
++- WO-A's split-K partials and reduce-cast over Q-B's output, which stands in for
++  the sparse-MLA output of the same ``[rows, 16 x 512]`` shape, then WO-B;
++- the FFN entry on WO-B's output;
++- the shared expert on its own stream (gate/up on the FFN entry's cast, SwiGLU,
++  cast, down) beside the routed experts (dispatch, FC1 on the same cast, SwiGLU and
++  cast, FC2), and the combine, which waits for the shared expert and adds its output
++  before one rounding.
++
++That is the decode layer without its attention core (RoPE, cache writes, sparse-MLA
++metadata and attention), its router and its all-reduces: 20 kernels. Expert routes
++are fixed by the seed. The same seed gives the same inputs, weights and routes, so
++the outputs depend only on the kernels' arithmetic, whatever build or launch
++schedule runs them. Only APIs that predate PDL are used, so the chain runs on the
++build without it too.
++"""
++
++import hashlib
++
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import linear, mhc
++from vllm.models.deepseek_v4_1.tilelang.activation import swiglu_clamp_kernel
++from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan, workspace_bytes
++from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
++from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
++
++DEVICE = "cuda"
++HIDDEN = 5120
++# TP4 serving shapes (gemm.DECODE_FP8_CONFIGS): fused Q-A/KV, Q-B, grouped WO-A,
++# WO-B, the shared expert's gate/up and down.
++QA_KV = (1792, HIDDEN)
++Q_LATENT = 1280
++Q_B = (8192, Q_LATENT)
++WO_GROUPS = 2
++WO_A = (2048, 4096)
++WO_B = (HIDDEN, 2048)
++SHARED = 576
++EXPERTS, TOPK = 384, 6
++LIMIT = 10.0
++RMS_EPS, HC_EPS, SINKHORN = 1e-20, 1e-6, 20
++# A decode step's rows: one stream (1 + 5 drafted), eight mixed streams, eight at
++# six rows each.
++ROWS = {"c1": 6, "c8": 24, "c8x6": 48}
++
++
++class _Projection:
++    """A block-32 FP8 weight as the TileLang linear method holds one."""
++
++    def __init__(self, n: int, k: int, gen: torch.Generator):
++        self.weight = (torch.randn((n, k), generator=gen, device=DEVICE) * 2).to(
++            torch.float8_e4m3fn
++        )
++        self.weight_scale_inv = torch.randint(
++            120,
++            125,
++            (n // 32, k // 32),
++            generator=gen,
++            device=DEVICE,
++            dtype=torch.uint8,
++        )
++
++
++def _block32(
++    n: int, k: int, gen: torch.Generator, mxfp8_input: bool = False
++) -> _Projection:
++    """``mxfp8_input``: the projection reads the cast its input's producer wrote (an
++    mHC entry's), as the model's fused Q-A/KV and shared gate/up do."""
++    layer = _Projection(n, k, gen)
++    layer.tilelang_mxfp8_input = mxfp8_input
++    linear._block32_scale_words(layer)
++    linear._declare_block32(layer)
++    return layer
++
++
++class _Entry:
++    """An mHC sublayer entry (``post_pre``): the streams, the incoming mixes and fn;
++    its output ``y`` and that output's MXFP8 cast ``mx``."""
++
++    def __init__(self, rows: int, gen: torch.Generator):
++        def randn(*shape, scale=1.0):
++            return torch.randn(*shape, generator=gen, device=DEVICE) * scale
++
++        splits = HIDDEN // mhc.BLOCK_H
++        self.fn = randn(mhc.MIXES, mhc.MULT * HIDDEN, scale=0.02)
++        self.scale = randn(3, scale=0.1) + 1.0
++        self.base = randn(mhc.MIXES, scale=0.1)
++        self.weight = (randn(HIDDEN, scale=0.1) + 1.0).bfloat16()
++        self.streams = torch.empty(
++            (rows, mhc.MULT * HIDDEN), dtype=torch.bfloat16, device=DEVICE
++        )
++        self.P = torch.empty((splits, rows, 1, mhc.MIXES), device=DEVICE)
++        self.S = torch.empty((splits, rows, 1), device=DEVICE)
++        self.C = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++        self.Q = torch.empty((splits, rows), device=DEVICE)
++        self.post = torch.empty((rows, mhc.MULT), device=DEVICE)
++        self.comb = torch.empty((rows, mhc.MULT, mhc.MULT), device=DEVICE)
++        self.pre = torch.empty((rows, mhc.MULT), device=DEVICE)
++        self.y = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++        self.mx = linear.empty_mxfp8(self.y)
++        self.project = mhc.project_streams(
++            HIDDEN, "post_pre", block_M=mhc.BLOCK_M, world=1
++        )
++        self.finalize = mhc.finalize(
++            HIDDEN, mhc.MULT * HIDDEN, RMS_EPS, HC_EPS, SINKHORN, RMS_EPS
++        )
++
++    def __call__(self, x, streams, post, comb, pre) -> None:
++        """Fold ``x`` (post, comb) into ``streams``; project, collapse with ``pre``."""
++        self.project(
++            x.unsqueeze(0),
++            streams,
++            post,
++            comb,
++            pre,
++            self.fn,
++            self.streams,
++            self.P,
++            self.S,
++            self.C,
++            self.Q,
++        )
++        self.finalize(
++            self.P,
++            self.S,
++            self.C,
++            self.Q,
++            self.scale,
++            self.base,
++            self.weight,
++            self.post,
++            self.comb,
++            self.pre,
++            self.y,
++            self.mx.values,
++            self.mx.scales,
++        )
++
++
++class LayerChain:
++    """The layer's kernels and buffers at ``rows`` rows; see the module docstring."""
++
++    def __init__(self, rows: int, seed: int = 0):
++        gen = torch.Generator(device=DEVICE).manual_seed(seed)
++
++        def randn(*shape, scale=1.0):
++            return torch.randn(*shape, generator=gen, device=DEVICE) * scale
++
++        self.rows = rows
++        self.tk = linear._tile_kernels()
++        # The chain's inputs: the streams, the previous FFN output and its mixes.
++        self.x = randn(rows, HIDDEN).bfloat16()
++        self.streams = randn(rows, mhc.MULT * HIDDEN).bfloat16()
++        self.post_in = torch.rand((rows, mhc.MULT), generator=gen, device=DEVICE) * 2
++        self.comb_in = torch.softmax(randn(rows, mhc.MULT, mhc.MULT), dim=-1)
++        self.pre_in = torch.softmax(randn(rows, mhc.MULT), dim=-1) + 1e-6
++        self.attention_entry = _Entry(rows, gen)
++        self.ffn_entry = _Entry(rows, gen)
++        self.qa_kv = _block32(*QA_KV, gen, mxfp8_input=True)
++        self.q_norm = TileLangRMSNorm(Q_LATENT)
++        self.q_norm.weight.data = (randn(Q_LATENT, scale=0.1) + 1.0).bfloat16()
++        self.q_norm.declare_kernels()
++        self.q_b = _block32(*Q_B, gen)
++        self.wo = TileLangWOProjection(
++            _Projection(*WO_A, gen), _Projection(*WO_B, gen), groups=WO_GROUPS
++        )
++        self.wo.declare_kernels()
++        self.gate_up = _block32(2 * SHARED, HIDDEN, gen, mxfp8_input=True)
++        self.down = _block32(HIDDEN, SHARED, gen)
++        self.swiglu = swiglu_clamp_kernel(SHARED, LIMIT)
++        self.plan = MoeExpertsV41Plan(
++            EXPERTS,
++            TOPK,
++            HIDDEN,
++            SHARED,
++            swiglu_limit=LIMIT,
++            out_dtype=torch.float32,
++        )
++        self.plan.declare_kernels()
++
++        def codes(*shape):  # packed E2M1 pairs
++            out = torch.empty(shape, dtype=torch.uint8, device=DEVICE)
++            return out.random_(generator=gen)
++
++        def exponents(*shape):  # UE8M0 scales 2^-9 to 2^-6
++            return torch.randint(
++                118, 122, shape, generator=gen, device=DEVICE, dtype=torch.uint8
++            )
++
++        w13 = codes(EXPERTS, 2 * SHARED, HIDDEN // 2)
++        w13_sf = exponents(EXPERTS, 2 * SHARED, HIDDEN // 32)
++        w2 = codes(EXPERTS, HIDDEN, SHARED // 2)
++        w2_sf = exponents(EXPERTS, HIDDEN, SHARED // 32)
++        self.experts = self.plan.prepare_weights(w13, w13_sf, w2, w2_sf)
++        del w13, w13_sf, w2, w2_sf
++        self.ids = torch.stack(
++            [
++                torch.randperm(EXPERTS, generator=gen, device=DEVICE)[:TOPK]
++                for _ in range(rows)
++            ]
++        ).contiguous()
++        self.route_weights = (
++            torch.rand((rows, TOPK), generator=gen, device=DEVICE) + 0.1
++        ).contiguous()
++        self.workspace = torch.empty(
++            workspace_bytes(self.plan.workspace_specs(rows, self.ids.dtype)),
++            dtype=torch.uint8,
++            device=DEVICE,
++        )
++
++        def empty(cols, dtype=torch.bfloat16):
++            return torch.empty((rows, cols), dtype=dtype, device=DEVICE)
++
++        self.qa = empty(QA_KV[0])
++        self.qn = empty(Q_LATENT)
++        self.qb = empty(Q_B[0])
++        self.wo_out = empty(HIDDEN)
++        self.h = empty(2 * SHARED)
++        self.act = empty(SHARED)
++        self.shared_out = empty(HIDDEN)
++        self.out = empty(HIDDEN)
++        self.casts = {
++            name: [
++                torch.empty(shape, dtype=dtype, device=DEVICE)
++                for shape, dtype in linear._activation_specs(
++                    rows, k, layer.tilelang_decode_rows
++                )
++            ]
++            for name, k, layer in (
++                ("q_b", Q_LATENT, self.q_b),
++                ("wo_b", WO_B[1], self.wo.b),
++                ("down", SHARED, self.down),
++            )
++        }
++        self.partials = [
++            torch.empty(shape, dtype=dtype, device=DEVICE)
++            for shape, dtype in self.wo.a.partial_specs(rows)
++        ]
++        self.aux = torch.cuda.Stream()
++
++    def _project(self, name: str, layer: _Projection, x, out) -> None:
++        """A block-32 projection: TileKernels' MXFP8 cast, then the decode GEMM."""
++        xq, sf = self.casts[name]
++        self.tk.quant.per_token_cast(
++            x,
++            "e4m3",
++            32,
++            round_sf=True,
++            use_packed_ue8m0=True,
++            out=(xq[: self.rows], sf[: self.rows]),
++        )
++        linear._block32_gemm(layer, xq, sf, out, self.rows)
++
++    def run(self) -> None:
++        """The layer's kernels on the current stream (the shared expert on ``aux``)."""
++        rows, a, f = self.rows, self.attention_entry, self.ffn_entry
++        a(self.x, self.streams, self.post_in, self.comb_in, self.pre_in)
++        linear._block32_gemm(self.qa_kv, a.mx.values, a.mx.scales, self.qa, rows)
++        self.q_norm(self.qa[:, :Q_LATENT], out=self.qn)
++        self._project("q_b", self.q_b, self.qn, self.qb)
++        xq, sf = self.casts["wo_b"]
++        self.wo.a(
++            self.qb, xq[:rows], sf[:rows], self.partials[0] if self.partials else None
++        )
++        linear._block32_gemm(self.wo.b, xq, sf, self.wo_out, rows)
++        f(self.wo_out, a.streams, a.post, a.comb, a.pre)
++        main = torch.cuda.current_stream()
++        self.aux.wait_stream(main)
++        with torch.cuda.stream(self.aux):
++            linear._block32_gemm(self.gate_up, f.mx.values, f.mx.scales, self.h, rows)
++            self.swiglu(self.h, self.act)
++            self._project("down", self.down, self.act, self.shared_out)
++
++        def shared():
++            main.wait_stream(self.aux)
++            return self.shared_out
++
++        self.plan.run(
++            f.mx,
++            self.ids,
++            self.route_weights,
++            self.experts,
++            self.out,
++            self.workspace,
++            shared=shared,
++        )
++
++    def outputs(self) -> dict[str, torch.Tensor]:
++        """Every buffer a kernel of the chain writes (live rows), the layer's output
++        last. The routed experts' workspace is left out: the dispatch owns it."""
++        a, f, rows = self.attention_entry, self.ffn_entry, self.rows
++        out = {}
++        for name, entry in (("attention", a), ("ffn", f)):
++            for field in ("streams", "P", "S", "C", "Q", "post", "comb", "pre", "y"):
++                out[f"{name} {field}"] = getattr(entry, field)
++            out[f"{name} cast"] = entry.mx.values[:rows]
++            out[f"{name} scales"] = entry.mx.scales[:rows]
++        for name, (xq, sf) in self.casts.items():
++            out[f"{name} cast"] = xq[:rows]
++            out[f"{name} scales"] = sf[:rows]
++        for i, partials in enumerate(self.partials):
++            out[f"wo-a partials {i}"] = partials
++        out.update(
++            {
++                "q-a/kv": self.qa,
++                "q latent": self.qn,
++                "q-b": self.qb,
++                "wo-b": self.wo_out,
++                "shared gate/up": self.h,
++                "shared swiglu": self.act,
++                "shared down": self.shared_out,
++                "layer output": self.out,
++            }
++        )
++        return out
++
++    def poison(self) -> None:
++        """NaN in every buffer ``outputs`` lists, padding rows included: a kernel that
++        read one before its producer wrote it would carry a NaN to the output."""
++        for tensor in self.outputs().values():
++            if tensor.dtype.is_floating_point and tensor.element_size() > 1:
++                tensor.fill_(float("nan"))
++        casts = [*self.casts.values()]
++        casts += [entry.mx[1:] for entry in (self.attention_entry, self.ffn_entry)]
++        for xq, sf in casts:
++            xq.view(torch.uint8).fill_(0x7F)  # E4M3 NaN
++            sf.fill_(0xFF)  # UE8M0 NaN
++
++    def digests(self) -> dict[str, str]:
++        """A short SHA-256 of each buffer ``outputs`` lists."""
++        return {
++            name: hashlib.sha256(
++                tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
++            ).hexdigest()[:16]
++            for name, tensor in self.outputs().items()
++        }
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+new file mode 100644
+index 000000000..a0e44df01
+--- /dev/null
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""pytest plugin (``-p tests.kernels.deepseek_v41_pdl_sources``): every DeepSeek-V4.1
++kernel a test session launches is checked for PDL in its CUDA source.
++
++Run with the DS4.1 TileLang kernel tests, it records each TileLang kernel at its
++first launch and, when the session ends, checks every ``__global__`` function:
++
++- a kernel of the PDL chain (``CHAIN``; ``gemm_mxfp8`` when compiled without warp
++  specialization) calls ``cudaGridDependencySynchronize()`` outside any block
++  (every thread waits) and before any statement that names one of its pointer
++  parameters, then ``cudaTriggerProgrammaticLaunchCompletion()``;
++- a warp-specialized GEMM (``WARP_SPECIALIZED``, ``gemm_mxfp8``'s prefill tiles)
++  has no PDL: its producer warps' loads would have to follow the wait too;
++- any other kernel that waits (TileKernels', whose PDL switch ``pdl.tile_kernels``
++  turns on) waits before it names a pointer parameter.
++
++A violation fails the session. TileKernels' switch is turned on when the session
++starts, so its kernels compile as serving compiles them.
++"""
++
++import re
++
++CHAIN = {
++    "activation_swiglu_clamp",
++    "cache_writer",
++    "compress",
++    "compress_gather_partial_state",
++    "gemm_bf16_splitk",
++    "gemm_fp8w_bf16",
++    "gemm_fp8w_bf16_cast",
++    "gemm_fp8w_bf16_partials",
++    "gemm_mxfp8_partials",
++    "gemm_splitk_reduce",
++    "gemm_splitk_reduce_cast",
++    "gemm_splitk_reduce_two",
++    "indexer_mxfp4_quantize",
++    "indexer_score",
++    "indexer_topk_merge",
++    "indexer_topk_segment",
++    "metadata_builder",
++    "metadata_chunk",
++    "metadata_decode",
++    "metadata_pages",
++    "mhc_collapse",
++    "mhc_collapse_column",
++    "mhc_finalize",
++    "mhc_post",
++    "mhc_project_streams",
++    "moe_combine",
++    "moe_dispatch",
++    "moe_grouped_fp8_fp4_gemm",
++    "moe_swiglu_cast_kernel",
++    "rope",
++    "router_partials",
++    "routing_masks",
++    "sparse_mla",
++}
++WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
++WAIT = "cudaGridDependencySynchronize()"
++TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
++_GLOBAL = re.compile(
++    r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?(\w+)\s*\("
++)
++
++_kernels: dict[int, object] = {}
++
++
++def _matching(text: str, start: int, open_: str, close: str) -> int:
++    """The index just past the bracket closing the one before ``start``."""
++    depth = 1
++    while depth:
++        depth += {open_: 1, close: -1}.get(text[start], 0)
++        start += 1
++    return start
++
++
++def functions(source: str):
++    """``(name, pointer parameter names, body)`` of every ``__global__`` function."""
++    for match in _GLOBAL.finditer(source):
++        end = _matching(source, match.end(), "(", ")")
++        params = source[match.end() : end - 1]
++        open_body = source.index("{", end)
++        body = source[open_body + 1 : _matching(source, open_body + 1, "{", "}") - 1]
++        pointers = [
++            re.findall(r"\w+", param)[-1] for param in params.split(",") if "*" in param
++        ]
++        yield match.group(1), pointers, body
++
++
++def violations(source: str, warp_specialized: bool) -> list[str]:
++    """What is wrong with one compiled module's kernels, if anything."""
++    out = []
++    for name, pointers, body in functions(source):
++        base = re.sub(r"_kernel(_\d+)?$", "", name)
++        wait = body.find(WAIT)
++        if base in WARP_SPECIALIZED or (base == "gemm_mxfp8" and warp_specialized):
++            if wait >= 0 or TRIGGER in body:
++                out.append(f"{name}: warp-specialized, but uses PDL")
++            continue
++        chain = base in CHAIN or base == "gemm_mxfp8"
++        if wait < 0:
++            if chain:
++                out.append(f"{name}: on the PDL chain, but never waits")
++            continue
++        before = body[:wait]
++        if before.count("{") != before.count("}"):
++            out.append(f"{name}: waits inside a block, so some threads may not")
++        # A parameter, not a member such as threadIdx.x.
++        early = [
++            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++        ]
++        if early:
++            out.append(f"{name}: names {', '.join(early)} before the wait")
++        if chain and body.find(TRIGGER) < wait:
++            out.append(f"{name}: does not trigger its dependents after the wait")
++    return out
++
++
++def pytest_configure(config):
++    import tilelang.jit.kernel as kernel_module
++
++    from vllm.models.deepseek_v4_1.tilelang import pdl
++
++    pdl.tile_kernels()
++    launch = kernel_module.JITKernel.__call__
++
++    def recorded(self, *args, **kwargs):
++        _kernels.setdefault(id(self), self)
++        return launch(self, *args, **kwargs)
++
++    kernel_module.JITKernel.__call__ = recorded
++
++
++def pytest_sessionfinish(session, exitstatus):
++    problems, checked, waiting = [], 0, 0
++    for kernel in _kernels.values():
++        source = kernel.get_kernel_source()
++        configs = {
++            str(key): value for key, value in (kernel.pass_configs or {}).items()
++        }
++        warp_specialized = not any(
++            "disable_warp_specialized" in key and value
++            for key, value in configs.items()
++        )
++        checked += 1
++        waiting += WAIT in source
++        problems.extend(violations(source, warp_specialized))
++    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
++    lines = [
++        f"PDL sources: {checked} kernels launched, {waiting} with PDL, "
++        f"{len(problems)} violations"
++    ] + [f"  {problem}" for problem in sorted(set(problems))]
++    for line in lines:
++        if reporter is not None:
++            reporter.write_line(line)
++        else:
++            print(line)
++    if problems:
++        session.exitstatus = 1
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_pdl.py b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+new file mode 100644
+index 000000000..be999fada
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Programmatic dependent launch on DeepSeek-V4.1's decode chain (``tilelang/pdl.py``).
++
++PDL changes when a kernel launches, never what it computes. These tests check that
++the launches are programmatic in CUDA graphs and that nothing reads early:
++
++- a reader that loads its input before ``griddepcontrol.wait`` sees a slow
++  producer's buffer before the producer writes it (the edge is programmatic: the
++  reader runs beside the producer), and a reader that waits first never does;
++- one decode layer's chain (``deepseek_v41_pdl_chains``), replayed in a CUDA graph
++  with every intermediate buffer poisoned with NaN before each replay, gives its
++  eager outputs bit for bit on every replay;
++- TileKernels compiles with its PDL switch on.
++
++``deepseek_v41_pdl_sources`` (a pytest plugin) checks the compiled sources of every
++chain kernel that the DS4.1 kernel tests build: the wait comes before any access to
++global memory.
++"""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++tilelang = pytest.importorskip("tilelang")
++pytest.importorskip("tile_kernels")
++
++import tilelang.language as T  # noqa: E402
++
++from tests.kernels.deepseek_v41_pdl_chains import ROWS, LayerChain  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import pdl  # noqa: E402
++
++DEVICE = "cuda"
++REPLAYS = 20
++THREADS = 128
++# FMA steps a producer thread runs before it writes: tens of microseconds on GB10,
++# far longer than a launch.
++SPIN = 20000
++POISON = -1.0
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def slow_copy(n: int):
++    """``dst = src`` after a spin, on the PDL chain."""
++
++    @T.prim_func
++    def pdl_slow_copy(
++        src: T.Tensor((n,), T.float32),
++        dst: T.Tensor((n,), T.float32),
++    ):
++        with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
++            pdl.chain()
++            i = bx * THREADS + T.get_thread_binding()
++            acc = T.alloc_var(T.float32, init=src[i])
++            for _ in T.serial(SPIN):
++                acc = acc * 0.999999 + 1e-6
++            # A comparison the compiler cannot fold keeps the spin.
++            dst[i] = T.if_then_else(acc == 12345.5, POISON - 1.0, src[i])
++
++    return pdl_slow_copy
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def reader(n: int, early: bool):
++    """``out = dst``; with ``early``, ``dst`` is loaded before the wait."""
++
++    @T.prim_func
++    def pdl_reader(
++        dst: T.Tensor((n,), T.float32),
++        out: T.Tensor((n,), T.float32),
++    ):
++        with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
++            i = bx * THREADS + T.get_thread_binding()
++            value = T.alloc_var(T.float32)
++            if early:
++                value = dst[i]
++                T.pdl_sync()
++            else:
++                pdl.chain()
++                value = dst[i]
++            out[i] = value
++
++    return pdl_reader
++
++
++def _graph(fn) -> torch.cuda.CUDAGraph:
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        fn()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        fn()
++    return graph
++
++
++def test_tile_kernels_pdl_on():
++    tk = pdl.tile_kernels()
++    assert tk.get_pdl()
++
++
++@pytest.mark.parametrize("early", [True, False])
++def test_reader_waits_for_its_producer(early, n=48 * THREADS):
++    """In a CUDA graph a reader starts beside its producer: one that loads before
++    its wait reads the producer's buffer unwritten; one that waits first reads what
++    the producer wrote, on every replay."""
++    src = torch.arange(n, dtype=torch.float32, device=DEVICE)
++    dst = torch.empty_like(src)
++    out = torch.empty_like(src)
++    copy, read = slow_copy(n), reader(n, early)
++
++    def chain():
++        copy(src, dst)
++        read(dst, out)
++
++    graph = _graph(chain)
++    early_reads = 0
++    for _ in range(REPLAYS):
++        dst.fill_(POISON)
++        out.zero_()
++        graph.replay()
++        torch.cuda.synchronize()
++        stale = int((out == POISON).sum())
++        if not early:
++            assert stale == 0, f"{stale} elements read before the producer wrote them"
++            assert torch.equal(out, src)
++        early_reads += stale
++    if early:
++        # Without this the edges are not programmatic and PDL does nothing.
++        assert early_reads > 0, "the early reader never ran beside its producer"
++
++
++@pytest.mark.usefixtures("default_vllm_config")
++@pytest.mark.parametrize("step", sorted(ROWS))
++def test_layer_chain_replays_bit_equal(step):
++    """The layer's chain in a CUDA graph, every intermediate poisoned before each
++    replay: every replay gives the eager outputs' bits, and the output is finite."""
++    chain = LayerChain(ROWS[step])
++    chain.poison()
++    chain.run()
++    torch.cuda.synchronize()
++    want = chain.digests()
++    assert torch.isfinite(chain.out).all()
++    graph = _graph(chain.run)
++    for replay in range(REPLAYS):
++        chain.poison()
++        graph.replay()
++        torch.cuda.synchronize()
++        got = chain.digests()
++        differ = [name for name in want if got[name] != want[name]]
++        assert not differ, f"replay {replay}: {differ} differ from the eager run"

@@ -67,6 +67,7 @@
   "tests/entrypoints/openai/test_reasoning_enable_thinking.py": "reasoning_effort and the DeepSeek API's top-level thinking switch mapped into the chat template",
   "tests/jit_monitor/test_hooks.py": "the JIT monitor's Triton, CuTe DSL and TileLang hooks (production runs it from preparation on)",
   "tests/jit_monitor/test_hooks_gpu.py": "the JIT monitor detecting a real Triton recompile",
+  "tests/kernels/attention/test_deepseek_v41_ced_replay.py": "CED replays the prompt's last 128 rows wherever its chunks end: a decoder stack on the TileLang kernels under several chunkings, bit for bit against one chunk",
   "tests/kernels/attention/test_deepseek_v41_tilelang.py": "TileLang indexer and sparse MLA against torch references, selected records only, NaN",
   "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py": "TileLang MoE experts against an FP32 reference, batch invariance, shared-expert fold, NaN",
   "tests/kernels/moe/test_deepseek_v41_tilelang_router.py": "TileKernels router and fused gate-router against DeepSeek's gate; padding and CED masks",
@@ -88,7 +89,8 @@
   "tests/kernels/test_deepseek_v41_tilelang_glp.py": "GLP steering's TileLang projection against FP64 and the FP32 torch projection (rounding, batch independence, non-finite rows, declaration)",
   "tests/kernels/test_deepseek_v41_tilelang_metadata.py": "TileLang attention metadata against the Triton kernels it replaced",
   "tests/kernels/test_deepseek_v41_tilelang_mhc.py": "TileLang mHC pre, post and collapse against FP32; rank-order parts; NaN",
-  "tests/kernels/test_deepseek_v41_tilelang_rope.py": "TileLang RoPE against TileKernels and FP64",
+  "tests/kernels/test_deepseek_v41_tilelang_pdl.py": "programmatic dependent launch on the decode chain: programmatic graph edges, no read before the wait in replays or eager launches, a layer's chain bit for bit with poisoned buffers, TileKernels' chained calls",
+  "tests/kernels/test_deepseek_v41_tilelang_rope.py":"TileLang RoPE against TileKernels and FP64",
   "tests/kernels/test_deepseek_v41_tilelang_vision.py": "the TileLang vision tower: B12X's SIMT projection at few rows, torch's GELU, accuracy against FP64",
   "tests/model_executor/model_loader/test_direct_loader.py": "the direct loader (--load-format direct) without a GPU: its descriptors executed on host memory equal Torch's copies (TP shards, strided and padded destinations, BF16 expansion, scratch conversions), header checks, Engram file-source descriptors, the host-page-table refusal, the helper's build",
   "tests/model_executor/model_loader/test_direct_loader_cuda.py": "the direct loader's O_DIRECT bounce ring on the GPU (B12X's test_direct.py): exact bytes at large offsets, untouched padding, failures without a buffered retry, a routed module's digest equal to a Torch copy's; DIRECT_IO_TEST_DIR on /c",
@@ -163,7 +165,8 @@
   "tests/v1/worker/test_mixed_warmup_gate.py": "the kernel warm-up gate: fixed drafts warmed before the adaptive verification manager is restored",
   "tests/v1/worker/test_mtp_target_states.py": "a target without an MTP override buffer",
   "tests/v1/worker/test_prepare_kernels.py": "the worker's kernel-preparation order, TileLang and B12X",
-  "tests/v1/worker/test_startup_rendezvous.py": "the startup rendezvous: liveness heartbeats, a stopped rank named"
+  "tests/v1/worker/test_startup_rendezvous.py": "the startup rendezvous: liveness heartbeats, a stopped rank named",
+  "tests/v1/worker/test_workspace.py": "workspace lanes and reservations; the TileLang attention scratch reserved in its model's lane, so the drafter's lane does not take the target's (changed by the series)"
  },
  "notes": "The DeepSeek V4.1 Flash deployment's vLLM tests (docs/testing.md). gate: exact paths, every test must pass or skip; excluded: paths or globs, with the reason; deselect: tests of gate files left out, with the reason. scripts/release_tests.py check refuses a selected file this does not classify.",
  "periodic": {},

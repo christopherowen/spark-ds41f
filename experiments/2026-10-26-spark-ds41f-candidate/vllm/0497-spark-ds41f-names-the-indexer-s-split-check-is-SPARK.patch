@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:28:18 +0100
+Subject: [PATCH 497/497] spark-ds41f names: the indexer's split check is
+ SPARK_DS41F_INDEXER_SPLIT_CHECK
+
+The SPARK3_* to SPARK_DS41F_* rename kept this variable's model infix, so
+it read SPARK_DS41F_DS41_INDEXER_SPLIT_CHECK: the project name already says
+DS4.1. It is a validation switch (off unless set): under a sequence-parallel
+indexer split every rank also runs the full-row indexer and compares its rows.
+No recipe sets it, and nothing else reads the old name.
+
+Tests: none read the variable; serving is unchanged with it unset.
+---
+ vllm/models/deepseek_v4_1/attention.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index ac6f73a92..b9512167d 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -48,7 +48,7 @@ logger = init_logger(__name__)
+ 
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+-_INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_DS41_INDEXER_SPLIT_CHECK") == "1"
++_INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_INDEXER_SPLIT_CHECK") == "1"
+ 
+ 
+ def _source(prefix, layer):

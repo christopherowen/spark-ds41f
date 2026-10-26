@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:44:27 +0100
+Subject: [PATCH 517/517] [DS4.1] Live-page tables: the page loads issue before
+ the stores
+
+Run 3 (dgx4, 20:34 CET) loaded each entry once, as a71368f70 meant, and was
+still 6.4 us against 3.2 at a full 1M context. The live-page loop put each
+column's load and its store under one branch. Scheduling stays inside the
+branch, so each store waited for its load before the next column's load
+issued: an L2 round trip a column (about 0.15 us; 32 of them at 1M). The
+kernel that wrote every column loads in a select and stores
+unconditionally, so its loads issue back to back. The page part now loads
+the thread's columns into registers first, each load a select, and then
+stores the live ones.
+---
+ .../models/deepseek_v4_1/tilelang/metadata.py | 27 ++++++++++---------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 460a12dac..38af81b9a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -274,10 +274,11 @@ def decode_metadata_kernel(
+     req_count = T.dynamic("req_count")
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
+-    # Blocks as wide as the window part; the page part loops over the row's live
+-    # pages (idle threads cost the prefill rows' blocks). The loop keeps the table
+-    # width's trip count, so it unrolls and a long context's loads overlap; past the
+-    # live pages an iteration is a compare.
++    # Blocks as wide as the window part; the page part covers the row's live pages
++    # (idle threads cost the prefill rows' blocks). It loads the thread's columns
++    # first, each load a select (predicated, no branch), then stores the live ones,
++    # so a long context's loads issue back to back as the full-width kernel's did. A
++    # load and its store under one branch per column wait a round trip each.
+     threads, per_thread = _threads(width)
+     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+     main_per_thread = (main_width + threads - 1) // threads
+@@ -305,9 +306,7 @@ def decode_metadata_kernel(
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+             live = T.alloc_var(T.int32)  # the page part's columns
+-            # One load a column: as an alias, the select below would load it twice, the
+-            # second load waiting on the first's value.
+-            entry = T.alloc_var(T.int32)
++            entries = T.alloc_local((main_per_thread,), T.int32)
+             if part == 0:
+                 window_row(
+                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+@@ -320,11 +319,15 @@ def decode_metadata_kernel(
+                 )
+                 if req < 0:
+                     live = 0
+-                for k in T.serial(main_per_thread):
+-                    col = k * threads + tx
+-                    if col < live:
+-                        entry = main_table[req, col]
+-                        main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
++                for k in T.unroll(main_per_thread):
++                    entries[k] = T.if_then_else(
++                        k * threads + tx < live, main_table[req, k * threads + tx], 0
++                    )
++                for k in T.unroll(main_per_thread):
++                    if k * threads + tx < live:
++                        main_pages[row, k * threads + tx] = T.if_then_else(
++                            entries[k] > 0, entries[k], -1
++                        )
+ 
+     return metadata_decode
+ 

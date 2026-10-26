@@ -1,0 +1,25 @@
+{
+ "notes": "Candidate 7 at tp4-ring: spark-ds41f-1025's recipe (config/cluster.json) on candidate 7's image and lock (vLLM patch head 8203a3b8, tree fbd941eb), with the series' three recipe changes: --load-format direct (0499), VLLM_PLUGINS empty so that no plugin loads (B12X's loader plugin is not needed; unset would load every installed plugin), and no VLLM_DS41_KERNEL_BACKEND (0494 removed the switch; the source manifest records tilelang-only). Every other variable is read as on 1025 (README).",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-ring"
+ },
+ "set": {
+  "container": {
+   "image": "spark-ds41f:19f2c20ed4d6-next-7",
+   "expected_labels": {
+    "local.spark-ds41f.vllm.tree": "fbd941eb861bd44fc03d4ae6b1c4bba270e0633d"
+   }
+  },
+  "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/upstreams.lock.json",
+  "environment": {
+   "VLLM_PLUGINS": ""
+  }
+ },
+ "serve_options": {
+  "--load-format": "direct"
+ },
+ "unset": [
+  "environment.VLLM_DS41_KERNEL_BACKEND"
+ ]
+}

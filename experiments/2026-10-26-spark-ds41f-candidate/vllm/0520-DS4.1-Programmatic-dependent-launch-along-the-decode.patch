@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:46:55 +0100
+Subject: [PATCH 520/520] [DS4.1] Programmatic dependent launch along the
+ decode chain
+
+A decode step is one chain of about 1,850 kernels in CUDA graphs. On its
+critical path (request-inventory-5's rank-0 traces) the graph-internal launch
+gaps between consecutive kernels of one capture stream are 3.5% of a
+one-stream greedy step (median 0.51 us), 4.5% sampled and 1.6% at eight
+streams; cross-stream joins are under 0.01%.
+
+Every kernel on the layer chain now begins with pdl.chain():
+griddepcontrol.wait before any global access, so a kernel sees exactly what
+a serialized launch would, then launch_dependents, so the next kernel's
+launch and CTA start-up overlap this one's body. TileLang marks a kernel that
+waits for programmatic stream serialization, which CUDA graph capture keeps
+as a programmatic edge. Kernels: mHC entry, finalize, post and collapse; the
+decode MXFP8 GEMMs, split-K partials and reduces, WO-A; RoPE, cache writes,
+sparse-MLA metadata and attention, the indexer and compressor; MoE dispatch,
+grouped GEMMs, SwiGLU cast and combine; routing; the shared expert's SwiGLU.
+TileKernels' casts and norms use DeepSeek's own switch (pdl.tile_kernels).
+
+The warp-specialized GEMMs keep their launch (gemm_bf16, gemm_bf16_two and
+gemm_bf16_partials: the router and the other BF16 projections; the MXFP8
+prefill tiles): their producer warps' TMA loads would have to follow the
+wait as well. mxfp8_gemm_decode always chains; mxfp8_gemm never.
+
+Scheduling only: no arithmetic, input or store order changes.
+---
+ .../deepseek_v4_1/tilelang/activation.py      |  3 +-
+ .../deepseek_v4_1/tilelang/cache_writer.py    |  3 +-
+ .../models/deepseek_v4_1/tilelang/compress.py |  4 ++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 51 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  7 ++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  6 +--
+ .../models/deepseek_v4_1/tilelang/metadata.py |  6 +++
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  7 ++-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 12 +++--
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  6 +--
+ vllm/models/deepseek_v4_1/tilelang/pdl.py     | 50 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/rope.py    |  3 +-
+ vllm/models/deepseek_v4_1/tilelang/router.py  |  8 +--
+ .../deepseek_v4_1/tilelang/sparse_mla.py      |  5 +-
+ 14 files changed, 149 insertions(+), 22 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/pdl.py
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index 9e88588ba..ceaa5f88b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -18,7 +18,7 @@ import tilelang.language as T
+ import torch
+ from torch import nn
+ 
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ _VEC = 8
+ 
+@@ -39,6 +39,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+         Y: T.Tensor((M, n), T.bfloat16),
+     ):
+         with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
++            pdl.chain()
+             col = (bx * threads + T.get_thread_binding()) * _VEC
+             gate = T.alloc_local((_VEC,), T.bfloat16)
+             up = T.alloc_local((_VEC,), T.bfloat16)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+index 6dd8a6353..3ad50cbd2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -26,7 +26,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+-from . import prepare
++from . import pdl, prepare
+ 
+ DIM = 512
+ RECORD_BYTES = {"swa": 528, "indexed": 288}
+@@ -101,6 +101,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+     ):
+         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
+             T.import_source(_CVT_HEADER)
++            pdl.chain()
+             tx = T.get_thread_binding()
+             token = bx * tokens_per_block + tx // per_token
+             item = tx % per_token
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index 9c89f51cc..66e19e712 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -32,6 +32,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import pdl
++
+ DIM = 512
+ STATE = 2 * DIM  # a ring slot: the value, then the gate
+ EPS = 1e-20
+@@ -63,6 +65,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+         local_ids: T.Tensor((max_requests,), T.int64),
+     ):
+         with T.Kernel(max_requests, threads=128) as r:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             buf = T.alloc_local((_VEC,), T.float32)
+             nt = counts[0]
+@@ -129,6 +132,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+         emitted_slots: T.Tensor((rows,), T.int64),
+     ):
+         with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             token = bx * warps + tx // 32
+             lane = tx % 32
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 32e61eb7a..85819043c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -20,6 +20,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import pdl
++
+ SF_BLOCK = 32  # K elements per UE8M0 scale
+ SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
+ 
+@@ -58,6 +60,7 @@ def _mxfp8_gemm(
+     swizzle_panel: int = 0,
+     groups: int = 1,
+     shards: int = 1,
++    pdl_chain: bool = False,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -87,6 +90,10 @@ def _mxfp8_gemm(
+     zero and the shards are added in order: the arithmetic of
+     ``mxfp8_gemm_partials`` plus ``splitk_reduce``, so a narrow projection's
+     split-K decode rows give its prefill rows' bits.
++
++    ``pdl_chain`` starts the kernel with ``pdl.chain()``: the decode tiles
++    (``mxfp8_gemm_decode``), which compile without warp specialization, do; the
++    warp-specialized prefill tiles do not.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0, (
+         "block_K must divide K and be a multiple of 64"
+@@ -119,6 +126,8 @@ def _mxfp8_gemm(
+         ) as (bx, by):
+             if swizzle_panel:
+                 T.use_swizzle(panel_size=swizzle_panel)
++            if pdl_chain:
++                pdl.chain()
+             # The group's activation columns and scale words.
+             group = bx * block_N // N
+             a_k = group * K if groups > 1 else 0
+@@ -218,6 +227,7 @@ def _mxfp8_gemm_partials(
+         with T.Kernel(
+             T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
+         ) as (bx, s, by):
++            pdl.chain()
+             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
+             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+@@ -255,10 +265,42 @@ def _mxfp8_gemm_partials(
+     return gemm_mxfp8_partials
+ 
+ 
++def _mxfp8_gemm_decode(
++    N: int,
++    K: int,
++    block_M: int = 128,
++    block_N: int = 128,
++    block_K: int = 128,
++    num_stages: int = 2,
++    threads: int = 128,
++    out_dtype: T.dtype = T.bfloat16,
++    padded_rows: bool = False,
++    swizzle_panel: int = 0,
++    groups: int = 1,
++    shards: int = 1,
++):
++    """``_mxfp8_gemm``'s decode tiles: no warp specialization, on the PDL chain."""
++    return _mxfp8_gemm(
++        N,
++        K,
++        block_M,
++        block_N,
++        block_K,
++        num_stages,
++        threads,
++        out_dtype,
++        padded_rows,
++        swizzle_panel,
++        groups,
++        shards,
++        pdl_chain=True,
++    )
++
++
+ mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
+ mxfp8_gemm_decode = tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+-)(_mxfp8_gemm)
++)(_mxfp8_gemm_decode)
+ mxfp8_gemm_partials = tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ )(_mxfp8_gemm_partials)
+@@ -285,6 +327,7 @@ def splitk_reduce(
+         P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)
+     ):
+         with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bx, m):
++            pdl.chain()
+             acc = T.alloc_fragment((block_N,), T.float32)
+             # Columns past N (a narrow projection's last block) are skipped.
+             for j in T.Parallel(block_N):
+@@ -393,6 +436,7 @@ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128
+         S: T.Tensor((M, N // 32), T.uint8),
+     ):
+         with T.Kernel(N // 128, T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            pdl.chain()
+             X = T.alloc_fragment((block_M * blocks, 32), T.float32)
+             amax = T.alloc_fragment((block_M * blocks,), T.float32)
+             inv = T.alloc_fragment((block_M * blocks,), T.float32)
+@@ -535,6 +579,7 @@ def fp8w_bf16_gemm(
+             bx,
+             by,
+         ):
++            pdl.chain()
+             g = bx // n_tiles
+             n0 = g * N + (bx % n_tiles) * block_N
+             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+@@ -604,6 +649,7 @@ def fp8w_bf16_gemm_cast(
+             bx,
+             by,
+         ):
++            pdl.chain()
+             g = bx // n_tiles
+             n0 = g * N + (bx % n_tiles) * block_N
+             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+@@ -707,6 +753,7 @@ def fp8w_bf16_gemm_partials(
+         with T.Kernel(
+             groups * n_tiles, shards, T.ceildiv(M, block_M), threads=threads
+         ) as (bx, s, by):
++            pdl.chain()
+             g = bx // n_tiles
+             n0 = g * N + (bx % n_tiles) * block_N
+             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+@@ -748,6 +795,7 @@ def splitk_reduce_two(
+         C1: T.Tensor((M, N), out_dtype),
+     ):
+         with T.Kernel(2 * tiles, M, threads=threads) as (bx, m):
++            pdl.chain()
+             acc = T.alloc_fragment((block_N,), T.float32)
+             for j in T.Parallel(block_N):
+                 acc[j] = P[0, m, bx * block_N + j]
+@@ -950,6 +998,7 @@ def bf16_gemm_splitk(
+             by,
+         ):
+             T.import_source(_SPLITK_HEADER)
++            pdl.chain()
+             tx = T.get_thread_binding()
+             A_shared = T.alloc_shared((block_M, block_K), dtype)
+             B_shared = T.alloc_shared((block_N, block_K), dtype)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index abee9ce12..f5858e79c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -46,7 +46,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+-from . import prepare
++from . import pdl, prepare
+ from .gemm import SF_BLOCK
+ 
+ INDEX_HEADS = 32
+@@ -316,6 +316,7 @@ def indexer_score_v41(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+         ):
+             with T.Kernel(ctas, rows, threads=threads) as (cta, row):
++                pdl.chain()
+                 extent = _row_extent(Lengths, Active, row, width)
+                 score_row(
+                     Q,
+@@ -352,6 +353,7 @@ def indexer_score_v41(
+         Scores: T.Tensor([rows, width], T.bfloat16),
+     ):
+         with T.Kernel(ctas, rows, threads=threads) as (cta, row):
++            pdl.chain()
+             extent = _row_extent(CandidateLengths, None, row, width)
+             score_row(
+                 Q,
+@@ -417,6 +419,7 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+     @T.macro
+     def body(X, Q, S, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             g = bx * threads + tx
+             row, k = g // groups, g % groups
+@@ -770,6 +773,7 @@ def indexer_topk_segment_v41(
+         WorkEntries,
+     ):
+         with T.Kernel(segments, rows, threads=threads) as (seg, row):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             keys = T.alloc_shared([segment], T.int32)
+             hist = T.alloc_shared([257], T.int32)
+@@ -931,6 +935,7 @@ def indexer_topk_merge_v41(
+     @T.macro
+     def body(WorkValues, WorkEntries, Lengths, Active, Gather, Indices, Values, Counts):
+         with T.Kernel(groups, rows, threads=threads) as (g, row):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             keys = T.alloc_shared([n_pad], T.int32)
+             hist = T.alloc_shared([257], T.int32)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 9ef4555e7..24325148d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -30,7 +30,7 @@ from torch import nn
+ 
+ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+ from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ from vllm.v1.worker.workspace import (
+     current_preallocated_workspace,
+     current_workspace_manager,
+@@ -69,9 +69,7 @@ _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+ 
+ 
+ def _tile_kernels():
+-    import tile_kernels
+-
+-    return tile_kernels
++    return pdl.tile_kernels()
+ 
+ 
+ def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 179405a01..0b290a32a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -31,6 +31,8 @@ including which rows each launch writes:
+ import tilelang
+ import tilelang.language as T
+ 
++from . import pdl
++
+ _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ _BLOCK = 128
+ _TOP = 512  # top-k length cap
+@@ -75,6 +77,7 @@ def builder_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+         nt: T.int32,
+     ):
+         with T.Kernel(request_blocks + T.ceildiv(cover, _BLOCK), threads=_BLOCK) as bx:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             bounds = T.alloc_local((2,), T.int32)
+             if bx < request_blocks:
+@@ -240,6 +243,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+         offset: T.int32,
+     ):
+         with T.Kernel(rows, threads=threads) as row:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+             window_row(
+@@ -307,6 +311,7 @@ def decode_metadata_kernel(
+     ):
+         # Two blocks a row, one launch: the window metadata, then the page table.
+         with T.Kernel(rows, 2, threads=threads) as (row, part):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+             live = T.alloc_var(T.int32)  # the page part's columns
+@@ -364,6 +369,7 @@ def pages_kernel(width: int, page: int):
+         read_width: T.int32,
+     ):
+         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
++            pdl.chain()
+             entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
+             col = cb * _BLOCK + T.get_thread_binding()
+             req = reqs[offset + row]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index a29c46849..f8b36da99 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -53,7 +53,7 @@ from torch import nn
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
+ from vllm.models.deepseek_v4_1.tilelang.linear import (
+@@ -153,6 +153,7 @@ def project_streams(
+         Q: T.Tensor((splits, M), T.float32),
+     ):
+         with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
++            pdl.chain()
+             h0 = sp * block_H
+             A_shared = T.alloc_shared((block_M, block_H), T.float32)
+             F_shared = T.alloc_shared((N, block_H), T.float32)
+@@ -339,6 +340,7 @@ def finalize(
+         ysf: T.Tensor((Mq, sf_width), T.uint8),
+     ):
+         with T.Kernel(M, threads=threads) as pid:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             mixes_shared = T.alloc_shared((MIXES,), T.float32)
+             xv = T.alloc_local((VEC,), T.bfloat16)
+@@ -473,6 +475,7 @@ def post_streams(hidden_size: int, threads: int = 128):
+         out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+     ):
+         with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
+             token = pid // blocks
+             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+             xv = T.alloc_local((VEC,), T.bfloat16)
+@@ -569,6 +572,7 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
+             out: T.Tensor((M, hidden_size), T.bfloat16),
+         ):
+             with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
+                 tx = T.get_thread_binding()
+                 sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+                 # Held, not used: the one write keeps the allocation, and with it
+@@ -600,6 +604,7 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
+         columns: T.Tensor((M, MULT), T.float32),
+     ):
+         with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+             reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 371fabca9..26c2e0f56 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -47,7 +47,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ from .gemm import (
+     SF_BLOCK,
+@@ -202,6 +202,7 @@ def moe_dispatch_v41(
+             NumTiles: T.Tensor([1], T.int32),
+         ):
+             with T.Kernel(1, threads=threads):
++                pdl.chain()
+                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
+                 scan = T.alloc_shared([threads], T.int32)
+                 count = T.alloc_var(T.int32)
+@@ -250,6 +251,7 @@ def moe_dispatch_v41(
+             Rank: T.Tensor([rows * topk], T.int32),
+         ):
+             with T.Kernel(chunks, threads=threads) as c:
++                pdl.chain()
+                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
+                 tx = T.get_thread_binding()
+                 expert, rank = rank_routes(
+@@ -276,6 +278,7 @@ def moe_dispatch_v41(
+             NumTiles: T.Tensor([1], T.int32),
+         ):
+             with T.Kernel(1, threads=threads):
++                pdl.chain()
+                 scan = T.alloc_shared([threads], T.int32)
+                 count = T.alloc_var(T.int32)
+                 tx = T.get_thread_binding()
+@@ -318,6 +321,7 @@ def moe_dispatch_v41(
+         RoutePos: T.Tensor([rows, topk], T.int32),
+     ):
+         with T.Kernel(chunks, threads=threads) as c:
++            pdl.chain()
+             tx = T.get_thread_binding()
+             expert = T.alloc_var(T.int32)
+             r = c * threads + tx
+@@ -364,6 +368,7 @@ def moe_combine_v41(
+         Out: T.Tensor([rows, hidden], out_dtype),
+     ):
+         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
++            pdl.chain()
+             acc = T.alloc_fragment([block_D], T.float32)
+             T.clear(acc)
+             if shared:
+@@ -727,6 +732,7 @@ def grouped_fp8_fp4_gemm(
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
++            pdl.chain()
+             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
+             B_shared = T.alloc_shared(
+                 (stages, block_N, block_K), T.float4_e2m1_unpacked
+@@ -999,6 +1005,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+         TileExpert: T.Tensor((tiles,), T.int32),
+     ):
+         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
++            pdl.chain()
+             tid = T.get_thread_binding()
+             col = (tid // warp) * chunk + (tid % warp) * vec
+             orders = T.alloc_local((rows_per_cta,), T.int32)
+@@ -1390,8 +1397,7 @@ def _present(weights):
+ 
+ 
+ def _tile_kernels(block_M):
+-    import tile_kernels
+-
++    tile_kernels = pdl.tile_kernels()
+     # Expert segments in the dispatch layout start on block_M rows.
+     tile_kernels.config.set_token_alignment(block_M)
+     return tile_kernels
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 570743d96..636de3eed 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -7,16 +7,14 @@ import functools
+ import torch
+ from torch import nn
+ 
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ 
+ @torch.library.custom_op("vllm::dsv41_tilelang_rmsnorm", mutates_args=("out",))
+ def _rmsnorm(
+     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
+ ) -> None:
+-    import tile_kernels
+-
+-    tile_kernels.quant.norm_forward(x, weight, eps, out=out)
++    pdl.tile_kernels().quant.norm_forward(x, weight, eps, out=out)
+ 
+ 
+ @_rmsnorm.register_fake
+diff --git a/vllm/models/deepseek_v4_1/tilelang/pdl.py b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+new file mode 100644
+index 000000000..832ae47bc
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Programmatic dependent launch (PDL) along DeepSeek-V4.1's decode chain.
++
++A decode step is one chain of about 1,850 small kernels in CUDA graphs; at one
++stream the graph-internal launch gaps on its critical path (median 0.5 us) are
++3.5% of the step. With PDL a kernel is launched while the kernel before it on
++its stream still runs, so its launch and CTA start-up overlap that kernel's
++tail instead of following its completion.
++
++A kernel on the chain begins with ``chain()``:
++
++- ``T.pdl_sync()`` (``griddepcontrol.wait``) before anything else: the kernel
++  reads and writes no global memory until every kernel it depends on has
++  completed and its writes are visible, so the arithmetic, the inputs it sees
++  and the order of its stores are those of a serialized launch, to the bit.
++  TileLang then launches the kernel with programmatic stream serialization,
++  which CUDA graph capture keeps as a programmatic edge.
++- ``T.pdl_trigger()`` (``griddepcontrol.launch_dependents``) once every CTA has
++  passed the wait: the next kernel may launch now, and its CTAs wait in turn.
++  At most two kernels of the chain are resident at once, the running one and
++  the next, so waiting CTAs never pile up ahead of the work they wait for.
++
++A kernel that does not begin with ``chain()`` launches as before, after its
++predecessor completes; one that does, after a kernel that does not, starts as
++that kernel's CTAs exit. Kernels compiled with warp specialization do not use
++it: their producer warps' TMA loads would have to follow the wait too.
++
++TileKernels' casts and norms (``tile_kernels()``) use DeepSeek's own PDL
++switch, which places the wait first and the trigger after the stores.
++"""
++
++import functools
++
++import tilelang.language as T
++
++
++@T.macro
++def chain():
++    T.pdl_sync()
++    T.pdl_trigger()
++
++
++@functools.cache
++def tile_kernels():
++    """TileKernels, with PDL on for every kernel it compiles from now on."""
++    import tile_kernels
++
++    tile_kernels.config.set_pdl(True)
++    return tile_kernels
+diff --git a/vllm/models/deepseek_v4_1/tilelang/rope.py b/vllm/models/deepseek_v4_1/tilelang/rope.py
+index 747765363..301d8feeb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/rope.py
++++ b/vllm/models/deepseek_v4_1/tilelang/rope.py
+@@ -15,7 +15,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+-from . import prepare
++from . import pdl, prepare
+ 
+ _PAIRS = 4  # pairs per thread: 8 BF16, one 16-byte access
+ 
+@@ -46,6 +46,7 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+             T.ceildiv(heads, heads_per_block),
+             threads=threads,
+         ) as (tb, hb):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             t = tb * tokens_per_block + tx // per_token
+             head = hb * heads_per_block + tx % per_token // lanes
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index e74e08004..af818d68d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -39,7 +39,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+     FusedTopKBiasRouter,
+ )
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ _MASK_THREADS = 256
+ 
+@@ -73,6 +73,7 @@ def routing_masks_kernel(image_ids: str | None, route: bool):
+         rows: T.int32,
+     ):
+         with T.Kernel(T.ceildiv(rows, _MASK_THREADS), threads=_MASK_THREADS) as b:
++            pdl.chain()
+             i = b * _MASK_THREADS + T.get_thread_binding()
+             if image_ids is not None:  # noqa: SIM102
+                 if i < ids_len:
+@@ -262,9 +263,7 @@ def _topk_gate(
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
+     bias and no shared experts."""
+-    from tile_kernels.moe import moe_topk_gate_forward
+-
+-    return moe_topk_gate_forward(
++    return pdl.tile_kernels().moe.moe_topk_gate_forward(
+         logits,
+         num_topk,
+         use_shared_as_routed=False,
+@@ -407,6 +406,7 @@ def route_partials(
+         routed_scaling_factor: T.float32,
+     ):
+         with T.Kernel(T.ceildiv(rows, warps), threads=warps * _WARP) as pid:
++            pdl.chain()
+             thread = T.get_thread_binding()
+             token = thread // _WARP
+             row = token + pid * warps
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index b1b98de70..577af60fa 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -72,7 +72,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+-from . import prepare
++from . import pdl, prepare
+ from .gemm import _reference_roundtrip
+ 
+ HEAD_DIM = 512
+@@ -400,6 +400,7 @@ def sparse_mla_fwd_v41(
+         Output,
+     ):
+         with T.Kernel(head_blocks, rows, threads=threads) as (hb, row):
++            pdl.chain()
+             Q_shared = T.alloc_shared([block_H, D], dtype)
+             KV_shared = T.alloc_shared([BI, D], dtype)
+             P_shared = T.alloc_shared([block_H, BI], dtype)
+@@ -522,6 +523,7 @@ def sparse_mla_fwd_v41(
+         Output,
+     ):
+         with T.Kernel(segments, head_blocks, rows, threads=threads) as (seg, hb, row):
++            pdl.chain()
+             Q_shared = T.alloc_shared([block_H, D], dtype)
+             KV_shared = T.alloc_shared([BI, D], dtype)
+             P_shared = T.alloc_shared([block_H, BI], dtype)
+@@ -606,6 +608,7 @@ def sparse_mla_fwd_v41(
+ 
+         # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
++            pdl.chain()
+             o = T.alloc_fragment([D], accum_dtype)
+             O_shared = T.alloc_shared([1, D], dtype)
+             X = T.alloc_fragment([D // 32, 32], accum_dtype)

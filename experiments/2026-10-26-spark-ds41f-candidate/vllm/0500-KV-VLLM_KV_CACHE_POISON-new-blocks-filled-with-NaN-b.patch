@@ -1,0 +1,663 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:48:23 +0100
+Subject: [PATCH 500/500] [KV] VLLM_KV_CACHE_POISON: new blocks filled with NaN
+ bytes, not zeros (debug)
+
+vLLM zeroes newly allocated KV blocks when the cache mixes precisions
+(needs_kv_cache_zeroing), since a block reused across groups would decode
+another precision's stale bytes. Whether a model's kernels need that, or
+only mask unwritten slots by select, is not visible from the outputs: a
+kernel that reads an unwritten slot, or masks one arithmetically
+(0 * x, x + -inf), sees zeros and stays finite.
+
+The debug switch VLLM_KV_CACHE_POISON (off by default, never in serving)
+fills each new block with all-ones bytes instead: NaN in FP32, BF16, FP16,
+FP8 E4M3 and E5M2 and UE8M0 at every byte offset (E2M1 reads -6.0, beside a
+NaN UE8M0 scale). Such a read then turns its output NaN. The switch forces
+the fill for caches that skip zeroing and also fills the compressor ring's
+CircularBufferSpec blocks, which zeroing never touches. Warmup compiles the
+fill on the null block with zeros, which leaves it as zeroing does.
+
+The fill is its own TileLang kernel, fill_kv_blocks_kernel: the zeroing
+kernel's segments, pages and predicated stores with a word argument,
+declared in its place under the switch, so the frozen kernel cache accepts
+it. With the switch off nothing changes: the zeroing kernel, its key and its
+declaration are as before, and no fill is declared or compiled.
+
+On DeepSeek V4.1 Flash zeroing runs only because the compressor ring is
+FP32 beside byte pages; it costs 0.20% of a 15K-token prefill and nothing
+measurable in decode.
+
+Tests (CPU): the zeroer fills where it zeroes, the warmup's zero null
+block, the declared kernel by mode, the poison bytes as NaN in each float
+format, the forced fill, DS4.1's ring as the only mixed precision, the ring
+manager recording its block under the switch. GPU: the TileLang fill writes
+the word exactly where the Triton zeroing clears, and launches only its
+declared call.
+---
+ tests/v1/core/test_kv_cache_utils.py          |  45 ++++++
+ .../core/test_single_type_kv_cache_manager.py |  29 ++++
+ tests/v1/worker/test_gpu_tilelang_inputs.py   |  71 +++++++++-
+ tests/v1/worker/test_kv_block_zeroer.py       | 128 ++++++++++++++++++
+ vllm/envs.py                                  |   7 +
+ vllm/v1/core/single_type_kv_cache_manager.py  |   8 +-
+ vllm/v1/kv_cache_interface.py                 |   9 +-
+ vllm/v1/worker/gpu/tilelang_inputs.py         |  62 +++++++++
+ vllm/v1/worker/utils.py                       |  69 +++++++++-
+ 9 files changed, 420 insertions(+), 8 deletions(-)
+
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index c926c6f8e..e5fe6102d 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -5110,6 +5110,51 @@ def test_wrapped_mamba_group_requires_block_zeroing():
+     assert config.needs_kv_cache_zeroing
+ 
+ 
++def _zeroing_config(**specs: KVCacheSpec) -> KVCacheConfig:
++    return KVCacheConfig(
++        num_blocks=4,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                [name],
++                UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs={name: spec}),
++            )
++            for name, spec in specs.items()
++        ],
++    )
++
++
++def test_ds41_shaped_cache_zeroing_comes_from_the_fp32_compressor_ring():
++    """DeepSeek V4.1's window and compressed pages are bytes and its compressors'
++    open groups FP32 (``CircularBufferSpec``, whose blocks are not zeroed): the
++    ring alone makes the cache mixed-precision, and so zeroed."""
++    common = dict(num_kv_heads=1, head_size=1)
++    window = SlidingWindowMLASpec(
++        block_size=4, sliding_window=8, dtype=torch.uint8, **common
++    )
++    compressed = MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common)
++    ring = CircularBufferSpec(block_size=4, dtype=torch.float32, **common)
++
++    assert not _zeroing_config(
++        window=window, compressed=compressed
++    ).needs_kv_cache_zeroing
++    assert _zeroing_config(
++        window=window, compressed=compressed, ring=ring
++    ).needs_kv_cache_zeroing
++
++
++def test_kv_cache_poison_forces_the_fill(monkeypatch):
++    """``VLLM_KV_CACHE_POISON`` runs the new-block fill for a cache that skips
++    zeroing (it fills with NaN bytes, never zeros)."""
++    spec = FullAttentionSpec(
++        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.bfloat16
++    )
++    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    assert not _zeroing_config(full=spec).needs_kv_cache_zeroing
++    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    assert _zeroing_config(full=spec).needs_kv_cache_zeroing
++
++
+ def _spec_decode_grouping_config(method="dspark", model_type=None):
+     """Grouping config with an EAGLE-family speculative method enabled."""
+     return SimpleNamespace(
+diff --git a/tests/v1/core/test_single_type_kv_cache_manager.py b/tests/v1/core/test_single_type_kv_cache_manager.py
+index d2170d5a9..a274e46d0 100644
+--- a/tests/v1/core/test_single_type_kv_cache_manager.py
++++ b/tests/v1/core/test_single_type_kv_cache_manager.py
+@@ -244,6 +244,35 @@ def get_chunked_local_attention_manager(
+     )
+ 
+ 
++@pytest.mark.parametrize("poison", [False, True])
++def test_kv_cache_poison_records_the_circular_buffer_block(monkeypatch, poison):
++    """A ring's block is never zeroed; under ``VLLM_KV_CACHE_POISON`` its new
++    block goes to the worker's fill with the other groups' blocks."""
++    if poison:
++        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    else:
++        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    spec = CircularBufferSpec(
++        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float32
++    )
++    block_pool = BlockPool(num_gpu_blocks=10, enable_caching=True, hash_block_size=4)
++    manager = CircularBufferManager(
++        spec,
++        block_pool=block_pool,
++        enable_caching=True,
++        kv_cache_group_id=0,
++        scheduler_block_size=4,
++        needs_kv_cache_zeroing=True,
++        max_admission_blocks_per_request=1,
++    )
++    blocks = manager.allocate_new_blocks("r", num_tokens=128, num_tokens_main_model=128)
++    assert manager.records_new_block_ids == poison
++    assert manager.take_new_block_ids() == ([blocks[0].block_id] if poison else [])
++    # The ring's one block lasts the request: later steps allocate nothing.
++    assert manager.allocate_new_blocks("r", 256, 256) == []
++    assert manager.take_new_block_ids() == []
++
++
+ def test_circular_buffer_allocates_one_block_for_the_request_lifetime():
+     block_size = 4
+     spec = CircularBufferSpec(
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 6800c55b5..7d603ee45 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -44,7 +44,11 @@ from vllm.v1.worker.gpu.buffer_utils import (  # noqa: E402
+     _apply_write_kernel,
+ )
+ from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash  # noqa: E402
+-from vllm.v1.worker.utils import KVBlockZeroer, _zero_kv_blocks_kernel  # noqa: E402
++from vllm.v1.worker.utils import (  # noqa: E402
++    KV_POISON_WORD,
++    KVBlockZeroer,
++    _zero_kv_blocks_kernel,
++)
+ 
+ DEVICE = torch.device("cuda")
+ MAX_REQS = 16
+@@ -406,6 +410,71 @@ def test_zero_kv_blocks(num_ids):
+         assert torch.equal(r, s)
+ 
+ 
++@pytest.mark.parametrize("num_ids", [1, 5, 32])
++def test_poison_fills_what_zeroing_clears(monkeypatch, num_ids):
++    """``VLLM_KV_CACHE_POISON``: the fill writes the poison word to exactly the
++    elements the Triton zeroing clears (``test_zero_kv_blocks``' segments), and
++    launches only the call it declares."""
++    gen = _gen(100 + num_ids)
++    num_blocks = 40
++    layouts = [  # (block stride, page, element offset)
++        (33792, 33792, 0),
++        (1100, 1027, 0),
++        (12, 4, 3),
++        (2048, 2048, 1),
++        (5, 5, 0),
++    ]
++    storages = [
++        _garbage((num_blocks * stride + offset + 8,), torch.int32, gen)
++        for stride, _, offset in layouts
++    ]
++    addrs = [s.data_ptr() + offset * 4 for s, (_, _, offset) in zip(storages, layouts)]
++    strides = torch.tensor([s for s, _, _ in layouts], device=DEVICE)
++    pages = torch.tensor([p for _, p, _ in layouts], device=DEVICE)
++    max_page = max(p for _, p, _ in layouts)
++    blk = min(1 << (max_page - 1).bit_length(), 1024)
++    ids = torch.randperm(num_blocks, generator=gen, device=DEVICE)[:num_ids].tolist()
++    # What zeroing clears: the Triton reference over all-ones copies.
++    cleared = [torch.ones_like(s) for s in storages]
++    cleared_addrs = [
++        c.data_ptr() + (a - s.data_ptr()) for c, s, a in zip(cleared, storages, addrs)
++    ]
++    _zero_kv_blocks_kernel[(num_ids, len(layouts), math.ceil(max_page / blk))](
++        torch.tensor(cleared_addrs, dtype=torch.uint64, device=DEVICE),
++        strides,
++        pages,
++        torch.tensor(ids, dtype=torch.int64, device=DEVICE),
++        BLOCK_SIZE=blk,
++    )
++    expected = [
++        torch.where(c == 0, KV_POISON_WORD, s) for c, s in zip(cleared, storages)
++    ]
++    launched = set()
++    kernel = tli._kernel
++
++    def record(factory, *key):
++        launched.add((id(factory), key))
++        return kernel(factory, *key)
++
++    monkeypatch.setattr(tli, "_kernel", record)
++    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
++    zeroer.device = DEVICE
++    zeroer._fill_word = KV_POISON_WORD
++    zeroer._meta = (
++        torch.tensor(addrs, dtype=torch.uint64, device=DEVICE),
++        strides,
++        pages,
++        math.ceil(max_page / blk),
++        blk,
++        len(layouts),
++    )
++    zeroer.zero_block_ids(ids)
++    torch.accelerator.synchronize()
++    for e, s in zip(expected, storages):
++        assert torch.equal(e, s)
++    assert launched == {(id(f), key) for f, key, _ in tli.fill_kv_blocks_calls()}
++
++
+ # --- Step inputs --------------------------------------------------------------
+ 
+ 
+diff --git a/tests/v1/worker/test_kv_block_zeroer.py b/tests/v1/worker/test_kv_block_zeroer.py
+index 96e164e57..a04c63a93 100644
+--- a/tests/v1/worker/test_kv_block_zeroer.py
++++ b/tests/v1/worker/test_kv_block_zeroer.py
+@@ -394,3 +394,131 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
+             assert (view[b].view(torch.int8) == 1).all(), layout
+     zero_bytes = int((raw == 0).sum().item())
+     assert zero_bytes == num_layers * spec.page_size_bytes, layout
++
++
++# --- VLLM_KV_CACHE_POISON -----------------------------------------------------
++
++
++def _cpu_zeroer(monkeypatch, poison: bool, num_blocks: int = 4) -> KVBlockZeroer:
++    """A zeroer over two CPU layers, its launches recorded instead of run."""
++    if poison:
++        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    else:
++        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    spec = SlidingWindowSpec(
++        block_size=1, num_kv_heads=1, head_size=1, dtype=torch.int32, sliding_window=1
++    )
++    storages = {
++        name: torch.ones((num_blocks, 8), dtype=torch.int32) for name in ("a", "b")
++    }
++    zeroer = KVBlockZeroer(
++        torch.device("cpu"),
++        attn_groups_iter=[AttentionGroup(None, list(storages), spec, 0)],
++        kernel_block_sizes=[1],
++        static_forward_context={
++            name: SimpleNamespace(kv_cache=storage)
++            for name, storage in storages.items()
++        },
++        num_blocks=num_blocks,
++    )
++    monkeypatch.setattr(
++        worker_utils,
++        "async_tensor_h2d",
++        lambda values, **kwargs: torch.tensor(values, dtype=torch.int64),
++    )
++    zeroer.launches = []
++    monkeypatch.setattr(
++        worker_utils,
++        "_zero_kv_blocks",
++        lambda addrs, strides, pages, ids, max_el: zeroer.launches.append(
++            ("zero", ids.tolist(), addrs.numel(), max_el)
++        ),
++    )
++    monkeypatch.setattr(
++        worker_utils,
++        "_fill_kv_blocks",
++        lambda addrs, strides, pages, ids, max_el, word: zeroer.launches.append(
++            ("fill", ids.tolist(), addrs.numel(), max_el, word)
++        ),
++    )
++    return zeroer
++
++
++def test_poison_fills_new_blocks_where_zeroing_would_zero(monkeypatch):
++    """The poison check fills the segments and pages zeroing clears, with
++    ``KV_POISON_WORD``; off, the zeroing kernel runs as before."""
++    zeroer = _cpu_zeroer(monkeypatch, poison=False)
++    zeroer.zero_block_ids([1, 3])
++    zeroer.zero_block_ids([])
++    assert zeroer.launches == [("zero", [1, 3], 2, 8)]
++
++    zeroer = _cpu_zeroer(monkeypatch, poison=True)
++    zeroer.zero_block_ids([1, 3])
++    zeroer.zero_block_ids([])
++    assert zeroer.launches == [("fill", [1, 3], 2, 8, worker_utils.KV_POISON_WORD)]
++    assert worker_utils.KV_POISON_WORD & 0xFFFFFFFF == 0xFFFFFFFF
++
++
++def test_poison_warmup_compiles_the_fill_on_a_zero_null_block(monkeypatch):
++    """Warmup compiles the kernel the steps launch; under the poison check it fills
++    the null block (no request's) with zeros, as zeroing leaves it."""
++    zeroer = _cpu_zeroer(monkeypatch, poison=False)
++    zeroer.warmup(4)
++    assert zeroer.launches == [("zero", [0], 2, 8)]
++
++    zeroer = _cpu_zeroer(monkeypatch, poison=True)
++    zeroer.warmup(4)
++    zeroer.warmup(0)
++    assert zeroer.launches == [("fill", [0], 2, 8, 0)]
++
++
++@pytest.mark.parametrize("poison", [False, True])
++def test_poison_declares_the_kernel_it_launches(monkeypatch, poison):
++    """The frozen kernel cache accepts only declared calls: the poison check
++    declares the fill in place of zeroing, and serving declares no fill."""
++    if poison:
++        monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
++    else:
++        monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
++    declared = []
++    fake = SimpleNamespace(
++        declare=declared.append,
++        zero_kv_blocks_calls=object(),
++        fill_kv_blocks_calls=object(),
++    )
++    import sys
++
++    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu.tilelang_inputs", fake)
++    import vllm.v1.worker.gpu as gpu_package
++
++    monkeypatch.setattr(gpu_package, "tilelang_inputs", fake, raising=False)
++    worker_utils.declare_zero_kv_blocks_kernel()
++    expected = fake.fill_kv_blocks_calls if poison else fake.zero_kv_blocks_calls
++    assert declared == [expected]
++
++
++@pytest.mark.parametrize(
++    "dtype",
++    [
++        torch.float32,
++        torch.bfloat16,
++        torch.float16,
++        torch.float8_e4m3fn,
++        torch.float8_e5m2,
++        torch.float8_e8m0fnu,
++    ],
++)
++def test_poison_bytes_are_nan_in_every_cache_float_format(dtype):
++    """All-ones bytes are NaN in each float format a KV page may hold. Every byte
++    is the same, so a field at any offset of a record reads this pattern: the
++    record's layout cannot turn the poison into a number."""
++    word = torch.tensor([worker_utils.KV_POISON_WORD] * 4, dtype=torch.int32)
++    assert torch.isnan(word.view(dtype).float()).all()
++
++
++def test_poison_nibbles_are_the_largest_e2m1_magnitude():
++    """E2M1 (FP4) has no NaN or Inf: the all-ones nibble is -6.0, its largest
++    magnitude (the poison check relies on the UE8M0 scale beside it)."""
++    # E2M1: sign, two exponent bits (bias 1), one mantissa bit.
++    sign, exponent, mantissa = 1, 0b11, 1
++    assert (-1) ** sign * 2 ** (exponent - 1) * (1 + mantissa / 2) == -6.0
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b83105166..15ada29c3 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -328,6 +328,7 @@ if TYPE_CHECKING:
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
++    VLLM_KV_CACHE_POISON: bool = False
+     VLLM_SINK_DETECTOR_COLUMN: int | None = None
+     VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
+     VLLM_SINK_REJECTION: bool | None = None
+@@ -2202,6 +2203,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
+         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+     ),
++    # Debug only, never in serving: fill newly allocated KV cache blocks with
++    # all-ones bytes (NaN in FP32, BF16, FP16, FP8 E4M3/E5M2 and UE8M0) instead
++    # of zeros, compressor rings included, so a kernel that reads a slot it has
++    # not written, or masks one arithmetically, turns its output NaN. Forces the
++    # fill on for caches that skip zeroing.
++    "VLLM_KV_CACHE_POISON": lambda: bool(int(os.getenv("VLLM_KV_CACHE_POISON", "0"))),
+     # Attention-sink detector and rejection (vllm.v1.sample.sink). On by
+     # default for the models in its SINK_CHANNELS table, which holds each
+     # one's watched residual column and threshold; off for every other model.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 968b7b67f..a1eb644a0 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,7 @@ from collections import defaultdict
+ from collections.abc import Sequence
+ from typing import TYPE_CHECKING, ClassVar
+ 
++import vllm.envs as envs
+ from vllm.distributed.kv_events import MEDIUM_CPU
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+@@ -193,10 +194,15 @@ class SingleTypeKVCacheManager(ABC):
+         self._max_admission_blocks_per_request = max_admission_blocks_per_request
+         # Record newly allocated block ids only when worker-side zeroing will
+         # consume them and this manager holds a spec type that gets zeroed.
++        # A ring's block is not zeroed; under VLLM_KV_CACHE_POISON it is
++        # poisoned too, so a read of a ring slot before its write shows.
+         self._record_new_block_ids = (
+             needs_kv_cache_zeroing
+             and isinstance(kv_cache_spec, AttentionSpec)
+-            and not isinstance(kv_cache_spec, CircularBufferSpec)
++            and (
++                not isinstance(kv_cache_spec, CircularBufferSpec)
++                or envs.VLLM_KV_CACHE_POISON
++            )
+         )
+         self.new_block_ids: list[int] = []
+ 
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 467c46b5c..be1d35f1a 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, TypeVar
+ import torch
+ from typing_extensions import Self
+ 
++import vllm.envs as envs
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv, round_up
+ from vllm.utils.torch_utils import get_dtype_size
+@@ -1704,5 +1705,11 @@ class KVCacheConfig:
+         (#35219), and for mixed-precision caches, where a block reused across
+         groups can be reinterpreted under a different precision and decode stale
+         bytes to NaN/Inf. Uniform-precision caches skip zeroing.
++        ``VLLM_KV_CACHE_POISON`` (debug) runs the fill for every cache, with
++        NaN bytes in place of zeros.
+         """
+-        return self.has_mamba_layers or self.has_mixed_precision_kv_cache
++        return (
++            self.has_mamba_layers
++            or self.has_mixed_precision_kv_cache
++            or envs.VLLM_KV_CACHE_POISON
++        )
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 0e12863ce..dcd5d13cc 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -11,6 +11,8 @@ reference):
+ - ``compute_slot_mappings``: ``block_table._compute_slot_mappings_kernel``
+ - ``apply_staged_writes``: ``buffer_utils._apply_write_kernel``
+ - ``zero_kv_blocks``: ``worker.utils._zero_kv_blocks_kernel``
++- ``fill_kv_blocks``: ``zero_kv_blocks`` storing a given word (the debug-only
++  ``VLLM_KV_CACHE_POISON`` check; it has no Triton original)
+ - ``prepare_prefill_inputs``: ``input_batch._prepare_prefill_inputs_kernel``
+ - ``prepare_pos_seq_lens``: ``input_batch._prepare_pos_seq_lens_kernel``
+ - ``combine_sampled_and_draft_tokens``:
+@@ -565,6 +567,62 @@ def zero_kv_blocks(
+     )
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def fill_kv_blocks_kernel():
++    """``zero_kv_blocks_kernel`` storing ``word`` in place of zero: the same
++    segments, pages and predicated int32 stores, so a fill covers exactly what
++    zeroing covers."""
++    segments = T.dynamic("segments")
++    stride_len = T.dynamic("stride_len")
++    page_len = T.dynamic("page_len")
++    num_ids = T.dynamic("num_ids")
++
++    @T.prim_func
++    def fill_kv_blocks(
++        seg_addrs: T.Tensor((segments,), T.ptr),
++        seg_block_strides: T.Tensor((stride_len,), T.int64),
++        seg_page_sizes: T.Tensor((page_len,), T.int64),
++        block_ids: T.Tensor((num_ids,), T.int64),
++        chunks: T.int32,
++        word: T.int32,
++    ):
++        with T.Kernel(num_ids, segments, chunks, threads=_ZERO_THREADS) as (b, s, cx):
++            T.import_source(_STORE_IF)
++            tx = T.get_thread_binding()
++            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
++            first = T.cast(cx, T.int64) * _ZERO_CHUNK
++            if first < page:
++                stride = T.alloc_var(T.int64, init=seg_block_strides[s])
++                block_id = T.alloc_var(T.int64, init=block_ids[b])
++                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
++                base = block_id * stride
++                for k in T.unroll(_ZERO_PER_THREAD):
++                    col = first + k * _ZERO_THREADS + tx
++                    T.call_extern(
++                        "handle", "vllm_store_if_b32",
++                        T.address_of(segment[base + col]), word, col < page,
++                    )  # fmt: skip
++
++    return fill_kv_blocks
++
++
++def fill_kv_blocks(
++    seg_addrs: torch.Tensor,
++    seg_block_strides: torch.Tensor,
++    seg_page_sizes: torch.Tensor,
++    block_ids: torch.Tensor,
++    max_page_size: int,
++    word: int,
++) -> None:
++    """``KVBlockZeroer``'s fill under ``VLLM_KV_CACHE_POISON``: ``word`` an int32."""
++    chunks = _ceil(max_page_size, _ZERO_CHUNK)
++    if chunks == 0 or seg_addrs.shape[0] == 0 or block_ids.shape[0] == 0:
++        return
++    _kernel(fill_kv_blocks_kernel)(
++        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, chunks, word
++    )
++
++
+ # --- The logits rows' inputs ------------------------------------------------------
+ 
+ _LOGITS_ROWS_THREADS = 128
+@@ -2492,6 +2550,10 @@ def zero_kv_blocks_calls() -> list:
+     return [_call(zero_kv_blocks_kernel)]
+ 
+ 
++def fill_kv_blocks_calls() -> list:
++    return [_call(fill_kv_blocks_kernel)]
++
++
+ def input_batch_calls(
+     *,
+     num_lookahead: int,
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 31fafdf16..85cbd0c9b 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -10,6 +10,7 @@ from typing import Any
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import CacheConfig, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+@@ -109,11 +110,22 @@ def zero_kv_blocks_block_size(max_page_size_el: int) -> int:
+     return min(1 << (max_page_size_el - 1).bit_length(), 1024)
+ 
+ 
++# ``VLLM_KV_CACHE_POISON``'s fill: every byte 0xFF, a NaN in FP32, BF16, FP16, FP8
++# E4M3 and E5M2 and UE8M0, whatever the record's layout or the byte's offset in it.
++# E2M1 (FP4) has neither NaN nor Inf: its nibble reads -6, its largest magnitude,
++# and the UE8M0 scale beside it is NaN.
++KV_POISON_WORD = -1
++
++
+ def declare_zero_kv_blocks_kernel() -> None:
+-    """Declare KV block zeroing (one kernel for every page size and block count)."""
++    """Declare KV block zeroing (one kernel for every page size and block count), or
++    under ``VLLM_KV_CACHE_POISON`` the fill that replaces it."""
+     from vllm.v1.worker.gpu import tilelang_inputs
+ 
+-    tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
++    if envs.VLLM_KV_CACHE_POISON:
++        tilelang_inputs.declare(tilelang_inputs.fill_kv_blocks_calls)
++    else:
++        tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
+ 
+ 
+ def _zero_kv_blocks(
+@@ -131,14 +143,34 @@ def _zero_kv_blocks(
+     )
+ 
+ 
++def _fill_kv_blocks(
++    seg_addrs: torch.Tensor,
++    seg_block_strides: torch.Tensor,
++    seg_page_sizes: torch.Tensor,
++    block_ids: torch.Tensor,
++    max_page_size_el: int,
++    word: int,
++) -> None:
++    """``_zero_kv_blocks`` storing ``word`` (an int32) in place of zero."""
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    tilelang_inputs.fill_kv_blocks(
++        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, max_page_size_el, word
++    )
++
++
+ class KVBlockZeroer:
+     """Manages efficient zeroing of KV cache blocks via a TileLang kernel.
+ 
+     Construct once after KV caches are allocated to precompute segment
+     addresses, then call :meth:`zero_block_ids` each step to zero
+-    newly-allocated blocks.
++    newly-allocated blocks. Under ``VLLM_KV_CACHE_POISON`` the same pages are
++    filled with ``KV_POISON_WORD`` instead.
+     """
+ 
++    # The word new blocks are filled with in place of zeros (the poison check).
++    _fill_word: int | None = None
++
+     def __init__(
+         self,
+         device: torch.device,
+@@ -167,6 +199,7 @@ class KVBlockZeroer:
+         Only AttentionSpec layers are processed; Mamba layers are skipped.
+         """
+         self.device = device
++        self._fill_word = KV_POISON_WORD if envs.VLLM_KV_CACHE_POISON else None
+         self._meta: (
+             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+         ) = None
+@@ -256,7 +289,11 @@ class KVBlockZeroer:
+         )
+ 
+     def zero_block_ids(self, block_ids: list[int]) -> None:
+-        """Zero the KV cache memory for the given block IDs."""
++        """Zero the KV cache memory for the given block IDs (poison it under
++        ``VLLM_KV_CACHE_POISON``)."""
++        if self._fill_word is not None:
++            self._fill_block_ids(block_ids, self._fill_word)
++            return
+         if not block_ids or self._meta is None:
+             return
+         seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
+@@ -273,9 +310,31 @@ class KVBlockZeroer:
+             max_chunks * blk_size,
+         )
+ 
++    def _fill_block_ids(self, block_ids: list[int], word: int) -> None:
++        if not block_ids or self._meta is None:
++            return
++        seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
++            self._meta
++        )
++        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
++        _fill_kv_blocks(
++            seg_addrs.view(torch.int64),
++            seg_block_strides,
++            seg_page_sizes,
++            idx,
++            max_chunks * blk_size,
++            word,
++        )
++
+     def warmup(self, num_kv_blocks: int) -> None:
+         """JIT-compile the zeroing kernel before the first real request."""
+-        if num_kv_blocks > 0:
++        if num_kv_blocks <= 0:
++            return
++        if self._fill_word is not None:
++            # The poison fill compiles on the null block, which no request is
++            # given: it stays zero, as without the check.
++            self._fill_block_ids([0], 0)
++        else:
+             self.zero_block_ids([0])
+ 
+ 

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:31:04 +0100
+Subject: [PATCH 516/516] [DS4.1] Live-page tables: each entry loaded once
+
+The diagnostics bundle (dgx4, 2026-10-25 20:28 CET) wrote the kernels'
+CUDA sources. The live-page forms bound `page_id = main_table[req, col]`
+as an alias, so `T.if_then_else(page_id > 0, page_id, -1)` loaded the
+entry twice, the second load inside the branch on the first one's value:
+two dependent round trips a column. At a full 1M context, where every one
+of a row's 32 iterations is live, that cost 6.3 us against 3.2 for the
+kernel that wrote every column, which binds its select's load once
+(condval). decode_metadata and pages now load each entry into a
+T.alloc_var once.
+---
+ vllm/models/deepseek_v4_1/tilelang/metadata.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index c8dbe8286..460a12dac 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -305,6 +305,9 @@ def decode_metadata_kernel(
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+             live = T.alloc_var(T.int32)  # the page part's columns
++            # One load a column: as an alias, the select below would load it twice, the
++            # second load waiting on the first's value.
++            entry = T.alloc_var(T.int32)
+             if part == 0:
+                 window_row(
+                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+@@ -320,8 +323,8 @@ def decode_metadata_kernel(
+                 for k in T.serial(main_per_thread):
+                     col = k * threads + tx
+                     if col < live:
+-                        page_id = main_table[req, col]
+-                        main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++                        entry = main_table[req, col]
++                        main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
+ 
+     return metadata_decode
+ 
+@@ -346,13 +349,14 @@ def pages_kernel(width: int, page: int):
+         read_width: T.int32,
+     ):
+         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
++            entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
+             col = cb * _BLOCK + T.get_thread_binding()
+             req = reqs[offset + row]
+             live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
+             if (req >= 0) & (col < live):
+                 # vLLM reserves physical block zero; page tables use -1 for holes.
+-                page_id = table[req, col]
+-                out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++                entry = table[req, col]
++                out[row, col] = T.if_then_else(entry > 0, entry, -1)
+ 
+     return metadata_pages
+ 

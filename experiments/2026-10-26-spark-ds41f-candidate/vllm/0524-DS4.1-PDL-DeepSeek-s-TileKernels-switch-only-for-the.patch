@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:31:20 +0100
+Subject: [PATCH 524/524] [DS4.1] PDL: DeepSeek's TileKernels switch only for
+ the chain's own calls
+
+The source check over the kernel tests (dgx4, 2026-10-25) found TileKernels
+kernels that read an input before their wait when PDL is on: the mHC post
+reads its mixes, RoPE its positions and cos/sin table (and waits inside a
+branch). DeepSeek's placement is safe only where the kernel launched just
+before them did not write those inputs. The deployment never launches them,
+but set_pdl(True) at first use turned PDL on for every TileKernels kernel,
+the tests' references included.
+
+pdl.per_token_cast, pdl.norm_forward and pdl.moe_topk_gate_forward now set
+the switch for their call only and restore it: the casts, norms and top-k
+gate on the decode chain, which wait first. Every other TileKernels kernel
+keeps its default (no PDL).
+
+Tests: the early reader is its own kernel (pdl_early_reader), which the
+source check exempts by name; a cast through pdl has a programmatic edge in
+a captured graph and a direct TileKernels call does not; the switch is off
+after either. The layer chain casts through pdl when the build has it.
+---
+ tests/kernels/deepseek_v41_pdl_chains.py      | 10 +++-
+ tests/kernels/deepseek_v41_pdl_sources.py     | 17 +++---
+ .../kernels/test_deepseek_v41_tilelang_pdl.py | 56 +++++++++++++++----
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 12 ++--
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  3 +-
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  2 +-
+ vllm/models/deepseek_v4_1/tilelang/pdl.py     | 43 +++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/router.py  |  2 +-
+ 8 files changed, 104 insertions(+), 41 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_chains.py b/tests/kernels/deepseek_v41_pdl_chains.py
+index ba99599b6..bebed3069 100644
+--- a/tests/kernels/deepseek_v41_pdl_chains.py
++++ b/tests/kernels/deepseek_v41_pdl_chains.py
+@@ -31,6 +31,13 @@ import hashlib
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.tilelang import linear, mhc
++
++try:  # a build with PDL casts the activations as its projections do, chained
++    from vllm.models.deepseek_v4_1.tilelang.pdl import per_token_cast
++except ImportError:  # the build before PDL
++    import tile_kernels
++
++    per_token_cast = tile_kernels.quant.per_token_cast
+ from vllm.models.deepseek_v4_1.tilelang.activation import swiglu_clamp_kernel
+ from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan, workspace_bytes
+ from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
+@@ -158,7 +165,6 @@ class LayerChain:
+             return torch.randn(*shape, generator=gen, device=DEVICE) * scale
+ 
+         self.rows = rows
+-        self.tk = linear._tile_kernels()
+         # The chain's inputs: the streams, the previous FFN output and its mixes.
+         self.x = randn(rows, HIDDEN).bfloat16()
+         self.streams = randn(rows, mhc.MULT * HIDDEN).bfloat16()
+@@ -252,7 +258,7 @@ class LayerChain:
+     def _project(self, name: str, layer: _Projection, x, out) -> None:
+         """A block-32 projection: TileKernels' MXFP8 cast, then the decode GEMM."""
+         xq, sf = self.casts[name]
+-        self.tk.quant.per_token_cast(
++        per_token_cast(
+             x,
+             "e4m3",
+             32,
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index f372c22b5..5542f6334 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -12,11 +12,12 @@ first launch and, when the session ends, checks every ``__global__`` function:
+   parameters, then ``cudaTriggerProgrammaticLaunchCompletion()``;
+ - a warp-specialized GEMM (``WARP_SPECIALIZED``, ``gemm_mxfp8``'s prefill tiles)
+   has no PDL: its producer warps' loads would have to follow the wait too;
+-- any other kernel that waits (TileKernels', whose PDL switch ``pdl.tile_kernels``
+-  turns on) waits before it names a pointer parameter.
++- any other kernel that waits (TileKernels' casts, norms and top-k gate, which the
++  deployment launches through ``pdl``'s wrappers with DeepSeek's switch on) waits
++  before it names a pointer parameter.
+ 
+-A violation fails the session. TileKernels' switch is turned on when the session
+-starts, so its kernels compile as serving compiles them.
++A violation fails the session. ``EXEMPT`` names the PDL test's deliberate early
++reader.
+ """
+ 
+ import re
+@@ -57,6 +58,8 @@ CHAIN = {
+     "sparse_mla",
+ }
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
++# test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
++EXEMPT = {"pdl_early_reader"}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -93,6 +96,8 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+     out = []
+     for name, pointers, body in functions(source):
+         base = re.sub(r"_kernel(_\d+)?$", "", name)
++        if base in EXEMPT:
++            continue
+         wait = body.find(WAIT)
+         if base in WARP_SPECIALIZED or (base == "gemm_mxfp8" and warp_specialized):
+             if wait >= 0 or TRIGGER in body:
+@@ -120,13 +125,9 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+ def pytest_configure(config):
+     import importlib
+ 
+-    from vllm.models.deepseek_v4_1.tilelang import pdl
+-
+     # ``tilelang.jit`` is also the decorator tilelang re-exports, so the module is
+     # imported by name.
+     kernel_module = importlib.import_module("tilelang.jit.kernel")
+-
+-    pdl.tile_kernels()
+     launch = kernel_module.JITKernel.__call__
+ 
+     def recorded(self, *args, **kwargs):
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_pdl.py b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+index 84a0a8832..898b4774a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_pdl.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -15,7 +15,7 @@ the launches are programmatic in CUDA graphs and that nothing reads early:
+ - one decode layer's chain (``deepseek_v41_pdl_chains``), replayed in a CUDA graph
+   with every intermediate buffer poisoned with NaN before each replay, gives its
+   eager outputs bit for bit on every replay;
+-- TileKernels compiles with its PDL switch on.
++- TileKernels' cast is chained when called through ``pdl`` and only then.
+ 
+ ``deepseek_v41_pdl_sources`` (a pytest plugin) checks the compiled sources of every
+ chain kernel that the DS4.1 kernel tests build: the wait comes before any access to
+@@ -23,6 +23,7 @@ global memory.
+ """
+ 
+ import ctypes
++import functools
+ import re
+ 
+ import pytest
+@@ -76,25 +77,32 @@ def slow_copy(n: int):
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def reader(n: int, early: bool):
+-    """``out = dst``; with ``early``, ``dst`` is loaded before the wait."""
++    """``out = dst``; with ``early``, ``dst`` is loaded before the wait (a kernel the
++    source check exempts by name)."""
+ 
+     @T.prim_func
+     def pdl_reader(
+         dst: T.Tensor((n,), T.float32),
+         out: T.Tensor((n,), T.float32),
++    ):
++        with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
++            pdl.chain()
++            i = bx * THREADS + T.get_thread_binding()
++            out[i] = dst[i]
++
++    @T.prim_func
++    def pdl_early_reader(
++        dst: T.Tensor((n,), T.float32),
++        out: T.Tensor((n,), T.float32),
+     ):
+         with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
+             i = bx * THREADS + T.get_thread_binding()
+             value = T.alloc_var(T.float32)
+-            if early:
+-                value = dst[i]
+-                T.pdl_sync()
+-            else:
+-                pdl.chain()
+-                value = dst[i]
++            value = dst[i]
++            T.pdl_sync()
+             out[i] = value
+ 
+-    return pdl_reader
++    return pdl_early_reader if early else pdl_reader
+ 
+ 
+ def _graph(fn, keep: bool = False) -> torch.cuda.CUDAGraph:
+@@ -201,9 +209,33 @@ def _chained(kernel: str) -> bool:
+     )
+ 
+ 
+-def test_tile_kernels_pdl_on():
+-    tk = pdl.tile_kernels()
+-    assert tk.get_pdl()
++def test_tile_kernels_chained_through_pdl_only():
++    """TileKernels' cast is chained when the deployment calls it through ``pdl``
++    (a programmatic edge from the torch kernel before it) and not when called
++    directly; its switch is off again after the call."""
++    import tile_kernels
++
++    x = torch.randn((64, 5120), device=DEVICE)
++
++    def cast(through_pdl: bool) -> None:
++        y = (x * 2).bfloat16()
++        if through_pdl:
++            pdl.per_token_cast(y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True)
++        else:
++            tile_kernels.quant.per_token_cast(
++                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++            )
++
++    for through_pdl in (True, False):
++        graph = _graph(functools.partial(cast, through_pdl), keep=True)
++        edges = [
++            (source, kind)
++            for source, target, kind in _edges(graph)
++            if target is not None and target.startswith("per_token_cast")
++        ]
++        assert len(edges) == 1 and edges[0][0] is not None, edges
++        assert (edges[0][1] == PROGRAMMATIC) == through_pdl, (through_pdl, edges)
++        assert not tile_kernels.get_pdl()
+ 
+ 
+ @pytest.mark.parametrize("launch", ["graph", "eager"])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 24325148d..ca8850ab3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -68,10 +68,6 @@ _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
+ _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+ 
+ 
+-def _tile_kernels():
+-    return pdl.tile_kernels()
+-
+-
+ def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
+     """MXFP8 activations and packed scales; decode rows fill whole tiles.
+ 
+@@ -136,7 +132,7 @@ def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
+     out = empty_mxfp8(rows)
+     m = rows.shape[0]
+     if m:
+-        _tile_kernels().quant.per_token_cast(
++        pdl.per_token_cast(
+             rows,
+             "e4m3",
+             SF_BLOCK,
+@@ -249,7 +245,7 @@ def _block32_linear(
+         _block32_split(layer, x, out.view(rows, n), scratch)
+         return
+     xq, sf = _scratch(_activation_specs(rows, k, layer.tilelang_decode_rows), scratch)
+-    _tile_kernels().quant.per_token_cast(
++    pdl.per_token_cast(
+         x,
+         "e4m3",
+         SF_BLOCK,
+@@ -294,7 +290,7 @@ def _split_specs(layer, rows: int):
+ def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
+     rows = x.shape[0]
+     xq, sf, partials = _scratch(_split_specs(layer, rows), scratch)
+-    _tile_kernels().quant.per_token_cast(
++    pdl.per_token_cast(
+         x,
+         "e4m3",
+         SF_BLOCK,
+@@ -417,7 +413,7 @@ def _warm_cast(k: int, rows: int) -> None:
+         torch.empty(shape, dtype=dtype, device="cuda")
+         for shape, dtype in _activation_specs(rows, k)
+     )
+-    _tile_kernels().quant.per_token_cast(
++    pdl.per_token_cast(
+         x,
+         "e4m3",
+         SF_BLOCK,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 26c2e0f56..98b10ce2e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1397,7 +1397,8 @@ def _present(weights):
+ 
+ 
+ def _tile_kernels(block_M):
+-    tile_kernels = pdl.tile_kernels()
++    import tile_kernels
++
+     # Expert segments in the dispatch layout start on block_M rows.
+     tile_kernels.config.set_token_alignment(block_M)
+     return tile_kernels
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 636de3eed..b1331a30e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -14,7 +14,7 @@ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ def _rmsnorm(
+     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
+ ) -> None:
+-    pdl.tile_kernels().quant.norm_forward(x, weight, eps, out=out)
++    pdl.norm_forward(x, weight, eps, out=out)
+ 
+ 
+ @_rmsnorm.register_fake
+diff --git a/vllm/models/deepseek_v4_1/tilelang/pdl.py b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+index 832ae47bc..da8a0050e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/pdl.py
++++ b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+@@ -26,11 +26,15 @@ predecessor completes; one that does, after a kernel that does not, starts as
+ that kernel's CTAs exit. Kernels compiled with warp specialization do not use
+ it: their producer warps' TMA loads would have to follow the wait too.
+ 
+-TileKernels' casts and norms (``tile_kernels()``) use DeepSeek's own PDL
+-switch, which places the wait first and the trigger after the stores.
++TileKernels' kernels on the chain (``per_token_cast``, ``norm_forward``,
++``moe_topk_gate_forward`` here) use DeepSeek's own PDL switch, set only for the
++call: these place the wait first and the trigger after their stores. The switch
++stays off for every other TileKernels kernel. Some read an input before their
++wait (the mHC post its mixes, RoPE its positions), which is safe only where the
++kernel launched just before them did not write it.
+ """
+ 
+-import functools
++import contextlib
+ 
+ import tilelang.language as T
+ 
+@@ -41,10 +45,33 @@ def chain():
+     T.pdl_trigger()
+ 
+ 
+-@functools.cache
+-def tile_kernels():
+-    """TileKernels, with PDL on for every kernel it compiles from now on."""
++@contextlib.contextmanager
++def _tile_kernels():
++    """TileKernels with its PDL switch on inside the block (each call compiles and
++    launches with it; the kernel cache keys on the switch)."""
+     import tile_kernels
+ 
+-    tile_kernels.config.set_pdl(True)
+-    return tile_kernels
++    previous = tile_kernels.get_pdl()
++    tile_kernels.set_pdl(True)
++    try:
++        yield tile_kernels
++    finally:
++        tile_kernels.set_pdl(previous)
++
++
++def per_token_cast(*args, **kwargs):
++    """TileKernels' ``quant.per_token_cast``, chained."""
++    with _tile_kernels() as tk:
++        return tk.quant.per_token_cast(*args, **kwargs)
++
++
++def norm_forward(*args, **kwargs):
++    """TileKernels' ``quant.norm_forward``, chained."""
++    with _tile_kernels() as tk:
++        return tk.quant.norm_forward(*args, **kwargs)
++
++
++def moe_topk_gate_forward(*args, **kwargs):
++    """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
++    with _tile_kernels() as tk:
++        return tk.moe.moe_topk_gate_forward(*args, **kwargs)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index af818d68d..aadf8a3ab 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -263,7 +263,7 @@ def _topk_gate(
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
+     bias and no shared experts."""
+-    return pdl.tile_kernels().moe.moe_topk_gate_forward(
++    return pdl.moe_topk_gate_forward(
+         logits,
+         num_topk,
+         use_shared_as_routed=False,

@@ -1,0 +1,1029 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:35:27 +0100
+Subject: [PATCH 495/495] [DS4.1] The ported model kernels' Triton originals go
+
+Request inventory 5 found no Triton kernel in any request type; serving runs
+the TileLang ports. The DS4.1 package keeps no Triton:
+
+- sparse_mla.py: _requests, _tokens and _chunk (tilelang.metadata's
+  requests, tokens and chunk/decode_metadata);
+- attention.py: _pages (tilelang.metadata.pages); vLLM's cdiv replaces
+  triton.cdiv in the shared geometry;
+- compressor.py: _load_partial_state and _save_partial_states
+  (tilelang.compress's gather_partial_state and compress);
+- nvidia/model_state.py: _gather_lookback_kernel (tilelang.lookback).
+
+Tests that held the TileLang kernels to these Triton kernels hold them to
+torch references of the same contracts instead, exactly, rows left alone
+included: the metadata kernels (requests, tokens, chunk, pages,
+decode_metadata), the state-ring gather (the ring save already had one), and
+the lookback window. The references were checked against transliterations of
+the deleted Triton code on the tests' inputs (70 metadata and 40 ring cases).
+The runner-inputs benchmark's lookback case, which timed the TileLang kernel
+against the Triton one, goes. Docstrings state the contracts instead of
+naming the deleted kernels.
+---
+ .../benchmark_runner_inputs_tilelang.py       |  24 +-
+ .../test_deepseek_v41_tilelang_compress.py    |  83 +++---
+ .../test_deepseek_v41_tilelang_metadata.py    | 265 +++++++++++-------
+ tests/v1/worker/test_gpu_tilelang_inputs.py   |  26 +-
+ vllm/models/deepseek_v4_1/attention.py        |  21 +-
+ vllm/models/deepseek_v4_1/compressor.py       |  54 ----
+ .../deepseek_v4_1/nvidia/model_state.py       |  35 ---
+ vllm/models/deepseek_v4_1/sparse_mla.py       | 138 +--------
+ .../models/deepseek_v4_1/tilelang/compress.py |   8 +-
+ .../models/deepseek_v4_1/tilelang/lookback.py |   2 +-
+ .../models/deepseek_v4_1/tilelang/metadata.py |  18 +-
+ 11 files changed, 242 insertions(+), 432 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+index 243664140..6f2ee2ef8 100644
+--- a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
++++ b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+@@ -24,8 +24,7 @@ from collections.abc import Callable
+ 
+ import torch
+ 
+-from vllm.models.deepseek_v4_1.nvidia.model_state import _gather_lookback_kernel
+-from vllm.models.deepseek_v4_1.tilelang import dspark_context, lookback
++from vllm.models.deepseek_v4_1.tilelang import dspark_context
+ from vllm.triton_utils import triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu import input_batch as ib
+@@ -538,26 +537,6 @@ def case_prepare_dflash_inputs(gen, num_reqs, prefill, widths):
+     return triton_call, tilelang_call
+ 
+ 
+-def case_gather_lookback(gen, num_reqs, prefill, widths):
+-    """The Engram window of every row (the batch's, then -1) at depth 3."""
+-    reqs = 1 if prefill else num_reqs
+-    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
+-    computed = _randint(3, HISTORY, (MAX_REQS,), gen)
+-    history = _history(gen)
+-    window = torch.empty(MAX_REQS, 3, dtype=torch.int32, device=DEVICE)
+-
+-    def triton_call():
+-        _gather_lookback_kernel[(MAX_REQS,)](
+-            window, idx, computed, history, history.stride(0), reqs, DEPTH=3,
+-            BLOCK_DEPTH=4,
+-        )  # fmt: skip
+-
+-    def tilelang_call():
+-        lookback.gather_lookback(window, idx, computed, history)
+-
+-    return triton_call, tilelang_call
+-
+-
+ def case_gather_consumed_drafts(gen, num_reqs, prefill, widths):
+     """The drafts a step's inputs consumed, which the async-scheduling hand-off
+     copies to the host for structured-output requests: before the port, torch's
+@@ -591,7 +570,6 @@ CASES = {
+     "dspark_context": case_dspark_context,
+     "post_update": case_post_update,
+     "prepare_dflash_inputs": case_prepare_dflash_inputs,
+-    "gather_lookback": case_gather_lookback,
+     "gather_consumed_drafts": case_gather_consumed_drafts,
+ }
+ 
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index 96b6cb89e..0bd74170a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and vLLM's
+-Triton state-ring kernels."""
++"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and torch
++references of the state ring."""
+ 
+ import pytest
+ import torch
+@@ -15,10 +15,6 @@ if not (
+ 
+ pytest.importorskip("tilelang")
+ 
+-from vllm.models.deepseek_v4_1.compressor import (  # noqa: E402
+-    _load_partial_state,
+-    _save_partial_states,
+-)
+ from vllm.models.deepseek_v4_1.tilelang.compress import (  # noqa: E402
+     DIM,
+     STATE,
+@@ -75,34 +71,49 @@ def _step(lengths, ratio, seed, padding=3):
+ 
+ 
+ def _ring(step):
+-    """Each request's carry, by the Triton kernel and the TileLang one."""
+-    out = []
+-    for fn in ("triton", "tilelang"):
+-        pv = torch.full((REQUESTS, DIM), 9.0, device=DEVICE)
+-        pg = torch.full_like(pv, 9.0)
+-        tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
+-        ids = torch.full_like(tags, 7)
+-        if fn == "triton":
+-            pool = step["pool"]
+-            _load_partial_state[(REQUESTS,)](
+-                pool, step["table"], step["starts"], step["positions"], pv, pg, tags,
+-                ids, step["counts"], pool.stride(0), step["table"].stride(0), PAGE,
+-            )  # fmt: skip
+-        else:
+-            gather_partial_state(
+-                step["pool"], step["table"], step["starts"], step["positions"],
+-                step["counts"], pv, pg, tags, ids, page=PAGE,
+-            )  # fmt: skip
+-        out.append((pv, pg, tags, ids))
+-    return out
++    """Each request's carry, by the TileLang kernel."""
++    pv = torch.full((REQUESTS, DIM), 9.0, device=DEVICE)
++    pg = torch.full_like(pv, 9.0)
++    tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
++    ids = torch.full_like(tags, 7)
++    gather_partial_state(
++        step["pool"], step["table"], step["starts"], step["positions"],
++        step["counts"], pv, pg, tags, ids, page=PAGE,
++    )  # fmt: skip
++    return pv, pg, tags, ids
++
++
++def _ref_ring(step):
++    """The carry's contract: a live request (one of the step's, rows within the
++    step's tokens, a position) at an odd position reads its predecessor's value
++    and gate from its ring block (in the first column of its block table), tagged
++    with the predecessor's position; every other request carries zeros, tag -1. A
++    live request keeps its index as its state id, others -1."""
++    starts, positions, table, counts = (
++        step[name].cpu().long() for name in ("starts", "positions", "table", "counts")
++    )
++    pool = step["pool"].cpu()
++    nt, nr = int(counts[0]), int(counts[1])
++    r = torch.arange(REQUESTS)
++    first, end = starts[:REQUESTS], starts[1 : REQUESTS + 1]
++    live = (r < nr) & (first >= 0) & (first < end) & (end <= nt) & (positions >= 0)
++    needed = live & (positions > 0) & (positions % 2 == 1)
++    page = torch.where(needed, table[:, 0], 0)
++    valid = needed & (page > 0)
++    predecessor = positions - 1
++    base = (torch.where(valid, predecessor, 0) % PAGE) * STATE
++    column = base[:, None] + torch.arange(DIM)
++    rows = pool[page]
++    value = torch.where(valid[:, None], rows.gather(1, column), 0.0)
++    gate = torch.where(valid[:, None], rows.gather(1, column + DIM), 0.0)
++    return value, gate, torch.where(valid, predecessor, -1), torch.where(live, r, -1)
+ 
+ 
+ @pytest.mark.parametrize("seed", [1, 2, 3])
+-def test_gather_equals_triton(seed):
++def test_gather_matches_the_reference(seed):
+     step, _, _ = _step([3, 0, 5, 1, 2, 6], 2, seed)
+-    triton_ring, tilelang_ring = _ring(step)
+-    for a, b in zip(tilelang_ring, triton_ring):
+-        assert torch.equal(a, b)
++    for actual, expected in zip(_ring(step), _ref_ring(step)):
++        assert torch.equal(actual.cpu(), expected.to(actual.dtype))
+ 
+ 
+ def normalized_latent(values, weight, gates=None):
+@@ -177,7 +188,7 @@ def _bf16_ulps(a, b):
+ @pytest.mark.parametrize("lengths", [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [300]])
+ def test_compress_matches_reference(ratio, lengths):
+     step, rows, starts = _step(lengths, ratio, seed=len(lengths) * 10 + ratio)
+-    carry = _ring(step)[1]
++    carry = _ring(step)
+     want = _reference(step, rows, starts, ratio, carry)
+     pool_before = step["pool"].clone()
+     out, emitted, eslots = _run(step, rows, ratio, carry)
+@@ -200,21 +211,13 @@ def test_compress_matches_reference(ratio, lengths):
+                 latest[slot // PAGE, base : base + DIM] = step["values"][token]
+                 latest[slot // PAGE, base + DIM : base + STATE] = step["gates"][token]
+         assert torch.equal(step["pool"], latest)
+-        if max(lengths) <= PAGE:
+-            # No slot collides: vLLM's Triton save writes the same.
+-            triton_pool = pool_before.clone()
+-            _save_partial_states[(CAPACITY,)](
+-                triton_pool, step["state_slots"], step["values"], step["gates"],
+-                step["counts"], triton_pool.stride(0), PAGE,
+-            )  # fmt: skip
+-            assert torch.equal(step["pool"], triton_pool)
+ 
+ 
+ @pytest.mark.parametrize("ratio", [1, 2])
+ def test_token_independent_of_batch_and_graphs(ratio):
+     lengths = [4, 6, 2]
+     step, rows, starts = _step(lengths, ratio, seed=40 + ratio)
+-    carry = _ring(step)[1]
++    carry = _ring(step)
+     together = _run(step, rows, ratio, carry)[0][:rows].clone()
+     # The middle request alone: its rows packed first, the same positions.
+     alone_step = {k: v.clone() for k, v in step.items()}
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index d208110d4..3b97390d2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang sparse-MLA metadata against the Triton kernels, exactly."""
++"""DeepSeek-V4.1 TileLang sparse-MLA metadata against torch references of its
++contracts, exactly: every row a launch writes, and the rows it must leave alone."""
+ 
+ from types import SimpleNamespace
+ 
+@@ -16,13 +17,11 @@ if not (
+ 
+ pytest.importorskip("tilelang")
+ 
+-from vllm.models.deepseek_v4_1.attention import _chunk, _pages  # noqa: E402
+-from vllm.models.deepseek_v4_1.sparse_mla import _requests, _tokens  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang import metadata  # noqa: E402
+-from vllm.triton_utils import triton  # noqa: E402
+ 
+ DEVICE = "cuda"
+ R, CAP, COLS = 16, 1024, 40
++BLOCK = 128  # tokens' rows a program covers
+ 
+ 
+ def _step(lengths, seed, padding=5):
+@@ -47,23 +46,125 @@ def _step(lengths, seed, padding=5):
+ STEPS = [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [700], [200, 1, 300]]
+ 
+ 
++# --- Torch references of the contracts, in int64 on the host -----------------
++
++
++def _host(*tensors):
++    return [t.cpu().long() for t in tensors]
++
++
++def _ref_requests(s, nr, nt):
++    """Each of the R + 1 request starts (``nt`` past the last request), each
++    request's first position (-1 past the last), and (tokens, requests)."""
++    qsl, seq = _host(s["qsl"], s["seq"])
++    starts = torch.where(torch.arange(R + 1) <= nr, qsl, nt)
++    live = torch.arange(R) < nr
++    ends = torch.where(live, qsl[1:], nt)
++    positions = torch.where(live, seq - (ends - starts[:R]), -1)
++    return starts, positions, torch.tensor([nt, nr])
++
++
++def _ref_tokens(s, nr, nt, page, ratio, circular):
++    """Each token row of the first ``max(1, ceil(nt / BLOCK))`` blocks: its position
++    and request (-1 when it belongs to none, its position is negative or, outside
++    a ring, the worker gave it no slot), the cache slot it writes (-1 when it
++    emits nothing: the page is a hole or past the table, the ratio's group is not
++    complete, or, in a ring, an earlier row of a long prefill would race later
++    writers) and its visible length ((position + 1) / ratio, 0 when invalid). Rows
++    past those blocks are left alone (None)."""
++    qsl, seq, table, input_slots = _host(s["qsl"], s["seq"], s["table"], s["slots"])
++    cover = min(CAP, max(1, -(-nt // BLOCK)) * BLOCK)
++    t = torch.arange(cover)
++    # The first request whose rows end past t: as many as end at or before it.
++    req = torch.searchsorted(qsl[1 : nr + 1].contiguous(), t, right=True)
++    valid = (t < nt) & (req < nr)
++    r = req.clamp(max=R - 1)
++    start, end = qsl[r], qsl[r + 1]
++    pos = seq[r] - (end - start) + t - start
++    valid &= pos >= 0
++    if not circular:
++        valid &= torch.where(t < nt, input_slots[t], -1) >= 0
++    logical = torch.where(valid, pos, 0) // ratio
++    column = torch.zeros_like(logical) if circular else logical // page
++    valid &= column < table.shape[1]
++    block = torch.where(valid, table[r, column.clamp(max=table.shape[1] - 1)], 0)
++    valid &= block > 0
++    emit = valid & ((torch.where(valid, pos, 0) + 1) % ratio == 0)
++    if circular:
++        emit &= t >= end - page
++    return (
++        torch.where(valid, pos, -1),
++        torch.where(valid, req, -1),
++        torch.where(emit, block * page + logical % page, -1),
++        torch.where(valid, (pos + 1) // ratio, 0),
++    )
++
++
++def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
++               width, page, window, draft, replay_start):  # fmt: skip
++    """Rows ``offset:offset + rows``: each row's window of physical SWA slots (-1 in
++    holes and past its length), its length (clamped to ``width``; 0 when its
++    request or position is invalid) and its indexed length (visible, at most 512).
++    A draft row's window is its request's: prefix plus the request's rows."""
++    pos, reqs, table, visible, qsl, request_positions = _host(
++        pos, reqs, table, visible, qsl, request_positions
++    )
++    row = torch.arange(rows) + offset
++    req, p = reqs[row], pos[row]
++    valid = (req >= 0) & (p >= 0)
++    r = torch.where(valid, req, 0)
++    if draft:
++        first, end = qsl[r] * valid, qsl[r + 1] * valid
++        prefix = request_positions[r] * valid
++        start = (prefix - window).clamp(min=0)
++        length = prefix + end - first - start
++    else:
++        start = (p + 1 - window).clamp(min=0)
++        if replay_start is not None:
++            start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
++        length = p + 1 - start
++    length = torch.where(valid, length.clamp(0, width), 0)
++    col = torch.arange(width)
++    logical = start[:, None] + col
++    live = valid[:, None] & (logical >= 0) & (col < length[:, None])
++    column = torch.where(live, logical // page, 0)
++    assert int(column.max()) < table.shape[1]  # no read past a table row
++    page_id = torch.where(live, table[r[:, None], column], -1)
++    swa = torch.where(live & (page_id > 0), page_id * page + logical % page, -1)
++    top = torch.where(valid, visible[row].clamp(0, 512), 0)
++    return swa, length, top
++
++
++def _ref_pages(reqs, table, offset, rows, width, read_width):
++    """Rows ``offset:offset + rows``: each row's request's page table, ``width``
++    columns, -1 in holes (vLLM's block zero), past ``read_width`` and for rows
++    without a request."""
++    reqs, table = _host(reqs, table)
++    req = reqs[torch.arange(rows) + offset]
++    col = torch.arange(width)
++    live = (req >= 0)[:, None] & (col < read_width)
++    page = torch.where(
++        live, table[req.clamp(min=0)[:, None], col.clamp(max=table.shape[1] - 1)], -1
++    )
++    return torch.where(page > 0, page, -1)
++
++
++def _rows_equal(actual, expected, rows, sentinel=7):
++    """``actual``'s first rows equal the reference, and the rest are untouched."""
++    actual = actual.cpu().long()
++    assert torch.equal(actual[:rows], expected)
++    assert bool((actual[rows:] == sentinel).all())
++
++
+ @pytest.mark.parametrize("lengths", STEPS)
+ def test_requests(lengths):
+     s, nr, nt = _step(lengths, seed=len(lengths))
+-    outs = []
+-    for impl in ("triton", "tilelang"):
+-        out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
+-        pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
+-        counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
+-        if impl == "triton":
+-            _requests[(triton.cdiv(R + 1, 128),)](
+-                s["qsl"], s["seq"], out_starts, pos, counts, nr, nt, R, 128
+-            )
+-        else:
+-            metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
+-        outs.append((out_starts, pos, counts))
+-    for a, b in zip(*outs):
+-        assert torch.equal(a, b)
++    out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
++    pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
++    counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
++    metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
++    for actual, expected in zip((out_starts, pos, counts), _ref_requests(s, nr, nt)):
++        assert torch.equal(actual.cpu().long(), expected)
+ 
+ 
+ TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
+@@ -73,26 +174,18 @@ TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
+ @pytest.mark.parametrize("page, ratio, circular", TOKEN_CASES)
+ def test_tokens(lengths, page, ratio, circular):
+     s, nr, nt = _step(lengths, seed=page + ratio + len(lengths))
+-    outs = []
+-    for impl in ("triton", "tilelang"):
+-        pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
+-        reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
+-        visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        if impl == "triton":
+-            _tokens[(max(1, triton.cdiv(nt, 128)),)](
+-                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
+-                nr, nt, s["table"].stride(0), s["table"].shape[1], CAP, page, ratio,
+-                128, circular,
+-            )  # fmt: skip
+-        else:
+-            metadata.tokens(
+-                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
+-                nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
+-            )  # fmt: skip
+-        outs.append((pos, reqs, slots, visible))
+-    for a, b in zip(*outs):
+-        assert torch.equal(a, b)
++    pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
++    reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
++    visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    metadata.tokens(
++        s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
++        nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
++    )  # fmt: skip
++    expected = _ref_tokens(s, nr, nt, page, ratio, circular)
++    cover = expected[0].shape[0]
++    for actual, reference in zip((pos, reqs, slots, visible), expected):
++        _rows_equal(actual, reference, cover)
+ 
+ 
+ def _token_metadata(s, nr, nt, page):
+@@ -120,26 +213,20 @@ def test_chunk(lengths, draft, replay, width):
+     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
+     rows, offset = min(nt, 600), 3 if nt > 10 else 0
+     rows = min(rows, nt - offset)
+-    outs = []
+-    for impl in ("triton", "tilelang"):
+-        swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+-        lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        if impl == "triton":
+-            _chunk[(rows,)](
+-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+-                request_positions, offset, s["table"].stride(0), page, window, width,
+-                draft, triton.next_power_of_2(width), swa_replay_start=replay_start,
+-            )  # fmt: skip
+-        else:
+-            metadata.chunk(
+-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+-                request_positions, offset, rows, page=page, window=window, draft=draft,
+-                replay_start=replay_start,
+-            )  # fmt: skip
+-        outs.append((swa, lengths_out, top))
+-    for a, b in zip(*outs):
+-        assert torch.equal(a, b)
++    swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
++    lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    metadata.chunk(
++        pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
++        request_positions, offset, rows, page=page, window=window, draft=draft,
++        replay_start=replay_start,
++    )  # fmt: skip
++    expected = _ref_chunk(
++        pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
++        width, page, window, draft, replay_start,
++    )  # fmt: skip
++    for actual, reference in zip((swa, lengths_out, top), expected):
++        _rows_equal(actual, reference, rows)
+ 
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+@@ -149,18 +236,10 @@ def test_pages(lengths, width, read_width):
+     _, reqs, _ = _token_metadata(s, nr, nt, 64)
+     rows, offset = min(nt, 500), 2 if nt > 4 else 0
+     rows = min(rows, nt - offset)
+-    outs = []
+-    for impl in ("triton", "tilelang"):
+-        out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+-        if impl == "triton":
+-            _pages[(rows, triton.cdiv(width, 128))](
+-                reqs, s["table"], out, offset, s["table"].stride(0), read_width,
+-                width, 128,
+-            )  # fmt: skip
+-        else:
+-            metadata.pages(reqs, s["table"], out, offset, rows, read_width)
+-        outs.append(out)
+-    assert torch.equal(outs[0], outs[1])
++    out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
++    metadata.pages(reqs, s["table"], out, offset, rows, read_width)
++    expected = _ref_pages(reqs, s["table"], offset, rows, width, read_width)
++    _rows_equal(out, expected, rows)
+ 
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+@@ -176,32 +255,26 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
+     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
+     rows, offset = min(nt, 600), 3 if nt > 10 else 0
+     rows = min(rows, nt - offset)
+-    outs = []
+-    for impl in ("triton", "tilelang"):
+-        swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
+-        lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
+-        main_pages = torch.full((CAP, main_width), 7, dtype=torch.int32, device=DEVICE)
+-        if impl == "triton":
+-            _chunk[(rows,)](
+-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+-                request_positions, offset, s["table"].stride(0), page, window, width,
+-                draft, triton.next_power_of_2(width), swa_replay_start=replay_start,
+-            )  # fmt: skip
+-            _pages[(rows, triton.cdiv(main_width, 128))](
+-                main_reqs, s["table"], main_pages, offset, s["table"].stride(0),
+-                s["table"].shape[1], main_width, 128,
+-            )  # fmt: skip
+-        else:
+-            metadata.decode_metadata(
+-                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
+-                request_positions, main_reqs, s["table"], main_pages, offset, rows,
+-                s["table"].shape[1], page=page, window=window, draft=draft,
+-                replay_start=replay_start,
+-            )  # fmt: skip
+-        outs.append((swa, lengths_out, top, main_pages))
+-    for a, b in zip(*outs):
+-        assert torch.equal(a, b)
++    swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
++    lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++    main_pages = torch.full((CAP, main_width), 7, dtype=torch.int32, device=DEVICE)
++    metadata.decode_metadata(
++        pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
++        request_positions, main_reqs, s["table"], main_pages, offset, rows,
++        s["table"].shape[1], page=page, window=window, draft=draft,
++        replay_start=replay_start,
++    )  # fmt: skip
++    expected = _ref_chunk(
++        pos, reqs, s["table"], visible, s["qsl"], request_positions, offset, rows,
++        width, page, window, draft, replay_start,
++    ) + (
++        _ref_pages(
++            main_reqs, s["table"], offset, rows, main_width, s["table"].shape[1]
++        ),
++    )  # fmt: skip
++    for actual, reference in zip((swa, lengths_out, top, main_pages), expected):
++        _rows_equal(actual, reference, rows)
+ 
+ 
+ @torch.inference_mode()
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 7d603ee45..2b46fd379 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -26,9 +26,6 @@ if not (
+ 
+ pytest.importorskip("tilelang")
+ 
+-from vllm.models.deepseek_v4_1.nvidia.model_state import (  # noqa: E402
+-    _gather_lookback_kernel,
+-)
+ from vllm.models.deepseek_v4_1.tilelang import lookback  # noqa: E402
+ from vllm.triton_utils import triton  # noqa: E402
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # noqa: E402
+@@ -1246,20 +1243,17 @@ def test_gather_lookback(num_reqs, depth):
+     computed = _randint(0, 12, (MAX_REQS,), gen)  # windows before the history
+     history = _history(gen, 64)
+     window = _garbage((MAX_REQS, depth), torch.int32, gen)
+-    ref = window.clone()
+-    _gather_lookback_kernel[(MAX_REQS,)](
+-        ref,
+-        idx,
+-        computed,
+-        history,
+-        history.stride(0),
+-        num_reqs,
+-        DEPTH=depth,
+-        BLOCK_DEPTH=triton.next_power_of_2(depth),
+-    )
+     lookback.gather_lookback(window, idx, computed, history)
+-    torch.accelerator.synchronize()
+-    assert torch.equal(ref, window)
++    # The window's contract: each batch row's request's last ``depth`` tokens
++    # before its computed tokens, -1 before its history starts; every row past the
++    # batch -1.
++    idx, computed, history = (t.cpu().long() for t in (idx, computed, history))
++    ref = torch.full((MAX_REQS, depth), -1, dtype=torch.long)
++    for row in range(num_reqs):
++        req = int(idx[row])
++        pos = torch.arange(int(computed[req]) - depth, int(computed[req]))
++        ref[row] = torch.where(pos >= 0, history[req, pos.clamp(min=0)], -1)
++    assert torch.equal(window.cpu().long(), ref)
+ 
+ 
+ # --- Preparation --------------------------------------------------------------
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index f784f1fce..0a7e6c37a 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -37,7 +37,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
+ )
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+-from vllm.triton_utils import tl, triton
++from vllm.utils.math_utils import cdiv
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+@@ -65,21 +65,6 @@ def _native_linear(layer):
+     raise ValueError("V4.1 attention only supports native linear methods")
+ 
+ 
+-@triton.jit(do_not_specialize=["offset", "stride", "width"])
+-def _pages(
+-    Reqs, Table, Out, offset, stride, width, WIDTH: tl.constexpr, B: tl.constexpr
+-):
+-    row = tl.program_id(0).to(tl.int64)
+-    col = tl.program_id(1) * B + tl.arange(0, B)
+-    req = tl.load(Reqs + offset + row)
+-    page = tl.load(
+-        Table + req.to(tl.int64) * stride + col, (req >= 0) & (col < width), other=-1
+-    )
+-    # vLLM reserves physical block zero; b12x page tables use -1 for holes.
+-    page = tl.where(page > 0, page, -1)
+-    tl.store(Out + row * WIDTH + col, page, col < WIDTH)
+-
+-
+ class _Cache(nn.Module, AttentionLayerBase):
+     def __init__(self, config, prefix, *, kind, ratio=1, window=0, draft=False):
+         super().__init__()
+@@ -542,7 +527,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             and self.layer_id < self.candidate_source_layer
+         ):
+             short_rows = min(1024, self.capacity)
+-            short_width = min(self._index_width, triton.cdiv(16384, self._index_page))
++            short_width = min(self._index_width, cdiv(16384, self._index_page))
+             self._short_index_shape = (short_rows, short_width)
+             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
+         self._staging_specs = tuple(specs)
+@@ -965,7 +950,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             ):
+                 score_width = min(
+                     self._index_width * self._index_page,
+-                    max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
++                    max(1, cdiv(im.max_seq_len, self.compress_ratio)),
+                 )
+             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+             index_pages = self._index_pages
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index a15c5ee81..4be84e918 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -8,64 +8,10 @@ import torch.nn as nn
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+ from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
+-from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backend import MultipleOf
+ from vllm.v1.kv_cache_interface import CircularBufferSpec
+ 
+ 
+-@triton.jit(do_not_specialize=["stride", "table_stride"])
+-def _load_partial_state(
+-    Pool,
+-    Table,
+-    Starts,
+-    Positions,
+-    Values,
+-    Gates,
+-    Tags,
+-    LocalIds,
+-    Counts,
+-    stride,
+-    table_stride,
+-    PAGE: tl.constexpr,
+-):
+-    r = tl.program_id(0).to(tl.int64)
+-    col = tl.arange(0, 512)
+-    nr = tl.load(Counts + 1)
+-    nt = tl.load(Counts)
+-    first = tl.load(Starts + r)
+-    end = tl.load(Starts + r + 1)
+-    pos = tl.load(Positions + r)
+-    live = (r < nr) & (first >= 0) & (first < end) & (end <= nt)
+-    live = live & (pos >= 0)
+-    predecessor = pos - 1
+-    needed = live & (pos > 0) & (pos % 2 == 1)
+-    page = tl.load(Table + r * table_stride, needed, other=0).to(tl.int64)
+-    valid = needed & (page > 0)
+-    base = Pool + page * stride + (predecessor % PAGE) * 1024
+-    value = tl.load(base + col, valid, other=0)
+-    gate = tl.load(base + 512 + col, valid, other=0)
+-    tl.store(Values + r * 512 + col, value)
+-    tl.store(Gates + r * 512 + col, gate)
+-    tl.store(Tags + r, tl.where(valid, predecessor, -1))
+-    tl.store(LocalIds + r, tl.where(live, r, -1))
+-
+-
+-@triton.jit(do_not_specialize=["stride"])
+-def _save_partial_states(
+-    Pool, Slots, Values, Gates, Counts, stride, PAGE: tl.constexpr
+-):
+-    token = tl.program_id(0).to(tl.int64)
+-    col = tl.arange(0, 512)
+-    nt = tl.load(Counts)
+-    slot = tl.load(Slots + token).to(tl.int64)
+-    valid = (token < nt) & (slot >= PAGE)
+-    base = Pool + (slot // PAGE) * stride + (slot % PAGE) * 1024
+-    value = tl.load(Values + token * 512 + col, valid, other=0)
+-    gate = tl.load(Gates + token * 512 + col, valid, other=0)
+-    tl.store(base + col, value, valid)
+-    tl.store(base + 512 + col, gate, valid)
+-
+-
+ class CompressorBackend(DeepseekV41B12xBackend):
+     @staticmethod
+     def get_name():
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 11e3b1dcd..ad82bc843 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -17,7 +17,6 @@ from vllm.models.deepseek_v4_1.ced import (
+ )
+ from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+-from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -28,40 +27,6 @@ from vllm.v1.worker.gpu.states import RequestState
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ 
+-# The reference ``tilelang.lookback.gather_lookback_kernel`` is tested against;
+-# the model state no longer launches it.
+-@triton.jit(do_not_specialize=["num_reqs"])
+-def _gather_lookback_kernel(
+-    lookback_ptr,
+-    idx_mapping_ptr,
+-    num_computed_tokens_ptr,
+-    all_token_ids_ptr,
+-    all_token_ids_stride,
+-    num_reqs,
+-    DEPTH: tl.constexpr,
+-    BLOCK_DEPTH: tl.constexpr,
+-):
+-    # One program per lookback row; rows past the batch are filled with -1.
+-    batch_idx = tl.program_id(0)
+-    in_batch = batch_idx < num_reqs
+-    req_state_idx = tl.load(idx_mapping_ptr + batch_idx, mask=in_batch, other=0)
+-    num_computed = tl.load(
+-        num_computed_tokens_ptr + req_state_idx, mask=in_batch, other=0
+-    )
+-
+-    offs = tl.arange(0, BLOCK_DEPTH)
+-    pos = num_computed - DEPTH + offs
+-    valid = in_batch & (offs < DEPTH) & (pos >= 0)
+-    ids = tl.load(
+-        all_token_ids_ptr
+-        + req_state_idx.to(tl.int64) * all_token_ids_stride
+-        + pos.to(tl.int64),
+-        mask=valid,
+-        other=-1,
+-    )
+-    tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
+-
+-
+ def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:
+     """Validate the serving contract before enabling CED's nonfinal row skip."""
+     scheduler = vllm_config.scheduler_config
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 677ff8e34..5a9798390 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -8,7 +8,6 @@ from typing import ClassVar
+ import torch
+ 
+ from vllm.config import CacheConfig
+-from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -20,140 +19,6 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
+ 
+ 
+-@triton.jit(do_not_specialize=["nr", "nt"])
+-def _requests(
+-    Starts, Seq, OutStarts, Pos, Counts, nr, nt, R: tl.constexpr, B: tl.constexpr
+-):
+-    r = tl.program_id(0) * B + tl.arange(0, B)
+-    start = tl.load(Starts + r, r <= nr, other=nt)
+-    end = tl.load(Starts + r + 1, r < nr, other=nt)
+-    seq = tl.load(Seq + r, r < nr, other=0)
+-    tl.store(OutStarts + r, start, r <= R)
+-    tl.store(Pos + r, tl.where(r < nr, seq - (end - start), -1), r < R)
+-    if tl.program_id(0) == 0:
+-        tl.store(Counts, nt)
+-        tl.store(Counts + 1, nr)
+-
+-
+-@triton.jit(do_not_specialize=["nr", "nt", "stride", "table_width"])
+-def _tokens(
+-    Starts,
+-    Seq,
+-    Table,
+-    InputSlots,
+-    Positions,
+-    Reqs,
+-    Slots,
+-    Visible,
+-    nr,
+-    nt,
+-    stride,
+-    table_width,
+-    T: tl.constexpr,
+-    PAGE: tl.constexpr,
+-    RATIO: tl.constexpr,
+-    B: tl.constexpr,
+-    CIRCULAR: tl.constexpr = False,
+-):
+-    t = tl.program_id(0) * B + tl.arange(0, B)
+-    lo = tl.full((B,), 0, tl.int32)
+-    hi = tl.full((B,), nr, tl.int32)
+-    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+-        mid = (lo + hi) // 2
+-        end = tl.load(Starts + mid + 1, mid < nr, other=nt)
+-        right = end <= t
+-        active = lo < hi
+-        lo = tl.where(active & right, mid + 1, lo)
+-        hi = tl.where(active & ~right, mid, hi)
+-    valid = (t < nt) & (lo < nr)
+-    start = tl.load(Starts + lo, valid, other=0)
+-    end = tl.load(Starts + lo + 1, valid, other=0)
+-    seq = tl.load(Seq + lo, valid, other=0)
+-    pos = seq.to(tl.int64) - (end - start) + t - start
+-    input_slot = tl.load(InputSlots + t, t < nt, other=-1)
+-    # A ring group takes no slot-mapping row (its spec opts out, so every entry
+-    # is padding); its slot comes from the ring block below, and padded rows
+-    # are excluded by the request range and block checks.
+-    valid = valid & (pos >= 0) if CIRCULAR else valid & (pos >= 0) & (input_slot >= 0)
+-    logical = pos // RATIO
+-    page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
+-    valid = valid & (page_col < table_width)
+-    block = tl.load(Table + lo.to(tl.int64) * stride + page_col, valid, other=0).to(
+-        tl.int64
+-    )
+-    valid = valid & (block > 0)
+-    slot = block * PAGE + logical % PAGE
+-    emit = valid & ((pos + 1) % RATIO == 0)
+-    if CIRCULAR:
+-        # Only the final capacity rows may write: earlier rows would race
+-        # later writers to the same ring slots during a long prefill.
+-        emit = emit & (t >= end - PAGE)
+-    tl.store(Positions + t, tl.where(valid, pos, -1), t < T)
+-    tl.store(Reqs + t, tl.where(valid, lo, -1), t < T)
+-    tl.store(Slots + t, tl.where(emit, slot, -1), t < T)
+-    tl.store(Visible + t, tl.where(valid, (pos + 1) // RATIO, 0), t < T)
+-
+-
+-@triton.jit(do_not_specialize=["offset", "table_stride"])
+-def _chunk(
+-    Positions,
+-    Reqs,
+-    Table,
+-    Swa,
+-    Lengths,
+-    TopLengths,
+-    Visible,
+-    Starts,
+-    RequestPositions,
+-    offset,
+-    table_stride,
+-    PAGE: tl.constexpr,
+-    WINDOW: tl.constexpr,
+-    WIDTH: tl.constexpr,
+-    DRAFT: tl.constexpr,
+-    BLOCK: tl.constexpr,
+-    swa_replay_start=None,
+-):
+-    row = tl.program_id(0).to(tl.int64)
+-    col = tl.arange(0, BLOCK)
+-    req = tl.load(Reqs + offset + row)
+-    pos = tl.load(Positions + offset + row).to(tl.int64)
+-    valid = (req >= 0) & (pos >= 0)
+-    if DRAFT:
+-        first = tl.load(Starts + req, valid, other=0).to(tl.int64)
+-        end = tl.load(Starts + req + 1, valid, other=0).to(tl.int64)
+-        prefix = tl.load(RequestPositions + req, valid, other=0).to(tl.int64)
+-        start = tl.maximum(prefix - WINDOW, 0)
+-        if swa_replay_start is not None:
+-            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
+-            start = tl.maximum(start, replay)
+-        length = prefix + end - first - start
+-    else:
+-        start = tl.maximum(pos + 1 - WINDOW, 0)
+-        if swa_replay_start is not None:
+-            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
+-            start = tl.maximum(start, replay)
+-        length = pos + 1 - start
+-    length = tl.where(valid, tl.minimum(tl.maximum(length, 0), WIDTH), 0)
+-    logical = start + col
+-    page = tl.load(
+-        Table + req.to(tl.int64) * table_stride + logical // PAGE,
+-        valid & (logical >= 0) & (col < length),
+-        other=-1,
+-    ).to(tl.int64)
+-    physical = page * PAGE + logical % PAGE
+-    tl.store(
+-        Swa + row * WIDTH + col,
+-        tl.where((page > 0) & (logical >= 0) & (col < length), physical, -1),
+-        col < WIDTH,
+-    )
+-    tl.store(Lengths + row, tl.maximum(length, 0))
+-    visible = tl.load(Visible + offset + row)
+-    tl.store(
+-        TopLengths + row, tl.where(valid, tl.minimum(tl.maximum(visible, 0), 512), 0)
+-    )
+-
+-
+ @dataclass
+ class DeepseekV41B12xMetadata:
+     num_actual_tokens: int
+@@ -246,7 +111,8 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         return self._metadata(cm, table)
+ 
+     def _build_tilelang(self, cm, table) -> None:
+-        """``_requests`` and ``_tokens`` as the TileLang metadata kernels."""
++        """The step's request starts and positions, then each token's request,
++        position, slot and visible length."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+ 
+         tl_metadata.requests(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index eff5735f1..9c89f51cc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -17,10 +17,10 @@ step (``gather_partial_state``, which must finish before ``compress`` overwrites
+ slots). ``compress`` also saves each request's latest ``page`` positions of the step
+ (value and gate) to their ring slots, so a slot holds its latest position.
+ 
+-This replaces B12X's ``mla_compress`` (one 128-thread block per token of the whole
++This replaced B12X's ``mla_compress`` (one 128-thread block per token of the whole
+ batch capacity every call, then a pending-ring commit vLLM never reads) and vLLM's two
+-Triton ring kernels (``_load_partial_state``, ``_save_partial_states``, the latter also
+-over the whole capacity): two launches sized by the step. One warp owns a token, 16
++Triton ring kernels (the load, and the save over the whole capacity): two launches
++sized by the step. One warp owns a token, 16
+ values a lane, and reduces its sum of squares with warp shuffles. ``exp`` and
+ ``rsqrt`` are the FP32 library functions, as the reference computes them (B12X used
+ fast approximations).
+@@ -260,7 +260,7 @@ def gather_partial_state(
+     pool, table, starts, positions, counts, pending_values, pending_gates, tags,
+     local_ids, *, page,
+ ):  # fmt: skip
+-    """vLLM's ``_load_partial_state``: each request's carry from the state ring."""
++    """Each request's carry from the state ring."""
+     max_requests = positions.shape[0]
+     gather_partial_state_kernel(max_requests, page)(
+         pool, table, starts, positions, counts, pending_values, pending_gates, tags,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/lookback.py b/vllm/models/deepseek_v4_1/tilelang/lookback.py
+index 0816bd0b7..383666490 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/lookback.py
++++ b/vllm/models/deepseek_v4_1/tilelang/lookback.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""The Engram lookback window, ``model_state._gather_lookback_kernel``'s contract.
++"""The Engram lookback window.
+ 
+ Each row of ``lookback`` ([rows, depth], int32) holds the ids of the ``depth``
+ tokens before its request's computed tokens, oldest first, from the runner's token
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 9b2174920..85966cc2f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -2,9 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TileLang sparse-MLA metadata for DeepSeek-V4.1: integer kernels, exact.
+ 
+-The same contracts as the Triton kernels they replace (``sparse_mla._requests``,
+-``_tokens``, ``attention._chunk`` and ``_pages``), element for element, including
+-which rows each launch writes:
++Each keeps the contract of the Triton kernel it replaced, element for element,
++including which rows each launch writes:
+ 
+ - ``requests``: request starts (``nt`` past the live requests), each request's first
+   position (``seq - query``, -1 past them) and the live counts ``[nt, nr]``.
+@@ -140,8 +139,8 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+ 
+ 
+ def _window_macro(page, window, width, draft, replay, threads, per_thread):
+-    """One row's sliding-window metadata (``attention._chunk``), for a block of
+-    ``threads`` threads."""
++    """One row's sliding-window metadata (``chunk``), for a block of ``threads``
++    threads."""
+ 
+     @T.macro
+     def window_row(
+@@ -338,7 +337,7 @@ def pages_kernel(width: int):
+ 
+ 
+ def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:
+-    """``sparse_mla._requests``."""
++    """Request starts, first positions and live counts (module docstring)."""
+     requests_kernel(positions.shape[0])(
+         starts, seq, out_starts, positions, counts, nr, nt
+     )
+@@ -348,7 +347,8 @@ def tokens(
+     starts, seq, table, input_slots, positions, reqs, slots, visible, nr: int,
+     nt: int, *, max_requests: int, page: int, ratio: int, circular: bool,
+ ) -> None:  # fmt: skip
+-    """``sparse_mla._tokens``: rows of the first ``max(1, ceil(nt / 128))`` blocks."""
++    """Per-token metadata, for the rows of the first ``max(1, ceil(nt / 128))``
++    blocks."""
+     cover = min(positions.shape[0], max(1, -(-nt // _BLOCK)) * _BLOCK)
+     tokens_kernel(max_requests, page, ratio, circular)(
+         starts, seq, table, input_slots, positions[:cover], reqs[:cover],
+@@ -361,7 +361,7 @@ def chunk(
+     request_positions, offset: int, rows: int, *, page: int, window: int,
+     draft: bool, replay_start=None,
+ ) -> None:  # fmt: skip
+-    """``attention._chunk`` for ``rows`` rows from source row ``offset``."""
++    """Window metadata for ``rows`` rows from source row ``offset``."""
+     width = swa.shape[1]
+     replay = replay_start is not None
+     chunk_kernel(page, window, width, draft, replay)(
+@@ -388,7 +388,7 @@ def decode_metadata(
+ 
+ 
+ def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
+-    """``attention._pages`` for ``rows`` rows from source row ``offset``; ``out`` is
++    """Page tables for ``rows`` rows from source row ``offset``; ``out`` is
+     ``[*, width]`` and columns at or past ``read_width`` are -1."""
+     pages_kernel(out.shape[1])(reqs, table, out[:rows], offset, read_width)
+ 
