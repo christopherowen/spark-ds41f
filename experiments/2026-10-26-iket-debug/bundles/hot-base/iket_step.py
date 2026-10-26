@@ -132,7 +132,9 @@ def main():
         generation_config="vllm",
         hf_overrides=shrink,
         jit_monitor_mode="off",
-        limit_mm_per_prompt={"image": 0},
+        # One image, not none: a stubbed vision tower (limit 0) still declares its
+        # TileLang kernels, and binding them fails on its meta weights.
+        limit_mm_per_prompt={"image": 1},
         mm_processor_cache_gb=0,
     )
     boot = time.monotonic() - started
