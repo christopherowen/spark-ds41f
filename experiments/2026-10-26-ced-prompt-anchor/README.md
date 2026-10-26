@@ -224,6 +224,8 @@ from the image's tree (26382f5cf).
   check as a record.
 - `bundles/anchor`: the CED test files and the new test, the chunking check (every
   chunking bit-identical), and the CED kernel benchmark.
+- `bundles/anchor-wide` and `bundles/next-candidate-wide`: the test files of the paths
+  the change reaches beyond CED, on each tree.
 
 [chunking_check.py](chunking_check.py) runs the decoder stack under each tree's own
 model state; next-candidate's gets the recipe's skip policy. It covers:
@@ -281,13 +283,41 @@ Nothing ran on dgx1-dgx3.
 | 129 rows | 5 of 6 (the 384-row chunking leaves a 1-row final) | 6 of 6 |
 | hit at 448, then 88 rows | 0 of 1 | 1 of 1 |
 
-**Unaffected prompts against next-candidate.** In each tree, every unaffected chunking
-equals that tree's single chunk. The single chunk keeps the same rows from the same
-replay start in both trees, and every other kernel the stack runs is the same code, so
-the two trees agree on these prompts. A second run of both bundles adds a SHA-256 of
-every case's rows to check this across trees. **That run was interrupted:** it started at
-about 08:10 CET, and dgx1-dgx4 powered off at about 08:15 CET for re-cabling, on the
-owner's instruction. It re-runs once dgx4 is back, as `out/*-3`.
+**Unaffected prompts against next-candidate (run 3, finished 14:39 CET;
+[runs/anchor-3](runs/anchor-3), [runs/next-candidate-3](runs/next-candidate-3)).** The
+chunking check now prints a SHA-256 of every case's rows, so the two trees compare bit
+for bit. Run 2 was interrupted when dgx1-dgx4 powered off at about 08:15 CET for
+re-cabling, and run 3 replaced it.
+- **The single chunk:** identical across trees (25 of 25 digests).
+- **Unaffected cases:** all 8 (every 129-row final and the long-final chunkings) give
+  next-candidate's rows bit for bit.
+- **Affected cases:** all 17 differ from next-candidate, as intended. On the branch each
+  equals its single chunk; on next-candidate none does.
+- **Everything else repeats run 1:** the branch's chunking check 25 of 25, next-candidate
+  17 of 25 differing, the benchmark exact, the same failure sets.
+
+| | Cases | Branch equals its single chunk | Branch equals next-candidate |
+| --- | ---: | ---: | ---: |
+| Unaffected (next-candidate equals its single chunk) | 8 | 8 | 8 |
+| Affected (final chunk of 1-128 rows) | 17 | 17 | 0 |
+
+**Wider tests (`anchor-wide`, finished 14:39 CET; [runs/anchor-wide-1](runs/anchor-wide-1)).**
+These are the test files of the paths the change reaches beyond CED:
+- the DS4.1 attention layers, DSpark context KV and MLA, SP prefill, the TileLang attention
+  kernels;
+- the drafter's input preparation and lookahead, adaptive verification, the Markov head;
+- the runner's graph profiling, the context limit and the input batch, the KV manager's
+  utilities.
+
+428 passed, 2 skipped, 1 xfailed; 43 failed and 5 errors.
+- Every failure is in `tests/v1/core/test_kv_cache_utils.py` (40 and the 5 errors) or
+  `tests/v1/spec_decode/test_dflash_lookahead.py` (3).
+- 43 need a Hugging Face config (`Qwen/Qwen3-0.6B`) that the offline lab container
+  lacks; the 5 errors need the `caplog_vllm` fixture, which `--noconftest` removes.
+- The branch changes neither file, and the paths they test take no input from it.
+- **next-candidate (`next-candidate-wide`, finished 14:43 CET;
+  [runs/next-candidate-wide-1](runs/next-candidate-wide-1))** gives the same counts and
+  the same failure set exactly.
 
 ## What the gate and the release comparison must expect
 
@@ -323,6 +353,9 @@ owner's instruction. It re-runs once dgx4 is back, as `out/*-3`.
   On next-candidate the TP3-8192 output differs from the other two; on this branch all
   three must be identical. The prompt must be token-exact, so send prompt token ids
   through `/v1/completions`.
+
+**For the candidate's release tests:** the manifest already lists the CED test files this
+branch changes. Add the new `tests/kernels/attention/test_deepseek_v41_ced_replay.py`.
 
 ## Not done here
 

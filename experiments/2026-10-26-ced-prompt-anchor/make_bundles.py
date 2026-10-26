@@ -13,6 +13,8 @@ mounted as one that fails to import.
   chunking check as a record of the per-chunk anchor.
 - ``anchor``: ced-prompt-anchor: the CED test files with the new ones, the chunking
   check (every chunking bit-identical) and the CED kernel benchmark.
+- ``anchor-wide`` and ``next-candidate-wide``: the test files of the paths the change
+  reaches beyond CED, on each tree (the second for failures that predate the anchor).
 
 Both mount ced-prompt-anchor's decoder-stack test at /b/ced_replay_stack.py for the
 chunking check, which imports it. Files are written in place, never deleted.
@@ -47,6 +49,24 @@ CED_TESTS = [
     "tests/v1/worker/test_gpu_model_runner_v2.py",
     "tests/v1/core/test_aligned_prefill_chunks.py",
 ]
+# The paths the change reaches beyond CED: the attention layers' replay start, the
+# drafter's context and inputs, adaptive verification, the runner's graph dispatch, and
+# the KV manager's replay window.
+WIDE_TESTS = [
+    "tests/models/test_deepseek_v4_1_attention.py",
+    "tests/models/test_deepseek_v4_dspark_context_kv.py",
+    "tests/models/test_dspark_mla.py",
+    "tests/models/test_deepseek_v4_1_sp_prefill.py",
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+    "tests/v1/spec_decode/test_dflash_prepare_inputs.py",
+    "tests/v1/spec_decode/test_dflash_lookahead.py",
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "tests/v1/spec_decode/test_dspark_v41_gathered_markov.py",
+    "tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py",
+    "tests/v1/worker/test_model_state_context_limit.py",
+    "tests/v1/worker/test_gpu_input_batch_v2.py",
+    "tests/v1/core/test_kv_cache_utils.py",
+]
 
 # name: (ref, description, steps [(label, argv after python, timeout seconds)])
 BUNDLES = {
@@ -73,6 +93,20 @@ BUNDLES = {
             ("CED kernel benchmark", ["benchmarks/kernels/benchmark_deepseek_v41_ced.py"],
              5400),
         ],
+    ),
+    "anchor-wide": (
+        ANCHOR,
+        "the test files of the paths the anchor reaches beyond CED (attention, the "
+        "drafter, adaptive verification, graph dispatch, the KV manager)",
+        [("wider test files", PYTEST + [
+            "--basetemp", "/c/pytest-ced-anchor-wide", *WIDE_TESTS], 7200)],
+    ),
+    "next-candidate-wide": (
+        NEXT,
+        "the same wider test files on next-candidate, for failures that predate the "
+        "anchor",
+        [("wider test files on next-candidate", PYTEST + [
+            "--basetemp", "/c/pytest-ced-anchor-next-wide", *WIDE_TESTS], 7200)],
     ),
 }
 
