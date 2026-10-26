@@ -23,6 +23,7 @@ does (as retire-conditionals' bundles do), so nothing in the image reaches it.
 - bundles/pdl-rows: the same A/B over pdl_rows.py, every row count the engine grid
   judges with the shared expert beside the routed experts and inline;
   bundles/pdl-rows-focus: 15 rounds at the row counts where PDL was level or slower;
+- bundles/pdl-trace: the 16- and 48-row chains under the torch profiler, kernel by kernel;
 - bundles/pdl-sources: sources_cpu.py, every chain kernel lowered at its decode shapes
   without device compilation and checked as the plugin checks launched kernels;
 - pdl-tp4.json, pdl-tp4-dev.json (PDL) and base-tp4.json, base-tp4-dev.json (BASE):
@@ -313,6 +314,25 @@ def main() -> None:
     for script in ("pdl_chain_ab.py", "pdl_rows.py"):
         shutil.copyfile(HERE / script, focus / script)
 
+    # Kernel by kernel: the 16- and 48-row chains under the torch profiler.
+    traced = bundle(
+        "pdl-trace",
+        f"The layer chain's CUDA graph at 16 and 48 rows replayed under the torch profiler on next-candidate's "
+        f"build (vLLM {base} {base_commit}) and on vLLM {head} {commit}, two rounds alternating "
+        "(pdl_chain_ab.py running pdl_trace.py): each kernel's median start, end and duration in a replay.",
+        ["/b/pdl_chain_ab.py", "2", "/b/pdl_trace.py", "--rows", "16,48"],
+        [
+            ["pdl_chain_ab.py", "/b/pdl_chain_ab.py"],
+            ["pdl_trace.py", "/b/pdl_trace.py"],
+        ],
+        "status",
+    )
+    candidate = json.loads((traced / "candidate.json").read_text())
+    candidate["mounts"] += both_builds
+    write_json(traced / "candidate.json", candidate)
+    for script in ("pdl_chain_ab.py", "pdl_trace.py"):
+        shutil.copyfile(HERE / script, traced / script)
+
     # The chain kernels' sources, lowered at their decode shapes.
     sources = bundle(
         "pdl-sources",
@@ -377,7 +397,7 @@ def main() -> None:
         )
     print(
         "wrote overlay/, overlay-base/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-rows, "
-        "bundles/pdl-rows-focus, "
+        "bundles/pdl-rows-focus, bundles/pdl-trace, "
         "bundles/pdl-sources, "
         "bundles/pdl-mechanism, "
         "pdl-tp4.json, pdl-tp4-dev.json, base-tp4.json, base-tp4-dev.json"
