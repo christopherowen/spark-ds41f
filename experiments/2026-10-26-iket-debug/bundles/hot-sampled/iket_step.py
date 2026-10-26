@@ -30,6 +30,7 @@ the wall time of each request, the vLLM tree's IKET state and the config overrid
 
 import argparse
 import functools
+import gc
 import json
 import os
 import sys
@@ -237,6 +238,16 @@ def main():
     }
     (out / "result.json").write_text(json.dumps(result, indent=1) + "\n")
     print(json.dumps(result), flush=True)
+    # run-iket decodes its records on the host when the process exits, and GB10's CPU
+    # and GPU share memory: release the engine's first (run 26 ran out in the decode).
+    free = torch.cuda.mem_get_info()[0]
+    llm.llm_engine.engine_core.shutdown()
+    del llm, measured
+    gc.collect()
+    torch.cuda.empty_cache()
+    result["freed_gib_before_exit"] = round((torch.cuda.mem_get_info()[0] - free) / 2**30, 1)
+    (out / "result.json").write_text(json.dumps(result, indent=1) + "\n")
+    print(f"engine shut down: {result['freed_gib_before_exit']} GiB freed", flush=True)
 
 
 if __name__ == "__main__":

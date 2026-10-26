@@ -66,14 +66,21 @@ the hot kernels did not:
 - `VLLM_DS41_IKET_ITERS=N`: a range inside a `for` loop records in at most N of its
   iterations, each in the middle of its share of the loop, so `N=1` samples the middle
   iteration rather than the pipeline's fill. The guard uses the loop variable, so it is
-  uniform within an iteration. With it, only lane 0 of a warp records: IKET records an
-  event each time a group of a warp's lanes runs it, so where lanes diverge, one
-  statement would leave several records. Each range then records at most once per
-  sampled iteration, and every site's static bound in the manifests holds. A TVM
+  uniform within an iteration. Each range then records at most once per sampled
+  iteration and group of lanes that reaches it, and the manifests' static bound holds
+  where a warp's lanes do not diverge (sparknet's polling lanes: 26 records against a
+  bound of 22). A TVM
   `while (1)` loop has no variable to sample: a range inside one records in every
   iteration, the site lists the loop as unsampled, and its kernel has no bound. In the
   decode step that is the logits processor (`bias_kernel`, at most 16 vocabulary tiles)
   and the slot-mapping binary search.
+
+  A sampled event sits in a loop of zero or one iterations (`TL_IKET_WHEN`), never
+  behind a plain `if`. run-iket gives every event a warp *issues* a slot in the warp's
+  record, predicated off or not, and ptxas predicates a short guarded block whatever its
+  condition. Behind `if`s, the sampled sparse MLA kernel's warps took 109 slots for 42
+  records (187 while lane 0 alone recorded: a lane's guard predicates more). ptxas does
+  not predicate a loop, and an `asm` hides the loop's count from it.
 - `VLLM_DS41_IKET_SKIP=REGEX`: kernels whose name matches compile uninstrumented. run-iket
   still records their warps' lifetimes.
 
