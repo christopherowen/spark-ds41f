@@ -1050,6 +1050,33 @@ def grouped_fp8_fp4_gemm_stream(
         T.barrier_arrive(loaded[s])
 
     @T.macro
+    def issue(A, SFA, B, BT, SFB, SFBase, A_shared, B_shared, SFA_shared, SFC_shared,
+              rows_shared, experts_shared, a_row, sfa_row, base_next, loaded, first,
+              t0, tx, h, s):  # fmt: skip
+        """Stage s <- global K step h of the CTA's run (item first + h / k_blocks); at
+        an item's first K block, also that item's base words, into base_next."""
+        w = first + h // k_blocks
+        ko = h % k_blocks
+        bx = w % n_blocks
+        slot = w // n_blocks - t0
+        expert = experts_shared[slot]
+        for c in T.unroll(a_copies):
+            a_row[c] = rows_shared[
+                slot, T.min((c * threads + tx) // row_segments, block_M - 1)
+            ]
+        for c in T.unroll(sfa_copies):
+            sfa_row[c] = rows_shared[slot, T.min(c * threads + tx, block_M - 1)]
+        if ko == 0:
+            for c in T.unroll(sfb_copies):
+                j = c * threads + tx
+                if j < block_N:
+                    base_next[c] = T.cast(
+                        SFBase[expert, bx * block_N + j], T.uint32
+                    ) * T.uint32(0x01010101)
+        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFC_shared,
+             a_row, sfa_row, loaded, expert, bx, tx, ko, s)  # fmt: skip
+
+    @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, NumTiles, C):
         with T.Kernel(ctas, threads=threads) as cta:
             pdl.chain()
@@ -1070,13 +1097,14 @@ def grouped_fp8_fp4_gemm_stream(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             tx = T.get_thread_binding()
 
-            live = NumTiles[0]
-            per = T.ceildiv(live * n_blocks, ctas)
-            first = cta * per
-            mine = T.min(live * n_blocks - first, per)
+            # The run: items first .. first + mine - 1, from tile t0 on.
+            live = T.alloc_var(T.int32, init=NumTiles[0])
+            per = T.alloc_var(T.int32, init=T.ceildiv(live * n_blocks, ctas))
+            first = T.alloc_var(T.int32, init=cta * per)
+            mine = T.alloc_var(T.int32, init=T.min(live * n_blocks - first, per))
             if mine <= 0:
                 T.thread_return()
-            t0 = first // n_blocks
+            t0 = T.alloc_var(T.int32, init=first // n_blocks)
             for i in T.Parallel(slots * block_M):
                 t = t0 + i // block_M
                 route = T.if_then_else(
@@ -1093,34 +1121,12 @@ def grouped_fp8_fp4_gemm_stream(
                 )
             T.sync_threads()
 
-            @T.macro
-            def issue(h, s):
-                """Load global K step h of this CTA's run into stage s."""
-                w = first + h // k_blocks
-                ko = h % k_blocks
-                bx = w % n_blocks
-                slot = w // n_blocks - t0
-                expert = experts_shared[slot]
-                for c in T.unroll(a_copies):
-                    a_row[c] = rows_shared[
-                        slot, T.min((c * threads + tx) // row_segments, block_M - 1)
-                    ]
-                for c in T.unroll(sfa_copies):
-                    sfa_row[c] = rows_shared[slot, T.min(c * threads + tx, block_M - 1)]
-                if ko == 0:
-                    for c in T.unroll(sfb_copies):
-                        j = c * threads + tx
-                        if j < block_N:
-                            base_next[c] = T.cast(
-                                SFBase[expert, bx * block_N + j], T.uint32
-                            ) * T.uint32(0x01010101)
-                load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFC_shared,
-                     a_row, sfa_row, loaded, expert, bx, tx, ko, s)  # fmt: skip
-
             steps = mine * k_blocks
             T.clear(C_local)
             for p in T.unroll(stages - 1):
-                issue(p, p)
+                issue(A, SFA, B, BT, SFB, SFBase, A_shared, B_shared, SFA_shared,
+                      SFC_shared, rows_shared, experts_shared, a_row, sfa_row,
+                      base_next, loaded, first, t0, tx, p, p)  # fmt: skip
             for g in T.serial(steps):
                 ko = g % k_blocks
                 if ko == 0:
@@ -1131,7 +1137,10 @@ def grouped_fp8_fp4_gemm_stream(
                 # The stage loaded next was last read by iteration g - 1.
                 T.sync_threads()
                 if g + stages - 1 < steps:
-                    issue(g + stages - 1, (g + stages - 1) % stages)
+                    issue(A, SFA, B, BT, SFB, SFBase, A_shared, B_shared, SFA_shared,
+                          SFC_shared, rows_shared, experts_shared, a_row, sfa_row,
+                          base_next, loaded, first, t0, tx, g + stages - 1,
+                          (g + stages - 1) % stages)  # fmt: skip
                 else:
                     T.ptx_commit_group()
                 T.ptx_wait_group(stages - 1)
