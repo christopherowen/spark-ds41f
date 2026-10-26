@@ -1,0 +1,105 @@
+{
+ "kernel": "per_token_cast_kernel_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "wait.pdl",
+   "phase": "wait",
+   "kinds": [
+    "pdl"
+   ],
+   "first_line": 28,
+   "last_line": 28,
+   "statement": "cudaGridDependencySynchronize();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 29,
+   "last_line": 33,
+   "statement": "for (int i = 0; i < 2; ++i)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 42,
+   "last_line": 42,
+   "statement": "amax_fragment[i_1] = cutlass::bfloat16_t(__hmax((bfloat16_t(((nv_bfloat162*)(&(amax_fragment_pack[i_1])))->x)).to_nv_bfloat16(), (cutlass::bfloat16_t(__hmax((bf",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "compute.reduce",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 43,
+   "last_line": 43,
+   "statement": "amax_fragment[i_1] = tl::AllReduce<tl::MaxOp, 2, 1, 0, tl::NamedBarrier<64>>::run(amax_fragment[i_1]);",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 52,
+   "last_line": 52,
+   "statement": "out_sf[((((((int64_t)((int)blockIdx.x)) % (int64_t)9) * (int64_t)2) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) >> (int64_t)1)) + (((((((int64_t)((int)block",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "store.global#2",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 57,
+   "last_line": 72,
+   "statement": "for (int i_3 = 0; i_3 < 4; ++i_3)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "per_token_cast_kernel_kernel",
+   "range": "store.global#3",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 76,
+   "last_line": 76,
+   "statement": "*(fp8_e4_16_t*)(out + ((((((((int64_t)((int)blockIdx.x)) / (int64_t)9) * (int64_t)18432) + (((int64_t)i_4) * (int64_t)9216)) + ((((int64_t)((int)threadIdx.x)) >",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  }
+ ]
+}

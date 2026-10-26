@@ -147,9 +147,64 @@ survey's measure).
 The sampled window is in `step_shares.json`: 29.45 ms, FC1 16.4%, the all-reduces
 13.8%, FC2 10.5%.
 
-## Inside the kernels: the phase split (IKET)
+## The c1 layer at one rank's shapes, measured (dgx1)
 
-From IKET's hot traces (#610 run 5: TP3 shapes, 8 rows, mean warp shares). Each row
+`layer_table.py` over run layer-1 (TP4 and TP3, 3 of 6 rows live, 13.25 distinct experts
+a layer) and layer-live6-1 (TP4, all 6 rows live, 24.38). Columns:
+- **cost:** each kernel's end less the previous main-chain kernel's end, in CUDA graph
+  replays, summed over a family's launches in a layer, median over layers;
+- **excess:** cost less the family's bytes at 266.6 GB/s;
+- **phases:** IKET's split of a warp's life with the PDL wait taken out;
+- **waits:** what each wait range waits for, named from its statement.
+
+The dense GEMMs read cold weights here; in production the L2 prefetch fills them first.
+
+**TP4, 13.25 experts a layer: 519.8 µs a layer**
+
+| kernel | TP4 production share | cost µs | excess µs | wait | load | compute | store | the waits are for |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| MoE block: dispatch, FC1, SwiGLU, FC2, combine, with the shared expert beside them | 42.5% | 287.6 | 32.5 | | | | | |
+| routed FC1 (its window also carries the shared gate/up's bytes) | 26.1% | 181.0 | | 65% | 8% | 16% | 0% | TMA weight tiles 36%; the sync after cp.async 20%; cp.async 6% |
+| routed FC2 | 15.5% | 82.1 | 8.3 | 46% | 30% | 16% | 3% | the sync after cp.async 19%; TMA weight tiles 10%; cp.async 9% |
+| routed combine (waits for the shared down GEMM, which runs after FC2 under PDL at six rows) | 0.8% | 15.5 | | 0% | 89% | 0% | 3% | |
+| routed dispatch | | 6.4 | | 42% | 1% | 0% | 52% | its block syncs |
+| routed SwiGLU and cast | | 1.6 | | 0% | 60% | 4% | 3% | |
+| WO-B GEMM | 2.6% | 46.6 | 7.2 | 80% | 12% | 5% | 0% | cp.async weight copies 65%; the sync after them 14% |
+| Q-B GEMM | 3.3% | 45.0 | 5.6 | 74% | 19% | 4% | 0% | cp.async 57%; sync 16% |
+| WO-A partials and reduce-cast | 2.9% | 40.2 | 8.7 | 68% | 17% | 3% | 0% | cp.async 49%; sync 15% |
+| Q-A/KV GEMM | 2.4% | 39.6 | 5.1 | 86% | 8% | 6% | 0% | cp.async 62%; sync 19% |
+| mHC project and finalize (4 launches) | 5.2% | 22.3 | 7.6 | 11% | 44% | 15% | 3% | block syncs |
+| sparse MLA (split and combine) | 3.0% | 15.6 | | 22% | 27% | 20% | 3% | block syncs 19% |
+| q-latent norm and Q-B cast | 1.8% | 2.8 | | 3% | 16% | 4% | 53% | |
+| LM head (once a step) | 3.0% | 972.4 | 41.3 | 40% | 25% | 7% | 0% | cp.async 24%; sync 14% |
+
+**TP3, 13.25 experts: 673.7 µs a layer.** MoE block 350.9 µs, 28.7 over its bytes. FC1
+224.5 µs, and FC2 100.3 µs (6.7 over). WO-B 76.6 (17.6 over), Q-B 68.1 (9.1),
+WO-A 60.5 (13.3), Q-A/KV 38.6 (4.2), mHC 22.1 (7.4), MLA 17.3. LM head 1,297.8 µs (55.2
+over). The phase splits match TP4's within a few points.
+
+**TP4, 24.38 experts: 703.0 µs a layer.** MoE block 465.6 µs, 34.7 over its bytes; FC1
+298.8, FC2 140.1 (8.2 over).
+
+What the tables say:
+- **The MoE block's non-byte time is a fixed ~33 µs a layer.** At TP4 it is 32.5 µs at
+  13 experts and 34.7 at 24; at TP3, 28.7. It is the launch boundaries' ramps and tails
+  and the small kernels between them, not a per-expert loss. Each expert streams at the
+  attainable rate once the GEMMs run.
+- **FC2 gives away about 8 µs a layer to its tiles.** Each CTA lives 4 µs (TP4), and
+  13% of that is the base-exponent loads of its prologue.
+- **The shared expert's down GEMM finishes after FC2,** and the combine waits for it:
+  about 12 µs a layer on the chain at TP4. Its bytes count in the floor anyway. PDL's
+  order at six rows trades this against FC1's last wave keeping DRAM to itself
+  (next-candidate 97e204cd9).
+- **The latency-bound kernels add about 37 µs a layer at TP4:** mHC's non-byte 7.6,
+  MLA 15.6, the norm and cast, dispatch, SwiGLU, combine. They are the fusion survey's
+  territory.
+
+## Earlier evidence: IKET's hot traces at 45 experts
+
+Before dgx1 was free, the study worked from IKET's hot traces (#610 run 5: TP3 shapes,
+8 rows, mean warp shares). Each row
 draws six random experts, so a layer reads about 45 distinct experts (the expectation
 for 8 × 6 draws from 384); the rates below use that number. These are not c1's routes. The c1 tables at both ranks' shapes are the
 `layer` bundle's job.
