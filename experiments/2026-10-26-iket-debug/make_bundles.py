@@ -266,7 +266,8 @@ BUNDLES = {
         ref=ref,
         what=f"the c3/c8 NaN on {label}, IKET off: c3 eager with a non-finite hook on every "
              f"module, c3 with the graphs, and c8's boot",
-        env=STEP_ENV,
+        # 1025's tree still defaults to the B12X family; the recipe picks TileLang.
+        env={**STEP_ENV, "VLLM_DS41_KERNEL_BACKEND": "tilelang"},
         mounts=[HUB],
         steps=[
             ("off, TP4, c3, eager, nan hooks",
