@@ -169,7 +169,6 @@ def main():
                                                 exponents(EXPERTS, HIDDEN, inter // 32)))
             plans.append(plan)
         read = {words: expert_stream(words) for words in {w_one, w_fc1, w_fc2}}
-        prepare.freeze("stream_bound.py: every kernel was prepared before the first launch")
 
         # The ideal reads' buffers: a row an expert, one set of rows per weight set.
         def rows(words):
@@ -196,6 +195,8 @@ def main():
             workspace = torch.empty(workspace_bytes(plan.workspace_specs(args.rows, torch.int32)),
                                     dtype=torch.uint8, device=DEVICE)
             layers.append((plan, x, topk, weights, experts[i % args.sets], y, workspace))
+        # The inputs' MXFP8 casts compiled their kernel above.
+        prepare.freeze("stream_bound.py: every kernel was prepared before the first launch")
 
         def chain():
             for plan, x, topk, weights, ex, y, workspace in layers:

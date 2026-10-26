@@ -28,6 +28,13 @@ for, from its statement in the site manifests:
 - ``mbarrier`` in the dense GEMMs: TMA tiles.
 
 ``--shares`` adds each family's share of the TP4 production step (step_shares.py).
+
+Each weight-streaming family also gets its bytes at the rank's shapes, its floor at the
+attainable 266.6 GB/s (#598) and its excess: cost less floor, the part of its time that
+is not the byte floor. The routed GEMMs' bytes follow each layer's distinct experts
+(the off run's result.json). The shared expert runs beside the routed GEMMs, so its
+bytes are counted with the MoE block (dispatch to combine) as a whole. The dense GEMMs
+here read cold weights; production prefetches them into L2.
 """
 import argparse
 import glob
@@ -45,6 +52,33 @@ FAMILY_SHARES = {  # this table's family -> step_shares.py family (TP4 productio
     "routed dispatch": "routed dispatch, SwiGLU, combine", "routed SwiGLU and cast": "routed dispatch, SwiGLU, combine",
     "routed combine": "routed dispatch, SwiGLU, combine", "q norm and Q-B cast": "casts and norms",
 }
+
+
+RATE = 266.6e3  # bytes a microsecond
+HIDDEN = 5120
+RANK = {4: dict(heads=16, groups=2, inter=576, vocab=32320), 3: dict(heads=24, groups=3, inter=768, vocab=43136)}
+MOE_BLOCK = ("routed dispatch", "routed FC1", "routed SwiGLU and cast", "routed FC2", "routed combine")
+
+
+def fp8(n, k):
+    return n * k + (n // 32) * (k // 32)
+
+
+def expert(n, k):
+    return n * k // 2 + n * 2 * -(-k // 128) + n
+
+
+def family_bytes(tp):
+    """Bytes a layer of each weight-streaming family (the routed GEMMs per expert)."""
+    s = RANK[tp]
+    groups = s["groups"] * 1024
+    return {
+        "Q-A/KV GEMM": fp8(1792, HIDDEN), "Q-B GEMM": fp8(s["heads"] * 512, 1280),
+        "WO-A partials and reduce-cast": fp8(groups, 4096), "WO-B GEMM": fp8(HIDDEN, groups),
+        "mHC project and finalize": 2 * 4 * 24 * 4 * HIDDEN, "LM head": s["vocab"] * HIDDEN * 3 // 2,
+        "shared": fp8(2 * s["inter"], HIDDEN) + fp8(HIDDEN, s["inter"]),
+        "routed FC1": expert(2 * s["inter"], HIDDEN), "routed FC2": expert(HIDDEN, s["inter"]),
+    }
 
 
 def passes(db):
@@ -98,11 +132,15 @@ def classify(layer):
     return out
 
 
-def costs(all_passes):
+def costs(all_passes, distinct, tp):
+    """Per family, over layers: cost (main-chain increments), duration, and excess over
+    the byte floor; the MoE block's cost and excess; each layer's span."""
     per = defaultdict(list)
     dur = defaultdict(list)
+    excess = defaultdict(list)
     keys = {}
     layer_us = []
+    nbytes = family_bytes(tp)
     for p in all_passes:
         layers, cur = [], []
         for r in p:
@@ -110,7 +148,15 @@ def costs(all_passes):
             if r[6].startswith("moe_combine"):
                 layers.append(cur)
                 cur = []
-        for layer in layers[1:]:
+        if cur and cur[-1][6].startswith("vocab_packed") and layers:
+            head = cur[-1]
+            dur["LM head"].append((head[1] - head[0]) / 1000)
+            per["LM head"].append((head[1] - max(r[1] for r in layers[-1])) / 1000)
+            excess["LM head"].append(per["LM head"][-1] - nbytes["LM head"] / RATE)
+            keys.setdefault("LM head", set()).add((head[6], (head[2], head[3], head[4]), head[5]))
+        for index, layer in enumerate(layers):
+            if index == 0:
+                continue
             prev_end = None
             aux_end = 0
             cost, length = defaultdict(float), defaultdict(float)
@@ -128,8 +174,17 @@ def costs(all_passes):
                 dur[fam].append(us)
             for fam, us in cost.items():
                 per[fam].append(us)
+            experts = distinct[index % len(distinct)]
+            floors = {fam: b / RATE for fam, b in nbytes.items() if fam in cost}
+            for fam in ("routed FC1", "routed FC2"):
+                floors[fam] = experts * nbytes[fam] / RATE
+            for fam, floor in floors.items():
+                excess[fam].append(cost[fam] - floor)
+            block = sum(cost[f] for f in MOE_BLOCK if f in cost)
+            per["MoE block"].append(block)
+            excess["MoE block"].append(block - floors["routed FC1"] - floors["routed FC2"] - nbytes["shared"] / RATE)
             layer_us.append((layer[-1][1] - layer[0][0]) / 1000)
-    return per, dur, keys, layer_us
+    return per, dur, excess, keys, layer_us
 
 
 def wait_kinds(sources):
@@ -166,7 +221,12 @@ def main():
     ap.add_argument("--json")
     args = ap.parse_args()
     db = sqlite3.connect(os.path.join(args.run, "nsys-graph.sqlite"))
-    per, dur, keys, layer_us = costs(passes(db))
+    result_path = next(p for p in (os.path.join(args.run, "off-result.json"), os.path.join(args.run, "off", "result.json"))
+                       if os.path.exists(p))
+    off = json.load(open(result_path))
+    per, dur, excess, keys, layer_us = costs(passes(db), off["distinct_experts"], args.tp)
+    keys.setdefault("MoE block", set())
+    dur.setdefault("MoE block", per["MoE block"])
     table = json.load(open(os.path.join(args.run, "table.json")))["groups"]
     by_key = {(g["kernel"], tuple(g["grid"]), g["block"][0]): g for g in table}
     kinds = wait_kinds(os.path.join(args.run, "sources"))
@@ -195,23 +255,29 @@ def main():
             phases["unattributed"] += g["phases"].get("unattributed", 0.0)
         split = {k: round(v / life, 3) for k, v in phases.items()} if life else {}
         rows.append({
-            "family": fam, "launches_a_layer": round(len(dur[fam]) / max(1, len(layer_us)), 1),
+            "family": fam,
             "cost_us": round(statistics.median(per[fam]), 2) if per.get(fam) else None,
             "duration_us": round(statistics.median(dur[fam]), 2),
+            "excess_us": round(statistics.median(excess[fam]), 2) if excess.get(fam) else None,
             "phases": split, "waits": {k: round(v / life, 3) for k, v in sorted(waits.items(), key=lambda kv: -kv[1])} if life else {},
             "production_share_tp4": shares.get(FAMILY_SHARES.get(fam)),
         })
-    result = {"tp": args.tp, "layer_us": round(statistics.median(layer_us), 1), "families": rows}
-    print(f"TP{args.tp}: a layer {result['layer_us']} us (median, graph replays)\n")
-    print("| kernel | TP4 production share | cost µs a layer | duration µs | wait | load | compute | store | unattributed | the waits are for |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    result = {"tp": args.tp, "layer_us": round(statistics.median(layer_us), 1),
+              "distinct_mean": off["distinct_mean"], "families": rows}
+    print(f"TP{args.tp}: a layer {result['layer_us']} us (median, graph replays), "
+          f"{off['distinct_mean']} distinct experts a layer\n")
+    print("| kernel | TP4 production share | cost µs a layer | excess over bytes µs | duration µs | wait | load "
+          "| compute | store | unattributed | the waits are for |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for r in rows:
         p = r["phases"]
         w = "; ".join(f"{k} {v:.0%}" for k, v in list(r["waits"].items())[:3])
         share = f"{r['production_share_tp4']:.1%}" if r["production_share_tp4"] is not None else "-"
         cost = r["cost_us"] if r["cost_us"] is not None else "(aux)"
-        print(f"| {r['family']} | {share} | {cost} | {r['duration_us']} | " + " | ".join(
-            f"{p.get(k, 0):.0%}" for k in ("wait", "load", "compute", "store", "unattributed")) + f" | {w} |")
+        ex = r["excess_us"] if r["excess_us"] is not None else "-"
+        print(f"| {r['family']} | {share} | {cost} | {ex} | {r['duration_us']} | " + " | ".join(
+            f"{p.get(k, 0):.0%}" if p else "-" for k in ("wait", "load", "compute", "store", "unattributed"))
+              + f" | {w} |")
     if args.json:
         with open(args.json, "w") as handle:
             json.dump(result, handle, indent=1)

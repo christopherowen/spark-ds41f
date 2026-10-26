@@ -948,9 +948,10 @@ def grouped_fp8_fp4_gemm_stream(
 
     The grid kernel launches a CTA for each (tile, column block) item; each CTA fills
     its pipeline, streams one ``[block_N, K]`` slab and drains. Here ``ctas`` CTAs
-    split a call's live items (``NumTiles[0] * N / block_N``) into contiguous runs of
-    ``ceil(items / ctas)``, so the runs are equal but the last, and fewer CTAs run
-    when that divides the items more evenly. A CTA's pipeline runs through its items'
+    split a call's live items (``NumTiles[0] * N / block_N``) into contiguous runs that
+    differ by at most one item, so every SM streams (one SM keeps only ``num_stages -
+    1`` K blocks in flight, too few for its share of the stream on fewer SMs). A CTA's
+    pipeline runs through its items'
     K blocks without draining: the first K blocks of its next item load while the
     current item's last ones multiply, and an item's result is stored when its last
     K block has multiplied.
@@ -1097,11 +1098,13 @@ def grouped_fp8_fp4_gemm_stream(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             tx = T.get_thread_binding()
 
-            # The run: items first .. first + mine - 1, from tile t0 on.
+            # The run: items first .. first + mine - 1, from tile t0 on. Every CTA
+            # streams: the first items % ctas runs hold one item more.
             live = T.alloc_var(T.int32, init=NumTiles[0])
-            per = T.alloc_var(T.int32, init=T.ceildiv(live * n_blocks, ctas))
-            first = T.alloc_var(T.int32, init=cta * per)
-            mine = T.alloc_var(T.int32, init=T.min(live * n_blocks - first, per))
+            per = T.alloc_var(T.int32, init=live * n_blocks // ctas)
+            extra = T.alloc_var(T.int32, init=live * n_blocks % ctas)
+            first = T.alloc_var(T.int32, init=cta * per + T.min(cta, extra))
+            mine = T.alloc_var(T.int32, init=per + T.if_then_else(cta < extra, 1, 0))
             if mine <= 0:
                 T.thread_return()
             t0 = T.alloc_var(T.int32, init=first // n_blocks)
