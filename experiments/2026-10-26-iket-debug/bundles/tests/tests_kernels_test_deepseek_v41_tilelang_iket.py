@@ -145,18 +145,15 @@ def test_sampled_iterations_guard_loop_ranges():
     lines = [line.strip() for line in out.splitlines()]
     in_loop = [s["range"] for s in sites if s["loops"]]
     assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
-    guarded = [
-        line for line in lines if line.startswith(f"if (__tl_iket_lane0 && {stride}) ")
-    ]
+    guarded = [line for line in lines if line.startswith(f"if ({stride}) ")]
     # Each in-loop range: its start, its settle and its end.
     assert len(guarded) == 3 * len(in_loop)
-    # Lane 0 alone records; ranges outside the loop, and the unrolled loop wrapped
-    # whole, have no iteration condition.
-    assert "const bool __tl_iket_lane0 = __tl_iket_laneid == 0u;" in lines
-    load = 'if (__tl_iket_lane0) TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");'
-    assert load in lines
+    # Ranges outside the loop, and the unrolled loop wrapped whole, have no condition;
+    # none depends on the lane (a lane's guard would leave ptxas predicating events).
+    assert 'TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");' in lines
+    assert "laneid" not in out
     both = iket.annotate(KERNEL, _token, ctas=4, iters=2)[0]
-    assert f"if (__tl_iket_cta && __tl_iket_lane0 && {stride}) TL_IKET_EVENT(1," in both
+    assert f"if (__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
 
 
 def test_while_loop_ranges_have_no_bound():
