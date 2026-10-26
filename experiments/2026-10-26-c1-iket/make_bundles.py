@@ -60,22 +60,23 @@ def layer(mode, tp, out, *extra):
     return ["{python}", LAYER, mode, "--tp", str(tp), "--routes", ROUTES, "--out", out, *extra]
 
 
-# run-iket writes an empty trace when no kernel is instrumented (smoke run 2). With one
-# small kernel instrumented, every launch's warp lifetimes are recorded, and the others
-# run as built.
-LIFETIMES_SKIP = "^(?!moe_combine_kernel$)"
+# run-iket records warp lifetimes only for instrumented kernels (smoke runs 2 and 3: none
+# with every kernel skipped, the combine's alone with only it instrumented). With one CTA
+# a launch recording ranges (VLLM_DS41_IKET_CTAS=1) and loops sampled once, every warp's
+# lifetime is recorded and the other CTAs pass a uniform branch at each event.
+LIFETIMES_SAMPLING = ["--ctas", "1", "--iters", "1"]
 
 
 def lifetime_steps(tp, live, tag):
-    """run-iket with only the combine instrumented (exact warp lifetimes of every other
-    kernel), and cta_timeline.py's SM occupancy and weight stream from them."""
+    """run-iket with one CTA a launch recording ranges (every warp's lifetime), and
+    cta_timeline.py's SM occupancy and weight stream from them."""
     shape = ["--live", str(live), "--mla", "--head"]
     out = f"{{out}}/tp{tp}-{tag}"
     return [
-        (f"TP{tp} {tag}: lifetimes, run-iket, only the combine instrumented",
+        (f"TP{tp} {tag}: lifetimes, run-iket, one CTA a launch recording",
          [*PROFILE, f"{out}/lifetimes", "profile", "--postprocess", "json", "--",
           *layer("on", tp, f"{out}/lifetimes-run", *shape, "--iket", f"{out}/lifetimes-run/iket",
-                 "--skip", LIFETIMES_SKIP, "--layers", "4", "--replays", "3")], 3600),
+                 *LIFETIMES_SAMPLING, "--layers", "4", "--replays", "3")], 3600),
         (f"TP{tp} {tag}: CTA timelines",
          ["{python}", TIMELINE, f"{out}/lifetimes", "--tp", str(tp), "--routes", ROUTES, "--live", str(live),
           "--layers", "4", "--json", f"{out}/timeline.json"], 1800),
@@ -126,7 +127,7 @@ BUNDLES = {
             ("TP4: lifetimes, run-iket",
              [*PROFILE, "{out}/lifetimes", "profile", "--postprocess", "json", "--",
               *layer("on", 4, "{out}/lifetimes-run", *SMOKE, "--iket", "{out}/lifetimes-run/iket",
-                     "--skip", LIFETIMES_SKIP, "--replays", "1")], 1800),
+                     *LIFETIMES_SAMPLING, "--replays", "1")], 1800),
             ("TP4: CTA timelines", ["{python}", TIMELINE, "{out}/lifetimes", "--tp", "4", "--json",
                                     "{out}/timeline.json"], 600),
         ],

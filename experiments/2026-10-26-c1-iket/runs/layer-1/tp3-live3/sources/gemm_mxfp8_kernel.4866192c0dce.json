@@ -1,0 +1,134 @@
+{
+ "kernel": "gemm_mxfp8_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "wait.sync",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 48,
+   "last_line": 48,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "wait.mbarrier",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 51,
+   "last_line": 51,
+   "statement": "mbarrier[((ko & 1) + 4)].wait((((ko & 3) >> 1) ^ 1));",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "load",
+   "phase": "load",
+   "kinds": [
+    "cp_async",
+    "tma"
+   ],
+   "first_line": 52,
+   "last_line": 59,
+   "statement": "tl::cp_async_gs_conditional<4>((&(((uint*)SFA_shared)[(((ko & 1) * 128) + ((int)threadIdx.x))])), (&(SFA[((min(((((int64_t)((int)blockIdx.y)) * (int64_t)128) + ",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "wait.mbarrier#2",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 60,
+   "last_line": 60,
+   "statement": "mbarrier[((ko & 1) + 6)].wait((((ko & 3) >> 1) ^ 1));",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "load.tma",
+   "phase": "load",
+   "kinds": [
+    "tma"
+   ],
+   "first_line": 61,
+   "last_line": 65,
+   "statement": "if (tl::tl_shuffle_elect<128>())",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "wait.mbarrier#3",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 76,
+   "last_line": 76,
+   "statement": "mbarrier[(ko_1 & 1)].wait(((ko_1 & 3) >> 1));",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "wait.mbarrier#4",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 77,
+   "last_line": 77,
+   "statement": "mbarrier[((ko_1 & 1) + 2)].wait(((ko_1 & 3) >> 1));",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "compute.mma",
+   "phase": "compute",
+   "kinds": [
+    "mma"
+   ],
+   "first_line": 78,
+   "last_line": 97,
+   "statement": "{",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "gemm_mxfp8_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 101,
+   "last_line": 111,
+   "statement": "for (int i_4 = 0; i_4 < 64; ++i_4)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  }
+ ]
+}

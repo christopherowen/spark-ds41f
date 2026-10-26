@@ -1,0 +1,77 @@
+{
+ "kernel": "moe_dispatch_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "moe_dispatch_kernel",
+   "range": "wait.pdl",
+   "phase": "wait",
+   "kinds": [
+    "pdl"
+   ],
+   "first_line": 20,
+   "last_line": 20,
+   "statement": "cudaGridDependencySynchronize();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "moe_dispatch_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 23,
+   "last_line": 23,
+   "statement": "expert = ((int)TopkIdx[((((int64_t)((int)blockIdx.x)) * (int64_t)512) + ((int64_t)((int)threadIdx.x)))]);",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "moe_dispatch_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 26,
+   "last_line": 37,
+   "statement": "if (((0 <= expert) && (expert < 384)))",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "moe_dispatch_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 38,
+   "last_line": 42,
+   "statement": "if ((pos < (tiles * 32)) && (0 <= pos))",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "moe_dispatch_kernel",
+   "range": "store.global#2",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 44,
+   "last_line": 44,
+   "statement": "RoutePos[((((int64_t)((int)blockIdx.x)) * (int64_t)512) + ((int64_t)((int)threadIdx.x)))] = -1;",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 10
+  }
+ ]
+}

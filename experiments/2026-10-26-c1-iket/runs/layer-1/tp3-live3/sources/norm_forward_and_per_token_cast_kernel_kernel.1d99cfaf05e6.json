@@ -1,0 +1,161 @@
+{
+ "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "wait.pdl",
+   "phase": "wait",
+   "kinds": [
+    "pdl"
+   ],
+   "first_line": 32,
+   "last_line": 32,
+   "statement": "cudaGridDependencySynchronize();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 37,
+   "last_line": 44,
+   "statement": "if ((((((int)blockIdx.x) * 2) + (((int)threadIdx.x) >> 6)) < num_tokens) && (((vi * 2) + ((((int)threadIdx.x) & 63) >> 5)) < 5))",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 45,
+   "last_line": 55,
+   "statement": "for (int j_1 = 0; j_1 < 4; ++j_1)",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "compute.reduce",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 60,
+   "last_line": 60,
+   "statement": "warp_reducer[0] = tl::AllReduce<tl::SumOp, 32, 1, 0, tl::NamedBarrier<128>>::run(warp_reducer[0]);",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "store.global#2",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 63,
+   "last_line": 63,
+   "statement": "sum_shared[(((int)threadIdx.x) >> 5)] = warp_fragment[0];",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "wait.sync",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 65,
+   "last_line": 65,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 66,
+   "last_line": 66,
+   "statement": "*(float2*)(row_partial + 0) = *(float2*)(sum_shared + ((((int)threadIdx.x) >> 6) * 2));",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "store.global#3",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 75,
+   "last_line": 75,
+   "statement": "rstd[(((((int64_t)((int)blockIdx.x)) * (int64_t)2) + (((int64_t)((int)threadIdx.x)) >> (int64_t)6)) + (((int64_t)((int)blockIdx.y)) * ((int64_t)num_tokens)))] =",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "load.global#3",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 79,
+   "last_line": 81,
+   "statement": "if (((vi_1 * 2) + ((((int)threadIdx.x) & 63) >> 5)) < 5)",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "store.global#4",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 82,
+   "last_line": 99,
+   "statement": "for (int j_2 = 0; j_2 < 2; ++j_2)",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "norm_forward_and_per_token_cast_kernel_kernel",
+   "range": "store.global#5",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 108,
+   "last_line": 108,
+   "statement": "*(uint4*)(out + ((((((int64_t)vi_1) * (int64_t)512) + ((((int64_t)((int)threadIdx.x)) & (int64_t)63) * (int64_t)8)) + (((int64_t)((int)blockIdx.y)) * ((int64_t)",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  }
+ ]
+}

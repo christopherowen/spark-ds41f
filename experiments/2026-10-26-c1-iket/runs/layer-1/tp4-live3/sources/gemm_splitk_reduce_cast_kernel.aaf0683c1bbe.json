@@ -1,0 +1,63 @@
+{
+ "kernel": "gemm_splitk_reduce_cast_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "gemm_splitk_reduce_cast_kernel",
+   "range": "wait.pdl",
+   "phase": "wait",
+   "kinds": [
+    "pdl"
+   ],
+   "first_line": 24,
+   "last_line": 24,
+   "statement": "cudaGridDependencySynchronize();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 8
+  },
+  {
+   "kernel": "gemm_splitk_reduce_cast_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 28,
+   "last_line": 47,
+   "statement": "if ((1 <= M))",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 8
+  },
+  {
+   "kernel": "gemm_splitk_reduce_cast_kernel",
+   "range": "compute.reduce",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 63,
+   "last_line": 63,
+   "statement": "amax[0] = tl::AllReduce<tl::MaxOp, 8, 1, 0, tl::NamedBarrier<128>>::run(amax[0]);",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 8
+  },
+  {
+   "kernel": "gemm_splitk_reduce_cast_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 68,
+   "last_line": 85,
+   "statement": "if (((((int)blockIdx.y) * 4) + (((int)threadIdx.x) >> 5)) < M)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": 8
+  }
+ ]
+}
