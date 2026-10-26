@@ -120,12 +120,16 @@ BUNDLES = {
         steps=[
             # run-iket's pool is a bump allocator for the whole run: every warp of every
             # instrumented launch gets the run's largest warp record (5,016 timestamps
-            # unsampled: 898 GB). Sampled CTAs and iterations bound that record, and the
-            # pool it sizes from the dry run.
+            # unsampled: 898 GB). Sampled CTAs and iterations bound that record: lane 0
+            # records, and each range at most once a loop, so no warp records more than 64
+            # (the sources' static bounds). The dry run still recommends 424 (52 GB for 26.6M
+            # instrumented warps, more than GB10 has beside the engine), so the cap is set:
+            # twice the bound, which the trace's counts show no warp reaches.
             # The vision tower and the top-k/top-p sampler are not in a greedy text decode
             # step; left uninstrumented, their warps reserve no records.
             ("decode steps, on, under run-iket",
-             [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
+             [*PROFILE, "{out}/trace", "profile", "--keep", "--max-ts-cnt-per-warp", "128",
+              "--postprocess", "all", "--",
               "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "1",
               "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
