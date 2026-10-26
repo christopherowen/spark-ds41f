@@ -105,8 +105,8 @@ def calls():
             f"cache writer {kind}",
             {"": cache_writer.writer_call(kind, 64, torch.int64)},
         )
-    add("metadata requests", metadata.requests_kernel, 16)
-    add("metadata tokens", metadata.tokens_kernel, 16, 64, 1, False)
+    add("metadata builder", metadata.builder_kernel, 16, 64, 1, False)
+    add("metadata builder circular", metadata.builder_kernel, 16, 64, 4, True)
     add("metadata chunk", metadata.chunk_kernel, 64, 128, 512, True, False)
     add(
         "metadata decode",
@@ -117,20 +117,28 @@ def calls():
         True,
         False,
         2048,
+        64,
     )
-    add("metadata pages", metadata.pages_kernel, 512)
+    add("metadata pages", metadata.pages_kernel, 512, 64)
+    add("metadata pages of 256", metadata.pages_kernel, 512, 256)
     add_calls("indexer", {"quantize": indexer.quantize_call(), "quantize paged": indexer.quantize_call(64),
                           "score": indexer._score_call(8192, 64, False)})  # fmt: skip
     add_calls("indexer top-k", dict(enumerate(indexer.IndexerTopK.calls(8192))))
+    # The re-index: scores and selection over candidate block ids.
+    add_calls("indexer candidates", dict(enumerate(indexer.IndexerV41Plan.calls(
+        8192, 256, candidates=True, candidate_blocks=True))))  # fmt: skip
     add("compress gather", compress.gather_partial_state_kernel, 16, 64)
     add("compress", compress.compress_kernel, 4, 16, 64)
     add("SwiGLU clamp", activation.swiglu_clamp_kernel, 576, 10.0)
     add("router partials", router.route_partials, 6, 384, 8, False, False)
     add("routing masks", router.routing_masks_kernel, None, True)
-    add_calls(
-        "MoE dispatch",
-        moe.MoeDispatchV41Plan(384, 6, 32, H, torch.int64, torch.float32).kernels(),
-    )
+    for block_M in (32, 64):  # decode and prefill tiles
+        add_calls(
+            f"MoE dispatch @{block_M}",
+            moe.MoeDispatchV41Plan(
+                384, 6, block_M, H, torch.int64, torch.float32
+            ).kernels(),
+        )
     add_calls(
         "MoE experts",
         moe.MoeExpertsV41Plan(384, 6, H, 576, swiglu_limit=10.0).kernels(),

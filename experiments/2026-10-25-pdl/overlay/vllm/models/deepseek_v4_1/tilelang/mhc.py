@@ -36,7 +36,11 @@ entry:
   results do not depend on the batch.
 - ``finalize``: per token, TileKernels' fused reduce, RMS, mix split and
   Sinkhorn (``mhc_pre_big_fuse``), emitting the new pre-mix, beside the
-  collapse's RMSNorm with the sublayer's weight.
+  collapse's RMSNorm with the sublayer's weight, which it also writes as the
+  MXFP8 input of the sublayer's block-32 projections (``linear.MXFP8Rows``,
+  ``per_token_cast``'s bytes): the entry returns it, and the projections that read
+  the sublayer input (attention's fused Q-A/KV, the shared expert's gate/up, the
+  routed experts) no longer cast it themselves.
 """
 
 from functools import cache
@@ -51,6 +55,12 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.models.deepseek_v4_1 import sp_prefill
 from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
+from vllm.models.deepseek_v4_1.tilelang.linear import (
+    MXFP8Rows,
+    cast_mxfp8,
+    empty_mxfp8,
+)
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
@@ -295,12 +305,23 @@ def finalize(
 ):
     """One token per CTA: warp 0 turns the projection partials into the new
     pre-mix, the post-mix and the Sinkhorn combination (TileKernels'
-    ``mhc_pre_big_fuse``); the other warps RMS-normalize the collapse."""
+    ``mhc_pre_big_fuse``); the other warps RMS-normalize the collapse into ``y``
+    and write its MXFP8 cast for the sublayer's projections, ``per_token_cast``'s
+    bytes: E4M3 ``yq`` and a UE8M0 byte per 32 columns in ``ysf``.
+
+    A worker holds eight adjacent columns of ``y``, so four adjacent lanes hold a
+    32-column block; two lane shuffles give them the block's amax. ``yq`` and ``ysf``
+    may have more rows than ``y`` (the projections' whole decode tiles); those rows
+    are not written."""
     assert hidden_size % VEC == 0
     splits = hidden_size // block_H
     chunks = hidden_size // VEC
     workers = threads - 32
-    M = T.dynamic("M")
+    # Every warp's lanes take part in a step or none do, so the shuffles of a step's
+    # blocks are warp-uniform; a block's four lanes sit in one warp.
+    assert chunks % 32 == 0 and workers % 32 == 0
+    sf_width = 4 * scale_words(hidden_size)
+    M, Mq = T.dynamic("M, Mq")
 
     @T.prim_func
     def mhc_finalize(
@@ -315,6 +336,8 @@ def finalize(
         comb: T.Tensor((M, MULT, MULT), T.float32),
         pre_out: T.Tensor((M, MULT), T.float32),
         y: T.Tensor((M, hidden_size), T.bfloat16),
+        yq: T.Tensor((Mq, hidden_size), T.float8_e4m3fn),
+        ysf: T.Tensor((Mq, sf_width), T.uint8),
     ):
         with T.Kernel(M, threads=threads) as pid:
             pdl.chain()
@@ -323,7 +346,10 @@ def finalize(
             xv = T.alloc_local((VEC,), T.bfloat16)
             wv = T.alloc_local((VEC,), T.bfloat16)
             yv = T.alloc_local((VEC,), T.bfloat16)
+            xf = T.alloc_local((VEC,), T.float32)
+            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
             total = T.alloc_local((1,), T.float32)
+            amax = T.alloc_local((1,), T.float32)
 
             if tx < 32:
                 # Reduce the split partials; RMS over the flattened streams.
@@ -378,7 +404,8 @@ def finalize(
                 for j, k in T.Parallel(MULT, MULT):
                     comb[pid, j, k] = cm[j, k]
             else:
-                # RMSNorm of the collapse, with the sublayer's weight.
+                # RMSNorm of the collapse, with the sublayer's weight, and its MXFP8
+                # cast.
                 worker = tx - 32
                 total[0] = 0
                 for i_split in T.serial(splits):
@@ -400,6 +427,15 @@ def finalize(
                             )
                         for v in T.vectorized(VEC):
                             y[pid, chunk * VEC + v] = xv[v]
+                        amax[0] = T.float32(0)
+                        for v in T.unroll(VEC):
+                            xf[v] = T.Cast(T.float32, xv[v])
+                            amax[0] = T.max(amax[0], T.abs(xf[v]))
+                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
+                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
+                        cast_block_mxfp8(
+                            xf, xq, VEC, amax[0], yq, ysf, pid, chunk * VEC
+                        )
 
     return mhc_finalize
 
@@ -643,7 +679,7 @@ def _collapse(hidden: int, column: int = -1):
 
 @torch.library.custom_op(
     "vllm::dsv41_tilelang_mhc_pre",
-    mutates_args=("residual_out", "y", "post", "comb", "pre_out"),
+    mutates_args=("residual_out", "y", "y_q", "y_sf", "post", "comb", "pre_out"),
 )
 def _mhc_pre(
     residual: torch.Tensor,
@@ -654,6 +690,8 @@ def _mhc_pre(
     pre: torch.Tensor,
     residual_out: torch.Tensor | None,
     y: torch.Tensor,
+    y_q: torch.Tensor,
+    y_sf: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
     pre_out: torch.Tensor,
@@ -708,7 +746,7 @@ def _mhc_pre(
         Q,
     )
     _finalize(hidden, k, rms_eps, hc_eps, iterations)(
-        P, S, C, Q, scale, base, norm, post, comb, pre_out, y
+        P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
     )
 
 
@@ -722,6 +760,8 @@ def _mhc_pre_fake(
     pre,
     residual_out,
     y,
+    y_q,
+    y_sf,
     post,
     comb,
     pre_out,
@@ -832,7 +872,7 @@ def _constant_mixes(
 
 
 class TileKernelsMHC(nn.Module):
-    """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
+    """V4.1 lagged mHC for a decoder layer: pre, post_pre, post and collapse."""
 
     def __init__(self, config):
         super().__init__()
@@ -897,6 +937,9 @@ class TileKernelsMHC(nn.Module):
         previous_post=None,
         previous_comb=None,
     ):
+        """A sublayer entry: ``(streams, post-mix, combination, y, new pre-mix,
+        y_mxfp8)``. ``y`` is the sublayer's normalized input and ``y_mxfp8`` its MXFP8
+        cast (``linear.MXFP8Rows``), which the sublayer's block-32 projections read."""
         tokens, device = int(residual.shape[0]), residual.device
         if isinstance(previous_output, RankOrderParts):
             # Added inside the projection kernel, in rank order.
@@ -912,6 +955,7 @@ class TileKernelsMHC(nn.Module):
             )
         )
         y = torch.empty((tokens, self.hidden_size), dtype=residual.dtype, device=device)
+        y_mxfp8 = empty_mxfp8(y)
         post = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
         comb = torch.empty((tokens, MULT, MULT), dtype=torch.float32, device=device)
         pre_out = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
@@ -924,6 +968,8 @@ class TileKernelsMHC(nn.Module):
             pre,
             residual_out,
             y,
+            y_mxfp8.values,
+            y_mxfp8.scales,
             post,
             comb,
             pre_out,
@@ -934,7 +980,7 @@ class TileKernelsMHC(nn.Module):
             previous_post,
             previous_comb,
         )
-        return residual if unchanged else residual_out, post, comb, y, pre_out
+        return residual if unchanged else residual_out, post, comb, y, pre_out, y_mxfp8
 
     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
         return self.pre(
@@ -955,6 +1001,12 @@ class TileKernelsMHC(nn.Module):
         out = torch.empty_like(residual)
         _mhc_post(x, residual, post, comb, out)
         return out
+
+    @staticmethod
+    def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
+        """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
+        compact rows, prefill SP's gathered rows), for the projections that read it."""
+        return cast_mxfp8(rows)
 
     def collapse(
         self,

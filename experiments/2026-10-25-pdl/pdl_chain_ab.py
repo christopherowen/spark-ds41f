@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""The layer-chain benchmark on the image's vLLM build and on the PDL build, in
-alternation on one GPU: time per layer and whether every buffer's bits agree.
+"""The layer-chain benchmark on the base build and on the PDL build, in alternation
+on one GPU: time per layer and whether every buffer's bits agree.
 
 usage: pdl_chain_ab.py [ROUNDS]
 
-The PDL build is the image's vLLM tree with the PDL branch's package files in place:
-/tmp/pdl-tree/vllm holds symbolic links to the image's files, and the branch's files
-(mounted under /b/pdl) are copied over theirs. Each round runs
-benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py once per build, the image's
+Each build is the image's vLLM tree with package files in place: /tmp/pdl-tree/base/vllm
+holds symbolic links to the image's files with the base build's files (mounted under
+/b/base: the files it changes over the image's tree) copied over theirs, and
+/tmp/pdl-tree/pdl/vllm is the base build with the PDL branch's files (/b/pdl: the files
+it changes over the base) copied over those. Each round runs
+benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py once per build, the base build's
 first in odd rounds and the PDL build's first in even rounds, each in a fresh process
-on the bundle's TileLang cache. A probe first confirms which build each tree imports.
+on the bundle's TileLang cache. A probe first confirms that each tree imports its own
+mHC module, chained only in the PDL build.
 
 Prints each run's lines, then one JSON line per shape (medians over rounds, the
 difference) and a {"bits": ...} line per shape. Exit status 0 only when every run
@@ -26,8 +29,10 @@ import sys
 from pathlib import Path
 
 IMAGE_TREE = Path("/opt/spark-ds41f/candidate/vllm")
-PDL_TREE = Path("/tmp/pdl-tree/vllm")
-BRANCH = Path("/b/pdl")
+TREES = Path("/tmp/pdl-tree")
+# Each build's files, in the order they are copied over the image's tree.
+LAYERS = {"base": [Path("/b/base")], "pdl": [Path("/b/base"), Path("/b/pdl")]}
+MHC = "vllm/models/deepseek_v4_1/tilelang/mhc.py"
 BENCH = [
     "benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py",
     "--layers",
@@ -36,24 +41,27 @@ BENCH = [
     "50",
 ]
 PROBE = (
-    "import inspect, vllm.models.deepseek_v4_1.tilelang.mhc as m; "
-    "print('pdl.chain()' in inspect.getsource(m))"
+    "import inspect, json, os, vllm.models.deepseek_v4_1.tilelang.mhc as m; "
+    "print(json.dumps({'chained': 'pdl.chain()' in inspect.getsource(m), "
+    "'file': os.path.realpath(m.__file__)}))"
 )
 
 
-def build_tree() -> list[str]:
-    shutil.rmtree(PDL_TREE.parent, ignore_errors=True)
-    PDL_TREE.parent.mkdir(parents=True)
-    subprocess.run(["cp", "-as", str(IMAGE_TREE), str(PDL_TREE)], check=True)
-    placed = []
-    for source in sorted(p for p in BRANCH.rglob("*") if p.is_file()):
-        target = PDL_TREE / source.relative_to(BRANCH)
-        if target.is_symlink() or target.exists():
-            target.unlink()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-        placed.append(str(source.relative_to(BRANCH)))
-    return placed
+def build_tree(name: str) -> Path:
+    tree = TREES / name / "vllm"
+    tree.parent.mkdir(parents=True)
+    subprocess.run(["cp", "-as", str(IMAGE_TREE), str(tree)], check=True)
+    for layer in LAYERS[name]:
+        placed = []
+        for source in sorted(p for p in layer.rglob("*") if p.is_file()):
+            target = tree / source.relative_to(layer)
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            placed.append(str(source.relative_to(layer)))
+        print(f"{name} build, {layer}: {len(placed)} files: {', '.join(placed)}")
+    return tree
 
 
 def environment(tree: Path) -> dict:
@@ -88,8 +96,8 @@ def run(tree: Path, label: str) -> list[dict]:
 
 def main() -> int:
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    print("PDL build files:", ", ".join(build_tree()), flush=True)
-    builds = {"image": IMAGE_TREE, "pdl": PDL_TREE}
+    shutil.rmtree(TREES, ignore_errors=True)
+    builds = {name: build_tree(name) for name in LAYERS}
     for name, tree in builds.items():
         probe = subprocess.run(
             [sys.executable, "-c", PROBE],
@@ -98,20 +106,20 @@ def main() -> int:
             capture_output=True,
             text=True,
         )
-        chained = probe.stdout.strip()
-        print(
-            f"{name} build imports chained mHC: {chained} {probe.stderr[-500:]}",
-            flush=True,
-        )
-        if chained != str(name == "pdl"):
-            raise SystemExit(f"the {name} tree does not import the {name} build")
+        print(f"{name} build imports: {probe.stdout.strip()} {probe.stderr[-500:]}")
+        found = json.loads(probe.stdout or "{}")
+        want = {"chained": name == "pdl", "file": str(tree / MHC)}
+        if found != want:
+            raise SystemExit(
+                f"the {name} tree does not import the {name} build: {want}"
+            )
     results = {name: [] for name in builds}
     for r in range(rounds):
-        order = ("image", "pdl") if r % 2 == 0 else ("pdl", "image")
+        order = ("base", "pdl") if r % 2 == 0 else ("pdl", "base")
         for name in order:
             results[name].append(run(builds[name], f"round {r + 1}: {name}"))
     ok = True
-    reference = results["image"][0]
+    reference = results["base"][0]
     for i, want in enumerate(reference):
         shape = want["shape"]
         rows = {name: [runs[i] for runs in results[name]] for name in builds}
@@ -132,20 +140,20 @@ def main() -> int:
         ok = ok and good and not differ
         summary = {"shape": shape, "rows": want["rows"]}
         for kind in ("warm_us", "cold_us"):
-            image = statistics.median(row[kind] for row in rows["image"])
+            base = statistics.median(row[kind] for row in rows["base"])
             pdl = statistics.median(row[kind] for row in rows["pdl"])
             summary[kind] = {
-                "image": round(image, 2),
+                "base": round(base, 2),
                 "pdl": round(pdl, 2),
-                "saved": round(image - pdl, 2),
-                "saved_percent": round(100 * (image - pdl) / image, 2),
+                "saved": round(base - pdl, 2),
+                "saved_percent": round(100 * (base - pdl) / base, 2),
             }
         summary["finite_and_replays_equal"] = good
         print(json.dumps(summary), flush=True)
         print(
             json.dumps(
                 {
-                    "bits": f"{shape}: image vs PDL build, all rounds",
+                    "bits": f"{shape}: base vs PDL build, all rounds",
                     "differs_at": differ,
                 }
             ),

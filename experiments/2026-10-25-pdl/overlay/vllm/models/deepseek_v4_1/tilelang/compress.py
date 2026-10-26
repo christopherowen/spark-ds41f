@@ -17,10 +17,10 @@ step (``gather_partial_state``, which must finish before ``compress`` overwrites
 slots). ``compress`` also saves each request's latest ``page`` positions of the step
 (value and gate) to their ring slots, so a slot holds its latest position.
 
-This replaces B12X's ``mla_compress`` (one 128-thread block per token of the whole
+This replaced B12X's ``mla_compress`` (one 128-thread block per token of the whole
 batch capacity every call, then a pending-ring commit vLLM never reads) and vLLM's two
-Triton ring kernels (``_load_partial_state``, ``_save_partial_states``, the latter also
-over the whole capacity): two launches sized by the step. One warp owns a token, 16
+Triton ring kernels (the load, and the save over the whole capacity): two launches
+sized by the step. One warp owns a token, 16
 values a lane, and reduces its sum of squares with warp shuffles. ``exp`` and
 ``rsqrt`` are the FP32 library functions, as the reference computes them (B12X used
 fast approximations).
@@ -264,7 +264,7 @@ def gather_partial_state(
     pool, table, starts, positions, counts, pending_values, pending_gates, tags,
     local_ids, *, page,
 ):  # fmt: skip
-    """vLLM's ``_load_partial_state``: each request's carry from the state ring."""
+    """Each request's carry from the state ring."""
     max_requests = positions.shape[0]
     gather_partial_state_kernel(max_requests, page)(
         pool, table, starts, positions, counts, pending_values, pending_gates, tags,

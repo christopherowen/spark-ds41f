@@ -12,10 +12,17 @@ each row's accumulation order fixed, so results do not depend on the batch.
 
 The kernels run inside custom ops, which keeps them opaque to torch.compile,
 and borrow activation scratch from vLLM's workspace.
+
+A projection marked ``tilelang_mxfp8_input`` casts nothing: the kernel that
+produced its input wrote the cast too (``MXFP8Rows``; the mHC entries do, for the
+sublayer's first projections), and hands it over for the call
+(``provide_mxfp8``).
 """
 
+import contextlib
 import functools
 import math
+from typing import NamedTuple
 from weakref import WeakValueDictionary
 
 import torch
@@ -61,12 +68,6 @@ _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
 _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 
-def _tile_kernels():
-    import tile_kernels
-
-    return tile_kernels
-
-
 def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
     """MXFP8 activations and packed scales; decode rows fill whole tiles.
 
@@ -83,6 +84,90 @@ def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
     return (
         ((tile_rows, k), torch.float8_e4m3fn),
         ((tile_rows, 4 * scale_words(k)), torch.uint8),
+    )
+
+
+# A producer writes a projection's MXFP8 input in whole DECODE_ROWS tiles up to the
+# widest decode row bound (WIDE_DECODE: 128 rows), so each 16-, 32- or 64-row decode
+# tile reads in bounds; past it, the prefill GEMMs read the live rows alone.
+MXFP8_DECODE_ROWS = max(max(wide) for wide in WIDE_DECODE.values())
+
+
+def mxfp8_rows(rows: int) -> int:
+    """Rows a producer writes for ``rows`` rows of a projection's MXFP8 input."""
+    if rows > MXFP8_DECODE_ROWS:
+        return rows
+    return -(-rows // DECODE_ROWS) * DECODE_ROWS
+
+
+class MXFP8Rows(NamedTuple):
+    """BF16 activation rows beside their MXFP8 cast, as block-32 projections read it.
+
+    ``values`` (E4M3) and ``scales`` (packed UE8M0 bytes, ``4 * scale_words(K)`` a row)
+    hold ``per_token_cast``'s bytes of ``rows`` in their first ``rows.shape[0]`` rows,
+    padded to ``mxfp8_rows`` rows that no GEMM stores."""
+
+    rows: torch.Tensor
+    values: torch.Tensor
+    scales: torch.Tensor
+
+
+def empty_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
+    """Unwritten MXFP8 buffers for ``rows`` (BF16 ``[M, K]``), for their producer."""
+    m, k = rows.shape
+    padded = mxfp8_rows(m)
+    return MXFP8Rows(
+        rows,
+        torch.empty((padded, k), dtype=torch.float8_e4m3fn, device=rows.device),
+        torch.empty(
+            (padded, 4 * scale_words(k)), dtype=torch.uint8, device=rows.device
+        ),
+    )
+
+
+def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
+    """``rows``' MXFP8 cast by TileKernels' ``per_token_cast``: the producer of rows
+    regrouped after the kernel that wrote their cast (a CED boundary's compact rows,
+    prefill SP's gathered rows). ``_warm_casts`` of their width declares it."""
+    out = empty_mxfp8(rows)
+    m = rows.shape[0]
+    if m:
+        pdl.per_token_cast(
+            rows,
+            "e4m3",
+            SF_BLOCK,
+            round_sf=True,
+            use_packed_ue8m0=True,
+            out=(out.values[:m], out.scales[:m]),
+        )
+    return out
+
+
+# The MXFP8 rows handed to the projections of the calls in progress, innermost last.
+_PROVIDED: list[MXFP8Rows] = []
+
+
+@contextlib.contextmanager
+def provide_mxfp8(rows: MXFP8Rows):
+    """Hand ``rows`` to the projections that read their input's cast from its producer
+    (``tilelang_mxfp8_input``) for the calls inside: the sublayer the rows feed."""
+    _PROVIDED.append(rows)
+    try:
+        yield
+    finally:
+        _PROVIDED.pop()
+
+
+def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+    """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
+    holder keeps them alive, so no other tensor can be at that address. A projection
+    whose input arrives without its cast fails here: it has no cast of its own."""
+    for rows in reversed(_PROVIDED):
+        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
+            return rows
+    raise RuntimeError(
+        f"no MXFP8 cast was handed over for these {tuple(x.shape)} rows: the "
+        "projection reads its input's cast from the input's producer (provide_mxfp8)"
     )
 
 
@@ -152,6 +237,10 @@ def _block32_linear(
     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
     x = x.reshape(-1, k)
     rows = x.shape[0]
+    if layer.tilelang_mxfp8_input:
+        provided = provided_mxfp8(x)
+        _block32_gemm(layer, provided.values, provided.scales, out.view(rows, n), rows)
+        return
     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
         _block32_split(layer, x, out.view(rows, n), scratch)
         return
@@ -169,9 +258,12 @@ def _block32_linear(
 
 def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
     """The GEMM of a block-32 projection without split-K on its MXFP8 activations
-    (``_activation_specs`` buffers, the first ``rows`` rows live)."""
+    (``_activation_specs`` buffers or a producer's ``MXFP8Rows``, the first ``rows``
+    rows live)."""
     if rows > layer.tilelang_decode_rows:
         gemm = layer.tilelang_prefill
+        # A producer pads rows that another projection's decode tiles read.
+        xq, sf = xq[:rows], sf[:rows]
     else:
         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
     gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
@@ -347,7 +439,9 @@ def _warm_casts(k: int) -> None:
 def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
     """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
     register it for the custom op, and declare its kernels. ``cast=False``: the
-    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches."""
+    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches.
+    A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
+    producer (``provide_mxfp8``) and casts nothing either."""
     n, k = layer.weight.shape
     kernels = _block32_kernels(n, k, groups)
     layer.tilelang_groups = groups
@@ -357,6 +451,15 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
     layer.tilelang_shards = split["shards"] if split else 1
     if split:
         layer.tilelang_split_rows = split["rows"]
+    layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+    if layer.tilelang_mxfp8_input:
+        heights = {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
+        if split or groups != 1 or any(DECODE_ROWS % height for height in heights):
+            # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
+            raise ValueError(
+                f"the ({n}, {k}) projection cannot read a producer's MXFP8 rows"
+            )
+        cast = False
     layer.tilelang_key = id(layer)
     _LAYERS[layer.tilelang_key] = layer
 
@@ -401,6 +504,8 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
         _block32_scale_words(layer)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
+        if getattr(layer, "tilelang_mxfp8_input", False):
+            return 0  # its producer writes the activations
         return _spec_bytes(
             _activation_specs(
                 num_tokens, layer.weight.shape[1], layer.tilelang_decode_rows
@@ -675,10 +780,16 @@ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None
 
 
 __all__ = [
+    "MXFP8Rows",
     "TileLangBlock32Rows",
     "TileLangFP8LinearMethod",
     "TileLangLinearMethod",
     "TileLangScaledLinearMethod",
     "TileLangSplitLinearMethod",
+    "cast_mxfp8",
+    "empty_mxfp8",
+    "mxfp8_rows",
     "project_parts",
+    "provide_mxfp8",
+    "provided_mxfp8",
 ]

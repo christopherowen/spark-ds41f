@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """Write the PDL experiment's kernel-lab bundles and serving arms from the vLLM branch.
 
-usage: make_bundles.py [VLLM_REPO] [BASE] [HEAD]
-       (default ~/projects/vllm-pdl 26382f5cf pdl)
+usage: make_bundles.py [VLLM_REPO] [IMAGE_TREE] [BASE] [HEAD]
+       (default ~/projects/vllm-pdl-next 26382f5cf 577091997 pdl-next)
 
-BASE is the release tree candidate 6 serves (image -next-6 carries its package files);
-HEAD is the PDL branch. Every package file the branch changes goes to overlay/vllm (the
-serving arms mount it over the image) and into each bundle; the branch's new tests and
-benchmarks are mounted into the image's tree.
+IMAGE_TREE is the tree image -next-6 carries (candidate 6's, 26382f5cf); BASE is the
+build PDL is measured against (next-candidate); HEAD is the PDL branch on it. Every file
+HEAD changes over IMAGE_TREE (package files, tests, benchmarks) is written once to
+overlay/, and BASE's version of each package file PDL changes to overlay-base/. The
+bundles and serving arms mount them from the node's checkout over the image's tree: a
+build is the image's tree with its changed files in place. A package module deleted
+since IMAGE_TREE is replaced in overlay/ by one that fails to import as a missing module
+does (as retire-conditionals' bundles do), so nothing in the image reaches it.
 
 - bundles/pdl-tests: the PDL tests, then the DS4.1 TileLang kernel tests of every
-  changed module on the PDL build, all with the source check
+  module PDL changes, on the PDL build, all with the source check
   (tests.kernels.deepseek_v41_pdl_sources);
-- bundles/pdl-chain: the layer-chain benchmark on the image's build and on the PDL
+- bundles/pdl-chain: the layer-chain benchmark on the base build and on the PDL
   build in alternation (pdl_chain_ab.py), bits compared;
 - bundles/pdl-mechanism: the synthetic PDL benchmark and the traced layer
   (layer-c1.json, from critical_path.py --layer-sequence);
-- pdl-tp4.json, pdl-tp4-dev.json: candidate 6's arms with the overlay mounted.
+- bundles/pdl-sources: sources_cpu.py, every chain kernel lowered at its decode shapes
+  without device compilation and checked as the plugin checks launched kernels;
+- pdl-tp4.json, pdl-tp4-dev.json (PDL) and base-tp4.json, base-tp4-dev.json (BASE):
+  candidate 6's arms with the overlays mounted.
 """
 
 import json
@@ -36,7 +43,6 @@ RELEASE_BUNDLE = (
 ENV = {
     "HF_HUB_OFFLINE": "1",
     "TILELANG_CACHE_DIR": "/c/tilelang-pdl",
-    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
     "PYTHONPATH": f"/b:{ROOT}:/opt/spark-ds41f/candidate/b12x",
 }
 PYTEST = [
@@ -72,9 +78,24 @@ KERNEL_TESTS = [
 ]
 
 
-def changed(repo: str, base: str, head: str) -> list[str]:
+MISSING = """# Deleted in vLLM since the image's tree ({image_tree}..{head}); mounted over the
+# image's copy so that importing it fails as importing a missing module does.
+raise ModuleNotFoundError(f"No module named {{__name__!r}}", name=__name__)
+"""
+
+
+def changed(repo: str, base: str, head: str, status: str = "AM") -> list[str]:
     out = subprocess.run(
-        ["git", "-C", repo, "diff", "--name-only", "--diff-filter=AM", base, head],
+        [
+            "git",
+            "-C",
+            repo,
+            "diff",
+            "--name-only",
+            f"--diff-filter={status}",
+            base,
+            head,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -113,39 +134,72 @@ def bundle(name: str, description: str, argv: list, mounts: list, verdict: str) 
     return path
 
 
-def main() -> None:
-    repo = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / "projects/vllm-pdl")
-    base = sys.argv[2] if len(sys.argv) > 2 else "26382f5cf"
-    head = sys.argv[3] if len(sys.argv) > 3 else "pdl"
-    commit = subprocess.run(
-        ["git", "-C", repo, "rev-parse", head],
+def rev(repo: str, name: str) -> str:
+    return subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--short=9", name],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    files = changed(repo, base, head)
-    package = [f for f in files if f.startswith("vllm/")]
+
+
+def packages(files: list[str]) -> list[str]:
+    return [f for f in files if f.startswith("vllm/")]
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    repo = args[0] if args else str(Path.home() / "projects/vllm-pdl-next")
+    image_tree = args[1] if len(args) > 1 else "26382f5cf"
+    base = args[2] if len(args) > 2 else "577091997"
+    head = args[3] if len(args) > 3 else "pdl-next"
+    commit, base_commit = rev(repo, head), rev(repo, base)
+    files = changed(repo, image_tree, head)
+    package = packages(files)
     extra = [f for f in files if not f.startswith("vllm/")]
+    # Package modules deleted since the image's tree (by next-candidate; PDL deletes none).
+    gone = [
+        f for f in packages(changed(repo, image_tree, head, "D")) if f.endswith(".py")
+    ]
+    if gone != [
+        f for f in packages(changed(repo, image_tree, base, "D")) if f.endswith(".py")
+    ]:
+        raise SystemExit("the PDL branch deletes modules the base build keeps")
+    base_package = packages(changed(repo, image_tree, base))
+    pdl_files = changed(repo, base, head)
+    pdl_package = packages(pdl_files)
+    # The PDL branch's own tests and benchmarks: all the chain and mechanism bundles run.
+    pdl_extra = [f for f in pdl_files if not f.startswith("vllm/")]
     print(
-        f"vLLM {head} {commit[:9]} over {base}: {len(package)} package files, {len(extra)} others"
+        f"vLLM {head} {commit} over {image_tree}: {len(package)} package files, "
+        f"{len(extra)} others; base {base_commit}: {len(base_package)} package files; "
+        f"PDL over base: {len(pdl_package)}; {len(gone)} deleted modules fail to import"
     )
 
-    shutil.rmtree(HERE / "overlay", ignore_errors=True)
-    for f in package:
-        copy(repo, head, f, HERE / "overlay" / f)
+    # Each file once: HEAD's files over the image's tree in overlay/, and in
+    # overlay-base/ BASE's version of the package files PDL changes. The bundles mount
+    # them from the lab node's checkout (lab.py resolves relative mount sources there).
+    shared = [f for f in base_package if f in pdl_package]
+    for name, ref, paths in (("overlay", head, files), ("overlay-base", base, shared)):
+        shutil.rmtree(HERE / name, ignore_errors=True)
+        for f in paths:
+            copy(repo, ref, f, HERE / name / f)
+    for f in gone:
+        (HERE / "overlay" / f).parent.mkdir(parents=True, exist_ok=True)
+        (HERE / "overlay" / f).write_text(
+            MISSING.format(image_tree=image_tree, head=base)
+        )
+    package += gone
+    base_package += gone
 
-    def extras(path: Path) -> list:
-        """The branch's tests and benchmarks, mounted into the image's tree."""
-        mounts = []
-        for f in extra:
-            flat = f.replace("/", "_")
-            copy(repo, head, f, path / flat)
-            mounts.append([flat, f"{ROOT}/{f}"])
-        return mounts
+    def source(f: str, build: str = "pdl") -> str:
+        """Where ``build``'s version of ``f`` is, relative to the checkout."""
+        name = "overlay-base" if build == "base" and f in shared else "overlay"
+        return f"{REL}/{name}/{f}"
 
-    def overlay(path: Path, under: str = "overlay") -> None:
-        for f in package:
-            copy(repo, head, f, path / under / f)
+    def into_tree(paths, build: str = "pdl") -> list:
+        """``build``'s version of each file, mounted over the image's tree."""
+        return [[source(f, build), f"{ROOT}/{f}"] for f in paths]
 
     # PDL tests and the kernel tests with the source check.
     steps = [
@@ -167,7 +221,8 @@ def main() -> None:
     ]
     tests = bundle(
         "pdl-tests",
-        f"PDL along the decode chain (vLLM {head} {commit[:9]} over {base}) on candidate 6's image: the PDL "
+        f"PDL along the decode chain (vLLM {head} {commit}: next-candidate {base_commit} with PDL) on the "
+        f"-next-6 image with its package files over {image_tree}'s: the PDL "
         "tests (programmatic edges are live in graphs, a waiting reader never reads early, the layer chain "
         "bit-equal over poisoned replays), then every changed module's TileLang kernel tests with each launched "
         "kernel's CUDA source checked (wait first, trigger after; no PDL in warp-specialized GEMMs).",
@@ -180,12 +235,10 @@ def main() -> None:
         ],
         "exit",
     )
-    mounts = extras(tests)
     candidate = json.loads((tests / "candidate.json").read_text())
-    candidate["mounts"] += mounts
+    candidate["mounts"] += into_tree(files + gone)
     candidate["io_uring"] = True
     write_json(tests / "candidate.json", candidate)
-    overlay(tests)
     write_json(tests / "steps.json", steps)
     shutil.copyfile(HERE / "run_steps.py", tests / "run.py")
     for shim in ("tblib_stub.py", "offline_skip.py"):
@@ -194,20 +247,39 @@ def main() -> None:
     # The layer chain on both builds.
     chain = bundle(
         "pdl-chain",
-        f"One decode layer's kernel chain (23 kernels at TP4's shapes: mHC entries, Q-A/KV, q norm, Q-B, WO-A/B, "
-        f"shared expert on its own stream, routed experts, combine) in CUDA graphs at 6, 24 and 48 rows, on "
-        f"candidate 6's build and on it with the PDL branch's package files (vLLM {head} {commit[:9]}), three "
-        "rounds alternating: time per layer warm and L2-cold, and every written buffer's bits compared.",
+        f"One decode layer's kernel chain (20 kernels at TP4's shapes: mHC entries with their MXFP8 casts, "
+        f"Q-A/KV, q norm, Q-B, WO-A/B, shared expert on its own stream, routed experts, combine) in CUDA graphs "
+        f"at 6, 24 and 48 rows, on next-candidate's build (vLLM {base} {base_commit}) and on it with PDL "
+        f"(vLLM {head} {commit}), both as package files over the -next-6 image's, three rounds alternating: "
+        "time per layer warm and L2-cold, and every written buffer's bits compared.",
         ["/b/pdl_chain_ab.py", "3"],
-        [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"]]
-        + [[f"pdl/{f}", f"/b/pdl/{f}"] for f in package],
+        [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"]],
         "status",
     )
     candidate = json.loads((chain / "candidate.json").read_text())
-    candidate["mounts"] += extras(chain)
+    candidate["mounts"] += (
+        [[source(f, "base"), f"/b/base/{f}"] for f in base_package]
+        + [[source(f), f"/b/pdl/{f}"] for f in pdl_package]
+        + into_tree(pdl_extra)
+    )
     write_json(chain / "candidate.json", candidate)
-    overlay(chain, "pdl")
     shutil.copyfile(HERE / "pdl_chain_ab.py", chain / "pdl_chain_ab.py")
+
+    # The chain kernels' sources, lowered at their decode shapes.
+    sources = bundle(
+        "pdl-sources",
+        f"The PDL chain kernels' CUDA sources (vLLM {head} {commit}), lowered for sm_121 at TP4 decode shapes "
+        "with each factory's pass configs and no device compilation, each checked as the source-check plugin "
+        "checks launched kernels: the wait outside any block before any pointer parameter, the trigger after "
+        "it, no PDL in warp-specialized GEMMs.",
+        ["/b/sources_cpu.py"],
+        [["sources_cpu.py", "/b/sources_cpu.py"]],
+        "status",
+    )
+    candidate = json.loads((sources / "candidate.json").read_text())
+    candidate["mounts"] += into_tree(package + pdl_extra)
+    write_json(sources / "candidate.json", candidate)
+    shutil.copyfile(HERE / "sources_cpu.py", sources / "sources_cpu.py")
 
     # The synthetic mechanism and the traced layer.
     mechanism = bundle(
@@ -224,36 +296,41 @@ def main() -> None:
         "status",
     )
     candidate = json.loads((mechanism / "candidate.json").read_text())
-    candidate["mounts"] += extras(mechanism)
+    candidate["mounts"] += into_tree(package + pdl_extra)
     write_json(mechanism / "candidate.json", candidate)
-    overlay(mechanism)
     shutil.copyfile(HERE / "layer-c1.json", mechanism / "layer-c1.json")
 
-    # Serving arms: candidate 6 with the overlay.
-    overlay_mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]] + [
-        [f"{{home}}/projects/spark-ds41f/{REL}/overlay/{f}", f"{ROOT}/{f}", "ro"]
-        for f in package
-    ]
-    write_json(
-        HERE / "pdl-tp4.json",
-        {
-            "notes": f"Candidate 6 at tp4-ring with PDL along the decode chain: vLLM {head} {commit[:9]}'s "
-            f"{len(package)} package files over the image's (26382f5cf's), mounted from overlay/.",
-            "extends": {"config": f"{RC6}/rc-tp4.json"},
-            "set": {"container": {"mounts": overlay_mounts}},
-        },
-    )
-    write_json(
-        HERE / "pdl-tp4-dev.json",
-        {
-            "notes": "pdl-tp4.json with the dev-mode collective RPC, for the suites' engine grid.",
-            "extends": {"config": f"{REL}/pdl-tp4.json"},
-            "set": {"environment": {"VLLM_SERVER_DEV_MODE": "1"}},
-        },
-    )
+    # Serving arms: candidate 6's recipe with each build's package files over the image's.
+    for arm, ref, ref_commit, paths, what in (
+        ("pdl", head, commit, package, "next-candidate with PDL along the decode chain"),
+        ("base", base, base_commit, base_package, "next-candidate without PDL"),
+    ):  # fmt: skip
+        mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]] + [
+            [f"{{home}}/projects/spark-ds41f/{source(f, arm)}", f"{ROOT}/{f}", "ro"]
+            for f in paths
+        ]
+        write_json(
+            HERE / f"{arm}-tp4.json",
+            {
+                "notes": f"Candidate 6's tp4-ring recipe on {what}: vLLM {ref} {ref_commit}'s {len(paths)} "
+                f"package files over the image's ({image_tree}'s), mounted from overlay/ (and "
+                "overlay-base/ for the base build's version of a file PDL changes).",
+                "extends": {"config": f"{RC6}/rc-tp4.json"},
+                "set": {"container": {"mounts": mounts}},
+            },
+        )
+        write_json(
+            HERE / f"{arm}-tp4-dev.json",
+            {
+                "notes": f"{arm}-tp4.json with the dev-mode collective RPC, for the suites' engine grid.",
+                "extends": {"config": f"{REL}/{arm}-tp4.json"},
+                "set": {"environment": {"VLLM_SERVER_DEV_MODE": "1"}},
+            },
+        )
     print(
-        "wrote overlay/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-mechanism, pdl-tp4.json, "
-        "pdl-tp4-dev.json"
+        "wrote overlay/, overlay-base/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-sources, "
+        "bundles/pdl-mechanism, "
+        "pdl-tp4.json, pdl-tp4-dev.json, base-tp4.json, base-tp4-dev.json"
     )
 
 

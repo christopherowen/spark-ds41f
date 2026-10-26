@@ -398,6 +398,28 @@ def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
         )
 
 
+@T.macro
+def cast_block_mxfp8(values, quantized, count, amax, Q, S, row, col):
+    """One thread's share of a 32-value block in registers through ``_reference_cast``'s
+    arithmetic: ``values[0:count]`` (FP32 copies of BF16 values) are columns ``col`` on
+    of output row ``row``, ``amax`` the whole block's (the caller reduces it across the
+    block's threads). Their E4M3 bytes go through ``quantized`` (local, ``count``
+    long) to ``Q`` and, from the thread whose columns start the block, the UE8M0 byte
+    to ``S``: the bytes ``per_token_cast`` writes. A producer whose output is in
+    registers writes its consumers' MXFP8 input with it."""
+    bits = T.reinterpret(
+        T.max(amax, T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32
+    )
+    exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
+    inv = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
+    if col % 32 == 0:
+        S[row, col // 32] = T.Cast(T.uint8, exponent + 127)
+    for v in T.vectorized(count):
+        quantized[v] = T.Cast(T.float8_e4m3fn, values[v] * inv)
+    for v in T.vectorized(count):
+        Q[row, col + v] = quantized[v]
+
+
 @tilelang.jit
 def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128):
     """``splitk_reduce`` to BF16, then the reference's activation cast: E4M3 ``Q`` and

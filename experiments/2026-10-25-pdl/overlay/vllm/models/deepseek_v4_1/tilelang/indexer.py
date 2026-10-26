@@ -30,8 +30,13 @@ shared memory, runs a two-pass 8-bit radix select and an ordered compaction
 small batches still spread over many CTAs. Positions come back in ascending
 order, padded with ``-1``.
 ``group=8`` ranks blocks of eight positions by their maximum, always keeping
-the block that holds the last visible position, and expands them: V4.1's
-candidate-domain selection at its candidate source layer.
+the block that holds the last visible position: V4.1's candidate-domain
+selection at its candidate source layer. It returns the blocks' ids, ascending
+and ``-1`` padded, and their count of visible positions. Every selected block
+but the last is wholly visible and the last holds the row's last position, so
+candidate ``j < count`` of such a list is position
+``ids[j // 8] * 8 + j % 8``: the reindex layers read their candidates that way,
+from an eighth of the bytes of a position list.
 
 Selection is deterministic: the same scores give the same positions
 regardless of thread timing or batch composition.
@@ -87,6 +92,27 @@ def _row_extent(Lengths, Active, row, width):
     return T.min(extent, width)
 
 
+def _candidate_block(Candidates, row, j):
+    """Candidate ``j``'s block id (``-1``: masked). Candidate rows score whole tiles of
+    a width that is a multiple of the tile, so ``j`` never passes the list."""
+    return Candidates[row, j // CANDIDATE_BLOCK]
+
+
+def _candidate_position(Candidates, row, j, count=None):
+    """Candidate ``j``'s position, always one the row has written. A masked block reads
+    block 0, whole in any row of more than one block. With ``count`` (the tile holding
+    the row's count), past it the last block's ids point past the row's end, so the
+    offset is 0: the first position of the last kept block, which holds the row's last
+    position, or position 0 past the kept blocks; without it ``j`` is below the count.
+    As a multiple of the block plus an offset below it, the page arithmetic on it folds
+    to the block id's."""
+    block = T.max(_candidate_block(Candidates, row, j), 0)
+    offset = j % CANDIDATE_BLOCK
+    if count is not None:
+        offset = T.Select(j < count, offset, 0)
+    return block * CANDIDATE_BLOCK + offset
+
+
 @tilelang.jit
 def indexer_score_v41(
     width: int,
@@ -108,18 +134,23 @@ def indexer_score_v41(
     - ``PageTable``: ``[rows, table_width]`` int32 physical page per logical page;
     - ``Lengths``: ``[rows]`` int32 positions per row;
     - ``Active``: ``[1]`` int32 width cap;
-    - candidate mode: ``Candidates`` ``[rows, width]`` int32 positions and
-      ``CandidateLengths`` ``[rows]``.
+    - candidate mode: ``Candidates`` ``[rows, width // CANDIDATE_BLOCK]`` int32
+      block ids (``-1``: a masked block) and ``CandidateLengths`` ``[rows]``,
+      candidate ``j`` being position ``Candidates[j // 8] * 8 + j % 8``; its
+      source layer writes the ids whole, ``-1`` padded.
 
     Writes ``Scores`` (``[rows, width]`` BF16) up to each row's extent, ``-inf``
     for masked candidates; entries past the extent are left unwritten and the
-    top-k never reads them. Each row gets at most ``max_ctas`` CTAs, which loop
-    over its live tiles, so the launch scales with the context in use rather
-    than the planned width.
+    top-k never reads them. No key or scale is read past the visible positions
+    either.
+    Each row gets at most ``max_ctas`` CTAs, which loop over its live tiles, so
+    the launch scales with the context in use rather than the planned width.
     """
     assert page_size % block_P == 0 or candidates, (
         "dense tiles must not straddle a page"
     )
+    assert not candidates or width % block_P == 0, "candidate rows score whole tiles"
+    blocks = width // CANDIDATE_BLOCK
     rows, pool_pages, table_width, pool_stride, scale_stride = T.dynamic(
         "rows, pool_pages, table_width, pool_stride, scale_stride"
     )
@@ -129,6 +160,33 @@ def indexer_score_v41(
     page_words = page_bytes(page_size) // 4
     scale_word0 = page_size * D // 2 // 4  # first scale word of a page
     ctas = min(tilelang.cdiv(width, block_P), max_ctas)
+
+    @T.macro
+    def load_keys(
+        KPool, KScale, PageTable, row, p0, position, loads, K_shared, SFK_shared
+    ):
+        for p, d in T.Parallel(block_P, D):
+            pos = position(p0, p)
+            page = T.min(
+                T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
+                pool_pages - 1,
+            )
+            K_shared[p, d] = T.if_then_else(
+                loads(p0, p),
+                KPool[page, (pos % page_size) * D + d],
+                T.cast(0, fp4),
+            )
+        for p in T.Parallel(block_P):
+            pos = position(p0, p)
+            page = T.min(
+                T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
+                pool_pages - 1,
+            )
+            SFK_shared[p, 0] = T.if_then_else(
+                loads(p0, p),
+                KScale[page, scale_word0 + pos % page_size],
+                T.cast(0, T.uint32),
+            )
 
     @T.macro
     def score_row(
@@ -143,6 +201,9 @@ def indexer_score_v41(
         extent,
         position,
         slot_valid,
+        loads,
+        whole,
+        whole_position,
         Scores,
     ):
         K_shared = T.alloc_shared([block_P, D], fp4)
@@ -161,21 +222,53 @@ def indexer_score_v41(
             W_shared[h] = T.cast(Weights[row, h], accum_dtype)
         for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
             p0 = (cta + i * ctas) * block_P
-            # Invalid slots load a clamped, in-pool key and are masked at the end.
-            for p, d in T.Parallel(block_P, D):
-                pos = position(p0, p)
-                page = T.min(
-                    T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
-                    pool_pages - 1,
+            # No load reaches past the visible positions (DeepSeek's reference reads
+            # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
+            # (a dense row's rows past its extent) load no key or scale and score
+            # zeros, which the store drops. Only the key and scale loads are
+            # predicated: the page read stays unconditional, so a dense tile's
+            # addresses stay affine and its loads issue together. Every candidate
+            # row loads: its position is always a visible one (a masked or padding
+            # candidate's too, ``_candidate_position``), and its score is masked at
+            # the end. Only the tile holding a candidate row's count bounds its
+            # positions by it: a tile ``whole`` below the count takes
+            # ``whole_position``, chosen once for the tile.
+            if whole is None:
+                load_keys(
+                    KPool,
+                    KScale,
+                    PageTable,
+                    row,
+                    p0,
+                    position,
+                    loads,
+                    K_shared,
+                    SFK_shared,
                 )
-                K_shared[p, d] = KPool[page, (pos % page_size) * D + d]
-            for p in T.Parallel(block_P):
-                pos = position(p0, p)
-                page = T.min(
-                    T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
-                    pool_pages - 1,
+            elif whole(p0):
+                load_keys(
+                    KPool,
+                    KScale,
+                    PageTable,
+                    row,
+                    p0,
+                    whole_position,
+                    loads,
+                    K_shared,
+                    SFK_shared,
                 )
-                SFK_shared[p, 0] = KScale[page, scale_word0 + pos % page_size]
+            else:
+                load_keys(
+                    KPool,
+                    KScale,
+                    PageTable,
+                    row,
+                    p0,
+                    position,
+                    loads,
+                    K_shared,
+                    SFK_shared,
+                )
             T.mma_gemm_blockscaled(
                 K_shared,
                 Q_shared,
@@ -237,6 +330,9 @@ def indexer_score_v41(
                     extent,
                     lambda p0, p: p0 + p,
                     lambda p0, p: True,
+                    lambda p0, p: p0 + p < extent,
+                    None,
+                    None,
                     Scores,
                 )
 
@@ -252,7 +348,7 @@ def indexer_score_v41(
         PageTable: T.Tensor([rows, table_width], T.int32),
         Lengths: T.Tensor([rows], T.int32),
         Active: T.Tensor([1], T.int32),
-        Candidates: T.Tensor([rows, width], T.int32),
+        Candidates: T.Tensor([rows, blocks], T.int32),
         CandidateLengths: T.Tensor([rows], T.int32),
         Scores: T.Tensor([rows, width], T.bfloat16),
     ):
@@ -269,8 +365,11 @@ def indexer_score_v41(
                 row,
                 cta,
                 extent,
-                lambda p0, p: T.max(Candidates[row, T.min(p0 + p, width - 1)], 0),
-                lambda p0, p: Candidates[row, T.min(p0 + p, width - 1)] >= 0,
+                lambda p0, p: _candidate_position(Candidates, row, p0 + p, extent),
+                lambda p0, p: _candidate_block(Candidates, row, p0 + p) >= 0,
+                lambda p0, p: True,
+                lambda p0: p0 + block_P <= extent,
+                lambda p0, p: _candidate_position(Candidates, row, p0 + p),
                 Scores,
             )
 
@@ -555,8 +654,10 @@ def _final_writer(threads, topk, group):
     ):
         """Write the ``total`` selected entries (``entry(slot)``), ``-1`` padded.
 
-        Grouped entries expand to their positions below ``extent``; ``Counts``
-        receives how many positions that leaves.
+        Grouped entries are block ids; ``Counts`` receives their positions below
+        ``extent``. ``Gather`` (candidate rows) holds candidate block ids:
+        entry ``e`` is position ``Gather[e // CANDIDATE_BLOCK] * CANDIDATE_BLOCK +
+        e % CANDIDATE_BLOCK``.
         """
         tx = T.get_thread_binding()
         count = T.alloc_var(T.int32)
@@ -567,21 +668,18 @@ def _final_writer(threads, topk, group):
                 if slot < total:
                     e = entry(slot)
                     Values[row, slot] = _value16(sel_key[slot])
-                    if group == 1:
-                        if Gather is not None:
-                            Indices[row, slot] = Gather[row, e]
-                        else:
-                            Indices[row, slot] = e
+                    if Gather is not None:
+                        Indices[row, slot] = (
+                            Gather[row, e // CANDIDATE_BLOCK] * CANDIDATE_BLOCK
+                            + e % CANDIDATE_BLOCK
+                        )
                     else:
-                        for o in T.serial(group):
-                            Indices[row, slot * group + o] = T.if_then_else(
-                                e * group + o < extent, e * group + o, -1
-                            )
+                        Indices[row, slot] = e
+                    if group > 1:
                         count += T.min(group, extent - e * group)
                 else:
                     Values[row, slot] = -T.infinity(T.bfloat16)
-                    for o in T.serial(group):
-                        Indices[row, slot * group + o] = -1
+                    Indices[row, slot] = -1
         if Counts is not None:
             T.sync_threads()
             if tx == 0:
@@ -614,10 +712,11 @@ def indexer_topk_segment_v41(
     entry is a block of ``group`` positions keyed by its maximum; the block
     holding the last position always ranks first.
 
-    ``final`` (one segment per row) writes ``Indices`` (``[rows, topk * group]``
-    int32 ascending positions, ``-1`` padded) and ``Values`` (``[rows, topk]``
-    BF16); ``candidates`` maps entries through ``Gather`` (``[rows, width]``),
-    and ``group > 1`` also writes ``Counts`` (``[rows]`` positions kept).
+    ``final`` (one segment per row) writes ``Indices`` (``[rows, topk]`` int32
+    ascending positions, or block ids with ``group > 1``, ``-1`` padded) and
+    ``Values`` (``[rows, topk]`` BF16); ``candidates`` maps entries through
+    ``Gather`` (``[rows, width // CANDIDATE_BLOCK]`` block ids), and
+    ``group > 1`` also writes ``Counts`` (``[rows]`` positions kept).
     Otherwise it writes each live segment's winners, in entry order, to
     ``WorkValues`` / ``WorkEntries`` (``[rows, segments * topk]``, ``-1``
     padded); segments past a row's extent are left unwritten.
@@ -761,7 +860,7 @@ def indexer_topk_segment_v41(
         def indexer_topk_segment(
             Scores: T.Tensor([rows, width], T.bfloat16),
             Lengths: T.Tensor([rows], T.int32),
-            Gather: T.Tensor([rows, width], T.int32),
+            Gather: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
             Indices: T.Tensor([rows, topk], T.int32),
             Values: T.Tensor([rows, topk], T.bfloat16),
         ):
@@ -776,7 +875,7 @@ def indexer_topk_segment_v41(
             Scores: T.Tensor([rows, width], T.bfloat16),
             Lengths: T.Tensor([rows], T.int32),
             Active: T.Tensor([1], T.int32),
-            Indices: T.Tensor([rows, topk * group], T.int32),
+            Indices: T.Tensor([rows, topk], T.int32),
             Values: T.Tensor([rows, topk], T.bfloat16),
             Counts: T.Tensor([rows], T.int32),
         ):
@@ -945,7 +1044,7 @@ def indexer_topk_merge_v41(
             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
             Lengths: T.Tensor([rows], T.int32),
-            Gather: T.Tensor([rows, width], T.int32),
+            Gather: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
             Indices: T.Tensor([rows, topk], T.int32),
             Values: T.Tensor([rows, topk], T.bfloat16),
         ):
@@ -961,7 +1060,7 @@ def indexer_topk_merge_v41(
             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
             Lengths: T.Tensor([rows], T.int32),
             Active: T.Tensor([1], T.int32),
-            Indices: T.Tensor([rows, topk * group], T.int32),
+            Indices: T.Tensor([rows, topk], T.int32),
             Values: T.Tensor([rows, topk], T.bfloat16),
             Counts: T.Tensor([rows], T.int32),
         ):
@@ -1008,8 +1107,9 @@ class IndexerTopK:
     SM120 shared memory. Every route returns the same positions: each merge
     sees exact winners in entry order and applies the same score-then-position
     order. Segments and merge groups past a row's extent are skipped.
-    ``candidates`` rows select from their first ``Lengths`` candidates and
-    return the candidates' positions.
+    ``candidates`` rows select from their first ``Lengths`` candidates (a list
+    of candidate block ids) and return the candidates' positions; grouped rows
+    return block ids.
     """
 
     def __init__(self, width, topk=INDEX_TOPK, group=1, candidates=False):
@@ -1091,7 +1191,7 @@ class IndexerTopK:
         """Select into ``indices`` / ``values``; grouped selections fill ``counts``.
 
         ``active`` is the ``[1]`` width cap of dense rows; candidate rows take
-        ``gather`` (their candidate positions) instead.
+        ``gather`` (their candidate block ids) instead.
         """
         rows = scores.shape[0]
         cap = () if self.candidates else (active,)
@@ -1207,10 +1307,11 @@ class IndexerV41Plan:
     ):
         """Select each row's top positions into ``out``; returns ``(out, scores)``.
 
-        Reindex plans take ``candidates`` / ``candidate_lengths``; source plans
-        write ``candidate_out`` (``[rows, CANDIDATE_BLOCKS * CANDIDATE_BLOCK]``
-        ascending positions, ``-1`` padded) and ``candidate_out_lengths``
-        (its count of positions). Scores past a row's extent are unwritten.
+        Reindex plans take ``candidates`` (``[rows, CANDIDATE_BLOCKS]`` block ids)
+        / ``candidate_lengths`` (positions); source plans write ``candidate_out``
+        (``[rows, CANDIDATE_BLOCKS]`` ascending block ids, ``-1`` padded) and
+        ``candidate_out_lengths`` (its count of positions). Scores past a row's
+        extent are unwritten.
         """
         rows = q_packed.shape[0]
         buffers = _take(scratch, self.scratch_specs(rows))
