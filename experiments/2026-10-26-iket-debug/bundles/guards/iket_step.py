@@ -147,9 +147,34 @@ def nan_hooks(worker):
                               f"absmax {float(x.float().abs().max()):.3g}", flush=True)
                 return
 
+    def finite(value):
+        return not (isinstance(value, torch.Tensor) and value.is_floating_point() and value.numel()
+                    and not bool(torch.isfinite(value).all()))
+
+    def checked(label, method):
+        """``method`` (a layer's mHC pre or post_pre, called functionally, so no module
+        hook sees it), reporting its first non-finite output and which inputs were so."""
+        def call(*args, **kwargs):
+            out = method(*args, **kwargs)
+            if not first:
+                bad = [i for i, o in enumerate(out if isinstance(out, tuple) else (out,)) if not finite(o)]
+                if bad:
+                    first.append(label)
+                    inputs = {**{str(i): a for i, a in enumerate(args)}, **kwargs}
+                    print(f"first non-finite output: {label} outputs {bad}; non-finite inputs "
+                          f"{[k for k, v in inputs.items() if not finite(v)]}; tensor inputs "
+                          f"{[(k, tuple(v.shape)) for k, v in inputs.items() if isinstance(v, torch.Tensor)]}",
+                          flush=True)
+            return out
+        return call
+
     for name, module in model.named_modules():
         module.nan_name = name or "model"
         module.register_forward_hook(hook)
+        mhc = getattr(module, "mhc", None)
+        for method in ("pre", "post_pre"):
+            if mhc is not None and callable(getattr(mhc, method, None)):
+                setattr(mhc, method, checked(f"{name}.mhc.{method}", getattr(mhc, method)))
     return len(list(model.named_modules()))
 
 
