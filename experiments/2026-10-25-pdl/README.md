@@ -9,9 +9,12 @@ the whole decode step from the critical path, and prototypes it.
 Rules: bound each idea's gain from traces before building it; bit-identical outputs; correctness
 before speed; no fallback paths.
 
-Status: **analysis done, prototype committed, kernel checks run on dgx4** ([results](#results-on-dgx4-2026-10-25-cet)):
-bits identical, 0 source violations, 1.3-1.8% faster per c1 layer chain. The serving screen and
-profile need the cluster and stay queued.
+Status: **analysis done; the final head is vLLM `pdl-next` 1bc005688 on next-candidate
+577091997; kernel checks run on dgx4** ([results](#results-on-dgx4-2026-10-25-cet),
+[final head](#the-final-head-pdl-next-on-next-candidate-577091997)). Bits are identical and
+the source check finds 0 violations. The c1 layer chain is 0.7-1.3% faster against
+next-candidate (1.3-1.8% against candidate 6's build). The 48-row chain trends 0.4% slower, an
+open finding. The serving screen and profile need the cluster and stay queued.
 
 ## The short answer
 
@@ -49,11 +52,13 @@ profile need the cluster and stay queued.
   - the source check finds 0 violations;
   - the captured graphs carry programmatic edges;
   - a boundary costs 0.25-0.36 us less with `pdl.chain()`;
-  - the traced c1 layer is 1.42% shorter, and the real c1 layer chain 1.81% warm and 1.30%
-    cold;
-  - at 24-48 rows the chain is within noise.
+  - the traced c1 layer is 0.75-1.42% shorter (two runs). The real c1 layer chain is 1.81% warm
+    and 1.30% cold faster on candidate 6's build. On next-candidate, whose finalize cast already
+    removed three of the chain's boundaries, it is 0.67-1.31% warm and 0.97-1.12% cold faster;
+  - at 24 rows the chain is within noise; at 48 rows PDL trends 0.4% slower (three runs; the
+    mechanism is not yet tested; see [the final head](#the-final-head-pdl-next-on-next-candidate-577091997)).
 
-  That is roughly 1.0-1.5% of a c1 step, if serving confirms it.
+  That is roughly 0.7-1.3% of a c1 step, if serving confirms it.
 - **The L2 prefetch windows are late, and neither PDL nor an earlier issue fixes that**
   ([below](#the-l2-weight-prefetch-windows)). 77-87% of window instances still run when their
   first consumer starts; the consumers' time above their L2 speed is 4.67% of a c1 greedy step
@@ -64,8 +69,10 @@ profile need the cluster and stay queued.
   sampled, 0.60% c8, plus 0.55% for WO); evict-last lines survive the GEMMs in between on GB10
   (moe-overlap's probe). The prefetch join never binds; the forks cost about 0.04%.
 - **Built:** every kernel on the layer chain begins with `pdl.chain()`, TileKernels' casts and
-  norms take DeepSeek's PDL switch, the warp-specialized GEMMs keep their launch (vLLM `pdl`
-  0b7952de4 and 62538a5d8, with tests in 75e6d02c7, 59b72eb81 and 352b07b52, over 26382f5cf). Scheduling only: the tests require identical bits.
+  norms take DeepSeek's PDL switch for their own calls, and the warp-specialized GEMMs keep their
+  launch. That is vLLM `pdl-next` (0ccbe30e5, 3a0ac1afa, b2bae34c9, b3f659d9a, 1bc005688 over
+  next-candidate 577091997), first built as `pdl` over 26382f5cf. Scheduling only: the tests
+  require identical bits.
 
 ## How the critical path was computed
 
@@ -250,7 +257,12 @@ Bounds:
 
   Together they are bounded by the 4.67% excess pool and by L2's 24 MB.
 
-## The prototype (vLLM `pdl`, two commits over 26382f5cf)
+## The prototype (vLLM `pdl-next`, five commits over next-candidate 577091997)
+
+First built as vLLM `pdl` over 26382f5cf (0b7952de4, 62538a5d8, tests in 75e6d02c7, 59b72eb81
+and 352b07b52); the measurements in [Results](#results-on-dgx4-2026-10-25-cet) items 1-4 are of
+that branch. `pdl-next` carries the same five commits onto next-candidate
+([below](#the-final-head-pdl-next-on-next-candidate-577091997)).
 
 `vllm/models/deepseek_v4_1/tilelang/pdl.py`:
 - `chain()`: `T.pdl_sync()` then `T.pdl_trigger()`, the first statement of a kernel. The wait
@@ -259,17 +271,22 @@ Bounds:
   runs, so at most two kernels of the chain are resident. TileLang (b95ee4ff) marks a kernel that
   waits `has_cuda_pdl_sync` and its TVM runtime launches it with
   `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`.
-- `tile_kernels()`: TileKernels with `set_pdl(True)`, used by every call site (casts, norms, the
-  top-k gate). DeepSeek's kernels place the wait first and the trigger after their stores.
+- `per_token_cast`, `norm_forward`, `moe_topk_gate_forward`: TileKernels' kernels with
+  DeepSeek's PDL switch on for that call only, used by every chain call site (the casts,
+  `linear.cast_mxfp8` among them, the norms and the top-k gate). These kernels place the wait
+  first and the trigger after their stores. Every other TileKernels kernel keeps its default (no
+  PDL): some read inputs before their wait (results item 2).
 
-Chained: mHC entry, finalize, post and collapse; the decode MXFP8 GEMM tiles, split-K partials
-and reduces, WO-A's W8A16 kernels, the split-K BF16 GEMM; RoPE, cache writes, the sparse-MLA
-metadata (decode, chunk, pages, requests, tokens), sparse MLA and its combine, the indexer and
-compressor; MoE dispatch, grouped FP8 x FP4 GEMMs, SwiGLU cast and combine; routing masks and
-partials; the shared expert's SwiGLU. Not chained: the warp-specialized GEMMs (`gemm_bf16`,
-`gemm_bf16_two`, `gemm_bf16_partials`, `mxfp8_gemm`'s prefill tiles), whose producer warps'
-TMA loads would have to follow the wait as well; `mxfp8_gemm_decode` always chains and
-`mxfp8_gemm` never, so there is no switch.
+Chained: mHC entry, finalize (which on next-candidate also writes its output's MXFP8 cast),
+post and collapse; the decode MXFP8 GEMM tiles, split-K partials and reduces, WO-A's W8A16
+kernels, the split-K BF16 GEMM; RoPE, cache writes, the sparse-MLA metadata (builder, decode,
+chunk, pages), sparse MLA and its combine, the indexer (its re-index over candidate block ids
+included) and compressor; MoE dispatch, grouped FP8 x FP4 GEMMs, SwiGLU cast and combine, at the
+decode and the 64-row prefill tile heights; routing masks and partials; the shared expert's
+SwiGLU. Not chained: the warp-specialized GEMMs (`gemm_bf16`, `gemm_bf16_two`,
+`gemm_bf16_partials`, `mxfp8_gemm`'s prefill tiles), whose producer warps' TMA loads would have
+to follow the wait as well; `mxfp8_gemm_decode` always chains and `mxfp8_gemm` never, so there
+is no switch.
 
 Why the bits cannot change: every global load and store follows the wait, which returns only
 when every kernel the launch depends on has completed and its writes are visible. TileLang drops
@@ -300,8 +317,11 @@ bundles below.
   changed module, which also check each kernel's bits against its reference on the PDL build.
 - `tests/kernels/deepseek_v41_pdl_chains.py`: one decode layer's kernel chain at TP4's shapes
   (mHC entries, fused Q-A/KV, q norm, Q-B, WO-A split-K and reduce-cast, WO-B, the shared expert
-  on its own stream beside the routed experts, the combine waiting for it): 23 kernels, random
-  weights and fixed routes by seed, only APIs that predate PDL, so it runs on either build.
+  on its own stream beside the routed experts, the combine waiting for it), random weights and
+  fixed routes by seed, only APIs that predate PDL, so it runs on either build. On `pdl` it
+  was 23 kernels. On `pdl-next` it is 20: finalize writes the MXFP8 cast that fused Q-A/KV, the
+  shared gate/up and the routed experts read, so their three casts go, and the entries' casts
+  are among the digested buffers.
 - `benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py`: that chain, four layers a graph, at
   6, 24 and 48 rows, warm and L2-cold, with every written buffer's digest.
 - <a id="benchmarks"></a>`benchmarks/kernels/benchmark_deepseek_v41_pdl_mechanism.py`: synthetic
@@ -317,26 +337,40 @@ never waits); `lab.py run --dry-run` of the three specs.
 
 ## Lab specs
 
-Regenerate the bundles and arms from the vLLM branch with
-`python3 experiments/2026-10-25-pdl/make_bundles.py ~/projects/vllm-pdl 26382f5cf pdl`.
+Regenerate the bundles and arms from the vLLM branches with
+`python3 experiments/2026-10-25-pdl/make_bundles.py ~/projects/vllm-pdl-next 26382f5cf 577091997 pdl-next`.
 Image: candidate 6 (`spark-ds41f:19f2c20ed4d6-next-6`, whose package files are 26382f5cf's).
+Both builds are that image with files mounted over its tree. The PDL build gets every file
+`pdl-next` changes since 26382f5cf ([overlay/](overlay)). The base build, next-candidate
+577091997, gets the same files except PDL's: next-candidate's version of the seven package
+files PDL changes ([overlay-base/](overlay-base)), and the image's own for the rest. The four
+modules next-candidate deletes are mounted in both as modules that fail to import. The bundles
+mount these from the node's checkout.
+
+[bundles/pdl-sources](bundles/pdl-sources) runs [sources_cpu.py](sources_cpu.py) through
+kernel-local: every chain kernel lowered at its decode shapes and checked without a launch.
 
 1. [kernel.json](kernel.json), the cluster stopped, three nodes at once:
    - dgx2 [bundles/pdl-tests](bundles/pdl-tests): the PDL tests, then the 11 changed modules'
      kernel tests with the source check. Pass: exit 0, no violations.
    - dgx3 [bundles/pdl-chain](bundles/pdl-chain): [pdl_chain_ab.py](pdl_chain_ab.py) runs the
-     chain benchmark on the image's build and on a tree of links to it with the branch's 14
-     package files copied in, three rounds alternating. Pass: every digest equal across builds,
-     replays and rounds; the line per shape gives the time saved per layer.
+     chain benchmark on the base build and on the PDL build, three rounds alternating. Each
+     build is a tree of links to the image's with its files copied in: the base build's 59
+     (55 package files and the four stubs), then PDL's 14 on top. A probe checks that each tree
+     imports its own mHC module, chained only in the PDL build. Pass: every digest equal across
+     builds, replays and rounds; the line per shape gives the time saved per layer.
    - dgx4 [bundles/pdl-mechanism](bundles/pdl-mechanism): the synthetic benchmark (a status
      bundle; its numbers are the result).
-2. [screen.json](screen.json): the determinism gate on [pdl-tp4.json](pdl-tp4.json) (candidate 6
-   with [overlay/](overlay) mounted), whose hashes must be candidate 6's (log probabilities
-   `3eab5112` / `db25fde3`, text `c9cf9dbe` / `c6bb4f4e`), with sampled and controls digests,
-   16/8/4 distinct streams and the startup lines; then `screen` and `single-stream` on
-   [pdl-tp4-dev.json](pdl-tp4-dev.json), candidate 6's dev arm, and the PDL arm again.
-3. [profile.json](profile.json): candidate 6 and the PDL arm under the torch profiler
-   ([prof-candidate6.json](prof-candidate6.json), [prof-pdl.json](prof-pdl.json)), greedy, sampled
+2. [screen.json](screen.json): the determinism gate on [base-tp4.json](base-tp4.json) and
+   [pdl-tp4.json](pdl-tp4.json), candidate 6's tp4-ring recipe on next-candidate without and with
+   PDL. The PDL arm's hashes must be the base arm's, and so must its sampled and controls digests
+   and its 16/8/4 distinct streams; the startup lines are recorded. Then `screen` and
+   `single-stream` on [pdl-tp4-dev.json](pdl-tp4-dev.json),
+   [base-tp4-dev.json](base-tp4-dev.json), and the PDL arm again. (Candidate 6's recipe passes
+   `--load-format b12x`, which next-candidate still accepts. Next-candidate no longer reads its
+   `VLLM_DS41_KERNEL_BACKEND`, as in retire-conditionals' arms.)
+3. [profile.json](profile.json): the base and PDL arms under the torch profiler
+   ([prof-base.json](prof-base.json), [prof-pdl.json](prof-pdl.json)), greedy, sampled
    and mixed-c8 windows ([profile_decode.py](profile_decode.py) with `--scenarios`). Then
    `critical_path.py results/private/determinism/pdl-profile/<label> --scenarios greedy,sampled,mixed-c8
    --window ...` on both. Under PDL a kernel's CTAs start before its predecessor ends, so its gap
@@ -352,14 +386,17 @@ least 0.5%, no suite row slower beyond the run's own repeat. The specs need this
 
 dgx4 alone, uncabled, image `spark-ds41f:19f2c20ed4d6-next-6` (`sha256:82b071b57485`), bundles
 run with `scripts/lab.py kernel-local BUNDLE --out DIR` from a checkout of this branch under
-`~/spark-lab/agents/bound-and-prototype-pdl/` (outputs in its `out/`). Serving, determinism
-and profile checks stay queued: they need the cluster.
+`~/spark-lab/agents/bound-and-prototype-pdl/` (outputs in its `out/`; the final head's in
+`out/1bc005688` and `out/2362f6f8`, 2026-10-26 01:56-02:09 CET). Serving, determinism and
+profile checks stay queued: they need the cluster.
 
 1. **Source check without a GPU** ([sources_cpu.py](sources_cpu.py),
    [sources_cpu.txt](sources_cpu.txt)), spark-ds41f 4de3d223 (vLLM `pdl` 352b07b52), the image
    run without `--gpus`: 64 chain-kernel calls at TP4 shapes lowered for sm_121 with each
    factory's pass configs. 62 wait first and trigger after, the two warp-specialized GEMMs have
-   no PDL, **0 violations**; 2 calls need a GPU to pick their arguments. The decode MXFP8 GEMM's
+   no PDL, **0 violations**; 2 calls were skipped: the MoE SwiGLU needs a GPU to pick its
+   arguments, and the compress call was the script's own error (ratio 4, which the factory
+   rejects; found and fixed at the final head, item 5). The decode MXFP8 GEMM's
    generated code sets up its shared-memory pointers, then calls
    `cudaGridDependencySynchronize()` and `cudaTriggerProgrammaticLaunchCompletion()` before
    any load; its pointer parameters lose `__restrict__`, as TileLang does for a kernel that
@@ -440,22 +477,119 @@ and profile checks stay queued: they need the cluster.
      c8 (about 1.5 ms), so a 0.2-0.6% gain is below this benchmark's resolution. The serving
      screen measures c8 on real routes.
 
+### The final head: `pdl-next` on next-candidate 577091997
+
+vLLM `pdl-next` 1bc005688 (2026-10-26) is the five commits rebased onto next-candidate 577091997:
+
+| Commit | |
+| --- | --- |
+| 0ccbe30e5 | Programmatic dependent launch along the decode chain |
+| 3a0ac1afa | PDL: replay tests, a source check and two benchmarks |
+| b2bae34c9 | PDL tests: the captured graph's edges, and eager launches |
+| b3f659d9a | PDL source check: import `tilelang.jit.kernel` by name |
+| 1bc005688 | PDL: DeepSeek's TileKernels switch only for the chain's own calls |
+
+How the overlaps resolved:
+- **`metadata.py`:** next-candidate's `builder_kernel` (kernel-audit's requests and tokens in
+  one launch, prim_func `metadata_builder`) and live-page `pages_kernel`, with `pdl.chain()` at
+  the top of the builder, chunk, decode and pages kernels.
+- **`moe.py`:** `run` takes the tokens as `MXFP8Rows` from finalize, so PDL's token cast there
+  goes.
+- **`linear.py`:** `linear.cast_mxfp8` (the cast left for regrouped rows) goes through
+  `pdl.per_token_cast`. `linear._tile_kernels` had no caller left and is gone. The fold lands
+  in 1bc005688, the commit that scopes the switch.
+- **The layer-chain harness:** finalize's `yq`/`ysf`; Q-A/KV, the shared gate/up and the routed
+  experts read the entries' casts; 20 kernels.
+
+Two newer kernel paths were checked against the chain:
+- **0504's 64-row tiles (next-candidate 9ad4a1fdb):** `MoeExpertsV41Plan` builds the prefill
+  grouped GEMMs and SwiGLU cast from the same factories as the decode ones, and the prefill
+  dispatch plan from the same dispatch factory. All begin with `pdl.chain()`. They are
+  prefill-only: calls above the decode rows.
+- **0507's re-index (577091997):** `indexer_score_v41` with `candidates=True` and the
+  candidate-block top-k. These are the same chained `indexer_score` and `indexer_topk_*`
+  prim_funcs, so they are chained wherever they run.
+
+Apart from `metadata_builder` replacing `metadata_requests` and `metadata_tokens`, 577091997's
+DS4.1 model tree has the same prim_funcs as 26382f5cf. The V2 runner's new `fill_kv_blocks`
+(the debug-only `VLLM_KV_CACHE_POISON` fill) is input preparation outside the model's graphs,
+unchained like the other input-preparation kernels.
+
+5. **The source check over the final kernel set** ([bundles/pdl-sources](bundles/pdl-sources),
+   kernel-local):
+   - 3a3792c2 ([runs/sources-3a3792c2.txt](runs/sources-3a3792c2.txt), 62 s): 83 calls, 81
+     waiting first and triggering after, the two warp-specialized GEMMs without PDL, 0
+     violations. The compress call was skipped again. That was the script's error (ratio 4;
+     the factory takes 1 or 2), not a GPU need, so the static check had never covered the
+     compress kernel; the kernel tests' launches had, through the plugin.
+   - Fixed in 2362f6f8: both ratios are lowered, and a call that fails to lower fails the run.
+     **2362f6f8 ([runs/sources-2362f6f8.txt](runs/sources-2362f6f8.txt), 74 s, pass): 85 calls,
+     83 with PDL, 0 violations, none unlowered.** The metadata builder (plain and circular),
+     the pages kernel at pages of 64 and 256, the re-index and the 64-row dispatch are among
+     them.
+6. **pdl-tests**, 3a3792c2 ([runs/tests-3a3792c2.txt](runs/tests-3a3792c2.txt), 211 s, pass):
+   - PDL tests: 10 passed.
+   - The 11 modules' kernel tests on the PDL build: **530 passed**, 1 skipped
+     (compute-sanitizer is not in the image), 1 xfailed.
+   - **Source check: 0 violations** over 321 launched kernels, 242 of them with PDL.
+7. **pdl-mechanism**, 3a3792c2 ([runs/mechanism-3a3792c2.txt](runs/mechanism-3a3792c2.txt),
+   70 s, pass):
+   - `chain()` saves 0.19-0.37 us a boundary, as in the first run, and the fork/join 0.34 us.
+   - The traced c1 layer takes 510.5 us plain and 506.7 us chained: 3.85 us, 0.75% (7.17 us,
+     1.42% in the first run). It is a synthetic benchmark of spins, independent of the vLLM
+     build, so the two runs bound its run-to-run spread.
+8. **pdl-chain:** next-candidate's build against `pdl-next`, both over the image. The
+   20-kernel chain, four layers a graph, three rounds alternating, 50 replays each. Two runs:
+   3a3792c2 ([runs/chain-3a3792c2.txt](runs/chain-3a3792c2.txt), 96 s) and 2362f6f8
+   ([runs/chain-2362f6f8.txt](runs/chain-2362f6f8.txt), 94 s), both pass.
+   - **Bits: identical** in both runs: every written buffer's digest, the entries' MXFP8 casts
+     included, across builds, rounds and replays at all three shapes, and every replay equals
+     its eager run. The probes confirmed that each tree imports its own `mhc.py`, chained only
+     in the PDL build.
+   - Time per layer (median of rounds; base - PDL per round, warm):
+
+     | Rows | run | warm, base / PDL | saved | cold, base / PDL | saved | per round (warm) |
+     | ---: | --- | ---: | ---: | ---: | ---: | --- |
+     | 6 (c1) | 1 | 958.9 / 952.5 us | **6.4 us, 0.67%** | 953.6 / 944.4 us | **9.2 us, 0.97%** | +1.2, +9.0, +21.5 |
+     | 6 (c1) | 2 | 955.8 / 943.3 us | **12.5 us, 1.31%** | 948.9 / 938.3 us | **10.6 us, 1.12%** | +11.2, +10.2, +12.5 |
+     | 24 | 1 | 2632.1 / 2619.8 us | 0.47% | 2628.8 / 2616.4 us | 0.47% | +12.4, +23.0, +12.9 |
+     | 24 | 2 | 2619.4 / 2619.8 us | -0.01% | 2616.2 / 2618.2 us | -0.08% | -3.9, -3.1, +2.2 |
+     | 48 | 1 | 3947.7 / 3966.5 us | **-0.48%** | 3945.3 / 3965.2 us | -0.50% | +4.4, -6.4, -27.8 |
+     | 48 | 2 | 3948.2 / 3963.0 us | **-0.37%** | 3947.5 / 3961.1 us | -0.34% | +11.4, -12.9, -31.9 |
+
+   - **c1: PDL is faster in every round of both runs, 0.67-1.31% warm and 0.97-1.12% cold.**
+     That is 6-12 us a layer, about the mechanism's estimate (20 boundaries at 0.29 us). The
+     chain on 26382f5cf saved 17 us over 23 kernels. Next-candidate's finalize cast removed
+     three of the boundaries PDL would have shortened.
+   - 24 rows: within noise (+0.47%, then -0.01%).
+   - **48 rows: PDL trends slower.** The median is -0.37% to -0.48% in both runs, PDL is slower
+     in 4 of 6 rounds, and the chain on 26382f5cf gave -0.23%. Per round the spread is 40 us,
+     so a 15 us effect is at this benchmark's resolution. But the sign holds across three runs,
+     so it is recorded as a finding, not as noise.
+     - The likely mechanism (not yet tested): a chained kernel's CTAs launch early and hold SM
+       slots while they wait. At 48 rows the routed experts' long kernels run beside the shared
+       expert's kernels on the aux stream, which then get fewer SMs.
+     - The discriminating check: the same A/B with the shared expert inline (no aux stream).
+       The regression should vanish if this is the cause.
+     - The serving screen's c8 and c16 rows measure it on real routes.
+
 The cluster checks stay queued as [screen.json](screen.json) and [profile.json](profile.json).
 
 ## Interactions with the other sessions
 
 - **kernel-audit** (vLLM `kernel-audit`): it merges `metadata_requests` and `metadata_tokens`
   into one launch, the largest eager boundaries here (136 us a c1 step, 0.40%), and moves the mHC
-  entry's fn tile loads. Its `mhc.py` and `metadata.py` edits and this branch's one-line
-  `pdl.chain()` insertions touch the same kernels: a textual merge, and its merged metadata
-  kernel needs `pdl.chain()` too. Every kernel it removes takes a PDL boundary with it.
+  entry's fn tile loads. Every kernel it removes takes a PDL boundary with it. On next-candidate
+  its merged `metadata_builder` begins with `pdl.chain()` (`pdl-next`, resolved in 0ccbe30e5),
+  like its live-page `metadata_pages`.
 - **moe-overlap** (vLLM `moe-overlap`): its GB10 probe settles the cache-priority question for
   the windows. Evict-last prefetched lines survive the GEMMs between a fill and its consumer
   at set-aside 0; the set-aside adds nothing; routed evict-first is dropped. That makes split
   fills (at most 1.5% at c1, above) possible without a set-aside; the windows' lateness sizes
-  the pool (77-87% of instances late by a median 27-48 us, 4.67% of the step). The act-quant fold into `mhc_finalize` removes the cast between finalize
-  and the projections (two boundaries become one, about 0.5 us a sublayer saved by either); the
-  new finalize keeps `pdl.chain()`.
+  the pool (77-87% of instances late by a median 27-48 us, 4.67% of the step). The act-quant fold into `mhc_finalize` (next-candidate a7ba079c7)
+  removes the casts between finalize and the projections it feeds (two boundaries become one,
+  about 0.5 us a sublayer saved by either); its finalize keeps `pdl.chain()`, and the cast left
+  for regrouped rows (`linear.cast_mxfp8`) goes through `pdl.per_token_cast`.
 - **fusion-survey**: its "PDL across the decode graphs" ceiling (1.9 / 2.4 / 1.1%) counted gaps up
   to 1.5 us inside the layers plus `min(predecessor, GEMM)` for weight GEMMs. Measured on the
   critical path the boundary gaps alone are 3.7 / 4.8 / 1.7% (half of them over 1 us), and the
@@ -463,6 +597,10 @@ The cluster checks stay queued as [screen.json](screen.json) and [profile.json](
   boundary also removes that boundary's PDL gain: the ceilings overlap.
 
 ## Follow-ups (not built)
+
+- The 48-row chain's 0.4% slowdown: the same A/B with the shared expert inline. If the
+  slowdown goes away, waiting CTAs are taking SMs from the aux stream. One kernel-local
+  bundle on dgx4.
 
 - sparknet's one-shot all-reduce and all-gather kernels with `T.pdl_sync()` first (57 us a c1
   step, 0.17%): a sparknet change, released and pinned on its own.
@@ -478,10 +616,12 @@ The cluster checks stay queued as [screen.json](screen.json) and [profile.json](
 - [prefetch_windows.py](prefetch_windows.py), [prefetch_windows.json](prefetch_windows.json):
   the L2 prefetch windows on the critical path.
 - [make_bundles.py](make_bundles.py), [run_steps.py](run_steps.py),
-  [pdl_chain_ab.py](pdl_chain_ab.py), [bundles/](bundles), [overlay/](overlay): the bundles and
-  the serving overlay, generated from vLLM `pdl`.
+  [pdl_chain_ab.py](pdl_chain_ab.py), [sources_cpu.py](sources_cpu.py), [bundles/](bundles),
+  [overlay/](overlay), [overlay-base/](overlay-base): the bundles and the builds' files,
+  generated from vLLM `pdl-next` and next-candidate.
 - [pdl-tp4.json](pdl-tp4.json), [pdl-tp4-dev.json](pdl-tp4-dev.json),
-  [prof-candidate6.json](prof-candidate6.json), [prof-pdl.json](prof-pdl.json): arms.
+  [base-tp4.json](base-tp4.json), [base-tp4-dev.json](base-tp4-dev.json),
+  [prof-base.json](prof-base.json), [prof-pdl.json](prof-pdl.json): arms.
 - [kernel.json](kernel.json), [screen.json](screen.json), [profile.json](profile.json): specs.
 - [profile_decode.py](profile_decode.py), [summarize_kernels.py](summarize_kernels.py),
   [analyze_costs.py](analyze_costs.py): request-inventory's profiling scripts (the first with
