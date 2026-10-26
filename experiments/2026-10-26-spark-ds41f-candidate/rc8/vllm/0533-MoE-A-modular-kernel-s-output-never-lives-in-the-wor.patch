@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:59:43 +0100
+Subject: [PATCH 533/533] [MoE] A modular kernel's output never lives in the
+ workspace arena
+
+The layer's output outlives the call, while the arena's views are valid
+only until the next lease. With a prepared (routed/shared) workspace the
+output was workspace[2]; at TP1, where no all-reduce copies it, DeepSeek
+V4.1's next mHC entry leased its scratch from the same bytes and overwrote
+the routed output while reading it: NaN gate logits once a batch held three
+or more requests (silently wrong rows below that).
+---
+ .../moe/test_moe_output_outlives_workspace.py | 62 +++++++++++++++++++
+ .../layers/fused_moe/modular_kernel.py        | 11 ++--
+ 2 files changed, 68 insertions(+), 5 deletions(-)
+ create mode 100644 tests/kernels/moe/test_moe_output_outlives_workspace.py
+
+diff --git a/tests/kernels/moe/test_moe_output_outlives_workspace.py b/tests/kernels/moe/test_moe_output_outlives_workspace.py
+new file mode 100644
+index 000000000..eb771598d
+--- /dev/null
++++ b/tests/kernels/moe/test_moe_output_outlives_workspace.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A modular MoE kernel's output outlives the call, so it never lives in the
++workspace arena it was handed: the arena's views are reused by the next lease.
++
++DeepSeek V4.1 at TP1 (no all-reduce to copy the output) returned the routed
++experts' output from ``workspace[2]``; the next decoder layer's mHC entry leased its
++scratch from the same bytes and overwrote that output while reading it (NaN gate
++logits with three or more requests in a batch).
++"""
++
++from types import SimpleNamespace
++
++import torch
++
++from vllm.model_executor.layers.fused_moe import modular_kernel as mk
++
++
++def _impl():
++    impl = object.__new__(mk.FusedMoEKernelModularImpl)
++    impl.fused_experts = SimpleNamespace(output_dtype=torch.bfloat16)
++
++    def prepare(hidden, weights, ids, *rest):
++        return hidden, None, None, ids, weights
++
++    impl._prepare = prepare
++
++    def fused_experts(*, output_alias, **kwargs):
++        # The experts write the caller's output directly, as the aliasing path does.
++        output_alias.fill_(1.0)
++        return output_alias
++
++    impl._fused_experts = fused_experts
++    impl._finalize = lambda output, fused_out, *rest, **kwargs: output
++    return impl
++
++
++def test_output_is_not_a_workspace_view():
++    rows, hidden = 6, 64
++    states = torch.randn(rows, hidden, dtype=torch.bfloat16)
++    size = rows * hidden * 2
++    arena = torch.zeros(2 * size, dtype=torch.uint8)
++    fused_out = arena[size:].view(torch.bfloat16).view(rows, hidden)
++    workspace = (
++        arena[:0].view(torch.bfloat16),
++        arena[:size].view(torch.bfloat16),
++        fused_out,
++    )
++    out = _impl().apply(
++        states,
++        torch.empty(4, 1),
++        torch.empty(4, 1),
++        torch.zeros(rows, 2, dtype=torch.int64),
++        torch.ones(rows, 2),
++        workspace=workspace,
++    )
++    assert out.shape == states.shape and bool((out == 1).all())
++    low, high = arena.data_ptr(), arena.data_ptr() + arena.numel()
++    assert not low <= out.data_ptr() < high
++    # A later lease of the arena leaves the output as it was.
++    arena.fill_(0xFF)
++    assert bool((out == 1).all())
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 00fe916b4..5fbc781dc 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1510,11 +1510,12 @@ class FusedMoEKernelModularImpl:
+         Returns:
+         - torch.Tensor: The output tensor after applying the MoE layer.
+         """
+-        output = (
+-            workspace[2]
+-            if workspace is not None
+-            else torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
+-        )
++        # The layer's output outlives this call, so it never lives in the workspace
++        # arena: the arena's views are valid only until its next lease, and the next
++        # consumer leases scratch from the same bytes (at TP1, where no all-reduce
++        # copies the output, the next decoder layer's mHC entry overwrote it as it
++        # read it). The experts still write it directly (``output_alias``).
++        output = torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
+ 
+         local_num_experts = w1.shape[0]
+         if global_num_experts == -1:
