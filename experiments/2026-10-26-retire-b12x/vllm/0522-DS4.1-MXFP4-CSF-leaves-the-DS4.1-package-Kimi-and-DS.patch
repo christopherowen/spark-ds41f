@@ -1,0 +1,405 @@
+From 0b0ddfed391d1ff4504787c391b63e9975864b9f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:21:50 +0100
+Subject: [PATCH 522/526] [DS4.1] MXFP4-CSF leaves the DS4.1 package; Kimi and
+ DS4-Flash keep its experts
+
+vllm/models/deepseek_v4_1/mxfp4_csf.py held two things: the MXFP4-CSF
+routed-expert method (Mxfp4CsfMoEMethod, B12X's prepared fused MoE over
+losslessly compressed MXFP4 scales), which the Kimi-K3 and DeepSeek-V4-Flash
+CSF configurations also use, and DeepSeek-V4.1's CSF configuration. The
+recipe serves the native DS4.1 checkpoint, and DS4.1 runs TileLang kernels
+only, so its CSF configuration (B12X experts inside the TileLang model) is
+not served.
+
+- The method moves, unchanged, to vllm/model_executor/layers/quantization/
+  mxfp4_csf_moe.py; Kimi and DS4-Flash import it from there.
+- DeepseekV41Mxfp4CsfConfig goes; the mxfp4_csf dispatcher refuses a DS4.1
+  CSF checkpoint by name instead of building one.
+- The CSF reader keeps its DS4.1 family contract (loader-level, unchanged).
+
+Tests: the method's tests take DS4-Flash's CSF configuration as owner; the
+DS4.1 configuration's selection test goes (DS4-Flash's equivalent stays);
+the dispatcher selects Kimi and refuses DS4.1.
+---
+ tests/quantization/test_mxfp4_csf.py          | 110 ++++++------------
+ vllm/config/load.py                           |   4 +-
+ .../layers/quantization/kimi_mxfp4_csf.py     |   2 +-
+ .../layers/quantization/mxfp4_csf.py          |  11 +-
+ .../layers/quantization/mxfp4_csf_moe.py}     |  72 +-----------
+ vllm/models/deepseek_v4/mxfp4_csf.py          |   2 +-
+ 6 files changed, 48 insertions(+), 153 deletions(-)
+ rename vllm/{models/deepseek_v4_1/mxfp4_csf.py => model_executor/layers/quantization/mxfp4_csf_moe.py} (72%)
+
+diff --git a/tests/quantization/test_mxfp4_csf.py b/tests/quantization/test_mxfp4_csf.py
+index 473b8eea1..beaa23afa 100644
+--- a/tests/quantization/test_mxfp4_csf.py
++++ b/tests/quantization/test_mxfp4_csf.py
+@@ -18,14 +18,11 @@ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEParallelConfig,
+     RoutingMethodType,
+ )
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ from vllm.model_executor.model_loader.mxfp4_csf_loader import Mxfp4CsfModelLoader
+ from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+     _slice_scale_plane as slice_scale_plane,
+ )
+-from vllm.models.deepseek_v4_1.mxfp4_csf import (
+-    DeepseekV41Mxfp4CsfConfig,
+-    Mxfp4CsfMoEMethod,
+-)
+ 
+ from .csf_fixtures import decode_planes, matrix
+ 
+@@ -50,14 +47,13 @@ def moe():
+ 
+ @pytest.fixture
+ def owner():
+-    return DeepseekV41Mxfp4CsfConfig.from_config(
+-        {"format_version": 1, "checkpoint_root": "/csf"}
+-    )
++    from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+ 
++    return DeepseekV4Mxfp4CsfConfig.from_config(DS4_FLASH_SERVING)
+ 
+-def test_exact_config_keeps_native_dense_precision_and_empty_expert_handles(moe, owner):
+-    assert owner.is_scale_e8m0 and owner.weight_block_size == [32, 32]
+-    assert owner.is_checkpoint_fp8_serialized and owner.scale_scratch is None
++
++def test_csf_experts_have_empty_expert_handles(moe, owner):
++    assert owner.scale_scratch is None
+     method = Mxfp4CsfMoEMethod(moe, owner)
+     layer = torch.nn.Module()
+     layer.layer_name = "model.layers.17.ffn.experts"
+@@ -65,8 +61,6 @@ def test_exact_config_keeps_native_dense_precision_and_empty_expert_handles(moe,
+     assert not list(layer.named_parameters()) and not layer.state_dict()
+     assert method.layer_index == 17 and method.local_intermediate == 576
+     assert method.get_fused_moe_quant_config(layer).weight_quant_dtype == "mxfp4"
+-    with pytest.raises(ValueError, match="format_version"):
+-        DeepseekV41Mxfp4CsfConfig.from_config({})
+ 
+ 
+ def test_exact_config_and_loader_are_registered():
+@@ -83,12 +77,14 @@ def test_exact_config_and_loader_are_registered():
+ def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+     monkeypatch, moe, owner
+ ):
++    from vllm.model_executor.layers.quantization import mxfp4_csf_moe
+     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+     from vllm.utils.torch_utils import set_default_torch_num_threads
+ 
+-    monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_world_size", lambda: 4)
+-    monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr(
++        mxfp4_csf_moe, "get_tensor_model_parallel_world_size", lambda: 4
++    )
++    monkeypatch.setattr(mxfp4_csf_moe, "get_tensor_model_parallel_rank", lambda: 0)
+     method = Mxfp4CsfMoEMethod(moe, owner)
+     layer = torch.nn.Module()
+     layer.layer_name = "model.layers.17.ffn.experts"
+@@ -105,52 +101,6 @@ def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+         assert torch.get_num_threads() == 4
+ 
+ 
+-@pytest.mark.parametrize("mode", ["normal", "pipeline", "ubatching", "wrong_loader"])
+-@pytest.mark.parametrize("force_a16", [False, True])
+-def test_target_uses_csf_while_dense_and_draft_keep_native_methods(
+-    monkeypatch, moe, owner, mode, force_a16
+-):
+-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+-
+-    monkeypatch.setattr(mxfp4_csf.envs, "VLLM_B12X_MOE_FP4_FORCE_A16", force_a16)
+-
+-    config = SimpleNamespace(
+-        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=40)),
+-        parallel_config=SimpleNamespace(
+-            pipeline_parallel_size=2 if mode == "pipeline" else 1,
+-            use_ubatching=mode == "ubatching",
+-        ),
+-        load_config=SimpleNamespace(
+-            load_format="safetensors" if mode == "wrong_loader" else "mxfp4_csf"
+-        ),
+-    )
+-    monkeypatch.setattr(mxfp4_csf, "get_current_vllm_config", lambda: config)
+-    native = object()
+-    monkeypatch.setattr(
+-        mxfp4_csf.DeepseekV41FP8Config,
+-        "get_quant_method",
+-        lambda *args, **kwargs: native,
+-    )
+-    layer = Mock(spec=RoutedExperts)
+-    layer.moe_config = moe
+-    if mode == "normal":
+-        method = owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-        assert isinstance(method, Mxfp4CsfMoEMethod)
+-        assert method.activation_mode == ("a16" if force_a16 else "a8")
+-        assert method.get_fused_moe_quant_config(layer).quant_dtype == (
+-            None if force_a16 else "mxfp8"
+-        )
+-    elif mode == "wrong_loader":
+-        with pytest.raises(ValueError, match="load-format"):
+-            owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-    else:
+-        with pytest.raises(NotImplementedError, match="PP1 without ubatching"):
+-            owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-    assert owner.get_quant_method(layer, "model.layers.40.ffn.experts") is native
+-    assert owner.get_quant_method(torch.nn.Module(), "model.layers.0.attn") is native
+-
+-
+ @pytest.mark.parametrize(
+     "field,value", [("dp_size", 2), ("use_ep", True), ("enable_eplb", True)]
+ )
+@@ -340,9 +290,8 @@ def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
+     assert torch.equal(result[dense], tensors[dense])
+ 
+ 
+-@pytest.mark.parametrize("family", ["kimi_k3", "deepseek_v41"])
+ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+-    monkeypatch, moe, family
++    monkeypatch, moe
+ ):
+     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+@@ -352,9 +301,10 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+     )
+     from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+ 
+-    monkeypatch.setattr(checkpoint, "checkpoint_contract", lambda _: {"family": family})
++    monkeypatch.setattr(
++        checkpoint, "checkpoint_contract", lambda _: {"family": "kimi_k3"}
++    )
+     owner = get_quantization_config("mxfp4_csf").from_config(
+         {"format_version": 1, "checkpoint_root": "/compressed-scales"}
+     )
+@@ -363,23 +313,17 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+         load_config=SimpleNamespace(load_format="mxfp4_csf"),
+     )
+-    for module in (kimi_mxfp4_csf, mxfp4_csf):
+-        monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(kimi_mxfp4_csf, "get_current_vllm_config", lambda: config)
+     layer = Mock(spec=RoutedExperts)
+     layer.moe_config = moe
+     assert owner.get_name() == "mxfp4_csf"
+     assert isinstance(
+         owner.get_quant_method(layer, "model.layers.3.mlp.experts"), Mxfp4CsfMoEMethod
+     )
+-    if family == "deepseek_v41":
+-        assert owner.is_checkpoint_fp8_serialized
+-        assert owner.weight_block_size == [32, 32] and owner.is_scale_e8m0
+-        assert isinstance(owner, DeepseekV41Mxfp4CsfConfig)
+-    else:
+-        assert isinstance(
+-            owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
+-            UnquantizedLinearMethod,
+-        )
++    assert isinstance(
++        owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
++        UnquantizedLinearMethod,
++    )
+     assert (
+         Mxfp4CsfConfig.override_quantization_method(
+             {"quant_method": "mxfp4_csf"}, "mxfp4_csf"
+@@ -793,6 +737,20 @@ def test_reader_admits_tp3_for_deepseek_v41_only(
+         )
+ 
+ 
++def test_mxfp4_csf_refuses_deepseek_v41_checkpoints(monkeypatch):
++    # DeepSeek-V4.1 runs TileLang kernels only; the CSF experts are B12X's.
++    from vllm.model_executor.layers.quantization import get_quantization_config
++    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
++
++    monkeypatch.setattr(
++        checkpoint, "checkpoint_contract", lambda _: {"family": "deepseek_v41"}
++    )
++    with pytest.raises(ValueError, match="TileLang"):
++        get_quantization_config("mxfp4_csf").from_config(
++            {"format_version": 1, "checkpoint_root": "/compressed-scales"}
++        )
++
++
+ def test_mxfp4_csf_dispatches_ds4_flash_with_source_dense_config(monkeypatch):
+     from vllm.model_executor.layers.quantization import get_quantization_config
+     from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index 2e3db8acc..d950fea95 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -41,8 +41,8 @@ class LoadConfig:
+       registered host ring straight into CUDA tensors, without the page cache.
+       It needs a GPU that reads pageable memory through the host page tables,
+       such as GB10.
+-    - "mxfp4_csf" reads losslessly compressed Kimi/DS4.1/DS4-Flash
+-      MXFP4 expert scales and retains file-backed loading for Engram tables.
++    - "mxfp4_csf" reads losslessly compressed Kimi/DS4-Flash MXFP4 expert
++      scales and retains file-backed loading for Engram tables.
+     - "instanttensor" will load the Safetensors weights on CUDA devices using
+       InstantTensor, which enables distributed loading with pipelined prefetching
+       and fast direct I/O.
+diff --git a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+index f9ffbe7db..6428f8fc9 100644
+--- a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+@@ -7,7 +7,7 @@ import torch
+ from vllm.config import get_current_vllm_config
+ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+-from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ 
+ 
+ class KimiMxfp4CsfConfig(Mxfp4Config):
+diff --git a/vllm/model_executor/layers/quantization/mxfp4_csf.py b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+index de0306934..380d5c74c 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+@@ -2,13 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """MXFP4 lossless scale compression with model-specific retained precision."""
+ 
+-from vllm.models.deepseek_v4_1.mxfp4_csf import DeepseekV41Mxfp4CsfConfig
+-
+ from .kimi_mxfp4_csf import KimiMxfp4CsfConfig
+ 
+ 
+ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+-    """Select Kimi, DeepSeek-V4.1 or DeepSeek-V4 dense precision by family."""
++    """Select Kimi or DeepSeek-V4 dense precision by family."""
+ 
+     @classmethod
+     def get_name(cls):
+@@ -31,7 +29,12 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+             raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+         family = checkpoint_contract(config["checkpoint_root"])["family"]
+         if family == "deepseek_v41":
+-            return DeepseekV41Mxfp4CsfConfig.from_config(config)
++            # The CSF experts run B12X's fused MoE; DeepSeek-V4.1 runs TileLang's
++            # kernels only.
++            raise ValueError(
++                "MXFP4-CSF DeepSeek-V4.1 checkpoints are not served: DeepSeek-V4.1 "
++                "runs TileLang kernels only; serve the native checkpoint"
++            )
+         if family == "deepseek_v4_flash":
+             # Deferred: the DeepSeek-V4 package imports its platform model.
+             from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+diff --git a/vllm/models/deepseek_v4_1/mxfp4_csf.py b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+similarity index 72%
+rename from vllm/models/deepseek_v4_1/mxfp4_csf.py
+rename to vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+index 32ea19c7e..def60994d 100644
+--- a/vllm/models/deepseek_v4_1/mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+@@ -1,12 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Losslessly compressed DS4.1 routed experts with native dense tensors."""
++"""Routed experts with losslessly compressed MXFP4 scales (MXFP4-CSF), on B12X's
++prepared fused MoE. The Kimi-K3 and DeepSeek-V4-Flash MXFP4-CSF configurations
++select it for their target models' routed experts."""
+ 
+ import regex as re
+ import torch
+ 
+-import vllm.envs as envs
+-from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+@@ -25,77 +25,11 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+     MoEPrepareAndFinalizeNoDPEPModular,
+ )
+-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.utils.torch_utils import set_default_torch_num_threads
+ 
+-from .quant_config import DeepseekV41FP8Config
+-
+ logger = init_logger(__name__)
+ 
+ 
+-class DeepseekV41Mxfp4CsfConfig(DeepseekV41FP8Config):
+-    """MXFP4-CSF main experts; unchanged native dense, shared and draft weights."""
+-
+-    checkpoint_root: str
+-    scale_scratch: tuple[torch.Tensor, ...] | None
+-
+-    @classmethod
+-    def get_name(cls):
+-        return "mxfp4_csf"
+-
+-    @classmethod
+-    def get_min_capability(cls):
+-        return 120
+-
+-    @classmethod
+-    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+-        if (
+-            user_quant in (None, cls.get_name())
+-            and hf_quant_cfg is not None
+-            and hf_quant_cfg.get("quant_method") == cls.get_name()
+-            and getattr(hf_config, "model_type", None)
+-            in ("deepseek_v41", "deepseek_v41_text")
+-        ):
+-            return cls.get_name()
+-        return None
+-
+-    @classmethod
+-    def from_config(cls, config):
+-        if config.get("format_version") != 1 or not config.get("checkpoint_root"):
+-            raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+-        result = cls(
+-            is_checkpoint_fp8_serialized=True,
+-            activation_scheme="dynamic",
+-            weight_block_size=[32, 32],
+-        )
+-        result.checkpoint_root = config["checkpoint_root"]
+-        result.scale_scratch = None
+-        return result
+-
+-    def get_quant_method(self, layer, prefix):
+-        if isinstance(layer, RoutedExperts):
+-            match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+-            if match is None:
+-                raise ValueError("DS4.1 routed experts require a numbered layer")
+-            config = get_current_vllm_config()
+-            if int(match.group(1)) < config.model_config.hf_config.num_hidden_layers:
+-                if (
+-                    config.parallel_config.pipeline_parallel_size != 1
+-                    or config.parallel_config.use_ubatching
+-                ):
+-                    raise NotImplementedError(
+-                        "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
+-                    )
+-                if config.load_config.load_format not in ("mxfp4_csf",):
+-                    raise ValueError("MXFP4-CSF requires --load-format mxfp4_csf ")
+-                return Mxfp4CsfMoEMethod(
+-                    layer.moe_config,
+-                    self,
+-                    activation_mode="a16" if envs.VLLM_B12X_MOE_FP4_FORCE_A16 else "a8",
+-                )
+-        return super().get_quant_method(layer, prefix)
+-
+-
+ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
+     """Expand scales for routed experts into serialized, model-owned scratch."""
+ 
+diff --git a/vllm/models/deepseek_v4/mxfp4_csf.py b/vllm/models/deepseek_v4/mxfp4_csf.py
+index d1f121df8..ab88c5917 100644
+--- a/vllm/models/deepseek_v4/mxfp4_csf.py
++++ b/vllm/models/deepseek_v4/mxfp4_csf.py
+@@ -15,7 +15,7 @@ import torch
+ import vllm.envs as envs
+ from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+-from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

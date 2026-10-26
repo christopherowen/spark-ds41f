@@ -1,0 +1,147 @@
+From ea60f8afeaf8021407df7c415f2ef10a28bc4fb3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:27:08 +0100
+Subject: [PATCH 526/526] Tests: B12X's own preparation tests skip without B12X
+
+Fifteen tests of the B12X preparation driver and coordinator (progress
+aggregation, tuning shards, winner artifacts, tuning caches, the declaration
+dump, collective profiling) build B12X's own preparation objects. They now
+skip, as vLLM's other B12X tests do, when the b12x package is not
+installed. The driver's and coordinator's other tests, which a deployment
+without B12X still runs (no units, the control exchanges), are unchanged.
+---
+ tests/model_executor/test_b12x_warmup.py |  2 ++
+ tests/v1/executor/test_b12x_startup.py   | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
+index b432d5b80..07e7eba79 100644
+--- a/tests/model_executor/test_b12x_warmup.py
++++ b/tests/model_executor/test_b12x_warmup.py
+@@ -642,6 +642,7 @@ def test_blockscaled_holder_declares_provided_workspace_under_the_cap(
+ def test_profile_prepares_collectives_and_releases_only_fresh_plans(
+     monkeypatch, fail
+ ) -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import CollectiveRequirement
+ 
+     from vllm.distributed import parallel_state
+@@ -860,6 +861,7 @@ def test_provider_attachment_never_registers_a_child_module() -> None:
+ def test_declaration_dump_flattens_metadata_and_never_raises(
+     tmp_path, monkeypatch
+ ) -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import FrozenMapping
+ 
+     path = tmp_path / "queries.jsonl"
+diff --git a/tests/v1/executor/test_b12x_startup.py b/tests/v1/executor/test_b12x_startup.py
+index 493f6339e..cd8222fc6 100644
+--- a/tests/v1/executor/test_b12x_startup.py
++++ b/tests/v1/executor/test_b12x_startup.py
+@@ -191,6 +191,7 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
+ def test_progress_aggregates_work_totals_and_preserves_rank_local_batch_counts() -> (
+     None
+ ):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     outcomes = [
+@@ -238,6 +239,7 @@ def test_progress_aggregates_work_totals_and_preserves_rank_local_batch_counts()
+ 
+ 
+ def test_progress_does_not_finish_until_every_rank_finishes() -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     ready = PreparationProgress(False, False, (), True, phase="ready")
+@@ -253,6 +255,7 @@ def test_progress_does_not_finish_until_every_rank_finishes() -> None:
+ 
+ 
+ def test_progress_does_not_sum_replicated_fixed_candidate_count() -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     fixed = PreparationProgress(
+@@ -382,6 +385,7 @@ def test_abort_closes_active_job_once() -> None:
+ 
+ @pytest.mark.parametrize("variant", ("batched", "varlen"))
+ def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
++    pytest.importorskip("b12x")
+     import torch
+     from b12x.attention import varlen
+     from b12x.preparation.session import PreparationJob
+@@ -554,6 +558,7 @@ def test_winner_artifacts_arrive_before_installation_without_retuning(
+ ):
+     from dataclasses import replace
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     from vllm.v1.worker import b12x_artifacts
+@@ -617,6 +622,7 @@ def test_winner_artifacts_arrive_before_installation_without_retuning(
+ 
+ @pytest.mark.parametrize("failure", ("missing", "corrupt", "stalled"))
+ def test_winner_transfer_failure_leaves_a_local_compile_miss(tmp_path, failure):
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
+@@ -650,6 +656,7 @@ def test_transferred_pair_is_verified_before_publication(tmp_path):
+     import fcntl
+     import shutil
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     sender = CuTeArtifactCache(tmp_path / "sender")
+@@ -673,6 +680,7 @@ def test_transferred_pair_is_verified_before_publication(tmp_path):
+ 
+ @pytest.mark.parametrize("all_rejected", (False, True))
+ def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_rejected):
++    pytest.importorskip("b12x")
+     from b12x.preparation import TuningRequirement
+ 
+     progress = [_tuning_progress(rank, keys=("query",)) for rank in (0, 1)]
+@@ -710,6 +718,7 @@ def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_reje
+ 
+ @pytest.mark.parametrize("cancel", (False, True))
+ def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress, TuningCacheRequirement
+ 
+     caches = tuple(
+@@ -736,6 +745,7 @@ def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
+ 
+ 
+ def test_missing_cache_participant_fails_all_ranks_without_hanging():
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress, TuningCacheRequirement
+ 
+     cache = TuningCacheRequirement((0, 1), {}, {})
+@@ -845,6 +855,7 @@ def test_executor_runs_worker_on_calling_thread_and_cancels_without_step_rpcs():
+ def test_candidate_progress_waits_for_every_expected_rank_to_finish_planning():
+     from dataclasses import replace
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     known = PreparationProgress(
+@@ -870,6 +881,7 @@ def test_candidate_progress_waits_for_every_expected_rank_to_finish_planning():
+ 
+ @pytest.mark.parametrize("measured", [(3900, 3725, 3725, 3725), (11901,) * 4])
+ def test_four_rank_candidate_fraction_uses_the_same_scope_for_both_counts(measured):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     outcomes = [
+@@ -948,6 +960,7 @@ def test_cancel_drains_pending_winners_then_orders_collective_warmup():
+ def test_heuristic_warmup_is_local_on_each_rank(tmp_path, monkeypatch):
+     from dataclasses import dataclass
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation import (
+         CollectiveRequirement,
+         DetectedDevice,
+-- 
+2.54.0 (Apple Git-157)
+

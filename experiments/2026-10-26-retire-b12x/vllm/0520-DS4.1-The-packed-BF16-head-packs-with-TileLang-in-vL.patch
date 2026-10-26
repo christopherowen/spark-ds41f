@@ -1,0 +1,1074 @@
+From 6c05a5b01e644739b90e19123d2bb818f3ff592a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:21:23 +0100
+Subject: [PATCH 520/526] [DS4.1] The packed BF16 head packs with TileLang in
+ vLLM; B12X's packed projection goes
+
+The served DS4.1 head (VLLM_DS41_PACKED_BF16_LM_HEAD=1) is packed at load
+by B12X's packer (spark-ds41f's B12X patch 0012), the last B12X call the
+head needs: its projection is TileLang's already. The packer moves into
+vLLM (vllm/models/deepseek_v4_1/tilelang/vocab_pack.py) with the same
+format, window choice, exception order and refusal, so the packed tensors
+are B12X's byte for byte:
+
+- PackedBf16Weight, pack(weight, in_place=...), unpack and is_supported,
+  B12X's contract (is_supported: SM120/SM121 with TileLang).
+- Three TileLang passes for B12X's three Triton ones: the exponent
+  histogram (shared-memory counts, one global add a bin and block), the
+  per-row exception counts (a warp a row) and the row pack (a warp a row:
+  each 128-column group as four 32-column parts in column order, a warp
+  prefix sum placing a part's exceptions, every encoded value decoded and
+  compared with its source bits). The window choice, the row-offset
+  prefix sum, the 1,024-row staging block of the in-place pack and the
+  round-trip refusal are B12X's host code unchanged.
+
+The packed head is TileLang's only: ParallelLMHead refuses it unless the
+linear backend is tilelang, the logits processor's B12X packed branches go
+(B12X's packed projection existed only in that patch), and so does
+vllm.utils.b12x's accessor for it. The B12X BF16 vocabulary projection of
+other models stays.
+
+Tests: the TileLang vocabulary tests pack with vLLM's packer (they skipped
+without B12X before); B12X's packer tests, ported (every value class
+round-trips, exceptions in column order, the window rule and its tie,
+allocations, the in-place pack's one staging block, refusals); and B12X's
+packed-head integration test, ported to TileLang (ParallelLMHead's method
+packs in its own storage and the target and drafter processors project it,
+batch-invariant, on graph replay). The B12X packed-head test goes.
+---
+ .../test_deepseek_v41_tilelang_vocab.py       | 220 ++++++++++-
+ ...test_deepseek_v4_1_prepared_projections.py |  83 +----
+ .../model_executor/layers/logits_processor.py |  70 +---
+ .../layers/quantization/online/packed_bf16.py |  67 ++--
+ .../layers/vocab_parallel_embedding.py        |  16 +-
+ .../deepseek_v4_1/tilelang/vocab_pack.py      | 344 ++++++++++++++++++
+ vllm/utils/b12x.py                            |   5 -
+ 7 files changed, 606 insertions(+), 199 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/vocab_pack.py
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 65602b7e5..b31236bc5 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang vocabulary heads: the exact packed BF16 head and BF16
+-heads, against FP32 references, with logits independent of the batch."""
++"""DeepSeek-V4.1 TileLang vocabulary heads: the exact packed BF16 head (its packer and
++its projection) and BF16 heads, against FP32 references, with logits independent of
++the batch."""
+ 
+ from types import SimpleNamespace
+ 
+@@ -16,8 +17,8 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ pytest.importorskip("tilelang")
+-packed_format = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
+ 
++from vllm.models.deepseek_v4_1.tilelang import vocab_pack as packed_format  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
+     ROW_TILES,
+     packed_vocab_projection,
+@@ -32,6 +33,163 @@ DEVICE = "cuda"
+ SHAPES = [(1000, 512), (32320, 5120)]
+ 
+ 
++def _format_weight(rows, k, *, seed=0, infinities=False):
++    """Vocabulary-like weights plus the value classes the format must keep (B12X's
++    packer tests): zeros, subnormals, values far below and above the window, +-1,
++    infinities and a NaN, and rows with many out-of-window values."""
++    generator = torch.Generator(device=DEVICE).manual_seed(seed)
++    weight = torch.randn(rows, k, device=DEVICE, generator=generator) * 0.02
++    weight = weight.bfloat16()
++    bits = weight.view(torch.int16)
++    specials = [0x0000, -0x8000, 0x0001, -0x7FFF, 0x007F, 0x0080, 0x2000, 0x1000]
++    specials += [0x3F80, -0x4080, 0x4500]
++    if infinities:
++        specials += [0x7F7F, 0x7F80, -0x0080, 0x7FC0]
++    specials = torch.tensor(specials, dtype=torch.int16, device=DEVICE)
++    bits[3, : specials.numel()] = specials
++    bits[7, 64 : 64 + specials.numel()] = specials
++    bits[rows - 2, ::3] = 0x4100
++    bits[rows - 5, 1::4] = 0x2000
++    return weight
++
++
++def _bits(weight):
++    return weight.view(torch.int16)
++
++
++def test_pack_round_trips_every_bit():
++    weight = _format_weight(512, 640, infinities=True)
++    packed = packed_format.pack(weight)
++    assert packed.values.shape == (512, 960) and packed.values.dtype == torch.uint8
++    assert packed.exceptions > 300
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(weight))
++    offsets = packed.row_offsets.cpu()
++    assert offsets[0] == 0 and offsets[-1] == packed.exceptions
++    assert torch.all(offsets[1:] >= offsets[:-1])
++
++
++def test_pack_lists_each_rows_exceptions_in_column_order():
++    weight = _format_weight(300, 1024, seed=4, infinities=True)
++    packed = packed_format.pack(weight)
++    rows = packed.exception_rows[: packed.exceptions].cpu()
++    entries = packed.exception_entries[: packed.exceptions].cpu()
++    offsets = packed.row_offsets.cpu()
++    for row in range(weight.shape[0]):
++        start, end = int(offsets[row]), int(offsets[row + 1])
++        assert torch.all(rows[start:end] == row)
++        columns = entries[start:end] >> 16
++        assert torch.all(columns[1:] > columns[:-1]), row
++    # Every out-of-window value's slot holds +0: a code of 0 and a zero byte.
++    columns = (entries >> 16).long()
++    assert torch.all(packed.values[rows.long().cuda(), columns.cuda()] == 0)
++
++
++def test_pack_window_is_the_lowest_of_the_fullest():
++    # Exponents 112..126 hold every value but two: the window starts at 112.
++    exponents = torch.arange(-15, 0, device=DEVICE).repeat(64, 18)[:, :256]
++    weight = torch.ldexp(torch.ones(64, 256, device=DEVICE), exponents).bfloat16()
++    weight[0, 0], weight[1, 1] = 2.0**20, 2.0**-40
++    packed = packed_format.pack(weight)
++    assert packed.exponent_base == 112 and packed.exceptions == 2
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(weight))
++    # Only exponents 120 and 121 (and zeros, which take code 0): every window from
++    # 107 to 120 holds them all, and the lowest is taken.
++    tied = torch.where(exponents % 2 == 0, 2.0**-7, -(2.0**-6)).bfloat16()
++    tied[5, 9] = 0.0
++    packed = packed_format.pack(tied)
++    assert packed.exponent_base == 107 and packed.exceptions == 0
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(tied))
++
++
++def test_pack_allocates_only_its_result():
++    # Packing runs at load, beside the whole model: it must not need transient
++    # copies of the weight, which unified-memory GPUs do not hand back cleanly.
++    weight = _format_weight(4096, 5120, seed=11)
++    torch.cuda.synchronize()
++    torch.cuda.reset_peak_memory_stats()
++    before = torch.cuda.memory_allocated()
++    packed = packed_format.pack(weight)
++    torch.cuda.synchronize()
++    peak = torch.cuda.max_memory_allocated() - before
++    result = sum(
++        t.numel() * t.element_size()
++        for t in (
++            packed.values,
++            packed.exception_rows,
++            packed.exception_entries,
++            packed.row_offsets,
++        )
++    )
++    assert peak <= result + 64 * 1024, (peak, result)
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(weight))
++
++
++def test_pack_in_place_matches_and_allocates_one_staging_block():
++    # 2,500 rows: two full 1,024-row blocks and a partial one.
++    weight = _format_weight(2_500, 5_120, seed=13, infinities=True)
++    original = weight.clone()
++    expected = packed_format.pack(original.clone())
++    torch.cuda.synchronize()
++    torch.cuda.reset_peak_memory_stats()
++    before = torch.cuda.memory_allocated()
++    packed = packed_format.pack(weight, in_place=True)
++    torch.cuda.synchronize()
++    peak = torch.cuda.max_memory_allocated() - before
++    staging = 1_024 * (5_120 + 2_560)
++    small = sum(
++        t.numel() * t.element_size()
++        for t in (packed.exception_rows, packed.exception_entries, packed.row_offsets)
++    )
++    assert peak <= staging + small + 64 * 1024, (peak, staging, small)
++    assert packed.values.data_ptr() == weight.data_ptr()
++    assert packed.values.is_contiguous() and packed.values.shape == (2_500, 7_680)
++    assert packed.exponent_base == expected.exponent_base
++    assert packed.exceptions == expected.exceptions
++    for name in ("values", "exception_rows", "exception_entries", "row_offsets"):
++        assert torch.equal(getattr(packed, name), getattr(expected, name)), name
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(original))
++
++
++def test_pack_without_exceptions_and_rejects_bad_weights():
++    weight = torch.full((16, 128), 0.5, device=DEVICE, dtype=torch.bfloat16)
++    packed = packed_format.pack(weight)
++    assert packed.exceptions == 0 and packed.exception_rows.numel() == 1
++    assert torch.equal(packed_format.unpack(packed), weight)
++    with pytest.raises(ValueError):
++        packed_format.pack(torch.zeros((16, 96), device=DEVICE, dtype=torch.bfloat16))
++    with pytest.raises(TypeError):
++        packed_format.pack(torch.zeros((16, 128), device=DEVICE, dtype=torch.float16))
++    transposed = torch.zeros((128, 16), device=DEVICE, dtype=torch.bfloat16).t()
++    with pytest.raises(ValueError):
++        packed_format.pack(transposed)
++
++
++def test_pack_refuses_a_weight_that_does_not_round_trip(monkeypatch):
++    # The write pass counts the values whose decoded bits differ from the source;
++    # any count refuses the pack.
++    weight = _format_weight(64, 256, seed=2)
++    real = packed_format.pack_rows_kernel
++
++    def corrupting(k):
++        kernel = real(k)
++
++        def run(bits, values, offsets, rows, entries, mismatches, base, start):
++            kernel(bits, values, offsets, rows, entries, mismatches, base, start)
++            mismatches.add_(1)
++
++        return run
++
++    monkeypatch.setattr(packed_format, "pack_rows_kernel", corrupting)
++    with pytest.raises(ValueError, match="round-trip"):
++        packed_format.pack(weight)
++
++
++def test_is_supported_on_this_device():
++    assert packed_format.is_supported()
++    assert packed_format.is_supported(torch.device("cuda", 0))
++    assert not packed_format.is_supported("cpu")
++
++
+ def _head(n, k, seed):
+     """Head-like BF16 weights with values outside any exponent window, and zeros."""
+     generator = torch.Generator(device=DEVICE).manual_seed(seed)
+@@ -231,3 +389,59 @@ def test_logits_processor_projects_fp32_heads():
+     assert logits.dtype == torch.float32
+     expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
+     assert torch.equal(logits, expected)
++
++
++@torch.no_grad()
++def test_packed_lm_head_packs_in_its_storage_and_projects(
++    default_vllm_config, dist_init, monkeypatch
++):
++    """A packed BF16 LM head from load to logits: ParallelLMHead's packed method packs
++    the loaded head in its own storage, declares the TileLang projection, and the
++    shared target and drafter processors project it, close to the BF16 head, with a
++    token's logits the same bits in any batch and on graph replay."""
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
++    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++
++    monkeypatch.setattr(default_vllm_config.kernel_config, "linear_backend", "tilelang")
++    torch.manual_seed(412)
++    with torch.device(DEVICE):
++        head = ParallelLMHead(
++            32768, 5120, params_dtype=torch.bfloat16, lm_head_quantization="packed_bf16"
++        )
++    assert head.runtime_lm_head_quantization == "packed_bf16"
++    head.weight.normal_(std=0.02)
++    head.weight[5, :7] = torch.tensor(
++        [0.0, -0.0, 1e-30, 3.0, -2.5, 1e-7, 6e-39], dtype=torch.bfloat16
++    )
++    original = head.weight.detach().clone()
++    storage = head.weight.data_ptr()
++    head.quant_method.process_weights_after_loading(head)
++    assert head.weight.dtype == torch.uint8 and head.weight.shape == (32768, 7680)
++    assert head.weight.data_ptr() == storage
++    packed = head.quant_method.packed_weight(head)
++    assert packed.exceptions > 0
++    assert torch.equal(_bits(packed_format.unpack(packed)), _bits(original))
++    head.quant_method.declare_layer_kernels(head)
++    assert set(head.tilelang_vocab) == set(ROW_TILES)
++    target, draft = LogitsProcessor(32768), LogitsProcessor(32768)
++    for processor in (target, draft):
++        processor.prepare_b12x_vocab_projection(head)
++        assert not processor._tilelang_vocab_heads  # the packed method owns its kernels
++    source = (torch.randn(8, 5120, device=DEVICE) * 0.5).bfloat16()
++    first = target(head, source[:1])
++    for rows in (1, 7, 8):
++        for processor in (target, draft):
++            actual = processor(head, source[:rows])
++            assert _close_to_fp32(actual, source[:rows], original)
++            assert torch.equal(_bits(actual[:1]), _bits(first))
++    expected = draft(head, source).clone()
++    graph = torch.cuda.CUDAGraph()
++    try:
++        with torch.cuda.graph(graph):
++            actual = draft(head, source)
++        actual.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(_bits(actual), _bits(expected))
++    finally:
++        graph.reset()
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index 50fb1120b..0f3131a87 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""B12X logits heads (shared and Markov) prepared as DeepSeek V4.1 declares them."""
++"""B12X BF16 logits heads (shared and Markov) through the B12X preparation pass, as
++the B12X linear backend declares them. The packed BF16 head is TileLang's only
++(tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py)."""
+ 
+ import pytest
+ import torch
+@@ -102,82 +104,3 @@ def test_weights_collection_prepares_shared_and_markov_logits_heads(
+             torch.testing.assert_close(bias, expected_bias, rtol=0.008, atol=1e-4)
+         finally:
+             graph.reset()
+-
+-
+-@torch.no_grad()
+-def test_packed_shared_logits_head_is_exact_and_batch_invariant(
+-    default_vllm_config,
+-    dist_init,
+-    monkeypatch,
+-):
+-    from b12x.gemm import packed_bf16_vocab_projection as projection
+-    from b12x.preparation import PreparationSession
+-
+-    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+-    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+-    from vllm.utils.b12x import B12xWorkload
+-
+-    device = _device()
+-    monkeypatch.setattr(default_vllm_config.kernel_config, "linear_backend", "b12x")
+-    torch.manual_seed(412)
+-    target, draft = torch.nn.Module(), torch.nn.Module()
+-    with torch.device(device):
+-        target.lm_head = ParallelLMHead(
+-            32768, 5120, params_dtype=torch.bfloat16, lm_head_quantization="packed_bf16"
+-        )
+-    assert target.lm_head.runtime_lm_head_quantization == "packed_bf16"
+-    target.lm_head.weight.normal_(std=0.02)
+-    target.lm_head.weight[5, :7] = torch.tensor(
+-        [0.0, -0.0, 1e-30, 3.0, -2.5, 1e-7, 6e-39], dtype=torch.bfloat16
+-    )
+-    original = target.lm_head.weight.detach().clone()
+-    target.lm_head.quant_method.process_weights_after_loading(target.lm_head)
+-    assert target.lm_head.weight.dtype == torch.uint8
+-    assert target.lm_head.weight.shape == (32768, 7680)
+-    packed = target.lm_head.quant_method.packed_weight(target.lm_head)
+-    assert packed.exceptions > 0
+-    assert torch.equal(
+-        projection.unpack(packed).view(torch.int16), original.view(torch.int16)
+-    )
+-    target.logits_processor = LogitsProcessor(32768)
+-    draft.logits_processor = LogitsProcessor(32768)
+-    draft.lm_head = target.lm_head
+-    workload = B12xWorkload(
+-        stage="weights",
+-        token_counts=(1, 8),
+-        fixed_token_counts=(1,),
+-        output_dtype=torch.bfloat16,
+-        max_tokens=8,
+-        max_seqs=8,
+-        max_model_len=1048576,
+-    )
+-    seen = set()
+-    units = tuple(_units_from_modules(target, workload, seen=seen)) + tuple(
+-        _units_from_modules(draft, workload, seen=seen)
+-    )
+-    assert len(units) == 1 and units[0].stage == "weights"
+-    source = torch.randn(8, 5120, dtype=torch.bfloat16, device=device)
+-    processors = (target.logits_processor, draft.logits_processor)
+-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+-        session.prepare(tuple(request for unit in units for request in unit.requests))
+-        session.freeze()
+-        first = processors[0](target.lm_head, source[:1])
+-        for rows in (1, 7, 8):
+-            expected = torch.nn.functional.linear(source[:rows].float(), original.float())
+-            for processor in processors:
+-                actual = processor(target.lm_head, source[:rows])
+-                torch.testing.assert_close(actual.float(), expected, rtol=0.008, atol=2e-3)
+-                # A token's logits do not depend on what else is in the batch.
+-                assert torch.equal(actual[:1].view(torch.int16), first.view(torch.int16))
+-        expected = draft.logits_processor(target.lm_head, source).clone()
+-        graph = torch.cuda.CUDAGraph()
+-        try:
+-            with session.capture(), torch.cuda.graph(graph):
+-                actual = draft.logits_processor(target.lm_head, source)
+-            actual.fill_(float("nan"))
+-            graph.replay()
+-            torch.cuda.synchronize(device)
+-            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+-        finally:
+-            graph.reset()
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index fffff730f..857ae1a87 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -25,7 +25,6 @@ from vllm.utils.b12x import (
+     B12xPreparationUnit,
+     B12xWorkload,
+     get_b12x_bf16_vocab_projection,
+-    get_b12x_packed_bf16_vocab_projection,
+     set_b12x_preparation_provider,
+ )
+ from vllm.utils.flashinfer import has_flashinfer
+@@ -138,12 +137,6 @@ class LogitsProcessor(PluggableLayer):
+             and self._b12x_vocab_projection is not None
+             and self._b12x_vocab_projection.is_supported()
+         )
+-        self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
+-        self.use_b12x_packed_vocab_projection = bool(
+-            kernel_config.linear_backend == "b12x"
+-            and self._b12x_packed_vocab_projection is not None
+-            and self._b12x_packed_vocab_projection.is_supported()
+-        )
+         if lm_head is not None:
+             self.prepare_b12x_vocab_projection(lm_head)
+ 
+@@ -156,7 +149,7 @@ class LogitsProcessor(PluggableLayer):
+         With the TileLang backend, the first processor to register a BF16 head
+         fixes its logits dtype here and declares its kernels when the worker
+         prepares kernels (``declare_kernels``); a packed head's method declares
+-        the packed head's kernels.
++        the packed head's kernels (packed heads are TileLang's only).
+         """
+         if self.use_tilelang_vocab_projection:
+             if (
+@@ -167,14 +160,7 @@ class LogitsProcessor(PluggableLayer):
+                 lm_head.tilelang_vocab_dtype = self.head_dtype or lm_head.weight.dtype
+                 self._tilelang_vocab_heads.append(lm_head)
+             return
+-        if _is_packed_head(lm_head):
+-            if (
+-                not self.use_b12x_packed_vocab_projection
+-                or not hasattr(lm_head, "packed_bf16_exponent_base")
+-                or not lm_head.weight.is_cuda
+-            ):
+-                return
+-        elif not self.use_b12x_vocab_projection or not _is_plain_bf16_head(lm_head):
++        if not self.use_b12x_vocab_projection or not _is_plain_bf16_head(lm_head):
+             return
+         owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
+         if owner is not None:
+@@ -203,17 +189,6 @@ class LogitsProcessor(PluggableLayer):
+         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
+ 
+     def _declare_b12x_vocab_plan(self, head: VocabParallelEmbedding, rows: int):
+-        if _is_packed_head(head):
+-            packed = self._b12x_packed_vocab_projection
+-            assert packed is not None
+-            return packed.plan(
+-                packed.Caps(
+-                    device=head.weight.device,
+-                    max_tokens=rows,
+-                    in_features=head.packed_bf16_in_features,
+-                    out_features=int(head.weight.shape[0]),
+-                )
+-            )
+         projection = self._b12x_vocab_projection
+         assert head is not None and projection is not None
+         out_features, in_features = map(int, head.weight.shape)
+@@ -227,10 +202,7 @@ class LogitsProcessor(PluggableLayer):
+         )
+ 
+     def _b12x_vocab_call(self, head: VocabParallelEmbedding, rows: int):
+-        packed = _is_packed_head(head)
+-        in_features = (
+-            head.packed_bf16_in_features if packed else int(head.weight.shape[1])
+-        )
++        in_features = int(head.weight.shape[1])
+ 
+         def call(state):
+             from b12x.preparation import PreparedCall
+@@ -251,25 +223,6 @@ class LogitsProcessor(PluggableLayer):
+                 ).reshape_as(source)
+                 source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
+ 
+-            if packed:
+-                weight = head.quant_method.packed_weight(head)
+-                return PreparedCall(
+-                    run=lambda: state.run(
+-                        source,
+-                        weight.values,
+-                        weight.exception_rows,
+-                        weight.exception_entries,
+-                        weight.row_offsets,
+-                        weight.exponent_base,
+-                    ),
+-                    produce=produce,
+-                    owners=(
+-                        weight.values,
+-                        weight.exception_rows,
+-                        weight.exception_entries,
+-                        weight.row_offsets,
+-                    ),
+-                )
+             return PreparedCall(
+                 run=lambda: state.run(source, head.weight),
+                 produce=produce,
+@@ -402,23 +355,6 @@ class LogitsProcessor(PluggableLayer):
+                 flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                 logits = project_head(lm_head, flat)
+                 return logits.reshape(*hidden_states.shape[:-1], -1)
+-            if (
+-                _is_packed_head(lm_head)
+-                and self.use_b12x_packed_vocab_projection
+-                and embedding_bias is None
+-            ):
+-                # The packed head's bytes are its only copy of the weights.
+-                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+-                plan = self._b12x_vocab_plan_for(lm_head, int(flat.shape[0]))
+-                packed = self._b12x_packed_vocab_projection
+-                assert packed is not None
+-                binding = packed.bind(
+-                    plan,
+-                    source=flat,
+-                    weight=lm_head.quant_method.packed_weight(lm_head),
+-                )
+-                logits = packed.run(binding)
+-                return logits.reshape(*hidden_states.shape[:-1], -1)
+             if (
+                 self.use_b12x_vocab_projection
+                 and embedding_bias is None
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index 7157e4220..00c731d46 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -1,19 +1,21 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Vocabulary heads stored in B12X's exact 12-bit packed BF16 form.
++"""Vocabulary heads stored in an exact 12-bit packed BF16 form.
+ 
+ The checkpoint's BF16 head loads unchanged; after loading it is packed, in
+ its own storage, into one sign-and-mantissa byte plus a 4-bit exponent code
+ per value, with the rare out-of-window values kept exactly in a per-row
+-exception list. Packing
+-verifies that every bit round-trips and refuses otherwise, so the served head
+-is the checkpoint tensor in 75% of the bytes, not an approximation.
++exception list (``vllm.models.deepseek_v4_1.tilelang.vocab_pack``, B12X's
++format). Packing verifies that every bit round-trips and refuses otherwise,
++so the served head is the checkpoint tensor in 75% of the bytes, not an
++approximation.
+ 
+-The packed head runs only through the logits processor's vocabulary
+-projection, which reads the packed bytes directly: B12X's prepared projection,
+-or TileLang's with the TileLang linear backend.
++The packed head runs only through the logits processor's TileLang vocabulary
++projection, which reads the packed bytes directly.
+ """
+ 
++import importlib.util
++
+ import torch
+ from torch.nn import Parameter
+ 
+@@ -21,29 +23,25 @@ from vllm.config import get_current_vllm_config
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+-from vllm.utils.b12x import get_b12x_packed_bf16_vocab_projection
+ 
+ logger = init_logger(__name__)
+ 
+ 
+ def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
+-    projection = get_b12x_packed_bf16_vocab_projection()
++    if importlib.util.find_spec("tilelang") is None:
++        return False
++    from vllm.models.deepseek_v4_1.tilelang import vocab_pack
++
+     return (
+-        projection is not None
+-        and projection.is_supported()
++        vocab_pack.is_supported()
+         and params_dtype == torch.bfloat16
+-        and input_size % 128 == 0
++        and input_size % vocab_pack.GROUP == 0
+     )
+ 
+ 
+ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     """A BF16 LM head served from its exact 12-bit packed form."""
+ 
+-    def __init__(self) -> None:
+-        super().__init__()
+-        kernel_config = get_current_vllm_config().kernel_config
+-        self.tilelang = kernel_config.linear_backend == "tilelang"
+-
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+@@ -73,15 +71,15 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+-        projection = get_b12x_packed_bf16_vocab_projection()
+-        assert projection is not None
++        from vllm.models.deepseek_v4_1.tilelang.vocab_pack import pack
++
+         weight = layer.weight.data
+         in_features = int(weight.shape[1])
+         # In place: the packed rows take the first three quarters of the BF16
+         # head's own storage, so loading frees nothing the BF16 head would not.
+         # On GB10 freed memory stays charged to the process, so an extra
+         # allocation and free here would cost host memory for good.
+-        packed = projection.pack(weight, in_place=True)
++        packed = pack(weight, in_place=True)
+         del weight
+         replace_parameter(layer, "weight", packed.values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+@@ -91,14 +89,13 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         layer.packed_bf16_exponent_base = packed.exponent_base
+         layer.packed_bf16_exceptions = packed.exceptions
+         layer._already_called_process_weights_after_loading = True
+-        if self.tilelang:
+-            # The model's head dtype: FP32 logits as DeepSeek's reference head, or
+-            # the model dtype. The projection is declared with it when the worker
+-            # prepares kernels (declare_layer_kernels).
+-            model_config = get_current_vllm_config().model_config
+-            layer.tilelang_vocab_dtype = (
+-                model_config.head_dtype if model_config else torch.bfloat16
+-            )
++        # The model's head dtype: FP32 logits as DeepSeek's reference head, or
++        # the model dtype. The projection is declared with it when the worker
++        # prepares kernels (declare_layer_kernels).
++        model_config = get_current_vllm_config().model_config
++        layer.tilelang_vocab_dtype = (
++            model_config.head_dtype if model_config else torch.bfloat16
++        )
+         logger.info_once(
+             "Packed the BF16 LM head exactly into 12 bits per weight: "
+             "exponents %d..%d, %d out-of-window values kept exactly per shard.",
+@@ -108,9 +105,9 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         )
+ 
+     def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
+-        """With the TileLang backend, declare the packed head's projection: once the
+-        head is packed, since its kernels depend on the exponent base packing found."""
+-        if not self.tilelang or not hasattr(layer, "packed_bf16_exponent_base"):
++        """Declare the packed head's TileLang projection: once the head is packed,
++        since its kernels depend on the exponent base packing found."""
++        if not hasattr(layer, "packed_bf16_exponent_base"):
+             return
+         from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
+ 
+@@ -119,9 +116,9 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     @staticmethod
+     def packed_weight(layer: torch.nn.Module):
+         """The layer's current packed tensors (after any relocation)."""
+-        projection = get_b12x_packed_bf16_vocab_projection()
+-        assert projection is not None
+-        return projection.PackedBf16Weight(
++        from vllm.models.deepseek_v4_1.tilelang.vocab_pack import PackedBf16Weight
++
++        return PackedBf16Weight(
+             layer.weight,
+             layer.packed_bf16_exponent_base,
+             layer.weight_exception_rows,
+@@ -138,7 +135,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     ) -> torch.Tensor:
+         raise RuntimeError(
+             "A packed BF16 LM head runs only through the logits processor's "
+-            "vocabulary projection (linear backend b12x or tilelang, no bias)."
++            "TileLang vocabulary projection (no bias)."
+         )
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 022c4dca8..7571919da 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -437,17 +437,15 @@ class VocabParallelEmbedding(PluggableLayer):
+                 raise ValueError(
+                     "A packed BF16 LM head needs an untied, unquantized checkpoint head"
+                 )
+-            # DS4.1's TileLang family keeps B12X's vocabulary projections.
+-            if config.kernel_config.linear_backend not in (
+-                "b12x",
+-                "tilelang",
+-            ) or not packed_bf16_supported(
+-                embedding_dim, params_dtype or torch.get_default_dtype()
++            if config.kernel_config.linear_backend != "tilelang" or not (
++                packed_bf16_supported(
++                    embedding_dim, params_dtype or torch.get_default_dtype()
++                )
+             ):
+                 raise ValueError(
+-                    "A packed BF16 LM head needs B12X's packed vocabulary "
+-                    "projection: linear backend b12x or tilelang, BF16 weights "
+-                    "and K divisible by 128"
++                    "A packed BF16 LM head needs the TileLang vocabulary "
++                    "projection: linear backend tilelang on SM120/SM121, BF16 "
++                    "weights and K divisible by 128"
+                 )
+             quant_method = PackedBf16LmHeadMethod()
+             self.runtime_lm_head_quantization = "packed_bf16"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab_pack.py b/vllm/models/deepseek_v4_1/tilelang/vocab_pack.py
+new file mode 100644
+index 000000000..146d3c7ee
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab_pack.py
+@@ -0,0 +1,344 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact 12-bit storage for BF16 vocabulary heads, packed by TileLang at load.
++
++A BF16 value is a sign bit, an 8-bit exponent and a 7-bit mantissa. Each value
++here keeps its sign and mantissa in one byte and its exponent in a 4-bit code:
++code ``c`` in 1..15 means exponent ``base + c - 1`` for one 15-exponent window
++chosen per tensor, and code 0 means exponent 0 (zero and subnormal values keep
++their bits exactly). The rare values whose exponent falls outside the window
++are exceptions: their slot holds +0 and their exact BF16 bits sit in a per-row
++list (``row_offsets`` indexes it by row; each entry is the value's bits in the
++low half and its column in the high half), in column order within a row.
++
++Row layout, ``K + K / 2`` bytes: the ``K`` sign-and-mantissa bytes, then the
++codes. Byte ``j`` of each 128-column group's 64 code bytes holds the code of
++column ``j`` in its low nibble and of column ``j + 64`` in its high nibble.
++``vocab.packed_vocab_projection`` reads this layout.
++
++The format, the window choice and the packing are B12X's
++(``b12x.gemm.packed_bf16_vocab_projection``, spark-ds41f's B12X patch 0012), and
++the packed tensors are B12X's byte for byte. ``pack`` streams the BF16 weight
++through three TileLang passes (exponent histogram, per-row exception counts,
++then the packed bytes and exceptions) and allocates nothing large but its
++result; ``pack(..., in_place=True)`` writes the result into the weight's own
++storage instead. The write pass decodes every value it encodes and compares it
++with the source bits; ``pack`` refuses unless all of them match, so a packed
++tensor is the checkpoint tensor, not an approximation.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++import importlib.util
++from dataclasses import dataclass
++
++import tilelang
++import tilelang.language as T
++import torch
++
++GROUP = 128  # columns per code group
++WINDOW = 15  # exponents a 4-bit code covers (code 0 is exponent 0)
++WARP = 32
++# Rows one histogram block counts; rows (one a warp) one count or pack block covers.
++_HISTOGRAM_ROWS = 16
++_HISTOGRAM_THREADS = 256
++_ROW_WARPS = 4
++# In place, rows are packed through a staging block of this many rows.
++_BLOCK_ROWS = 1_024
++
++_PASS_CONFIGS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++
++
++@dataclass(frozen=True)
++class PackedBf16Weight:
++    """A packed ``[out_features, in_features]`` BF16 weight."""
++
++    values: torch.Tensor
++    exponent_base: int
++    exception_rows: torch.Tensor
++    exception_entries: torch.Tensor
++    row_offsets: torch.Tensor
++    exceptions: int
++
++    @property
++    def out_features(self) -> int:
++        return int(self.values.shape[0])
++
++    @property
++    def in_features(self) -> int:
++        return int(self.values.shape[1]) * 2 // 3
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def exponent_histogram_kernel(K: int):
++    """Count every value's 8-bit exponent into ``histogram`` [256] (added to it)."""
++    rows, threads = _HISTOGRAM_ROWS, _HISTOGRAM_THREADS
++    N = T.dynamic("N")
++
++    @T.prim_func
++    def exponent_histogram(
++        weight: T.Tensor((N, K), T.int16),
++        histogram: T.Tensor((256,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(N, rows), threads=threads) as bx:
++            tx = T.get_thread_binding()
++            counts = T.alloc_shared((256,), T.int32)
++            T.fill(counts, 0)
++            T.sync_threads()
++            for step in T.serial(T.ceildiv(rows * K, threads)):
++                index = step * threads + tx
++                row = bx * rows + index // K
++                if index < rows * K and row < N:
++                    bits = T.cast(weight[row, index % K], T.int32) & 0xFFFF
++                    T.atomic_add(counts[(bits >> 7) & 0xFF], 1)
++            T.sync_threads()
++            if counts[tx] != 0:
++                T.atomic_add(histogram[tx], counts[tx])
++
++    return exponent_histogram
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def exception_count_kernel(K: int):
++    """``counts[row]``: the row's values outside the window from ``base`` (one warp
++    a row)."""
++    N = T.dynamic("N")
++
++    @T.prim_func
++    def exception_count(
++        weight: T.Tensor((N, K), T.int16),
++        counts: T.Tensor((N,), T.int32),
++        base: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(N, _ROW_WARPS), threads=_ROW_WARPS * WARP) as bx:
++            tx = T.get_thread_binding()
++            lane = tx % WARP
++            row = bx * _ROW_WARPS + tx // WARP
++            if row < N:
++                total = T.alloc_var(T.int32)
++                total = 0
++                for chunk in T.serial(K // WARP):
++                    bits = T.cast(weight[row, chunk * WARP + lane], T.int32) & 0xFFFF
++                    exponent = (bits >> 7) & 0xFF
++                    outside = exponent != 0 and (
++                        exponent < base or exponent >= base + WINDOW
++                    )
++                    total = total + T.if_then_else(outside, 1, 0)
++                for step in T.unroll(5):
++                    total = total + T.shfl_xor(total, 16 >> step)
++                if lane == 0:
++                    counts[row] = total
++
++    return exception_count
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def pack_rows_kernel(K: int):
++    """Pack rows ``row_start + r`` into row ``r`` of ``values``, one warp a row.
++
++    A warp takes each 128-column group as four 32-column parts in column order;
++    a part's exceptions take the next slots of the row's list in lane order (a
++    warp prefix sum), so the list is in column order, as ``row_offsets`` (the
++    exception counts' prefix sum) expects. Every encoded value is decoded and
++    compared with its source bits; ``mismatches`` counts the values that differ
++    and the rows whose exceptions do not fill their slots exactly.
++    """
++    width = K + K // 2
++    N = T.dynamic("N")
++    N1 = T.dynamic("N1")  # N + 1
++    R = T.dynamic("R")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def pack_rows(
++        weight: T.Tensor((N, K), T.int16),
++        values: T.Tensor((R, width), T.uint8),
++        row_offsets: T.Tensor((N1,), T.int32),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        mismatches: T.Tensor((1,), T.int32),
++        base: T.int32,
++        row_start: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(R, _ROW_WARPS), threads=_ROW_WARPS * WARP) as bx:
++            tx = T.get_thread_binding()
++            lane = tx % WARP
++            local = bx * _ROW_WARPS + tx // WARP
++            if local < R:
++                row = row_start + local
++                codes = T.alloc_local((4,), T.int32)
++                written = T.alloc_var(T.int32)
++                written = row_offsets[row]
++                bad = T.alloc_var(T.int32)
++                bad = 0
++                inclusive = T.alloc_var(T.int32)
++                for group in T.serial(K // GROUP):
++                    for part in T.unroll(GROUP // WARP):
++                        column = group * GROUP + part * WARP + lane
++                        bits = T.cast(weight[row, column], T.int32) & 0xFFFF
++                        exponent = (bits >> 7) & 0xFF
++                        outside = exponent != 0 and (
++                            exponent < base or exponent >= base + WINDOW
++                        )
++                        code = T.if_then_else(
++                            exponent != 0 and not outside, exponent - base + 1, 0
++                        )
++                        sign_mantissa = ((bits >> 8) & 0x80) | (bits & 0x7F)
++                        low = T.if_then_else(outside, 0, sign_mantissa)
++                        decoded = (
++                            ((low & 0x80) << 8)
++                            | (T.if_then_else(code == 0, 0, code + base - 1) << 7)
++                            | (low & 0x7F)
++                        )
++                        differs = not outside and decoded != bits
++                        bad = bad + T.if_then_else(differs, 1, 0)
++                        flag = T.if_then_else(outside, 1, 0)
++                        inclusive = flag
++                        for step in T.unroll(5):
++                            prior = T.shfl_up(inclusive, 1 << step)
++                            inclusive = inclusive + T.if_then_else(
++                                lane >= (1 << step), prior, 0
++                            )
++                        if outside:
++                            slot = written + inclusive - 1
++                            exception_rows[slot] = row
++                            exception_entries[slot] = (column << 16) | bits
++                        written = written + T.shfl_sync(inclusive, WARP - 1)
++                        values[local, column] = T.cast(low, T.uint8)
++                        codes[part] = code
++                    values[local, K + group * (GROUP // 2) + lane] = T.cast(
++                        codes[0] | (codes[2] << 4), T.uint8
++                    )
++                    values[local, K + group * (GROUP // 2) + WARP + lane] = T.cast(
++                        codes[1] | (codes[3] << 4), T.uint8
++                    )
++                bad = bad + T.if_then_else(written != row_offsets[row + 1], 1, 0)
++                for step in T.unroll(5):
++                    bad = bad + T.shfl_xor(bad, 16 >> step)
++                if lane == 0 and bad != 0:
++                    T.atomic_add(mismatches[0], bad)
++
++    return pack_rows
++
++
++def is_supported(device=None) -> bool:
++    """True on SM120/SM121 GPUs with TileLang available."""
++    if not torch.cuda.is_available():
++        return False
++    device = torch.device(device) if device is not None else torch.device("cuda")
++    if device.type != "cuda":
++        return False
++    major, minor = torch.cuda.get_device_capability(device)
++    return (
++        major == 12
++        and minor in (0, 1)
++        and importlib.util.find_spec("tilelang") is not None
++    )
++
++
++def _check_weight(weight: torch.Tensor) -> None:
++    if weight.ndim != 2 or weight.dtype != torch.bfloat16:
++        raise TypeError("packing needs a 2-D torch.bfloat16 weight")
++    if not weight.is_cuda or not weight.is_contiguous():
++        raise ValueError("packing needs a contiguous CUDA weight")
++    if weight.shape[0] == 0 or weight.shape[1] == 0 or weight.shape[1] % GROUP:
++        raise ValueError(
++            f"packing needs rows and K divisible by {GROUP}, got {tuple(weight.shape)}"
++        )
++
++
++def pack(weight: torch.Tensor, *, in_place: bool = False) -> PackedBf16Weight:
++    """Pack ``weight`` exactly; raise if any value would not round-trip.
++
++    Out of place, it allocates the result plus the 256-bin histogram, the
++    mismatch counter and a row-count prefix sum. ``in_place=True`` writes the
++    packed rows into the first three quarters of ``weight``'s own storage, so
++    the only other allocation is one 1,024-row staging block (7.5 MiB at
++    K=5,120); ``weight`` must not be read as BF16 afterwards. A packed row is
++    shorter than a BF16 row, so each block's packed bytes land only on rows
++    already read: blocks are packed into staging while their own rows are
++    intact, then copied into place, in row order.
++    """
++    _check_weight(weight)
++    out_features, in_features = map(int, weight.shape)
++    width = in_features + in_features // 2
++    device = weight.device
++    bits = weight.view(torch.int16)
++    histogram = torch.zeros(256, dtype=torch.int32, device=device)
++    exponent_histogram_kernel(in_features)(bits, histogram)
++    hist = histogram.to(torch.int64).cpu()
++    hist[0] = 0
++    windows = hist.unfold(0, WINDOW, 1).sum(1)
++    windows[0] = -1
++    base = int(windows.argmax())  # the lowest of equally good windows
++    row_offsets = torch.zeros(out_features + 1, dtype=torch.int32, device=device)
++    exception_count_kernel(in_features)(bits, row_offsets[1:], base)
++    row_offsets[1:] = torch.cumsum(row_offsets[1:], 0, dtype=torch.int32)
++    exceptions = int(row_offsets[-1])
++    # Kernels take a valid pointer even when the row offsets select nothing.
++    rows = torch.zeros(max(exceptions, 1), dtype=torch.int32, device=device)
++    entries = torch.zeros_like(rows)
++    mismatches = torch.zeros(1, dtype=torch.int32, device=device)
++    pack_rows = pack_rows_kernel(in_features)
++    if in_place:
++        values = (
++            weight.view(torch.uint8)
++            .view(-1)[: out_features * width]
++            .view(out_features, width)
++        )
++        staging = torch.empty(
++            (min(_BLOCK_ROWS, out_features), width), dtype=torch.uint8, device=device
++        )
++        for start in range(0, out_features, _BLOCK_ROWS):
++            count = min(_BLOCK_ROWS, out_features - start)
++            pack_rows(
++                bits,
++                staging[:count],
++                row_offsets,
++                rows,
++                entries,
++                mismatches,
++                base,
++                start,
++            )
++            values[start : start + count].copy_(staging[:count])
++        del staging
++    else:
++        values = torch.empty((out_features, width), dtype=torch.uint8, device=device)
++        pack_rows(bits, values, row_offsets, rows, entries, mismatches, base, 0)
++    if int(mismatches) != 0:
++        raise ValueError(
++            f"packed BF16 weight does not round-trip ({int(mismatches)} mismatches)"
++        )
++    return PackedBf16Weight(values, base, rows, entries, row_offsets, exceptions)
++
++
++def unpack(packed: PackedBf16Weight) -> torch.Tensor:
++    """The exact BF16 weight that ``packed`` stores (tests and inspection; it
++    allocates freely)."""
++    count, width = packed.values.shape
++    k = width * 2 // 3
++    low = packed.values[:, :k].to(torch.int32)
++    codes = packed.values[:, k:].to(torch.int32).view(count, k // GROUP, 1, GROUP // 2)
++    code = torch.cat((codes & 0xF, codes >> 4), dim=2).reshape(count, k)
++    exponent = torch.where(code == 0, 0, code + packed.exponent_base - 1)
++    bits = ((low & 0x80) << 8) | (exponent << 7) | (low & 0x7F)
++    if packed.exceptions:
++        entries = packed.exception_entries[: packed.exceptions]
++        bits[
++            packed.exception_rows[: packed.exceptions].long(), (entries >> 16).long()
++        ] = entries & 0xFFFF
++    return bits.to(torch.int16).view(torch.bfloat16)
++
++
++__all__ = [
++    "GROUP",
++    "PackedBf16Weight",
++    "WINDOW",
++    "exception_count_kernel",
++    "exponent_histogram_kernel",
++    "is_supported",
++    "pack",
++    "pack_rows_kernel",
++    "unpack",
++]
+diff --git a/vllm/utils/b12x.py b/vllm/utils/b12x.py
+index bcb7fa27d..c119b1f58 100644
+--- a/vllm/utils/b12x.py
++++ b/vllm/utils/b12x.py
+@@ -316,7 +316,6 @@ _B12X_SUBMODULES = {
+         "b12x.gemm.bf16_vocab_projection",
+         "b12x.gemm.blockscaled",
+         "b12x.gemm.mla_query_projection",
+-        "b12x.gemm.packed_bf16_vocab_projection",
+         "b12x.gemm.wo_projection",
+         "b12x.norm.mhc",
+         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
+@@ -357,10 +356,6 @@ def get_b12x_bf16_vocab_projection() -> ModuleType | None:
+     return _get_submodule("b12x.gemm.bf16_vocab_projection")
+ 
+ 
+-def get_b12x_packed_bf16_vocab_projection() -> ModuleType | None:
+-    return _get_submodule("b12x.gemm.packed_bf16_vocab_projection")
+-
+-
+ def get_b12x_mla_query_projection() -> ModuleType | None:
+     return _get_submodule("b12x.gemm.mla_query_projection")
+ 
+-- 
+2.54.0 (Apple Git-157)
+
