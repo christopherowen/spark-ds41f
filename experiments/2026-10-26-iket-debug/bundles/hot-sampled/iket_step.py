@@ -2,7 +2,7 @@
 
 usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--skip REGEX]
                     [--eager] [--filled] [--batched N] [--chunk N] [--model DIR]
-                    [--drafts N] [--tokens N]
+                    [--drafts N] [--tokens N] [--overrides JSON]
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
@@ -29,6 +29,7 @@ the wall time of each request, the vLLM tree's IKET state and the config overrid
 """
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -55,11 +56,11 @@ PROMPTS = [
 ]
 
 
-def shrink(config):
-    """The six-layer config, for the target and (a callable override reaches it too)
-    the DSpark drafter."""
+def shrink(config, overrides):
+    """The six-layer config with ``overrides``, for the target and (a callable override
+    reaches it too) the DSpark drafter."""
     text = config.get_text_config()
-    for key, value in TEXT_OVERRIDES.items():
+    for key, value in overrides.items():
         setattr(text, key, value)
     return config
 
@@ -115,7 +116,11 @@ def main():
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
+    parser.add_argument("--overrides", default="{}",
+                        help="JSON: text-config overrides applied after the six-layer set "
+                             "(e.g. one rank's shapes at a TP size)")
     args = parser.parse_args()
+    overrides = {**TEXT_OVERRIDES, **json.loads(args.overrides)}
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -184,7 +189,7 @@ def main():
             "cudagraph_capture_sizes": [args.drafts + 1, 2 * (args.drafts + 1)],
         },
         generation_config="vllm",
-        hf_overrides=shrink,
+        hf_overrides=functools.partial(shrink, overrides=overrides),
         jit_monitor_mode="off",
         # One image, not none: a stubbed vision tower (limit 0) still declares its
         # TileLang kernels, and binding them fails on its meta weights.
@@ -227,7 +232,7 @@ def main():
         "filled": args.filled,
         "eager": args.eager,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
-        "text_overrides": TEXT_OVERRIDES,
+        "text_overrides": overrides,
         "drafts": args.drafts,
     }
     (out / "result.json").write_text(json.dumps(result, indent=1) + "\n")

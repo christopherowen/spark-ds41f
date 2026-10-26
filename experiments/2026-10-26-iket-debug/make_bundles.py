@@ -146,28 +146,24 @@ BUNDLES = {
     "step": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
-             "production recipe's kernels): on under run-iket without CUDA graphs (four CTAs a "
-             "launch and the middle iteration of each loop record ranges; the vision tower and "
-             "the sampler's top-k/top-p kernel uninstrumented), nsys durations off without and "
-             "with the graphs, and the decode-step table",
+             "production recipe's kernels and graphs): on under run-iket (four CTAs a launch "
+             "and the middle iteration of each loop record ranges; the vision tower and the "
+             "sampler's top-k/top-p kernel uninstrumented), nsys durations off without and with "
+             "the graphs, and the decode-step table",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
             # run-iket's pool is a bump allocator for the whole run: every warp of every
             # instrumented launch gets the run's largest warp record (5,016 timestamps
-            # unsampled: 898 GB). Sampled CTAs and iterations bound that record: lane 0
-            # records, and each range at most once a loop, so no warp records more than 64
-            # (the sources' static bounds). The dry run recommends 424 all the same, with
-            # the graphs and without, and capped at 128 the run's exit dump crashes in a
-            # warp record (iket::to_json, runs 15 and 18). With the graphs that is a 52 GB
-            # pool (26.6M instrumented warps), more than GB10 has beside the engine;
-            # without them, 15.1M warps take 28 GB. So this trace runs without graphs and
-            # uncapped; the trace's counts show which warps record more than the bound.
+            # unsampled: 898 GB). Sampled CTAs and iterations bound that record, once
+            # every sampled event is in a loop of zero or one iterations: a warp takes a
+            # slot for every event it issues, and ptxas predicated guarded events (the
+            # dry run's 424 a warp, runs 14-20; a cap under it crashed the exit dump).
             # The vision tower and the top-k/top-p sampler are not in a greedy text decode
             # step; left uninstrumented, their warps reserve no records.
-            ("decode steps, on, eager, under run-iket",
+            ("decode steps, on, under run-iket",
              [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
-              "{python}", STEP, "on", "--eager", "--iket", "{out}/trace-run/iket", "--ctas", "4",
+              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4",
               "--iters", "1", "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
                                        "{out}/trace-run/iket/sources"], 1800),
