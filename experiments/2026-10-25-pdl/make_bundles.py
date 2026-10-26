@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Write the PDL experiment's kernel-lab bundles and serving arms from the vLLM branch.
 
-usage: make_bundles.py [VLLM_REPO] [IMAGE_TREE] [BASE] [HEAD]
+usage: make_bundles.py [VLLM_REPO] [IMAGE_TREE] [BASE] [HEAD] [NAME=REF...]
        (default ~/projects/vllm-pdl-next 26382f5cf 577091997 pdl-next)
+
+Each NAME=REF is a variant of the PDL build (a fix candidate on HEAD): its package
+files over BASE, those that differ from HEAD's written to overlay-NAME/. With variants,
+bundles/pdl-fix and bundles/pdl-fix-trace time and trace every build side by side.
 
 IMAGE_TREE is the tree image -next-6 carries (candidate 6's, 26382f5cf); BASE is the
 build PDL is measured against (next-candidate); HEAD is the PDL branch on it. Every file
@@ -157,6 +161,7 @@ def main() -> None:
     image_tree = args[1] if len(args) > 1 else "26382f5cf"
     base = args[2] if len(args) > 2 else "577091997"
     head = args[3] if len(args) > 3 else "pdl-next"
+    variants = [arg.split("=", 1) for arg in args[4:]]
     commit, base_commit = rev(repo, head), rev(repo, base)
     files = changed(repo, image_tree, head)
     package = packages(files)
@@ -204,6 +209,23 @@ def main() -> None:
     def into_tree(paths, build: str = "pdl") -> list:
         """``build``'s version of each file, mounted over the image's tree."""
         return [[source(f, build), f"{ROOT}/{f}"] for f in paths]
+
+    # Variants: their package files over the base, mounted at /b/NAME; a file the
+    # variant changes from HEAD comes from overlay-NAME/, the others from overlay/.
+    variant_mounts, variant_notes = [], []
+    for name, ref in variants:
+        own = set(packages(changed(repo, head, ref)))
+        shutil.rmtree(HERE / f"overlay-{name}", ignore_errors=True)
+        for f in sorted(own):
+            copy(repo, ref, f, HERE / f"overlay-{name}" / f)
+        mine = packages(changed(repo, base, ref))
+        variant_mounts += [
+            [f"{REL}/overlay-{name}/{f}" if f in own else source(f), f"/b/{name}/{f}"]
+            for f in mine
+        ]
+        variant_notes.append(f"{name} (vLLM {ref} {rev(repo, ref)})")
+        print(f"variant {name}: {ref} {rev(repo, ref)}, {len(mine)} package files over the base, "
+              f"{len(own)} differing from {head}")  # fmt: skip
 
     # PDL tests and the kernel tests with the source check.
     steps = [
@@ -332,6 +354,33 @@ def main() -> None:
     write_json(traced / "candidate.json", candidate)
     for script in ("pdl_chain_ab.py", "pdl_trace.py"):
         shutil.copyfile(HERE / script, traced / script)
+
+    # The fix candidates beside the base and PDL builds.
+    if variants:
+        builds = (
+            f"next-candidate (vLLM {base} {base_commit}), vLLM {head} {commit}, "
+            + ", ".join(variant_notes)
+        )
+        for name, description, argv in (
+            ("pdl-fix", "The decode layer's chain at the engine grid's rows (2-96), the shared expert on its "
+             "side stream, ten rounds rotating", ["/b/pdl_chain_ab.py", "10", "/b/pdl_rows.py", "--modes", "aux"]),
+            ("pdl-fix-trace", "The 16- and 48-row chains under the torch profiler, two rounds rotating",
+             ["/b/pdl_chain_ab.py", "2", "/b/pdl_trace.py", "--rows", "16,48"]),
+        ):  # fmt: skip
+            script = argv[2].removeprefix("/b/")
+            fixed = bundle(
+                name,
+                f"{description} over {builds}: time per layer (or each kernel's place in a replay) and every "
+                "written buffer's bits compared.",
+                argv,
+                [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"], [script, f"/b/{script}"]],
+                "status",
+            )
+            candidate = json.loads((fixed / "candidate.json").read_text())
+            candidate["mounts"] += both_builds + variant_mounts
+            write_json(fixed / "candidate.json", candidate)
+            for each in ("pdl_chain_ab.py", script):
+                shutil.copyfile(HERE / each, fixed / each)
 
     # The chain kernels' sources, lowered at their decode shapes.
     sources = bundle(
