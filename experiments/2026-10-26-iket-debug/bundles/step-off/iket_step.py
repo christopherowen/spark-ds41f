@@ -151,10 +151,33 @@ def nan_hooks(worker):
         return not (isinstance(value, torch.Tensor) and value.is_floating_point() and value.numel()
                     and not bool(torch.isfinite(value).all()))
 
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    aliased = []
+
+    def in_workspace(tensor):
+        """The workspace manager's buffer (lane) that ``tensor``'s bytes lie in, if any."""
+        start = tensor.data_ptr()
+        for lane, buffer in enumerate(current_workspace_manager()._current_workspaces):
+            if buffer is not None:
+                low = buffer.data_ptr()
+                if low <= start < low + buffer.numel() * buffer.element_size():
+                    return lane
+        return None
+
     def checked(label, method):
         """``method`` (a layer's mHC pre or post_pre, called functionally, so no module
-        hook sees it), reporting its first non-finite output and which inputs were so."""
+        hook sees it), reporting its first non-finite output and which inputs were so;
+        and the first time its ``previous_output`` (the previous sublayer's output) lies
+        in the workspace manager's buffer, whose views its own scratch reuses."""
         def call(*args, **kwargs):
+            previous = kwargs.get("previous_output", args[0] if label.endswith("post_pre") and args else None)
+            if isinstance(previous, torch.Tensor) and not aliased:
+                lane = in_workspace(previous)
+                if lane is not None:
+                    aliased.append(label)
+                    print(f"{label}: previous_output {tuple(previous.shape)} lies in workspace lane "
+                          f"{lane} (rows {previous.shape[0]})", flush=True)
             out = method(*args, **kwargs)
             if not first:
                 bad = [i for i, o in enumerate(out if isinstance(out, tuple) else (out,)) if not finite(o)]

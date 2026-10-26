@@ -269,14 +269,14 @@ BUNDLES = {
         # 1025's tree still defaults to the B12X family; the recipe picks TileLang.
         env={**STEP_ENV, "VLLM_DS41_KERNEL_BACKEND": "tilelang"},
         mounts=[HUB],
+        # Runs 38-39: both fail; the NaN enters layer 1's mHC pre through its
+        # previous_output. Does that output lie in the workspace its scratch reuses, at
+        # c1 (no NaN) as at c3?
         steps=[
-            ("off, TP4, c3, eager, nan hooks",
-             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "3", "--eager", "--nan-hooks",
-              "--out", "{out}/c3-eager"], 1800),
-            ("off, TP4, c3, graphs",
-             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "3", "--out", "{out}/c3"], 1800),
-            ("off, TP4, c8, graphs",
-             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", "8", "--out", "{out}/c8"], 1800),
+            (f"off, TP4, c{requests}, eager, nan hooks",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--eager",
+              "--nan-hooks", "--out", f"{{out}}/c{requests}-eager"], 1800)
+            for requests in (1, 3)
         ],
     ) for name, ref, label in (("nan-next", "c579b3fe1", "next-candidate c579b3fe1"),
                                ("nan-1025", BASE, "1025's tree (26382f5cf, no overlay)"))},
