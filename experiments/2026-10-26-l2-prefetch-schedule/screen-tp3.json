@@ -1,0 +1,118 @@
+{
+ "experiment": "experiments/2026-10-26-l2-prefetch-schedule",
+ "run": "l2-schedule-screen-tp3",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/sampled_digest.py",
+     [
+      "--tokens",
+      "192"
+     ],
+     "sampled"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/controls_digest.py",
+     [
+      "--tokens",
+      "96"
+     ],
+     "controls-digest"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "4",
+      "--tokens",
+      "256"
+     ],
+     "c8-distinct"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "4",
+      "--samples",
+      "4",
+      "--tokens",
+      "256"
+     ],
+     "c4-distinct"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "head-tp3.json",
+     "label": "head"
+    },
+    {
+     "config": "chained-tp3.json",
+     "label": "chained"
+    },
+    {
+     "config": "typed-tp3.json",
+     "label": "typed"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "suite": [
+    "screen-tp3",
+    "single-stream"
+   ],
+   "arms": [
+    {
+     "config": "typed-tp3-dev.json",
+     "label": "typed"
+    },
+    {
+     "config": "chained-tp3-dev.json",
+     "label": "chained"
+    },
+    {
+     "config": "head-tp3-dev.json",
+     "label": "head"
+    },
+    {
+     "config": "typed-tp3-dev.json",
+     "label": "typed-again"
+    }
+   ]
+  }
+ ]
+}
