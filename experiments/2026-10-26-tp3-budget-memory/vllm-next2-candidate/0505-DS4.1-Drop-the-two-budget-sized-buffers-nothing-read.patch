@@ -1,0 +1,124 @@
+From a0dc662f5841303faec18b8bfb83f35ad1c445cd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:16:33 +0100
+Subject: [PATCH 505/507] [DS4.1] Drop the two budget-sized buffers nothing
+ reads
+
+DeepseekV4Model allocated candidate_block_buffer (budget x 2,048 int32) and
+passed it to every attention layer, which takes the argument and never keeps
+it: the candidate source layer (20) publishes its candidates in its own
+staging (_candidates). DSparkModel allocated a top-k buffer (budget x 512
+int32) for its layers, which are window-only (compress ratio 0): their
+attention is its own owner and has no compressed cache, so no indexed
+attention reads it, and DSpark's loader shares no indexer storage with the
+target. Both go: 10 KiB per budget token on every rank (80 MiB at TP3's
+8,192 tokens, 160 MiB at the ring's 16,384). The drafter now refuses a layer
+that is not window-only, since such a layer would need a top-k buffer.
+---
+ vllm/models/deepseek_v4_1/attention.py     |  1 -
+ vllm/models/deepseek_v4_1/nvidia/dspark.py | 13 ++++++-------
+ vllm/models/deepseek_v4_1/nvidia/model.py  | 20 +++-----------------
+ 3 files changed, 9 insertions(+), 25 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 637e72a76..acde3dc36 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -255,7 +255,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         prefix,
+         topk_indices_buffer=None,
+         aux_stream_list=None,
+-        candidate_block_buffer=None,
+     ):
+         super().__init__()
+         self.config = vllm_config
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index b26bdae19..9c645e313 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -268,12 +268,6 @@ class DSparkDeepseekV4Model(nn.Module):
+         )
+         self.main_norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+-        self.topk_indices_buffer = torch.empty(
+-            vllm_config.scheduler_config.max_num_batched_tokens,
+-            config.index_topk,
+-            dtype=torch.int32,
+-        )
+-
+         current_vllm_config = get_current_vllm_config()
+         self._l2pf_ready = False
+         self.layers = nn.ModuleList(
+@@ -281,11 +275,16 @@ class DSparkDeepseekV4Model(nn.Module):
+                 DeepseekV4DecoderLayer(
+                     current_vllm_config,
+                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
+-                    topk_indices_buffer=self.topk_indices_buffer,
+                 )
+                 for i in range(self.num_dspark_layers)
+             ]
+         )
++        # The drafter's layers attend to their window only (compress ratio 0): no
++        # indexed attention reads a top-k buffer, so none is allocated for them.
++        if any(layer.attn.compress_ratio for layer in self.layers):
++            raise ValueError(
++                "DSpark draft layers must be window-only (compress ratio 0)"
++            )
+         # A draft forward routes one query block per request, as DSparkSpeculator
+         # lays it out: the speculative tokens, plus the anchor unless the drafter
+         # predicts from it.
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 71b3fc620..a54ed55a3 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -91,7 +91,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+         prefix,
+         topk_indices_buffer: torch.Tensor | None = None,
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
+-        candidate_block_buffer: torch.Tensor | None = None,
+         engram_layout: EngramLayout | None = None,
+     ):
+         super().__init__()
+@@ -119,7 +118,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+             prefix=f"{prefix}.attn",
+             topk_indices_buffer=topk_indices_buffer,
+             aux_stream_list=aux_stream_list,
+-            candidate_block_buffer=candidate_block_buffer,
+         )
+         if self.use_sequence_parallel:
+             self.attn.wo_b.reduce_results = False
+@@ -451,20 +449,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             dtype=torch.int32,
+         )
+ 
+-        # Two-level candidate filtering: the indexer at
+-        # candidate_source_layer_id publishes the top candidate blocks of
+-        # compressed positions here; later ratio-1 indexers (24/28/32/36)
+-        # mask their scores with it.
+-        candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
+-        candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
+-        if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
+-            self.candidate_block_buffer = torch.empty(
+-                vllm_config.scheduler_config.max_num_batched_tokens,
+-                candidate_topk_blocks,
+-                dtype=torch.int32,
+-            )
+-        else:
+-            self.candidate_block_buffer = None
++        # Two-level candidate filtering needs no buffer here: the attention of
++        # candidate_source_layer_id keeps the candidates it publishes for the
++        # later ratio-1 indexers (24/28/32/36) in its own staging (_candidates).
+ 
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+@@ -486,7 +473,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 prefix=prefix,
+                 topk_indices_buffer=self.topk_indices_buffer,
+                 aux_stream_list=aux_stream_list,
+-                candidate_block_buffer=self.candidate_block_buffer,
+                 engram_layout=self.engram_layout,
+             ),
+             prefix=f"{prefix}.layers",
+-- 
+2.54.0 (Apple Git-157)
+

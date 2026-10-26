@@ -1,0 +1,552 @@
+From 9ad4a1fdb8a2538f477f5d6cdf41bf29bd5da5ab Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:12:31 +0100
+Subject: [PATCH 504/507] [DS4.1] Routed experts: 64-row tiles for prefill
+ calls
+
+Every grouped-GEMM tile holds block_M routes of one expert and reads that
+expert's weight slab again, so at prefill sizes, where an expert has hundreds
+of routes, the 32-row decode tile makes the routed experts L2-bound on weight
+re-reads. A call now takes 64-row tiles once the average expert has a full
+32-row tile of routes (rows * topk >= 32 * experts: 2,048 tokens for V4.1's
+384 experts at top-6); decode steps and their CUDA graphs (at most 96 rows),
+the CED decoder's compacted rows and the drafter's MoE stay at 32. The plan
+declares both heights' GEMMs, fused SwiGLU and dispatch, and lays each call's
+scratch out at its own height (the layout pads to 64 rows: about 0.16 GiB more
+workspace at TP3's 8,192 tokens). A call's rows are its routes' rows
+(topk_ids), the tokens arriving as their producer's MXFP8 rows.
+
+A row's sum over K runs in the same order at either tile height, so every
+output bit is unchanged: the tests compare the two heights through the whole
+plan near and above the threshold, the fused SwiGLU against TileKernels at
+64-row tiles, and the existing batch-composition checks now cross the two
+heights. GB10, one layer's experts (spark-ds41f
+experiments/2026-10-26-tp3-budget-memory): -11% at 8,192 tokens and -19% at
+16,384 at TP3's 768 columns a rank, -11% and -15% at TP4's 576.
+benchmark_deepseek_v41_moe_prefill_tiles.py times the plan as serving calls
+it against the plan before it (the parent commit's moe.py), on one shared
+copy of the weights and tokens, gated on identical outputs, never slower
+where the heights differ, and faster from 8,192 tokens.
+---
+ ...enchmark_deepseek_v41_moe_prefill_tiles.py | 238 ++++++++++++++++++
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  75 ++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  96 +++++--
+ 3 files changed, 385 insertions(+), 24 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py b/benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py
+new file mode 100644
+index 000000000..c9e0c9751
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py
+@@ -0,0 +1,238 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired timing of DeepSeek-V4.1's routed experts with the prefill tile height (64
++rows a tile from 2,048 tokens, ``MoeExpertsV41Plan.tile_height``) against the plan
++before it (32 rows at every size: the parent commit's ``moe.py``, ``--baseline``).
++
++One layer's routed experts as serving runs them (``plan.run`` on the tokens' MXFP8
++rows, cast once and shared by both plans: dispatch, gate/up GEMM, fused SwiGLU, down
++GEMM, combine), at TP4's and TP3's
++per-rank expert widths. Sequence-parallel prefill runs the MoE on the chunk's gathered
++rows on every rank, so a call's rows are the chunk's tokens on either shape: 1,024 to
++24,576 (TP3 serves 8,192, the ring 16,384), across the threshold. Two routings:
++uniform top-6 over 384 experts, and a skewed one (expert popularity ~ 1 / rank^0.5),
++which leaves cold experts with few routes and so more partial tiles.
++
++Both plans read one copy of the weights and run in one workspace and output buffer, so
++no difference comes from where their memory lies (GB10 reads two copies of the same
++bytes up to 1.1% apart, experiments/2026-10-19-memory-placement). Each case is measured
++on eight fresh inputs. On each, both plans' outputs are first compared bit for bit, then
++CUDA graphs of CALLS launches of each run back to back, alternating which goes first;
++the case's 95% interval comes from the eight per-input differences. The gate
++(``--gate``): outputs identical everywhere; where the tile heights differ, the patched
++plan not slower (interval wholly above zero fails); and faster at every size from 8,192
++tokens (interval wholly below zero). Below 2,048 tokens both plans launch the same
++kernels on the same memory; those rows are reported, not gated.
++"""
++
++import argparse
++import importlib.util
++import json
++import math
++import statistics
++
++import tile_kernels
++import torch
++
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.models.deepseek_v4_1.tilelang import moe
++from vllm.models.deepseek_v4_1.tilelang.gemm import pack_scale_codes
++from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
++
++EXPERTS, TOPK, HIDDEN, LIMIT, BLOCK_N = 384, 6, 5120, 10.0, 128
++SHAPES = {"TP4": 576, "TP3": 768}
++TOKENS = (1024, 1536, 2048, 3072, 4096, 8192, 12288, 16384, 24576)
++GATED_FASTER_FROM = 8192
++ROUTINGS = ("uniform", "skewed")
++SAMPLES, CALLS = 8, 3
++
++
++def baseline_module(path: str, name: str):
++    """The baseline's copy of a TileLang module, under ``name`` in the same package:
++    its relative imports resolve to the package's other modules."""
++    package = "vllm.models.deepseek_v4_1.tilelang"
++    spec = importlib.util.spec_from_file_location(f"{package}.{name}", path)
++    module = importlib.util.module_from_spec(spec)
++    module.__package__ = package
++    spec.loader.exec_module(module)
++    return module
++
++
++def checkpoint_like(intermediate: int, generator):
++    """Packed E2M1 weights with UE8M0 exponents 118-121 (where the checkpoint's sit)."""
++    out = []
++    for n, k in ((2 * intermediate, HIDDEN), (HIDDEN, intermediate)):
++        packed = torch.randint(
++            0, 256, (EXPERTS, n, k // 2), generator=generator, device="cuda",
++            dtype=torch.uint8,
++        )  # fmt: skip
++        exponents = torch.randint(
++            118, 122, (EXPERTS, n, k // 32), generator=generator, device="cuda",
++            dtype=torch.uint8,
++        )  # fmt: skip
++        out.append((packed, exponents))
++    return out
++
++
++def routes(tokens: int, routing: str, generator):
++    scores = torch.rand((tokens, EXPERTS), generator=generator, device="cuda")
++    if routing == "skewed":
++        rank = torch.arange(1, EXPERTS + 1, device="cuda", dtype=torch.float32)
++        # Gumbel top-k: distinct experts drawn with popularity ~ rank^-0.5.
++        scores = -0.5 * rank.log() - torch.log(-torch.log(scores.clamp_min(1e-20)))
++    ids = scores.topk(TOPK, dim=-1).indices.to(torch.int32).contiguous()
++    weights = torch.rand((tokens, TOPK), generator=generator, device="cuda") + 0.1
++    return ids, weights.float().contiguous()
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(2):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(CALLS):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 1000 / CALLS  # microseconds a call
++
++
++def interval(differences: list[float]) -> list[float]:
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    return [mean - half, mean + half]  # t(7), 95%
++
++
++def measure(plans, prepared, tokens: int, routing: str) -> dict:
++    times = {name: [] for name in plans}
++    differences = []
++    nbytes = max(
++        moe.workspace_bytes(plan.workspace_specs(tokens, torch.int32))
++        for plan in plans.values()
++    )
++    workspace = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
++    for sample in range(SAMPLES):
++        generator = torch.Generator(device="cuda").manual_seed(1000 * tokens + sample)
++        ids, weights = routes(tokens, routing, generator)
++        x = torch.randn((tokens, HIDDEN), generator=generator, device="cuda") * 0.5
++        x = x.bfloat16()
++        rows = cast_mxfp8(x)  # the tokens as their producer casts them, for both plans
++        out = torch.empty_like(x)
++        calls, outs = {}, {}
++        for name, plan in plans.items():
++
++            def call(plan=plan, rows=rows, ids=ids, weights=weights, out=out):
++                plan.run(rows, ids, weights, prepared, out, workspace)
++
++            call()
++            torch.cuda.synchronize()
++            calls[name], outs[name] = call, out.clone()
++        same = torch.equal(
++            outs["tiles"].view(torch.int16), outs["release"].view(torch.int16)
++        )
++        if not same:
++            raise SystemExit(
++                f"outputs differ from the baseline's at {tokens} {routing}"
++            )
++        captures = {name: graph(call) for name, call in calls.items()}
++        order = list(plans) if sample % 2 == 0 else list(plans)[::-1]
++        measured = {name: elapsed(captures[name]) for name in order}
++        for name in plans:
++            times[name].append(measured[name])
++        differences.append(measured["tiles"] - measured["release"])
++        del captures, calls, outs
++    return {
++        "tokens": tokens,
++        "routing": routing,
++        "tile_height": plans["tiles"].tile_height(tokens),
++        "tiles_us": statistics.median(times["tiles"]),
++        "release_us": statistics.median(times["release"]),
++        "difference_us": statistics.fmean(differences),
++        "interval_us": interval(differences),
++        "change": statistics.fmean(differences) / statistics.median(times["release"]),
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--baseline",
++        required=True,
++        help="the parent commit's vllm/models/deepseek_v4_1/tilelang/moe.py",
++    )
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    # Declaring a plan warms TileKernels' token cast for the scheduler's batch
++    # buckets, which reads the current config.
++    with set_current_vllm_config(VllmConfig()):
++        results = run(args)
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        gate(results)
++
++
++def run(args) -> dict:
++    release = baseline_module(args.baseline, "moe_release")
++    results = {}
++    for shape, intermediate in SHAPES.items():
++        plans = {
++            "tiles": moe.MoeExpertsV41Plan(
++                EXPERTS, TOPK, HIDDEN, intermediate, swiglu_limit=LIMIT
++            ),
++            "release": release.MoeExpertsV41Plan(
++                EXPERTS, TOPK, HIDDEN, intermediate, swiglu_limit=LIMIT
++            ),
++        }
++        for plan in plans.values():
++            plan.declare_kernels()
++        tile_kernels.config.set_token_alignment(32)
++        generator = torch.Generator(device="cuda").manual_seed(7)
++        gemms = []
++        for packed, exponents in checkpoint_like(intermediate, generator):
++            tiles, tails = moe.tile_expert_weights(packed.view(torch.int8), BLOCK_N)
++            codes, base = pack_scale_codes(exponents)
++            gemms.append((tiles, tails, moe.tile_codes(codes, BLOCK_N), base))
++        prepared = tuple(gemms)  # one copy, both plans
++        results[shape] = []
++        for routing in ROUTINGS:
++            for tokens in TOKENS:
++                case = measure(plans, prepared, tokens, routing)
++                results[shape].append(case)
++                print(shape, json.dumps(case), flush=True)
++        del prepared, plans
++        torch.cuda.empty_cache()
++    return results
++
++
++def gate(results: dict) -> None:
++    slower = [
++        f"{shape} {c['tokens']} {c['routing']}"
++        for shape, cases in results.items()
++        for c in cases
++        if c["tile_height"] != 32 and c["interval_us"][0] > 0
++    ]
++    not_faster = [
++        f"{shape} {c['tokens']} {c['routing']}"
++        for shape, cases in results.items()
++        for c in cases
++        if c["tokens"] >= GATED_FASTER_FROM and c["interval_us"][1] >= 0
++    ]
++    if slower or not_faster:
++        raise SystemExit(f"slower at {slower}; not faster at {not_faster}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index d613ab736..b065b96e0 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -522,6 +522,81 @@ def test_moe_swiglu_cast_equals_tile_kernels(
+             assert a[first].float().isnan().any()
+ 
+ 
++def test_tile_height_follows_routes_per_expert():
++    """A call takes the prefill tiles once the average expert has a full decode tile
++    of routes; decode steps (at most 16 streams x 6 rows) and the drafter keep the
++    decode tiles, and each call's scratch is laid out at its own height."""
++    plan = MoeExpertsV41Plan(384, 6, 5120, 768, swiglu_limit=LIMIT)
++    assert plan.tile_height(96) == plan.tile_height(2047) == 32
++    assert plan.tile_height(2048) == plan.tile_height(24576) == 64
++    drafter = MoeExpertsV41Plan(128, 3, 5120, 768, swiglu_limit=LIMIT)
++    assert drafter.tile_height(96) == 32
++    for rows, height in ((2047, 32), (2048, 64), (16384, 64)):
++        layout_rows = (
++            plan.workspace_specs(rows, torch.int32)[-4][0][0]  # the gate/up output
++        )
++        tiles = min(rows * 6, -(-rows * 6 // height) + 384)
++        assert layout_rows == tiles * height, (rows, layout_rows)
++
++
++@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
++@pytest.mark.parametrize("rows", [170, 171, 1000])
++@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
++def test_prefill_tiles_give_the_decode_tiles_bits(
++    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
++):
++    """A call's output has the same bits at the prefill tile height as at the decode
++    one: every row's sum over K runs in the same order whatever the tile height
++    (171 rows is the first prefill call at 32 experts, top-6)."""
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 5)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 6)
++    x = (torch.randn((rows, hidden), generator=_gen(7), device=DEVICE) * 0.5).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 8, idx_dtype)
++    outs = {}
++    for prefill_block_M in (64, 32):  # 32: the decode tiles at every size
++        plan = _plan(
++            num_experts,
++            topk,
++            hidden,
++            intermediate,
++            swiglu_limit=LIMIT,
++            prefill_block_M=prefill_block_M,
++        )
++        weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++        outs[prefill_block_M] = torch.empty_like(x)
++        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[prefill_block_M])
++    assert _plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
++    ).tile_height(rows) == (64 if rows >= 171 else 32)
++    assert torch.equal(outs[64].view(torch.int16), outs[32].view(torch.int16))
++
++
++@pytest.mark.parametrize("intermediate", [576, 768])
++@pytest.mark.parametrize("rows", [2048, 4096])
++def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
++    rows, intermediate, num_experts=384, topk=6
++):
++    """At the prefill tile height (64 rows) the fused SwiGLU's bytes and scales still
++    equal TileKernels' kernel over the same layout."""
++    try:
++        layout, h = _swiglu_case(rows, intermediate, num_experts, topk, block_M=64)
++        live = layout["order"] >= 0
++        ours = moe_swiglu_cast(intermediate, 64, LIMIT)
++        theirs = _tile_kernels_swiglu(intermediate, num_experts, 64)
++        a, a_sf = _swiglu_outputs(h.shape[0], intermediate)
++        b, b_sf = _swiglu_outputs(h.shape[0], intermediate)
++        ours(
++            h, a, a_sf, layout["order"], layout["layout_weights"], layout["tile_expert"]
++        )
++        theirs(h, b, b_sf, layout["psum"], layout["layout_weights"], 1.0, None)
++        cols = intermediate // 32
++        assert torch.equal(a[live].view(torch.uint8), b[live].view(torch.uint8))
++        assert torch.equal(a_sf[live, :cols], b_sf[live, :cols])
++    finally:
++        # The plans' decode tiles: TileKernels' alignment is process-wide.
++        tile_kernels.config.set_token_alignment(32)
++
++
+ @pytest.mark.parametrize("k", [5120, 576, 768, 256])
+ def test_scale_codes_are_the_words_exactly(k):
+     """A row base and 4-bit deltas give back every scale word byte for byte (padding
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index a43cb7525..371fabca9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1158,6 +1158,16 @@ class MoeExpertsV41Plan:
+     ``workspace_specs(rows)`` lists one call's scratch. Its owner calls
+     ``declare_kernels()`` when preparing kernels; ``run`` launches the kernels it
+     binds.
++
++    Each grouped-GEMM tile holds ``block_M`` routes of one expert and reads that
++    expert's weight slab again, so a call's tile height is chosen by its rows
++    (``tile_height``): decode keeps ``block_M``, whose partial tiles cost least
++    when an expert has a few routes; a prefill call, where the average expert has
++    at least one full ``block_M`` tile, uses ``prefill_block_M`` rows a tile and
++    reads the weights half as often a route (GB10, one layer's experts at TP3's
++    768 columns a rank: 11% faster at 8,192 tokens, 19% at 16,384; spark-ds41f
++    experiments/2026-10-26-tp3-budget-memory). A row's sum over K runs in the same
++    order at either height, so its output has the same bits.
+     """
+ 
+     def __init__(
+@@ -1169,6 +1179,7 @@ class MoeExpertsV41Plan:
+         *,
+         swiglu_limit=None,
+         block_M=32,
++        prefill_block_M=64,
+         block_N=128,
+         num_stages=3,
+         out_dtype=torch.bfloat16,
+@@ -1179,21 +1190,30 @@ class MoeExpertsV41Plan:
+             hidden,
+             intermediate,
+         )
+-        self.block_M, self.block_N = block_M, block_N
++        self.block_M, self.prefill_block_M, self.block_N = (
++            block_M,
++            prefill_block_M,
++            block_N,
++        )
+         self.num_stages = num_stages
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+-        self.dispatch = {
+-            dtype: MoeDispatchV41Plan(
+-                num_experts, topk, block_M, hidden, dtype, out_dtype
+-            )
+-            for dtype in (torch.int32, torch.int64)
+-        }
++        self.dispatch, self.prefill_dispatch = (
++            {
++                dtype: MoeDispatchV41Plan(
++                    num_experts, topk, height, hidden, dtype, out_dtype
++                )
++                for dtype in (torch.int32, torch.int64)
++            }
++            for height in (block_M, prefill_block_M)
++        )
+         self.tk = _tile_kernels(block_M)
+ 
+     def kernels(self) -> dict:
+-        """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
++        """The grouped GEMMs and the fused SwiGLU at both tile heights, as the calls
++        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``, and the
++        same with a ``prefill_`` prefix at ``prefill_block_M``."""
+         config = dict(
+             block_N=self.block_N, num_stages=self.num_stages, coded_scales=True
+         )
+@@ -1203,9 +1223,9 @@ class MoeExpertsV41Plan:
+             self.hidden,
+             self.intermediate,
+         )
+-        block_M = self.block_M
+-        return {
+-            "gate_up": prepare.call(
++        kernels = {}
++        for prefix, block_M in (("", self.block_M), ("prefill_", self.prefill_block_M)):
++            kernels[f"{prefix}gate_up"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+                 2 * inter,
+@@ -1214,8 +1234,8 @@ class MoeExpertsV41Plan:
+                 True,
+                 block_M,
+                 **config,
+-            ),
+-            "down": prepare.call(
++            )
++            kernels[f"{prefix}down"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+                 hidden,
+@@ -1224,24 +1244,49 @@ class MoeExpertsV41Plan:
+                 False,
+                 block_M,
+                 **config,
+-            ),
+-            "swiglu": prepare.call(moe_swiglu_cast, inter, block_M, self.swiglu_limit),
+-        }
++            )
++            kernels[f"{prefix}swiglu"] = prepare.call(
++                moe_swiglu_cast, inter, block_M, self.swiglu_limit
++            )
++        return kernels
++
++    def tile_height(self, rows: int) -> int:
++        """The tile height of a call of ``rows`` tokens: ``prefill_block_M`` once the
++        average expert has a full ``block_M`` tile of routes (``rows * topk >=
++        block_M * num_experts``: 2,048 tokens for V4.1's 384 experts at top-6),
++        else ``block_M``. Decode steps and their CUDA graphs stay below it."""
++        if rows * self.topk >= self.block_M * self.num_experts:
++            return self.prefill_block_M
++        return self.block_M
++
++    def _dispatch_for(self, rows: int, idx_dtype):
++        """The dispatch plan of a call at its tile height."""
++        if self.tile_height(rows) == self.block_M:
++            return self.dispatch[idx_dtype]
++        return self.prefill_dispatch[idx_dtype]
++
++    def _kernels_for(self, rows: int):
++        """The (gate/up, SwiGLU, down) kernels of a call at its tile height."""
++        if self.tile_height(rows) == self.block_M:
++            return self.gate_up, self.swiglu, self.down
++        return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
+ 
+     def declare_kernels(self) -> None:
+         """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
+         kernels, stored on the plans once prepared."""
+ 
++        dispatches = (*self.dispatch.values(), *self.prefill_dispatch.values())
++
+         def calls() -> list[prepare.TileLangCall]:
+             out = _calls(self.kernels())
+-            for dispatch in self.dispatch.values():
++            for dispatch in dispatches:
+                 out.extend(_calls(dispatch.kernels()))
+             return out
+ 
+         def bind() -> None:
+             for name, kernel in _launch(self.kernels()).items():
+                 setattr(self, name, kernel)
+-            for dispatch in self.dispatch.values():
++            for dispatch in dispatches:
+                 dispatch.bind()
+ 
+         prepare.declare(calls, bind=bind)
+@@ -1268,8 +1313,10 @@ class MoeExpertsV41Plan:
+         return tuple(prepared)
+ 
+     def workspace_specs(self, rows, idx_dtype=torch.int64):
+-        dispatch = self.dispatch[idx_dtype]
+-        layout_rows = dispatch.tiles(rows) * self.block_M
++        """One call's scratch, laid out for the call's tile height (``tile_height``):
++        ``prefill_block_M`` tiles pad each expert's routes to more rows."""
++        dispatch = self._dispatch_for(rows, idx_dtype)
++        layout_rows = dispatch.tiles(rows) * dispatch.block_M
+         hidden, inter = self.hidden, self.intermediate
+         return (
+             *dispatch.workspace_specs(rows),
+@@ -1307,7 +1354,8 @@ class MoeExpertsV41Plan:
+         unchanged until its last call.
+         """
+         rows = topk_ids.shape[0]
+-        dispatch = self.dispatch[topk_ids.dtype]
++        dispatch = self._dispatch_for(rows, topk_ids.dtype)
++        gate_up_kernel, swiglu_kernel, down_kernel = self._kernels_for(rows)
+         specs = self.workspace_specs(rows, topk_ids.dtype)
+         if workspace is None:
+             workspace = torch.empty(
+@@ -1321,9 +1369,9 @@ class MoeExpertsV41Plan:
+         order, tile_expert = layout["order"], layout["tile_expert"]
+         # The gather reads the live rows only; padding rows past them are not read.
+         x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
+-        self.gate_up(x.values, x_words, *_present(gate_up), order, tile_expert, h)
+-        self.swiglu(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+-        self.down(hq, h_words, *_present(down), order, tile_expert, y)
++        gate_up_kernel(x.values, x_words, *_present(gate_up), order, tile_expert, h)
++        swiglu_kernel(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
++        down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
+         if callable(shared):
+             shared = shared()
+         if out is not None:
+-- 
+2.54.0 (Apple Git-157)
+

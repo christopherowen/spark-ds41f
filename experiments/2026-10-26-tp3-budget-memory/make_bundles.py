@@ -19,7 +19,9 @@ still BASE's: every package file the ref changes from BASE is mounted, and a pac
 it deletes is mounted as one that fails to import (as
 experiments/2026-10-25-retire-conditionals/make_review_bundle.py does). Their benchmarks
 compare against NEXT's modules. They have no serving arms: candidate 6's recipe still
-selects the kernel family that next-candidate removes.
+selects the kernel family that next-candidate removes. The ``next2-*`` bundles are the
+same on next-candidate after the kernel audit landed (NEXT2, branch tp3-levers-next2), and
+``next2-audit-attention`` runs the audit's attention bundle's steps on that branch.
 """
 import json
 import shutil
@@ -38,7 +40,17 @@ BASE_ARMS = {
 }
 FIXTURES = HERE.parent / "2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 NEXT = "4209a1903"
-ON_NEXT = ("next-candidate", "next-levers")
+# next-candidate after the kernel audit landed (e20c47020 and the audit's seven commits).
+NEXT2 = "16c1b8cae"
+# Each next bundle's base: what its benchmarks compare against.
+PARENTS = {
+    "next-candidate": NEXT,
+    "next-levers": NEXT,
+    "next2-candidate": NEXT2,
+    "next2-levers": NEXT2,
+    "next2-audit-attention": NEXT2,
+}
+ON_NEXT = tuple(PARENTS)
 MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
@@ -80,6 +92,49 @@ def without_release_failures(step):
     if "tests/models/test_deepseek_v4_1_attention.py" not in argv:
         return step
     return (label, [*argv, "-k", f"not ({' or '.join(RELEASE_FAILURES)})"], *rest)
+
+
+def next_lever_steps(name: str) -> list:
+    """The levers' checks on a next-candidate tree: their test files, both gated
+    benchmarks against the base's modules, the lane check and the initcheck control."""
+    return [
+        ("the levers' test files", PYTEST + [
+            "--basetemp", f"/c/pytest-tp3-levers-{name}", *LEVER_TESTS], 7200),
+        ("prefill tiles benchmark", [
+            "benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py",
+            "--baseline", "/b/baseline/moe.py", "--gate"], 5400),
+        ("candidate ids against next-candidate's positions", [
+            "benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py",
+            "--baseline", "/b/baseline/indexer.py", "--gate"], 5400),
+        ("lane reservations by layer role", ["/b/lane_check.py"], 1800),
+        ("initcheck positive control: candidates without their count bound", [
+            "/b/initcheck_control.py", f"{SANITIZER_MOUNT}/compute-sanitizer", ROOT],
+         3600),
+    ]
+
+
+# The kernel audit's attention bundle on next-candidate
+# (experiments/2026-10-25-kernel-audit/bundles/audit-next-attention): its tests share
+# test_deepseek_v41_tilelang.py with 0507's.
+AUDIT_ATTENTION_STEPS = [
+    ("metadata and attention kernel tests", PYTEST + [
+        "--basetemp", "/c/pytest-tp3-levers-audit-attention",
+        "tests/kernels/test_deepseek_v41_tilelang_metadata.py",
+        "tests/kernels/attention/test_deepseek_v41_tilelang.py"], 3600),
+    ("attention layer tests", PYTEST + [
+        "--basetemp", "/c/pytest-tp3-levers-audit-attention-layer",
+        "tests/models/test_deepseek_v4_1_attention.py"], 1800),
+    ("compressor tests", PYTEST + [
+        "--basetemp", "/c/pytest-tp3-levers-audit-compressor",
+        "tests/models/test_deepseek_v4_1_compressor.py"], 1800),
+    ("live-page benchmark",
+     ["benchmarks/kernels/benchmark_deepseek_v41_metadata_pages.py", "--gate"], 3600),
+    ("one-launch builder benchmark",
+     ["benchmarks/kernels/benchmark_deepseek_v41_metadata_builder.py", "--gate"], 1800),
+]
+
+LEVER_BASELINES = ["vllm/models/deepseek_v4_1/tilelang/moe.py",
+                   "vllm/models/deepseek_v4_1/tilelang/indexer.py"]
 
 
 # change: (branch, description, baseline modules, [(label, argv after python, timeout
@@ -156,21 +211,33 @@ CHANGES = {
     "next-levers": (
         "tp3-levers-next",
         "the four levers on next-candidate, 0504-0507 as individual commits",
-        ["vllm/models/deepseek_v4_1/tilelang/moe.py",
-         "vllm/models/deepseek_v4_1/tilelang/indexer.py"],
-        [("the levers' test files", PYTEST + [
-            "--basetemp", "/c/pytest-tp3-levers-next-levers", *LEVER_TESTS], 7200),
-         ("prefill tiles benchmark", [
-             "benchmarks/kernels/benchmark_deepseek_v41_moe_prefill_tiles.py",
-             "--baseline", "/b/baseline/moe.py", "--gate"], 5400),
-         ("candidate ids against next-candidate's positions", [
-             "benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py",
-             "--baseline", "/b/baseline/indexer.py", "--gate"], 5400),
-         ("lane reservations by layer role", ["/b/lane_check.py"], 1800),
-         ("initcheck positive control: candidates without their count bound", [
-             "/b/initcheck_control.py", f"{SANITIZER_MOUNT}/compute-sanitizer", ROOT],
-          3600)],
+        LEVER_BASELINES,
+        next_lever_steps("next-levers"),
         ["lane_check.py", "initcheck_control.py"],
+    ),
+    "next2-candidate": (
+        NEXT2,
+        "next-candidate with the kernel audit: every test file the levers' bundles run, "
+        "for the failures that predate them there",
+        [],
+        [("the levers' test files on next-candidate", PYTEST + [
+            "--basetemp", "/c/pytest-tp3-levers-next2-candidate", *LEVER_TESTS], 7200)],
+        [],
+    ),
+    "next2-levers": (
+        "tp3-levers-next2",
+        "the four levers on next-candidate with the kernel audit, 0504-0507 as individual "
+        "commits",
+        LEVER_BASELINES,
+        next_lever_steps("next2-levers"),
+        ["lane_check.py", "initcheck_control.py"],
+    ),
+    "next2-audit-attention": (
+        "tp3-levers-next2",
+        "the kernel audit's attention tests and benchmarks with the four levers on it",
+        [],
+        AUDIT_ATTENTION_STEPS,
+        [],
     ),
     "memory-cuts": (
         "memory-cuts",
@@ -243,7 +310,7 @@ def main() -> None:
         deleted = {path for kind, path in status if kind == "D"}
         changed = [path for kind, path in status
                    if kind != "D" or path.startswith("vllm/")]
-        parent = NEXT if name in ON_NEXT else BASE
+        parent = PARENTS.get(name, BASE)
         bundle = HERE / "bundles" / name
         # Files are overwritten in place, never deleted: a file this run would not write
         # (a path the branch no longer changes) stops it, for a person to remove.

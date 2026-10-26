@@ -12,6 +12,34 @@
   - the memory cuts (levers 2-4): layer 20's candidates as block ids, the drafter's workspace lane
     without the target's indexer scratch, the two unread buffers.
 
+## On next-candidate with the kernel audit (2026-10-26, about 01:30 CET)
+
+next-candidate moved to 16c1b8cae: e20c47020 (the replay-start reference fix) and the kernel
+audit's seven commits. The levers land second.
+- **vLLM branch:** `tp3-levers-next2` (local, not pushed), on 16c1b8cae. Its commits, in order:
+  1. 0504 9ad4a1fdb;
+  2. 0505 a0dc662f5;
+  3. 0506 410338b04;
+  4. 0507 577091997.
+- **Patches:** [vllm-next2-candidate/](vllm-next2-candidate). They replay onto 16c1b8cae to the
+  branch's tree.
+- **The one conflict, `test_deepseek_v41_tilelang.py`:**
+  - both sides' appended tests are kept;
+  - the audit's `test_indexer_reads_only_live_pages[candidates=True]` now builds block ids as
+    the source writes them (the last block partly visible, one masked block, `-1` padding),
+    since 0507's re-index plan takes block ids.
+- **dgx4 runs:**
+
+  | Bundle | Result | Record |
+  | --- | --- | --- |
+  | `next2-candidate` (16c1b8cae itself) | 207 passed, 1 xfailed | [runs/next2-candidate.json](runs/next2-candidate.json) |
+  | `next2-levers` | 232 passed, 1 xfailed; prefill tiles −11.4% at TP3's 8,192 and −15.1% at TP4's 16,384, bits identical; re-index 239.1 vs 247.0 µs; lane check; initcheck control | [runs/next2-levers.json](runs/next2-levers.json) |
+  | `next2-audit-attention` (the audit's `audit-next-attention` steps on this branch) | 175 + 5 + 5 passed, 1 xfailed; both of the audit's gated benchmarks pass | [runs/next2-audit-attention.json](runs/next2-audit-attention.json) |
+
+  The audit's own generator rewrites its bundles in place after deleting them, so its steps
+  are mirrored in [make_bundles.py](make_bundles.py) (`AUDIT_ATTENTION_STEPS`) and run with
+  this experiment's temp directories and dgx4's compute-sanitizer.
+
 ## On next-candidate (2026-10-26, about 01:00 CET)
 
 Owner direction, through the coordinator: build a new candidate from next-candidate, and push
@@ -628,7 +656,8 @@ is kept here, ready, in case candidate 6's own cost per budget token is wanted l
 - [make_bundles.py](make_bundles.py): writes the levers' bundles (`bundles/<lever>`) and their
   serving arms (`<lever>-tp3.json`, `<lever>-tp4.json`) from the vLLM branches. It writes in
   place and stops on stale files; it never deletes. `bundles/next-candidate` and
-  `bundles/next-levers` are next-candidate and `tp3-levers-next`, with no serving arms.
+  `bundles/next-levers` are next-candidate and `tp3-levers-next`, and `bundles/next2-*` the
+  same after the kernel audit plus its attention steps; none has serving arms.
 - [initcheck_control.py](initcheck_control.py): the read-bound test's positive control in
   candidate mode.
 - [lane_check.py](lane_check.py): each attention layer role's workspace reservation (lever 3's
@@ -639,3 +668,5 @@ is kept here, ready, in case candidate 6's own cost per budget token is wanted l
   the release's 26382f5cf).
 - [vllm-next-candidate/](vllm-next-candidate): the same four on next-candidate 4209a1903, as
   `tp3-levers-next` holds them.
+- [vllm-next2-candidate/](vllm-next2-candidate): the same four on next-candidate 16c1b8cae
+  (with the kernel audit), as `tp3-levers-next2` holds them.
