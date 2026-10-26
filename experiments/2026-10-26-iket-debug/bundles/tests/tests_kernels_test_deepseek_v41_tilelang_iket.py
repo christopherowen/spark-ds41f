@@ -137,6 +137,21 @@ def test_sampled_ctas_guard_every_event():
     assert "__tl_iket_cta" not in iket.annotate(KERNEL, _token)[0]
 
 
+def test_sampled_iterations_guard_loop_ranges():
+    out, sites = iket.annotate(KERNEL, _token, iters=2)
+    stride = "((int)((ko) - (0)) % max(1, (int)(((4) - (0) + 1) / 2)) == 0)"
+    lines = [line.strip() for line in out.splitlines()]
+    in_loop = [s["range"] for s in sites if s["loops"]]
+    assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
+    guarded = [line for line in lines if line.startswith(f"if ({stride}) ")]
+    # Each in-loop range: its start, its settle and its end.
+    assert len(guarded) == 3 * len(in_loop)
+    # Ranges outside the loop, and the unrolled loop wrapped whole, are not guarded.
+    assert 'TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");' in lines
+    both = iket.annotate(KERNEL, _token, ctas=4, iters=2)[0]
+    assert f"if (__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
+
+
 def test_module_without_kernels_is_unchanged():
     code = (
         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"

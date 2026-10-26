@@ -112,18 +112,18 @@ BUNDLES = {
     "step": dict(
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
-             "production recipe's kernels and graphs): on under run-iket (four CTAs a launch "
-             "record ranges), nsys durations off, and the decode-step table",
+             "production recipe's kernels and graphs): on under run-iket (four CTAs a launch and "
+             "two iterations a loop record ranges), nsys durations off, and the decode-step table",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
-            # run-iket sizes its pool as if every launch of the run were in flight at
-            # once (898 GB here: 16,894 launches, 5,016 timestamps a warp); the pool
-            # is reused as launches finish, so a fixed one holds the step's.
+            # run-iket's pool is a bump allocator for the whole run: every warp of every
+            # instrumented launch gets the run's largest warp record (5,016 timestamps
+            # unsampled: 898 GB). Sampled CTAs and iterations bound that record, and the
+            # pool it sizes from the dry run.
             ("decode steps, on, under run-iket",
-             ["run-iket", "--context-buffer-size", "8G", "--output-dir", "{out}/trace", "profile",
-              "--postprocess", "all", "--",
-              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4",
+             [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
+              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "2",
               "--out", "{out}/trace-run"], 7200),
             ("decode steps, nsys, off", [*NSYS_PROFILE, "{out}/nsys-off", "--cuda-graph-trace=node",
                                          "{python}", STEP, "off", "--out", "{out}/nsys-off-run"], 5400),
@@ -157,23 +157,28 @@ BUNDLES = {
     ),
     "step-bits": dict(
         ref=IKET,
-        what="decode steps end to end at TP1 with uninitialized tensors filled: off twice and on "
-             "(four CTAs a launch), and whether their tokens agree",
+        what="decode steps end to end at TP1 with uninitialized tensors filled: off, and on with "
+             "no sampling, four CTAs a launch, and four CTAs and two iterations a loop; whether "
+             "their tokens agree",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
             ("decode steps, off, filled", ["{python}", STEP, "off", "--filled", "--out", "{out}/off"], 5400),
-            ("decode steps, off again, filled",
-             ["{python}", STEP, "off", "--filled", "--out", "{out}/off-again"], 5400),
-            ("decode steps, on, filled", ["{python}", STEP, "on", "--filled", "--iket", "{out}/on/iket",
-                                          "--ctas", "4", "--out", "{out}/on"], 5400),
+            ("decode steps, on, filled, unsampled",
+             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on/iket", "--out", "{out}/on"], 5400),
+            ("decode steps, on, filled, CTAs sampled",
+             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on-ctas/iket", "--ctas", "4",
+              "--out", "{out}/on-ctas"], 5400),
+            ("decode steps, on, filled, CTAs and iterations sampled",
+             ["{python}", STEP, "on", "--filled", "--iket", "{out}/on-iters/iket", "--ctas", "4",
+              "--iters", "2", "--out", "{out}/on-iters"], 5400),
             ("tokens agree", ["{python}", "-c",
-                              "import json, sys; t = [json.load(open(p))['token_ids'] for p in sys.argv[1:]]; "
-                              "print(json.dumps({'off': t[0], 'off_again': t[1], 'on': t[2], "
-                              "'off_repeats': t[0] == t[1], 'on_equals_off': t[2] == t[0]})); "
-                              "sys.exit(0 if t[0] == t[1] == t[2] else 1)",
-                              "{out}/off/result.json", "{out}/off-again/result.json", "{out}/on/result.json"],
-             60),
+                              "import json, sys; names = ['off', 'on', 'on_ctas', 'on_iters']; "
+                              "t = dict(zip(names, (json.load(open(p))['token_ids'] for p in sys.argv[1:]))); "
+                              "print(json.dumps({**t, **{n + '_equals_off': t[n] == t['off'] for n in names[1:]}})); "
+                              "sys.exit(0 if len({tuple(v) for v in t.values()}) == 1 else 1)",
+                              "{out}/off/result.json", "{out}/on/result.json", "{out}/on-ctas/result.json",
+                              "{out}/on-iters/result.json"], 60),
         ],
     ),
     "step-off": dict(

@@ -12,19 +12,7 @@
   5400
  ],
  [
-  "decode steps, off again, filled",
-  [
-   "{python}",
-   "/b/iket_step.py",
-   "off",
-   "--filled",
-   "--out",
-   "{out}/off-again"
-  ],
-  5400
- ],
- [
-  "decode steps, on, filled",
+  "decode steps, on, filled, unsampled",
   [
    "{python}",
    "/b/iket_step.py",
@@ -32,10 +20,42 @@
    "--filled",
    "--iket",
    "{out}/on/iket",
+   "--out",
+   "{out}/on"
+  ],
+  5400
+ ],
+ [
+  "decode steps, on, filled, CTAs sampled",
+  [
+   "{python}",
+   "/b/iket_step.py",
+   "on",
+   "--filled",
+   "--iket",
+   "{out}/on-ctas/iket",
    "--ctas",
    "4",
    "--out",
-   "{out}/on"
+   "{out}/on-ctas"
+  ],
+  5400
+ ],
+ [
+  "decode steps, on, filled, CTAs and iterations sampled",
+  [
+   "{python}",
+   "/b/iket_step.py",
+   "on",
+   "--filled",
+   "--iket",
+   "{out}/on-iters/iket",
+   "--ctas",
+   "4",
+   "--iters",
+   "2",
+   "--out",
+   "{out}/on-iters"
   ],
   5400
  ],
@@ -44,10 +64,11 @@
   [
    "{python}",
    "-c",
-   "import json, sys; t = [json.load(open(p))['token_ids'] for p in sys.argv[1:]]; print(json.dumps({'off': t[0], 'off_again': t[1], 'on': t[2], 'off_repeats': t[0] == t[1], 'on_equals_off': t[2] == t[0]})); sys.exit(0 if t[0] == t[1] == t[2] else 1)",
+   "import json, sys; names = ['off', 'on', 'on_ctas', 'on_iters']; t = dict(zip(names, (json.load(open(p))['token_ids'] for p in sys.argv[1:]))); print(json.dumps({**t, **{n + '_equals_off': t[n] == t['off'] for n in names[1:]}})); sys.exit(0 if len({tuple(v) for v in t.values()}) == 1 else 1)",
    "{out}/off/result.json",
-   "{out}/off-again/result.json",
-   "{out}/on/result.json"
+   "{out}/on/result.json",
+   "{out}/on-ctas/result.json",
+   "{out}/on-iters/result.json"
   ],
   60
  ]

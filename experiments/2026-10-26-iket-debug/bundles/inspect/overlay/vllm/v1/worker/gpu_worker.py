@@ -431,7 +431,9 @@ class Worker(WorkerBase):
             # compiles, so it must be on before the first one.
             from vllm.models.deepseek_v4_1.tilelang import iket
 
-            iket.enable(envs.VLLM_DS41_IKET, envs.VLLM_DS41_IKET_CTAS)
+            iket.enable(
+                envs.VLLM_DS41_IKET, envs.VLLM_DS41_IKET_CTAS, envs.VLLM_DS41_IKET_ITERS
+            )
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

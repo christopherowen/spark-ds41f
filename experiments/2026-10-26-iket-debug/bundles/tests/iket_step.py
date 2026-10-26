@@ -99,6 +99,7 @@ def main():
     parser.add_argument("--drafts", type=int, default=5)
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
+    parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
@@ -118,9 +119,10 @@ def main():
         # The worker enables the mode again from these; the same arguments agree.
         os.environ["VLLM_DS41_IKET"] = args.iket
         os.environ["VLLM_DS41_IKET_CTAS"] = str(args.ctas)
+        os.environ["VLLM_DS41_IKET_ITERS"] = str(args.iters)
         from vllm.models.deepseek_v4_1.tilelang import iket
 
-        iket.enable(args.iket, args.ctas)
+        iket.enable(args.iket, args.ctas, args.iters)
     marker = marker_kernel()
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
 
@@ -142,13 +144,13 @@ def main():
         # A small profile run keeps the startup's share of a trace small; prefill
         # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192),
         # with room in the step for the decode rows beside one.
-        max_num_batched_tokens=1024,
-        long_prefill_token_threshold=512,
+        max_num_batched_tokens=512,
+        long_prefill_token_threshold=256,
         max_parallel_prefills=1,
         async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
         # The startup check wants this share free; run-iket's pool takes some.
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=0.6,
         enable_prefix_caching=False,
         attention_backend="TILELANG",
         linear_backend="tilelang",
@@ -197,6 +199,7 @@ def main():
         "token_ids": list(measured.outputs[0].token_ids),
         "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
         "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
+        "VLLM_DS41_IKET_ITERS": envs.VLLM_DS41_IKET_ITERS,
         "filled": args.filled,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "text_overrides": TEXT_OVERRIDES,

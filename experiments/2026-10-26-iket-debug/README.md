@@ -211,6 +211,108 @@ What the table shows:
    - Its time shows at the barrier that follows (`wait.sync#2` above). This is a property
      of IKET's warp granularity, not something the pass can change.
 
+## Step 4: decode steps end to end on one GPU
+
+DS4.1-Flash does not fit one GB10 at native weights. `harness/iket_step.py` runs vLLM's
+engine in its own process, on DS4.1-Flash-1017's config with dummy weights at TP1. It
+uses the production recipe's kernels and graphs:
+- the TileLang attention, linear and MoE backends;
+- DSpark with five greedy drafts, block verification and adaptive verification;
+- `FULL_AND_PIECEWISE` CUDA graphs;
+- the packed BF16 head in FP32;
+- async scheduling and aligned prefill chunks.
+
+Six of the 40 layers keep every attention role (callable `hf_overrides`, which reach the
+drafter too):
+- two SWA layers (ratio 0);
+- a CSA layer that is a KV and index source, and one that reuses it (ratio 2);
+- the HCA candidate source, and a layer that re-indexes its candidates (ratio 1);
+- the drafter's three layers after them.
+
+The Engram layers are left out, and at TP1 nothing all-reduces. Shapes are TP1's: the
+sharded GEMMs are three times TP3's width. A marker kernel (`iket_step_marker`) brackets
+the measured request: one prefill and eight decode steps after a warm request.
+`iket_table.py --between iket_step_marker_kernel` reads only the launches between the
+two markers.
+
+What a whole-engine trace needed:
+- **CTA sampling (`VLLM_DS41_IKET_CTAS=4`).** In each launch only about four CTAs,
+  evenly spread, record ranges. run-iket still records every warp's lifetime, so spans
+  stay exact.
+  - Unsampled, the hot kernels alone wrote a 1.39 GB trace.json from 61 launches: the
+    expert GEMMs' K loops put up to 36 iterations of ranges in every warp.
+- **A fixed IKET pool (`--context-buffer-size 8G`).** run-iket sizes its device pool as
+  if every launch of the run were in flight at once:
+  - the dry run saw 16,894 launches and 86 graph launches, mostly the engine's startup;
+  - its largest warp held 5,016 timestamps, which it reserves for every warp of every
+    instrumented launch;
+  - that came to 898 GB, and the run was killed.
+
+  The pool is reused as launches finish.
+- **Room on the GPU.** The pool counts against vLLM's startup check, so the harness sets
+  `gpu_memory_utilization=0.8`. The KV pool is fixed by bytes.
+- **Comparable runs.** vLLM's dummy loader leaves integer tensors uninitialized: the
+  packed FP4 experts and their UE8M0 scales. The harness zeroes them. Even then, two off
+  runs give different tokens, because more of what the TP1 dummy engine reads is never
+  written. So the token comparison (`step-bits`) fills uninitialized tensors with
+  `torch.use_deterministic_algorithms(True, warn_only=True)`. The trace run does not,
+  since the fills add kernels to the graphs.
+
+<step 4 results>
+
+## Tracing a multi-rank serving step later (not run)
+
+What run-iket does that matters here:
+- It injects through `CUDA_INJECTION64_PATH` and `SMODEL_INJECTION_CONFIG`. vLLM's `mp`
+  workers inherit both, so each rank writes its own `iket_pid_*` trace.
+- It also sets `CUTE_DSL_COMPILER_OPT=iket`, which keeps CuTe DSL's own IKET ops in any
+  CuTe kernel compiled under it.
+- It runs the workload twice: the tracker dry run, then the measured run. A server never
+  exits, so the dry run must be bounded.
+
+What a serving trace on the cluster would take:
+1. **A finite workload.** Wrap each node's `vllm serve` as `run-iket … profile -- vllm
+   serve …`, with a driver that sends a fixed request set and then stops the servers. The
+   alternative is a dry run of the same workload once, replayed with
+   `--use-tracker-dir`. Both passes must run the same launches: run-iket assumes stable
+   record counts between them.
+2. **Memory.** Size the pool by hand (`--context-buffer-size`), and lower
+   `--kv-cache-memory-bytes` by it.
+   - Serving leaves 5–7 GiB free a node, and dgx1's 5 GiB startup guard binds. The pool
+     must come out of the KV budget, never out of the guard.
+   - Use `VLLM_DS41_IKET_CTAS` to keep records small.
+3. **Boot time.** The mode turns TileLang's caches off, so every rank compiles every
+   kernel cold. The startup rendezvous waits for alive ranks; the heartbeat timeout only
+   matters for a hung rank.
+4. **One timeline.** Traces from different GPUs are not on one clock. sparknet's trace
+   clock (`sparknet.oneshot._trace_clock`) measures each node's `%globaltimer`-minus-
+   `CLOCK_MONOTONIC_RAW` offset with a ping kernel. That ties a rank's IKET timestamps to
+   its own host.
+   - Across nodes it still needs a shared reference: the hosts' synchronized
+     `CLOCK_REALTIME`, or the one-shot all-reduces themselves, whose peer waits end
+     within about a microsecond on every rank.
+5. **No nsys at the same time.** IKET and nsys both need CUPTI.
+6. **A window.** It needs the owner's consent and a cluster window (`bin/spark cluster
+   stop/start`), with memguard armed as always. dgx4 cannot do it alone: it is uncabled.
+
+## Found on the way (not fixed here)
+
+1. **A stubbed vision tower still declares its kernels.** With `limit_mm_per_prompt
+   {"image": 0}`, DS4.1's TileLang vision tower is a stub with meta weights, but
+   `declare_kernels` still declares its calls. Binding them then raises "the TileLang
+   vision tower requires CUDA weights" (`nvidia/tilelang_vision.py` `_device`).
+   Production allows 4 images and never meets it.
+2. **The dead-row warmup assumes two sequences.** `_warmup_dead_row_kernels`
+   (`v1/worker/gpu/warmup.py`) launches for one request and for two. At
+   `max_num_seqs=1` it copies three `query_start_loc` entries into a two-entry buffer
+   and fails. Production runs 16.
+3. **vLLM's dummy loader leaves integer tensors uninitialized** (upstream; it zeroes them
+   only on ROCm): DS4.1's packed FP4 experts and their UE8M0 scales. More of what the
+   TP1 dummy engine reads is never written, so two dummy runs give different tokens.
+4. **run-iket's automatic pool sizing does not scale to an engine run** (NVIDIA's
+   tool). It reserves the run's largest warp record for every warp of every
+   instrumented launch, as if all were in flight. Set `--context-buffer-size`.
+
 ## Reading a trace
 
 ```sh

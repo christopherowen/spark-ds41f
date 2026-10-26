@@ -298,12 +298,13 @@ class _Range:
     kinds: set[str]
     first: _Node
     last: _Node
+    loops: tuple[str, ...] = ()  # the headers of the for loops around the range
     kernel: str = ""
     base: str = ""
     name: str = ""
 
 
-def _ranges(nodes: list[_Node]) -> list[_Range]:
+def _ranges(nodes: list[_Node], loops: tuple[str, ...] = ()) -> list[_Range]:
     """Ranges over a statement list: runs of one phase, each wait alone. A block
     that mixes phases, jumps, shares a line or waits (other than a spin loop) is
     entered instead."""
@@ -318,20 +319,37 @@ def _ranges(nodes: list[_Node]) -> list[_Range]:
         )
         if node.jumps or node.phase == "mixed" or not node.alone or waits:
             run = None
+            inner = (*loops, node.text) if node.text.startswith("for") else loops
             for children in (node.body, node.orelse):
                 if children and node.phase is not None:
-                    found.extend(_ranges(children))
+                    found.extend(_ranges(children, inner))
             continue
         if node.phase == "wait":
-            found.append(_Range("wait", set(node.kinds), node, node))
+            found.append(_Range("wait", set(node.kinds), node, node, loops))
             run = None
         elif run is not None and run.phase == node.phase:
             run.last = node
             run.kinds |= node.kinds
         else:
-            run = _Range(node.phase, set(node.kinds), node, node)
+            run = _Range(node.phase, set(node.kinds), node, node, loops)
             found.append(run)
     return found
+
+
+_FOR = re.compile(
+    r"for\s*\(\s*(?:[\w:]+\s+)+(\w+)\s*=\s*([^;]+);\s*\1\s*<\s*([^;]+);\s*\+\+\1\s*\)"
+)
+
+
+def _iterations(header: str, iters: int) -> str | None:
+    """True in at most ``iters`` evenly spread iterations of a TVM ``for`` loop
+    (``for (int v = start; v < bound; ++v)``), or None for another header."""
+    loop = _FOR.match(header)
+    if loop is None:
+        return None
+    v, start, bound = (part.strip() for part in loop.groups())
+    stride = f"max(1, (int)((({bound}) - ({start}) + {iters - 1}) / {iters}))"
+    return f"((int)(({v}) - ({start})) % {stride} == 0)"
 
 
 def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
@@ -361,7 +379,7 @@ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
 
 
 def annotate(
-    code: str, token: Callable[[str, int], str], ctas: int = 0
+    code: str, token: Callable[[str, int], str], ctas: int = 0, iters: int = 0
 ) -> tuple[str, list[dict]]:
     """``code`` with each phase of each kernel in an IKET range, and its sites.
 
@@ -369,9 +387,12 @@ def annotate(
     ``name``. With ``ctas`` > 0 only about that many CTAs of a launch, evenly
     spread, record their ranges (run-iket still records every warp's lifetime):
     a kernel with many CTAs and loop-carried ranges otherwise writes millions of
-    records a launch. A module with no ``__global__`` definition comes back
-    unchanged; a kernel with a preprocessor conditional in its body is left as
-    it is."""
+    records a launch. With ``iters`` > 0 a range inside a ``for`` loop records in
+    at most that many of its iterations, evenly spread: run-iket reserves the
+    run's largest warp record for every warp of every instrumented launch, so a
+    long loop of ranges in one kernel sizes the whole run's buffer. A module with
+    no ``__global__`` definition comes back unchanged; a kernel with a
+    preprocessor conditional in its body is left as it is."""
     found: list[_Range] = []
     sites: list[dict] = []
     bodies: dict[str, int] = {}
@@ -403,7 +424,6 @@ def annotate(
             item.name = item.base
     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
     inserts: list[tuple[int, int, str]] = []
-    guard = "if (__tl_iket_cta) " if ctas else ""
     for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):
         if not ctas:
             break
@@ -415,6 +435,17 @@ def annotate(
         )
         inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
     for item in found:
+        # Each condition holds through a range: the CTA's, and its loops' iterations
+        # (a loop variable does not change inside one iteration).
+        conditions = ["__tl_iket_cta"] if ctas else []
+        unsampled = []
+        for header in item.loops if iters else ():
+            condition = _iterations(header, iters)
+            if condition is None:
+                unsampled.append(" ".join(header.split()))
+            else:
+                conditions.append(condition)
+        guard = f"if ({' && '.join(conditions)}) " if conditions else ""
         sites.append(
             {
                 "kernel": item.kernel,
@@ -424,6 +455,8 @@ def annotate(
                 "first_line": code.count("\n", 0, item.first.start) + 1,
                 "last_line": code.count("\n", 0, item.last.end - 1) + 1,
                 "statement": " ".join(item.first.text.split())[:160],
+                "loops": len(item.loops),
+                **({"unsampled_loops": unsampled} if unsampled else {}),
                 "traced": item.name in traced,
             }
         )
@@ -458,7 +491,7 @@ def annotate(
 
 _lock = threading.Lock()
 _directory: Path | None = None
-_ctas = 0
+_sampling = (0, 0)  # (CTAs a launch, iterations a loop); 0: all
 
 
 def directory() -> Path | None:
@@ -466,18 +499,19 @@ def directory() -> Path | None:
     return _directory
 
 
-def enable(output: str | os.PathLike[str], ctas: int = 0) -> Path:
+def enable(output: str | os.PathLike[str], ctas: int = 0, iters: int = 0) -> Path:
     """Turn the IKET mode on for this process, before it compiles any TileLang
-    kernel; ``ctas`` > 0 samples about that many CTAs a launch (``annotate``).
-    Idempotent for the same directory and sampling."""
-    global _directory, _ctas
+    kernel; ``ctas`` and ``iters`` > 0 sample CTAs and loop iterations
+    (``annotate``). Idempotent for the same directory and sampling."""
+    global _directory, _sampling
     root = Path(output).expanduser().resolve()
+    sampling = (int(ctas), int(iters))
     with _lock:
         if _directory is not None:
-            if (root, ctas) != (_directory, _ctas):
+            if (root, sampling) != (_directory, _sampling):
                 raise RuntimeError(
-                    f"IKET mode is already on with {_directory} and {_ctas} CTAs, "
-                    f"not {root} and {ctas}"
+                    f"IKET mode is already on with {_directory}, sampling {_sampling}; "
+                    f"not {root}, {sampling}"
                 )
             return _directory
         import tilelang.cache
@@ -501,7 +535,7 @@ def enable(output: str | os.PathLike[str], ctas: int = 0) -> Path:
         os.environ["TILELANG_CACHE_DIR"] = str(root / "tilelang-cache")
         disable_cache()
         tvm_ffi.register_global_func(_CUDA_POSTPROC, f=_postproc)
-        _directory, _ctas = root, int(ctas)
+        _directory, _sampling = root, sampling
     return root
 
 
@@ -517,12 +551,13 @@ def _postproc(code: str, target) -> str:
     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
 
     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
-    annotated, sites = annotate(code, _token, _ctas)
+    ctas, iters = _sampling
+    annotated, sites = annotate(code, _token, ctas, iters)
     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
     kernel = next((name for name, *_ in _kernels(code)), "module")
     stem = f"{kernel}.{digest}"
     (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
-    manifest = {"kernel": kernel, "ctas": _ctas, "sites": sites}
+    manifest = {"kernel": kernel, "ctas": ctas, "iters": iters, "sites": sites}
     (_directory / "sources" / f"{stem}.json").write_text(
         json.dumps(manifest, indent=1) + "\n"
     )
