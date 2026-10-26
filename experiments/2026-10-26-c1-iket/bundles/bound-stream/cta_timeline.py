@@ -112,7 +112,10 @@ def bins(intervals, start, end, width=1000):
     return out
 
 
-def describe(launch, locations, previous_end, tp):
+def describe(launch, locations, previous_end, tp, gemm=None, experts=None):
+    """One launch's numbers. ``gemm`` ("FC1"/"FC2") names a routed GEMM by its place
+    after the dispatch; ``experts`` (the layer's distinct experts) sets the stream
+    GEMM's bytes, whose CTAs each run several items."""
     c = ctas(launch, locations)
     first = min(s for s, _, _ in c.values())
     last = max(e for _, e, _ in c.values())
@@ -138,12 +141,19 @@ def describe(launch, locations, previous_end, tp):
     if name.startswith("moe_grouped"):
         # A CTA past the last used tile exits right after its PDL wait.
         lives = {k: v for k, v in c.items() if v[1] - max(v[0], ready) > 1500}
-        n_blocks = grid[0]
-        fc1 = n_blocks * BLOCK_N == 2 * INTER[tp]
+        stream = "stream" in name
+        fc1 = gemm == "FC1" if gemm else grid[0] * BLOCK_N == 2 * INTER[tp]
         n, k = (2 * INTER[tp], HIDDEN) if fc1 else (HIDDEN, INTER[tp])
+        n_blocks = n // BLOCK_N
         per = tile_bytes(n, k)
-        total = len(lives) * per
-        intervals = [(max(s, ready), e, per) for s, e, _ in lives.values()]
+        if stream and experts:
+            # Items split evenly over the CTAs: each streams its share of the bytes.
+            total = experts * n_blocks * per
+            share = total / max(1, len(lives))
+            intervals = [(max(s, ready), e, share) for s, e, _ in lives.values()]
+        else:
+            total = len(lives) * per
+            intervals = [(max(s, ready), e, per) for s, e, _ in lives.values()]
         rate = bins(intervals, ready, last)
         peak = max(rate) if rate else 0.0
         hot = [i for i, r in enumerate(rate) if r >= 0.9 * peak]
@@ -153,7 +163,8 @@ def describe(launch, locations, previous_end, tp):
         lifetimes = sorted((e - max(s, ready)) / 1000 for s, e, _ in lives.values())
         starts = sorted((max(s, ready) - ready) / 1000 for s, _, _ in lives.values())
         row.update({
-            "gemm": "FC1" if fc1 else "FC2", "live_tiles": len(lives), "experts": round(len(lives) / n_blocks, 2),
+            "gemm": "FC1" if fc1 else "FC2", "live_tiles": len(lives),
+            "experts": experts if stream and experts else round(len(lives) / n_blocks, 2),
             "exited_ctas": len(c) - len(lives), "tile_bytes": per, "bytes": total,
             "floor_us": floor / 1000, "excess_us": busy / 1000 - floor / 1000,
             "achieved_gbs": total / busy if busy else 0, "peak_bin_gbs": peak,
@@ -178,11 +189,22 @@ def main():
     launches, locations = load(args.trace)
     layers = segments(launches)
     print(f"{len(launches)} launches, {len(layers)} layers")
+    distinct = None
+    if args.routes and args.live:
+        steps = json.loads(Path(args.routes).read_text())["steps"]
+        distinct = [len({e for r in range(args.live) for e in steps[r]["routes_last_position"][str(layer)]})
+                    for layer in range(args.layers)]
     rows = []
     for index, (main, aux) in enumerate(layers):
         previous = None
+        grouped = 0
         for launch in main:
-            row = describe(launch, locations, previous, args.tp)
+            gemm = None
+            if launch["kernelName"].startswith("moe_grouped"):
+                gemm = ("FC1", "FC2")[min(grouped, 1)]
+                grouped += 1
+            experts = distinct[index % len(distinct)] if distinct else None
+            row = describe(launch, locations, previous, args.tp, gemm, experts)
             row["layer"], row["stream"] = index, "main"
             rows.append(row)
             previous = row["_end"]
@@ -193,9 +215,9 @@ def main():
     # Steady layers: drop the first layer of each pass (its predecessor is the host).
     groups = defaultdict(list)
     for row in rows:
-        groups[(row["stream"], row["kernel"], row["grid"])].append(row)
+        groups[(row["stream"], row["kernel"], row["grid"], row.get("gemm"))].append(row)
     summary = []
-    for (stream, kernel, grid), items in groups.items():
+    for (stream, kernel, grid, _), items in groups.items():
         keys = ("span_us", "busy_us", "exclusive_us", "start_gap_us", "sm_idle", "waves", "ctas", "sms")
         entry = {"stream": stream, "kernel": kernel, "grid": grid, "launches": len(items)}
         for key in keys:
