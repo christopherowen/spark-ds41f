@@ -385,10 +385,9 @@ def main():
                      for step in measured.outputs[0].logprobs or []],
         "batched": args.batched,
         "chunk": args.chunk,
-        "VLLM_DS41_IKET": envs.VLLM_DS41_IKET,
-        "VLLM_DS41_IKET_CTAS": envs.VLLM_DS41_IKET_CTAS,
-        "VLLM_DS41_IKET_ITERS": envs.VLLM_DS41_IKET_ITERS,
-        "VLLM_DS41_IKET_SKIP": envs.VLLM_DS41_IKET_SKIP,
+        # A vLLM tree without the IKET mode has none of these (an off run).
+        **{name: getattr(envs, name, None) for name in (
+            "VLLM_DS41_IKET", "VLLM_DS41_IKET_CTAS", "VLLM_DS41_IKET_ITERS", "VLLM_DS41_IKET_SKIP")},
         "filled": args.filled,
         "eager": args.eager,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),

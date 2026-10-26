@@ -42,6 +42,7 @@ NSYS_PROFILE = ["/opt/nsys/bin/nsys", "profile", "--trace=cuda", "--sample=none"
                 "--export=sqlite", "--force-overwrite=true", "--output"]
 
 TESTS = ["tests/kernels/test_deepseek_v41_tilelang_iket.py"]
+MOE_OUTPUT_TEST = "tests/kernels/moe/test_moe_output_outlives_workspace.py"
 PYTEST = ["{python}", "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest"]
 # The production recipe's variables that the TP1 engine reads (config/cluster.json).
 STEP_ENV = {
@@ -261,25 +262,34 @@ BUNDLES = {
         ],
     ),
     # The c3/c8 NaN off the IKET branch (coordinator, 2026-10-26): next-candidate's head,
-    # and 1025's runtime tree (the image's 26382f5cf; its 0489-0490 change only tests).
+    # 1025's runtime tree (the image's 26382f5cf; its 0489-0490 change only tests), and
+    # the fix (vLLM moe-output-fresh: a modular MoE kernel's output never lives in the
+    # workspace arena). Runs 38-40: both trees fail; the NaN enters layer 1's mHC pre
+    # through its previous_output, layer 0's routed output, which lies in the workspace
+    # lane its scratch reuses (at c1 too).
     **{name: dict(
         ref=ref,
-        what=f"the c3/c8 NaN on {label}, IKET off: c3 eager with a non-finite hook on every "
-             f"module, c3 with the graphs, and c8's boot",
+        what=f"the c3/c8 NaN on {label}, IKET off: the fix's test, then c1 and c3 eager with a "
+             f"non-finite hook on every module, c3 with the graphs, and c8",
         # 1025's tree still defaults to the B12X family; the recipe picks TileLang.
         env={**STEP_ENV, "VLLM_DS41_KERNEL_BACKEND": "tilelang"},
         mounts=[HUB],
-        # Runs 38-39: both fail; the NaN enters layer 1's mHC pre through its
-        # previous_output. Does that output lie in the workspace its scratch reuses, at
-        # c1 (no NaN) as at c3?
+        tests=[MOE_OUTPUT_TEST],
+        tests_ref="moe-output-fresh",
         steps=[
-            (f"off, TP4, c{requests}, eager, nan hooks",
-             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--eager",
-              "--nan-hooks", "--out", f"{{out}}/c{requests}-eager"], 1800)
-            for requests in (1, 3)
+            ("the fix's test", [*PYTEST, "--basetemp", "{out}/pytest", MOE_OUTPUT_TEST], 600),
+            *((f"off, TP4, c{requests}, eager, nan hooks",
+               ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--eager",
+                "--nan-hooks", "--out", f"{{out}}/c{requests}-eager"], 1800)
+              for requests in (1, 3)),
+            *((f"off, TP4, c{requests}, graphs",
+               ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests),
+                "--out", f"{{out}}/c{requests}"], 1800)
+              for requests in (3, 8)),
         ],
     ) for name, ref, label in (("nan-next", "c579b3fe1", "next-candidate c579b3fe1"),
-                               ("nan-1025", BASE, "1025's tree (26382f5cf, no overlay)"))},
+                               ("nan-1025", BASE, "1025's tree (26382f5cf, no overlay)"),
+                               ("nan-fix", "moe-output-fresh", "the fix over next-candidate"))},
     "step-counts": dict(
         ref=IKET,
         what="which kernels' warps record past the static bound in the eager decode steps: one "
@@ -483,7 +493,8 @@ def write_bundle(repo, name, spec, bundle, image=IMAGE, base=BASE):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(MISSING.encode() if kind == "D" else show(repo, ref, path))
     for path in tests:
-        (bundle / path.replace("/", "_")).write_bytes(show(repo, ref, path))
+        # ``tests_ref``: a test from another ref, run against this one's tree.
+        (bundle / path.replace("/", "_")).write_bytes(show(repo, spec.get("tests_ref", ref), path))
     for target, source in SCRIPTS.items():
         shutil.copy(source, bundle / target)
     (bundle / "run.py").write_text(RUN)
