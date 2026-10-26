@@ -9,11 +9,13 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4_1.ced import (
+    CED_WINDOW,
+    KEEP_ALL,
     CEDState,
     ced_decoder_start,
     gather_rows,
-    nonfinal_limits,
     plan_ced,
+    replay_rows,
     scatter_rows,
 )
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
@@ -48,70 +50,150 @@ def test_limits_shrink_rows_but_keep_the_window_bound():
     assert plan_ced([7, 4096], [False, False], capacities).num_tokens == 135
 
 
-def test_nonfinal_limits_skip_only_unread_chunks():
-    def limits(q, start, total, full=False, ok=True, align=4096, remaining=200):
-        return nonfinal_limits(
-            [7, q],
-            [900, start],
-            [900, total],
-            [False, full],
-            [True, ok],
-            min_remaining=remaining,
-            chunk_align=align,
+def test_limits_compact_short_queries():
+    # A 100-row chunk that keeps 36 rows compacts, though no query passes the window.
+    plan = plan_ced([7, 100], [False, False], (8, 128, 256), [128, 36])
+    assert (plan.capacity, plan.num_tokens, plan.max_query_len) == (128, 43, 100)
+    assert plan_ced([7, 100], [False, False], (8, 128, 256), [128, 128]) is None
+
+
+def test_replay_rows_anchor_at_the_prompt_end():
+    # The 16,288-row chunk and the 64-row final chunk of a 16,352-row prompt: the
+    # first keeps its last 64 rows, the second all of its rows; both replay from
+    # 16,224, the prompt end less the window.
+    assert replay_rows([16288], [0], [16352], [0], [False]) == ([16224], [64])
+    assert replay_rows([64], [16288], [16352], [0], [False]) == ([16224], [128])
+    # 129 final rows: the earlier chunk keeps one row, the final chunk its last 128.
+    assert replay_rows([16288], [0], [16417], [0], [False]) == ([16289], [1])
+    assert replay_rows([129], [16288], [16417], [0], [False]) == ([16289], [128])
+    # A short first chunk after a prefix hit, cut by the floor.
+    assert replay_rows([32], [16256], [16400], [16256], [False]) == ([16272], [16])
+    # A prompt shorter than the window replays from its start, or from its prefix.
+    assert replay_rows([100], [0], [100], [0], [False]) == ([0], [100])
+    assert replay_rows([60], [40], [100], [40], [False]) == ([40], [60])
+    # A resumed request's prefill length holds the outputs it recomputes.
+    assert replay_rows([4096], [4096], [8200], [4096], [False]) == ([8072], [120])
+    # Decode rows keep the window from the prefix start; prompt logprobs every row.
+    assert replay_rows([6], [5000], [5000], [256], [False]) == ([256], [CED_WINDOW])
+    assert replay_rows([4096], [0], [8192], [64], [True]) == ([64], [KEEP_ALL])
+
+
+def _aligned_chunks(threshold, start, end):
+    """The scheduler's aligned prefill chunks ``(start, rows)`` of a prompt computed
+    from ``start``, when every step has room for a whole chunk."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold)
+    )
+    chunks = []
+    while start < end:
+        rows = Scheduler._aligned_prefill_chunk(
+            scheduler, start, min(end - start, threshold)
+        )
+        chunks.append((start, rows))
+        start += rows
+    return chunks
+
+
+def _replay_windows(chunks, prompt_end, prefix=0):
+    """Each kept decoder row's first visible row, ``{position: row}``, as the requests
+    kernel (kept rows, replay start) and the window metadata (the SWA window from the
+    replay start) place them. Each step's draft window, whose context rows are the
+    kept rows, holds only kept rows."""
+    windows = {}
+    for start, rows in chunks:
+        floors, limits = replay_rows([rows], [start], [prompt_end], [prefix], [False])
+        kept = min(rows, CED_WINDOW, limits[0])
+        plan = plan_ced([rows], [False], (1 << 31,), limits)
+        assert (plan is None) == (kept == rows)
+        end = start + rows
+        replay = min(floors[0], end - kept)
+        for position in range(end - kept, end):
+            windows[position] = max(position + 1 - CED_WINDOW, replay)
+        draft = range(max(end - CED_WINDOW, replay), end)
+        assert all(row in windows for row in draft), (start, rows, prompt_end)
+    return windows
+
+
+@pytest.mark.parametrize("threshold", [300, 4048, 8144, 16288])
+def test_anchored_replay_does_not_depend_on_chunking(threshold):
+    """However the scheduler chunks a prompt, from its start or from a prefix hit, the
+    decoder replays its last CED_WINDOW rows: every row from the floor on is kept and
+    sees ``[max(position - 127, floor), position]``, so the drafter's first window
+    after the prompt is kept too; an earlier kept row is one chunk's last and sees only
+    itself."""
+    window = CED_WINDOW
+    boundaries = (k * threshold + r for k in (1, 2) for r in range(-2, 2 * window + 3))
+    for prompt_end in sorted({*range(1, 3 * window), *boundaries}):
+        hits = (threshold - 96, threshold - 32, threshold + 32, 2 * threshold - 32)
+        for prefix in (0, *(h for h in hits if 0 < h <= prompt_end - window)):
+            floor = max(prefix, prompt_end - window)
+            windows = _replay_windows(
+                _aligned_chunks(threshold, prefix, prompt_end), prompt_end, prefix
+            )
+            case = (threshold, prompt_end, prefix)
+            replayed = {p: first for p, first in windows.items() if p >= floor}
+            expected = {p: max(p + 1 - window, floor) for p in range(floor, prompt_end)}
+            assert replayed == expected, case
+            earlier = [p for p, first in windows.items() if p < floor and first != p]
+            assert not earlier, case
+
+
+@pytest.mark.parametrize("threshold", [300, 4048, 16288])
+def test_final_chunks_over_the_window_replay_as_before(threshold):
+    """A prompt whose final chunk has more than CED_WINDOW rows, or that is a single
+    chunk, keeps its final chunk's rows and replay start: the per-chunk anchor
+    already replayed it from the prompt end."""
+    for prompt_end in range(1, 3 * threshold + 2 * CED_WINDOW, 7):
+        chunks = _aligned_chunks(threshold, 0, prompt_end)
+        start, rows = chunks[-1]
+        if len(chunks) > 1 and rows <= CED_WINDOW:
+            continue
+        floors, limits = replay_rows([rows], [start], [prompt_end], [0], [False])
+        kept = min(rows, CED_WINDOW, limits[0])
+        anchored = (kept, min(floors[0], prompt_end - kept))
+        before = min(rows, CED_WINDOW)
+        per_chunk = (before, prompt_end - before if rows > before else 0)
+        assert anchored == per_chunk, prompt_end
+
+
+def test_compacted_short_chunks_run_eagerly():
+    """A step compacts a chunk that fits the graphs' query bound only when the replay
+    floor cuts it; that step runs eagerly."""
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.ced_state = object()
+    state._ced_prompt_logprobs = set()
+    state._ced_prefix_start = {"decode": 0, "hit": 16256}
+
+    def batch(rows, prompt_end, prefilling=True):
+        return SimpleNamespace(
+            req_ids=["decode", "hit"],
+            num_scheduled_tokens=np.array([6, rows]),
+            num_computed_prefill_tokens_np=np.array([5000, 16256]),
+            prefill_len_np=np.array([5000, prompt_end]),
+            has_prefill=prefilling,
         )
 
-    assert limits(4096, 0, 4296) == [128, 1]
-    assert limits(4096, 4096, 8392) == [128, 1]
-    # Fewer than min_remaining rows follow: the next chunk may replay into this one.
-    assert limits(4096, 0, 4295) is None
-    # The final chunk, and chunks off the scheduler's aligned boundaries.
-    assert limits(4096, 0, 4096) is None
-    assert limits(4000, 96, 9000, align=4096) == [128, 1]
-    assert limits(4000, 0, 9000) is None
-    # Prompt logprobs, multimodal requests and untruncated chunks keep their rows.
-    assert limits(4096, 0, 9000, full=True) is None
-    assert limits(4096, 0, 9000, ok=False) is None
-    assert limits(128, 3968, 9000) is None
+    # The 32-row first chunk after the hit keeps 16 rows, or one before the floor.
+    assert state.compacts_short_queries(batch(32, 16400))
+    assert state.compacts_short_queries(batch(32, 20000))
+    # It keeps every row when the floor is at its start.
+    assert not state.compacts_short_queries(batch(32, 16384))
+    # Prompt logprobs keep every row; longer chunks are eager anyway.
+    state._ced_prompt_logprobs.add("hit")
+    assert not state.compacts_short_queries(batch(32, 20000))
+    state._ced_prompt_logprobs.clear()
+    assert not state.compacts_short_queries(batch(4096, 30000))
+    assert not state.compacts_short_queries(batch(6, 5000, prefilling=False))
+    assert not state.compacts_short_queries(None)
 
 
-@pytest.mark.parametrize(
-    ("spec", "align", "aligned", "expected"),
-    [
-        ("dspark", 4048, True, (199, 4048)),
-        (None, 4048, True, None),
-        ("mtp", 4048, True, None),
-        ("dspark", 198, True, None),
-        ("dspark", 4048, False, None),
-    ],
-)
-def test_nonfinal_skip_policy(spec, align, aligned, expected):
-    from vllm.models.deepseek_v4_1.nvidia.model_state import _nonfinal_skip_policy
-
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(
-            long_prefill_token_threshold=align,
-            enable_chunked_prefill=True,
-            align_prefill_chunks=aligned,
-        ),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
-        speculative_config=None
-        if spec is None
-        else SimpleNamespace(
-            use_dspark=lambda: spec == "dspark",
-            draft_model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(sliding_window=128)
-            ),
-            num_speculative_tokens=5,
-        ),
-    )
-    if expected is None:
-        with pytest.raises(ValueError):
-            _nonfinal_skip_policy(config)
-    else:
-        assert _nonfinal_skip_policy(config) == expected
-
-
-def _state(lengths, seq_lens=None, full=None, prefix=None):
+def _state(lengths, seq_lens=None, full=None, floors=None):
+    """CED state staged for a step of ``lengths`` rows; ``floors``: the requests'
+    replay floors (``replay_rows``)."""
     lengths = np.asarray(lengths, dtype=np.int32)
     nr = len(lengths)
     starts = torch.tensor(np.r_[0, lengths.cumsum()], dtype=torch.int32, device="cuda")
@@ -119,15 +201,16 @@ def _state(lengths, seq_lens=None, full=None, prefix=None):
         lengths if seq_lens is None else seq_lens, dtype=torch.int32, device="cuda"
     )
     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
-    state.stage(starts, seq, lengths, full or [False] * nr, prefix or [0] * nr)
+    state.stage(starts, seq, lengths, full or [False] * nr, floors or [0] * nr)
     return state, starts, seq
 
 
 @cuda
 def test_mixed_metadata_keeps_context_bounds_and_padding():
-    state, starts, seq = _state([1, 4096], [900, 8192])
+    # A decode request and the final chunk of an 8,192-row prompt.
+    state, starts, seq = _state([1, 4096], [900, 8192], floors=[0, 8064])
     # Adaptive verification may produce fewer rows than the CPU scheduling bound.
-    state.stage(starts, seq, [2, 4096], [False, False], [0, 0])
+    state.stage(starts, seq, [2, 4096], [False, False], [0, 8064])
     indices = state.get_indices()
     assert indices.numel() == 130
     expected = torch.cat(
@@ -199,8 +282,6 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
-    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
-    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
     batch = SimpleNamespace(
         num_reqs=2,
@@ -208,6 +289,8 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([4096, 4096]),
+        num_computed_prefill_tokens_np=np.array([0, 0]),
+        prefill_len_np=np.array([4096, 4096]),
     )
     state.add_request(
         0,
@@ -231,35 +314,38 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
 
 @cuda
 def test_prefix_hit_short_chunk_has_no_unwritten_decoder_history():
-    state, _, _ = _state([128, 17], [4224, 9017], prefix=[4096, 0])
+    # A 128-row prompt end after a prefix hit at 4096, and a decode-like request.
+    state, _, _ = _state([128, 17], [4224, 9017], floors=[4096, 0])
     assert state.get_indices() is None
     assert state.replay_start.tolist() == [4096, 0, 0, 0]
 
 
 @cuda
 @pytest.mark.parametrize(
-    "chunk, seq_len, prefix, limit, first",
+    "chunk, seq_len, floor, limit, first",
     [
-        # A 17-row first chunk after a prefix hit at 4096: [4096 - 111, 4096)
+        # A 17-row prompt end after a prefix hit at 4096: [4096 - 111, 4096)
         # precedes the hit, and the drafter's caches are not prefix-cached.
         (17, 4096 + 17, 4096, None, 4096),
-        # A one-row nonfinal chunk: the decoder, and with it the drafter's
-        # context, kept the chunk's last row only.
-        (4096, 8192, 0, 1, 8191),
+        # A chunk that ends before the floor (a 12,288-row prompt): the decoder,
+        # and with it the drafter's context, kept the chunk's last row only.
+        (4096, 8192, 12160, 1, 8191),
+        # The chunk before a 64-row final chunk keeps its last 64 rows.
+        (4096, 8192, 8128, 64, 8128),
     ],
-    ids=["prefix-hit-short-chunk", "one-row-nonfinal-chunk"],
+    ids=["prefix-hit-short-chunk", "chunk-before-the-floor", "chunk-at-the-floor"],
 )
 def test_draft_window_starts_where_the_drafter_has_context(
-    chunk, seq_len, prefix, limit, first
+    chunk, seq_len, floor, limit, first
 ):
     """The drafter's context rows are the CED decoder's kept rows, so a draft
     window starts at CED's replay start: before it, nothing of the request's draft
     window was written in its current blocks."""
     from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
-    state, starts, seq = _state([chunk], [seq_len], prefix=[prefix])
+    state, starts, seq = _state([chunk], [seq_len], floors=[floor])
     if limit is not None:
-        state.stage(starts, seq, [chunk], [False], [prefix], [limit])
+        state.stage(starts, seq, [chunk], [False], [floor], [limit])
     assert state.replay_start[0].item() == first
     drafts, page, window, width = 6, 128, 128, 136
     draft_prefix = seq_len  # the step's anchor: drafts follow its last row
@@ -294,9 +380,10 @@ def test_draft_window_starts_where_the_drafter_has_context(
 
 
 @cuda
-def test_nonfinal_chunk_keeps_its_last_row():
-    state, starts, seq = _state([7, 4096], [900, 4096])
-    state.stage(starts, seq, [7, 4096], [False, False], [0, 0], [128, 1])
+def test_chunk_before_the_floor_keeps_its_last_row():
+    # A decode request, and a chunk that ends before its prompt's floor.
+    state, starts, seq = _state([7, 4096], [900, 4096], floors=[0, 8064])
+    state.stage(starts, seq, [7, 4096], [False, False], [0, 8064], [128, 1])
     expected = torch.tensor([0, 1, 2, 3, 4, 5, 6, 4102], device="cuda")
     torch.testing.assert_close(state.get_indices(), expected)
     assert state.counts.tolist() == [8, 2]
@@ -307,29 +394,42 @@ def test_nonfinal_chunk_keeps_its_last_row():
 
 
 @cuda
-def test_skipped_chunks_require_the_complete_successor(monkeypatch):
+@pytest.mark.parametrize(
+    "prompt_end, steps",
+    [
+        # Final chunks of 4,096, 129, 128, 64 and 1 rows. Each step's kept rows (as
+        # step-row indices) and replay start: every chunk keeps its rows from the
+        # floor on, or its last row when it ends before the floor.
+        (12288, [([4095], 4095), ([4095], 8191), (list(range(3968, 4096)), 12160)]),
+        (8321, [([4095], 4095), ([4095], 8191), (list(range(1, 129)), 8193)]),
+        (8320, [([4095], 4095), ([4095], 8191), (list(range(128)), 8192)]),
+        (
+            8256,
+            [([4095], 4095), (list(range(4032, 4096)), 8128), (list(range(64)), 8128)],
+        ),
+        (8193, [([4095], 4095), (list(range(3969, 4096)), 8065), ([0], 8065)]),
+    ],
+    ids=["final-4096", "final-129", "final-128", "final-64", "final-1"],
+)
+def test_prompt_chunks_replay_from_the_prompt_end(monkeypatch, prompt_end, steps):
+    """The model state's chunks of one prompt (threshold 4,096) through the TileLang
+    requests kernel: every replayed row starts at the prompt end less the window."""
     from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
-    monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
-    state._ced_skip_min_rows, state._ced_chunk_align = 200, 4096
-    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
     state.add_request(
         0,
         SimpleNamespace(
-            req_id="long",
-            num_computed_tokens=0,
-            sampling_params=None,
-            mm_features=[],
+            req_id="long", num_computed_tokens=0, sampling_params=None, mm_features=[]
         ),
     )
-
-    def step(start, rows):
+    staged = []
+    for start, rows in _aligned_chunks(4096, 0, prompt_end):
         starts = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
         seq = torch.tensor([start + rows], dtype=torch.int32, device="cuda")
         state._stage_ced(
@@ -340,23 +440,17 @@ def test_skipped_chunks_require_the_complete_successor(monkeypatch):
                 seq_lens=seq,
                 num_scheduled_tokens=np.array([rows]),
                 num_computed_prefill_tokens_np=np.array([start]),
-                prefill_len_np=np.array([12288]),
-                has_prefill=True,
+                prefill_len_np=np.array([prompt_end]),
             )
         )
-        return state.get_ced_indices().tolist(), state.ced_state.replay_start[0].item()
-
-    assert step(0, 4096) == ([4095], 4095)
-    assert state._ced_expected_chunk == {"long": (4096, 4096)}
-    with pytest.raises(RuntimeError, match="CED successor chunk"):
-        step(4096, 64)
-    assert state._ced_expected_chunk == {"long": (4096, 4096)}
-    assert step(4096, 4096) == ([4095], 8191)
-    # The final chunk keeps its window; the floor is below it, so it changes nothing.
-    indices, replay = step(8192, 4096)
-    assert indices == list(range(3968, 4096)) and replay == 12160
-    state.remove_request("long")
-    assert state._ced_expected_chunk == {}
+        indices = state.get_ced_indices()
+        staged.append(
+            (
+                list(range(rows)) if indices is None else indices.tolist(),
+                state.ced_state.replay_start[0].item(),
+            )
+        )
+    assert staged == steps
 
 
 @cuda
@@ -648,15 +742,16 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
-    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
-    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.disk_engram_models, state._prefill_tokens = (), {}
+    # The update's one new prompt token, at 1024.
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["stream"],
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([1]),
+        num_computed_prefill_tokens_np=np.array([1024]),
+        prefill_len_np=np.array([1025]),
     )
     updated = SimpleNamespace(
         req_id="stream",
@@ -668,7 +763,9 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.remove_request("stream")
     state.add_request(0, updated)
     state._stage_ced(batch)
-    assert state.ced_state.replay_start[0].item() == 256
+    # The live request's decoder rows from 256 on remain: it replays from the
+    # prompt end less the window.
+    assert state.ced_state.replay_start[0].item() == 1025 - CED_WINDOW
     # A genuinely new incarnation must not retain that older history bound.
     state.remove_request("stream")
     state.add_request(0, updated)
@@ -688,18 +785,19 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     state.ced_state, starts, seq = _state([256])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
-    state._ced_skip_min_rows, state._ced_chunk_align = 0, 0
-    state._ced_mm_requests, state._ced_expected_chunk = set(), {}
     state.lookback_token_ids = None
     state.disk_engram_models = ()
     state.device = torch.device("cuda")
     dummy_inputs = state.prepare_dummy_inputs(1, 256)
+    # Replayed with a two-token prompt.
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["request"],
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([256]),
+        num_computed_prefill_tokens_np=np.array([0]),
+        prefill_len_np=np.array([2]),
     )
     state.prepare_attn(batch, CUDAGraphMode.FULL, (), None, [], None, True)
     source = torch.ones((256, 2), device="cuda")

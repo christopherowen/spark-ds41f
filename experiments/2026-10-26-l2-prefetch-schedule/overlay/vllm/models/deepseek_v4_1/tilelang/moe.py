@@ -58,6 +58,9 @@ from .linear import MXFP8Rows, _calls, _launch
 
 # Routes handled by one CTA of the dispatch kernels.
 _CHUNK = 512
+# From this many rows a call's grouped GEMMs trigger their dependent's launch after
+# their K loop, not at their start (see pdl).
+LATE_TRIGGER_ROWS = 16
 
 
 def _dispatch_macros(num_experts, threads):
@@ -604,6 +607,7 @@ def grouped_fp8_fp4_gemm(
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
     coded_scales: bool = False,
+    trigger_after_loop: bool = False,
 ):
     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
 
@@ -627,6 +631,10 @@ def grouped_fp8_fp4_gemm(
     each row's base exponent. Every thread expands its row's code into the scale
     word the MMA reads, after the stage lands; the words, and so every output bit,
     are the uncoded ones, from half the scale bytes.
+
+    With ``trigger_after_loop`` the kernel begins with ``pdl.wait()`` and triggers its
+    dependent's launch after its K loop (``pdl.trigger()``) instead of at its start, so
+    the dependent launches near its end (see ``pdl``).
     """
     block_K = FP4_TMA_K
     tail = K % block_K
@@ -732,7 +740,10 @@ def grouped_fp8_fp4_gemm(
     @T.macro
     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
-            pdl.chain()
+            if trigger_after_loop:
+                pdl.wait()
+            else:
+                pdl.chain()
             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
             B_shared = T.alloc_shared(
                 (stages, block_N, block_K), T.float4_e2m1_unpacked
@@ -837,6 +848,8 @@ def grouped_fp8_fp4_gemm(
                             sf_a_granularity_k=SF_BLOCK,
                             sf_b_granularity_k=SF_BLOCK,
                         )
+            if trigger_after_loop:
+                pdl.trigger()
             # Only real rows are stored; padding rows of the layout stay untouched.
             for i, j in T.Parallel(block_M, block_N):
                 if rows_shared[i] >= 0:
@@ -1219,8 +1232,10 @@ class MoeExpertsV41Plan:
 
     def kernels(self) -> dict:
         """The grouped GEMMs and the fused SwiGLU at both tile heights, as the calls
-        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``, and the
-        same with a ``prefill_`` prefix at ``prefill_block_M``."""
+        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``; at the same
+        height ``late_gate_up`` and ``late_down``, which trigger after their K loop
+        (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a ``prefill_`` prefix
+        at ``prefill_block_M``, whose GEMMs trigger late too."""
         config = dict(
             block_N=self.block_N, num_stages=self.num_stages, coded_scales=True
         )
@@ -1231,7 +1246,11 @@ class MoeExpertsV41Plan:
             self.intermediate,
         )
         kernels = {}
-        for prefix, block_M in (("", self.block_M), ("prefill_", self.prefill_block_M)):
+        for prefix, block_M, late in (
+            ("", self.block_M, False),
+            ("late_", self.block_M, True),
+            ("prefill_", self.prefill_block_M, True),
+        ):
             kernels[f"{prefix}gate_up"] = prepare.call(
                 grouped_fp8_fp4_gemm,
                 num_experts,
@@ -1241,6 +1260,7 @@ class MoeExpertsV41Plan:
                 True,
                 block_M,
                 **config,
+                trigger_after_loop=late,
             )
             kernels[f"{prefix}down"] = prepare.call(
                 grouped_fp8_fp4_gemm,
@@ -1251,10 +1271,12 @@ class MoeExpertsV41Plan:
                 False,
                 block_M,
                 **config,
+                trigger_after_loop=late,
             )
-            kernels[f"{prefix}swiglu"] = prepare.call(
-                moe_swiglu_cast, inter, block_M, self.swiglu_limit
-            )
+            if prefix != "late_":  # the SwiGLU is the same at either trigger
+                kernels[f"{prefix}swiglu"] = prepare.call(
+                    moe_swiglu_cast, inter, block_M, self.swiglu_limit
+                )
         return kernels
 
     def tile_height(self, rows: int) -> int:
@@ -1273,10 +1295,13 @@ class MoeExpertsV41Plan:
         return self.prefill_dispatch[idx_dtype]
 
     def _kernels_for(self, rows: int):
-        """The (gate/up, SwiGLU, down) kernels of a call at its tile height."""
-        if self.tile_height(rows) == self.block_M:
-            return self.gate_up, self.swiglu, self.down
-        return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
+        """The (gate/up, SwiGLU, down) kernels of a call at its tile height, its
+        grouped GEMMs triggering late from ``LATE_TRIGGER_ROWS`` rows."""
+        if self.tile_height(rows) != self.block_M:
+            return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
+        if rows >= LATE_TRIGGER_ROWS:
+            return self.late_gate_up, self.swiglu, self.late_down
+        return self.gate_up, self.swiglu, self.down
 
     def declare_kernels(self) -> None:
         """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's

@@ -26,6 +26,20 @@ predecessor completes; one that does, after a kernel that does not, starts as
 that kernel's CTAs exit. Kernels compiled with warp specialization do not use
 it: their producer warps' TMA loads would have to follow the wait too.
 
+The routed experts' grouped GEMMs fill every SM for most of a layer's MoE time,
+and the shared expert's SwiGLU, cast and down GEMM on the aux stream run in the
+SM slots their last CTAs free. Triggered at the start, the gate/up GEMM lets
+the routed SwiGLU's CTAs launch into those slots and wait there. The routed down
+GEMM, launched early in turn, then holds every SM, and the shared down GEMM
+runs only after it. That keeps the shared weights' DRAM traffic out of the
+gate/up GEMM's last wave: at 6 rows the routed chain gains more than the
+shared down GEMM costs at the end. From 16 rows the shared down GEMM after the
+routed one costs more than that (GB10 layer-chain traces at 3, 6, 16 and 48
+rows). So from ``moe.LATE_TRIGGER_ROWS`` rows the grouped GEMMs begin with
+``wait()`` and call ``trigger()`` after their K loop: the kernel after them
+launches near their end, and the shared expert runs beside the gate/up GEMM's
+tail, as without PDL.
+
 TileKernels' kernels on the chain (``per_token_cast``, ``norm_forward``,
 ``moe_topk_gate_forward`` here) use DeepSeek's own PDL switch, set only for the
 call: these place the wait first and the trigger after their stores. The switch
@@ -42,6 +56,16 @@ import tilelang.language as T
 @T.macro
 def chain():
     T.pdl_sync()
+    T.pdl_trigger()
+
+
+@T.macro
+def wait():
+    T.pdl_sync()
+
+
+@T.macro
+def trigger():
     T.pdl_trigger()
 
 

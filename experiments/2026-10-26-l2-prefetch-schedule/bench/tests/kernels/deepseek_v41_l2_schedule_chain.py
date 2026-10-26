@@ -55,9 +55,15 @@ from tests.kernels.deepseek_v41_pdl_chains import (
 from vllm.models.deepseek_v4_1 import l2_prefetch
 from vllm.models.deepseek_v4_1.tilelang import linear, mhc
 from vllm.models.deepseek_v4_1.tilelang.activation import swiglu_clamp_kernel
-from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan, workspace_bytes
+from vllm.models.deepseek_v4_1.tilelang.moe import (
+    MoeExpertsV41Plan,
+    _present,
+    carve,
+    workspace_bytes,
+)
 from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
 from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
+from vllm.models.glm5next.nvidia import l2_prefetch as _l2pf
 
 LAYERS = 40
 ENGRAM = (1, 14)
@@ -128,7 +134,9 @@ SPINS = {
 }
 SPINS[96] = {k: v * (1.15 if k.endswith("_ar") else 1.3) for k, v in SPINS[48].items()}
 # Distinct experts a layer's rows route to: about the routed GEMMs' traced times.
-EXPERT_POOL = {6: 20, 48: 48, 96: 80}
+EXPERT_POOL = {6: 14, 48: 48, 96: 80}
+# Sizes (MB) of the routed chain's fills: NEXT's first bytes, or bytes nobody reads.
+SPLITS = (2, 4, 6)
 
 # Where each window is issued:
 # - head: the release (WO after Q-B, FFN after WO-B, NEXT after the combine);
@@ -315,11 +323,24 @@ class _Layer:
                     "indexer.weights_proj", nxt.weights_proj
                 )
             self.plans["NEXT"] = plan(segments, l2_prefetch.BUDGET_NEXT)
+            if not nxt.engram:
+                # NEXT's first bytes (A), issued inside the routed chain, and the
+                # rest (B) at NEXT's point.
+                taken, _ = _l2pf.take_budget(segments, l2_prefetch.BUDGET_NEXT)
+                for mb in SPLITS:
+                    head, tail = _l2pf.take_budget(taken, mb * 1_000_000)
+                    self.plans[f"NEXTA{mb}"] = plan(head, l2_prefetch.BUDGET_NEXT)
+                    self.plans[f"NEXTB{mb}"] = plan(tail, l2_prefetch.BUDGET_NEXT)
             if nxt.engram:
                 self.plans["ENGRAM"] = plan(
                     l2_prefetch.linear_segments("engram.wkv", nxt.wkv),
                     l2_prefetch.BUDGET_NEXT,
                 )
+        for mb in SPLITS:
+            self.plans[f"JUNK{mb}"] = plan(
+                [("junk", self.junk.data_ptr(), mb * 1_000_000)],
+                l2_prefetch.BUDGET_NEXT,
+            )
         if self.kind == "own":
             self.plans["IDXC"] = plan(
                 l2_prefetch.linear_segments("compressor", self.compressor),
@@ -344,12 +365,24 @@ class _Layer:
     def run(self, schedule: str, inputs, previous: "_Layer | None", spin) -> None:
         rows, a, f, s = self.rows, self.attention_entry, self.ffn_entry, self.spins
 
+        # "base+split:<point>:<MB>" issues NEXT's first MB megabytes at <point> in the
+        # routed chain (dispatch, fc1, fc2) and the rest at NEXT's point;
+        # "base+junk:<point>:<MB>" issues that many megabytes nobody reads there.
+        schedule, _, extra = schedule.partition("+")
+        fill, point, mb = extra.split(":") if extra else (None, None, None)
+
         def issue(name):
             if schedule != "off":
                 l2_prefetch.issue(self.plans.get(name), rows)
 
         typed_own = schedule in OWN_SCHEDULES
         typed_eng = schedule in ENGRAM_SCHEDULES
+        split = fill == "split" and f"NEXTA{mb}" in self.plans
+        hooks = {}
+        if split:
+            hooks[point] = lambda: issue(f"NEXTA{mb}")
+        elif fill == "junk":
+            hooks[point] = lambda: issue(f"JUNK{mb}")
         chained = schedule in ("chained", "typed")
         if self.engram:
             spin(s["eng_pre"])  # mHC post, row wait and gather, all-gather
@@ -417,16 +450,21 @@ class _Layer:
             main.wait_stream(aux)
             return self.shared_out
 
-        self.plan.run(
+        _moe_run(
+            self.plan,
             f.mx,
             self.ids,
             self.route_weights,
             self.experts,
             self.out,
             self.workspace,
-            shared=shared,
+            shared,
+            hooks,
         )
-        issue("ENGRAM" if typed_eng and "ENGRAM" in self.plans else "NEXT")
+        if typed_eng and "ENGRAM" in self.plans:
+            issue("ENGRAM")
+        else:
+            issue(f"NEXTB{mb}" if split else "NEXT")
         spin(s["moe_ar"])
 
     def outputs(self) -> dict[str, torch.Tensor]:
@@ -451,6 +489,32 @@ class _Layer:
         if self.engram:
             out["engram kv"] = self.kv
         return out
+
+
+def _moe_run(plan, x, topk_ids, topk_weights, weights, out, workspace, shared, hooks):
+    """``MoeExpertsV41Plan.run`` with fills between its launches: ``hooks`` maps
+    "dispatch", "fc1" and "fc2" to a callable run after that launch."""
+    rows = topk_ids.shape[0]
+    dispatch = plan._dispatch_for(rows, topk_ids.dtype)
+    gate_up_kernel, swiglu_kernel, down_kernel = plan._kernels_for(rows)
+    specs = plan.workspace_specs(rows, topk_ids.dtype)
+    buffers = carve(workspace, specs)
+    count = len(dispatch.workspace_specs(rows))
+    h, hq, h_sf, y = buffers[count:]
+    gate_up, down = weights
+    layout = dispatch.dispatch(topk_ids, topk_weights, buffers[:count])
+    if "dispatch" in hooks:
+        hooks["dispatch"]()
+    order, tile_expert = layout["order"], layout["tile_expert"]
+    x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
+    gate_up_kernel(x.values, x_words, *_present(gate_up), order, tile_expert, h)
+    if "fc1" in hooks:
+        hooks["fc1"]()
+    swiglu_kernel(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+    down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
+    if "fc2" in hooks:
+        hooks["fc2"]()
+    return dispatch.combine(y, layout, out, shared=shared())
 
 
 class ScheduleChain:
@@ -517,10 +581,14 @@ class ScheduleChain:
             k: v * (0.7 if tp == 3 and k.endswith("_ar") else 1.0)
             for k, v in SPINS[rows].items()
         }
-        for layer in self.layers:
+        # Bytes nobody reads, a slice a layer, for the junk fills.
+        slab = max(SPLITS) * 1_000_000 + 4096
+        junk = torch.empty(slab * len(self.layers), dtype=torch.uint8, device=DEVICE)
+        for i, layer in enumerate(self.layers):
             layer.plan_aux = self.aux
             layer.norms = norms
             layer.spins = spins
+            layer.junk = junk[i * slab : (i + 1) * slab]
         for layer, nxt in zip(self.layers, self.layers[1:] + [None]):
             layer.build_plans(nxt)
         # The prefetch kernel compiles before any capture, as the model's

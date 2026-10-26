@@ -14,6 +14,14 @@ as the tests' baseline and serve every other configuration):
 ``rejection_sample`` inserts the resampled token, as for every configuration
 (``tilelang_resampled``).
 
+With a dead-row cut (adaptive verification's dead rows: the drafts past a request's
+cut were verification rows that skipped the routed MoE, so their logits are not the
+target's), ``verify`` and ``resample`` end each request's block at its cut: its
+drafts from the cut on are -1 placeholders, which end a block as the drafter's own
+do. The last live draft takes the last draft's threshold (the joint ratio), no row
+past the cut weighs in any threshold or ratio, and the cut's row draws the bonus
+token: the outcome is block verification's of the truncated draft, bit for bit.
+
 The argmaxes, maxima, uniform draws, greedy verification and resampling are the
 Triton kernels' bit for bit, NaN and infinite logits included. The probabilities
 follow Barron, Gnanapragasam and Tschannen's fix ("A Fix for Softmax and
@@ -293,6 +301,23 @@ def _distances(lanes: int) -> tuple[int, ...]:
     return tuple(lanes >> i for i in range(1, lanes.bit_length()))
 
 
+def _live_draft(live, step, dead_row_cut, req, cut: bool):
+    """Whether step ``step`` verifies a draft: one of the request's (``live``) and,
+    with a dead-row ``cut``, before the request's cut."""
+    if cut:
+        return live & (step < dead_row_cut[req])
+    return live
+
+
+def _ends_block(ended, count, dead_row_cut, req, cut: bool):
+    """Whether the row after ``count`` accepted drafts ends the request's block: a
+    bonus row or a placeholder (``ended``) or, with a dead-row ``cut``, a row at or
+    past the request's cut."""
+    if cut:
+        return ended | (count >= dead_row_cut[req])
+    return ended
+
+
 @T.macro
 def _block_reduce(value, partial, tx, combine):
     """Combine every thread's ``value[0]`` across the block in Triton's order into
@@ -501,16 +526,19 @@ def verify_kernel(
     pos_dtype: str,
     lanes: int,
     width: int,
+    cut: bool = False,
 ):
     """``_compute_cumulative_log_p_kernel`` and ``_rejection_kernel`` (block
     verification, one-hot drafts), a block a request. ``lanes`` is Triton's
     PADDED_VOCAB_NUM_BLOCKS and ``width`` the sampled tokens' (num_speculative_steps
-    + 1). Each draft step takes ``lanes`` threads, one a vocabulary block: they load
-    its statistics, its draft and the draft's target logit at once, every load at an
-    index that exists whatever the masks say, the masks as selects, and reduce them
-    to the step's log-sum-exp and the draft's log probability (the paper's Eq. 5),
-    the greedy step's target argmax, and the step's uniform draw; each step's first
-    thread then folds its cumulative log ratio and threshold. Thread 0 then runs
+    + 1); with ``cut``, the drafts from each request's ``dead_row_cut`` on are
+    placeholders (see the module docstring). Each draft step takes ``lanes`` threads,
+    one a vocabulary block: they load its statistics, its draft and the draft's
+    target logit at once, every load at an index that exists whatever the masks say,
+    the masks as selects, and reduce them to the step's log-sum-exp and the draft's
+    log probability (the paper's Eq. 5), the greedy step's target argmax, and the
+    step's uniform draw; each step's first thread then folds its cumulative log
+    ratio and threshold. Thread 0 then runs
     both kernels' loops over the drafts from shared memory, where Triton's take two
     or three dependent round trips to memory a step. The step's cumulative log ratio
     is stored as the cumulative kernel stores it, for sampled requests only; the
@@ -524,8 +552,8 @@ def verify_kernel(
         raise ValueError(f"{steps} draft steps of {lanes} blocks exceed a block")
     groups = threads // lanes
     reqs, num_logits, vocab, blocks = T.dynamic("reqs, num_logits, vocab, blocks")
-    drafts_len, idx_len, temp_len, seed_len, pos_len = T.dynamic(
-        "drafts_len, idx_len, temp_len, seed_len, pos_len"
+    drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len = T.dynamic(
+        "drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len"
     )
     sampled_stride, logits_stride, argmax_stride, max_stride, sumexp_stride = T.dynamic(
         "sampled_stride, logits_stride, argmax_stride, max_stride, sumexp_stride",
@@ -553,6 +581,7 @@ def verify_kernel(
         temperature: T.Tensor((temp_len,), T.float32),
         seeds: T.Tensor((seed_len,), T.int64),
         pos: T.Tensor((pos_len,), pos_dtype),
+        dead_row_cut: T.Tensor((cut_len,), T.int32),
     ):
         with T.Kernel(reqs, threads=threads) as req:
             T.import_source(_HEADER)
@@ -598,7 +627,11 @@ def verify_kernel(
             in_row = live & (block < blocks)
             maximum = T.if_then_else(in_row, maximum, -T.infinity(T.float32))
             sumexp = T.if_then_else(in_row, sumexp, T.float32(0))
-            draft = T.if_then_else(live, draft, T.int64(-1))
+            # The cut's own row is live: it draws the truncated block's bonus (and a
+            # greedy request's target argmax there).
+            draft = T.if_then_else(
+                _live_draft(live, step, dead_row_cut, req, cut), draft, T.int64(-1)
+            )
             logit = T.alloc_var(
                 T.float32,
                 init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
@@ -771,6 +804,7 @@ def verify_key(
     pos_dtype: torch.dtype,
     vocab_size: int,
     num_speculative_steps: int,
+    cut: bool = False,
 ) -> tuple:
     return (
         _DTYPES[logits_dtype],
@@ -779,6 +813,7 @@ def verify_key(
         _DTYPES[pos_dtype],
         _padded_blocks(vocab_size),
         num_speculative_steps + 1,
+        cut,
     )
 
 
@@ -799,10 +834,11 @@ def verify(
     seed: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_logits]
     num_speculative_steps: int,
+    dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
 ) -> None:
     """The launches of ``_compute_cumulative_log_p_kernel`` and
     ``_rejection_kernel`` (block verification, one-hot drafts) as one, into the
-    given outputs."""
+    given outputs; with ``dead_row_cut``, each request's block ends at its cut."""
     if num_sampled.shape[0] == 0:
         return
     kernel = _kernel(
@@ -814,6 +850,7 @@ def verify(
             pos.dtype,
             target_logits.shape[1],
             num_speculative_steps,
+            dead_row_cut is not None,
         ),
     )
     kernel(
@@ -832,6 +869,8 @@ def verify(
         temperature,
         seed,
         pos.contiguous(),
+        # Without a cut it is not read: the counts stand in.
+        num_sampled if dead_row_cut is None else dead_row_cut,
     )
 
 
@@ -840,20 +879,26 @@ def verify(
 
 @tilelang.jit(pass_configs=_PASS)
 def resample_kernel(
-    logits_dtype: str, idx_dtype: str, drafts_dtype: str, pos_dtype: str, run: int
+    logits_dtype: str,
+    idx_dtype: str,
+    drafts_dtype: str,
+    pos_dtype: str,
+    run: int,
+    cut: bool = False,
 ):
     """``_resample_kernel`` without draft logits or watermark, FP32: one block of
     128 threads per ``(request, vocabulary block of 1024)``, a thread's elements in
     runs of ``run`` (``_triton_run``). The request's first unaccepted row is
     resampled: the target logits with a rejected draft masked to -inf (the residual of
-    a one-hot draft; a bonus row and a -1 placeholder mask nothing), plus the draw's
-    Gumbel noise unless the temperature is 0; each block's argmax index (global,
-    int64) and score. A greedy request's rejected row is left alone: verification
-    stored its target argmax."""
+    a one-hot draft; a bonus row and a -1 placeholder mask nothing, nor with ``cut``
+    the row at or past the request's ``dead_row_cut``, the bonus of its truncated
+    block), plus the draw's Gumbel noise unless the temperature is 0; each block's
+    argmax index (global, int64) and score. A greedy request's rejected row is left
+    alone: verification stored its target argmax."""
     reqs, num_logits, vocab, blocks = T.dynamic("reqs, num_logits, vocab, blocks")
     # Inputs may be longer than the batch: each has its own length.
-    idx_len, drafts_len, temp_len, seed_len, pos_len = T.dynamic(
-        "idx_len, drafts_len, temp_len, seed_len, pos_len"
+    idx_len, drafts_len, temp_len, seed_len, pos_len, cut_len = T.dynamic(
+        "idx_len, drafts_len, temp_len, seed_len, pos_len, cut_len"
     )
     logits_stride, argmax_stride, max_stride = T.dynamic(
         "logits_stride, argmax_stride, max_stride", "int64"
@@ -907,6 +952,7 @@ def resample_kernel(
         temperature: T.Tensor((temp_len,), T.float32),
         seeds: T.Tensor((seed_len,), T.int64),
         pos: T.Tensor((pos_len,), pos_dtype),
+        dead_row_cut: T.Tensor((cut_len,), T.int32),
     ):
         with T.Kernel(reqs, blocks, threads=_THREADS) as (req, blk):
             T.import_source(_HEADER)
@@ -945,7 +991,13 @@ def resample_kernel(
                         drafts[T.min(row + 1, T.cast(end - 1, T.int64))], T.int64
                     ),
                 )
-                rejected[0] = T.if_then_else(bonus | (draft < 0), T.int64(-1), draft)
+                rejected[0] = T.if_then_else(
+                    _ends_block(
+                        bonus | (draft < 0), num_sampled[req], dead_row_cut, req, cut
+                    ),
+                    T.int64(-1),
+                    draft,
+                )
                 # gumbel_block_argmax: a padded row draws with seed 0 and no noise.
                 seed = T.alloc_var(
                     T.int64,
@@ -978,6 +1030,7 @@ def resample_key(
     drafts_dtype: torch.dtype,
     pos_dtype: torch.dtype,
     run: int = 1,
+    cut: bool = False,
 ) -> tuple:
     return (
         _DTYPES[logits_dtype],
@@ -985,6 +1038,7 @@ def resample_key(
         _DTYPES[drafts_dtype],
         _DTYPES[pos_dtype],
         run,
+        cut,
     )
 
 
@@ -999,9 +1053,11 @@ def resample(
     temperature: torch.Tensor,  # [max_num_reqs]
     seed: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_logits]
+    dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
 ) -> None:
     """``_resample_kernel``'s launch without draft logits or watermark (FP32), into
-    the given ``[num_reqs, cdiv(vocab_size, 1024)]`` block winners."""
+    the given ``[num_reqs, cdiv(vocab_size, 1024)]`` block winners; with
+    ``dead_row_cut``, a row at a request's cut draws its block's bonus."""
     if num_sampled.shape[0] == 0:
         return
     kernel = _kernel(
@@ -1012,6 +1068,7 @@ def resample(
             draft_sampled.dtype,
             pos.dtype,
             _triton_run(target_logits),
+            dead_row_cut is not None,
         ),
     )
     kernel(
@@ -1025,6 +1082,8 @@ def resample(
         temperature,
         seed,
         pos.contiguous(),
+        # Without a cut it is not read: the counts stand in.
+        num_sampled if dead_row_cut is None else dead_row_cut,
     )
 
 
@@ -1051,12 +1110,16 @@ def verify_and_resample(
     # [max_num_reqs]
     seed: torch.Tensor,
     num_speculative_steps: int,
+    # [num_reqs] int32
+    dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``rejection_sample``'s launches before the insertion, with one-hot drafts,
     block verification, FP32 draws and no watermark: the sampled tokens
     ([num_reqs, num_speculative_steps + 1], int64) up to the first rejected or bonus
     token, their counts ([num_reqs], int32), and the block winners of that token's
-    resampling (``[num_reqs, cdiv(V, 1024)]`` indices, int64, and scores, FP32)."""
+    resampling (``[num_reqs, cdiv(V, 1024)]`` indices, int64, and scores, FP32).
+    With ``dead_row_cut``, each request's block ends at its cut: a count is at most
+    the cut, and the token after it comes from a live row."""
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
 
@@ -1104,6 +1167,7 @@ def verify_and_resample(
         seed,
         pos,
         num_speculative_steps,
+        dead_row_cut,
     )
 
     # Resample the rejected/bonus tokens.
@@ -1125,6 +1189,7 @@ def verify_and_resample(
         temperature,
         seed,
         pos,
+        dead_row_cut,
     )
     return sampled, num_sampled, resampled_local_argmax, resampled_local_max
 
@@ -1133,12 +1198,16 @@ def verify_and_resample(
 
 
 def rejection_calls(
-    logits_dtypes: Sequence[torch.dtype], vocab_size: int, num_speculative_steps: int
+    logits_dtypes: Sequence[torch.dtype],
+    vocab_size: int,
+    num_speculative_steps: int,
+    cuts: Sequence[bool] = (False,),
 ) -> list:
     """``verify_and_resample``'s calls for ``vocab_size``-wide target logits of
     each of ``logits_dtypes``, in both layouts a launch may take (``_runs``), with
     the input batch's int32 drafts and local positions and its int64 indices and
-    positions."""
+    positions; verification and resampling for each of ``cuts`` (True: with a
+    dead-row cut)."""
     calls = []
     for dtype in dict.fromkeys(logits_dtypes):
         for run in _runs(dtype):
@@ -1148,15 +1217,16 @@ def rejection_calls(
                     *local_stats_key(dtype, RUNNER_IDX_DTYPE, torch.int32, run),
                 )
             )
-            calls.append(
+            calls += [
                 _call(
                     resample_kernel,
                     *resample_key(
-                        dtype, RUNNER_IDX_DTYPE, torch.int32, torch.int64, run
+                        dtype, RUNNER_IDX_DTYPE, torch.int32, torch.int64, run, cut
                     ),
                 )
-            )
-        calls.append(
+                for cut in cuts
+            ]
+        calls += [
             _call(
                 verify_kernel,
                 *verify_key(
@@ -1166,15 +1236,24 @@ def rejection_calls(
                     torch.int64,
                     vocab_size,
                     num_speculative_steps,
+                    cut,
                 ),
             )
-        )
+            for cut in cuts
+        ]
     return calls
 
 
 def register_block_verification(
-    logits_dtypes: Sequence[torch.dtype], vocab_size: int, num_speculative_steps: int
+    logits_dtypes: Sequence[torch.dtype],
+    vocab_size: int,
+    num_speculative_steps: int,
+    dead_rows: bool = False,
 ) -> None:
     """Declare ``rejection_calls`` with the runner's JIT registry (a no-op where
-    none collects)."""
-    declare(lambda: rejection_calls(logits_dtypes, vocab_size, num_speculative_steps))
+    none collects); with ``dead_rows``, with a dead-row cut too (the steps that
+    verify), beside the steps without one (the warmup's)."""
+    cuts = (False, True) if dead_rows else (False,)
+    declare(
+        lambda: rejection_calls(logits_dtypes, vocab_size, num_speculative_steps, cuts)
+    )

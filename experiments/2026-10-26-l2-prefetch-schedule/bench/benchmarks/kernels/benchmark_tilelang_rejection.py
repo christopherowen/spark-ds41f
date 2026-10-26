@@ -18,10 +18,19 @@ timed replay, and are compared before anything is timed, the elements the kernel
 leave alone included: bit for bit where the arithmetic is shared (argmaxes, maxima,
 sampled tokens, resampling), and where the TileLang kernels follow Barron et al.'s
 fix within the baseline's rounding: a block sum without its maximum's column plus 1
-is the baseline's, the cumulative log ratios within 5e-5 (the baseline rounds them
+is the baseline's (a release with the fix leaves the column out too, so its sums are
+compared bit for bit), the cumulative log ratios within 5e-5 (the baseline rounds them
 at the magnitude of the maximum logit), and at most one request in twenty may take
 another count (a draw between the two thresholds). Both see the same tensor
 addresses.
+
+With ``--dead-rows``, every request has a dead-row cut, as adaptive verification
+gives it (from none of its drafts live to all, a request in four unclamped). The
+TileLang kernels take the cut, which ends each block at it; the release's do not,
+and its ``rejection_sample`` caps each count at the cut plus one in the insertion,
+as the runner served it. The outputs differ by design, so before timing ours are
+held to themselves on the same drafts with the dead ones as -1 placeholders, bit
+for bit, and a greedy request's committed tokens and count to the baseline's.
 """
 
 import argparse
@@ -52,10 +61,12 @@ def requests(rows):
     return counts
 
 
-def make_inputs(rows, dtype, temps, seed):
+def make_inputs(rows, dtype, temps, seed, dead_rows=False):
     """One graph node's verification inputs. Each row's next input is lifted by a
     margin that varies by row, so some drafts are accepted and others rejected;
-    with ``temps`` "mixed" every other request is greedy."""
+    with ``temps`` "mixed" every other request is greedy. With ``dead_rows``, each
+    request's cut ("cut") and the drafts with the dead ones as placeholders
+    ("placeholders")."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     counts = requests(rows)
     reqs = len(counts)
@@ -71,7 +82,7 @@ def make_inputs(rows, dtype, temps, seed):
         r = torch.arange(rows - 1, device="cuda")
         margin = torch.tensor([0.0, 3.0, 6.0, 9.0, 14.0, 40.0], device="cuda")
         logits[r, drafts[1:]] += margin[r % 6]
-    return {
+    x = {
         "logits": logits.to(dtype),
         "drafts": drafts.int(),
         "cu": torch.cat((sizes.new_zeros(1), sizes.cumsum(0))).int(),
@@ -84,6 +95,16 @@ def make_inputs(rows, dtype, temps, seed):
             -(2**63), 2**63 - 1, (states,), generator=g, device="cuda"
         ),
     }
+    if dead_rows:
+        # The draft combine's cut: a request's live drafts, or for one it does not
+        # clamp its block of eight plus one. Row j is draft j - 1's input.
+        live = torch.randint(0, 1 << 30, (reqs,), generator=g, device="cuda")
+        cut = live % sizes
+        cut[::4] = 9
+        x["cut"] = cut.int()
+        dead = x["local"].long() > cut.repeat_interleave(sizes)
+        x["placeholders"] = torch.where(dead, -1, x["drafts"]).int()
+    return x
 
 
 # --- rejection_sample's Triton launches for this configuration ----------------
@@ -281,12 +302,14 @@ def triton_rejection_sample(x):
     return sampled, num_sampled
 
 
-def tilelang_rejection_sample(x):
-    """rejection_sample itself, which takes the TileLang kernels here."""
+def tilelang_rejection_sample(x, placeholders=False):
+    """rejection_sample itself, which takes the TileLang kernels here, with the
+    inputs' dead-row cut if they have one; with ``placeholders``, without the cut
+    and with the dead drafts as -1 placeholders (what the cut must equal)."""
     return rs.rejection_sample(
         x["logits"],
         None,
-        x["drafts"],
+        x["placeholders"] if placeholders else x["drafts"],
         x["cu"],
         x["pos"],
         x["idx_mapping"],
@@ -296,6 +319,7 @@ def tilelang_rejection_sample(x):
         x["seeds"],
         STEPS,
         use_block_verification=True,
+        dead_row_cut=None if placeholders else x.get("cut"),
     )
 
 
@@ -303,6 +327,8 @@ class Triton:
     """The Triton kernels the TileLang ones replaced."""
 
     name = "triton"
+    # A block sum of Triton's includes the column holding the block's maximum.
+    sums_without_maximum = False
 
     def local_stats(self, x, out):
         triton_local_stats(x, out)
@@ -327,6 +353,9 @@ class Release:
         spec = importlib.util.spec_from_file_location("release_rejection", path)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
+        # A release with Barron et al.'s fix leaves the maximum's column out of a
+        # block sum, as ours does (its header's vllm_others); one before it does not.
+        self.sums_without_maximum = "vllm_others" in self.module._HEADER
 
     def local_stats(self, x, out):
         self.module.compute_local_stats(
@@ -366,7 +395,8 @@ class Release:
         )
 
     def rejection_sample(self, x):
-        """rejection_sample's TileLang branch with the release's kernels."""
+        """rejection_sample's TileLang branch with the release's kernels; a
+        dead-row cut caps the counts in the insertion, as the release's did."""
         sampled, num_sampled, ids, values = self.module.verify_and_resample(
             x["logits"],
             x["drafts"],
@@ -380,22 +410,35 @@ class Release:
             STEPS,
         )
         insert_resampled(
-            sampled, num_sampled, ids, values, x["cu"], x["expanded"], x["temperature"]
+            sampled,
+            num_sampled,
+            ids,
+            values,
+            x["cu"],
+            x["expanded"],
+            x["temperature"],
+            x.get("cut"),
         )
         return sampled, num_sampled
 
 
-def make_case(kind, rows, dtype, temps, seed, count, baseline):
-    """``reset``, ``invoke(index, ours)`` and ``output(index)`` for ``count`` graph
-    nodes, each with its own inputs and outputs."""
-    nodes = [make_inputs(rows, dtype, temps, seed * 1000 + i) for i in range(count)]
+def make_case(kind, rows, dtype, temps, seed, count, baseline, dead_rows=False):
+    """``reset``, ``invoke(index, ours, placeholders=False)``, ``output(index)`` and
+    the inputs for ``count`` graph nodes, each with its own inputs and outputs.
+    ``placeholders``: ours without the cut, the dead drafts as placeholders."""
+    nodes = [
+        make_inputs(rows, dtype, temps, seed * 1000 + i, dead_rows)
+        for i in range(count)
+    ]
 
     if kind == "rejection_sample":
         results = [None] * count
 
-        def invoke(index, ours):
-            run = tilelang_rejection_sample if ours else baseline.rejection_sample
-            results[index] = run(nodes[index])
+        def invoke(index, ours, placeholders=False):
+            if ours:
+                results[index] = tilelang_rejection_sample(nodes[index], placeholders)
+            else:
+                results[index] = baseline.rejection_sample(nodes[index])
 
         def output(index):
             # Only the committed tokens are defined.
@@ -404,7 +447,7 @@ def make_case(kind, rows, dtype, temps, seed, count, baseline):
             valid = columns[None, :] < num_sampled[:, None]
             return (num_sampled, torch.where(valid, sampled, -1))
 
-        return lambda: None, invoke, output
+        return lambda: None, invoke, output, nodes
 
     # The steps before the timed one, once: Triton's verification for resampling;
     # each implementation's own block statistics for verification (the TileLang
@@ -439,8 +482,10 @@ def make_case(kind, rows, dtype, temps, seed, count, baseline):
             for t in tensors:
                 t.fill_(-7)
 
-    def invoke(index, ours):
+    def invoke(index, ours, placeholders=False):
         x, out = nodes[index], buffers[index]
+        drafts = x["placeholders"] if placeholders else x["drafts"]
+        cut = None if placeholders else x.get("cut")
         if kind == "local_stats":
             if ours:
                 candidate.compute_local_stats(
@@ -464,13 +509,14 @@ def make_case(kind, rows, dtype, temps, seed, count, baseline):
                     cumulative,
                     x["logits"],
                     *x["our_stats"],
-                    x["drafts"],
+                    drafts,
                     x["cu"],
                     x["idx_mapping"],
                     x["temperature"],
                     x["seeds"],
                     x["pos"],
                     STEPS,
+                    cut,
                 )
             else:
                 baseline.verify(x, x["baseline_stats"], out)
@@ -481,18 +527,19 @@ def make_case(kind, rows, dtype, temps, seed, count, baseline):
                 x["verified"][2],
                 x["cu"],
                 x["expanded"],
-                x["drafts"],
+                drafts,
                 x["temperature"],
                 x["seeds"],
                 x["pos"],
+                cut,
             )
         else:
             baseline.resample(x, x["verified"], out)
 
-    return reset, invoke, lambda index: buffers[index]
+    return reset, invoke, lambda index: buffers[index], nodes
 
 
-def differences(kind, actual, expected):
+def differences(kind, actual, expected, baseline):
     """What the outputs may not differ in (see the module docstring): a list of
     ``(what, indices)``, empty when they agree."""
     found = []
@@ -520,7 +567,10 @@ def differences(kind, actual, expected):
         empty = written & (expected[2] == 0)
         same("empty blocks", actual[2][empty], expected[2][empty])
         live = written & (expected[2] > 0)
-        close("block sums", actual[2] + 1, expected[2], live, 1e-5, 0)
+        if baseline.sums_without_maximum:
+            same("block sums", actual[2][live], expected[2][live])
+        else:
+            close("block sums", actual[2] + 1, expected[2], live, 1e-5, 0)
     elif kind == "verify":
         same("sampled", actual[1], expected[1])
         same("draft lse", actual[4], expected[4])
@@ -536,6 +586,26 @@ def differences(kind, actual, expected):
         for what, a, b in zip(("ids", "values"), actual, expected):
             same(what, a, b)
     return found
+
+
+def identical(actual, expected):
+    """Every output bit for bit, in ``differences``' form."""
+    return [
+        (f"output {i}", (bits(a) != bits(b)).nonzero()[:8].tolist())
+        for i, (a, b) in enumerate(zip(actual, expected))
+        if not torch.equal(bits(a), bits(b))
+    ]
+
+
+def greedy_differences(actual, expected, x):
+    """The greedy requests' counts and committed tokens (``rejection_sample``'s
+    outputs), in ``differences``' form."""
+    greedy = x["temperature"][x["idx_mapping"]] == 0
+    return [
+        (f"greedy {what}", (a[greedy] != b[greedy]).nonzero()[:8].tolist())
+        for what, a, b in zip(("counts", "tokens"), actual, expected)
+        if not torch.equal(a[greedy], b[greedy])
+    ]
 
 
 def bits(t):
@@ -566,19 +636,37 @@ def elapsed(graph, reset, count):
     return begin.elapsed_time(end) * 1000 / count
 
 
-def measure(kind, rows, dtype_name, temps, seed, baseline):
+def measure(kind, rows, dtype_name, temps, seed, baseline, dead_rows=False):
     count = 8
     ours, theirs = [], []
     for sample in range(8):
-        reset, invoke, output = make_case(
-            kind, rows, DTYPES[dtype_name], temps, seed + sample, count, baseline
+        reset, invoke, output, nodes = make_case(
+            kind,
+            rows,
+            DTYPES[dtype_name],
+            temps,
+            seed + sample,
+            count,
+            baseline,
+            dead_rows,
         )
         reset()
         invoke(0, False)
         expected = [value.clone() for value in output(0)]
         reset()
         invoke(0, True)
-        found = differences(kind, output(0), expected)
+        if dead_rows:
+            # Ours with the cut against ours on placeholders; a greedy request
+            # against the baseline.
+            actual = [value.clone() for value in output(0)]
+            found = []
+            if kind == "rejection_sample":
+                found = greedy_differences(actual, expected, nodes[0])
+            reset()
+            invoke(0, True, placeholders=True)
+            found += identical(actual, output(0))
+        else:
+            found = differences(kind, output(0), expected, baseline)
         if found:
             print(json.dumps({"sample": sample, "differences": found}), flush=True)
             raise RuntimeError(
@@ -592,7 +680,7 @@ def measure(kind, rows, dtype_name, temps, seed, baseline):
         times = {id(graph): elapsed(graph, reset, count) for graph in order}
         ours.append(times[id(a)])
         theirs.append(times[id(b)])
-        del a, b, order, reset, invoke, output, expected
+        del a, b, order, reset, invoke, output, expected, nodes
     paired = [a - b for a, b in zip(ours, theirs)]
     mean = statistics.fmean(paired)
     half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
@@ -601,6 +689,7 @@ def measure(kind, rows, dtype_name, temps, seed, baseline):
         rows=rows,
         dtype=dtype_name,
         temperatures=temps,
+        dead_rows=dead_rows,
         baseline=baseline.name,
         tilelang_us=statistics.median(ours),
         baseline_us=statistics.median(theirs),
@@ -624,6 +713,9 @@ def main():
     parser.add_argument(
         "--baseline", metavar="DIR", help="the release's tilelang_rejection.py"
     )
+    parser.add_argument(
+        "--dead-rows", action="store_true", help="every request with a dead-row cut"
+    )
     args = parser.parse_args()
     baseline = Release(args.baseline) if args.baseline else Triton()
     cases = [
@@ -633,7 +725,7 @@ def main():
         for temps in args.temperatures.split(",")
         for rows in map(int, args.rows.split(","))
     ]
-    results = [measure(*case, args.seed, baseline) for case in cases]
+    results = [measure(*case, args.seed, baseline, args.dead_rows) for case in cases]
     failed = [
         (r["kernel"], r["rows"], r["dtype"], r["temperatures"])
         for r in results

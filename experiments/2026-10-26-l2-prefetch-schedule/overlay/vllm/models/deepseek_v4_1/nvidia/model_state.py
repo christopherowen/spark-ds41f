@@ -13,11 +13,10 @@ from vllm.models.deepseek_v4_1.ced import (
     CED_WINDOW,
     CEDState,
     ced_decoder_start,
-    nonfinal_limits,
+    replay_rows,
 )
 from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
-from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -25,36 +24,6 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
-
-
-def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:
-    """Validate the serving contract before enabling CED's nonfinal row skip."""
-    scheduler = vllm_config.scheduler_config
-    spec = vllm_config.speculative_config
-    if (
-        not scheduler.align_prefill_chunks
-        or not scheduler.enable_chunked_prefill
-        or spec is None
-        or not spec.use_dspark()
-    ):
-        raise ValueError("CED skip requires aligned chunked prefill and DSpark")
-    align = scheduler.long_prefill_token_threshold
-    hf = vllm_config.model_config.hf_config
-    window = getattr(spec.draft_model_config.hf_config, "sliding_window", None)
-    reach = max(
-        CED_WINDOW,
-        int(hf.sliding_window),
-        get_dspark_swa_index_width(
-            hf.sliding_window if window is None else window,
-            spec.num_speculative_tokens,
-        ),
-    )
-    min_remaining = reach + 2 + spec.num_speculative_tokens
-    if align < min_remaining:
-        raise ValueError(
-            f"CED skip needs a chunk threshold of at least {min_remaining}"
-        )
-    return min_remaining, align
 
 
 class DeepseekV41ModelState(DefaultModelState):
@@ -86,18 +55,13 @@ class DeepseekV41ModelState(DefaultModelState):
         self.ced_state: CEDState | None = None
         self._ced_prompt_logprobs: set[str] = set()
         self._ced_prefix_start: dict[str, int] = {}
-        # Each skipped chunk must be followed by its complete aligned successor.
-        # Validate that promise before any GPU work, rather than changing replay
-        # windows to hide a shortened successor and silently changing the output.
-        self._ced_skip_min_rows, self._ced_chunk_align = 0, 0
-        self._ced_mm_requests: set[str] = set()
-        self._ced_expected_chunk: dict[str, tuple[int, int]] = {}
         self._ced_batch: InputBatch | None = None
         self.max_cudagraph_query_len: int | None = None
         if ced_decoder_start(self.model_config.hf_config) is not None:
             compact_max = min(self.max_num_tokens, self.max_num_reqs * CED_WINDOW)
             # Compaction changes the model's optional-input branch; FULL graphs
-            # remain valid for every short/varlen decode split, never long chunks.
+            # remain valid for every short/varlen decode split, never long chunks
+            # or a short chunk that compacts (compacts_short_queries).
             self.max_cudagraph_query_len = CED_WINDOW
             capacities = tuple(
                 sorted(
@@ -118,9 +82,6 @@ class DeepseekV41ModelState(DefaultModelState):
             )
             self.ced_state = CEDState(
                 self.max_num_reqs, self.max_num_tokens, capacities, device
-            )
-            self._ced_skip_min_rows, self._ced_chunk_align = _nonfinal_skip_policy(
-                vllm_config
             )
             hf = self.model_config.hf_config
             parallel = vllm_config.parallel_config
@@ -205,22 +166,26 @@ class DeepseekV41ModelState(DefaultModelState):
         prefix_start = pending[1] if streaming else new_req_data.num_computed_tokens
         self._ced_streaming_prefix_start = None
         self._ced_prefix_start[new_req_data.req_id] = prefix_start
-        if not streaming:
-            self._ced_expected_chunk.pop(new_req_data.req_id, None)
-        if new_req_data.mm_features:
-            self._ced_mm_requests.add(new_req_data.req_id)
-        else:
-            self._ced_mm_requests.discard(new_req_data.req_id)
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
         self._prefill_tokens.pop(req_id, None)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
-        self._ced_mm_requests.discard(req_id)
-        pending = self._ced_streaming_prefix_start
-        if pending is None or pending[0] != req_id:
-            self._ced_expected_chunk.pop(req_id, None)
+
+    def compacts_short_queries(self, batch) -> bool:
+        """Whether CED compacts a request whose chunk fits the graphs' query bound
+        (``max_cudagraph_query_len``): a prefill chunk of at most ``CED_WINDOW`` rows
+        that keeps fewer, such as the first chunk after a prefix hit just before a
+        chunk boundary. A compacted step runs eagerly; ``batch`` is the runner's
+        request state before dispatch."""
+        if self.ced_state is None or batch is None or not batch.has_prefill:
+            return False
+        keep_full, _, limits = self._ced_rows(batch)
+        return any(
+            not full and limit < q <= CED_WINDOW
+            for q, full, limit in zip(batch.num_scheduled_tokens, keep_full, limits)
+        )
 
     def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
         return (
@@ -239,61 +204,37 @@ class DeepseekV41ModelState(DefaultModelState):
     def get_ced_indices(self) -> torch.Tensor | None:
         return None if self.ced_state is None else self.ced_state.get_indices()
 
+    def _ced_rows(self, batch) -> tuple[list[bool], list[int], list[int]]:
+        """``keep_full`` and ``replay_rows``' floors and limits of a batch's requests:
+        an ``InputBatch``, or the runner's request state before dispatch (the same
+        fields)."""
+        req_ids = batch.req_ids
+        nr = len(req_ids)
+        keep_full = [req_id in self._ced_prompt_logprobs for req_id in req_ids]
+        floors, limits = replay_rows(
+            batch.num_scheduled_tokens[:nr],
+            batch.num_computed_prefill_tokens_np[:nr],
+            batch.prefill_len_np[:nr],
+            [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids],
+            keep_full,
+        )
+        return keep_full, floors, limits
+
     def _stage_ced(self, input_batch: InputBatch, *, force_full: bool = False) -> None:
         state = self.ced_state
         if state is None:
             return
         nr = input_batch.num_reqs
-        req_ids = input_batch.req_ids
-        limits = None
         if force_full:
-            keep_full, prefix_start = [True] * nr, [0] * nr
+            keep_full, floors, limits = [True] * nr, [0] * nr, None
         else:
-            keep_full = [req_id in self._ced_prompt_logprobs for req_id in req_ids]
-            prefix_start = [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids]
-            if self._ced_skip_min_rows:
-                computed = input_batch.num_computed_prefill_tokens_np[:nr]
-                for i, req_id in enumerate(req_ids):
-                    expected = self._ced_expected_chunk.get(req_id)
-                    if expected is None:
-                        continue
-                    actual = (
-                        int(computed[i]),
-                        int(input_batch.num_scheduled_tokens[i]),
-                    )
-                    if actual != expected:
-                        raise RuntimeError(
-                            f"CED successor chunk for {req_id!r} is {actual}, "
-                            f"expected {expected}"
-                        )
-                    del self._ced_expected_chunk[req_id]
-                if input_batch.has_prefill:
-                    totals = input_batch.prefill_len_np[:nr]
-                    limits = nonfinal_limits(
-                        input_batch.num_scheduled_tokens[:nr],
-                        computed,
-                        totals,
-                        keep_full,
-                        [req_id not in self._ced_mm_requests for req_id in req_ids],
-                        min_remaining=self._ced_skip_min_rows,
-                        chunk_align=self._ced_chunk_align,
-                    )
-                    if limits is not None:
-                        for i, req_id in enumerate(req_ids):
-                            if limits[i] == 1:
-                                end = int(computed[i]) + int(
-                                    input_batch.num_scheduled_tokens[i]
-                                )
-                                self._ced_expected_chunk[req_id] = (
-                                    end,
-                                    min(int(totals[i]) - end, self._ced_chunk_align),
-                                )
+            keep_full, floors, limits = self._ced_rows(input_batch)
         state.stage(
             input_batch.query_start_loc,
             input_batch.seq_lens,
             input_batch.num_scheduled_tokens[:nr],
             keep_full,
-            prefix_start,
+            floors,
             limits,
         )
         self._ced_batch = input_batch

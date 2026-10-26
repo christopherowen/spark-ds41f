@@ -1,0 +1,698 @@
+=== test files on pertype
+......................................................FFF.....FF........ [ 43%]
+.....FF................................................................. [ 87%]
+.....................                                                    [100%]
+=================================== FAILURES ===================================
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-safetensors] __
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xfb4c704372e0>, {'layers.1.engram.embed.weight': tensor([[1....layer-0.safetensors'), PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfb4c866ef380>
+load_format = 'safetensors', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1248: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:828: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c7039d0a0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:40 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:40 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpwrjdvacw backend=nccl
+INFO 10-26 14:36:40 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpwrjdvacw backend=nccl
+INFO     vllm.distributed.parallel_state:parallel_state.py:2393 rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-fastsafetensors] _
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xfb4c7043d8a0>, {'layers.1.engram.embed.weight': tensor([[1....layer-0.safetensors'), PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading1/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfb4f50187590>
+load_format = 'fastsafetensors', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1248: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:828: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c8668d8b0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:40 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:40 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp76qsrgbv backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp76qsrgbv backend=nccl
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-instanttensor] _
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xfb4c70437420>, {'layers.1.engram.embed.weight': tensor([[1....layer-0.safetensors'), PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading2/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_engram_descriptor_loading2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfb4f50558d70>
+load_format = 'instanttensor', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1248: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:828: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4f506abd10>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:41 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:41 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpys3pao_a backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpys3pao_a backend=nccl
+_____ test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows ______
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xfb4c7048fa60>, {'layers.1.engram.embed.weight': tensor([[1....layer-0.safetensors'), PosixPath('/c/pytest-l2-schedule-pertype/test_disk_engram_preparation_r0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_disk_engram_preparation_r0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfb4f5055aa50>
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Accepted GPU history, images, padding and failures cross the eager boundary."""
+        make_model, weights, paths = tiny_engram_checkpoint
+        root, target, session = make_model("disk")
+        resident_root, resident, resident_session = make_model("device")
+>       _load_checkpoint(root, tmp_path)
+
+tests/models/test_deepseek_v4_1_engram.py:445: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1248: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:828: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c866bdfa0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:45 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:45 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpqbal6w8h backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpqbal6w8h backend=nccl
+___________ test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows ___________
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xfb4c7043dd00>, {'layers.1.engram.embed.weight': tensor([[1....layer-0.safetensors'), PosixPath('/c/pytest-l2-schedule-pertype/test_disk_engram_rows_the_host0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_disk_engram_rows_the_host0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfb4c7029de20>
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+        tiny_engram_checkpoint, tmp_path, monkeypatch
+    ):
+        """The host hashes a step's prefill chunks and the reader reads their rows before
+        the GPU's hash; a decode row in the same step comes from the GPU's hash. With the
+        debug check on, every early ID equals the GPU's, and the rows equal the resident
+        table's: a first chunk, a later chunk with history, a mixed step (decode first,
+        an image token in its history) and a decode-only step."""
+        monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
+        make_model, weights, paths = tiny_engram_checkpoint
+        root, target, session = make_model("disk")
+        resident_root, resident, resident_session = make_model("device")
+>       _load_checkpoint(root, tmp_path)
+
+tests/models/test_deepseek_v4_1_engram.py:602: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1248: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:828: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c7029c830>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = True
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:45 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:45 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmphc8c3e19 backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmphc8c3e19 backend=nccl
+__________________ test_disk_rows_read_whole_table_sources[0] __________________
+
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_disk_rows_read_whole_tabl0')
+dist_init = None, tp_rank = 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("tp_rank", [0, 3])
+    @torch.inference_mode()
+    def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+        """Each rank reads its shard (its hash columns) of the global tables from unaligned
+        file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+        lookup."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity = 7
+        geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+        caps = native.Caps(
+            device=device,
+            max_tokens=capacity,
+            max_seqs=2,
+            max_requests=2,
+            vocab_size=32,
+            layer_id=1,
+            tp_size=4,
+            tp_rank=tp_rank,
+        )
+        layout = SimpleNamespace(
+            caps=(caps,),
+            lookup_plans=(None,),
+            geometry=geometry,
+            table_memory="disk",
+            projection_tp=False,
+        )
+        config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device(device):
+                module = Engram(config, None, layout, 0, False, "engram_disk_test")
+        finally:
+            torch.set_default_dtype(old_dtype)
+        embed = module.embed_tokens
+        row_values = torch.arange(embed.table_rows).remainder(7).add(1)
+        weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
+        scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
+        for name, tensor, offset, scale in (
+            ("weight.bin", weight, 4093, False),
+            ("scale.bin", scales, 123, True),
+        ):
+            path = tmp_path / name
+            with path.open("wb") as stream:
+                stream.write(bytes(offset))
+                stream.write(tensor.view(torch.uint8).numpy().tobytes())
+            embed._disk_sources.append((str(path), offset, scale))
+>       embed.open_disk_rows()
+
+tests/models/test_deepseek_v4_1_engram.py:1067: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c701f5220>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 168, columns = 1118481, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:47 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:47 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp0j6rcz2d backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp0j6rcz2d backend=nccl
+__________________ test_disk_rows_read_whole_table_sources[3] __________________
+
+tmp_path = PosixPath('/c/pytest-l2-schedule-pertype/test_disk_rows_read_whole_tabl1')
+dist_init = None, tp_rank = 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("tp_rank", [0, 3])
+    @torch.inference_mode()
+    def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+        """Each rank reads its shard (its hash columns) of the global tables from unaligned
+        file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+        lookup."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity = 7
+        geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+        caps = native.Caps(
+            device=device,
+            max_tokens=capacity,
+            max_seqs=2,
+            max_requests=2,
+            vocab_size=32,
+            layer_id=1,
+            tp_size=4,
+            tp_rank=tp_rank,
+        )
+        layout = SimpleNamespace(
+            caps=(caps,),
+            lookup_plans=(None,),
+            geometry=geometry,
+            table_memory="disk",
+            projection_tp=False,
+        )
+        config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device(device):
+                module = Engram(config, None, layout, 0, False, "engram_disk_test")
+        finally:
+            torch.set_default_dtype(old_dtype)
+        embed = module.embed_tokens
+        row_values = torch.arange(embed.table_rows).remainder(7).add(1)
+        weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
+        scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
+        for name, tensor, offset, scale in (
+            ("weight.bin", weight, 4093, False),
+            ("scale.bin", scales, 123, True),
+        ):
+            path = tmp_path / name
+            with path.open("wb") as stream:
+                stream.write(bytes(offset))
+                stream.write(tensor.view(torch.uint8).numpy().tobytes())
+            embed._disk_sources.append((str(path), offset, scale))
+>       embed.open_disk_rows()
+
+tests/models/test_deepseek_v4_1_engram.py:1067: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/common/engram.py:592: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xfb4c866b1130>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 168, columns = 8947848, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 14:36:48 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 14:36:48 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpaph08wg4 backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpaph08wg4 backend=nccl
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-safetensors]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-fastsafetensors]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-instanttensor]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_rows_read_whole_table_sources[0]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_rows_read_whole_table_sources[3]
+7 failed, 158 passed, 14 warnings in 34.09s
+=== test files on pertype: exit 1
+{"steps": [["test files on pertype", 1]]}

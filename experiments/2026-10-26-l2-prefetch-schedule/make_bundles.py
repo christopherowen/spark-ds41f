@@ -8,11 +8,15 @@ From experiments/2026-10-26-tp3-budget-memory/make_bundles.py. Everything runs a
 tree over candidate 6's image, whose tree is the release's (BASE, tilelang-ports
 26382f5cf). Two trees, one per arm:
 
-- head: next-candidate with PDL (HEAD, 1bc005688);
-- pertype: HEAD with the owner and Engram layers' own windows (PERTYPE, 650fe3679;
-  later commits on the branch ``l2-prefetch-schedule`` may add tests and benchmarks,
-  no package file). The branch's chained and typed commits before it were measured
-  and dropped (README).
+- head: next-candidate (HEAD, c579b3fe1);
+- pertype: HEAD with the owner and Engram layers' own windows (PERTYPE, 530205c6a on
+  the branch ``l2-prefetch-pertype``; the branch's later commits add the benchmark, no
+  package file). Its package files are the prototype's (650fe3679 on
+  ``l2-prefetch-schedule`` over next-candidate 1bc005688, where the dgx2 runs and the
+  first dgx1 runs measured it); next-candidate changes none of them.
+
+The runs before the ramp/tail ones on next-candidate used this file at 4d5e8fc1, with
+HEAD 1bc005688 and PERTYPE 650fe3679 (README).
 
 The benchmark and its chain change no package file, so both trees run the branch
 head's copy of them.
@@ -36,9 +40,9 @@ EXPERIMENT = "experiments/2026-10-26-l2-prefetch-schedule"
 ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BASE = "26382f5cf"
-HEAD = "1bc005688"
-PERTYPE = "650fe3679"
-BRANCH = "l2-prefetch-schedule"
+HEAD = "c579b3fe1"
+PERTYPE = "530205c6a"
+BRANCH = "l2-prefetch-pertype"
 TREES = {"head": HEAD, "pertype": PERTYPE}
 RC = "experiments/2026-10-25-spark-ds41f-candidate/rc6"
 MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.

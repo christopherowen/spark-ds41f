@@ -5,8 +5,13 @@ rank's shapes (``tests/kernels/deepseek_v41_l2_schedule_chain``): step time, bit
 and each window consumer's time against its L2-speed floor.
 
 usage: benchmark_deepseek_v41_l2_schedule.py [--rows 6,48,96] [--tp 4]
-           [--schedules head,pertype2,pertype3,off] [--rounds 8] [--replays 10]
-           [--trace 5]
+           [--schedules head,pertype2,pertype2+split:fc1:4,...,off] [--rounds 8]
+           [--replays 10] [--trace 5]
+
+A schedule "<base>+split:<point>:<MB>" issues NEXT's first MB megabytes at <point> in
+the routed chain (after the dispatch, FC1 or FC2) and the rest at NEXT's own point;
+"<base>+junk:<point>:<MB>" issues that many megabytes nobody reads there, whose cost
+is the routed chain's spare DRAM time at that point.
 
 Per row count, one CUDA graph per schedule holds the forty layers (a target forward
 without its head). The graphs replay in alternation: ``--rounds`` rounds, the
@@ -161,6 +166,9 @@ def roles(ks: list[dict], chain: ScheduleChain) -> None:
         take("per_token_cast", "shared cast", n)
         take("gemm_mxfp8", "shared down", n)
         take("gemm_bf16", "router", n)
+        take("moe_dispatch", "dispatch", n)
+        take("moe_grouped", "FC1", n)
+        take("moe_grouped", "FC2", n)
         take("moe_combine", "combine", n)
     while i < len(ks):
         k = ks[i]
@@ -200,8 +208,11 @@ WINDOW = {
     "WO-A": "FFN",
     "WO-A reduce": "FFN",
     "WO-B": "FFN",
-    "combine": "NEXT",  # ENGRAM in a typed schedule before an Engram layer
+    "combine": "NEXT",  # ENGRAM before an Engram layer; NEXT's rest when split
     "engram": "NEXT",
+    "dispatch": "NEXTA",  # NEXT's first bytes, or bytes nobody reads (junk)
+    "FC1": "NEXTA",
+    "FC2": "NEXTA",
 }
 CONSUMERS = {
     "WO": ("WO-A", "WO-B"),
@@ -210,6 +221,9 @@ CONSUMERS = {
     "IDX": ("compressor", "index Q-B", "head weights"),
     "IDXQ": ("index Q-B", "head weights"),
     "ENGRAM": ("engram",),
+    "NEXTA": ("attention mHC", "fused Q-A/KV"),
+    "NEXTB": ("attention mHC", "fused Q-A/KV", "Q-B"),
+    "JUNK": (),
 }
 
 
@@ -218,6 +232,7 @@ def windows(ks: list[dict], chain: ScheduleChain, schedule: str) -> list[dict]:
     layer kind, fill start and end, and its consumers' kernels."""
     by = {(k.get("layer"), k.get("role")): k for k in ks}
     out = []
+    base, _, extra = schedule.partition("+")
     after_compressor = set()  # pertype3 issues IDXQ, then WO, after the compressor
     for k in ks:
         if not k.get("role", "").startswith("fill@"):
@@ -225,7 +240,7 @@ def windows(ks: list[dict], chain: ScheduleChain, schedule: str) -> list[dict]:
         anchor, n = k["role"][5:], k["layer"]
         L = chain.layers[n]
         window, target = WINDOW[anchor], n
-        own = schedule in OWN_SCHEDULES and L.kind == "own"
+        own = base in OWN_SCHEDULES and L.kind == "own"
         if window == "WO" and anchor == "Q-B" and own:
             window = "IDX"
         if (
@@ -235,10 +250,22 @@ def windows(ks: list[dict], chain: ScheduleChain, schedule: str) -> list[dict]:
         ):
             after_compressor.add(n)
             window = "IDXQ"
+        engram_next = (
+            base in ENGRAM_SCHEDULES
+            and n + 1 < len(chain.layers)
+            and chain.layers[n + 1].engram
+        )
         if anchor == "combine":
             target = n + 1
-            if schedule in ENGRAM_SCHEDULES and chain.layers[n + 1].engram:
+            if engram_next:
                 window = "ENGRAM"
+            elif extra.startswith("split:"):
+                window = "NEXTB"
+        if window == "NEXTA":
+            if extra.startswith("junk:"):
+                window = "JUNK"
+            else:
+                target = n + 1
         if anchor == "engram":
             target = n
         T = chain.layers[target]
@@ -435,7 +462,19 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="6,48,96")
     ap.add_argument("--tp", type=int, default=4)
-    ap.add_argument("--schedules", default="head,pertype2,pertype3,off")
+    ap.add_argument(
+        "--schedules",
+        default=(
+            "head,pertype2,"
+            + ",".join(
+                f"pertype2+{fill}:{point}:{mb}"
+                for fill, mbs in (("split", (2, 4, 6)), ("junk", (4,)))
+                for point in ("dispatch", "fc1", "fc2")
+                for mb in mbs
+            )
+            + ",off"
+        ),
+    )
     ap.add_argument("--rounds", type=int, default=8)
     ap.add_argument("--replays", type=int, default=10)
     ap.add_argument("--trace", type=int, default=5)

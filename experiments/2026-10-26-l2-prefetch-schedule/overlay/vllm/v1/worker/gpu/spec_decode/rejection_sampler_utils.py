@@ -1250,11 +1250,13 @@ def register_rejection_sample_warmups(
     synthetic_mode: bool,
     use_block_verification: bool,
     use_fp64: bool,
+    dead_rows: bool = False,
 ) -> None:
     """Register ``rejection_sample`` without draft logits or watermarking, for
     ``vocab_size``-wide target logits given as ``(dtype, row stride)`` pairs, with
     the input batch's int32 drafts and offsets and int64 indices and positions.
-    Block verification with FP32 draws declares its TileLang kernels; the other
+    Block verification with FP32 draws declares its TileLang kernels (with a
+    dead-row cut too when the step can have dead rows, ``dead_rows``); the other
     configurations register the Triton kernels.
     """
     if use_block_verification and not synthetic_mode and not use_fp64:
@@ -1262,6 +1264,7 @@ def register_rejection_sample_warmups(
             [logits_dtype for logits_dtype, _ in logits],
             vocab_size,
             num_speculative_steps,
+            dead_rows,
         )
     else:
         for logits_dtype, logits_stride in logits:
@@ -1328,7 +1331,10 @@ def rejection_sample(
     contexts: torch.Tensor | None = None,
     watermarking: torch.Tensor | None = None,
     watermark_key: int | None = None,
-    # [num_reqs] int32: with it, each request's count is capped at its cut + 1.
+    # [num_reqs] int32, each request's live drafts (adaptive verification's dead
+    # rows): with it, block verification ends each request's block at its cut, and
+    # the other methods, which verify each draft from its own row, cap the count at
+    # the cut + 1.
     dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
@@ -1365,8 +1371,10 @@ def rejection_sample(
                 temperature,
                 seed,
                 num_speculative_steps,
+                dead_row_cut,
             )
         )
+        # A block that ends at the cut commits at most the cut + 1: no cap.
         insert_resampled(
             sampled,
             num_sampled,
@@ -1375,9 +1383,15 @@ def rejection_sample(
             cu_num_logits,
             expanded_idx_mapping,
             temperature,
-            dead_row_cut,
         )
         return sampled, num_sampled
+    # Block verification weighs every draft of a block against the rows after it,
+    # so a cap after the fact cannot leave out dead rows; only the TileLang kernels
+    # end a block at a cut.
+    assert dead_row_cut is None or not use_block_verification, (
+        "Block verification with dead rows runs as the TileLang kernels only: "
+        "one-hot drafts, FP32 draws, no watermark."
+    )
     contexts_stride = 0
     context_width = 1
     watermarking_bytes: torch.Tensor | None = None

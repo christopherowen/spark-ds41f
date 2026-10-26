@@ -20,9 +20,19 @@ point could recover, and measures prototypes on next-candidate with PDL (vLLM
 - The bench's spin stand-ins make the prefetch worth 3-4 times what it is on the ring
   (prefetch off: +19% here at c1, +5% on the ring), so expect about 0.4% at c1 and 0.2%
   at c8 and c16 there. The cluster A/B (specs below) decides.
+- **On next-candidate c579b3fe1 (dgx1) the windows give the same**: TP4 -1.60 / -0.58 /
+  -0.30%, TP3 -1.54 / -0.50 / -0.28%, bit-identical, tests passing.
+- **Prefetch cannot fill the routed experts' ramp and tail** (dgx1). A fill there finds
+  DRAM time for at most about 2 MB a layer, but the lines it lands are evicted before
+  their consumers read them. Every split of NEXT into the routed chain loses at c8 and
+  c16. At c1 the best gains 0.15% (TP3 on 1bc005688) and at most 0.08% on next-candidate,
+  inside the rounds' spread.
 
-Branches: vLLM `l2-prefetch-schedule` (local, on the shared object store, as
-`pdl-next`; the prototype is 650fe3679), this branch `l2-prefetch-schedule`.
+Branches (vLLM ones local, on the shared object store, as `pdl-next`):
+- vLLM `l2-prefetch-schedule`: the prototype, 650fe3679 on next-candidate 1bc005688;
+- vLLM `l2-prefetch-pertype`: the prototype's package diff on next-candidate c579b3fe1
+  (530205c6a; the benchmark d1bfa0372): **what the next candidate would take**;
+- this branch, `l2-prefetch-schedule`.
 
 ## The loss, by layer type (cluster traces)
 
@@ -268,11 +278,105 @@ is no all-reduce to collide with. Scaled by those ratios, the prototype's 1.5 / 
 The 7 are the disk-Engram loader tests, which need io_uring; the kernel-local container
 does not permit it ("io_uring initialization failed: Operation not permitted").
 
+## dgx1: filling the routed chain's ramp and tail
+
+The c1 IKET study (#614) finds DRAM under-used for about 15.5 us a layer around the
+routed experts at c1: FC1's tail (7.1 us), the SwiGLU and gaps (3.8 us), FC2's ramp
+(4.6 us). That is up to 4 MB of reads at the 266.6 GB/s expert-stream rate. Can the
+prefetch use that time?
+
+The harness's routed chain is the model's own: `_moe_run` is `MoeExpertsV41Plan.run`'s
+launches (dispatch, FC1, SwiGLU, FC2, the shared expert on the aux stream, combine) with
+the plan's kernels at its row count and a per-rank pool of 14 / 48 / 80 experts at
+6 / 48 / 96 rows. Only the attention core, top-k, all-reduces and Engram waits are spins.
+Two kinds of schedule, each on top of the prototype (pertype2), issued from the side
+stream after a routed launch (`dispatch`, `fc1` after FC1, `fc2` after FC2):
+
+- **junk:POINT:4**: a 4 MB fill of bytes nobody reads (a per-layer slice of a 160 MB
+  buffer), to measure what a fill there costs;
+- **split:POINT:MB**: NEXT's first 2, 4 or 6 MB issued there, the rest after the combine
+  as now: the useful version.
+
+Runs (dgx1, 2026-10-26 15:20-15:31 CET): `ramp-tp4-2`, `ramp-tp3-2`, on the prototype tree
+650fe3679 over next-candidate 1bc005688. Every schedule's bits equal the eager run's.
+
+**What a fill costs** (step time against pertype2, a step; free = the 4 MB less the time it
+added at 266.6 GB/s, a layer):
+
+| 4 MB junk | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| after dispatch (beside FC1) | +357 us, 1.6 MB free | +375, 1.5 | +322, 1.9 | +341, 1.7 | +484, 0.8 | +642, none |
+| after FC1 (SwiGLU, FC2) | +256 us, **2.3 MB free** | +286, 2.1 | +289, 2.1 | +328, 1.8 | +387, 1.4 | +624, none |
+| after FC2 (shared expert, combine) | +355 us, 1.6 MB free | +475, 0.8 | +469, 0.9 | +417, 1.2 | +461, 0.9 | +461, 0.9 |
+
+Window consumers do not slow under junk; the cost is in the routed kernels the fill runs
+beside (after dispatch FC1 +309 us at TP4 c1; after FC1 FC2 +177; after FC2 the combine,
++430 at c8). **So prefetch traffic can fill at most about 2 MB a layer of the ramp and
+tail, 8 us of the 15.5, at TP4, and less at TP3.** If all of it came off NEXT's fill, the
+harness would gain about 8.6 us a layer, 1.5% at c1, about 0.4% on the ring.
+
+**What a split gains** (against pertype2; the rounds' range in brackets):
+
+| NEXT's first bytes | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 MB after dispatch | +1.66% | +0.43% | +0.12% | +1.74% | +0.42% | +0.32% |
+| 2 MB after FC1 | +1.41% | +0.31% | +0.08% | +1.54% | +0.37% | +0.31% |
+| 2 MB after FC2 | -0.04% [-0.15, +0.04] | +0.30% | +0.08% | -0.04% [-0.14, +0.29] | +0.26% | +0.25% |
+| 4 MB after FC2 | -0.02% [-0.08, +0.01] | +0.34% | +0.29% | -0.08% [-0.12, -0.04] | +0.31% | +0.22% |
+| 6 MB after FC2 | -0.04% [-0.08, +0.60] | +0.79% | +0.44% | **-0.15%** [-0.23, -0.08] | +0.31% | +0.33% |
+| 4 or 6 MB after dispatch or FC1 | +0.24 to +2.74% everywhere | | | | | |
+
+The bytes landed in the routed chain are gone when NEXT's consumers read them. The next
+layer's attention mHC, which reads NEXT's first bytes, slows from 412 to 1447 us a step
+(TP4 c1, 2 MB after FC1) and to 749 us (2 MB after FC2); its fused Q-A/KV from 349 to
+617 and 543 us at c8. Before FC2 the 21 MB expert stream passes through L2 between fill
+and use. After FC2 the early lines are the oldest unread ones when the rest of NEXT
+lands: the eviction order that sank chaining. Issued after FC2, the fill also slows
+the combine (+254 us a step at TP4 c8).
+
+**Ramp and tail are not prefetch's to fill.** There is DRAM time, at most 2 MB a layer,
+but L2 cannot keep what lands there until it is read. The best schedule, 6 MB after FC2,
+is 0.15% at TP3 c1 in the harness (about 0.04% on the ring) and costs 0.3% at c8 and c16.
+Not prototyped in vLLM: a row-count-dependent issue point for 0.04% would be an arm of
+its own. The ramp and tail have to shrink at their source: the routed GEMMs' own loads
+(#614's continuous FC1-FC2 stream).
+
+### On next-candidate c579b3fe1
+
+Next-candidate moved on after 1bc005688. From 16 rows its routed grouped GEMMs trigger
+their dependent's launch after their K loop (97e204cd9), which changes the c8 and c16
+tail; the other commits are CED and the rejection sampler. None touches the per-type
+windows' four files, which apply unchanged: vLLM `l2-prefetch-pertype` 530205c6a, and
+the benchmark d1bfa0372. The bundles now build these trees (`make_bundles.py`), and dgx1
+re-ran the tests and both sweeps on them (2026-10-26 15:36-15:49 CET, `next-*-1`).
+
+**Tests** (`next-tests-head-1`, `next-tests-pertype-1`): next-candidate 152 passed;
+with the windows 158 passed, its 6 new tests included. The same 7 disk-Engram loader
+tests fail on both (io_uring, as above).
+
+**Bits:** every schedule equals the eager run, at every row count, TP4 and TP3.
+
+**The per-type windows against next-candidate** (step time, the rounds' range in
+brackets):
+
+| | c1 (6 rows) | c8 (48 rows) | c16 (96 rows) |
+| --- | ---: | ---: | ---: |
+| TP4, next-schedule-tp4-1 | **-1.60%** [-1.71, -1.51], -373 us | **-0.58%** [-0.61, -0.55], -325 us | **-0.30%** [-0.35, -0.29], -261 us |
+| TP3, next-schedule-tp3-1 | **-1.54%** [-2.02, -1.45], -446 us | **-0.50%** [-0.55, -0.47], -348 us | **-0.28%** [-0.29, -0.23], -309 us |
+
+**Ramp and tail on next-candidate:** the same picture. A 4 MB fill after FC1 hides
+2.2 / 2.1 / 2.1 MB a layer at TP4 c1 / c8 / c16. No split gains: NEXT's first 2-6 MB after
+FC2 is +0.01 to +0.11% at c1 and +0.09 to +0.80% at c8 and c16; at the other points
++0.06 to +2.95%. TP3: a 4 MB fill after FC1 hides 1.9 / 1.4 MB a layer at c1 / c8 and
+nothing at c16. NEXT's first bytes after FC2 are -0.03 to -0.08% at c1 (rounds -0.14 to
++0.60), and +0.17 to +0.50% at c8 and c16; at the other points +0.24 to +2.45%.
+
 ## Cluster A/B (specs, not run)
 
-Arms are candidate 6's recipe with next-candidate (`head-*.json`) and with the prototype
-(`pertype-*.json`) mounted over the image, at tp4-ring and tp3-triangle; `-dev` adds the
-dev-mode RPC the suites use.
+Arms are candidate 6's recipe with next-candidate c579b3fe1 (`head-*.json`) and with
+the per-type windows on it, 530205c6a (`pertype-*.json`), mounted over the image, at
+tp4-ring and tp3-triangle; `-dev` adds the dev-mode RPC the suites use. (Until the
+ramp/tail runs they were on 1bc005688 and 650fe3679.)
 - [screen-tp4.json](screen-tp4.json): the determinism gate on head and pertype (the
   prototype's hashes, sampled and controls digests and 16/8/4 distinct streams must be the
   head's), then the screen and single-stream suites on pertype, head, pertype again.
@@ -298,18 +402,21 @@ screen; no suite row slower beyond the run's own repeat.
   [schedule_bounds.json](schedule_bounds.json): the trace analysis.
 - [make_bundles.py](make_bundles.py): overlays, bundles, arms and specs from the vLLM branch.
 - [harness_table.py](harness_table.py): step times, consumer excess and L2-speed shares
-  from a benchmark run's output; [runs/](runs): every dgx2 run's output and verdict.
+  from a benchmark run's output; [runs/](runs): every dgx2 and dgx1 run's output and
+  verdict.
 - [harness_check.py](harness_check.py): the benchmark's bookkeeping checked on the CPU, no
   torch: the chain's own `_Layer.run()` with recording fakes, through the benchmark's
   `roles()`, `windows()` and `summarize()`. Per schedule it prints each window's fills and
   their anchors; every fill must find all its consumers.
   `python3 -I experiments/2026-10-26-l2-prefetch-schedule/harness_check.py VLLM_TREE`.
-- [overlay/](overlay), [overlay-pertype/](overlay-pertype): next-candidate's 66 package
-  files over the image's tree, and the 4 the prototype changes from it. [bench/](bench):
-  every test and benchmark file the vLLM branch adds or changes over the image's tree, at
-  its path (the image's copies are the release's).
+- [overlay/](overlay), [overlay-pertype/](overlay-pertype): next-candidate c579b3fe1's
+  73 package files over the image's tree, and the 4 the per-type windows change from it.
+  [bench/](bench): every test and benchmark file the vLLM branch adds or changes over the
+  image's tree, at its path (the image's copies are the release's).
 - [bundles/](bundles): kernel-lab bundles (`schedule-smoke`, `schedule-tp4`,
-  `schedule-tp3`, `tests-head`, `tests-pertype`), run on dgx2.
+  `schedule-tp3`, `tests-head`, `tests-pertype`), run on dgx2 and dgx1. Runs before the
+  `next-` ones used them as this branch had them at 4d5e8fc1 (next-candidate 1bc005688,
+  66 files; the prototype 650fe3679).
 - `{head,pertype}-{tp4,tp3}[-dev].json`, `prof-{head,pertype}-tp4.json`: serving arms.
   The chained and typed arms and overlays were removed once dgx2 measured them (they are
   in this branch's history at 26dbd21d).

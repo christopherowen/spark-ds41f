@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CED's bounded replay on the TileLang kernels: however a prompt is chunked, the
+decoder stack's rows from the replay floor on come out bit-identical.
+
+A stack of sliding-window decoder layers runs each prefill step through the model
+state's CED staging (the requests and row-map kernels), the decoder's token metadata,
+the window metadata and the sparse MLA. A layer writes its input as the KV records of
+the step's kept rows into a cache that starts as NaN, and the next layer's input is
+its input plus its output, so a row's output depends on every row it saw on the way
+up and an unwritten read shows as NaN.
+"""
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from vllm.platforms import current_platform
+
+if not (
+    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+):
+    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+
+pytest.importorskip("tilelang")
+pytest.importorskip("tile_kernels")
+
+from tests.kernels.attention.test_deepseek_v41_tilelang import (  # noqa: E402
+    _pack_swa,
+    _paged,
+)
+from tests.kernels.deepseek_v41_contracts import rope_table  # noqa: E402
+from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata  # noqa: E402
+from vllm.models.deepseek_v4_1.tilelang.sparse_mla import (  # noqa: E402
+    HEAD_DIM,
+    SparseMlaV41Plan,
+)
+
+DEVICE = "cuda"
+PAGE = 64
+HEADS = 16
+LAYERS = 3
+RECORD = 528
+
+
+def aligned_chunks(threshold, start, end):
+    """The scheduler's aligned prefill chunks ``(start, rows)`` from ``start``."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold)
+    )
+    chunks = []
+    while start < end:
+        rows = Scheduler._aligned_prefill_chunk(
+            scheduler, start, min(end - start, threshold)
+        )
+        chunks.append((start, rows))
+        start += rows
+    return chunks
+
+
+def model_state_stager(prefix):
+    """Stages each chunk as serving does: the model state's ``_stage_ced``."""
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), DEVICE)
+    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {"prompt": prefix}
+
+    def stage(start, rows, prompt_end, starts, seq):
+        state._stage_ced(
+            SimpleNamespace(
+                num_reqs=1,
+                req_ids=["prompt"],
+                query_start_loc=starts,
+                seq_lens=seq,
+                num_scheduled_tokens=np.array([rows]),
+                num_computed_prefill_tokens_np=np.array([start]),
+                prefill_len_np=np.array([prompt_end]),
+            )
+        )
+        return state.ced_state
+
+    return stage
+
+
+def decoder_stack(prompt_end, chunks, stage, seed=5):
+    """The stack's last-layer rows for the kept positions of every step, in
+    ``{position: row}``, the last step's kept row winning."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    # The encoder's output: one fixed row a position, whatever the chunking.
+    encoder = torch.randn((prompt_end, HEAD_DIM), generator=gen, device=DEVICE)
+    scales = torch.linspace(0.5, 1.5, HEADS, device=DEVICE)
+    sinks = torch.linspace(-1.0, 1.0, HEADS, device=DEVICE)
+    pages = prompt_end // PAGE + 2
+    # Logical page j is physical page j + 1 (page 0 is the null page).
+    table = (torch.arange(pages, dtype=torch.int32, device=DEVICE) + 1)[None]
+    records = [
+        torch.full(((pages + 1) * PAGE, RECORD), 0xFF, dtype=torch.uint8, device=DEVICE)
+        for _ in range(LAYERS)
+    ]
+    rope = rope_table(prompt_end + 1)
+    plan = SparseMlaV41Plan(
+        HEADS, CED_WINDOW, 0, 128, swa_page_size=PAGE,
+        max_rows=256, decode_max_rows=256, split_max_rows=256,
+    )  # fmt: skip
+    outputs = {}
+    for start, rows in chunks:
+        starts = torch.tensor([0, rows], dtype=torch.int32, device=DEVICE)
+        seq = torch.tensor([start + rows], dtype=torch.int32, device=DEVICE)
+        state = stage(start, rows, prompt_end, starts, seq)
+        step = torch.arange(start, start + rows, device=DEVICE)
+        indices = state.get_indices()
+        if indices is None:
+            positions = step
+        else:
+            positions = ced_kernels.token_metadata(
+                indices,
+                step,
+                torch.zeros(rows, dtype=torch.int32, device=DEVICE),
+                step + PAGE,
+                (step + 1).int(),
+            )[0]
+        n = positions.numel()
+        swa = torch.empty((n, CED_WINDOW), dtype=torch.int32, device=DEVICE)
+        lengths = torch.empty(n, dtype=torch.int32, device=DEVICE)
+        top = torch.empty_like(lengths)
+        tl_metadata.chunk(
+            positions, torch.zeros(n, dtype=torch.int32, device=DEVICE), table, swa,
+            lengths, top, (positions + 1).int(), state.starts, state.request_positions,
+            0, n, page=PAGE, window=CED_WINDOW, draft=False,
+            replay_start=state.replay_start,
+        )  # fmt: skip
+        x = encoder[positions]
+        for layer in range(LAYERS):
+            records[layer][positions + PAGE] = _pack_swa(x)
+            q = (x[:, None, :] * scales[None, :, None]).bfloat16()
+            out = torch.empty((n, HEADS, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
+            plan.run(
+                q, _paged(records[layer], PAGE), swa, lengths, sinks, positions, rope,
+                out,
+            )  # fmt: skip
+            # Heads added in a fixed order: elementwise, the same for any row count.
+            for head in range(HEADS):
+                x = x + out[:, head].float() / HEADS
+        for position, row in zip(positions.tolist(), x):
+            outputs[position] = row
+    return outputs
+
+
+def replayed(outputs, floor, prompt_end):
+    return torch.stack([outputs[p] for p in range(floor, prompt_end)])
+
+
+@pytest.mark.parametrize("final_rows", [1, 64, 128, 129])
+def test_chunkings_give_the_same_decoder_rows(final_rows):
+    """A 1,024-row prompt start plus ``final_rows``: one chunk, 512-row chunks,
+    384-row chunks and, after a prefix hit at 448, 512-row chunks again. Every
+    chunking's rows from the floor (the prompt end less the window) on are the single
+    chunk's, bit for bit, and finite."""
+    prompt_end = 1024 + final_rows
+    floor = prompt_end - CED_WINDOW
+    whole = decoder_stack(prompt_end, [(0, prompt_end)], model_state_stager(0))
+    reference = replayed(whole, floor, prompt_end)
+    assert torch.isfinite(reference).all()
+    for threshold, prefix in ((512, 0), (384, 0), (512, 448)):
+        chunks = aligned_chunks(threshold, prefix, prompt_end)
+        rows = replayed(
+            decoder_stack(prompt_end, chunks, model_state_stager(prefix)),
+            floor,
+            prompt_end,
+        )
+        assert torch.equal(rows, reference), (threshold, prefix, chunks)

@@ -24,7 +24,7 @@ for name in [
     "torch", "torch.profiler", "torch.cuda",
     "tests", "tests.kernels", "tests.kernels.deepseek_v41_pdl_chains",
     "vllm", "vllm.config", "vllm.models", "vllm.models.deepseek_v4_1",
-    "vllm.models.deepseek_v4_1.l2_prefetch",
+    "vllm.models.deepseek_v4_1.l2_prefetch", "vllm.models.glm5next", "vllm.models.glm5next.nvidia",
     "vllm.models.deepseek_v4_1.tilelang",
     "vllm.models.deepseek_v4_1.tilelang.linear",
     "vllm.models.deepseek_v4_1.tilelang.mhc",
@@ -96,10 +96,22 @@ class WOA:
 
 
 class Plan:
-    def run(self, *args, shared):
-        k("moe_dispatch", "moe_grouped_fp8_fp4_gemm", "moe_swiglu_cast", "moe_grouped_fp8_fp4_gemm")
-        shared()
-        k("moe_combine")
+    pass
+
+
+def moe_run(plan, x, ids, weights, experts, out, workspace, shared, hooks):
+    """The chain's _moe_run: the routed launches, with its hooks between them."""
+    k("moe_dispatch")
+    hooks.get("dispatch", lambda: None)()
+    k("moe_grouped_fp8_fp4_gemm")
+    hooks.get("fc1", lambda: None)()
+    k("moe_swiglu_cast", "moe_grouped_fp8_fp4_gemm")
+    hooks.get("fc2", lambda: None)()
+    shared()
+    k("moe_combine")
+
+
+chain_mod._moe_run = moe_run
 
 
 def fake_layer(i):
@@ -132,11 +144,18 @@ for L, nxt in zip(layers, layers[1:] + [None]):
         L.plans["NEXT"] = "next"
         if nxt.engram:
             L.plans["ENGRAM"] = "engram"
+        else:
+            for mb in chain_mod.SPLITS:
+                L.plans.update({f"NEXTA{mb}": "nexta", f"NEXTB{mb}": "nextb"})
+    for mb in chain_mod.SPLITS:
+        L.plans[f"JUNK{mb}"] = "junk"
     if L.kind == "own":
         L.plans.update(IDX="idx", IDXC="idxc", IDXQ="idxq")
 fake_chain = types.SimpleNamespace(layers=layers)
 
-for schedule in ("head", "chained", "typed", "pertype", "pertype2", "pertype3", "own", "eng", "off"):
+for schedule in ("head", "chained", "typed", "pertype", "pertype2", "pertype3", "own", "eng",
+                 "pertype2+split:dispatch:2", "pertype2+split:fc1:4", "pertype2+split:fc2:6",
+                 "pertype2+junk:fc1:4", "off"):
     launched.clear()
     previous = None
     for L in layers:
