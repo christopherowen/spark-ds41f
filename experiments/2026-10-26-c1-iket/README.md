@@ -376,39 +376,88 @@ check (with conftest from stream-tests-2 on). `stream-ab` runs the layer harness
 next-candidate and the stream build in alternation, and compares bits and µs a layer.
 `layer-stream` and `lifetimes-stream` trace its CTA timelines.
 
-## What runs next
+## The weight-stream variants (stages-ab)
 
-In order, once a test box is free. `run_queue.sh` (copied to `~/spark-lab/agents/c1-iket/`
-on the node, with bundle:output pairs after the smoke run) stops at a failed smoke run or
-when a release request appears:
+With the stream GEMM losing, the other routed-pipeline levers were run as one variable
+each against next-candidate. Run stages-ab-1 is the layer harness in rotation over five
+builds, four rounds, every buffer's bits equal in every build. It gives µs saved a layer
+(median of rounds; the rounds spread about ±10 µs a layer, so the resolution is about
+±0.5%):
 
-1. `smoke`: the harness at both ranks' shapes, and one lifetimes trace.
-2. `stream-tests`: prototype 1's bits and the kernel tests.
-3. `layer`: the c1 tables at TP4 and TP3. They measure each routed launch's ramp,
-   steady stream and tail, and decide row 2's split.
-4. `stream-ab`: prototype 1 against next-candidate.
-5. `layer-stream`, `layer-live6`, `layer-base`: prototype 1's timelines, the 24-expert
-   operating point, and next-candidate's own bits and times in the harness.
+| arm (vLLM branch) | TP4, 13 experts | TP4, 24 experts | TP3, 13 experts |
+|---|---:|---:|---:|
+| the grid GEMMs at four stages in decode (`c1-stages4` 4d77b5e71) | −0.7 µs (−0.11%) | +1.8 (+0.22%) | −0.9 (−0.11%) |
+| base words loaded after the first stages are issued (`c1-prologue` 4981583ba) | −0.2 (−0.02%) | +4.9 (+0.59%) | +0.5 (+0.05%) |
+| the stream GEMM on all 48 SMs (`c1-stream` 59b2ac540) | −4.2 (−0.65%) | −15.3 (−1.81%) | −15.7 (−1.87%) |
+| that at four stages (`c1-stream-s4` 8023b0d85) | −2.3 (−0.36%) | −13.1 (−1.56%) | −8.5 (−1.02%) |
 
-About 2-3 hours of single-GPU time.
+None beats next-candidate beyond the run's resolution, which is what the bound predicts.
+A fourth stage keeps three K blocks in flight an SM and gains nothing, so the grid
+kernel's stream is not short of bytes in flight. The prologue reorder is within noise
+too.
 
-What the results decide:
-- If FC1's tail and FC2's ramp are near the 7 and 5 µs assumed, the continuous FC1-FC2
-  stream is worth building for the release after next. It is a persistent kernel: FC2
-  tiles of an expert start when its FC1 tiles are done, with the SwiGLU and cast fused,
-  and a deadline trap for liveness.
-- If prototype 1 alone recovers most of row 2a, take it first: it is a small,
-  bit-identical change.
+## Recommendation for the release after next
+
+- **Take no routed-expert pipeline change.** The chain is within 1-7 µs a layer of an
+  ideal stream (at most +1% at c1), and none of the five variants measured above the
+  noise.
+- **Spend the c1 effort where the measured non-byte time is:**
+  1. **The L2 prefetch schedule** (#615): already prototyped, −1.5% at c1. The bound
+     adds a reason: an ideal stream pays 5-17 µs of ramp and tail at each layer's MoE
+     boundary, and prefetch traffic known in advance is what can fill it.
+  2. **The latency-bound small kernels:** 34 µs a layer at either rank, at most 1.3 ms a
+     step. They are mHC's non-byte time, sparse MLA, the norm and cast, dispatch and
+     SwiGLU, and the fusion survey's attention-front and mHC boundary fusions target
+     them.
+  3. **The all-reduce's late peers** on the ring (dgx4 last in 39% of collectives): a
+     cluster study, at most +3.2%.
+- **For the 100 tok/s question this confirms #598 from the other side.** The weight
+  stream itself is at the attainable rate, inside the kernels as well as overall. A
+  step only gets shorter through fewer bytes (the exact byte cuts, a stronger drafter's
+  tokens a step) or through less non-byte time between the streams.
+- **IKET's per-rank decode-step tables** (#610's step bundles at TP4 and TP3 rank
+  shapes, on dgx3) are still running. They cover the per-step kernels this harness
+  leaves out: router, metadata, sampler, drafter. When they land, they attribute the
+  remaining part of #616's 6.5 ms grid-to-serving gap.
+
+## Runs on dgx1
+
+dgx1, 2026-10-26, image `spark-ds41f:19f2c20ed4d6-next-6`, `scripts/lab.py kernel-local`
+from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1-iket/out/`.
+`run_queue.sh` ran the bundles in order and stopped at a failed smoke run. Receipts
+(`output.txt`, `verdict.json`, and for the traces the derived tables) are in `runs/`.
+
+| run | started (CET) | bundle | result |
+|---|---|---|---|
+| smoke-1 | 13:50 | smoke | FAIL in 4 s: the harness read its default routes at import |
+| smoke-2 | 13:58 | smoke | pass, 171 s; the lifetimes trace was empty (no kernel instrumented) |
+| stream-tests-1 | 14:01 | stream-tests (v1) | 115 passed, bit-identity test included; four PDL layer-chain tests lacked conftest's fixture |
+| layer-1 | 14:02 | layer | pass, 572 s: the TP4 and TP3 tables |
+| smoke-3 | 14:11 | smoke | pass, 113 s; the lifetimes held the combine alone |
+| stream-ab-1 | 14:12 | stream-ab (v1) | pass, 453 s: bits equal, v1 0.4-1.8% slower |
+| bound-1 | 14:13 | bound | FAIL in 46 s: inputs cast after the kernel cache froze |
+| layer-stream-1 | 14:21 | layer-stream (v1) | pass, 417 s |
+| lifetimes-1 | 14:22 | lifetimes | pass, 255 s |
+| layer-live6-1 | 14:29 | layer-live6 | pass, 302 s: TP4 at 24 experts |
+| smoke-4 | 14:29 | smoke | pass, 115 s |
+| bound-stream-1 | 14:33 | bound-stream (v2) | pass, 50 s |
+| layer-base-1 | 14:38 | layer-base | pass, 78 s: next-candidate's digests equal the IKET build's at both ranks |
+| bound-2 | 14:40 | bound | pass, 41 s: the bound |
+| lifetimes-stream-1 | 14:41 | lifetimes-stream (v2) | pass, 255 s |
+| stages-ab-1 | 14:43 | stages-ab | pass, 730 s: no arm above noise, bits equal |
+| stream-tests-2 | 14:47 | stream-tests (v2) | 119 passed, every launched kernel source-checked |
 
 ## Files
 
 | file | what |
 |---|---|
 | `harness/c1_layer.py` | the per-rank c1 layer harness |
-| `cta_timeline.py` | SM occupancy and weight stream from run-iket's warp lifetimes |
+| `harness/stream_bound.py` | the routed chain against an ideal read of the same bytes |
+| `layer_table.py` | per-kernel cost, excess over bytes, IKET phases and waits, from a `layer` run |
+| `cta_timeline.py` | SM occupancy and weight stream from run-iket's warp lifetimes (qualitative under the profiler) |
 | `step_shares.py`, `step_shares.json` | kernel families' shares of the TP4 production step |
 | `routed_chain.py`, `routed_chain.json` | the routed chain in production; FC2's serving fit |
-| `levers.py`, `levers.json` | ceilings in tok/s |
-| `ab.py` | base against prototype on the harness |
+| `levers.py`, `levers.json` | ceilings in tok/s from the measured bound and tables |
+| `ab.py` | base against prototype builds on the harness, in rotation |
 | `make_bundles.py`, `bundles/` | the kernel-lab bundles (IKET experiment's mechanics) |
 | `run_queue.sh` | the node-side driver: the bundles one after another |
