@@ -168,7 +168,7 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 The baseline is
 [manifests/baselines/2026-10-25-spark-ds41f-1025.json](manifests/baselines/2026-10-25-spark-ds41f-1025.json)
 ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md)), on the ring at 1M context;
-the triangle serves the same release at 1M context since 2026-10-25
+the same release is qualified on the triangle at 1M context
 ([manifests/suites/2026-10-25-spark-ds41f-1025-tp3](manifests/suites/2026-10-25-spark-ds41f-1025-tp3/)). See
 [docs/current-state.md](docs/current-state.md). The three-node deployment (the four-node ring
 differs only in cabling, transport and memory sizing):
