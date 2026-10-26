@@ -213,9 +213,9 @@ def main() -> None:
 
     # Variants: their package files over the base, mounted at /b/NAME; a file the
     # variant changes from HEAD comes from overlay-NAME/, the others from overlay/.
-    variant_mounts, variant_notes = [], []
+    variant_mounts, variant_notes, owns = [], [], {}
     for name, ref in variants:
-        own = set(packages(changed(repo, head, ref)))
+        own = owns[name] = set(packages(changed(repo, head, ref)))
         shutil.rmtree(HERE / f"overlay-{name}", ignore_errors=True)
         for f in sorted(own):
             copy(repo, ref, f, HERE / f"overlay-{name}" / f)
@@ -356,6 +356,23 @@ def main() -> None:
     for script in ("pdl_chain_ab.py", "pdl_trace.py"):
         shutil.copyfile(HERE / script, traced / script)
 
+    # Each variant's own run of the PDL and kernel tests with the source check.
+    for name, ref in variants:
+        variant_tests = HERE / "bundles" / f"pdl-tests-{name}"
+        shutil.rmtree(variant_tests, ignore_errors=True)
+        shutil.copytree(tests, variant_tests)
+        candidate = json.loads((variant_tests / "candidate.json").read_text())
+        candidate["description"] = candidate["description"].replace(
+            f"vLLM {head} {commit}", f"vLLM {ref} {rev(repo, ref)}"
+        )
+        candidate["mounts"] = [
+            [f"{REL}/overlay-{name}/{f}", target] if f in owns[name] else [src, target]
+            for (src, target), f in (
+                (m, m[1].removeprefix(f"{ROOT}/")) for m in candidate["mounts"]
+            )
+        ]
+        write_json(variant_tests / "candidate.json", candidate)
+
     # The fix candidates beside the base and PDL builds.
     if variants:
         builds = (
@@ -369,6 +386,8 @@ def main() -> None:
              ["/b/pdl_chain_ab.py", "2", "/b/pdl_trace.py", "--rows", "16,48"]),
             ("pdl-fix-trace-small", "The 3- and 6-row chains under the torch profiler, three rounds rotating",
              ["/b/pdl_chain_ab.py", "3", "/b/pdl_trace.py", "--rows", "3,6"]),
+            ("pdl-fix-grid", "The decode layer's chain at the engine grid's rows (2-96), the shared expert on its "
+             "side stream, fifteen rounds rotating", ["/b/pdl_chain_ab.py", "15", "/b/pdl_rows.py", "--modes", "aux"]),
             ("pdl-fix-focus", "The decode layer's chain at 2, 3, 6, 16, 48 and 96 rows, the shared expert on its "
              "side stream, fifteen rounds rotating",
              ["/b/pdl_chain_ab.py", "15", "/b/pdl_rows.py", "--rows", "2,3,6,16,48,96", "--modes", "aux"]),
