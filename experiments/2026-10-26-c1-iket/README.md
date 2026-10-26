@@ -336,6 +336,24 @@ Reconciled with #598:
   consumer time.
 - Row 2 overlaps the fusion survey's mHC and attention-front rows.
 
+Row 2 measured (lever 2, below):
+- With PDL, a removed launch on the chain is worth about 1 µs, not its traced
+  pre-PDL time.
+- The mHC boundary gives nothing more at c1: four bit-identical restructurings are all
+  within noise.
+- The attention front in one launch gives +0.7% TP4 and +0.9% TP3 at c1.
+- What is left of row 2 is the other launches that can merge: the index-source layers'
+  compressor and indexer chains, and the q RoPE after Q-B.
+
+IKET's per-rank decode-step table (#610, `iket-step-timings` in the shared notes) adds no
+new lever. A request's step against the grid's dummy step:
+- The target's verification head runs eagerly after the graph, and the grid skips it.
+  That is 1.0 ms at a TP4 shard: its own 248 MB at 266.6 GB/s, so it is already in
+  #598's floor.
+- The request's rows reach more experts: +0.96 ms of bytes.
+- Request-only kernels add 0.17 ms.
+- The per-layer kernels run slower with real rows: +0.13 ms, 31% of it exposed.
+
 ## Prototype 1: the stream grouped GEMM (dropped)
 
 vLLM branch `c1-stream` (worktree ~/projects/vllm-c1-stream), not pushed:
@@ -544,12 +562,45 @@ restructurings of the rest are all within noise:
 What remains is the fusion survey's cluster idea, which one GPU cannot measure: the
 post, the collapse and the norm in the all-reduce's reduce phase.
 
-**Then the attention front.** At about 1 µs a removed launch, the front is worth about
-as many microseconds as the launches it removes. One kernel for both norms, the Q-B
-cast, and the kv RoPE with the cache write removes four launches a layer (about 0.6% at
-c1). The kv latent is read only by its RoPE and the cache write, so it can stay on chip.
-The norms are TileKernels', so a bit-exact port of `norm_forward_and_per_token_cast`
-comes first.
+**A5: the attention front in one launch** (`c1-front` 8a70cb9a9, bit-identical). With
+PDL a removed launch is worth about 1 µs, so the front's small kernels are worth about
+as much as their count. After the fused Q-A/KV projection, a decode step ran five of
+them on the two latents:
+- TileKernels' RMSNorm of each latent;
+- `per_token_cast` of the normalized q latent, for Q-B;
+- the kv latent's RoPE;
+- its SWA cache record.
+
+`attention_front` is one kernel in their place.
+- q CTAs run a TileLang port of TileKernels' `norm_forward_and_per_token_cast`: its row
+  split, fragment layouts and reducers, and its own cast helpers. They write the BF16 q
+  latent and its MXFP8 cast, which equals `per_token_cast` of that row.
+- kv CTAs run the same norm, then from registers `rope_kernel`'s rotation and
+  `cache_writer_kernel`'s record, with those kernels' arithmetic.
+
+The kv norm's thread layout makes this fit. The 64 rotated columns are the last vector
+of lanes 8-15, which are exactly `rope_kernel`'s lanes. A 32-column record group is
+four adjacent lanes, and two shuffles give its amax. The q heads' RoPE stays after
+Q-B.
+
+The harness gained `--front`: the kv norm, both RoPEs and the SWA record, as the decode
+forward runs them. Runs front-tests-1 and front-ab-1, against c579b3fe1:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A5: the attention front in one launch (`c1-front` 8a70cb9a9) | **+0.72%** | **+0.35%** | +0.07% | **+0.90%** | +0.23% | −0.03% | 49 passed, kernels source-checked |
+
+The tests include a new one: every output byte against the five kernels (BF16 q latent,
+E4M3 values, UE8M0 scales, rotated kv latent, cache pages), at 1-65 rows, with int64
+and int32 slots, a skipped slot, and zero, large and tiny rows.
+
+Every c1 round gained, on both ranks: 4.7 µs a layer at TP4 (rounds 1.8-7.7 µs) and
+7.7 µs at TP3 (rounds 6.6-13.1 µs). Every TP4 c8 round gained too. Over 43 layers that is
+about 0.20 ms of the TP4 step (+0.7%, 75.4 to 75.9 tok/s) and 0.33 ms of TP3's (+0.9%,
+60.7 to 61.2). At c16 it is neutral.
+
+It is the first lever-2 fusion to pay. Wiring it into the attention forward's decode
+path is next.
 
 ## Runs on dgx1
 
@@ -591,6 +642,9 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | smoke-9 | 17:21 | smoke | pass, 116 s |
 | mixaux-tests-1 | 17:23 | mixaux-tests (A4) | 122 passed, every launched kernel source-checked |
 | mixaux-ab-1 | 17:25 | mixaux-ab (A4) | pass, 618 s: bits equal, within noise (+0.2% to −0.7%) |
+| smoke-10 | 17:36 | smoke | pass, 116 s |
+| front-tests-1 | 17:38 | front-tests (A5) | 49 passed, every launched kernel source-checked |
+| front-ab-1 | 17:39 | front-ab (A5) | pass, 634 s: bits equal, +0.72% TP4 c1, +0.90% TP3 c1 |
 
 ## Files
 
