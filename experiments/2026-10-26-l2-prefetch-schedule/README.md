@@ -111,6 +111,18 @@ Options the brief named, bounded elsewhere or here:
 | 5816ad749 | the schedule benchmark (below); no package file |
 | 980aed9a4 | **chained** (S1, S2): WO issued right after the fused Q-A/KV in a layer without an indexer, so its fill queues behind NEXT's; FFN issued between WO-A and WO-B (`TileLangWOProjection(after_a=...)`) |
 | 9e6d9d78a | **typed** (S3, S3b, S4a, S4b): an owner layer issues WO after the index query and an IDX window (compressor, indexer wk, wq_b, head weights) after Q-B; before an Engram layer the MoE hook issues an ENGRAM window (the projection's first 20 MB) and the Engram layer issues NEXT between its projection's GEMM and all-gather |
+| 95a067b0d | tests of every layer type's issue points and plans, on fake layers (`tests/models/test_deepseek_v4_1_l2_schedule.py`) |
+| 71314ad6e | benchmark fixes found by reading it before its first run |
+
+Risks the traces cannot settle, for the cluster A/B:
+- S1 starts the WO fill while Q-B's 8.8 MB of NEXT lines are unread. Under LRU the fill
+  evicts the consumed mHC and Q-A/KV lines first; if GB10's L2 does not, Q-B slows.
+- S3 moves the owner layers' WO fill from beside the compressor and indexer projections
+  (DRAM-bound, so the fill costs nothing there) onto the top-k chain, which slows beside a
+  fill as sparse MLA does (11.3 to 14.8 us). At +20-30% on a 50 us chain that is 10-15 us
+  of the 26 us a layer S3 recovers.
+- S1 and S2 move fill time off sparse MLA and the attention all-reduce, which both slow
+  beside a fill: a gain the bounds do not count, and dgx4's spin stand-ins cannot show.
 
 Cache hints only: no kernel, buffer or value changes, so every output is bit-identical by
 construction; the benchmark and the cluster gate check it.

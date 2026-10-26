@@ -44,10 +44,13 @@ MISSING = '''# Deleted at this ref; importing it fails as importing a missing mo
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
 BENCH = "benchmarks/kernels/benchmark_deepseek_v41_l2_schedule.py"
+SCHEDULE_TESTS = "tests/models/test_deepseek_v4_1_l2_schedule.py"
+# Tests and benchmarks the image's tree lacks, mounted beside it from the branch head.
 BENCH_FILES = (
     "tests/kernels/deepseek_v41_pdl_chains.py",
     "tests/kernels/deepseek_v41_l2_schedule_chain.py",
     BENCH,
+    SCHEDULE_TESTS,
 )
 FIXTURES = "experiments/2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
@@ -88,13 +91,13 @@ BUNDLES = {
         "the prototype's test files on next-candidate's own tree, for failures that "
         "predate it",
         [("test files on head", PYTEST + ["--basetemp", "/c/pytest-l2-schedule-head",
-                                         *TESTS], 5400)],
+                                         *TESTS], 5400)],  # not SCHEDULE_TESTS: head lacks the points
     ),
     "tests-typed": (
         "typed",
         "the prototype's test files on its tree",
         [("test files on typed", PYTEST + ["--basetemp", "/c/pytest-l2-schedule-typed",
-                                          *TESTS], 5400)],
+                                          SCHEDULE_TESTS, *TESTS], 5400)],
     ),
 }
 

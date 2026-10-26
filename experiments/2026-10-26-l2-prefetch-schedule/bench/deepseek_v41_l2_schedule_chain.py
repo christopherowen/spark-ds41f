@@ -330,8 +330,9 @@ class _Layer:
         if chained and self.kind == "swa":
             issue("WO")
         q_norm, kv_norm = self.norms
-        qn = q_norm(self.qa[:, :Q_LATENT], out=self.qn)
+        q_norm(self.qa[:, :Q_LATENT], out=self.qn)
         kv_norm(self.qa[:, Q_LATENT:], out=self.kvn)
+        qn = self.qn
         self.casts["q_b"].project(self.q_b, qn, self.qb)
         if typed and self.kind == "own":
             issue("IDX")
@@ -441,7 +442,7 @@ class ScheduleChain:
             + 1e-6,
         )
         plan = MoeExpertsV41Plan(
-            EXPERTS, TOPK, HIDDEN, width, swiglu_limit=LIMIT, out_dtype=torch.bfloat16
+            EXPERTS, TOPK, HIDDEN, width, swiglu_limit=LIMIT, out_dtype=torch.float32
         )
         plan.declare_kernels()
 
