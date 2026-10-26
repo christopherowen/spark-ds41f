@@ -40,6 +40,7 @@ STREAM = "c1-stream"
 STREAM_IKET = "c1-stream-iket"
 FUSION = "c1-fusion"
 FUSION2 = "c1-fusion2"
+MHCFOLD = "c1-mhcfold"
 MHC_TESTS = "tests/kernels/test_deepseek_v41_tilelang_mhc.py"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
@@ -253,6 +254,26 @@ BUNDLES = {
                                        for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
                 14400)],
     ),
+    "mhcfold-tests": dict(
+        ref=MHCFOLD,
+        what="the mHC entry in one launch at decode sizes (finalize folded into project_streams "
+             "past a grid barrier): the mHC and PDL tests, every launched kernel source-checked",
+        tests=[MHC_TESTS, PDL_TESTS, "tests/kernels/deepseek_v41_pdl_sources.py",
+               "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("mHC and PDL tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
+    ),
+    "mhcfold-ab": dict(
+        ref=NEXT,
+        builds={"mhcfold": MHCFOLD},
+        what="the mHC entry in one launch at decode sizes against next-candidate on the layer "
+             "harness with all-reduce stand-ins, in alternation, four rounds: c1, c8 and c16 at "
+             "TP4 and TP3 shapes",
+        steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
+                                     *(f"tp={tp} rows={rows} live={live} ar=on"
+                                       for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
+                14400)],
+    ),
     "stream-ab": dict(
         ref=NEXT,
         builds={"stream": STREAM},
@@ -298,6 +319,8 @@ def main():
             for build, (build_ref, build_package) in builds.items():
                 for kind, path in build_package:
                     files[f"{build}/{path}"] = (kind, build_ref, path)
+                # The harness's mHC entries and projections come from the chain module.
+                files[f"{build}/{CHAINS}"] = ("M", build_ref, CHAINS)
             tests = []
         else:
             for kind, path in package:
