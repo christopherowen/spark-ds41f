@@ -35,7 +35,11 @@ def main():
                     bound = site["events_per_warp_bound"]
                     previous = bounds.get(site["kernel"], 0)
                     bounds[site["kernel"]] = None if None in (bound, previous) else max(previous, bound)
-    trace = max(run.glob("*.trace.json"), key=lambda p: p.stat().st_size)
+    # The json postprocess's trace, else run-iket's decoded records (the same format).
+    found = list(run.glob("*.trace.json")) or list(run.glob("iket/pid_*/iket.decoded_results.json"))
+    if not found:
+        raise SystemExit(f"{run}: no *.trace.json or iket/pid_*/iket.decoded_results.json")
+    trace = max(found, key=lambda p: p.stat().st_size)
     data = json.loads(trace.read_text())
     launches = list(data["launches"])
     graphs = data.get("graphLaunches") or {}

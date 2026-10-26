@@ -11,7 +11,11 @@ started two such children).
 
 So the dry run runs alone (``--skip-run``) into OUT_DIR/dry; the largest count over its
 processes sizes the measured run, which reuses that tracker (``--use-tracker-dir``) and
-writes OUT_DIR/trace.
+writes OUT_DIR/trace. Its records stay as run-iket decodes them,
+OUT_DIR/trace/iket/pid_*/iket.decoded_results.json, which is the format of the json
+postprocess's ``*.trace.json`` (that postprocess copies the file). The perfetto and html
+postprocesses, built in memory, took more than 100 GB for a decode-step run's 2.6 GB of
+records (run 29); ``run-iket postprocess`` makes them for a smaller run.
 """
 
 import json
@@ -35,7 +39,7 @@ def main():
         raise SystemExit("no process of the dry run recorded a count")
     sys.exit(subprocess.run(["run-iket", "--output-dir", str(out / "trace"), "profile", "--keep",
                              "--use-tracker-dir", str(out / "dry" / "tracker"),
-                             "--max-ts-cnt-per-warp", str(most), "--postprocess", "all", "--",
+                             "--max-ts-cnt-per-warp", str(most), "--postprocess", "none", "--",
                              *command]).returncode)
 
 

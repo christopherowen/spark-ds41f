@@ -210,6 +210,69 @@ def summarize(launches, names, locations, kernels=None, sampling=None):
     return sorted(out, key=lambda g: -g["span_total_us"])
 
 
+def find_trace(path):
+    """A trace file, or run-iket's output directory: its largest ``*.trace.json`` (the json
+    postprocess), else its decoded records (``iket/pid_*/iket.decoded_results.json``, the
+    same format: the json postprocess copies it)."""
+    path = Path(path)
+    if not path.is_dir():
+        return path
+    found = list(path.glob("*.trace.json")) or list(path.glob("iket/pid_*/iket.decoded_results.json"))
+    if not found:
+        raise SystemExit(f"{path}: no *.trace.json or iket/pid_*/iket.decoded_results.json")
+    return max(found, key=lambda p: p.stat().st_size)
+
+
+def engine_steps(launches, step_kernel, prefill_kernel):
+    """The launches split at each launch of ``step_kernel`` (once an engine step), as
+    (kind, launches): "prefill" where the step launches ``prefill_kernel``, else
+    "decode". Launches before the first ``step_kernel`` are left out."""
+    starts = [i for i, launch in enumerate(launches) if launch["kernelName"] == step_kernel]
+    if not starts:
+        raise SystemExit(f"{step_kernel}: not launched in the window")
+    out = []
+    for a, b in zip(starts, starts[1:] + [len(launches)]):
+        part = launches[a:b]
+        kind = "prefill" if any(launch["kernelName"] == prefill_kernel for launch in part) else "decode"
+        out.append((kind, part))
+    return out
+
+
+def occupancy(items):
+    """(wall us, busy us) of (start ns, end ns, kernel) items in start order; busy is the
+    union of their spans."""
+    busy, run_start, run_end = 0, items[0][0], items[0][1]
+    for start, end, _ in items[1:]:
+        if start > run_end:
+            busy += run_end - run_start
+            run_start, run_end = start, end
+        else:
+            run_end = max(run_end, end)
+    busy += run_end - run_start
+    return (max(end for _, end, _ in items) - items[0][0]) / 1000, busy / 1000
+
+
+def step_table(parts):
+    """Markdown and numbers: each engine step's launches, wall and busy time, and its
+    kernels with the most span."""
+    lines = ["\n## Engine steps\n", "| step | kind | launches | wall us | busy us | busy | most span |",
+             "|---:|---|---:|---:|---:|---:|---|"]
+    numbers = []
+    for i, (kind, part) in enumerate(parts):
+        items = spans(part)
+        wall, busy = occupancy(items)
+        total = defaultdict(float)
+        for start, end, name in items:
+            total[name] += (end - start) / 1000
+        top = sorted(total, key=lambda n: -total[n])[:3]
+        numbers.append({"kind": kind, "launches": len(part), "wall_us": wall, "busy_us": busy,
+                        "most_span": {n: total[n] for n in top}})
+        lines.append(f"| {i} | {kind} | {len(part)} | {wall:.1f} | {busy:.1f} | "
+                     f"{busy / wall if wall else 1:.0%} | "
+                     + ", ".join(f"{n} {total[n]:.0f}" for n in top) + " |")
+    return lines, numbers
+
+
 def spans(launches):
     """(start ns, end ns, kernel) of each IKET launch: its first warp start, last warp end."""
     return [(min(w["startTs"] for w in launch["warpLifetimes"]),
@@ -264,30 +327,35 @@ def timeline(items, gap_us, top=10):
     return lines, numbers
 
 
-def overview(groups, statements, top=20):
+def overview(groups, statements, top=20, per_step=None):
     """Markdown: kernels by their total span, and the waits the launches' last warps spend
-    most time in (a launch ends with its last warp)."""
+    most time in (a launch ends with its last warp). With ``per_step`` (the decode steps
+    the groups cover), launches and spans are also given a step."""
     total = sum(g["span_total_us"] for g in groups)
-    lines = [f"\n## Overview: {sum(g['launches'] for g in groups)} launches of {len(groups)} kernel "
-             f"shapes, spans summing to {total:.1f} us\n",
-             "| kernel | grid | launches | span total us | share | last warp: wait | load | compute "
-             "| store | unattributed |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    over = f" over {per_step} decode steps" if per_step else ""
+    step = per_step or 1
+    lines = [f"\n## Overview{over}: {sum(g['launches'] for g in groups)} launches of {len(groups)} "
+             f"kernel shapes, spans summing to {total:.1f} us ({total / step:.1f} a step)\n",
+             "| kernel | grid | launches a step | span us a step | share | span us a launch | last warp: "
+             "wait | load | compute | store | unattributed |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for g in groups[:top]:
         last = g["last_warp"]
         shares = [last["phases"].get(p, 0.0) / last["us"] if last["us"] else 0.0
                   for p in ("wait", "load", "compute", "store", "unattributed")]
-        lines.append(f"| {g['kernel']} | {g['grid']} | {g['launches']} | {g['span_total_us']:.1f} | "
-                     f"{g['span_total_us'] / total:.1%} | " + " | ".join(f"{s:.0%}" for s in shares) + " |")
+        lines.append(f"| {g['kernel']} | {g['grid']} | {g['launches'] / step:g} | "
+                     f"{g['span_total_us'] / step:.1f} | {g['span_total_us'] / total:.1%} | "
+                     f"{g['span_us']:.2f} | " + " | ".join(f"{s:.0%}" for s in shares) + " |")
     waits = []
     for g in groups:
         for name, us in g["last_warp"]["ranges_total_us"].items():
             if phase_of(name) == "wait":
                 waits.append((us, g, name))
-    lines += ["\n| wait | kernel | grid | last-warp us, all launches | per launch | first statement |",
+    lines += ["\n| wait | kernel | grid | last-warp us a step | a launch | first statement |",
               "|---|---|---|---:|---:|---|"]
     for us, g, name in sorted(waits, key=lambda item: -item[0])[:top]:
         statement = statements.get((g["kernel"], name), "")[:80].replace("|", "\\|")
-        lines.append(f"| {name} | {g['kernel']} | {g['grid']} | {us:.1f} | {us / g['launches']:.2f} | "
+        lines.append(f"| {name} | {g['kernel']} | {g['grid']} | {us / step:.1f} | {us / g['launches']:.2f} | "
                      f"`{statement}` |")
     return lines
 
@@ -300,18 +368,32 @@ def main():
     parser.add_argument("--kernels")
     parser.add_argument("--between")
     parser.add_argument("--gap-us", type=float, default=100.0)
+    parser.add_argument("--step-kernel",
+                        help="with --between: split the window at each launch of this kernel (once "
+                             "an engine step); the tables then cover the decode steps")
+    parser.add_argument("--prefill-kernel", default="prepare_prefill_inputs_kernel",
+                        help="a step that launches it is a prefill step")
     parser.add_argument("--json")
     args = parser.parse_args()
-    trace = Path(args.trace)
-    if trace.is_dir():  # run-iket's output directory: its largest trace
-        trace = max(trace.glob("*.trace.json"), key=lambda p: p.stat().st_size)
+    trace = find_trace(args.trace)
     data = json.loads(trace.read_text())
     graphs = data.get("graphLaunches")
-    print(f"trace {trace.name}: {len(data['launches'])} launches, graphLaunches "
+    print(f"trace {trace}: {len(data['launches'])} launches, graphLaunches "
           f"{type(graphs).__name__} of {len(graphs or [])}")
     launches = all_launches(data)
     if args.between:
         launches = window(launches, args.between)
+    lines, numbers = timeline(spans(launches), args.gap_us) if args.between else ([], None)
+    steps, per_step = None, None
+    if args.step_kernel:
+        parts = engine_steps(launches, args.step_kernel, args.prefill_kernel)
+        step_lines, steps = step_table(parts)
+        lines += step_lines
+        decode = [part for kind, part in parts if kind == "decode"]
+        if not decode:
+            raise SystemExit("no decode step in the window")
+        launches = [launch for part in decode for launch in part]
+        per_step = len(decode)
     statements, sampling = sites(args.sources) if args.sources else ({}, {})
     groups = summarize(launches, data["stringTable"], data["locationTable"], args.kernels, sampling)
     del data
@@ -323,8 +405,7 @@ def main():
         key = (g["kernel"], tuple(g["grid"]), tuple(g["block"]))
         g["nsys_us"] = {label: median(d.get(key, [])) for label, d in nsys.items()}
         g["nsys_launches"] = {label: len(d.get(key, [])) for label, d in nsys.items()}
-    lines, numbers = timeline(spans(launches), args.gap_us) if args.between else ([], None)
-    lines += overview(groups, statements)
+    lines += overview(groups, statements, per_step=per_step)
     for g in groups:
         nsys_text = "".join(f", nsys {label} {us:.2f} us" for label, us in g["nsys_us"].items())
         lines.append(f"\n### {g['kernel']} grid {g['grid']} block {g['block']}\n")
@@ -354,7 +435,8 @@ def main():
                          f"{r['max_us']:.2f} | `{statement}` |")
     print("\n".join(lines))
     if args.json:
-        Path(args.json).write_text(json.dumps({"timeline": numbers, "groups": groups}, indent=1) + "\n")
+        Path(args.json).write_text(json.dumps({"timeline": numbers, "steps": steps, "decode_steps": per_step,
+                                               "groups": groups}, indent=1) + "\n")
 
 
 if __name__ == "__main__":

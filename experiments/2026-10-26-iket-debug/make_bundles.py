@@ -86,9 +86,12 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
             ("decode steps, nsys, off, graphs",
              [*NSYS_PROFILE, "{out}/nsys-graphs", "--cuda-graph-trace=node", "{python}", STEP, "off",
               *shape, "--out", "{out}/nsys-graphs-run"], 5400),
+            # prepare_pos_seq_lens_kernel is the first of the kernels an engine step
+            # launches once (run 29); a step that prepares prefill inputs is a prefill step.
             ("timeline and tables",
              ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
               "--between", "iket_step_marker_kernel", "--gap-us", "200",
+              "--step-kernel", "prepare_pos_seq_lens_kernel",
               "--nsys", "graphs={out}/nsys-graphs.sqlite", "--json", "{out}/table.json"], 1800),
             ("nsys timeline", ["{python}", "/b/nsys_window.py", "{out}/nsys-graphs.sqlite",
                                "--gap-us", "200"], 600),
