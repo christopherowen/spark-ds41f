@@ -78,9 +78,10 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
         mounts=[HUB],
         steps=[
             # The dry run alone, then the measured run sized from its largest process count
-            # (run-iket reads only the first process's: iket_profile.py).
+            # (run-iket reads only the first process's: iket_profile.py). Debug logs name
+            # each launch, for a run that hangs (run 30's dry run spun in a graph replay).
             ("decode steps, on, under run-iket",
-             ["{python}", "/b/iket_profile.py", "{out}", "--",
+             ["{python}", "/b/iket_profile.py", "{out}", "--log-level", "debug", "--",
               "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", str(ctas),
               "--iters", str(iters), "--skip", skip, *shape, "--out", "{out}/trace-run"], 7200),
             ("records against the dry run's count",
