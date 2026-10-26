@@ -132,6 +132,12 @@ BUNDLES = {
               "--json", "{out}/table.json"], 1800),
         ],
     ),
+    "tests": dict(
+        ref=IKET,
+        what="the IKET mode's tests alone",
+        tests=TESTS,
+        steps=[("IKET mode tests", [*PYTEST, "--basetemp", "{out}/pytest", *TESTS], 1800)],
+    ),
     "inspect": dict(
         ref=IKET,
         what="the image's run-iket CLI sources, copied out for reading (how it injects into a "

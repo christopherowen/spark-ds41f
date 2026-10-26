@@ -226,7 +226,9 @@ print(json.dumps({
     "sum": c.double().sum().item(),
     "bits": hashlib.sha256(c.cpu().numpy().tobytes()).hexdigest(),
     "source_instrumented": "__iket_meta_info" in kernel.get_kernel_source(),
-    "modules": sorted(m for m in sys.modules if m.endswith(".iket") or ".iket." in m),
+    # The modules the mode adds; CuTe DSL's own experimental IKET loads with vLLM.
+    "modules": sorted(m for m in sys.modules if m.startswith("tilelang.tools.cuda")
+                      or m == "vllm.models.deepseek_v4_1.tilelang.iket"),
     "callback": tvm_ffi.get_global_func(callback, allow_missing=True) is not None,
     "cache_enabled": tilelang_env.is_cache_enabled(),
     "cache_dir": os.environ.get("TILELANG_CACHE_DIR"),
