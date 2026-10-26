@@ -120,8 +120,12 @@ BUNDLES = {
             ("decode steps, off", ["{python}", STEP, "off", "--out", "{out}/off"], 5400),
             ("decode steps, on", ["{python}", STEP, "on", "--iket", "{out}/on/iket", "--ctas", "4",
                                   "--out", "{out}/on"], 5400),
+            # run-iket sizes its pool as if every launch of the run were in flight at
+            # once (898 GB here: 16,894 launches, 5,016 timestamps a warp); the pool
+            # is reused as launches finish, so a fixed one holds the step's.
             ("decode steps, on, under run-iket",
-             [*PROFILE, "{out}/trace", "profile", "--postprocess", "all", "--",
+             ["run-iket", "--context-buffer-size", "8G", "--output-dir", "{out}/trace", "profile",
+              "--postprocess", "all", "--",
               "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4",
               "--out", "{out}/trace-run"], 7200),
             ("decode steps, nsys, off", [*NSYS_PROFILE, "{out}/nsys-off", "--cuda-graph-trace=node",
