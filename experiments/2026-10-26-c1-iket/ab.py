@@ -2,7 +2,8 @@
 """The c1 layer harness on the base build and a prototype build, in alternation on one
 GPU: microseconds a layer and whether every buffer's bits agree.
 
-usage: ab.py ROUNDS CASE [CASE ...]     (a CASE: "tp=4 live=3", c1_layer.py's options)
+usage: ab.py ROUNDS CASE [CASE ...]     (a CASE: "tp=4 live=3 ar=on", c1_layer.py's
+                                         options; "on" passes a flag)
 
 Each build is the image's vLLM tree with package files in place, as the PDL experiment's
 pdl_chain_ab.py builds them: /tmp/c1-ab/base/vllm links to the image's files with the
@@ -60,7 +61,8 @@ def run(tree, label, case, out):
     env = dict(os.environ)
     rest = [p for p in env.get("PYTHONPATH", "").split(":") if p and p != str(IMAGE_TREE)]
     env["PYTHONPATH"] = ":".join([str(tree), *rest])
-    options = [f"--{key}={value}" for key, value in (item.split("=") for item in case.split())]
+    options = [f"--{key}" if value == "on" else f"--{key}={value}"
+               for key, value in (item.split("=") for item in case.split())]
     argv = [sys.executable, str(LAYER), "off", *options, *COMMON, "--out", out]
     print(f"=== {label}", flush=True)
     process = subprocess.run(argv, cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

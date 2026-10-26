@@ -2,7 +2,7 @@
 
 usage: c1_layer.py off|on --tp 4|3 --out DIR [--iket DIR] [--rows 6] [--live N]
                    [--layers L] [--sets S] [--replays N] [--graph] [--evict]
-                   [--routes ROUTES.json] [--start T] [--head] [--mla]
+                   [--routes ROUTES.json] [--start T] [--head] [--mla] [--ar]
                    [--ctas N] [--iters N] [--skip REGEX]
 
 The layer is vLLM's PDL layer chain (tests/kernels/deepseek_v41_pdl_chains.py) at the
@@ -28,7 +28,10 @@ experts), layer ``i`` using set ``i % sets``, so a layer does not find the previ
 layer's weights in L2 (24 MB on GB10; a set's experts are 1.7 GB at TP4).
 
 ``--head`` adds the target's packed 12-bit vocabulary head at the rank's shard (32,320
-rows at TP4, 43,136 at TP3) on the last layer's output, once a pass.
+rows at TP4, 43,136 at TP3) on the last layer's output, once a pass. ``--ar`` puts a
+copy where each of the layer's two all-reduces runs: a kernel off the PDL chain, so the
+next entry launches only after it ends, as after the one-shot all-reduce. Rows past the
+reference's eight tokens stand for other requests (``reference_routes``).
 
 A pass is ``--layers`` layers back to back (and the head). It runs once to warm up,
 then ``--replays`` times, eagerly or (``--graph``) as one CUDA graph; ``--evict``
@@ -70,15 +73,23 @@ def default_routes():
 
 
 def reference_routes(path, start, rows, live):
-    """[layer][row] -> six experts (or -1s for a dead row), for every reference layer."""
+    """[layer][row] -> six experts (or -1s for a dead row), for every reference layer.
+
+    Rows past the reference's tokens stand for other requests: row r takes token
+    ``start + r % tokens``'s routes with the expert ids relabelled by request
+    ``r // tokens``'s fixed permutation (the identity for the first), so each
+    request has the reference's routing structure over its own experts."""
     data = json.loads(Path(path).read_text())
     steps = data["steps"] if "steps" in data else data
-    if start + rows > len(steps):
-        raise SystemExit(f"{path}: {len(steps)} reference tokens, need {start + rows}")
+    tokens = len(steps) - start
+    if tokens < 1 or (rows > tokens and start != 0):
+        raise SystemExit(f"{path}: {len(steps)} reference tokens, start {start}, {rows} rows")
+    perms = [list(range(EXPERTS))] + [torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(q)).tolist()
+                                      for q in range(1, -(-rows // tokens))]
     out = []
     for layer in range(LAYERS):
-        out.append([steps[start + r]["routes_last_position"][str(layer)] if r < live else [-1] * TOPK
-                    for r in range(rows)])
+        out.append([[perms[r // tokens][e] for e in steps[start + r % tokens]["routes_last_position"][str(layer)]]
+                    if r < live else [-1] * TOPK for r in range(rows)])
     return out
 
 
@@ -127,11 +138,11 @@ class WeightSet:
 class Layer:
     """One layer's buffers over a weight set, and its launches (``run``)."""
 
-    def __init__(self, tp, rows, weights, ids, gen, aux):
+    def __init__(self, tp, rows, weights, ids, gen, aux, ar=False):
         from vllm.models.deepseek_v4_1.tilelang import linear
         from vllm.models.deepseek_v4_1.tilelang.moe import workspace_bytes
 
-        self.tp, self.rows, self.w, self.aux = tp, rows, weights, aux
+        self.tp, self.rows, self.w, self.aux, self.ar = tp, rows, weights, aux, ar
         shape = RANK[tp]
         inter = shape["inter"]
         self.ids = torch.tensor(ids, dtype=torch.int32, device=DEVICE).contiguous()
@@ -145,6 +156,9 @@ class Layer:
 
         self.qa, self.qn, self.qb = empty(QA_KV[0]), empty(Q_LATENT), empty(shape["heads"] * 512)
         self.wo_out = empty(HIDDEN)
+        # With ``ar``, a copy stands in for each all-reduce: a kernel off the PDL chain
+        # between the sublayer's output and the next entry, as the one-shot is.
+        self.wo_ar, self.out_ar = empty(HIDDEN), empty(HIDDEN)
         self.h, self.act, self.shared_out, self.out = empty(2 * inter), empty(inter), empty(HIDDEN), empty(HIDDEN)
         w = weights
         self.casts = {
@@ -179,7 +193,11 @@ class Layer:
         xq, sf = self.casts["wo_b"]
         w.wo.a(self.qb, xq[:rows], sf[:rows], self.partials[0] if self.partials else None)
         linear._block32_gemm(w.wo.b, xq, sf, self.wo_out, rows)
-        f(self.wo_out, a.streams, a.post, a.comb, a.pre)
+        attention_out = self.wo_out
+        if self.ar:
+            self.wo_ar.copy_(self.wo_out)
+            attention_out = self.wo_ar
+        f(attention_out, a.streams, a.post, a.comb, a.pre)
         main = torch.cuda.current_stream()
         self.aux.wait_stream(main)
         with torch.cuda.stream(self.aux):
@@ -192,6 +210,9 @@ class Layer:
             return self.shared_out
 
         w.plan.run(f.mx, self.ids, self.route_weights, w.experts, self.out, self.workspace, shared=shared)
+        if self.ar:
+            self.out_ar.copy_(self.out)
+            return self.out_ar, f.streams, f.post, f.comb, f.pre
         return self.out, f.streams, f.post, f.comb, f.pre
 
     def outputs(self):
@@ -274,6 +295,7 @@ def main():
     ap.add_argument("--first-layer", type=int, default=0, help="reference layer of chain layer 0")
     ap.add_argument("--head", action="store_true")
     ap.add_argument("--mla", action="store_true")
+    ap.add_argument("--ar", action="store_true", help="a copy off the PDL chain for each all-reduce")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     ap.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
@@ -296,7 +318,7 @@ def main():
         sets = [WeightSet(args.tp, args.rows, gen) for _ in range(args.sets)]
         aux = torch.cuda.Stream()
         chain_layers = [(args.first_layer + i) % LAYERS for i in range(args.layers)]
-        layers = [Layer(args.tp, args.rows, sets[i % args.sets], routes[ref], gen, aux)
+        layers = [Layer(args.tp, args.rows, sets[i % args.sets], routes[ref], gen, aux, args.ar)
                   for i, ref in enumerate(chain_layers)]
         x = (torch.randn((args.rows, HIDDEN), generator=gen, device=DEVICE)).bfloat16()
         streams = torch.randn((args.rows, mhc.MULT * HIDDEN), generator=gen, device=DEVICE).bfloat16()
@@ -352,7 +374,7 @@ def main():
     result = {
         "mode": args.mode, "tp": args.tp, "rank_shapes": RANK[args.tp], "rows": args.rows, "live": args.live,
         "start": args.start, "layers": args.layers, "reference_layers": chain_layers, "sets": args.sets,
-        "graph": args.graph, "evict": args.evict, "head": args.head, "mla": mla_route,
+        "graph": args.graph, "evict": args.evict, "head": args.head, "mla": mla_route, "ar": args.ar,
         "distinct_experts": distinct, "distinct_mean": round(statistics.mean(distinct), 2),
         "replays": args.replays,
         "us_per_pass": round(statistics.median(times), 2),

@@ -157,7 +157,9 @@ def costs(all_passes, distinct, tp):
         for index, layer in enumerate(layers):
             if index == 0:
                 continue
-            prev_end = None
+            # The layer's first kernel follows the previous layer's combine.
+            layer_start = max(r[1] for r in layers[index - 1])
+            prev_end = layer_start
             aux_end = 0
             cost, length = defaultdict(float), defaultdict(float)
             for fam, r, aux in classify(layer):
@@ -183,7 +185,7 @@ def costs(all_passes, distinct, tp):
             block = sum(cost[f] for f in MOE_BLOCK if f in cost)
             per["MoE block"].append(block)
             excess["MoE block"].append(block - floors["routed FC1"] - floors["routed FC2"] - nbytes["shared"] / RATE)
-            layer_us.append((layer[-1][1] - layer[0][0]) / 1000)
+            layer_us.append((max(r[1] for r in layer) - layer_start) / 1000)
     return per, dur, excess, keys, layer_us
 
 
