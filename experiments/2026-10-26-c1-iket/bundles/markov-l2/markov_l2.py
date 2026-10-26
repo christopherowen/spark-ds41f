@@ -19,8 +19,14 @@ The bound of keeping it there: the same five drafts after the L2 prefetch kernel
 128 threads x ``VLLM_L2_PREFETCH_GRID`` CTAs) has loaded the weight, and that
 prefetch's own time.
 
+Whether L2 holds the weight at all: ``stream_bound.py``'s ideal read kernel (48 CTAs,
+32 KB chunks) reads the same weight five times back to back after the eviction, with and
+without the prefetch first. Reads 2-5 much faster than the first mean L2 keeps the bytes
+and the projection's own latency is what holds the drafts.
+
 Prints one JSON line per shape: microseconds a launch (medians over the reps), cold and
-per draft, after the prefetch, the prefetch, and the bytes' time at 266.6 GB/s.
+per draft, after the prefetch, the prefetch, the five reads either way, and the bytes'
+time at 266.6 GB/s.
 """
 
 import argparse
@@ -50,6 +56,8 @@ def main():
     from vllm.models.glm5next.nvidia import l2_prefetch as l2pf
     from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
 
+    from stream_bound import CTAS, THREADS, expert_stream
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=30)
     args = ap.parse_args()
@@ -63,6 +71,9 @@ def main():
             TileLangLinearMethod().declare_layer_kernels(layer)
             layers[name] = layer
         prefetch_kernel = l2_prefetch_kernel(l2pf._GRID, l2pf._BLOCK, l2pf._CHUNK_BYTES)
+        readers = {name: expert_stream(n * RANK // 2) for name, n in SHAPES.items()}
+        sink = torch.empty((CTAS * THREADS,), dtype=torch.int32, device="cuda")
+        row = torch.zeros((1,), dtype=torch.int32, device="cuda")
         prepare.freeze("markov_l2.py: every kernel was prepared before the first launch")
         for name, layer in layers.items():
             n = layer.weight.shape[0]
@@ -119,6 +130,21 @@ def main():
                 prefetch.append(marks[0].elapsed_time(marks[1]) * 1000)
                 for d in range(5):
                     prefetched[d].append(marks[2 * d + 1].elapsed_time(marks[2 * d + 2]) * 1000)
+            words = layer.weight.view(torch.int32).view(1, -1)
+            reads = {False: [[] for _ in range(5)], True: [[] for _ in range(5)]}
+            for prefetched_first in (False, True):
+                for _ in range(args.reps):
+                    evict.add_(1)
+                    if prefetched_first:
+                        prefetch_kernel(segs)
+                    marks = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
+                    marks[0].record()
+                    for d in range(5):
+                        readers[name](words, row, sink)
+                        marks[d + 1].record()
+                    torch.cuda.synchronize()
+                    for d in range(5):
+                        reads[prefetched_first][d].append(marks[d].elapsed_time(marks[d + 1]) * 1000)
             nbytes = n * RANK * 2
             print(json.dumps(dict(
                 shape=name, rows=n, weight_mb=round(nbytes / 1e6, 2),
@@ -128,6 +154,8 @@ def main():
                 argmax_us=round(statistics.median(arg), 1),
                 prefetched_draft_us=[round(statistics.median(d), 1) for d in prefetched],
                 prefetch_us=round(statistics.median(prefetch), 1),
+                read_us=[round(statistics.median(d), 1) for d in reads[False]],
+                prefetched_read_us=[round(statistics.median(d), 1) for d in reads[True]],
             )), flush=True)
 
 

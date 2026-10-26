@@ -616,16 +616,57 @@ Run front-wiring-tests-1 passed: the attention model tests (with a new routing t
 the front, RoPE, cache-writer and TileLang linear tests. It targets the release after
 next. A serving bench on the cluster is the gate it still needs.
 
-**The next small-kernel fusion to take**, at about 1 µs a removed launch, is the one that
-removes the most launches: each index-source layer's compressor and indexer chain (17-23
-small kernels). Then the q heads' RoPE, into the Q-B GEMM's store.
+**In a whole decode step** (IKET's step tool, #610: six target layers covering every
+attention role, plus the drafter, at a rank's shapes; dgx1 TP4 and dgx2 TP3 in
+parallel). The vLLM refs are next-candidate and the front, each with IKET's mode merged
+(`c1-step-base` bd175503b, `c1-step-front` 3732f532f).
+- **The step tool runs breakable CUDA graphs.** vLLM turns them on for DS4.1 unless
+  `VLLM_USE_BREAKABLE_CUDAGRAPH` is set; the serving recipe sets it to 0. The first
+  pair of runs (step-*-tp4-1, step-*-tp3-1) therefore never launched the front. Its
+  wiring stays off in that mode on purpose. The `-full` bundles set the variable to
+  0, as the recipe does.
+- **End to end, the front matches next-candidate.**
+  - With breakable graphs off, the TP4 tokens are equal, and the logprobs are equal
+    exactly at positions 1-31.
+  - Position 0's top-5 logprobs differ between any two runs, even of one build (IKET
+    found the same).
+  - At TP3, the dummy engine's reads of memory nothing writes split the two builds'
+    tokens, in both graph modes.
+  - With that memory filled (`--filled`: filled-base-tp3-1 on dgx2, filled-front-tp3-1
+    on dgx1, two runs each), all four runs give the same tokens and the same logprobs
+    at positions 1-31.
+- **The step's chain** (`step_chain.py`: each launch's increment of the step's end).
+  - The front launches 9 times a step, replacing 36 launches.
+  - The five kernels' chain cost falls from 109.0 to 84.1 µs a step at TP4, and from
+    107.3 to 82.3 at TP3, the front's 29.7-29.9 µs included.
+  - That is 2.8 µs a layer saved. It is a floor: a removed launch also lets its
+    successor start sooner, which the layer harness counts (4.7 and 7.7 µs a layer).
 
-## Runs on dgx1
+**The compressor and indexer chain bounds small.** In the TP4 step (breakable graphs
+off), the indexer's kernels cost about 40 µs a step over the two index-source layers:
+- top-k segments 14.4 µs;
+- the MXFP4 query quantization 9.8 µs;
+- scoring 6.3 µs;
+- the top-k merge and page tables, about 6 µs.
 
-dgx1, 2026-10-26, image `spark-ds41f:19f2c20ed4d6-next-6`, `scripts/lab.py kernel-local`
-from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1-iket/out/`.
-`run_queue.sh` ran the bundles in order and stopped at a failed smoke run. Receipts
-(`output.txt`, `verdict.json`, and for the traces the derived tables) are in `runs/`.
+`compress` adds about 3 µs per KV-source layer. Over the model's eight index-source and
+four KV-source layers that is at most about 0.17 ms a step (0.5% at TP4). At about 1 µs
+a removed launch, perhaps half of it would go, and merging the top-k passes risks
+changing which tied positions are kept. Not worth building ahead of anything else.
+
+The steady steps also sit idle about 111 µs between kernels. That is host time before
+per-step kernels (draft budget 22 µs, padding rows 16, CED requests 13, adaptive
+offsets 11, post-update 7). It is an engine-level lever.
+
+## Runs on dgx1 and dgx2
+
+dgx1, 2026-10-26, and from 18:57 CET also dgx2, both with image
+`spark-ds41f:19f2c20ed4d6-next-6` and `scripts/lab.py kernel-local`. Each node ran from
+its own `~/spark-lab/agents/c1-iket/spark-ds41f`, with outputs in
+`~/spark-lab/agents/c1-iket/out/`. `run_queue.sh` ran the bundles in order and stopped at
+a failed smoke run. Receipts (`output.txt`, `verdict.json`, and for the traces the
+derived tables) are in `runs/`. The step runs keep their results, step diffs and
+`step_chain.json`. Runs are on dgx1 unless the table names dgx2.
 
 | run | started (CET) | bundle | result |
 |---|---|---|---|
@@ -665,6 +706,13 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | front-ab-1 | 17:39 | front-ab (A5) | pass, 634 s: bits equal, +0.72% TP4 c1, +0.90% TP3 c1 |
 | smoke-11 | 18:04 | smoke | pass, 116 s |
 | front-wiring-tests-1 | 18:06 | front-wiring-tests (A5 wired) | 86 passed, every launched kernel source-checked |
+| step-base-tp4-1, step-front-tp4-1 | 18:59, 19:09 | IKET step tool, TP4 | pass; breakable graphs auto-enabled, so the front did not launch; tokens equal |
+| step-base-tp3-1, step-front-tp3-1 (dgx2) | 19:00, 19:10 | IKET step tool, TP3 | pass; breakable graphs; tokens split by the dummy engine's unwritten reads |
+| step-base-tp4-full-1, step-front-tp4-full-1 | 19:29, 19:39 | step tool, breakable off | pass: the front launched 9 times a step, its family −25 µs a step, tokens equal, logprobs equal at 1-31 |
+| step-base-tp3-full-1, step-front-tp3-full-1 (dgx2) | 19:29, 19:39 | step tool, breakable off | pass: the front family −25 µs a step |
+| filled-base-tp3-1 (dgx2), filled-front-tp3-1 | 19:59 | two filled-memory runs each | all four: tokens equal, logprobs equal at 1-31 |
+| markov-l2-1 | 20:02 | markov-l2 | FAIL in 7 s: a plain namespace cannot be referenced weakly |
+| markov-l2-2 | 20:10 | markov-l2 | pass: drafts 2-5 stream the weight from DRAM at every shard |
 
 ## Files
 
