@@ -41,6 +41,7 @@ STREAM_IKET = "c1-stream-iket"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
 LAYER = "/b/c1_layer.py"
+BOUND = "/b/stream_bound.py"
 TABLE = "/b/iket_table.py"
 TIMELINE = "/b/cta_timeline.py"
 ROUTES = "/b/ref-woa1.json"
@@ -135,6 +136,24 @@ BUNDLES = {
         steps=[*chain_steps(4, 3, "live3", phases=False), *chain_steps(4, 6, "live6", phases=False),
                *chain_steps(3, 3, "live3", phases=False)],
     ),
+    "bound": dict(
+        ref=NEXT,
+        what="the routed experts' chain against an ideal read of the same bytes (one launch a "
+             "layer, two, and one for all layers), at both ranks' shapes and 3 and 6 live rows",
+        steps=[(f"TP{tp}, {live} live rows",
+                ["{python}", BOUND, "--tp", str(tp), "--live", str(live), "--routes", ROUTES,
+                 "--out", f"{{out}}/tp{tp}-live{live}"], 3600)
+               for tp in (4, 3) for live in (3, 6)],
+    ),
+    "bound-stream": dict(
+        ref=STREAM,
+        what="the bound harness on the stream grouped GEMM's build: its routed chain against the "
+             "same ideal reads",
+        steps=[(f"TP{tp}, {live} live rows",
+                ["{python}", BOUND, "--tp", str(tp), "--live", str(live), "--routes", ROUTES,
+                 "--out", f"{{out}}/tp{tp}-live{live}"], 3600)
+               for tp in (4, 3) for live in (3, 6)],
+    ),
     "stream-tests": dict(
         ref=STREAM,
         what="the stream grouped GEMM: its bits against the grid GEMM's at both ranks' expert "
@@ -157,6 +176,7 @@ BUNDLES = {
 SCRIPTS = {
     "ab.py": HERE / "ab.py",
     "c1_layer.py": HERE / "harness" / "c1_layer.py",
+    "stream_bound.py": HERE / "harness" / "stream_bound.py",
     "cta_timeline.py": HERE / "cta_timeline.py",
     "iket_hot.py": IKET_DIR / "harness" / "iket_hot.py",
     "iket_table.py": IKET_DIR / "iket_table.py",
