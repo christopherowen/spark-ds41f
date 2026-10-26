@@ -737,9 +737,11 @@ measured +21.5% at 1M (3,907 against 3,216 tok/s). The stall step there was 1.44
 
 What 8,192 buys and costs:
 - **Prefill:** about +12% over 4,096 below 1M and +3% over 6,144 at 1M.
-- **The stall:** decode alone is level, but the other streams' step is about 1.7 times as long
-  while a long prompt prefills. On the ring the owner took the same kind of trade at 16,384
-  (stall step +78%).
+- **The stall:** decode alone is level, but while a long prompt prefills the other streams'
+  step is about 1.7 times as long as at the 4,096 budget. Against plain decode (0.100 s), the
+  steps during a 131K prefill are 8.6-14.4 times as long
+  ([2026-10-19-prefill-budget-tp3](../2026-10-19-prefill-budget-tp3/README.md)). On the ring
+  the owner took the same kind of trade at 16,384 (stall step +78% over 8,192).
 - **Memory, the question the fit check answers:**
   - Before the fixes, dgx1 kept 4.57 GiB through three 1M prefills at 8,192, 1.57 above the
     3 GiB guard: just over the 1.5 GiB margin.

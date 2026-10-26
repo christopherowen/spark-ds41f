@@ -124,8 +124,10 @@ lowest through three cold 1M prefills. Details are in the
   measured on the ring). Sampled c8 and c1 exist for this release only. The triangle's 1M figure
   comes from two runs the same evening, not one session; release-tp3 version 2 (#600) prefills
   to 1M from the next release on.
-- **The triangle's stall:** at 8,192 the other streams' decode step is about 1.7 times as long
-  while a long prompt prefills (the ring's 16,384: +78%).
+- **The triangle's stall:** while a long prompt prefills, the other streams' decode step at
+  8,192 is about 1.7 times as long as at 4,096 (the ring's 16,384: +78% over 8,192). Against
+  plain decode (0.100 s), steps during a 131K prefill are 8.6-14.4 times as long
+  ([2026-10-19-prefill-budget-tp3](../2026-10-19-prefill-budget-tp3/README.md)).
 
 ## Reports triaged for this release
 
