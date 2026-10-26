@@ -242,6 +242,15 @@ def main():
                         help="no CUDA graphs (enforce_eager): every kernel is a launch of its own")
     parser.add_argument("--batched", type=int, default=512, help="max_num_batched_tokens")
     parser.add_argument("--chunk", type=int, default=256, help="long_prefill_token_threshold")
+    parser.add_argument("--max-num-seqs", type=int, default=0,
+                        help="max_num_seqs (0: the requests, at least two); the recipe's is 16 "
+                             "(TP4) or 8 (TP3), which sizes the per-request state the step reads")
+    parser.add_argument("--max-model-len", type=int, default=8192,
+                        help="max_model_len; the recipe's 1,048,576 widens each block-table row "
+                             "the step copies")
+    parser.add_argument("--kv-bytes", type=int, default=2 << 30, help="kv_cache_memory_bytes")
+    parser.add_argument("--prefix-caching", action="store_true",
+                        help="enable_prefix_caching, as the recipe serves")
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
@@ -291,9 +300,9 @@ def main():
         seed=0,
         tensor_parallel_size=1,
         block_size=256,
-        max_model_len=8192,
+        max_model_len=args.max_model_len,
         # At least two: the dead-row warmup launches for one request and for two.
-        max_num_seqs=max(2, args.requests),
+        max_num_seqs=args.max_num_seqs or max(2, args.requests),
         # A small profile run keeps the startup's share of a trace small; prefill
         # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192),
         # with room in the step for the decode rows beside one.
@@ -301,10 +310,10 @@ def main():
         long_prefill_token_threshold=args.chunk,
         max_parallel_prefills=1,
         async_scheduling=True,
-        kv_cache_memory_bytes=2 << 30,
+        kv_cache_memory_bytes=args.kv_bytes,
         # The startup check wants this share free; run-iket's pool takes some.
         gpu_memory_utilization=0.5,
-        enable_prefix_caching=False,
+        enable_prefix_caching=args.prefix_caching,
         enforce_eager=args.eager,
         attention_backend="TILELANG",
         linear_backend="tilelang",
@@ -385,6 +394,14 @@ def main():
                      for step in measured.outputs[0].logprobs or []],
         "batched": args.batched,
         "chunk": args.chunk,
+        "max_num_seqs": args.max_num_seqs or max(2, args.requests),
+        "max_model_len": args.max_model_len,
+        "kv_bytes": args.kv_bytes,
+        "prefix_caching": args.prefix_caching,
+        # The recipe's environment that shapes a step (the bundle sets it).
+        "environment": {name: os.environ.get(name) for name in (
+            "VLLM_USE_BREAKABLE_CUDAGRAPH", "VLLM_LATE_ADMISSION_LAYER", "CUDA_DEVICE_MAX_CONNECTIONS",
+            "VLLM_DS41_KERNEL_BACKEND")},
         # A vLLM tree without the IKET mode has none of these (an off run).
         **{name: getattr(envs, name, None) for name in (
             "VLLM_DS41_IKET", "VLLM_DS41_IKET_CTAS", "VLLM_DS41_IKET_ITERS", "VLLM_DS41_IKET_SKIP")},

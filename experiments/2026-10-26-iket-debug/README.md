@@ -576,14 +576,45 @@ What a serving trace on the cluster would take:
      - It then never reached the next graph launch's callback. In the passing run that
        launch follows in the same millisecond, with no wait between.
      - It logged nothing more until `iket_profile.py`'s 1800 s timeout killed it.
-   - **Catching it:** run 43 repeats that dry run eight times (`dry-loop-tp3-c1`)
-     under `hangcatch.sh`. When a dry run's log stops growing, it records GPU power and
-     clocks, each thread's state, wait channel and kernel stack, py-spy, and gdb
-     backtraces.
+   - **Catching it:** run 43 repeated that dry run eight times (`dry-loop-tp3-c1`)
+     under `hangcatch.sh`. When a dry run's log stops growing, the catcher records:
+     - GPU power and clocks;
+     - each thread's state, wait channel and kernel stack;
+     - py-spy and gdb backtraces;
+     - then a cuda-gdb attach.
+
+     Dry runs 2 and 4 hung; the other six took 139-142 s each. With run 42's, that is
+     about one dry run in four.
+   - **Where it stops:**
+     - **The host:** the main thread is in `CUDAGraph.replay` (vLLM's `run_fullgraph`),
+       inside `cuGraphLaunch`. There run-iket's injection (`libsmodel_injection.so`)
+       calls back into libcuda and busy-waits, before it logs the launch.
+     - **The other threads:** idle, including the injection's own worker.
+     - **The GPU:** 17 W at 2522 MHz and 96% busy, against 10.9 W and 0% when idle. So
+       the host waits for GPU work that never completes.
+   - **The common window:**
+     - The eager launches since the previous graph's sync are `metadata_builder_kernel`
+       and `padding_rows_kernel`. Of the three hangs with logs, two stopped before the
+       drafter's query graph and one before the target's graph.
+     - Neither kernel can spin: no loop without a bound, no atomic, no flag, no PDL.
+     - The tracker's patch replaces each `PMTRIG` marker with
+       `UIADD3.64 UR0, UR0, 0x4` (a warp's count in a uniform register pair the
+       kernel does not use).
+     - It leaves the marker's store to shared address 0x20 executing. That address is
+       in the 1 KB each CTA reserves for the system: the compiler starts user shared
+       memory at 0x400 (`UMOV UR4, 0x400` in `mhc_project_streams`' SASS).
+     - Measured runs, which replace that store, have never hung.
+   - **cuda-gdb cannot attach to the hang:** its attach makes an inferior call on the
+     stuck main thread. That attach also re-initializes the injection, which truncates
+     its log. So the catcher now copies the log first.
    - **The catcher's first capture was a false alarm.** TP3 c1's dry run had finished:
      its log ends in `Finalize Dump Json`. The live harness was the measured run,
      decoding its records at exit (`iket::to_json`, GPU idle). The catcher now skips a
      log that ends that way.
+   - **What it needs (run 44):** the same dry run eight times in each of three setups:
+     - `metadata_builder` and `padding_rows` uninstrumented (`dry-skip-tp3-c1`);
+     - the mode off, so the tracker sees no events (`dry-off-tp3-c1`);
+     - no CUDA graphs (`dry-eager-tp3-c1`).
 
 ## Timing a decode step with your own vLLM branch
 

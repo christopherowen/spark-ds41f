@@ -59,6 +59,37 @@ STEP_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
 }
 
+# The recipe's environment (config/cluster.json "environment") for a one-GPU step:
+# - Breakable CUDA graphs are off, as the recipe serves. Unset, vLLM turns them on for
+#   DS4.1, runs the graphs' break points (the context-KV write, global-KV preparation)
+#   eagerly and drops torch.compile.
+# - Late admission's layer is scaled to six layers: the recipe's 30 of 40 is 4.5 of 6.
+# - Left out: build parallelism (MAX_JOBS), cache paths, the multi-rank settings (NCCL,
+#   sparknet, sockets) and the b12x loader plugin. Dummy weights load without the plugin.
+# - TP3's display carve-out weights are left out too: a TP1 head is whole, about
+#   2.5 GiB, more than the carve-out holds.
+RECIPE_ENV = {
+    **STEP_ENV,
+    "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
+    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+    "VLLM_LATE_ADMISSION_LAYER": "4",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "32",
+    "MALLOC_ARENA_MAX": "2",
+    "MALLOC_MMAP_THRESHOLD_": "1048576",
+    "OMP_NUM_THREADS": "8",
+    "SAFETENSORS_FAST_GPU": "1",
+    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+    "VLLM_DISABLE_PYNCCL": "0",
+    "VLLM_ENABLE_PCIE_ALLREDUCE": "0",
+    "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "900",
+    "VLLM_MAX_IMAGE_PIXELS": "16777216",
+}
+# The recipe's sizing for each shape: its stream count, and its context length,
+# which sets each block-table row's width.
+RECIPE_SIZING = {4: ["--max-num-seqs", "16"], 3: ["--max-num-seqs", "8"]}
+
+
 def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)", grid=8):
     """A bundle timing DS4.1 decode steps, kernel by kernel and phase by phase: iket_step.py
     at TP1 with one rank's shapes at ``tp``, ``requests`` concurrent requests of ``tokens``
@@ -67,15 +98,17 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
     nsys of off with the graphs, the records against the dry run's count, the timeline
     and tables of the measured requests, and their decode steps against the grid's."""
     shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens),
-             "--grid", str(grid)]
+             "--grid", str(grid), *RECIPE_SIZING.get(tp, []), "--max-model-len", "1048576",
+             "--kv-bytes", str(6 << 30), "--prefix-caching"]
     return dict(
         ref=ref,
         what=f"DS4.1 decode steps timed by kernel and phase: TP{tp} rank shapes at TP1 (six layers "
-             f"and the drafter, dummy weights, the production recipe's kernels and graphs), "
-             f"c{requests}, {tokens} tokens a request, then {grid} engine-grid steps at that shape; "
-             f"on under run-iket ({ctas} CTAs a launch, {iters} iteration(s) a loop), nsys of off "
-             f"with the graphs, the timeline and tables, and a decode step against the grid's",
-        env=STEP_ENV,
+             f"and the drafter, dummy weights, the production recipe's kernels, graphs, "
+             f"environment and sizing), c{requests}, {tokens} tokens a request, then {grid} "
+             f"engine-grid steps at that shape; on under run-iket ({ctas} CTAs a launch, {iters} "
+             f"iteration(s) a loop), nsys of off with the graphs, the timeline and tables, and a "
+             f"decode step against the grid's",
+        env=RECIPE_ENV,
         mounts=[HUB],
         steps=[
             # The dry run alone, then the measured run sized from its largest process count
