@@ -11,6 +11,12 @@ longest overlapping gap is the worst wait any stream saw; the overlapping gaps' 
 and p99 show how slowly decoding ran meanwhile. The streams stop ``tail_s`` after the
 document's first token, so each records the chunk that ends its wait. A repeat fails
 unless every stream decoded across the whole prefill.
+
+``probes`` sends short cold requests (``probe_tokens`` of real text, fresh cache salts)
+that many seconds after the document: their time to first token is what a new
+conversation waits while a long prompt prefills. Only probes sent before the document's
+first token count. Leave them free slots: streams + 1 + the probes in flight must not
+exceed the server's ``--max-num-seqs``, or the probes measure slot queueing instead.
 """
 import threading
 import time
@@ -42,30 +48,50 @@ def stream_body(model: str, text: str, max_tokens: int, vllm: bool, extra_body: 
     return body
 
 
+def probe_body(model: str, text: str, max_tokens: int, vllm: bool, extra_body: dict) -> dict:
+    body = {"model": model, "messages": [{"role": "user", "content": f"{text}\n\n{prefill.QUESTION}"}],
+            "max_tokens": max_tokens, "temperature": 0}
+    if vllm:
+        body["cache_salt"] = uuid.uuid4().hex
+    body.update(extra_body)
+    return body
+
+
 def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *, max_tokens: int,
-            warmup_s: float, tail_s: float, vllm: bool, extra_body: dict, sleep=time.sleep) -> dict:
-    """One prefill of ``size`` tokens under ``len(texts)`` decoding streams."""
+            warmup_s: float, tail_s: float, vllm: bool, extra_body: dict, probes: tuple = (),
+            probe_tokens: int = 500, probe_max_tokens: int = 64, sleep=time.sleep) -> dict:
+    """One prefill of ``size`` tokens under ``len(texts)`` decoding streams, with short
+    probes sent ``probes`` seconds after it."""
     document, counted = prefill.document(base_url, model, size, seed, vllm)
+    probe_texts = [prefill.document(base_url, model, probe_tokens, seed * 100 + 1 + i, vllm)[0]
+                   for i in range(len(probes))]
     stop = threading.Event()
     records: list[dict | None] = [None] * len(texts)
+    probe_records: list[dict | None] = [None] * len(probes)
 
     def decode(i: int) -> None:
         records[i] = client.stream_chat(base_url, stream_body(model, texts[i], max_tokens, vllm, extra_body),
                                         continuous_usage=vllm, stop=stop)
 
+    def probe(i: int) -> None:
+        sleep(probes[i])
+        probe_records[i] = client.stream_chat(
+            base_url, probe_body(model, probe_texts[i], probe_max_tokens, vllm, extra_body), continuous_usage=vllm)
+
     threads = [threading.Thread(target=decode, args=(i,), daemon=True) for i in range(len(texts))]
     for thread in threads:
         thread.start()
     sleep(warmup_s)
-    body = {"model": model, "messages": [{"role": "user", "content": f"{document}\n\n{prefill.QUESTION}"}],
-            "max_tokens": 1, "temperature": 0}
-    if vllm:
-        body["cache_salt"] = uuid.uuid4().hex
-    body.update(extra_body)
-    record = client.stream_chat(base_url, body, continuous_usage=vllm, timeout=max(900.0, size / 500))
+    probers = [threading.Thread(target=probe, args=(i,), daemon=True) for i in range(len(probes))]
+    for thread in probers:
+        thread.start()
+    record = client.stream_chat(base_url, probe_body(model, document, 1, vllm, extra_body),
+                                continuous_usage=vllm, timeout=max(900.0, size / 500))
     sleep(tail_s)
     stop.set()
     for thread in threads:
+        thread.join()
+    for thread in probers:
         thread.join()
     sent, first = record["sent"], record["first"]
     before, during, covering = [], [], 0
@@ -82,15 +108,29 @@ def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *
     error = record["error"]
     if error is None and covering < len(texts):
         error = f"{len(texts) - covering} of {len(texts)} streams did not decode across the prefill"
+    probe_rows = []
+    for offset, probe_record in zip(probes, probe_records):
+        probe_record = probe_record or {}
+        p_sent, p_first = probe_record.get("sent"), probe_record.get("first")
+        probe_rows.append({"offset_s": offset,
+                           "ttft_s": p_first - p_sent if p_sent is not None and p_first is not None else None,
+                           "during": first is not None and p_sent is not None and p_sent < first,
+                           "error": probe_record.get("error")})
+    if error is None and any(row["error"] or row["ttft_s"] is None for row in probe_rows):
+        error = "a probe failed"
+    probe_ttfts = [row["ttft_s"] for row in probe_rows if row["during"] and row["ttft_s"] is not None]
     return {"size": size, "prompt_tokens": tokens, "ttft_s": ttft,
             "tps": tokens / ttft if tokens and ttft else None, "streams": len(texts), "covering": covering,
             "before_s": stats.percentiles(before), "during_s": stats.percentiles(during),
-            "stall_s": max(during) if during else None, "error": error}
+            "stall_s": max(during) if during else None, "probes": probe_rows,
+            "probe_ttft_s": stats.percentiles(probe_ttfts),
+            "probe_ttft_max_s": max(probe_ttfts) if probe_ttfts else None, "error": error}
 
 
 def run(base_url: str, model: str, sizes: list[int], *, streams: int = 8, max_tokens: int = 16384,
         warmup_s: float = 20.0, tail_s: float = 2.0, repeats: int = 3, vllm: bool = True,
-        extra_body: dict | None = None, log=lambda message: None, sleep=time.sleep) -> list[dict]:
+        extra_body: dict | None = None, probes: tuple = (), probe_tokens: int = 500,
+        probe_max_tokens: int = 64, log=lambda message: None, sleep=time.sleep) -> list[dict]:
     pool = [p["text"] for p in prompts.default_prompts()]
     samples = []
     for repeat in range(repeats):
@@ -99,12 +139,14 @@ def run(base_url: str, model: str, sizes: list[int], *, streams: int = 8, max_to
             texts = [pool[(turn * streams + i) % len(pool)] for i in range(streams)]
             sample = measure(base_url, model, size, 1000 * repeat + index, texts, max_tokens=max_tokens,
                              warmup_s=warmup_s, tail_s=tail_s, vllm=vllm, extra_body=extra_body or {},
-                             sleep=sleep)
+                             probes=tuple(probes), probe_tokens=probe_tokens,
+                             probe_max_tokens=probe_max_tokens, sleep=sleep)
             sample["repeat"] = repeat
             samples.append(sample)
             log(f"servebench: stall {size} repeat {repeat + 1}/{repeats}: "
                 + (f"worst {sample['stall_s']:.2f} s, decode p50 {sample['during_s']['p50']:.3f} s "
                    f"(baseline {sample['before_s'].get('p50', float('nan')):.3f} s)"
+                   + (f", probe TTFT p50 {sample['probe_ttft_s']['p50']:.2f} s" if sample["probe_ttft_s"]["n"] else "")
                    if sample["error"] is None else f"failed ({sample['error']})"))
     return samples
 
@@ -117,7 +159,9 @@ def summarize(samples: list[dict]) -> list[dict]:
                   "during_p50_s": [s["during_s"]["p50"] for s in ok],
                   "during_p99_s": [s["during_s"]["p99"] for s in ok],
                   "before_p50_s": [s["before_s"]["p50"] for s in ok if s["before_s"]["n"]],
-                  "tps": [s["tps"] for s in ok]}
+                  "tps": [s["tps"] for s in ok],
+                  "probe_ttft_p50_s": [s["probe_ttft_s"]["p50"] for s in ok if s.get("probe_ttft_s", {}).get("n")],
+                  "probe_ttft_max_s": [s["probe_ttft_max_s"] for s in ok if s.get("probe_ttft_max_s") is not None]}
         rows.append({"size": size, "prompt_tokens": ok[0]["prompt_tokens"] if ok else None,
                      **{name: stats.describe(values) for name, values in series.items()},
                      "samples": {name: [round(v, 5) for v in values] for name, values in series.items()},
@@ -128,7 +172,9 @@ def summarize(samples: list[dict]) -> list[dict]:
 METRICS = (("stall_s", "worst decode wait during {size:,} prefill (s)", False),
            ("during_p99_s", "decode step p99 during {size:,} prefill (s)", False),
            ("during_p50_s", "decode step p50 during {size:,} prefill (s)", False),
-           ("tps", "prefill {size:,} tok/s under decode", True))
+           ("tps", "prefill {size:,} tok/s under decode", True),
+           ("probe_ttft_p50_s", "short request TTFT p50 during {size:,} prefill (s)", False),
+           ("probe_ttft_max_s", "short request TTFT max during {size:,} prefill (s)", False))
 
 
 def compare(base: list[dict], candidate: list[dict], *, tolerance_pct: float = 3.0) -> dict:

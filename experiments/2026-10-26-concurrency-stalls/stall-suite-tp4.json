@@ -1,0 +1,125 @@
+{
+ "name": "concurrency-stalls-tp4",
+ "version": 1,
+ "description": "Concurrency stalls, about 50 minutes a build on the ring (35 on the triangle): what short requests wait while a cold long prompt prefills (probes of 500 tokens sent 2-14 s into a 131K prefill and 10-160 s into a 1M prefill, beside 11 decoding streams so they find free slots), the release suite's stall step (15 streams), closed loops at 16 and 24 streams (24 queues for slots on production), the release Poisson load and cold 32K/131K prefill. Built for experiments/2026-10-26-concurrency-stalls; not a release suite.",
+ "steps": [
+  {
+   "id": "stall-probe",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 11,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 5,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall-probe-1m",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     1000000
+    ],
+    "streams": 11,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 2,
+    "probes": [
+     10,
+     40,
+     80,
+     120,
+     160
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 15,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c24",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 24,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "poisson",
+   "command": "run",
+   "args": {
+    "mode": "poisson",
+    "rate": 0.7,
+    "warmup": 60,
+    "duration": 300,
+    "slo_ttft": 2,
+    "slo_tpot": 100,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

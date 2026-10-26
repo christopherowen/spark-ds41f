@@ -1,0 +1,1157 @@
+From 54643f76ce32aa84d92aa672539b6233dccab772 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:21:59 +0100
+Subject: [PATCH 523/526] Model loading: the b12x load format and its in-tree
+ adapter go
+
+--load-format direct (0499) is B12X's bounce-mode O_DIRECT loader ported
+into vLLM, and the recipe loads with it (VLLM_PLUGINS empty). The in-tree
+adapter of B12X's loader (model_loader/b12x_loader.py, the "b12x" load
+format) imports B12X's loader package and has no other user:
+
+- b12x_loader.py and its test go; "b12x" leaves LoadFormats and
+  get_model_loader no longer registers it lazily.
+- The B12X executor-output test's weight-loading panel case goes (the
+  panel was the B12X loader's); its preparation-output cases stay.
+- direct_loader.py and the streaming-loading design note name the adapter
+  as gone.
+---
+ docs/design/streaming_weight_loading.md       |   4 +
+ .../model_loader/test_b12x_loader.py          | 598 ------------------
+ tests/v1/executor/test_b12x_output.py         | 122 ----
+ vllm/config/load.py                           |   2 -
+ vllm/model_executor/model_loader/__init__.py  |   5 -
+ .../model_loader/b12x_loader.py               | 316 ---------
+ .../model_loader/direct_loader.py             |   5 +-
+ 7 files changed, 7 insertions(+), 1045 deletions(-)
+ delete mode 100644 tests/model_executor/model_loader/test_b12x_loader.py
+ delete mode 100644 vllm/model_executor/model_loader/b12x_loader.py
+
+diff --git a/docs/design/streaming_weight_loading.md b/docs/design/streaming_weight_loading.md
+index 8fb55df61..1d85ccfe1 100644
+--- a/docs/design/streaming_weight_loading.md
++++ b/docs/design/streaming_weight_loading.md
+@@ -1,5 +1,9 @@
+ # Proposal: bounded streaming weight loading
+ 
++In this tree the `b12x` load format and its adapter are gone: `--load-format
++direct` (`vllm/model_executor/model_loader/direct_loader.py`) is the bounce-ring
++path below, ported into vLLM. The rest of this proposal is kept as written.
++
+ Status: the C99 O_DIRECT transport and b12x vLLM adapter load ordinary
+ PyTorch CUDA tensors. The loader owns bounded I/O buffers and retains destination
+ references until completion. Models use their normal allocation paths.
+diff --git a/tests/model_executor/model_loader/test_b12x_loader.py b/tests/model_executor/model_loader/test_b12x_loader.py
+deleted file mode 100644
+index 1a5091bdb..000000000
+--- a/tests/model_executor/model_loader/test_b12x_loader.py
++++ /dev/null
+@@ -1,598 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-"""The adapter preserves vLLM's indexed source selection and owned inputs."""
+-
+-import json
+-from contextlib import contextmanager
+-from types import SimpleNamespace
+-
+-import pytest
+-import torch
+-from safetensors.torch import save_file
+-
+-pytest.importorskip("b12x")
+-
+-from b12x.loader._checkpoint import DirectWeightSession
+-from b12x.loader._progress import CheckpointDisplay
+-
+-from vllm.config.load import LoadConfig
+-from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-
+-
+-@pytest.mark.parametrize("register_plugin", [False, True])
+-def test_load_format_selects_native_b12x_with_or_without_plugin(
+-    monkeypatch, register_plugin
+-):
+-    from vllm.model_executor import model_loader
+-
+-    monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+-    monkeypatch.setattr(
+-        model_loader,
+-        "_LOAD_FORMAT_TO_MODEL_LOADER",
+-        dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER),
+-    )
+-    model_loader._LOAD_FORMAT_TO_MODEL_LOADER.pop("b12x", None)
+-    if register_plugin:
+-        # FlashInfer's B12X ships without the standalone vLLM plugin package.
+-        plugin = pytest.importorskip("b12x.integration.vllm.loader")
+-        plugin.register_b12x_loader()
+-    config = LoadConfig(
+-        load_format="b12x", model_loader_extra_config={"read_mode": "bounce"}
+-    )
+-    loader = model_loader.get_model_loader(config)
+-    assert isinstance(loader, B12xModelLoader)
+-    assert loader.read_mode == "bounce"
+-    assert config.load_format == "b12x"
+-
+-
+-def test_direct_loader_reports_missing_host_hooks_when_selected(monkeypatch):
+-    from vllm.model_executor.model_loader import weight_utils
+-
+-    monkeypatch.delattr(weight_utils, "file_source_tensor", raising=False)
+-    with pytest.raises(
+-        RuntimeError, match="requires vLLM file-source hooks.*file_source_tensor"
+-    ):
+-        B12xModelLoader(LoadConfig(load_format="b12x"))
+-
+-
+-@pytest.mark.parametrize("read_mode", ["gds", "bounce"])
+-@pytest.mark.parametrize("expandable", [False, True])
+-@pytest.mark.parametrize("fail_loading", [False, True])
+-def test_shared_loading_preserves_allocator_settings(
+-    monkeypatch, read_mode, expandable, fail_loading
+-):
+-    import vllm.model_executor.model_loader.b12x_loader as adapter
+-    from vllm.distributed import parallel_state
+-
+-    original = f"max_split_size_mb:64,expandable_segments:{expandable}"
+-    settings = [original]
+-    monkeypatch.setattr(
+-        torch._C, "_accelerator_getAllocatorSettings", lambda: settings[0]
+-    )
+-    monkeypatch.setattr(
+-        torch._C,
+-        "_accelerator_setAllocatorSettings",
+-        lambda value: settings.__setitem__(0, value),
+-    )
+-    monkeypatch.setattr(
+-        parallel_state, "get_tp_group", lambda: SimpleNamespace(cpu_group=object())
+-    )
+-    monkeypatch.setattr(adapter, "SharedReadGroup", lambda *_: object())
+-
+-    @contextmanager
+-    def session(*args, **kwargs):
+-        yield SimpleNamespace(stats=lambda: {"payload_bytes": 0})
+-
+-    monkeypatch.setattr(adapter, "DirectWeightSession", session)
+-
+-    def load(loader, *args):
+-        expected = original.replace("True", "False") if read_mode == "gds" else original
+-        assert settings[0] == expected
+-        if fail_loading:
+-            raise RuntimeError("checkpoint read failed")
+-        loader.counter_before_loading_weights = 1.0
+-        loader.counter_after_loading_weights = 2.0
+-        return torch.nn.Module()
+-
+-    monkeypatch.setattr(DefaultModelLoader, "load_model", load)
+-    loader = B12xModelLoader(
+-        LoadConfig(
+-            load_format="b12x",
+-            model_loader_extra_config={"read_mode": read_mode},
+-        )
+-    )
+-    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+-    model_config = SimpleNamespace(enable_cumem_allocator=False)
+-    try:
+-        if fail_loading:
+-            with pytest.raises(RuntimeError, match="checkpoint read failed"):
+-                loader.load_model(config, model_config)
+-        else:
+-            loader.load_model(config, model_config)
+-    finally:
+-        assert settings[0] == original
+-
+-
+-def test_shared_gds_rejects_cumem_before_allocating_weights():
+-    loader = B12xModelLoader(
+-        LoadConfig(load_format="b12x", model_loader_extra_config={"read_mode": "gds"})
+-    )
+-    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+-    with pytest.raises(ValueError, match="does not support the CuMem allocator"):
+-        loader.load_model(config, SimpleNamespace(enable_cumem_allocator=True))
+-
+-
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA IPC")
+-def test_shared_weight_allocations_export_with_expandable_segments_enabled():
+-    from vllm.model_executor.model_loader.b12x_loader import _ipc_weight_allocations
+-
+-    original = torch._C._accelerator_getAllocatorSettings()
+-    configured = "max_split_size_mb:64,expandable_segments:True"
+-    try:
+-        torch._C._accelerator_setAllocatorSettings(configured)
+-        with DirectWeightSession(read_mode="gds") as session:
+-            native = session._gds
+-            executor = native.owner_create(
+-                session.device,
+-                session.io_threads,
+-                *(program.function for program in session._copy_programs),
+-            )
+-            try:
+-                with _ipc_weight_allocations():
+-                    assert torch._C._accelerator_getAllocatorSettings() == (
+-                        "max_split_size_mb:64,expandable_segments:False"
+-                    )
+-                    weights = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+-                assert torch._C._accelerator_getAllocatorSettings() == configured
+-                base, size, handle = native.owner_export(
+-                    executor, weights.data_ptr(), weights.nbytes
+-                )
+-                assert base <= weights.data_ptr()
+-                assert weights.data_ptr() + weights.nbytes <= base + size
+-                assert len(handle) == 64
+-            finally:
+-                native.owner_close(executor)
+-    finally:
+-        torch._C._accelerator_setAllocatorSettings(original)
+-
+-
+-@pytest.mark.parametrize("show_progress", [True, False])
+-@pytest.mark.parametrize("read_mode", ["auto", "bounce"])
+-def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
+-    tmp_path, capsys, show_progress, read_mode
+-):
+-    """Draft loading must not open unrelated target shards or reuse buffers."""
+-    save_file({"mtp.weight": torch.arange(16)}, tmp_path / "draft.safetensors")
+-    save_file({"mtp.bias": torch.arange(4) + 100}, tmp_path / "bias.safetensors")
+-    (tmp_path / "target.safetensors").write_bytes(b"must not be opened")
+-    (tmp_path / "model.safetensors.index.json").write_text(
+-        json.dumps(
+-            {
+-                "weight_map": {
+-                    "mtp.weight": "draft.safetensors",
+-                    "mtp.bias": "bias.safetensors",
+-                    "model.weight": "target.safetensors",
+-                }
+-            }
+-        )
+-    )
+-    config = LoadConfig(
+-        load_format="b12x",
+-        use_tqdm_on_load=show_progress,
+-        model_loader_extra_config={"read_mode": read_mode},
+-    )
+-    loader = B12xModelLoader(config)
+-    source = DefaultModelLoader.Source(
+-        str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
+-    )
+-    with (
+-        DirectWeightSession(read_mode=loader.read_mode) as session,
+-        CheckpointDisplay(enabled=show_progress) as display,
+-    ):
+-        loader._session = session
+-        loader._progress = display
+-        retained = dict(loader._get_weights_iterator(source))
+-        assert set(retained) == {"draft.mtp.weight", "draft.mtp.bias"}
+-        values = {}
+-        for name, descriptor in retained.items():
+-            values[name] = torch.empty_like(descriptor, device="cuda")
+-            assert session(values[name], descriptor)
+-        loader._session = None
+-        loader._progress = None
+-    torch.testing.assert_close(values["draft.mtp.weight"].cpu(), torch.arange(16))
+-    torch.testing.assert_close(values["draft.mtp.bias"].cpu(), torch.arange(4) + 100)
+-    assert config.load_format == "b12x"
+-    assert config.model_loader_extra_config == {"read_mode": read_mode}
+-    progress = capsys.readouterr().err
+-    if show_progress:
+-        assert "b12x routing checkpoint shards" in progress
+-        assert "2/2 shards routed" in progress
+-        assert "0.00 GB selected on rank 0" in progress
+-        assert "it/s" not in progress
+-    else:
+-        assert "shards routed" not in progress
+-
+-
+-def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
+-    from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+-        mamba_v2_sharded_weight_loader,
+-    )
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    path = tmp_path / "conv.safetensors"
+-    checkpoint = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+-    save_file({"conv.weight": checkpoint}, path)
+-    loader = mamba_v2_sharded_weight_loader(
+-        [(8, 0, 0), (4, 2, 1)], tp_size=2, tp_rank=1
+-    )
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        source = dict(session.weights([path]))["conv.weight"]
+-        target = torch.full((6, 2), -1.0, device="cuda")
+-        loader(target, source)
+-    torch.testing.assert_close(target.cpu(), checkpoint[4:])
+-
+-
+-def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypatch):
+-    """Loading the norm must preserve separate workspace contents."""
+-    from vllm.model_executor.weight_transfer import copy_weight, weight_transfer
+-    from vllm.models.qwen4_exp.nvidia.hyperconnection import (
+-        GroupedGemmaRMSNorm,
+-        HyperConnectionConfig,
+-        HyperConnectionWorkspace,
+-    )
+-
+-    monkeypatch.setattr(
+-        "vllm.models.qwen4_exp.nvidia.hyperconnection.get_tensor_model_parallel_world_size",
+-        lambda: 1,
+-    )
+-    expected = torch.arange(128, dtype=torch.bfloat16)
+-    path = tmp_path / "norm.safetensors"
+-    save_file({"weight": expected}, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        norm = GroupedGemmaRMSNorm(128, eps=1e-6, group_size=32, dtype=expected.dtype)
+-        workspace = HyperConnectionWorkspace(
+-            HyperConnectionConfig(
+-                hc_count=4,
+-                hidden_size=32,
+-                params_dtype=expected.dtype,
+-                hc_lowrank=16,
+-                rms_norm_eps=1e-6,
+-                hc_per_branch_norm=True,
+-            ),
+-            8,
+-        )
+-        source = dict(session.weights([path]))["weight"]
+-        copy_weight(norm.weight, source)
+-    torch.testing.assert_close(norm.weight.cpu(), expected)
+-    for buffer in workspace.buffers():
+-        buffer.fill_(7)
+-    torch.accelerator.synchronize()
+-    torch.testing.assert_close(norm.weight.cpu(), expected)
+-
+-
+-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
+-@pytest.mark.parametrize(
+-    "tp_size,rank", [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
+-)
+-def test_dflash_sink_shards_preserve_file_sources(tmp_path, monkeypatch, tp_size, rank):
+-    """Route per-head sinks into final parameters, including padded TP tails."""
+-    from vllm.model_executor.models import qwen3_dflash as dflash
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    monkeypatch.setattr(dflash, "get_tensor_model_parallel_world_size", lambda: tp_size)
+-    monkeypatch.setattr(dflash, "get_tensor_model_parallel_rank", lambda: rank)
+-    monkeypatch.setenv("VLLM_DFLASH_COMPACT_ROPE", "0")
+-    for name in (
+-        "QKVParallelLinear",
+-        "RowParallelLinear",
+-        "DFlashAttention",
+-        "RMSNorm",
+-        "get_rope",
+-    ):
+-        monkeypatch.setattr(dflash, name, lambda *args, **kwargs: torch.nn.Identity())
+-    heads = 8
+-    padded_heads = ((heads + tp_size - 1) // tp_size) * tp_size
+-    expected = torch.arange(heads, dtype=torch.float32) / 4
+-    name = "layers.0.self_attn.attention_sink_bias"
+-    path = tmp_path / "dflash-sinks.safetensors"
+-    save_file({name: expected}, path)
+-    model = dflash.DFlashQwen3Model.__new__(dflash.DFlashQwen3Model)
+-    torch.nn.Module.__init__(model)
+-    model.config = SimpleNamespace(num_attention_heads=padded_heads)
+-    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        model.layers[0].self_attn = dflash.DFlashQwen3Attention(
+-            hidden_size=padded_heads * 16,
+-            num_heads=padded_heads,
+-            num_kv_heads=1,
+-            head_dim=16,
+-            rope_parameters={},
+-            add_swa_attention_sink_bias=True,
+-        )
+-        assert model.load_weights(session.weights([path])) == {name}
+-    width = padded_heads // tp_size
+-    padded = torch.nn.functional.pad(expected, (0, padded_heads - heads))
+-    torch.testing.assert_close(
+-        model.layers[0].self_attn.attention_sink_bias.cpu(),
+-        padded[rank * width : (rank + 1) * width],
+-    )
+-
+-
+-@pytest.mark.parametrize("scale_first", [False, True])
+-@pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
+-def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
+-    tmp_path, scale_first, quantization
+-):
+-    """Numerical projection transforms must consume payloads, not meta views."""
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.glm5next.nvidia.model import Glm5NextModel
+-
+-    prefix = "layers.3.self_attn"
+-    if quantization == "mxfp8":
+-        projection = target = "indexer.weights_proj"
+-        scale_name = "weight_scale"
+-        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+-    else:
+-        projection, target = "q_a_proj", "fused_qkv_a_proj"
+-        scale_name = "weight_scale_inv"
+-        scale = torch.full((1, 1), 2.0, dtype=torch.float32)
+-    parameter_name = f"{prefix}.{target}.weight"
+-    weight = torch.arange(32).reshape(1, 32).to(torch.float8_e4m3fn)
+-    expected = weight.float() * 2
+-    path = tmp_path / "attention.safetensors"
+-    save_file(
+-        {
+-            f"{prefix}.{projection}.weight": weight,
+-            f"{prefix}.{projection}.{scale_name}": scale,
+-        },
+-        path,
+-    )
+-
+-    class Projection(torch.nn.Module):
+-        config = SimpleNamespace(
+-            is_moe=False, is_linear_attn=True, mla_nope=False, qk_rope_head_dim=0
+-        )
+-
+-        def named_parameters(self):
+-            return iter([(parameter_name, param)])
+-
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.nn.Parameter(
+-            torch.empty((1, 32), dtype=torch.float32, device="cuda")
+-        )
+-        param.weight_loader = lambda p, value, shard_id=None: default_weight_loader(
+-            p, value
+-        )
+-        sources = sorted(
+-            session.weights([path]),
+-            key=lambda pair: pair[0].endswith(".weight") == scale_first,
+-        )
+-        loaded = Glm5NextModel.load_weights(Projection(), iter(sources))
+-        assert loaded == {parameter_name}
+-    torch.testing.assert_close(param.cpu(), expected)
+-
+-
+-@pytest.mark.parametrize("rank", [0, 1])
+-def test_kda_convolution_loads_each_tp_shard_into_fused_weights(tmp_path, rank):
+-    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+-        _make_fused_conv1d_weight_loader,
+-    )
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    path = tmp_path / "kda.safetensors"
+-    weights = {
+-        name: (torch.arange(32).reshape(8, 1, 4) + i * 64).to(torch.bfloat16)
+-        for i, name in enumerate(("q", "k", "v"))
+-    }
+-    save_file(weights, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.empty((12, 1, 4), device="cuda")
+-        loader = _make_fused_conv1d_weight_loader([8, 8, 8], 2, rank)
+-        sources = dict(session.weights([path]))
+-        for i, name in enumerate(("q", "k", "v")):
+-            loader(param, sources[name], i)
+-    expected = torch.cat([weights[name][rank * 4 : (rank + 1) * 4] for name in weights])
+-    torch.testing.assert_close(param.cpu(), expected.float())
+-
+-
+-@pytest.mark.parametrize(
+-    "tp_size,rank", [(tp, rank) for tp in (2, 4) for rank in range(tp)]
+-)
+-def test_deepseek_sink_shards_are_flushed_before_derived_weights(
+-    tmp_path, monkeypatch, tp_size, rank
+-):
+-    """Padded sinks keep -inf and model post-load hooks consume completed reads."""
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.deepseek_v4.nvidia import model as ds4
+-
+-    monkeypatch.setattr(ds4, "get_tensor_model_parallel_world_size", lambda: tp_size)
+-    monkeypatch.setattr(ds4, "get_tensor_model_parallel_rank", lambda: rank)
+-    expected = torch.arange(64, dtype=torch.float32) / 4
+-    path = tmp_path / "sinks.safetensors"
+-    name = "layers.0.attn.attn_sink"
+-    save_file({name: expected}, path)
+-
+-    class Model(torch.nn.Module):
+-        config = SimpleNamespace(num_attention_heads=64)
+-        quant_config = None
+-        use_sequence_parallel = False
+-
+-        def __init__(self):
+-            super().__init__()
+-            self.sink = torch.nn.Parameter(
+-                torch.full((64,), -torch.inf, device="cuda"),
+-                requires_grad=False,
+-            )
+-            self.derived = None
+-
+-        def named_parameters(self):
+-            return iter([(name, self.sink)])
+-
+-        def get_expert_mapping(self):
+-            return []
+-
+-        def finalize_mega_moe_weights(self):
+-            pass
+-
+-        def finalize_mhc_broadcast_weights(self):
+-            self.derived = self.sink[: 64 // tp_size] * 2
+-
+-        def process_b12x_weights_after_loading(self):
+-            pass
+-
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        model = Model()
+-        assert ds4.DeepseekV4Model.load_weights(model, session.weights([path])) == {
+-            name
+-        }
+-        ds4.DeepseekV4ForCausalLM.process_weights_after_loading(
+-            SimpleNamespace(model=model)
+-        )
+-    width = 64 // tp_size
+-    assert model.derived is not None
+-    torch.testing.assert_close(
+-        model.derived.cpu(), expected[rank * width : (rank + 1) * width] * 2
+-    )
+-    assert torch.isneginf(model.sink[width:]).all()
+-
+-
+-@pytest.mark.parametrize("scale_first", [False, True])
+-def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
+-    tmp_path, scale_first
+-):
+-    """Full GLM's fused WK projection reads real FP8 values before dequantizing."""
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    prefix = "layers.0.self_attn.indexer"
+-    weight = (torch.arange(128 * 256).reshape(128, 256) % 64).to(torch.float8_e4m3fn)
+-    scale = torch.tensor([[0.5, 2.0]])
+-    paths = [tmp_path / "weight.safetensors", tmp_path / "scale.safetensors"]
+-    save_file({f"{prefix}.wk.weight": weight}, paths[0])
+-    save_file({f"{prefix}.wk.weight_scale_inv": scale}, paths[1])
+-    if scale_first:
+-        paths.reverse()
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.nn.Parameter(
+-            torch.zeros((160, 256), device="cuda", dtype=torch.bfloat16),
+-            requires_grad=False,
+-        )
+-        param.weight_loader = lambda p, value, shard_id: default_weight_loader(
+-            p[:128], value
+-        )
+-        name = f"{prefix}.wk_weights_proj.weight"
+-        pending: dict[str, dict[str, torch.Tensor]] = {}
+-        loaded: set[str] = set()
+-        for source_name, source in session.weights(paths):
+-            assert _try_load_fp8_indexer_wk(
+-                source_name, source, pending, {name: param}, loaded, []
+-            )
+-        assert not pending
+-        assert loaded == {name}
+-    expected = (weight.float() * scale.repeat_interleave(128, dim=1)).bfloat16()
+-    torch.testing.assert_close(param[:128].cpu(), expected, rtol=0, atol=0)
+-    assert torch.count_nonzero(param[128:]) == 0
+-
+-
+-def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
+-    tmp_path, monkeypatch
+-):
+-    """A plain nn.Embedding loads without allocation hooks."""
+-    from vllm import envs
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    monkeypatch.setattr(envs, "VLLM_MXFP8_LM_HEAD", False)
+-    expected = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+-    path = tmp_path / "markov.safetensors"
+-    save_file({"markov_w1.weight": expected}, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+-        source = dict(session.weights([path]))["markov_w1.weight"]
+-        default_weight_loader(head.markov_w1.weight, source)
+-        session.flush()
+-        result = head.embed(torch.tensor([0, 17, 127]))
+-    torch.testing.assert_close(result.cpu(), expected[[0, 17, 127]])
+-
+-
+-def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffers(
+-    tmp_path, monkeypatch
+-):
+-    """MTP's plain Linear loads without a target-model allocation scope."""
+-    from vllm.config import VllmConfig, set_current_vllm_config
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.glm5next.nvidia import mtp
+-
+-    class Decoder(torch.nn.Module):
+-        def __init__(self, **kwargs):
+-            super().__init__()
+-            self.topk_indices_buffer = kwargs["topk_indices_buffer"]
+-            self.pool_topk_indices_buffer = kwargs["pool_topk_indices_buffer"]
+-
+-    monkeypatch.setattr(mtp, "Glm5NextDecoderLayer", Decoder)
+-    monkeypatch.setattr(mtp, "SharedHead", lambda **kwargs: torch.nn.Identity())
+-    config = SimpleNamespace(
+-        hidden_size=8, rms_norm_eps=1e-6, index_topk=16, index_kpool=4
+-    )
+-    vllm_config = SimpleNamespace(
+-        speculative_config=SimpleNamespace(
+-            draft_model_config=SimpleNamespace(hf_config=config)
+-        ),
+-        quant_config=None,
+-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+-    )
+-    name = "model.language_model.layers.45.eh_proj.weight"
+-    expected = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+-    path = tmp_path / "model-00001-of-00001.safetensors"
+-    save_file(
+-        {name: expected, "model.language_model.layers.0.weight": torch.ones(8)}, path
+-    )
+-    with (
+-        set_current_vllm_config(VllmConfig()),
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        layer = mtp.Glm5NextMultiTokenPredictorLayer(vllm_config, "model.layers.45")
+-        source = dict(
+-            session.weights([path], prefixes=("model.language_model.layers.45.",))
+-        )
+-        assert set(source) == {name}
+-        default_weight_loader(layer.eh_proj.weight, source[name])
+-        session.flush()
+-        result = layer.eh_proj(torch.ones(1, 16))
+-    torch.testing.assert_close(layer.eh_proj.weight.cpu(), expected)
+-    torch.testing.assert_close(result.cpu(), expected.sum(dim=1).unsqueeze(0))
+diff --git a/tests/v1/executor/test_b12x_output.py b/tests/v1/executor/test_b12x_output.py
+index eaadf844b..cb92a8e6a 100644
+--- a/tests/v1/executor/test_b12x_output.py
++++ b/tests/v1/executor/test_b12x_output.py
+@@ -263,128 +263,6 @@ def test_executor_serializes_bound_handlers_native_writes_and_child_output(colum
+         os.close(master)
+ 
+ 
+-def _loading_with_native_output():
+-    import logging
+-    import time
+-    from types import SimpleNamespace
+-    from unittest.mock import patch
+-
+-    from vllm.config.load import LoadConfig
+-    from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-    from vllm.utils.system_utils import decorate_logs
+-
+-    decorate_logs("Worker_TP0")
+-    handler = logging.StreamHandler(sys.stderr)
+-    summary = dict(
+-        ranks=4,
+-        payload_bytes=305_750_000_000,
+-        shared_physical_bytes=299_595_000_000,
+-        physical_bytes=299_640_000_000,
+-        shared_transfer_seconds=0.1,
+-    )
+-    group = SimpleNamespace(
+-        epoch=1,
+-        progress=None,
+-        summary=summary,
+-        start=lambda session: None,
+-        _gather=lambda value: None,
+-    )
+-    session = SimpleNamespace(
+-        shared_read_group=group, progress=None, flush=lambda: None, stats=lambda **_: {}
+-    )
+-    loader = B12xModelLoader(LoadConfig(load_format="b12x"))
+-    loader._session = session
+-
+-    def route(self, model, config):
+-        self.counter_before_loading_weights = time.perf_counter()
+-        self._progress.source(48)
+-        for index in range(48):
+-            self._progress.advance((index + 1) * 1_592_447_916)
+-        for phase in ("prepare", "plan", "execute", "unmap"):
+-            group.progress(phase)
+-            self._progress._live.refresh()
+-            time.sleep(0.04)
+-        handler.emit(
+-            logging.LogRecord(
+-                "loader", logging.INFO, "", 0, "loading-bound-handler", (), None
+-            )
+-        )
+-        os.write(2, b"loading-native-write\n")
+-        subprocess.run(
+-            [
+-                sys.executable,
+-                "-c",
+-                'import os; os.write(1, b"loading-child-output\\n")',
+-            ],
+-            check=True,
+-        )
+-        self.counter_after_loading_weights = time.perf_counter()
+-        self._log_loading_time()
+-
+-    with patch.object(DefaultModelLoader, "load_weights", route):
+-        loader.load_weights(None, None)
+-    print("loading-returned")
+-
+-
+-@pytest.mark.parametrize("columns", [84, 133])
+-def test_weight_loading_keeps_one_complete_panel_with_native_logs(columns, tmp_path):
+-    master, slave = os.openpty()
+-    rows = 36
+-    termios.tcsetwinsize(slave, (rows, columns))
+-    os.set_blocking(master, False)
+-    env = dict(os.environ, TERM="xterm-256color", PYTHONDONTWRITEBYTECODE="1")
+-    for key in ("COLUMNS", "LINES"):
+-        env.pop(key, None)
+-    output = bytearray()
+-    try:
+-        process = subprocess.Popen(
+-            [sys.executable, str(Path(__file__).resolve()), "--loading-replay"],
+-            stdin=slave,
+-            stdout=slave,
+-            stderr=slave,
+-            env=env,
+-        )
+-        while process.poll() is None:
+-            if select.select([master], [], [], 0.1)[0]:
+-                output.extend(os.read(master, 65536))
+-        while select.select([master], [], [], 0)[0]:
+-            output.extend(os.read(master, 65536))
+-        (tmp_path / "terminal.ansi").write_bytes(output)
+-        assert process.returncode == 0, output.decode(errors="replace")
+-        screen = _terminal_text(bytes(output), rows, columns)
+-        (tmp_path / "screen.txt").write_text(screen)
+-        assert screen.count("b12x / weight loading") == 1, screen
+-        assert screen.index("Loading weights") > screen.index("└"), screen
+-        assert "0 / 0 shards" not in output.decode(errors="replace")
+-        for message in (
+-            "loading-bound-handler",
+-            "loading-native-write",
+-            "loading-child-output",
+-            "loading-returned",
+-        ):
+-            assert screen.count(message) == 1, screen
+-        top = next(
+-            i for i, line in enumerate(screen.splitlines()) if line.startswith("┌")
+-        )
+-        bottom = next(
+-            i for i, line in enumerate(screen.splitlines()) if line.startswith("└")
+-        )
+-        panel = screen.splitlines()[top : bottom + 1]
+-        assert len(panel) >= 8, screen
+-        assert all(
+-            line.startswith("│") and line.endswith("│") for line in panel[1:-1]
+-        ), screen
+-    finally:
+-        if "process" in locals() and process.poll() is None:
+-            process.terminate()
+-            process.wait(timeout=5)
+-        os.close(slave)
+-        os.close(master)
+-
+-
+ if __name__ == "__main__":
+     if "--startup-replay" in sys.argv:
+         _startup_with_native_output()
+-    elif "--loading-replay" in sys.argv:
+-        _loading_with_native_output()
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index d950fea95..f64dd7d37 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -35,8 +35,6 @@ class LoadConfig:
+       back to the pytorch bin format if safetensors format is not available.
+     - "pt" will load the weights in the pytorch bin format.
+     - "safetensors" will load the weights in the safetensors format.
+-    - "b12x" will load safetensors weights directly into CUDA tensors using
+-      the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
+     - "direct" will read safetensors weights with O_DIRECT through a
+       registered host ring straight into CUDA tensors, without the page cache.
+       It needs a GPU that reads pageable memory through the host page tables,
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 3fd6d5102..245d0757c 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -34,7 +34,6 @@ logger = init_logger(__name__)
+ # if a new load format is added here
+ LoadFormats = Literal[
+     "auto",
+-    "b12x",
+     "direct",
+     "hf",
+     "dummy",
+@@ -129,10 +128,6 @@ def register_model_loader(load_format: str):
+ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+     """Get a model loader based on the load format."""
+     load_format = load_config.load_format
+-    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+-        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-
+-        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+diff --git a/vllm/model_executor/model_loader/b12x_loader.py b/vllm/model_executor/model_loader/b12x_loader.py
+deleted file mode 100644
+index b3413bc4d..000000000
+--- a/vllm/model_executor/model_loader/b12x_loader.py
++++ /dev/null
+@@ -1,316 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-"""Checkpoint loading into ordinary PyTorch CUDA allocations."""
+-
+-from __future__ import annotations
+-
+-import dataclasses
+-import heapq
+-import json
+-import math
+-import sys
+-import time
+-from collections.abc import Iterator
+-from contextlib import ExitStack, contextmanager, nullcontext
+-from pathlib import Path
+-
+-import regex as re
+-import torch
+-from b12x.loader import capabilities
+-from b12x.loader._checkpoint import DirectWeightSession
+-from b12x.loader._progress import CheckpointDisplay
+-from b12x.loader._shared_checkpoint import SharedReadGroup
+-
+-from vllm.logger import init_logger
+-from vllm.model_executor.model_loader import weight_utils
+-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-from vllm.model_executor.model_loader.weight_utils import enable_tqdm
+-
+-logger = init_logger("vllm.model_executor.model_loader.b12x")
+-
+-
+-@contextmanager
+-def _ipc_weight_allocations() -> Iterator[None]:
+-    """Use IPC-exportable weight storage and restore the runtime allocator policy."""
+-    original = torch._C._accelerator_getAllocatorSettings()
+-    configured = re.sub(r"(\bexpandable_segments\s*:\s*)True\b", r"\1False", original)
+-    if configured == original:
+-        yield
+-        return
+-    torch._C._accelerator_setAllocatorSettings(configured)
+-    try:
+-        yield
+-    finally:
+-        torch._C._accelerator_setAllocatorSettings(original)
+-
+-
+-class B12xModelLoader(DefaultModelLoader):
+-    """Route checkpoint views through an asynchronous read ring or GDS."""
+-
+-    def __init__(self, load_config):
+-        missing = [
+-            name
+-            for name in ("file_source_tensor", "safetensors_file_sources")
+-            if not hasattr(weight_utils, name)
+-        ]
+-        if missing:
+-            raise RuntimeError(
+-                "b12x checkpoint loader requires vLLM file-source hooks: "
+-                + ", ".join(missing)
+-            )
+-        options = dict(load_config.model_loader_extra_config)
+-        self.io_threads = options.pop("io_threads", 8)
+-        self.read_mode = options.pop("read_mode", "auto")
+-        if self.read_mode not in ("auto", "bounce", "gds"):
+-            raise ValueError("read_mode must be auto, bounce or gds")
+-        if options.get("enable_multithread_load"):
+-            raise ValueError("b12x currently uses synchronous checkpoint routing")
+-        if load_config.safetensors_load_strategy not in (None, "lazy"):
+-            raise ValueError(
+-                "b12x O_DIRECT input does not use safetensors read strategies"
+-            )
+-        super().__init__(
+-            dataclasses.replace(
+-                load_config,
+-                load_format="safetensors",
+-                model_loader_extra_config=options,
+-            )
+-        )
+-        self._session = None
+-        self._progress = None
+-
+-    def load_model(self, vllm_config, model_config, prefix=""):
+-        from vllm.model_executor.weight_transfer import weight_transfer
+-
+-        device = torch.device(
+-            self.load_config.device or vllm_config.device_config.device
+-        )
+-        if device.type != "cuda":
+-            raise ValueError("the b12x loader requires a CUDA device")
+-        index = (
+-            torch.accelerator.current_device_index()
+-            if device.index is None
+-            else device.index
+-        )
+-        shared_read_group = None
+-        read_mode = self.read_mode
+-        if read_mode == "auto":
+-            read_mode = "bounce" if capabilities(index)["host_page_tables"] else "gds"
+-        if read_mode == "gds":
+-            if model_config.enable_cumem_allocator:
+-                raise ValueError(
+-                    "b12x shared GDS loading requires CUDA IPC-exportable weight "
+-                    "allocations and does not support the CuMem allocator or sleep mode"
+-                )
+-            from vllm.distributed.parallel_state import get_tp_group
+-
+-            shared_read_group = SharedReadGroup(get_tp_group().cpu_group, index)
+-        with (
+-            _ipc_weight_allocations()
+-            if shared_read_group is not None
+-            else nullcontext(),
+-            DirectWeightSession(
+-                index,
+-                io_threads=self.io_threads,
+-                shared_read_group=shared_read_group,
+-                read_mode=read_mode,
+-            ) as session,
+-            weight_transfer(session),
+-        ):
+-            self._session = session
+-            try:
+-                model = super().load_model(vllm_config, model_config, prefix)
+-                io_stats = session.stats()
+-            finally:
+-                self._session = None
+-        model._b12x_loader_storage = {
+-            "parameter_bytes": sum(p.nbytes for p in model.parameters()),
+-            "io": io_stats,
+-        }
+-        logger.debug("b12x O_DIRECT I/O counters: %s", io_stats)
+-        load_seconds = (
+-            self.counter_after_loading_weights - self.counter_before_loading_weights
+-        )
+-        payload_gb = io_stats["payload_bytes"] / 1e9
+-        logger.debug(
+-            "b12x effective weight loading: %.2f GB in %.2f s = %.2f GB/s "
+-            "(selected checkpoint payload, per rank)",
+-            payload_gb,
+-            load_seconds,
+-            payload_gb / load_seconds,
+-        )
+-        return model
+-
+-    def load_weights(self, model, model_config):
+-        from vllm.utils.system_utils import undecorated_log_stream
+-        from vllm.v1.executor._b12x_output import PreparationOutput
+-
+-        session = self._session
+-        group = session.shared_read_group if session is not None else None
+-        if group is not None:
+-            group.start(session)
+-            # Construction-time rank output must precede the live panel.
+-            group._gather(None)
+-        progress = CheckpointDisplay(
+-            enabled=enable_tqdm(self.load_config.use_tqdm_on_load),
+-            stream=undecorated_log_stream(sys.stderr),
+-        )
+-        with ExitStack() as stack:
+-            output = stack.enter_context(
+-                PreparationOutput(
+-                    progress.write_output,
+-                    enabled=progress._enabled and progress._stream.isatty(),
+-                )
+-            )
+-            if output.stream is not None:
+-                progress._stream = output.stream
+-            stack.enter_context(progress)
+-            stack.callback(output.stop)
+-            self._progress = progress
+-            if session is not None:
+-                session.progress = progress.phase
+-            if group is not None:
+-                group.progress = progress.phase
+-            try:
+-                super().load_weights(model, model_config)
+-            finally:
+-                self._progress = None
+-                if session is not None:
+-                    session.progress = None
+-                if group is not None:
+-                    group.progress = None
+-
+-    def _log_loading_time(self):
+-        session, progress = self._session, self._progress
+-        if session is not None and progress is not None:
+-            group = session.shared_read_group
+-            if group is not None and not group.epoch:
+-                raise RuntimeError(
+-                    "device checkpoint loading requires vLLM's "
+-                    "finish_weight_transfers routing hook"
+-                )
+-            session.flush()
+-            stats = session.stats(flush=False)
+-            summary = (
+-                dict(group.summary)
+-                if group is not None
+-                else dict(
+-                    ranks=1,
+-                    payload_bytes=stats["payload_bytes"],
+-                    physical_bytes=stats["physical_bytes"],
+-                )
+-            )
+-            summary["load_seconds"] = (
+-                self.counter_after_loading_weights - self.counter_before_loading_weights
+-            )
+-            progress.complete(summary)
+-            progress.stop()
+-        super()._log_loading_time()
+-
+-    @staticmethod
+-    def _needs_values(entry):
+-        return math.prod(entry.shape) == 1 or entry.name.rsplit(".", 1)[-1] in {
+-            "layer_multipliers",
+-            "ngram_heads_offsets",
+-            "ngram_heads_vocab_sizes",
+-        }
+-
+-    def _file_backed_weights_iterator(self, files, source, index_path):
+-        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+-
+-        session = self._session
+-        if session is None:
+-            raise RuntimeError("b12x requires an active initial-load session")
+-        weight_map = None
+-        if index_path.is_file():
+-            weight_map = json.loads(index_path.read_text())["weight_map"]
+-        indexed_paths = {}
+-        for path in files:
+-            sources = weight_utils.safetensors_file_sources(path)
+-            file_names = {name for name in sources if source.file_weight_filter(name)}
+-            resolved_path = Path(path).resolve()
+-            selected = []
+-            for name in sorted(sources):
+-                if source.weight_name_prefixes and not name.startswith(
+-                    source.weight_name_prefixes
+-                ):
+-                    continue
+-                if weight_map is not None:
+-                    indexed_file = weight_map.get(name)
+-                    if indexed_file is None:
+-                        continue
+-                    if indexed_file not in indexed_paths:
+-                        indexed_paths[indexed_file] = (
+-                            index_path.parent / indexed_file
+-                        ).resolve()
+-                    if indexed_paths[indexed_file] != resolved_path:
+-                        continue
+-                if not should_skip_weight(name, self.local_expert_ids):
+-                    selected.append(name)
+-            file_backed = (
+-                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
+-                for name in selected
+-                if name in file_names
+-            )
+-            # File-backed entries never enter the checkpoint direct reader, even
+-            # for mixed files or before metadata-value reads and routing.
+-            ordinary = (
+-                session.weights(
+-                    [path],
+-                    prefixes=source.weight_name_prefixes,
+-                    prefix=source.prefix,
+-                    index_path=index_path,
+-                    needs_values=self._needs_values,
+-                    skip=lambda name, file_names=file_names: (
+-                        name in file_names
+-                        or should_skip_weight(name, self.local_expert_ids)
+-                    ),
+-                )
+-                if any(name not in file_names for name in selected)
+-                else ()
+-            )
+-            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
+-
+-    def _get_weights_iterator(self, source):
+-        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+-
+-        session = self._session
+-        if session is None:
+-            raise RuntimeError("b12x requires an active initial-load session")
+-        folder, files, _ = self._prepare_weights(
+-            source.model_or_path,
+-            source.subfolder,
+-            source.revision,
+-            False,
+-            source.allow_patterns_overrides,
+-            source.weight_name_prefixes,
+-        )
+-        if self.counter_before_loading_weights == 0.0:
+-            self.counter_before_loading_weights = time.perf_counter()
+-        if self._progress is not None:
+-            self._progress.source(len(files))
+-
+-        def progress_files():
+-            for path in files:
+-                if self._progress is not None:
+-                    self._progress.file(Path(path).name)
+-                yield path
+-                if self._progress is not None:
+-                    self._progress.advance(session.payload_bytes)
+-
+-        if source.file_weight_filter is not None:
+-            yield from self._file_backed_weights_iterator(
+-                progress_files(),
+-                source,
+-                Path(folder) / "model.safetensors.index.json",
+-            )
+-            return
+-        yield from session.weights(
+-            progress_files(),
+-            prefixes=source.weight_name_prefixes,
+-            prefix=source.prefix,
+-            index_path=Path(folder) / "model.safetensors.index.json",
+-            needs_values=self._needs_values,
+-            skip=lambda name: should_skip_weight(name, self.local_expert_ids),
+-        )
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index c2232f17b..d8eb8cf8f 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -34,8 +34,9 @@ loader refuses others, since it has no GPU-direct-storage path. The native helpe
+ once the weights are loaded.
+ 
+ Ported from local-inference-lab/b12x b12x/integration/vllm/loader.py at 236ddff04a5f
+-(Apache-2.0) and vLLM's copy of it (``b12x_loader.py``). Changed: no GDS transport,
+-shared read group, IPC-exportable allocations or progress panel.
++(Apache-2.0) and vLLM's former copy of it (``b12x_loader.py``, the ``b12x`` load
++format). Changed: no GDS transport, shared read group, IPC-exportable allocations or
++progress panel.
+ """
+ 
+ import dataclasses
+-- 
+2.54.0 (Apple Git-157)
+

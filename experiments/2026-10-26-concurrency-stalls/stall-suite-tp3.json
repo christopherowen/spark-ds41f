@@ -1,0 +1,102 @@
+{
+ "name": "concurrency-stalls-tp3",
+ "version": 1,
+ "description": "Concurrency stalls, about 50 minutes a build on the ring (35 on the triangle): what short requests wait while a cold long prompt prefills (probes of 500 tokens sent 2-14 s into a 131K prefill, beside 4 decoding streams so they find free slots), the release suite's stall step (7 streams), closed loops at 8 and 12 streams (12 queues for slots on production), the release Poisson load and cold 32K/131K prefill. Built for experiments/2026-10-26-concurrency-stalls; not a release suite.",
+ "steps": [
+  {
+   "id": "stall-probe",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 4,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 5,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 7,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3
+   }
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 8,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c12",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 12,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "poisson",
+   "command": "run",
+   "args": {
+    "mode": "poisson",
+    "rate": 0.42,
+    "warmup": 60,
+    "duration": 300,
+    "slo_ttft": 2,
+    "slo_tpot": 100,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

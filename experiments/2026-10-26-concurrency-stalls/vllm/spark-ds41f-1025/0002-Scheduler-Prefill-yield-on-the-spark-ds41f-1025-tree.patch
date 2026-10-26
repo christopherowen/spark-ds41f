@@ -1,0 +1,51 @@
+From d29e028dedfdbe6f15366400b69d21b6e3940257 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:50:04 +0100
+Subject: [PATCH 2/2] [Scheduler] Prefill yield on the spark-ds41f-1025 tree:
+ chunks aligned by ALIGN_PREFILL_CHUNKS
+
+---
+ tests/v1/core/test_prefill_yield.py | 8 +++++---
+ vllm/v1/core/sched/scheduler.py     | 2 +-
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/core/test_prefill_yield.py b/tests/v1/core/test_prefill_yield.py
+index ecf56e327..fe8b6f0fa 100644
+--- a/tests/v1/core/test_prefill_yield.py
++++ b/tests/v1/core/test_prefill_yield.py
+@@ -32,14 +32,16 @@ THRESHOLD = BUDGET - SEQS
+ 
+ def _scheduler(monkeypatch, tmp_path, prefill_yield="short", limit_s=10.0):
+     utils = pytest.importorskip("tests.v1.core.utils")
+-    # DeepSeek V4.1's configuration sets align_prefill_chunks; this OPT model takes
+-    # it, and the yield option, here.
++    from vllm.v1.core.sched import scheduler as scheduler_module
++
++    # The TileLang kernel family aligns DeepSeek V4.1's chunks; this OPT model takes
++    # the alignment, and the yield option, here.
++    monkeypatch.setattr(scheduler_module, "ALIGN_PREFILL_CHUNKS", True)
+     monkeypatch.setattr(
+         utils,
+         "SchedulerConfig",
+         functools.partial(
+             utils.SchedulerConfig,
+-            align_prefill_chunks=True,
+             prefill_yield=prefill_yield,
+             prefill_yield_limit_s=limit_s,
+         ),
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d01690f0f..ec5e9d818 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -938,7 +938,7 @@ class Scheduler(SchedulerInterface):
+         threshold = self.scheduler_config.long_prefill_token_threshold
+         if threshold <= 0:
+             return True
+-        if self.scheduler_config.align_prefill_chunks:
++        if ALIGN_PREFILL_CHUNKS:
+             return self._aligned_prefill_chunk(num_computed_tokens, remaining) >= remaining
+         return remaining <= threshold
+ 
+-- 
+2.54.0 (Apple Git-157)
+

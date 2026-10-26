@@ -1,0 +1,470 @@
+
+=== tp4-ring: geometric means over mixes of each measure's ratio to production (sustainable mixes | overload mixes)
+policy                    output  TTFT p50  TTFT p99  ITL p99 long TTFT |  output  TTFT p50  TTFT p99  livelocks
+bypass-ft+slots              +1%      -47%      -73%     -14%       -1% |     +4%      -74%      -55%  
+bypass-ft+slots+prefix       +1%      -47%      -73%     -14%       -1% |     +4%      -74%      -56%  
+tiers-2k                     +7%      -47%      -65%     -49%      +76% |     -8%      +17%      +21%  
+tiers-by-load                +8%      -53%      -61%     -44%      +65% |     -8%      +17%      +24%  
+bypass-ft+tiers-4k           +6%      -52%      -60%     -33%      +36% |    -10%       +2%      +64%  
+tiers-4k                     +5%      -51%      -59%     -33%      +36% |     -3%       +4%       +3%  
+alone-32k+4k                 +5%      -52%      -59%     -33%      +36% |     -3%       +4%       +2%  
+bypass (no aging)            +1%      -42%      -55%      -9%       +3% |     -0%      -52%      -21%  
+bypass                       +1%      -42%      -54%      -9%       +5% |     +0%      -48%       -3%  
+bypass-ft                    +1%      -45%      -53%     -15%       +1% |     -0%       +0%       -1%  
+spf                          +1%      -42%      -52%     -10%       -1% |    -28%      -76%     +373%  
+tiers-8k                     +2%      -47%      -49%      -7%      +13% |     +0%       -0%       -1%  
+slots-32                     +0%       -4%      -35%      +5%       -3% |     +5%      -89%      -57%  
+slots-24                     +0%       -4%      -33%      +3%       -3% |     +5%      -73%      -46%  
+lanes2-fixed                 +0%      -22%      -33%      +9%       +3% |    -22%       -9%     +207%  
+slots-24 (steeper)*          -0%       -3%      -30%      +6%       +0% |     -3%      -55%      -35%  
+sink-off*                    +0%      -17%       -6%      +0%       -4% |     +0%       -5%       -0%  
+overhead-1.5ms*              +1%       -2%       -4%      -1%       -2% |     +1%       -3%       +5%  
+decode-rows-graphed*         +1%       -4%       -2%      -4%       -2% |     +3%       -8%       +2%  
+prefix-eviction              +0%       +0%       +0%      +0%       +0% |     +0%       -0%       -0%  
+pool-2x                      +0%       +0%       +0%      -0%       +0% |     +1%       -2%       -9%  
+engram-prefetch              +0%       -2%       +2%      -1%       -2% |     +0%       -5%       +2%  
+lanes2 (vLLM)                +1%      -72%      -73%     -28%       +4% |       -         -         -  44
+
+per mix (output / user TTFT p50 / p99 / decode ITL p99 or stall step / long TTFT):
+  sink-off*:
+      poisson: out +0%[-0%,+0%] TTFT p50 -30%[-31%,-30%] p99 -3%[-27%,-3%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 -1%[-1%,-1%] p99 -1%[-1%,-1%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall +0% long +0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -18%[-20%,-16%] p99 -0%[-2%,-0%] ITL/stall +1% long -2%
+      agents-c8: out +0%[-0%,+0%] TTFT p50 -11%[-12%,-11%] p99 -14%[-18%,-7%] ITL/stall +1% long -
+      agents-c16: out +0%[-0%,+0%] TTFT p50 -12%[-15%,-7%] p99 -0%[-3%,-0%] ITL/stall +0% long -
+      agents-c24: out +0%[+0%,+0%] TTFT p50 -1%[-1%,-1%] p99 -1%[-2%,-0%] ITL/stall -0% long -
+      agents-c8+chat: out -0%[-0%,-0%] TTFT p50 -21%[-24%,-19%] p99 -0%[-2%,-0%] ITL/stall +0% long -
+      agents-c8+chat-heavy: out +0%[+0%,+0%] TTFT p50 -0%[-1%,-0%] p99 -0%[-0%,-0%] ITL/stall -0% long -
+      soak: out -0%[-0%,+0%] TTFT p50 -30%[-31%,-30%] p99 -22%[-31%,-15%] ITL/stall +0% long -13%
+  engram-prefetch:
+      poisson: out +0%[-0%,+0%] TTFT p50 -2%[-3%,-1%] p99 -4%[-15%,+25%] ITL/stall -3% long -
+      stall: out +0%[+0%,+0%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall +0% long -0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall +0% long -0%
+      chat-docs: out -0%[-0%,-0%] TTFT p50 -1%[-5%,-1%] p99 +0%[-2%,+1%] ITL/stall -1% long -1%
+      agents-c8: out +0%[+0%,+1%] TTFT p50 -2%[-3%,-1%] p99 +16%[-0%,+41%] ITL/stall -3% long -
+      agents-c16: out +1%[+0%,+1%] TTFT p50 -11%[-18%,+2%] p99 -1%[-11%,+6%] ITL/stall +1% long -
+      agents-c24: out +0%[-0%,+1%] TTFT p50 +1%[-1%,+3%] p99 +6%[-2%,+14%] ITL/stall +4% long -
+      agents-c8+chat: out +1%[+0%,+1%] TTFT p50 -5%[-13%,+0%] p99 +1%[-20%,+19%] ITL/stall -2% long -
+      agents-c8+chat-heavy: out +0%[+0%,+0%] TTFT p50 -4%[-6%,-0%] p99 +3%[-6%,+3%] ITL/stall -2% long -
+      soak: out +0%[-0%,+0%] TTFT p50 -3%[-3%,-1%] p99 +3%[-18%,+12%] ITL/stall -0% long -8%
+  overhead-1.5ms*:
+      poisson: out +0%[-0%,+0%] TTFT p50 -4%[-5%,-3%] p99 -18%[-43%,+0%] ITL/stall -1% long -
+      stall: out +1%[+1%,+1%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall -0% long +0%
+      stall-1m: out +1%[+1%,+1%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall -0% long -0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -2%[-6%,-2%] p99 -1%[-4%,+0%] ITL/stall -5% long -0%
+      agents-c8: out +2%[+1%,+2%] TTFT p50 +0%[-2%,+2%] p99 +9%[-3%,+30%] ITL/stall +2% long -
+      agents-c16: out +1%[+0%,+1%] TTFT p50 -5%[-13%,+4%] p99 -1%[-6%,+6%] ITL/stall -0% long -
+      agents-c24: out +1%[-0%,+1%] TTFT p50 +1%[-3%,+5%] p99 +11%[-4%,+22%] ITL/stall +9% long -
+      agents-c8+chat: out +1%[+1%,+1%] TTFT p50 -5%[-11%,-2%] p99 -3%[-27%,+18%] ITL/stall +0% long -
+      agents-c8+chat-heavy: out +1%[+1%,+1%] TTFT p50 -4%[-5%,-1%] p99 +6%[-7%,+7%] ITL/stall +2% long -
+      soak: out +0%[+0%,+1%] TTFT p50 -3%[-3%,-3%] p99 -11%[-23%,-1%] ITL/stall +0% long -9%
+  decode-rows-graphed*:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 -4%[-4%,-4%] p99 -3%[-3%,-3%] ITL/stall -2% long -2%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 -3%[-3%,-3%] p99 -2%[-2%,-2%] ITL/stall -2% long -2%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -5%[-9%,-4%] p99 -3%[-7%,-1%] ITL/stall -10% long -2%
+      agents-c8: out +2%[+1%,+2%] TTFT p50 -6%[-7%,-5%] p99 +11%[-4%,+28%] ITL/stall -3% long -
+      agents-c16: out +4%[+3%,+4%] TTFT p50 -17%[-21%,-13%] p99 -9%[-13%,-1%] ITL/stall -4% long -
+      agents-c24: out +3%[+3%,+4%] TTFT p50 -1%[-5%,+2%] p99 +3%[-5%,+29%] ITL/stall -3% long -
+      agents-c8+chat: out +2%[+1%,+2%] TTFT p50 -9%[-15%,-4%] p99 -14%[-34%,-0%] ITL/stall -6% long -
+      agents-c8+chat-heavy: out +1%[+1%,+2%] TTFT p50 -6%[-10%,-3%] p99 +12%[-4%,+13%] ITL/stall -5% long -
+      soak: out +1%[+1%,+2%] TTFT p50 +0%[+0%,+0%] p99 -3%[-23%,+17%] ITL/stall -1% long -2%
+  bypass (no aging):
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -57%[-57%,-57%] p99 -55%[-57%,-54%] ITL/stall -75% long +9%
+      stall-1m: out +2%[+2%,+3%] TTFT p50 -95%[-95%,-95%] p99 -96%[-96%,-96%] ITL/stall -3% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +2%[+0%,+3%] p99 -22%[-50%,-10%] ITL/stall +98% long +13%
+      agents-c8: out -1%[-1%,+0%] TTFT p50 -1%[-2%,+0%] p99 -28%[-35%,-19%] ITL/stall +7% long -
+      agents-c16: out -0%[-1%,+0%] TTFT p50 -8%[-14%,-2%] p99 -53%[-57%,-41%] ITL/stall +2% long -
+      agents-c24: out -1%[-1%,-0%] TTFT p50 -71%[-72%,-70%] p99 +32%[-6%,+44%] ITL/stall +25% long -
+      agents-c8+chat: out +0%[-0%,+0%] TTFT p50 -1%[-7%,+8%] p99 -48%[-58%,-34%] ITL/stall +3% long -
+      agents-c8+chat-heavy: out -0%[-1%,+0%] TTFT p50 -58%[-63%,-52%] p99 -22%[-50%,-20%] ITL/stall +1% long -
+      soak: out -0%[-0%,+0%] TTFT p50 +0%[+0%,+0%] p99 -31%[-40%,-22%] ITL/stall -0% long -9%
+  bypass:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -57%[-57%,-57%] p99 -55%[-57%,-54%] ITL/stall -75% long +9%
+      stall-1m: out +2%[+2%,+3%] TTFT p50 -95%[-95%,-95%] p99 -96%[-96%,-96%] ITL/stall -3% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +2%[-0%,+3%] p99 -26%[-49%,-12%] ITL/stall +97% long +13%
+      agents-c8: out +0%[-1%,+0%] TTFT p50 +0%[-1%,+2%] p99 -30%[-39%,-22%] ITL/stall +4% long -
+      agents-c16: out +0%[-1%,+1%] TTFT p50 -4%[-9%,+3%] p99 -33%[-49%,-10%] ITL/stall +3% long -
+      agents-c24: out -1%[-2%,+0%] TTFT p50 -65%[-69%,-61%] p99 +97%[+63%,+125%] ITL/stall +6% long -
+      agents-c8+chat: out -0%[-0%,+0%] TTFT p50 +1%[-5%,+10%] p99 -40%[-52%,-25%] ITL/stall +1% long -
+      agents-c8+chat-heavy: out +1%[+0%,+1%] TTFT p50 -57%[-63%,-53%] p99 -31%[-49%,-5%] ITL/stall -1% long -
+      soak: out -0%[-0%,+0%] TTFT p50 +0%[+0%,+0%] p99 -28%[-38%,-20%] ITL/stall -0% long -4%
+  bypass-ft:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +4%[+4%,+4%] TTFT p50 -72%[-72%,-72%] p99 -69%[-69%,-69%] ITL/stall -84% long +11%
+      stall-1m: out +4%[+4%,+4%] TTFT p50 -95%[-95%,-95%] p99 -95%[-96%,-95%] ITL/stall -5% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +1%[-1%,+2%] p99 -13%[-23%,-3%] ITL/stall +100% long +1%
+      agents-c8: out -0%[-1%,+0%] TTFT p50 -0%[-2%,+1%] p99 -32%[-42%,-22%] ITL/stall +6% long -
+      agents-c16: out -0%[-1%,+0%] TTFT p50 -6%[-13%,+4%] p99 -8%[-14%,+6%] ITL/stall +0% long -
+      agents-c24: out -0%[-1%,+1%] TTFT p50 +5%[+3%,+7%] p99 -1%[-7%,+16%] ITL/stall +1% long -
+      agents-c8+chat: out -0%[-0%,+0%] TTFT p50 -2%[-8%,+6%] p99 -3%[-19%,+6%] ITL/stall +1% long -
+      agents-c8+chat-heavy: out +0%[-0%,+0%] TTFT p50 +2%[-4%,+4%] p99 +6%[-0%,+10%] ITL/stall +1% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +0%[+0%,+0%] p99 -34%[-42%,-25%] ITL/stall -1% long -8%
+  spf:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -57%[-57%,-57%] p99 -55%[-57%,-54%] ITL/stall -75% long +9%
+      stall-1m: out +2%[+2%,+3%] TTFT p50 -95%[-95%,-95%] p99 -96%[-96%,-96%] ITL/stall -3% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +1%[-3%,+2%] p99 +5%[-14%,+19%] ITL/stall +96% long -2%
+      agents-c8: out -0%[-1%,+0%] TTFT p50 -1%[-3%,+1%] p99 -32%[-39%,-24%] ITL/stall +6% long -
+      agents-c16: out -21%[-26%,-17%] TTFT p50 -25%[-34%,-12%] p99 +291%[+132%,+622%] ITL/stall +59% long -
+      agents-c24: out -54%[-74%,-37%] TTFT p50 -82%[-83%,-79%] p99 +1372%[+815%,+1600%] ITL/stall +62% long -
+      agents-c8+chat: out -0%[-0%,+0%] TTFT p50 -2%[-8%,+4%] p99 -39%[-54%,-20%] ITL/stall -1% long -
+      agents-c8+chat-heavy: out +0%[-0%,+1%] TTFT p50 -90%[-91%,-87%] p99 +84%[+45%,+176%] ITL/stall -1% long -
+      soak: out -0%[-0%,+0%] TTFT p50 +0%[+0%,+0%] p99 -28%[-37%,-20%] ITL/stall -1% long -9%
+  lanes2 (vLLM):
+      poisson: out +0%[-0%,+0%] TTFT p50 +0%[-0%,+1%] p99 +3%[-8%,+8%] ITL/stall +0% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -57%[-57%,-57%] p99 -55%[-56%,-55%] ITL/stall -61% long +8%
+      stall-1m: out +2%[+2%,+2%] TTFT p50 -95%[-95%,-95%] p99 -96%[-96%,-96%] ITL/stall -3% long +1%
+      chat-docs: LIVELOCK
+      agents-c8: LIVELOCK
+      agents-c16: LIVELOCK
+      agents-c24: LIVELOCK
+      agents-c8+chat: LIVELOCK
+      agents-c8+chat-heavy: LIVELOCK
+      soak: LIVELOCK
+  lanes2-fixed:
+      poisson: out +0%[-0%,+0%] TTFT p50 +0%[-0%,+1%] p99 +3%[-8%,+8%] ITL/stall +0% long -
+      stall: out +1%[+0%,+1%] TTFT p50 -38%[-39%,-38%] p99 -56%[-56%,-56%] ITL/stall -1% long +4%
+      stall-1m: out +1%[+1%,+2%] TTFT p50 -72%[-72%,-72%] p99 -74%[-74%,-74%] ITL/stall -1% long +0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +2%[-0%,+3%] p99 -13%[-22%,-2%] ITL/stall +85% long +5%
+      agents-c8: out -0%[-0%,+0%] TTFT p50 -1%[-2%,+0%] p99 -17%[-30%,-6%] ITL/stall +3% long -
+      agents-c16: out -20%[-24%,-15%] TTFT p50 -5%[-12%,+6%] p99 +200%[+53%,+1040%] ITL/stall +58% long -
+      agents-c24: out -42%[-60%,-28%] TTFT p50 -23%[-31%,-14%] p99 +835%[+303%,+2330%] ITL/stall +53% long -
+      agents-c8+chat: out -0%[-0%,+0%] TTFT p50 +3%[-4%,+11%] p99 +3%[-12%,+24%] ITL/stall -1% long -
+      agents-c8+chat-heavy: out +0%[-0%,+0%] TTFT p50 +1%[-3%,+4%] p99 +4%[-4%,+12%] ITL/stall +0% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +0%[+0%,+0%] p99 -31%[-41%,-22%] ITL/stall -1% long +3%
+  tiers-8k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +3%[+2%,+3%] TTFT p50 -71%[-71%,-71%] p99 -61%[-75%,-59%] ITL/stall -41% long +12%
+      stall-1m: out +17%[+16%,+17%] TTFT p50 -96%[-96%,-96%] p99 -97%[-97%,-97%] ITL/stall -43% long +9%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +9%[+4%,+16%] p99 +3%[-7%,+12%] ITL/stall +37% long +13%
+      agents-c8: out -0%[-1%,+0%] TTFT p50 -2%[-3%,-0%] p99 +11%[-3%,+21%] ITL/stall +31% long -
+      agents-c16: out -0%[-1%,+1%] TTFT p50 -7%[-12%,+2%] p99 -3%[-8%,+10%] ITL/stall -9% long -
+      agents-c24: out +1%[-0%,+2%] TTFT p50 +5%[+4%,+6%] p99 +1%[-14%,+21%] ITL/stall -20% long -
+      agents-c8+chat: out -0%[-0%,-0%] TTFT p50 +3%[-1%,+8%] p99 -7%[-26%,+12%] ITL/stall +11% long -
+      agents-c8+chat-heavy: out -0%[-0%,-0%] TTFT p50 +1%[-5%,+8%] p99 -2%[-15%,+15%] ITL/stall +18% long -
+      soak: out -1%[-2%,-1%] TTFT p50 +0%[+0%,+0%] p99 -36%[-43%,-30%] ITL/stall -14% long +17%
+  tiers-4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +6%[+6%,+6%] TTFT p50 -81%[-81%,-81%] p99 -82%[-85%,-81%] ITL/stall -64% long +35%
+      stall-1m: out +44%[+43%,+44%] TTFT p50 -98%[-98%,-98%] p99 -98%[-98%,-98%] ITL/stall -66% long +26%
+      chat-docs: out -0%[-1%,+0%] TTFT p50 +33%[+13%,+124%] p99 +22%[+7%,+49%] ITL/stall -2% long +35%
+      agents-c8: out -2%[-3%,-2%] TTFT p50 -0%[-2%,+1%] p99 -22%[-32%,-15%] ITL/stall -12% long -
+      agents-c16: out -4%[-4%,-3%] TTFT p50 -1%[-9%,+13%] p99 +2%[-6%,+12%] ITL/stall -35% long -
+      agents-c24: out -3%[-5%,-2%] TTFT p50 +8%[+6%,+9%] p99 -3%[-11%,+8%] ITL/stall -44% long -
+      agents-c8+chat: out -2%[-2%,-2%] TTFT p50 +10%[+3%,+23%] p99 +6%[-12%,+24%] ITL/stall -27% long -
+      agents-c8+chat-heavy: out -2%[-2%,-2%] TTFT p50 +6%[-1%,+11%] p99 +10%[-3%,+11%] ITL/stall -6% long -
+      soak: out -2%[-2%,-1%] TTFT p50 +0%[+0%,+0%] p99 -40%[-48%,-33%] ITL/stall -25% long +46%
+  tiers-2k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +10%[+10%,+11%] TTFT p50 -88%[-88%,-88%] p99 -91%[-91%,-91%] ITL/stall -76% long +82%
+      stall-1m: out +80%[+79%,+80%] TTFT p50 -99%[-99%,-99%] p99 -99%[-99%,-99%] ITL/stall -78% long +62%
+      chat-docs: out -1%[-1%,-0%] TTFT p50 +254%[+65%,+1652%] p99 +78%[+36%,+131%] ITL/stall -27% long +89%
+      agents-c8: out -8%[-8%,-8%] TTFT p50 +15%[+12%,+18%] p99 -27%[-37%,-17%] ITL/stall -23% long -
+      agents-c16: out -10%[-12%,-9%] TTFT p50 +7%[-5%,+27%] p99 +16%[+5%,+33%] ITL/stall -45% long -
+      agents-c24: out -10%[-11%,-9%] TTFT p50 +19%[+17%,+21%] p99 +18%[+1%,+43%] ITL/stall -52% long -
+      agents-c8+chat: out -6%[-6%,-6%] TTFT p50 +53%[+40%,+66%] p99 +28%[-4%,+57%] ITL/stall -37% long -
+      agents-c8+chat-heavy: out -4%[-4%,-4%] TTFT p50 +24%[+15%,+29%] p99 +31%[+15%,+37%] ITL/stall -33% long -
+      soak: out -4%[-4%,-3%] TTFT p50 +0%[+0%,+0%] p99 -57%[-63%,-52%] ITL/stall -50% long +71%
+  tiers-by-load:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +10%[+10%,+11%] TTFT p50 -88%[-88%,-88%] p99 -91%[-91%,-91%] ITL/stall -76% long +82%
+      stall-1m: out +80%[+79%,+80%] TTFT p50 -99%[-99%,-99%] p99 -99%[-99%,-99%] ITL/stall -78% long +62%
+      chat-docs: out -0%[-1%,+0%] TTFT p50 +128%[+26%,+711%] p99 +78%[+24%,+130%] ITL/stall -24% long +90%
+      agents-c8: out -3%[-3%,-2%] TTFT p50 -1%[-2%,+0%] p99 -24%[-38%,-1%] ITL/stall -11% long -
+      agents-c16: out -10%[-12%,-9%] TTFT p50 +10%[-4%,+37%] p99 +20%[+6%,+33%] ITL/stall -45% long -
+      agents-c24: out -10%[-11%,-9%] TTFT p50 +16%[+15%,+18%] p99 +14%[-6%,+33%] ITL/stall -52% long -
+      agents-c8+chat: out -5%[-5%,-4%] TTFT p50 +33%[+19%,+52%] p99 +58%[+9%,+124%] ITL/stall -33% long -
+      agents-c8+chat-heavy: out -4%[-5%,-4%] TTFT p50 +25%[+19%,+30%] p99 +40%[+10%,+46%] ITL/stall -33% long -
+      soak: out -5%[-5%,-4%] TTFT p50 +0%[+0%,+0%] p99 -40%[-48%,-32%] ITL/stall -28% long +34%
+  alone-32k+4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +6%[+6%,+6%] TTFT p50 -81%[-81%,-81%] p99 -82%[-85%,-81%] ITL/stall -64% long +35%
+      stall-1m: out +44%[+43%,+44%] TTFT p50 -98%[-98%,-98%] p99 -98%[-98%,-98%] ITL/stall -66% long +26%
+      chat-docs: out -0%[-1%,+0%] TTFT p50 +33%[+12%,+120%] p99 +22%[+7%,+48%] ITL/stall -2% long +35%
+      agents-c8: out -2%[-3%,-2%] TTFT p50 -2%[-4%,+0%] p99 -22%[-32%,-14%] ITL/stall -12% long -
+      agents-c16: out -4%[-4%,-3%] TTFT p50 -2%[-10%,+12%] p99 -3%[-7%,+8%] ITL/stall -35% long -
+      agents-c24: out -3%[-5%,-2%] TTFT p50 +7%[+6%,+9%] p99 -2%[-9%,+8%] ITL/stall -44% long -
+      agents-c8+chat: out -2%[-2%,-1%] TTFT p50 +6%[-0%,+14%] p99 +13%[-9%,+35%] ITL/stall -27% long -
+      agents-c8+chat-heavy: out -2%[-2%,-2%] TTFT p50 +9%[-0%,+14%] p99 +11%[+1%,+11%] ITL/stall -6% long -
+      soak: out -2%[-2%,-1%] TTFT p50 +0%[+0%,+0%] p99 -40%[-48%,-33%] ITL/stall -25% long +46%
+  bypass-ft+tiers-4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +8%[+7%,+8%] TTFT p50 -81%[-81%,-81%] p99 -86%[-86%,-86%] ITL/stall -64% long +38%
+      stall-1m: out +45%[+45%,+45%] TTFT p50 -98%[-98%,-98%] p99 -98%[-98%,-98%] ITL/stall -66% long +27%
+      chat-docs: out -0%[-1%,+0%] TTFT p50 +33%[+13%,+100%] p99 +19%[+1%,+43%] ITL/stall +3% long +41%
+      agents-c8: out -2%[-3%,-2%] TTFT p50 -1%[-3%,+0%] p99 -35%[-44%,-26%] ITL/stall -11% long -
+      agents-c16: out -5%[-7%,-4%] TTFT p50 -10%[-18%,-1%] p99 +9%[+1%,+24%] ITL/stall -35% long -
+      agents-c24: out -22%[-31%,-11%] TTFT p50 +7%[+3%,+12%] p99 +255%[+30%,+477%] ITL/stall -30% long -
+      agents-c8+chat: out -2%[-2%,-2%] TTFT p50 +10%[+3%,+22%] p99 +24%[+4%,+51%] ITL/stall -27% long -
+      agents-c8+chat-heavy: out -2%[-2%,-2%] TTFT p50 +10%[+1%,+15%] p99 +15%[+4%,+16%] ITL/stall -6% long -
+      soak: out -2%[-3%,-1%] TTFT p50 +0%[+0%,+0%] p99 -42%[-50%,-30%] ITL/stall -27% long +37%
+  bypass-ft+slots:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -87%[-89%,-3%] ITL/stall +1% long -
+      stall: out +4%[+4%,+4%] TTFT p50 -72%[-72%,-72%] p99 -69%[-69%,-69%] ITL/stall -84% long +11%
+      stall-1m: out +4%[+4%,+4%] TTFT p50 -95%[-95%,-95%] p99 -95%[-96%,-95%] ITL/stall -5% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -3%[-13%,-1%] p99 -50%[-64%,-34%] ITL/stall +115% long -6%
+      agents-c8: out -0%[-1%,+0%] TTFT p50 -1%[-2%,-0%] p99 -31%[-41%,-21%] ITL/stall +5% long -
+      agents-c16: out +2%[+2%,+3%] TTFT p50 -48%[-58%,-34%] p99 -78%[-81%,-72%] ITL/stall +20% long -
+      agents-c24: out +4%[+2%,+6%] TTFT p50 -83%[-85%,-80%] p99 -35%[-49%,-15%] ITL/stall +41% long -
+      agents-c8+chat: out +1%[+0%,+1%] TTFT p50 -21%[-27%,-19%] p99 -75%[-79%,-68%] ITL/stall +6% long -
+      agents-c8+chat-heavy: out +7%[+5%,+8%] TTFT p50 -82%[-90%,-74%] p99 -36%[-47%,-32%] ITL/stall +46% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +0%[+0%,+0%] p99 -34%[-42%,-26%] ITL/stall -1% long -10%
+  bypass-ft+slots+prefix:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -87%[-89%,-3%] ITL/stall +1% long -
+      stall: out +4%[+4%,+4%] TTFT p50 -72%[-72%,-72%] p99 -69%[-69%,-69%] ITL/stall -84% long +11%
+      stall-1m: out +4%[+4%,+4%] TTFT p50 -95%[-95%,-95%] p99 -95%[-96%,-95%] ITL/stall -5% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -3%[-13%,-1%] p99 -50%[-64%,-34%] ITL/stall +115% long -6%
+      agents-c8: out -0%[-1%,+0%] TTFT p50 -1%[-2%,-0%] p99 -31%[-41%,-21%] ITL/stall +5% long -
+      agents-c16: out +2%[+2%,+3%] TTFT p50 -48%[-58%,-34%] p99 -78%[-81%,-72%] ITL/stall +19% long -
+      agents-c24: out +4%[+2%,+6%] TTFT p50 -83%[-85%,-80%] p99 -38%[-48%,-27%] ITL/stall +40% long -
+      agents-c8+chat: out +1%[+0%,+1%] TTFT p50 -21%[-27%,-19%] p99 -75%[-79%,-68%] ITL/stall +6% long -
+      agents-c8+chat-heavy: out +7%[+5%,+8%] TTFT p50 -82%[-90%,-74%] p99 -36%[-48%,-32%] ITL/stall +46% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +0%[+0%,+0%] p99 -34%[-42%,-26%] ITL/stall -1% long -10%
+  prefix-eviction:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c8: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      agents-c16: out +0%[-0%,+1%] TTFT p50 -2%[-3%,+0%] p99 -2%[-7%,+1%] ITL/stall -0% long -
+      agents-c24: out +0%[+0%,+0%] TTFT p50 +1%[-1%,+2%] p99 +1%[-4%,+6%] ITL/stall +0% long -
+      agents-c8+chat: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      agents-c8+chat-heavy: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  pool-2x:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c8: out +0%[+0%,+0%] TTFT p50 -0%[-0%,+0%] p99 +0%[+0%,+0%] ITL/stall -0% long -
+      agents-c16: out +1%[+0%,+1%] TTFT p50 -5%[-8%,-2%] p99 -10%[-16%,-1%] ITL/stall -2% long -
+      agents-c24: out +4%[+3%,+4%] TTFT p50 +0%[-1%,+2%] p99 -17%[-24%,-14%] ITL/stall -14% long -
+      agents-c8+chat: out -0%[-0%,+0%] TTFT p50 +0%[-0%,+1%] p99 +0%[+0%,+0%] ITL/stall -0% long -
+      agents-c8+chat-heavy: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  slots-24:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -87%[-89%,-3%] ITL/stall +1% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +1%[+1%,+1%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -3%[-13%,-1%] p99 -13%[-24%,-3%] ITL/stall +15% long -11%
+      agents-c8: out +0%[-0%,+0%] TTFT p50 -0%[-2%,+1%] p99 +7%[+0%,+22%] ITL/stall +2% long -
+      agents-c16: out +3%[+2%,+3%] TTFT p50 -47%[-58%,-35%] p99 -61%[-66%,-51%] ITL/stall +16% long -
+      agents-c24: out +5%[+4%,+6%] TTFT p50 -83%[-86%,-80%] p99 -22%[-41%,+7%] ITL/stall +39% long -
+      agents-c8+chat: out +1%[+1%,+1%] TTFT p50 -25%[-30%,-21%] p99 -52%[-61%,-42%] ITL/stall +1% long -
+      agents-c8+chat-heavy: out +7%[+6%,+8%] TTFT p50 -77%[-86%,-70%] p99 -49%[-57%,-36%] ITL/stall +46% long -
+      soak: out +0%[-0%,+0%] TTFT p50 +0%[+0%,+0%] p99 -1%[-8%,+2%] ITL/stall -0% long -1%
+  slots-24 (steeper)*:
+      poisson: out +0%[-0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -82%[-84%,-1%] ITL/stall +10% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +1%[+1%,+1%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +2%[-2%,+2%] p99 -10%[-13%,+1%] ITL/stall +24% long +1%
+      agents-c8: out +0%[-0%,+0%] TTFT p50 -0%[-2%,+1%] p99 +7%[+0%,+22%] ITL/stall +2% long -
+      agents-c16: out -1%[-1%,+0%] TTFT p50 -47%[-57%,-34%] p99 -57%[-62%,-46%] ITL/stall +18% long -
+      agents-c24: out -5%[-7%,-5%] TTFT p50 -79%[-81%,-78%] p99 -31%[-42%,-27%] ITL/stall +40% long -
+      agents-c8+chat: out -0%[-1%,-0%] TTFT p50 -22%[-28%,-18%] p99 -52%[-57%,-47%] ITL/stall +5% long -
+      agents-c8+chat-heavy: out -4%[-4%,-3%] TTFT p50 -19%[-37%,-11%] p99 -7%[-17%,+11%] ITL/stall +31% long -
+      soak: out +0%[-0%,+0%] TTFT p50 +0%[+0%,+0%] p99 -1%[-8%,+2%] ITL/stall -0% long -1%
+  slots-32:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -87%[-89%,-3%] ITL/stall +1% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +1%[+1%,+1%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      stall-1m: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -5%[-15%,-2%] p99 -16%[-29%,-3%] ITL/stall +31% long -15%
+      agents-c8: out -0%[-0%,+0%] TTFT p50 +0%[-2%,+2%] p99 +7%[+0%,+21%] ITL/stall +2% long -
+      agents-c16: out +2%[+2%,+3%] TTFT p50 -48%[-58%,-36%] p99 -62%[-69%,-53%] ITL/stall +18% long -
+      agents-c24: out +5%[+4%,+6%] TTFT p50 -93%[-93%,-92%] p99 -43%[-59%,-35%] ITL/stall +42% long -
+      agents-c8+chat: out +1%[+0%,+1%] TTFT p50 -24%[-28%,-21%] p99 -59%[-67%,-48%] ITL/stall +3% long -
+      agents-c8+chat-heavy: out +8%[+7%,+10%] TTFT p50 -97%[-97%,-96%] p99 -62%[-78%,-53%] ITL/stall +59% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[-5%,+1%] ITL/stall -0% long +4%
+
+=== tp3-triangle: geometric means over mixes of each measure's ratio to production (sustainable mixes | overload mixes)
+policy                    output  TTFT p50  TTFT p99  ITL p99 long TTFT |  output  TTFT p50  TTFT p99  livelocks
+bypass-ft+slots+prefix       +1%      -26%      -71%     +20%       +2% |       -         -         -  
+bypass-ft+slots              +1%      -26%      -70%     +22%       +2% |       -         -         -  
+bypass-ft+tiers-4k           +0%      -27%      -50%     +19%      +16% |       -         -         -  
+bypass-ft                    +1%      -26%      -48%     +20%       +4% |       -         -         -  
+tiers-by-load                -0%      -32%      -48%      +6%      +21% |       -         -         -  
+tiers-2k                     -1%      -30%      -47%      -1%      +41% |       -         -         -  
+spf                          +0%      -24%      -47%     +23%       +2% |       -         -         -  
+bypass                       +0%      -24%      -43%     +20%       +3% |       -         -         -  
+bypass (no aging)            +0%      -24%      -43%     +21%       +4% |       -         -         -  
+alone-12k+4k                 +0%      -27%      -41%     +16%      +11% |       -         -         -  
+tiers-4k                     +0%      -27%      -38%     +16%      +11% |       -         -         -  
+slots-12                     +0%       +0%      -30%      +3%       -1% |       -         -         -  
+lanes2-fixed                 +0%      -15%      -28%     +17%       +2% |       -         -         -  
+sink-off*                    +0%      -19%       -9%      +1%       -4% |       -         -         -  
+retention-2048               +0%       +1%       -5%      -2%       +0% |       -         -         -  
+slots-12 (steeper)*          -0%       +0%       -5%      +7%       -1% |       -         -         -  
+pool+1.3GiB                  +0%       +0%       -4%      -1%       +0% |       -         -         -  
+prefix-eviction              +0%       +0%       -1%      -1%       +0% |       -         -         -  
+decode-rows-graphed*         +0%       +0%       +0%      +0%       +0% |       -         -         -  
+overhead-1.5ms*              +1%       -1%       +0%      -2%       +1% |       -         -         -  
+retention-8192               -0%       +1%       +2%      -1%       +0% |       -         -         -  
+engram-prefetch              +0%       -1%       +3%      -2%       -1% |       -         -         -  
+lanes2 (vLLM)                +1%      -56%      -39%      -1%       +6% |       -         -         -  32
+
+per mix (output / user TTFT p50 / p99 / decode ITL p99 or stall step / long TTFT):
+  sink-off*:
+      poisson: out +0%[-0%,+0%] TTFT p50 -31%[-32%,-30%] p99 -1%[-2%,-1%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 -1%[-1%,-1%] p99 -0%[-0%,-0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 -20%[-22%,-18%] p99 -1%[-4%,-0%] ITL/stall +2% long -3%
+      agents-c4: out +0%[+0%,+0%] TTFT p50 -9%[-10%,-8%] p99 -9%[-12%,-1%] ITL/stall +1% long -
+      agents-c2+chat: out -0%[-0%,+0%] TTFT p50 -20%[-22%,-20%] p99 -6%[-18%,-2%] ITL/stall +1% long -
+      soak: out -0%[-0%,+0%] TTFT p50 -30%[-32%,-29%] p99 -31%[-33%,-27%] ITL/stall -0% long -9%
+  engram-prefetch:
+      poisson: out +0%[-0%,+0%] TTFT p50 -2%[-3%,-1%] p99 -2%[-10%,+4%] ITL/stall -5% long -
+      stall: out +0%[+0%,+0%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall +0% long -0%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 -1%[-3%,-0%] p99 +0%[-0%,+1%] ITL/stall -2% long -0%
+      agents-c4: out +0%[-0%,+1%] TTFT p50 -2%[-3%,-0%] p99 +11%[-19%,+36%] ITL/stall -4% long -
+      agents-c2+chat: out -0%[-0%,+0%] TTFT p50 +0%[-3%,+2%] p99 +8%[-18%,+37%] ITL/stall -0% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +1%[-4%,+1%] p99 +1%[-15%,+20%] ITL/stall -0% long -4%
+  overhead-1.5ms*:
+      poisson: out +0%[-0%,+0%] TTFT p50 -3%[-4%,-2%] p99 -8%[-13%,-5%] ITL/stall -2% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -0%[-0%,-0%] p99 -0%[-0%,-0%] ITL/stall -0% long -0%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 -1%[-4%,-0%] p99 -0%[-1%,-0%] ITL/stall -2% long +0%
+      agents-c4: out +2%[+1%,+2%] TTFT p50 +0%[-1%,+2%] p99 +13%[-5%,+55%] ITL/stall -5% long -
+      agents-c2+chat: out +1%[+0%,+1%] TTFT p50 -2%[-5%,+1%] p99 -2%[-33%,+28%] ITL/stall -3% long -
+      soak: out +1%[+0%,+1%] TTFT p50 +1%[-1%,+1%] p99 -0%[-7%,+5%] ITL/stall -0% long +3%
+  decode-rows-graphed*:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c4: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      agents-c2+chat: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  bypass (no aging):
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +3%[+2%,+3%] TTFT p50 -81%[-81%,-81%] p99 -63%[-71%,-62%] ITL/stall -2% long +6%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +0%[-1%,+1%] p99 -60%[-81%,-54%] ITL/stall +171% long +4%
+      agents-c4: out +0%[+0%,+1%] TTFT p50 -1%[-3%,+2%] p99 -47%[-57%,-28%] ITL/stall +12% long -
+      agents-c2+chat: out -0%[-1%,+0%] TTFT p50 -1%[-3%,-0%] p99 -46%[-54%,+19%] ITL/stall +5% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +3%[-2%,+3%] p99 -15%[-20%,-9%] ITL/stall +0% long +1%
+  bypass:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +3%[+2%,+3%] TTFT p50 -81%[-81%,-81%] p99 -63%[-71%,-62%] ITL/stall -2% long +6%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +0%[-1%,+1%] p99 -60%[-81%,-14%] ITL/stall +171% long +4%
+      agents-c4: out +0%[-1%,+1%] TTFT p50 +0%[-1%,+2%] p99 -40%[-52%,-22%] ITL/stall +8% long -
+      agents-c2+chat: out -0%[-1%,+0%] TTFT p50 -1%[-3%,-0%] p99 -54%[-61%,-44%] ITL/stall +4% long -
+      soak: out -0%[-0%,+0%] TTFT p50 +3%[-3%,+3%] p99 -12%[-21%,-4%] ITL/stall +0% long +0%
+  bypass-ft:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +4%[+4%,+5%] TTFT p50 -83%[-83%,-83%] p99 -82%[-83%,-81%] ITL/stall -3% long +8%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -0%[-1%,+1%] p99 -54%[-80%,+3%] ITL/stall +167% long +5%
+      agents-c4: out +0%[-1%,+1%] TTFT p50 -0%[-2%,+2%] p99 -45%[-56%,-24%] ITL/stall +10% long -
+      agents-c2+chat: out -0%[-1%,+0%] TTFT p50 -0%[-2%,+2%] p99 -47%[-57%,-24%] ITL/stall +4% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +3%[-0%,+3%] p99 -19%[-26%,-10%] ITL/stall +0% long -1%
+  spf:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +3%[+2%,+3%] TTFT p50 -81%[-81%,-81%] p99 -63%[-71%,-62%] ITL/stall -2% long +6%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +0%[-1%,+1%] p99 -76%[-82%,-12%] ITL/stall +172% long +4%
+      agents-c4: out +0%[-1%,+1%] TTFT p50 -0%[-2%,+1%] p99 -47%[-56%,-25%] ITL/stall +19% long -
+      agents-c2+chat: out -1%[-1%,-0%] TTFT p50 +1%[-2%,+3%] p99 -49%[-59%,-38%] ITL/stall +9% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +0%[-3%,+3%] p99 -9%[-21%,+5%] ITL/stall -1% long -5%
+  lanes2 (vLLM):
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +2%[+2%,+2%] TTFT p50 -81%[-81%,-81%] p99 -63%[-76%,-62%] ITL/stall -2% long +6%
+      chat-docs: LIVELOCK
+      agents-c4: LIVELOCK
+      agents-c2+chat: LIVELOCK
+      soak: LIVELOCK
+  lanes2-fixed:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +1%[+1%,+2%] TTFT p50 -64%[-66%,-64%] p99 -49%[-51%,-49%] ITL/stall -0% long +4%
+      chat-docs: out -0%[-0%,-0%] TTFT p50 +0%[-1%,+1%] p99 -45%[-53%,-1%] ITL/stall +135% long +3%
+      agents-c4: out -1%[-2%,+1%] TTFT p50 +0%[-1%,+1%] p99 -3%[-18%,+30%] ITL/stall +7% long -
+      agents-c2+chat: out -1%[-2%,-0%] TTFT p50 +0%[-2%,+2%] p99 -44%[-52%,-23%] ITL/stall +6% long -
+      soak: out +0%[-0%,+1%] TTFT p50 +3%[-3%,+3%] p99 -12%[-18%,-6%] ITL/stall -0% long -1%
+  tiers-4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +5%[+4%,+5%] TTFT p50 -85%[-85%,-83%] p99 -80%[-85%,-78%] ITL/stall -39% long +17%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +1%[+0%,+2%] p99 -12%[-40%,+1%] ITL/stall +307% long +7%
+      agents-c4: out -1%[-2%,-0%] TTFT p50 -2%[-4%,-0%] p99 -27%[-40%,+7%] ITL/stall +20% long -
+      agents-c2+chat: out -1%[-1%,-0%] TTFT p50 -0%[-2%,+2%] p99 -26%[-37%,+17%] ITL/stall +37% long -
+      soak: out -2%[-2%,-1%] TTFT p50 +3%[+0%,+3%] p99 -40%[-47%,-31%] ITL/stall -39% long +8%
+  tiers-2k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +8%[+8%,+8%] TTFT p50 -90%[-90%,-90%] p99 -92%[-92%,-92%] ITL/stall -61% long +49%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 +3%[+1%,+5%] p99 -1%[-31%,+14%] ITL/stall +302% long +33%
+      agents-c4: out -5%[-6%,-4%] TTFT p50 +10%[+8%,+11%] p99 -26%[-41%,-2%] ITL/stall -8% long -
+      agents-c2+chat: out -3%[-3%,-2%] TTFT p50 -1%[-4%,+4%] p99 -30%[-43%,+43%] ITL/stall +21% long -
+      soak: out -3%[-4%,-3%] TTFT p50 +3%[+0%,+3%] p99 -48%[-52%,-43%] ITL/stall -45% long +43%
+  tiers-by-load:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +7%[+7%,+7%] TTFT p50 -90%[-90%,-89%] p99 -91%[-91%,-91%] ITL/stall -61% long +31%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +2%[+1%,+3%] p99 -7%[-35%,+15%] ITL/stall +294% long +15%
+      agents-c4: out -1%[-1%,-1%] TTFT p50 -3%[-4%,-2%] p99 -32%[-46%,-12%] ITL/stall +17% long -
+      agents-c2+chat: out -1%[-2%,-1%] TTFT p50 -2%[-6%,+1%] p99 -42%[-52%,-16%] ITL/stall +28% long -
+      soak: out -5%[-6%,-5%] TTFT p50 +3%[+0%,+3%] p99 -42%[-49%,-33%] ITL/stall -38% long +17%
+  alone-12k+4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +5%[+4%,+5%] TTFT p50 -85%[-85%,-83%] p99 -80%[-85%,-78%] ITL/stall -39% long +17%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +1%[-1%,+2%] p99 -13%[-42%,-1%] ITL/stall +315% long +7%
+      agents-c4: out -0%[-1%,+0%] TTFT p50 -2%[-3%,-1%] p99 -32%[-42%,-13%] ITL/stall +18% long -
+      agents-c2+chat: out -1%[-1%,-0%] TTFT p50 -2%[-4%,+1%] p99 -43%[-53%,-21%] ITL/stall +34% long -
+      soak: out -2%[-2%,-1%] TTFT p50 +3%[+0%,+3%] p99 -40%[-47%,-31%] ITL/stall -39% long +8%
+  bypass-ft+tiers-4k:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +6%[+5%,+6%] TTFT p50 -85%[-85%,-85%] p99 -88%[-88%,-88%] ITL/stall -40% long +18%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +1%[+0%,+3%] p99 -33%[-70%,+15%] ITL/stall +364% long +18%
+      agents-c4: out -1%[-1%,+0%] TTFT p50 -3%[-4%,-1%] p99 -39%[-51%,-19%] ITL/stall +23% long -
+      agents-c2+chat: out -2%[-2%,-1%] TTFT p50 -1%[-3%,+2%] p99 -46%[-58%,-34%] ITL/stall +35% long -
+      soak: out -2%[-2%,-2%] TTFT p50 +3%[+0%,+3%] p99 -42%[-48%,-35%] ITL/stall -38% long +12%
+  bypass-ft+slots:
+      poisson: out +0%[-0%,+0%] TTFT p50 -1%[-3%,+0%] p99 -84%[-94%,-64%] ITL/stall +4% long -
+      stall: out +4%[+4%,+4%] TTFT p50 -83%[-83%,-83%] p99 -83%[-83%,-83%] ITL/stall -2% long +8%
+      chat-docs: out -0%[-0%,-0%] TTFT p50 -0%[-1%,+0%] p99 -87%[-89%,-50%] ITL/stall +183% long +0%
+      agents-c4: out +0%[-0%,+1%] TTFT p50 +0%[-1%,+2%] p99 -42%[-52%,-25%] ITL/stall +11% long -
+      agents-c2+chat: out -1%[-1%,-0%] TTFT p50 +1%[-1%,+2%] p99 -56%[-64%,-46%] ITL/stall +3% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +3%[-3%,+3%] p99 -18%[-25%,-11%] ITL/stall -0% long -1%
+  bypass-ft+slots+prefix:
+      poisson: out +0%[-0%,+0%] TTFT p50 -1%[-3%,+0%] p99 -84%[-94%,-64%] ITL/stall +4% long -
+      stall: out +4%[+4%,+4%] TTFT p50 -83%[-83%,-83%] p99 -83%[-83%,-83%] ITL/stall -2% long +8%
+      chat-docs: out -0%[-0%,-0%] TTFT p50 -0%[-1%,+0%] p99 -87%[-89%,-50%] ITL/stall +183% long +0%
+      agents-c4: out +2%[+1%,+4%] TTFT p50 +2%[-1%,+4%] p99 -53%[-63%,-34%] ITL/stall -8% long -
+      agents-c2+chat: out -1%[-1%,-0%] TTFT p50 -1%[-4%,+1%] p99 -55%[-63%,-45%] ITL/stall +12% long -
+      soak: out -0%[-1%,+0%] TTFT p50 +3%[-3%,+3%] p99 -18%[-25%,-11%] ITL/stall -0% long -1%
+  prefix-eviction:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c4: out +0%[-1%,+1%] TTFT p50 +0%[-2%,+2%] p99 -3%[-20%,+30%] ITL/stall -7% long -
+      agents-c2+chat: out -0%[-0%,+0%] TTFT p50 +0%[+0%,+1%] p99 -2%[-6%,+0%] ITL/stall +1% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  pool+1.3GiB:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c4: out +2%[+1%,+5%] TTFT p50 +0%[-2%,+2%] p99 -22%[-37%,-1%] ITL/stall -9% long -
+      agents-c2+chat: out +0%[-0%,+0%] TTFT p50 +1%[-0%,+1%] p99 -2%[-11%,+0%] ITL/stall +1% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  retention-8192:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c4: out +1%[-1%,+3%] TTFT p50 +3%[+0%,+5%] p99 -13%[-33%,+12%] ITL/stall -7% long -
+      agents-c2+chat: out -1%[-2%,-1%] TTFT p50 +1%[-0%,+3%] p99 +33%[+6%,+58%] ITL/stall +1% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  retention-2048:
+      poisson: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      chat-docs: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+      agents-c4: out +2%[+1%,+4%] TTFT p50 +2%[+0%,+4%] p99 -22%[-40%,+0%] ITL/stall -10% long -
+      agents-c2+chat: out -0%[-0%,+0%] TTFT p50 +1%[-2%,+3%] p99 -4%[-16%,+15%] ITL/stall -0% long -
+      soak: out +0%[+0%,+0%] TTFT p50 +0%[+0%,+0%] p99 +0%[+0%,+0%] ITL/stall +0% long +0%
+  slots-12:
+      poisson: out +0%[-0%,+0%] TTFT p50 -1%[-3%,+0%] p99 -84%[-94%,-64%] ITL/stall +4% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +1%[+1%,+1%] p99 +1%[+1%,+1%] ITL/stall +0% long +1%
+      chat-docs: out -0%[-0%,+0%] TTFT p50 -0%[-2%,+0%] p99 -16%[-20%,+2%] ITL/stall +10% long -2%
+      agents-c4: out +0%[+0%,+1%] TTFT p50 -1%[-2%,+0%] p99 -0%[-21%,+29%] ITL/stall +1% long -
+      agents-c2+chat: out -0%[-1%,+0%] TTFT p50 +1%[-2%,+3%] p99 -11%[-38%,+5%] ITL/stall +4% long -
+      soak: out +0%[-0%,+0%] TTFT p50 +2%[-1%,+3%] p99 -5%[-10%,+0%] ITL/stall +0% long -0%
+  slots-12 (steeper)*:
+      poisson: out +0%[-0%,+0%] TTFT p50 +0%[-1%,+3%] p99 +15%[-89%,+24%] ITL/stall +20% long -
+      stall: out +0%[+0%,+0%] TTFT p50 +1%[+1%,+1%] p99 +1%[+1%,+1%] ITL/stall +0% long +1%
+      chat-docs: out +0%[-0%,+0%] TTFT p50 +0%[-0%,+1%] p99 -16%[-20%,+2%] ITL/stall +19% long -2%
+      agents-c4: out +0%[-0%,+1%] TTFT p50 -1%[-2%,+0%] p99 +4%[-20%,+31%] ITL/stall +3% long -
+      agents-c2+chat: out -1%[-2%,-0%] TTFT p50 -1%[-4%,+2%] p99 -21%[-47%,+7%] ITL/stall +3% long -
+      soak: out +0%[-0%,+0%] TTFT p50 +2%[-1%,+3%] p99 -5%[-10%,+0%] ITL/stall +0% long -0%

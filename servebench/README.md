@@ -112,6 +112,14 @@ chunk, which the long-prefill budget sets), the overlapping gaps' median and p99
 baseline median and the prefill rate under decode. A repeat fails unless every stream
 decoded across the whole prefill (`--max-tokens` must outlast warm-up and prefill).
 
+`--probes 2,5,8` also sends short cold requests that many seconds after the document
+(`--probe-tokens` of real text, default 500; `--probe-max-tokens`, default 64) and reports
+the time to first token of those sent before the document's first token: what a new
+conversation waits while a long prompt prefills. Leave them free slots: the streams, the
+document and the probes in flight must fit `--max-num-seqs`, or the probes measure slot
+queueing. Use prompts longer than the unused decode rows ((max-num-seqs − streams) x 6
+tokens), which can ride beside a long chunk.
+
 ## Engine cost grid
 
 ```sh

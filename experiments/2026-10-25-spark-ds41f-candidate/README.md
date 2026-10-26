@@ -22,6 +22,16 @@ published release benchmark. Promotion needs the owner's go.
     (vLLM's startup figure, 3.82x at 1M), as planned.
   - **Rollback:** stop with `config/cluster.json`, then start
     `experiments/2026-10-23-next-release/1022/cluster.json` with `--replace`.
+- **Back on the ring (2026-10-26).** The nodes were stopped (08:10 CET) and re-cabled for the
+  four-node ring. The dgx4-dgx1 link was missing until a second re-wire at 21:38 CET, so
+  production was down 08:10-21:46. The network config of dgx1 and dgx3 went back to the ring
+  (dgx-spark-fleet 323264e).
+  - **Started** with `cluster start --replace --change-shape --apply` (site shape `tp4-ring`,
+    every node at 6af41e64): the API was ready 90.6 s after launch.
+  - **Checks:** `doctor --live` OK (the weight-shard extent and fragmentation warnings only); KV
+    6,512,700 tokens (vLLM's startup figure, 6.21x at 1M), as before.
+  - **First-prefill probe** (step 5b): 32K at 6,715, 6,785 and 6,768 tok/s, 128K at 6,824. No
+    node logged a kernel compile, preparation or tuning line during it.
 
 The sections below record how the candidate got there.
 

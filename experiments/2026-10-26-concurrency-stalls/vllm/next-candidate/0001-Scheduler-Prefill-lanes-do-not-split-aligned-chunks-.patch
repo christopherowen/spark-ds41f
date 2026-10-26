@@ -1,0 +1,179 @@
+From f05748eada7716020ee6a8e4442b750a808d2703 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:37:56 +0100
+Subject: [PATCH] [Scheduler] Prefill lanes do not split aligned chunks to
+ their shares
+
+With aligned prefill chunks a chunk cannot be partial, so capping it at a
+lane's share only skipped it: two long prompts each given half the
+budget were skipped every step, kept their lanes, and nothing prefilled.
+An aligned chunk now takes the step's budget when that holds it; lanes
+still choose which prefills may run and rotate whole chunks. Unaligned
+chunks keep their shares.
+---
+ tests/v1/core/test_aligned_prefill_lanes.py | 100 ++++++++++++++++++++
+ vllm/config/scheduler.py                    |   5 +-
+ vllm/v1/core/sched/scheduler.py             |  17 +++-
+ 3 files changed, 118 insertions(+), 4 deletions(-)
+ create mode 100644 tests/v1/core/test_aligned_prefill_lanes.py
+
+diff --git a/tests/v1/core/test_aligned_prefill_lanes.py b/tests/v1/core/test_aligned_prefill_lanes.py
+new file mode 100644
+index 000000000..3f43c7102
+--- /dev/null
++++ b/tests/v1/core/test_aligned_prefill_lanes.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill lanes with aligned chunks: a lane's share does not split a whole chunk.
++
++Two long prompts each given half the budget never fit a whole aligned chunk; capped at
++their shares, both were skipped every step and nothing prefilled.
++"""
++
++import functools
++import json
++
++import pytest
++
++_OPT_CONFIG = {
++    "architectures": ["OPTForCausalLM"],
++    "model_type": "opt",
++    "hidden_size": 768,
++    "num_attention_heads": 12,
++    "num_hidden_layers": 12,
++    "ffn_dim": 3072,
++    "max_position_embeddings": 8192,
++    "vocab_size": 50272,
++    "word_embed_proj_dim": 768,
++    "torch_dtype": "float16",
++    "do_layer_norm_before": True,
++    "pad_token_id": 1,
++    "bos_token_id": 2,
++    "eos_token_id": 2,
++}
++
++BUDGET = 1024
++SEQS = 16
++THRESHOLD = BUDGET - SEQS
++
++
++def _schedules(monkeypatch, tmp_path, lanes, prompts, steps, aligned=True):
++    utils = pytest.importorskip("tests.v1.core.utils")
++    monkeypatch.setattr(
++        utils,
++        "SchedulerConfig",
++        functools.partial(utils.SchedulerConfig, align_prefill_chunks=aligned),
++    )
++    (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
++    scheduler = utils.create_scheduler(
++        model=str(tmp_path),
++        max_num_seqs=SEQS,
++        max_num_batched_tokens=BUDGET,
++        long_prefill_token_threshold=THRESHOLD,
++        max_parallel_prefills=lanes,
++        max_model_len=8192,
++        skip_tokenizer_init=True,
++        device="cpu",
++    )
++    for name, tokens in prompts:
++        (request,) = utils.create_requests(
++            num_requests=1, num_tokens=tokens, req_ids=[name]
++        )
++        scheduler.add_request(request)
++    return [dict(scheduler.schedule().num_scheduled_tokens) for _ in range(steps)]
++
++
++def test_two_lanes_prefill_two_long_prompts(monkeypatch, tmp_path):
++    steps = _schedules(monkeypatch, tmp_path, 2, [("a", 4000), ("b", 4000)], 6)
++    assert steps == [
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": 4000 - 3 * THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": THRESHOLD},
++    ]
++
++
++def test_two_lanes_rotate_whole_chunks(monkeypatch, tmp_path):
++    prompts = [("a", 3000), ("b", 2500), ("c", 300)]
++    # One lane: first come, first served.
++    assert _schedules(monkeypatch, tmp_path, 1, prompts, 6) == [
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": 3000 - 2 * THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": 2500 - 2 * THRESHOLD, "c": 300},
++    ]
++    # Two lanes go to the prefills served longest ago; each takes a whole chunk.
++    assert _schedules(monkeypatch, tmp_path, 2, prompts, 6) == [
++        {"a": THRESHOLD},
++        {"b": THRESHOLD},
++        {"a": THRESHOLD},
++        {"b": THRESHOLD},
++        {"a": 3000 - 2 * THRESHOLD},
++        {"b": 2500 - 2 * THRESHOLD, "c": 300},
++    ]
++
++
++def test_shares_still_split_unaligned_chunks(monkeypatch, tmp_path):
++    (step,) = _schedules(
++        monkeypatch, tmp_path, 2, [("a", 4000), ("b", 4000)], 1, aligned=False
++    )
++    assert step == {"a": BUDGET // 2, "b": BUDGET // 2}
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 20ae75c3b..d28a1eb0b 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -230,8 +230,9 @@ class SchedulerConfig:
+     caps that count by ``max_num_seqs``. The scheduler's normal token budget
+     limits actual work, so this remains independent of cache block size and
+     ``max_num_batched_tokens``. A lone prefill retains the full token budget
+-    and unused shares are redistributed within the step. ``1`` preserves
+-    legacy behavior.
++    and unused shares are redistributed within the step. With aligned prefill
++    chunks a lane takes its whole chunk while the step's budget holds it, and
++    lanes rotate whole chunks. ``1`` preserves legacy behavior.
+     """
+ 
+     prefill_policy: PrefillPolicy = "round-robin"
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8373b6d08..cd5efac54 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1202,7 +1202,15 @@ class Scheduler(SchedulerInterface):
+                     aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+                         request.num_computed_tokens, num_new_tokens
+                     )
+-                if request.is_prefill_chunk and prefill_interleave_step is not None:
++                if (
++                    request.is_prefill_chunk
++                    and prefill_interleave_step is not None
++                    and aligned_chunk is None
++                ):
++                    # An aligned chunk is not split to a lane's share: capped, it
++                    # would only be skipped, and two lanes whose chunks both exceed
++                    # their shares would never run. It takes the step's budget when
++                    # that holds it.
+                     num_new_tokens = min(
+                         num_new_tokens,
+                         prefill_interleave_step.token_budget(
+@@ -1762,7 +1770,12 @@ class Scheduler(SchedulerInterface):
+                             # prefill compute to a cadence-aligned step.
+                             break
+                     request_token_budget = min(token_budget, input_budget - draft_slots)
+-                    if interleaved_local_prefill:
++                    if (
++                        interleaved_local_prefill
++                        and not self.scheduler_config.align_prefill_chunks
++                    ):
++                        # Aligned chunks are not split to a lane's share (see the
++                        # running pass).
+                         assert prefill_interleave_step is not None
+                         request_token_budget = min(
+                             request_token_budget,
+-- 
+2.54.0 (Apple Git-157)
+

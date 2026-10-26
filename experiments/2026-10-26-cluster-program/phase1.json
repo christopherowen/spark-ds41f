@@ -1,0 +1,104 @@
+{
+ "experiment": "experiments/2026-10-26-cluster-program",
+ "run": "program-p1",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "gsm8k_acceptance.py",
+     [
+      "--questions",
+      "200",
+      "--shots",
+      "5",
+      "--max-tokens",
+      "512",
+      "--concurrency",
+      "8"
+     ],
+     "gsm8k"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "arm-1025.json",
+     "label": "1025"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "gsm8k_acceptance.py",
+     [
+      "--questions",
+      "200",
+      "--shots",
+      "5",
+      "--max-tokens",
+      "512",
+      "--concurrency",
+      "8"
+     ],
+     "gsm8k"
+    ],
+    [
+     "scripts/servebench_suite.py",
+     [
+      "--suite",
+      "experiments/2026-10-26-cluster-program/acceptance-suite.json",
+      "--out",
+      "results/private/lab/{run}-{label}",
+      "--label",
+      "{label}"
+     ],
+     "suite"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "arm-verify-all.json",
+     "label": "verify-all"
+    }
+   ]
+  },
+  {
+   "kind": "profile",
+   "workloads": [
+    "decode",
+    "c8"
+   ],
+   "workload_args": {
+    "decode": [
+     "--tokens",
+     "128",
+     "--replays",
+     "20"
+    ],
+    "c8": [
+     "--streams",
+     "8",
+     "--tokens",
+     "128",
+     "--replays",
+     "20"
+    ]
+   },
+   "arms": [
+    {
+     "config": "prof-1025.json",
+     "label": "prof-1025"
+    }
+   ]
+  }
+ ]
+}

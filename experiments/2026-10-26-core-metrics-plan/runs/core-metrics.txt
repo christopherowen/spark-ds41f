@@ -1,0 +1,128 @@
+
+=== TP4: one stream (single-stream suite, greedy, distinct prompts)
+release                         tok/s  step ms  tok/stp     rows    yield   wasted  grid ms   gap ms  TTFT ms in steps  tok/J>=
+karmic-kraken-r6v-tp4            71.1    31.71    2.255     3.98    0.566     1.73    19.57    12.13      103     3.24    0.472
+karmic-kraken-r6x-tp4            74.1    30.50    2.263     4.05    0.559     1.79    19.00    11.51       98     3.22    0.495
+spark-ds41f-1022-tp4             74.1    30.58    2.271     4.07    0.558     1.80    18.74    11.84      129     4.20        -
+spark-ds41f-1025-tp4             75.3    30.31    2.284     4.09    0.559     1.80    18.37    11.94      128     4.22    0.506
+
+=== TP4: c16 closed loop (release suite)
+release                         tok/s  step ms  tok/stp  req/stp     rows    yield  grid ms   gap ms   TTFT50   TTFT99  tok/J>=
+karmic-kraken-r6n-tp4           226.5   137.50    31.14    13.18     37.3    0.834    33.15   104.35      443      517        -
+karmic-kraken-r6v-tp4           243.8   125.25    30.53    12.88     35.8    0.854    32.76    92.49      406      498    0.828
+karmic-kraken-r6x-tp4           250.3   122.96    30.78    13.00     36.2    0.849    32.41    90.56      400      488    0.851
+spark-ds41f-1022-tp4            256.4   120.77    30.97    13.07     36.4    0.851    32.20    88.57      400      493    1.014
+spark-ds41f-1025-tp4            251.4   123.04    30.93    13.08     36.5    0.848    31.91    91.13      407      488    0.839
+
+=== TP4: Poisson (release suite)
+release                         tok/s   TTFT50   TTFT99   TPOT50   TPOT99  goodput  attain%
+karmic-kraken-r6v-tp4           180.4      259     7723     41.0     76.3    0.637     90.1
+karmic-kraken-r6x-tp4           180.4      250     6716     38.3     73.3    0.643     91.0
+spark-ds41f-1025-tp4            180.4      280     6288     36.9     72.8    0.650     92.0
+
+=== TP4: grid split at 1 request x 3 rows, 4K (target forward, drafter, rest)
+release                          step  forward  drafter     rest   ms/row    ctx %
+karmic-kraken-r6n-tp4           19.20    15.03     2.64     1.53    0.442     -1.0
+karmic-kraken-r6v-tp4           19.17    14.96     2.64     1.57    0.469     -1.2
+karmic-kraken-r6x-tp4           18.56    14.38     2.61     1.57    0.463     +0.4
+spark-ds41f-1022-tp4            18.37    14.23     2.60     1.54    0.368     +0.5
+spark-ds41f-1025-tp4            17.98    14.02     2.54     1.42    0.376     -0.1
+
+=== TP4: prefill (release suite)
+release                           size    tok/s   TTFT s  chunks    ms/1K   fit a s, b ms/1K, +ms/1K per 1M, worst ms; context tax
+karmic-kraken-r6n-tp4           32,768     5714     5.82       2        -   0.36, 163.8, +142.6, 452; +34.5%
+                               131,072     5669    23.38       9    177.0
+                               262,144     5430    48.30      17    190.8
+                               524,288     4959   105.44      32    219.6
+                             1,000,000     4248   235.30      61    275.2
+karmic-kraken-r6v-tp4           32,768     5982     5.56       2        -   0.36, 155.8, +141.7, 139; +35.8%
+                               131,072     5946    22.29       9    168.7
+                               262,144     5676    46.21      17    183.1
+                               524,288     5171   101.13      32    211.0
+                             1,000,000     4405   226.87      61    266.5
+karmic-kraken-r6x-tp4           32,768     5989     5.56       2        -   0.37, 155.7, +141.8, 297; +35.9%
+                               131,072     5947    22.28       9    168.7
+                               262,144     5680    46.17      17    182.8
+                               524,288     5173   101.08      32    211.0
+                             1,000,000     4407   226.78      61    266.4
+spark-ds41f-1022-tp4            32,768     6030     5.52       2        -
+                               131,072     5985    22.14       9    167.7
+spark-ds41f-1025-tp4            32,768     6762     4.92       2        -   0.42, 134.8, +134.4, 174; +36.8%
+                               131,072     6796    19.50       9    147.0
+                               262,144     6482    40.46      17    160.4
+                               524,288     5863    89.19      32    187.3
+                             1,000,000     4942   202.23      61    239.5
+
+=== TP4: memory and power over the release suite (lowest node; steady guard 3 GiB)
+release                        node  low GiB headroom   swap   sum W  per-node lows
+karmic-kraken-r6n-tp4             -
+karmic-kraken-r6v-tp4          dgx1    18.60    15.60   0.00     295  dgx1:18.60 dgx2:20.46 dgx3:20.71 dgx4:20.64
+karmic-kraken-r6x-tp4          dgx1    19.50    16.50   0.00     294  dgx1:19.50 dgx2:22.12 dgx3:22.54 dgx4:22.22
+spark-ds41f-1022-tp4           dgx1    22.21    19.21   0.00     253  dgx1:22.21 dgx2:23.53 dgx3:23.57 dgx4:23.50
+spark-ds41f-1025-tp4           dgx1    19.87    16.87   0.00     300  dgx1:19.87 dgx2:21.95 dgx3:22.26 dgx4:21.96
+
+=== TP3: one stream (single-stream suite, greedy, distinct prompts)
+release                         tok/s  step ms  tok/stp     rows    yield   wasted  grid ms   gap ms  TTFT ms in steps  tok/J>=
+karmic-kraken-r6x-tp3            59.7    37.59    2.250     4.04    0.558     1.79    23.33    14.26      125     3.33    0.516
+spark-ds41f-1022-tp3             59.2    38.07    2.263     4.07    0.556     1.80    23.35    14.72      159     4.17        -
+spark-ds41f-1025-tp3             60.5    37.44    2.269     4.08    0.557     1.81    22.73    14.71      156     4.16    0.522
+
+=== TP3: c8 closed loop (release suite)
+release                         tok/s  step ms  tok/stp  req/stp     rows    yield  grid ms   gap ms   TTFT50   TTFT99  tok/J>=
+karmic-kraken-r6n-tp3           139.7   118.15    16.51     7.03     25.6    0.645    32.54    85.62      384      469    0.684
+karmic-kraken-r6s-tp3           146.2   114.65    16.76     7.18     24.8    0.675    32.71    81.94      375      474    0.694
+karmic-kraken-r6u-tp3           145.6   111.73    16.27     6.93     24.1    0.676    32.37    79.36      370      443    0.695
+karmic-kraken-r6x-tp3           152.7   108.42    16.55     7.14     21.2    0.781    31.21    77.21      359      441    0.727
+spark-ds41f-1022-tp3            152.8   109.26    16.70     7.20     21.4    0.782    31.03    78.23      368      441    0.811
+spark-ds41f-1025-tp3            154.7   107.60    16.65     7.21     21.3    0.781    30.43    77.17      366      440    0.693
+
+=== TP3: Poisson (release suite)
+release                         tok/s   TTFT50   TTFT99   TPOT50   TPOT99  goodput  attain%
+karmic-kraken-r6n-tp3           116.0      320    14458     45.3     68.4    0.290     63.0
+karmic-kraken-r6s-tp3           117.3      308    13150     42.4     66.2    0.303     65.9
+karmic-kraken-r6u-tp3           117.3      303    12738     42.5     68.9    0.310     67.4
+karmic-kraken-r6x-tp3           118.3      296    10817     40.2     65.1    0.330     71.7
+spark-ds41f-1025-tp3            118.8      315    10233     37.9     63.3    0.333     72.5
+
+=== TP3: grid split at 1 request x 3 rows, 4K (target forward, drafter, rest)
+release                          step  forward  drafter     rest   ms/row    ctx %
+karmic-kraken-r6n-tp3           23.36    18.41     3.35     1.61    0.419     +0.5
+karmic-kraken-r6s-tp3           23.57    18.62     3.36     1.59    0.450     +0.2
+karmic-kraken-r6u-tp3           23.54    18.62     3.33     1.58    0.443     -0.0
+karmic-kraken-r6x-tp3           22.87    17.92     3.34     1.61    0.414     +0.3
+spark-ds41f-1022-tp3            22.86    18.00     3.31     1.55    0.434     +0.2
+spark-ds41f-1025-tp3            22.40    17.66     3.31     1.42    0.312     -0.2
+
+=== TP3: prefill (release suite)
+release                           size    tok/s   TTFT s  chunks    ms/1K   fit a s, b ms/1K, +ms/1K per 1M, worst ms; context tax
+karmic-kraken-r6n-tp3           32,768     4181     7.96       4        -   0.35, 226.8, +193.4, 357; +15.4%
+                               131,072     4114    32.21      17    244.6
+                               262,144     3948    66.43      33    261.9
+                               500,000     3625   137.91      62    300.6
+karmic-kraken-r6s-tp3           32,768     4425     7.52       4        -   0.31, 214.1, +190.6, 129; +16.1%
+                               131,072     4360    30.40      17    230.8
+                               262,144     4164    62.98      33    249.4
+                               500,000     3812   131.13      62    286.6
+karmic-kraken-r6u-tp3           32,768     4405     7.56       4        -   0.34, 214.5, +191.8, 168; +15.9%
+                               131,072     4343    30.52      17    231.6
+                               262,144     4154    63.15      33    249.7
+                               500,000     3801   131.52      62    287.5
+karmic-kraken-r6x-tp3           32,768     4465     7.45       4        -   0.32, 212.1, +192.1, 181; +16.4%
+                               131,072     4390    30.19      17    229.3
+                               262,144     4196    62.51      33    247.4
+                               500,000     3835   130.35      62    285.2
+spark-ds41f-1022-tp3            32,768     4457     7.47       4        -
+                               131,072     4377    30.28      17    230.1
+spark-ds41f-1025-tp3            32,768     5637     5.90       4        -   0.33, 164.1, +171.9, 177; +17.1%
+                               131,072     5628    23.55      17    178.0
+                               262,144     5320    49.30      33    197.1
+                               500,000     4815   103.81      62    229.2
+
+=== TP3: memory and power over the release suite (lowest node; steady guard 3 GiB)
+release                        node  low GiB headroom   swap   sum W  per-node lows
+karmic-kraken-r6n-tp3          dgx1     4.92     1.92   0.00     204  dgx1:4.92 dgx2:6.59 dgx3:6.58
+karmic-kraken-r6s-tp3          dgx1     4.87     1.87   0.00     210  dgx1:4.87 dgx2:6.32 dgx3:6.51
+karmic-kraken-r6u-tp3          dgx1     4.95     1.95   0.00     209  dgx1:4.95 dgx2:6.43 dgx3:6.67
+karmic-kraken-r6x-tp3          dgx1     4.86     1.86   0.00     210  dgx1:4.86 dgx2:6.56 dgx3:6.58
+spark-ds41f-1022-tp3           dgx1     5.14     2.14   0.00     188  dgx1:5.14 dgx2:6.45 dgx3:6.65
+spark-ds41f-1025-tp3           dgx1     5.99     2.99   0.00     223  dgx1:5.99 dgx2:7.54 dgx3:7.47

@@ -14,6 +14,10 @@ ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e
 # builds only the stages the selected one needs, so a B12X-only build neither
 # builds TileLang nor needs its contexts, and its layers are unchanged.
 ARG RUNTIME_STAGE=runtime
+# The stage the TileLang runtime builds on: `runtime` (with B12X) while the lock
+# lists B12X, `runtime-core` once it does not; a build without B12X then needs
+# no b12x-source context.
+ARG TILELANG_BASE_STAGE=runtime
 
 FROM ${BASE_IMAGE} AS vllm-native-builder
 
@@ -131,7 +135,11 @@ COPY --from=sparknet-source . /workspace/sparknet/
 RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
     ls /opt/sparknet/dgx_spark_networking-*.whl
 
-FROM ${BASE_IMAGE} AS runtime
+# Everything the image holds but B12X: the candidate vLLM tree with its two
+# rebuilt native extensions, the patched NCCL and the hash-locked CuTe DSL wheels.
+# While the lock lists B12X (spark-ds41f-1025 and earlier), `runtime` adds it on
+# top; a lock without it builds the TileLang runtime on this stage directly.
+FROM ${BASE_IMAGE} AS runtime-core
 
 ARG BASE_IMAGE_NAME=unrecorded
 ARG BASE_IMAGE_DIGEST=unrecorded
@@ -140,11 +148,6 @@ ARG VLLM_REF=unrecorded
 ARG VLLM_REVISION=unrecorded
 ARG VLLM_PATCH_HEAD=unrecorded
 ARG VLLM_TREE=unrecorded
-ARG B12X_UPSTREAM=unrecorded
-ARG B12X_REF=unrecorded
-ARG B12X_REVISION=unrecorded
-ARG B12X_PATCH_HEAD=unrecorded
-ARG B12X_TREE=unrecorded
 ARG NCCL_UPSTREAM=unrecorded
 ARG NCCL_REF=unrecorded
 ARG NCCL_REVISION=unrecorded
@@ -161,11 +164,6 @@ LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-
       local.spark-ds41f.vllm.revision="${VLLM_REVISION}" \
       local.spark-ds41f.vllm.patch-head="${VLLM_PATCH_HEAD}" \
       local.spark-ds41f.vllm.tree="${VLLM_TREE}" \
-      local.spark-ds41f.b12x.upstream="${B12X_UPSTREAM}" \
-      local.spark-ds41f.b12x.ref="${B12X_REF}" \
-      local.spark-ds41f.b12x.revision="${B12X_REVISION}" \
-      local.spark-ds41f.b12x.patch-head="${B12X_PATCH_HEAD}" \
-      local.spark-ds41f.b12x.tree="${B12X_TREE}" \
       local.spark-ds41f.nccl.upstream="${NCCL_UPSTREAM}" \
       local.spark-ds41f.nccl.ref="${NCCL_REF}" \
       local.spark-ds41f.nccl.revision="${NCCL_REVISION}" \
@@ -175,7 +173,6 @@ LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-
 USER root
 
 COPY --from=vllm-source . /opt/spark-ds41f/candidate/vllm/
-COPY --from=b12x-source . /opt/spark-ds41f/candidate/b12x/
 COPY --from=vllm-native-builder \
   /opt/vllm-native/vllm/_C_stable_libtorch.abi3.so \
   /opt/spark-ds41f/candidate/vllm/vllm/_C_stable_libtorch.abi3.so
@@ -190,7 +187,8 @@ RUN set -eux; \
     install -m 0755 /opt/spark-ds41f/nccl/libnccl.so.2 "$target"; \
     rm /opt/spark-ds41f/nccl/libnccl.so.2
 
-# B12X builds its io_uring disk row reader at first use; it needs the header.
+# vLLM's direct loader and Engram disk row reader (and B12X's readers, where it is
+# installed) build their io_uring helpers at first use; they need the header.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       liburing-dev liburing2 pkg-config \
@@ -213,27 +211,16 @@ RUN set -eux; \
     rm -f /tmp/vllm-deleted.txt; \
     test -f /opt/spark-ds41f/candidate/vllm/vllm/third_party/flashmla/flash_mla_interface.py
 
-# The nightly base installs CuTe DSL 4.7.1, which vLLM and quack-kernels require;
-# patches/b12x moves B12X's exact pin to it. Reinstall the hash-locked wheel set
-# (the same version) and B12X without dependencies.
+# The nightly base installs CuTe DSL 4.7.1, which vLLM and quack-kernels require.
+# Reinstall the hash-locked wheel set (the same version).
 RUN set -eux; \
     python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
       /tmp/cutlass-dsl-wheels/*.whl; \
-    rm -rf /tmp/cutlass-dsl-wheels; \
-    python3 -m pip install --no-cache-dir --no-build-isolation --no-deps \
-      /opt/spark-ds41f/candidate/b12x
+    rm -rf /tmp/cutlass-dsl-wheels
 RUN python3 - <<'PY'
 import importlib.metadata as metadata
 
 from packaging.requirements import Requirement
-
-for raw_requirement in metadata.requires("b12x") or ():
-    requirement = Requirement(raw_requirement)
-    if requirement.marker and not requirement.marker.evaluate():
-        continue
-    installed = metadata.version(requirement.name)
-    if requirement.specifier and installed not in requirement.specifier:
-        raise RuntimeError(f"B12X requires {requirement}, but {installed} is installed")
 
 # Every package built on CuTe DSL must accept the installed version: a locked
 # wheel set older than one consumer's requirement silently breaks that consumer
@@ -255,27 +242,16 @@ for consumer in ("vllm", "quack-kernels", "flashinfer-python", "nvidia-cudnn-fro
             raise RuntimeError(f"{consumer} requires {requirement}, but {installed} is installed")
 PY
 
-ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x
+ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm
 
-RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
+RUN python3 - <<'PY'
+import ctypes
+import hashlib
 import importlib.metadata as metadata
-import subprocess
 
 assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
 import cutlass.base_dsl.enums  # noqa: F401  (quack-kernels, the DS4.1 L2 prefetch)
 import quack.compile_utils  # noqa: F401
-import b12x.attention.compressed_sparse_mla  # noqa: F401
-import b12x.comm.roce  # noqa: F401
-import b12x.integration.vllm.loader  # noqa: F401
-import b12x.sequence.engram  # noqa: F401
-from b12x.comm.roce._proxy import load
-from b12x.loader._native import _build
-print("RoCE proxy ABI", load().roce_abi_version())
-native_path = _build()
-linked = subprocess.check_output(["ldd", native_path], text=True)
-assert "liburing.so" in linked, "B12X was built without io_uring row staging"
-import ctypes
-import hashlib
 
 # torch.cuda.nccl.version() reports the NCCL torch was compiled against, so
 # ask the installed library itself (NCCL_VERSION_CODE 2.30.7 = 23007).
@@ -289,14 +265,68 @@ with open(nccl, "rb") as handle:
 for name in ("_C_stable_libtorch", "_moe_C_stable_libtorch"):
     with open(f"/opt/spark-ds41f/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
         assert handle.read(4) == b"\x7fELF"
+print("runtime build checks passed")
+PY
+
+# B12X, while the lock lists it (spark-ds41f-1025 and earlier): its tree on
+# PYTHONPATH, installed without dependencies (patches/b12x moves its exact CuTe
+# DSL pin to the locked wheel set's version).
+FROM runtime-core AS runtime
+
+ARG B12X_UPSTREAM=unrecorded
+ARG B12X_REF=unrecorded
+ARG B12X_REVISION=unrecorded
+ARG B12X_PATCH_HEAD=unrecorded
+ARG B12X_TREE=unrecorded
+
+LABEL local.spark-ds41f.b12x.upstream="${B12X_UPSTREAM}" \
+      local.spark-ds41f.b12x.ref="${B12X_REF}" \
+      local.spark-ds41f.b12x.revision="${B12X_REVISION}" \
+      local.spark-ds41f.b12x.patch-head="${B12X_PATCH_HEAD}" \
+      local.spark-ds41f.b12x.tree="${B12X_TREE}"
+
+COPY --from=b12x-source . /opt/spark-ds41f/candidate/b12x/
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --no-deps \
+      /opt/spark-ds41f/candidate/b12x
+RUN python3 - <<'PY'
+import importlib.metadata as metadata
+
+from packaging.requirements import Requirement
+
+for raw_requirement in metadata.requires("b12x") or ():
+    requirement = Requirement(raw_requirement)
+    if requirement.marker and not requirement.marker.evaluate():
+        continue
+    installed = metadata.version(requirement.name)
+    if requirement.specifier and installed not in requirement.specifier:
+        raise RuntimeError(f"B12X requires {requirement}, but {installed} is installed")
+PY
+
+ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x
+
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
+import subprocess
+
+import b12x.attention.compressed_sparse_mla  # noqa: F401
+import b12x.comm.roce  # noqa: F401
+import b12x.integration.vllm.loader  # noqa: F401
+import b12x.sequence.engram  # noqa: F401
+from b12x.comm.roce._proxy import load
+from b12x.loader._native import _build
+print("RoCE proxy ABI", load().roce_abi_version())
+native_path = _build()
+linked = subprocess.check_output(["ldd", native_path], text=True)
+assert "liburing.so" in linked, "B12X was built without io_uring row staging"
 print("B12X build checks passed")
 PY
 
 # The TileLang kernel backend: the patched TileLang replaces the base image's
 # tilelang 0.1.12 (vLLM's pin), and TileKernels is added, both without
 # dependencies. Every requirement must already hold; no shared package moves
-# back to suit one consumer (docs/upstreams.md).
-FROM runtime AS runtime-tilelang
+# back to suit one consumer (docs/upstreams.md). It builds on `runtime` while
+# the lock lists B12X and on `runtime-core` once it does not
+# (TILELANG_BASE_STAGE, set by `bin/spark build image`).
+FROM ${TILELANG_BASE_STAGE} AS runtime-tilelang
 
 ARG TILELANG_UPSTREAM=unrecorded
 ARG TILELANG_REF=unrecorded

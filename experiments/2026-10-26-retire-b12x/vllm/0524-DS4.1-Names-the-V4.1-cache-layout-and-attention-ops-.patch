@@ -1,0 +1,444 @@
+From b748cec19685d6dd67542868fb785e8cfe120698 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:22:06 +0100
+Subject: [PATCH 524/526] [DS4.1] Names: the V4.1 cache layout and attention
+ ops lose B12X's name
+
+The V4.1 cache layout, metadata and builder classes kept B12X's name after
+0493 (DeepseekV41B12x*); TileLang's backend subclasses them. With B12X
+leaving the image:
+
+- DeepseekV41B12xMetadata, DeepseekV41B12xMetadataBuilder and
+  DeepseekV41B12xBackend become DeepseekV41Metadata,
+  DeepseekV41MetadataBuilder and DeepseekV41Backend;
+- the base backend reports "DSV41" (was "B12X") and the compressor's
+  "DSV41_COMPRESSOR" (was "B12X_DSV41_COMPRESSOR"); TileLang's still
+  reports "TILELANG";
+- the caches' cache_dtype_str is "dsv41" (was "b12x_dsv41"), a label
+  specs of one group must share, with the same bytes;
+- the opaque ops are vllm::dsv41_attention and vllm::dsv41_prepare_global_kv.
+
+Nothing outside the DS4.1 package and its tests named them. tilelang/
+vision.py's docstring says the B12X kernels it matches are no longer
+installed.
+---
+ .../test_deepseek_v41_tilelang_metadata.py    |  4 ++--
+ tests/models/test_deepseek_v4_1_compressor.py |  8 ++++----
+ .../attention/test_b12x_v41_ced_metadata.py   |  4 ++--
+ tests/v1/core/test_contiguous_kv_packing.py   |  6 ++----
+ tests/v1/core/test_kv_cache_utils.py          |  8 ++++----
+ vllm/models/deepseek_v4_1/attention.py        | 20 +++++++++----------
+ vllm/models/deepseek_v4_1/ced.py              |  6 ++----
+ vllm/models/deepseek_v4_1/compressor.py       |  6 +++---
+ .../deepseek_v4_1/nvidia/model_state.py       |  4 ++--
+ vllm/models/deepseek_v4_1/sparse_mla.py       | 14 ++++++-------
+ .../deepseek_v4_1/tilelang/attention.py       |  4 ++--
+ vllm/models/deepseek_v4_1/tilelang/vision.py  |  7 ++++---
+ 12 files changed, 44 insertions(+), 47 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 9222f3c17..4455666ec 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -358,10 +358,10 @@ def test_decode_metadata_wide_tables(main_width, read_width, main_page):
+ 
+ @torch.inference_mode()
+ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41MetadataBuilder
+ 
+     device = torch.device("cuda", torch.accelerator.current_device_index())
+-    builder = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
++    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+     builder.tokens, builder.requests = 4096, 4
+     builder.page, builder.ratio, builder.circular = 128, 1, False
+     builder.reorder_batch_threshold = 6
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 066c44382..c8e1bbdc2 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -95,7 +95,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+         pytest.skip("DeepSeek-V4.1 metadata kernels require SM12x")
+ 
+     from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41MetadataBuilder
+     from vllm.v1.kv_cache_interface import MLAAttentionSpec
+     from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
+ 
+@@ -153,7 +153,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+         max_query_len=8,
+         max_seq_len=48,
+     )
+-    builder = DeepseekV41B12xMetadataBuilder(ring, ["layer"], config, device)
++    builder = DeepseekV41MetadataBuilder(ring, ["layer"], config, device)
+     state = builder.build(0, cm)
+     torch.accelerator.synchronize()
+ 
+@@ -173,7 +173,7 @@ def compressor_runners(monkeypatch):
+     from vllm.model_executor.layers import linear
+     from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+     from vllm.models.deepseek_v4_1.sparse_mla import (
+-        DeepseekV41B12xMetadataBuilder,
++        DeepseekV41MetadataBuilder,
+     )
+     from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
+@@ -232,7 +232,7 @@ def compressor_runners(monkeypatch):
+                 tokens_per_state=2,
+             )
+             self.builders = [
+-                DeepseekV41B12xMetadataBuilder(spec, [name], config, device)
++                DeepseekV41MetadataBuilder(spec, [name], config, device)
+                 for spec in (main_spec, self.spec)
+             ]
+             self.graph = None
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index b7137e2a4..061a24f42 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -16,7 +16,7 @@ from vllm.models.deepseek_v4_1.ced import (
+     plan_ced,
+     scatter_rows,
+ )
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Metadata
+ 
+ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+ 
+@@ -138,7 +138,7 @@ def test_mixed_metadata_keeps_context_bounds_and_padding():
+     positions = torch.cat(
+         (torch.tensor([899], device="cuda"), torch.arange(4096, 8192, device="cuda"))
+     )
+-    metadata = DeepseekV41B12xMetadata(
++    metadata = DeepseekV41Metadata(
+         4097,
+         2,
+         4096,
+diff --git a/tests/v1/core/test_contiguous_kv_packing.py b/tests/v1/core/test_contiguous_kv_packing.py
+index 331192fd5..931126fac 100644
+--- a/tests/v1/core/test_contiguous_kv_packing.py
++++ b/tests/v1/core/test_contiguous_kv_packing.py
+@@ -723,7 +723,7 @@ def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
+         CompressorBackend,
+         CompressorStateCache,
+     )
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Backend
+     from vllm.v1.attention.backends.utils import (
+         get_supported_kv_cache_layouts,
+         resolve_kv_cache_layout,
+@@ -778,9 +778,7 @@ def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
+             alignment=None,
+         ),
+     }
+-    supported = get_supported_kv_cache_layouts(
+-        [DeepseekV41B12xBackend, CompressorBackend]
+-    )
++    supported = get_supported_kv_cache_layouts([DeepseekV41Backend, CompressorBackend])
+     # Profiling resolves the backend preference before the full specs arrive.
+     layout = resolve_kv_cache_layout(vllm_config, [[item.name for item in supported]])
+     # Exercise the real group planner, not prebuilt groups that bypass its
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index ffb2e8b76..18e82203b 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -1940,7 +1940,7 @@ def _ds41_cache_groups() -> list[KVCacheGroupSpec]:
+             state_content_bytes=content,
+             dtype=torch.uint8,
+             tokens_per_state=ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+         )
+ 
+     full: dict[str, KVCacheSpec] = {}
+@@ -1953,7 +1953,7 @@ def _ds41_cache_groups() -> list[KVCacheGroupSpec]:
+         head_size=512,
+         state_content_bytes=528,
+         dtype=torch.uint8,
+-        cache_dtype_str="b12x_dsv41",
++        cache_dtype_str="dsv41",
+         sliding_window=128,
+     )
+     ring = CircularBufferSpec(
+@@ -5613,7 +5613,7 @@ def _ds41_layer_specs() -> dict[str, KVCacheSpec]:
+             state_content_bytes=content,
+             dtype=torch.uint8,
+             tokens_per_state=ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+         )
+ 
+     specs: dict[str, KVCacheSpec] = {}
+@@ -5629,7 +5629,7 @@ def _ds41_layer_specs() -> dict[str, KVCacheSpec]:
+             head_size=512,
+             state_content_bytes=528,
+             dtype=torch.uint8,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             sliding_window=128,
+             extra_retained_tokens=int(draft),
+             prefix_cache_enabled=not bounded,
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 55b2f53ee..342f61d74 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -31,8 +31,8 @@ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+ from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
+ from vllm.models.deepseek_v4_1.sparse_mla import (
+     SLOT_DTYPE,
+-    DeepseekV41B12xBackend,
+-    DeepseekV41B12xMetadata,
++    DeepseekV41Backend,
++    DeepseekV41Metadata,
+     tilelang_builder_kernels,
+ )
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+@@ -100,7 +100,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+             state_content_bytes=528 if self.kind == "swa" else 68,
+             dtype=torch.uint8,
+             tokens_per_state=self.ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             alignment=None,
+             uses_only_written_slots=True,
+         )
+@@ -120,7 +120,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+         return MLAAttentionSpec(**common)
+ 
+     def get_attn_backend(self):
+-        return DeepseekV41B12xBackend
++        return DeepseekV41Backend
+ 
+     def forward(self):
+         raise RuntimeError("V4.1 caches are consumed by their owning attention layer")
+@@ -197,7 +197,7 @@ class DeepseekV4Indexer(nn.Module):
+         self.ratio = ratio
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_b12x_attention", mutates_args=())
++@torch.library.custom_op("vllm::dsv41_attention", mutates_args=())
+ def _attention(
+     hidden: torch.Tensor,
+     positions: torch.Tensor,
+@@ -216,7 +216,7 @@ def _attention_fake(hidden, positions, prefix, global_kv_ready):
+     return torch.empty_like(hidden, memory_format=torch.contiguous_format)
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_b12x_prepare_global_kv", mutates_args=())
++@torch.library.custom_op("vllm::dsv41_prepare_global_kv", mutates_args=())
+ def _prepare_global_kv(
+     hidden: torch.Tensor,
+     positions: torch.Tensor,
+@@ -241,7 +241,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     ``_quantize_index_query``, ``_write_index_keys``, ``_index_chunk`` and
+     ``_attend``."""
+ 
+-    backend_cls = DeepseekV41B12xBackend
++    backend_cls = DeepseekV41Backend
+     # Index scores need bounded row scratch; attention handles the whole batch.
+     INDEX_CHUNK = 256
+     DECODE_CHUNK = 64
+@@ -454,7 +454,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             state_content_bytes=288,
+             dtype=torch.uint8,
+             tokens_per_state=self.compress_ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             alignment=None,
+             uses_only_written_slots=True,
+         )
+@@ -734,7 +734,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # Index K consumes the ordinary-normalized PRE-RoPE latent.
+         key = indexer.k_norm(indexer.wk(latent))
+         key = self._rope(key, positions, "index_key")
+-        index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
++        index_meta = cast(DeepseekV41Metadata, metadata[indexer.k_cache.prefix])
+         self._write_index_keys(key, index_meta.slot_mapping[:rows])
+         latent = self._rope(latent, positions, "latent")
+         self._write_v41_cache(
+@@ -804,7 +804,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         q = self._rope(q, positions, "q")
+         output = torch.empty_like(q)
+         metadata = cast(
+-            dict[str, DeepseekV41B12xMetadata] | None,
++            dict[str, DeepseekV41Metadata] | None,
+             get_forward_context().attn_metadata,
+         )
+         if not isinstance(metadata, dict):
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 25dd274a8..9c6e1cc07 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -14,7 +14,7 @@ from .tilelang import ced as ced_kernels
+ from .tilelang import columns, prepare
+ 
+ if TYPE_CHECKING:
+-    from .sparse_mla import DeepseekV41B12xMetadata
++    from .sparse_mla import DeepseekV41Metadata
+ 
+ CED_WINDOW = 128
+ # The kept-row limit of a request that keeps every row (prompt logprobs, capture).
+@@ -287,9 +287,7 @@ class CEDState:
+     def get_indices(self) -> torch.Tensor | None:
+         return None if self.plan is None else self.indices[: self.plan.num_tokens]
+ 
+-    def decoder_metadata(
+-        self, metadata: DeepseekV41B12xMetadata
+-    ) -> DeepseekV41B12xMetadata:
++    def decoder_metadata(self, metadata: DeepseekV41Metadata) -> DeepseekV41Metadata:
+         plan = self.plan
+         assert plan is not None
+         indices = self.indices[: plan.num_tokens]
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 4be84e918..24aafff63 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -7,15 +7,15 @@ import torch.nn as nn
+ 
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+-from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41Backend
+ from vllm.v1.attention.backend import MultipleOf
+ from vllm.v1.kv_cache_interface import CircularBufferSpec
+ 
+ 
+-class CompressorBackend(DeepseekV41B12xBackend):
++class CompressorBackend(DeepseekV41Backend):
+     @staticmethod
+     def get_name():
+-        return "B12X_DSV41_COMPRESSOR"
++        return "DSV41_COMPRESSOR"
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes():
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index ad82bc843..ea1b016bb 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -15,8 +15,8 @@ from vllm.models.deepseek_v4_1.ced import (
+     ced_decoder_start,
+     nonfinal_limits,
+ )
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Metadata
+ from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+ from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -335,7 +335,7 @@ class DeepseekV41ModelState(DefaultModelState):
+                 routing_mask = ced_kernels.routing_mask(indices, input_batch.is_padding)
+             seen: set[int] = set()
+             for value in metadata.values():
+-                if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
++                if isinstance(value, DeepseekV41Metadata) and id(value) not in seen:
+                     seen.add(id(value))
+                     value.swa_replay_start = state.replay_start
+                     if state.plan is not None:
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 4e494875f..aeeeab32b 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
+ 
+ 
+ @dataclass
+-class DeepseekV41B12xMetadata:
++class DeepseekV41Metadata:
+     num_actual_tokens: int
+     num_reqs: int
+     max_query_len: int
+@@ -35,7 +35,7 @@ class DeepseekV41B12xMetadata:
+     cache_lengths: torch.Tensor
+     is_decode: bool
+     max_seq_len: int
+-    decoder: "DeepseekV41B12xMetadata | None" = None
++    decoder: "DeepseekV41Metadata | None" = None
+     swa_replay_start: torch.Tensor | None = None
+     # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
+     routing_mask: torch.Tensor | None = None
+@@ -71,7 +71,7 @@ def tilelang_builder_kernels(kv_cache_spec, max_requests: int) -> list:
+ SLOT_DTYPE = torch.int64
+ 
+ 
+-class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
++class DeepseekV41MetadataBuilder(AttentionMetadataBuilder):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+ 
+     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+@@ -146,7 +146,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             )[2]
+         else:
+             decode_tokens = 0
+-        return DeepseekV41B12xMetadata(
++        return DeepseekV41Metadata(
+             cm.num_actual_tokens,
+             cm.num_reqs,
+             cm.max_query_len,
+@@ -165,7 +165,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         )
+ 
+ 
+-class DeepseekV41B12xBackend(AttentionBackend):
++class DeepseekV41Backend(AttentionBackend):
+     supported_dtypes = [torch.bfloat16]
+     supported_kv_cache_dtypes = ["auto", "fp8", "fp8_ds_mla"]
+ 
+@@ -176,11 +176,11 @@ class DeepseekV41B12xBackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_name():
+-        return "B12X"
++        return "DSV41"
+ 
+     @staticmethod
+     def get_builder_cls():
+-        return DeepseekV41B12xMetadataBuilder
++        return DeepseekV41MetadataBuilder
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index af5f65027..94cbc9ce4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -18,7 +18,7 @@ from types import SimpleNamespace
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Backend
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     retain_cuda_graph_capture_resource,
+@@ -37,7 +37,7 @@ from .indexer import (
+ from .sparse_mla import SparseMlaV41Plan
+ 
+ 
+-class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
++class DeepseekV41TileLangBackend(DeepseekV41Backend):
+     """The V4.1 cache layout and metadata builder, under the TileLang name."""
+ 
+     @staticmethod
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vision.py b/vllm/models/deepseek_v4_1/tilelang/vision.py
+index d6aa77dc2..bcabe0c74 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vision.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vision.py
+@@ -5,9 +5,10 @@
+ One image is evaluated per call; every kernel takes the image's live rows as a
+ dynamic dimension, so a capacity-sized workspace serves any grid and one compiled
+ kernel serves every image size. The arithmetic of each elementwise and row-wise
+-operation is B12X's (``b12x.norm.vision`` and ``b12x.norm.hyperconnection``), with
+-each rounding written out (``T.fma``, ``T.fmul``, ``T.ieee_*``) so the compiler
+-cannot contract or reorder it:
++operation is that of the B12X kernels this port replaced (``b12x.norm.vision`` and
++``b12x.norm.hyperconnection``, which are no longer installed), with each rounding
++written out (``T.fma``, ``T.fmul``, ``T.ieee_*``) so the compiler cannot contract or
++reorder it:
+ 
+ - ``pad_columns``: rows of ``width`` BF16 values copied into ``padded``-wide rows
+   whose tail is zero (the patch embedding's 588 columns become 640, whole K tiles,
+-- 
+2.54.0 (Apple Git-157)
+
