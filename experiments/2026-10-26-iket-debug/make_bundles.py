@@ -321,13 +321,14 @@ BUNDLES = {
              "their scales zeroed, then filled with 0x77, and c1 filled",
         env=STEP_ENV,
         mounts=[HUB],
-        # Run 34: filled experts stop at boot the same way. So: the whole model's shapes,
-        # and fewer requests.
+        # Run 34: filled experts stop at boot the same way. Run 35: so do the whole model's
+        # shapes at c8, and c4 and c3 boot but stop in the requests. So: eager, with a
+        # hook on every module for the first output that is not finite.
         steps=[
-            (f"off, TP{tp}, c{requests}",
-             ["{python}", STEP, "off", "--tp-shape", str(tp), "--requests", str(requests),
-              "--out", f"{{out}}/tp{tp}-c{requests}"], 1800)
-            for tp, requests in ((1, 8), (4, 4), (4, 3))
+            (f"off, TP4, c{requests}, eager, nan hooks",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--eager",
+              "--nan-hooks", "--out", f"{{out}}/tp4-c{requests}-eager"], 1800)
+            for requests in (3, 8)
         ],
     ),
     "tests": dict(

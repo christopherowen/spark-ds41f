@@ -107,6 +107,44 @@ def same_dummy_weights(uint8_fill=0):
     weight_utils.initialize_single_dummy_weight = initialize
 
 
+def nan_hooks(worker):
+    """Run on the worker (collective_rpc): a forward hook on every module of the model
+    that prints the first module whose output is not finite, and any embedding's
+    out-of-range token ids. Hooks run in eager mode only (not in a CUDA graph)."""
+    import torch
+
+    model = worker.model_runner.model
+    first = []
+
+    def hook(module, inputs, output):
+        if first:
+            return
+        weight = getattr(module, "weight", None)
+        if isinstance(module, torch.nn.Embedding) or (
+                inputs and isinstance(inputs[0], torch.Tensor) and not inputs[0].is_floating_point()
+                and weight is not None and weight.dim() == 2):
+            ids = inputs[0]
+            if ids.numel() and (int(ids.max()) >= weight.shape[0] or int(ids.min()) < 0):
+                first.append(module.nan_name)
+                print(f"out-of-range ids into {module.nan_name}: min {int(ids.min())} max "
+                      f"{int(ids.max())} rows {weight.shape[0]}", flush=True)
+                return
+        for out in output if isinstance(output, (tuple, list)) else (output,):
+            if isinstance(out, torch.Tensor) and out.is_floating_point() and out.numel() \
+                    and not bool(torch.isfinite(out).all()):
+                first.append(module.nan_name)
+                bad = (~torch.isfinite(out)).nonzero()
+                print(f"first non-finite output: {module.nan_name} ({type(module).__name__}) "
+                      f"shape {tuple(out.shape)}, {bad.shape[0]} values, first at "
+                      f"{bad[0].tolist()}", flush=True)
+                return
+
+    for name, module in model.named_modules():
+        module.nan_name = name or "model"
+        module.register_forward_hook(hook)
+    return len(list(model.named_modules()))
+
+
 def marker_kernels():
     """Two one-thread kernels whose launches bracket the measured request
     (``iket_step_marker``) and the engine grid's steps (``iket_grid_marker``)."""
@@ -151,6 +189,8 @@ def main():
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
+    parser.add_argument("--nan-hooks", action="store_true",
+                        help="with --eager: print the first module whose output is not finite")
     parser.add_argument("--uint8-fill", type=lambda text: int(text, 0), default=0,
                         help="the byte uint8 dummy weights hold (0: zero; 0x77: small nonzero experts)")
     parser.add_argument("--tp-shape", type=int, choices=sorted(TP_SHAPES), default=1,
@@ -237,6 +277,8 @@ def main():
     )
     boot = time.monotonic() - started
     print(f"engine ready in {boot:.0f} s", flush=True)
+    if args.nan_hooks:
+        print(f"nan hooks on {llm.collective_rpc(nan_hooks)[0]} modules", flush=True)
     # The top-5 logprobs of each token compare runs more finely than the tokens.
     greedy = SamplingParams(temperature=0.0, max_tokens=args.tokens, ignore_eos=True, logprobs=5)
     timings = []
