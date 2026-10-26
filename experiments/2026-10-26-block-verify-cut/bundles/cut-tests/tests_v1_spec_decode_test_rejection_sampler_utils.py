@@ -1311,8 +1311,8 @@ def test_ds41f_verification_emits_same_tokens_with_insert_port(
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
     from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
 
-    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
-        # rejection_sample passes its dead-row cut, None without one.
+    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut=None):
+        # Block verification ends its blocks at a dead-row cut and passes none.
         assert dead_row_cut is None
         utils._insert_resampled_kernel[(counts.numel(),)](
             sampled,

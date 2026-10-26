@@ -152,12 +152,14 @@ def main() -> None:
         bundle = HERE / "bundles" / name
         # Files are overwritten in place, never deleted: a file this run would not
         # write (a path the ref no longer changes) stops it, for a person to remove.
+        # Bytecode a local compile check leaves is ignored by git and never synced.
         planned = {"prepare_fixtures.py", "run.py", "steps.json", "candidate.json",
                    "baseline_tilelang_rejection.py"}
         planned |= {f"overlay/{p}" if p.startswith("vllm/") else p.replace("/", "_")
                     for p in changed}
         stale = sorted(str(p.relative_to(bundle)) for p in bundle.rglob("*")
-                       if p.is_file() and str(p.relative_to(bundle)) not in planned)
+                       if p.is_file() and "__pycache__" not in p.parts
+                       and str(p.relative_to(bundle)) not in planned)
         if stale:
             raise SystemExit(f"{bundle} holds files this run would not write: {stale}")
         (bundle / "overlay").mkdir(parents=True, exist_ok=True)

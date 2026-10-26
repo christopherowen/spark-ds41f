@@ -1,0 +1,392 @@
+=== verification tests
+........................................................................ [ 10%]
+........................................................................ [ 21%]
+........................................................................ [ 32%]
+........................................................................ [ 43%]
+........................................................................ [ 54%]
+........................................................................ [ 65%]
+........................................................................ [ 76%]
+........................................................................ [ 86%]
+........................................................................ [ 97%]
+...............                                                          [100%]
+=============================== warnings summary ===============================
+tests/v1/spec_decode/test_tilelang_rejection.py: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+663 passed, 14 warnings in 71.45s (0:01:11)
+=== verification tests: exit 0
+=== rejection sampler tests
+........................................................................ [ 46%]
+......................FF.............................................s.. [ 92%]
+...........                                                              [100%]
+=================================== FAILURES ===================================
+_______ test_ds41f_verification_emits_same_tokens_with_insert_port[0.0] ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9516d2bdee0>
+temperature = 0.0
+
+    @pytest.mark.parametrize("temperature", [0.0, 1.0])
+    def test_ds41f_verification_emits_same_tokens_with_insert_port(
+        monkeypatch, temperature
+    ):
+        """Public verification preserves tokens at DS41F vocabulary and draft width."""
+        from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
+        from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+    
+        def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
+            # rejection_sample passes its dead-row cut, None without one.
+            assert dead_row_cut is None
+            utils._insert_resampled_kernel[(counts.numel(),)](
+                sampled,
+                sampled.stride(0),
+                counts,
+                ids,
+                ids.stride(0),
+                values,
+                values.stride(0),
+                values.shape[1],
+                cu,
+                mapping,
+                temp,
+                PADDED_RESAMPLE_NUM_BLOCKS=1 << (values.shape[1] - 1).bit_length(),
+            )
+    
+        torch.manual_seed(5297)
+        inputs = _build_rejection_sample_inputs(
+            torch.randn(129280, device="cuda"),
+            torch.randn(129280, device="cuda"),
+            5,
+            temperature,
+            num_trials=4,
+        )
+        inputs["draft_logits"] = None
+        monkeypatch.setattr(utils, "insert_resampled", original)
+>       expected, expected_counts = rejection_sample(
+            **inputs,
+            num_speculative_steps=5,
+            use_block_verification=True,
+        )
+
+tests/v1/spec_decode/test_rejection_sampler_utils.py:1342: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+target_logits = tensor([[-1.0108,  0.1352, -1.5047,  ..., -0.4372,  1.4828,  0.7668],
+        [-1.0108,  0.1352, -1.5047,  ..., -0.437...4372,  1.4828,  0.7668],
+        [-1.0108,  0.1352, -1.5047,  ..., -0.4372,  1.4828,  0.7668]],
+       device='cuda:0')
+draft_logits = None
+draft_sampled = tensor([     0, 109555,  90659, 103987,  36681,  78529,      0,  89163,  34865,
+         74115, 108669,  32258,      0,  63527,  15903,  45163, 101293, 122786,
+             0,  11961,    825,  51498,  94140,  12977], device='cuda:0')
+cu_num_logits = tensor([ 0,  6, 12, 18, 24], device='cuda:0', dtype=torch.int32)
+pos = tensor([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23], device='cuda:0', dtype=torch.int32)
+idx_mapping = tensor([0, 1, 2, 3], device='cuda:0', dtype=torch.int32)
+expanded_idx_mapping = tensor([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3],
+       device='cuda:0', dtype=torch.int32)
+expanded_local_pos = tensor([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5],
+       device='cuda:0', dtype=torch.int32)
+temperature = tensor([0., 0., 0., 0.], device='cuda:0')
+seed = tensor([0, 1, 2, 3], device='cuda:0'), num_speculative_steps = 5
+synthetic_conditional_rates = None, use_fp64 = False
+use_block_verification = True, contexts = None, watermarking = None
+watermark_key = None, dead_row_cut = None
+
+    def rejection_sample(
+        # [num_logits, V]
+        target_logits: torch.Tensor,
+        # [max_num_reqs, num_speculative_steps, V]
+        draft_logits: torch.Tensor | None,
+        # [num_logits]
+        draft_sampled: torch.Tensor,
+        # [num_reqs + 1]
+        cu_num_logits: torch.Tensor,
+        # [num_logits]
+        pos: torch.Tensor,
+        # [num_reqs]
+        idx_mapping: torch.Tensor,
+        # [num_logits]
+        expanded_idx_mapping: torch.Tensor,
+        # [num_logits]
+        expanded_local_pos: torch.Tensor,
+        # [max_num_reqs]
+        temperature: torch.Tensor,
+        # [max_num_reqs]
+        seed: torch.Tensor,
+        num_speculative_steps: int,
+        # [num_speculative_steps]
+        synthetic_conditional_rates: torch.Tensor | None = None,
+        use_fp64: bool = False,
+        use_block_verification: bool = False,
+        contexts: torch.Tensor | None = None,
+        watermarking: torch.Tensor | None = None,
+        watermark_key: int | None = None,
+        # [num_reqs] int32, each request's live drafts (adaptive verification's dead
+        # rows): with it, block verification ends each request's block at its cut, and
+        # the other methods, which verify each draft from its own row, cap the count at
+        # the cut + 1.
+        dead_row_cut: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+        assert draft_logits is None or (
+            draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
+        )
+        num_reqs = cu_num_logits.shape[0] - 1
+        num_logits, vocab_size = target_logits.shape
+    
+        watermark = contexts is not None
+        assert watermark == (watermarking is not None) == (watermark_key is not None), (
+            "contexts, watermarking and watermark_key must be set together."
+        )
+        if (
+            draft_logits is None
+            and use_block_verification
+            and synthetic_conditional_rates is None
+            and not watermark
+            and not use_fp64
+        ):
+            # One-hot drafts, block verification and FP32 draws, without watermark,
+            # run as TileLang kernels (tilelang_rejection): the Triton kernels below
+            # with the softmax fixed in their probabilities. Those serve every other
+            # configuration.
+            sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
+                verify_and_resample(
+                    target_logits,
+                    draft_sampled,
+                    cu_num_logits,
+                    pos,
+                    idx_mapping,
+                    expanded_idx_mapping,
+                    expanded_local_pos,
+                    temperature,
+                    seed,
+                    num_speculative_steps,
+                    dead_row_cut,
+                )
+            )
+            # A block that ends at the cut commits at most the cut + 1: no cap.
+>           insert_resampled(
+                sampled,
+                num_sampled,
+                resampled_local_argmax,
+                resampled_local_max,
+                cu_num_logits,
+                expanded_idx_mapping,
+                temperature,
+            )
+E           TypeError: test_ds41f_verification_emits_same_tokens_with_insert_port.<locals>.original() missing 1 required positional argument: 'dead_row_cut'
+
+vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1378: TypeError
+_______ test_ds41f_verification_emits_same_tokens_with_insert_port[1.0] ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9516d275430>
+temperature = 1.0
+
+    @pytest.mark.parametrize("temperature", [0.0, 1.0])
+    def test_ds41f_verification_emits_same_tokens_with_insert_port(
+        monkeypatch, temperature
+    ):
+        """Public verification preserves tokens at DS41F vocabulary and draft width."""
+        from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
+        from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+    
+        def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
+            # rejection_sample passes its dead-row cut, None without one.
+            assert dead_row_cut is None
+            utils._insert_resampled_kernel[(counts.numel(),)](
+                sampled,
+                sampled.stride(0),
+                counts,
+                ids,
+                ids.stride(0),
+                values,
+                values.stride(0),
+                values.shape[1],
+                cu,
+                mapping,
+                temp,
+                PADDED_RESAMPLE_NUM_BLOCKS=1 << (values.shape[1] - 1).bit_length(),
+            )
+    
+        torch.manual_seed(5297)
+        inputs = _build_rejection_sample_inputs(
+            torch.randn(129280, device="cuda"),
+            torch.randn(129280, device="cuda"),
+            5,
+            temperature,
+            num_trials=4,
+        )
+        inputs["draft_logits"] = None
+        monkeypatch.setattr(utils, "insert_resampled", original)
+>       expected, expected_counts = rejection_sample(
+            **inputs,
+            num_speculative_steps=5,
+            use_block_verification=True,
+        )
+
+tests/v1/spec_decode/test_rejection_sampler_utils.py:1342: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+target_logits = tensor([[-1.0108,  0.1352, -1.5047,  ..., -0.4372,  1.4828,  0.7668],
+        [-1.0108,  0.1352, -1.5047,  ..., -0.437...4372,  1.4828,  0.7668],
+        [-1.0108,  0.1352, -1.5047,  ..., -0.4372,  1.4828,  0.7668]],
+       device='cuda:0')
+draft_logits = None
+draft_sampled = tensor([     0, 109555,  90659, 103987,  36681,  78529,      0,  89163,  34865,
+         74115, 108669,  32258,      0,  63527,  15903,  45163, 101293, 122786,
+             0,  11961,    825,  51498,  94140,  12977], device='cuda:0')
+cu_num_logits = tensor([ 0,  6, 12, 18, 24], device='cuda:0', dtype=torch.int32)
+pos = tensor([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23], device='cuda:0', dtype=torch.int32)
+idx_mapping = tensor([0, 1, 2, 3], device='cuda:0', dtype=torch.int32)
+expanded_idx_mapping = tensor([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3],
+       device='cuda:0', dtype=torch.int32)
+expanded_local_pos = tensor([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5],
+       device='cuda:0', dtype=torch.int32)
+temperature = tensor([1., 1., 1., 1.], device='cuda:0')
+seed = tensor([0, 1, 2, 3], device='cuda:0'), num_speculative_steps = 5
+synthetic_conditional_rates = None, use_fp64 = False
+use_block_verification = True, contexts = None, watermarking = None
+watermark_key = None, dead_row_cut = None
+
+    def rejection_sample(
+        # [num_logits, V]
+        target_logits: torch.Tensor,
+        # [max_num_reqs, num_speculative_steps, V]
+        draft_logits: torch.Tensor | None,
+        # [num_logits]
+        draft_sampled: torch.Tensor,
+        # [num_reqs + 1]
+        cu_num_logits: torch.Tensor,
+        # [num_logits]
+        pos: torch.Tensor,
+        # [num_reqs]
+        idx_mapping: torch.Tensor,
+        # [num_logits]
+        expanded_idx_mapping: torch.Tensor,
+        # [num_logits]
+        expanded_local_pos: torch.Tensor,
+        # [max_num_reqs]
+        temperature: torch.Tensor,
+        # [max_num_reqs]
+        seed: torch.Tensor,
+        num_speculative_steps: int,
+        # [num_speculative_steps]
+        synthetic_conditional_rates: torch.Tensor | None = None,
+        use_fp64: bool = False,
+        use_block_verification: bool = False,
+        contexts: torch.Tensor | None = None,
+        watermarking: torch.Tensor | None = None,
+        watermark_key: int | None = None,
+        # [num_reqs] int32, each request's live drafts (adaptive verification's dead
+        # rows): with it, block verification ends each request's block at its cut, and
+        # the other methods, which verify each draft from its own row, cap the count at
+        # the cut + 1.
+        dead_row_cut: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+        assert draft_logits is None or (
+            draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
+        )
+        num_reqs = cu_num_logits.shape[0] - 1
+        num_logits, vocab_size = target_logits.shape
+    
+        watermark = contexts is not None
+        assert watermark == (watermarking is not None) == (watermark_key is not None), (
+            "contexts, watermarking and watermark_key must be set together."
+        )
+        if (
+            draft_logits is None
+            and use_block_verification
+            and synthetic_conditional_rates is None
+            and not watermark
+            and not use_fp64
+        ):
+            # One-hot drafts, block verification and FP32 draws, without watermark,
+            # run as TileLang kernels (tilelang_rejection): the Triton kernels below
+            # with the softmax fixed in their probabilities. Those serve every other
+            # configuration.
+            sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
+                verify_and_resample(
+                    target_logits,
+                    draft_sampled,
+                    cu_num_logits,
+                    pos,
+                    idx_mapping,
+                    expanded_idx_mapping,
+                    expanded_local_pos,
+                    temperature,
+                    seed,
+                    num_speculative_steps,
+                    dead_row_cut,
+                )
+            )
+            # A block that ends at the cut commits at most the cut + 1: no cap.
+>           insert_resampled(
+                sampled,
+                num_sampled,
+                resampled_local_argmax,
+                resampled_local_max,
+                cu_num_logits,
+                expanded_idx_mapping,
+                temperature,
+            )
+E           TypeError: test_ds41f_verification_emits_same_tokens_with_insert_port.<locals>.original() missing 1 required positional argument: 'dead_row_cut'
+
+vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1378: TypeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_rejection_sampler_chunking.py::test_chunked_scores_match_full_batch[raw_logits]
+  /usr/local/lib/python3.12/dist-packages/tilelang/utils/deprecated.py:34: DeprecationWarning: T.symbolic(...) is deprecated, use T.dynamic(...) instead and will be removed in v0.1.15
+    deprecated_warning(method_name, new_method_name, phaseout_version)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/spec_decode/test_rejection_sampler_utils.py::test_ds41f_verification_emits_same_tokens_with_insert_port[0.0]
+FAILED tests/v1/spec_decode/test_rejection_sampler_utils.py::test_ds41f_verification_emits_same_tokens_with_insert_port[1.0]
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:475: requires two CUDA devices
+2 failed, 152 passed, 1 skipped, 15 warnings in 116.43s (0:01:56)
+=== rejection sampler tests: exit 1
+=== sink kernel tests
+........................................................................ [ 62%]
+...........................................                              [100%]
+115 passed, 575 deselected in 43.08s
+=== sink kernel tests: exit 0
+=== sink tests
+............................................                             [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_sink.py::test_collapse_sequence_draft_zero_rejected[0.0]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+tests/v1/worker/test_gpu_sink.py::test_alternate_logprobs_match_the_torch_glue[129280-129280-False-dtype0]
+tests/v1/worker/test_gpu_sink.py::test_alternate_logprobs_match_the_torch_glue[129280-129280-False-dtype1]
+tests/v1/worker/test_gpu_sink.py::test_alternate_logprobs_match_the_torch_glue[1000-1003-False-dtype0]
+tests/v1/worker/test_gpu_sink.py::test_alternate_logprobs_match_the_torch_glue[1000-1003-False-dtype1]
+tests/v1/worker/test_gpu_sink.py::test_alternate_logprobs_feed_the_policy
+  /usr/local/lib/python3.12/dist-packages/tilelang/utils/deprecated.py:34: DeprecationWarning: T.symbolic(...) is deprecated, use T.dynamic(...) instead and will be removed in v0.1.15
+    deprecated_warning(method_name, new_method_name, phaseout_version)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+44 passed, 20 warnings in 49.66s
+=== sink tests: exit 0
+=== preparation tests
+.......................................................................  [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+71 passed, 14 warnings in 10.41s
+=== preparation tests: exit 0
+{"steps": [["verification tests", 0], ["rejection sampler tests", 1], ["sink kernel tests", 0], ["sink tests", 0], ["preparation tests", 0]]}

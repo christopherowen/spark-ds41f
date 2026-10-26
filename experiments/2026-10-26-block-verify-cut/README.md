@@ -168,12 +168,50 @@ On the laptop: [exact_law.py](exact_law.py), in FP64.
 
 ## dgx4 runs
 
-Not run yet. dgx1-4 were powered off at 08:10 CET on 2026-10-26 for re-cabling, on the
-owner's instruction. No job of this experiment had been submitted. The runs wait until
-dgx4 is a test box again, or for a lab window: `cut-tests`, then `cut-bench`, with
-`scripts/lab.py kernel-local` from a checkout of this branch under
-`~/spark-lab/agents/block-verify-cut/`. `next-tests` runs only if a test fails, to tell
-whether the failure predates the branch.
+Setup:
+- **Node:** dgx4 alone, while production was down for re-cabling. dgx1-4 were powered
+  off at 08:10 CET on 2026-10-26, on the owner's instruction. dgx4 was released for
+  testing in the afternoon.
+- **Image:** `spark-ds41f:19f2c20ed4d6-next-6`.
+- **Command:** `scripts/lab.py kernel-local`, from a checkout of this branch under
+  `~/spark-lab/agents/block-verify-cut/`. The outputs are in its `out/`, with copies in
+  [runs/](runs/), tabulated by [bench_table.py](bench_table.py).
+- **`next-tests`** runs only if a test fails in a way the branch does not explain.
+
+### Run 1, 13:50-14:40 CET: two failures, both in the harness
+
+vLLM 4ce2b98ad, spark-ds41f 5e1368f4.
+
+**`cut-tests`** ([output](runs/run-1/cut-tests-output.txt)):
+
+| Step | Result |
+| --- | --- |
+| verification tests | 663 passed |
+| rejection sampler tests | 152 passed, 1 skipped (needs two GPUs), **2 failed** |
+| sink kernel tests | 115 passed |
+| sink tests | 44 passed |
+| preparation tests | 71 passed |
+
+The failure was both parametrizations of
+`test_ds41f_verification_emits_same_tokens_with_insert_port`. The test's stand-in for
+`insert_resampled` took the cut as a required argument, and the TileLang path no longer
+passes one. Fixed in 21ce222ba: the argument defaults to None, and the stand-in still
+asserts it is None. Every new test passed, the distribution test and its control
+included.
+
+**`cut-bench`** ([output](runs/run-1/cut-bench-output.txt)):
+- **Without dead rows:** all 20 `rejection_sample` cases passed the gate. The first
+  `local_stats` case then stopped the step. The harness adds the maximum's column back
+  to our block sums before comparing them with Triton's, but next-candidate's sums
+  (with the softmax fix) leave that column out too. Fixed in ab8d398c0: against a fixed
+  release, the sums are compared bit for bit.
+- **With dead rows:** all 60 cases (`rejection_sample`, `verify` and `resample`, 1-96
+  rows, both dtypes, sampled and mixed) passed the gate. Every output was bit for bit
+  that of the placeholder drafts, and every greedy request's was next-candidate's.
+
+### Run 2
+
+vLLM ab8d398c0: both bundles again. Pending.
 
 ## What the release comparison should expect
 
