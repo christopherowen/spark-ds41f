@@ -13,8 +13,11 @@ Status: **analysis done; the final head is vLLM `pdl-next` 1bc005688 on next-can
 577091997; kernel checks run on dgx4** ([results](#results-on-dgx4-2026-10-25-cet),
 [final head](#the-final-head-pdl-next-on-next-candidate-577091997)). Bits are identical and
 the source check finds 0 violations. The c1 layer chain is 0.7-1.3% faster against
-next-candidate (1.3-1.8% against candidate 6's build). The 48-row chain trends 0.4% slower, an
-open finding. The serving screen and profile need the cluster and stay queued.
+next-candidate (1.3-1.8% against candidate 6's build). At 48 rows PDL was 0.11% slower
+(not 0.4%): the shared expert's down GEMM ran after the routed one. The fix, vLLM
+`pdl-moe-trigger` 97e204cd9 ([48 rows](#48-rows-the-shared-expert-pushed-behind-the-routed-down-gemm-2026-10-26-cet)),
+keeps c1's gain and makes 48 rows level. The serving screen and profile need the cluster and
+stay queued.
 
 ## The short answer
 
@@ -632,6 +635,68 @@ fresh process per build:
       down GEMM back before the routed one at 16 and 48 rows.
 
     Every build's buffers have the base build's bits in every round.
+13. **Fifteen rounds at six row counts** (b83ea330, [bundles/pdl-fix-focus](bundles/pdl-fix-focus);
+    [runs/fix-focus-b83ea330.txt](runs/fix-focus-b83ea330.txt)), base - build a round, warm:
+
+    | Rows | PDL | late-fc1 | late-trigger |
+    | ---: | ---: | ---: | ---: |
+    | 2 | +1.33% +- 0.24 | +1.40% +- 0.18 | +1.64% +- 0.21 |
+    | 3 | +0.89% +- 0.20 | +1.11% +- 0.18 | +1.12% +- 0.17 |
+    | 6 | +0.95% +- 0.17 | +0.76% +- 0.18 | +0.63% +- 0.15 |
+    | 16 | +0.25% +- 0.08 | +0.05% +- 0.11 | +0.33% +- 0.12 |
+    | 48 | -0.08% +- 0.07 | +0.02% +- 0.08 | +0.11% +- 0.07 |
+    | 96 | +0.03% +- 0.06 | +0.03% +- 0.08 | +0.09% +- 0.07 |
+
+    late-trigger's loss at 6 rows reproduces (0.3 points in both runs; cold 0.42% against
+    0.89%). late-fc1 is no better than either there, and below both at 16 rows.
+14. **Why 6 rows differs** ([bundles/pdl-fix-trace-small](bundles/pdl-fix-trace-small),
+    92821e76; [runs/fix-trace-small-92821e76.txt](runs/fix-trace-small-92821e76.txt)). At 6 rows
+    PDL also puts the shared down GEMM after the routed one (+4.2 us, every layer), and its
+    layer is still the fastest. With the late trigger the shared expert runs in the routed
+    gate/up GEMM's last wave again, as in the base build. It streams its weights there beside
+    the gate/up GEMM's, so the gate/up GEMM ends 10-15 us later than under PDL (relative to the
+    FFN entry: base 501.8 us, PDL 488.4, late-fc1 498.6, late-trigger 503.6). Under PDL the
+    routed SwiGLU's waiting CTAs hold those slots and move no data, and the shared down GEMM
+    after the routed one costs about 4 us. At 48 rows the same order costs PDL about 16 us,
+    more than the gate/up GEMM gains. At 3 rows no build reorders it. It is a trade of DRAM
+    time between the routed experts' last wave and the shared expert's tail, so neither
+    trigger point is best at every row count. Over all runs PDL at 48 rows is -0.11% +- 0.04
+    (inverse-variance mean of seven runs; about 4 us a layer).
+15. **The fix: the late trigger from 16 rows** (vLLM `pdl-moe-trigger` **97e204cd9**, one commit
+    on 1bc005688). The plan's grouped GEMMs trigger after their K loop from
+    `moe.LATE_TRIGGER_ROWS` (16) rows (`late_gate_up` and `late_down` at the decode tile
+    height, and the prefill GEMMs), and at their start below it, the same kernels as
+    `pdl-next`. Its tests (b5c51cb9, [bundles/pdl-tests-moe-trigger](bundles/pdl-tests-moe-trigger);
+    [runs/tests-moe-trigger-b5c51cb9.txt](runs/tests-moe-trigger-b5c51cb9.txt)): PDL tests 10
+    passed, kernel tests 530 passed, **0 source-check violations** over 325 launched kernels.
+    Fifteen rounds at every grid row count (b5c51cb9, [bundles/pdl-fix-grid](bundles/pdl-fix-grid);
+    [runs/fix-grid-b5c51cb9.txt](runs/fix-grid-b5c51cb9.txt)), base - build a round, mean +-
+    standard error:
+
+    | Rows | PDL, warm | fix, warm | late-trigger, warm | PDL, cold | fix, cold |
+    | ---: | ---: | ---: | ---: | ---: | ---: |
+    | 2 | +1.65% +- 0.15 | +1.26% +- 0.18 | +1.46% +- 0.17 | +1.70% | +1.34% |
+    | 3 | +0.75% +- 0.27 | +1.11% +- 0.16 | +1.05% +- 0.18 | +0.97% | +1.22% |
+    | 6 | +1.15% +- 0.13 | +0.90% +- 0.10 | +0.79% +- 0.12 | +0.96% | +0.88% |
+    | 8 | +0.84% +- 0.12 | +0.80% +- 0.13 | +0.54% +- 0.12 | +0.69% | +0.65% |
+    | 12 | +0.52% +- 0.08 | +0.53% +- 0.07 | +0.44% +- 0.07 | +0.55% | +0.54% |
+    | 16 | +0.10% +- 0.06 | +0.12% +- 0.07 | +0.25% +- 0.09 | +0.11% | +0.14% |
+    | 24 | +0.15% +- 0.07 | +0.13% +- 0.07 | +0.18% +- 0.07 | +0.19% | +0.15% |
+    | 32 | +0.11% +- 0.10 | +0.10% +- 0.08 | +0.16% +- 0.09 | +0.10% | +0.08% |
+    | **48** | **-0.11% +- 0.05** | **+0.02% +- 0.04** | +0.04% +- 0.06 | -0.10% | +0.03% |
+    | 72 | -0.01% +- 0.07 | +0.11% +- 0.05 | +0.16% +- 0.07 | -0.02% | +0.11% |
+    | 96 | +0.05% +- 0.04 | +0.06% +- 0.04 | +0.17% +- 0.06 | +0.04% | +0.06% |
+
+    - Below 16 rows the fix launches exactly PDL's kernels, so its gain there is PDL's. The two
+      builds' differences at 2-12 rows (-0.39 to +0.36 points) are this benchmark's spread
+      between builds: they are within the stated errors (chi-square 6.6 on five points).
+    - From 16 rows it launches late-trigger's kernels. Over every run of those kernels, 48 rows
+      is +0.05%, against PDL's -0.11% +- 0.04; 72 and 96 rows gain about 0.1 point; 16-32 rows
+      are level with PDL.
+    - So c1's gain stays (2-12 rows: PDL's kernels), and 48 rows is level with the base build
+      or better. Every build's buffers keep the base build's bits in every round.
+    - Not measured here: the prefill GEMMs, which now trigger late too (calls of 2,048 tokens
+      and more). The serving screen's prefill rows measure them.
 
 The cluster checks stay queued as [screen.json](screen.json) and [profile.json](profile.json).
 
@@ -658,9 +723,9 @@ The cluster checks stay queued as [screen.json](screen.json) and [profile.json](
 
 ## Follow-ups (not built)
 
-- The 48-row chain's 0.4% slowdown: the same A/B with the shared expert inline. If the
-  slowdown goes away, waiting CTAs are taking SMs from the aux stream. One kernel-local
-  bundle on dgx4.
+- The serving A/B of the fix (`pdl-moe-trigger` 97e204cd9) at c8 and c16, and its prefill
+  rows: the arms are [pdl-tp4.json](pdl-tp4.json) and [base-tp4.json](base-tp4.json) regenerated
+  with HEAD `pdl-moe-trigger`.
 
 - sparknet's one-shot all-reduce and all-gather kernels with `T.pdl_sync()` first (57 us a c1
   step, 0.17%): a sparknet change, released and pinned on its own.
@@ -675,6 +740,9 @@ The cluster checks stay queued as [screen.json](screen.json) and [profile.json](
   [layer-c1.json](layer-c1.json): the analysis and its output.
 - [prefetch_windows.py](prefetch_windows.py), [prefetch_windows.json](prefetch_windows.json):
   the L2 prefetch windows on the critical path.
+- [pdl_rows.py](pdl_rows.py), [pdl_trace.py](pdl_trace.py), [ab_table.py](ab_table.py),
+  [trace_compare.py](trace_compare.py): the per-row-count A/B, the kernel-by-kernel trace and
+  their tables.
 - [make_bundles.py](make_bundles.py), [run_steps.py](run_steps.py),
   [pdl_chain_ab.py](pdl_chain_ab.py), [sources_cpu.py](sources_cpu.py), [bundles/](bundles),
   [overlay/](overlay), [overlay-base/](overlay-base): the bundles and the builds' files,
