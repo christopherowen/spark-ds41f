@@ -1,0 +1,2654 @@
+=== CED test files on next-candidate
+........................................................................ [  6%]
+........................................................................ [ 13%]
+........................................................................ [ 19%]
+......................................................................FF [ 26%]
+F.....FF.............FF................................................. [ 32%]
+........................................................................ [ 39%]
+........................................................................ [ 45%]
+........................................................................ [ 52%]
+........................................................................ [ 59%]
+........................................................................ [ 65%]
+........................................................................ [ 72%]
+........................................................................ [ 78%]
+.................................................s...................... [ 85%]
+........................................................................ [ 91%]
+..........................................................FF............ [ 98%]
+FFFFFFFFF.EFF....                                                        [100%]
+==================================== ERRORS ====================================
+_ ERROR at setup of test_profile_run_releases_generic_outputs_before_deepseek_profile _
+file /opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_model_runner_v2.py, line 683
+  def test_profile_run_releases_generic_outputs_before_deepseek_profile(
+E       fixture 'workspace_init' not found
+>       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, default_vllm_config, dist_init, doctest_namespace, free_tcp_port, free_tcp_port_factory, free_udp_port, free_udp_port_factory, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, reset_default_torch_device, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_model_runner_v2.py:683
+=================================== FAILURES ===================================
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-safetensors] __
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xe979ac207f60>, {'layers.1.engram.embed.weight': tensor([[1....ng0/layer-0.safetensors'), PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe979ac5b74a0>
+load_format = 'safetensors', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1223: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:803: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe979ac5b0a40>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:32 [scheduler.py:409] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-26 07:04:32 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:32 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpusiblk1k backend=nccl
+INFO 10-26 07:04:32 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.scheduler:scheduler.py:409 Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpusiblk1k backend=nccl
+INFO     vllm.distributed.parallel_state:parallel_state.py:2393 rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-fastsafetensors] _
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xe979ac530c20>, {'layers.1.engram.embed.weight': tensor([[1....ng1/layer-0.safetensors'), PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading1/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe97a7ded8830>
+load_format = 'fastsafetensors', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1223: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:803: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe979ac77f9b0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:32 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:32 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpvrygq54j backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpvrygq54j backend=nccl
+_ test_engram_descriptor_loading_preserves_ordinary_weights[disk-instanttensor] _
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xe97a7def72e0>, {'layers.1.engram.embed.weight': tensor([[1....ng2/layer-0.safetensors'), PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading2/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_engram_descriptor_loading2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe97a7df2af60>
+load_format = 'instanttensor', table_memory = 'disk'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+    )
+    @pytest.mark.parametrize("table_memory", ["disk", "ram"])
+    def test_engram_descriptor_loading_preserves_ordinary_weights(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+        load_format,
+        table_memory,
+    ):
+        """Raw table entries never reach payload readers or placeholder parameters."""
+        make_model, weights, _ = tiny_engram_checkpoint
+        root, target, session = make_model(table_memory)
+        real_open = weight_utils.safe_open
+    
+        @contextmanager
+        def guarded_open(*args, **kwargs):
+            with real_open(*args, **kwargs) as archive:
+    
+                class GuardedArchive:
+                    def __getattr__(self, name):
+                        return getattr(archive, name)
+    
+                    def get_tensor(self, name):
+                        assert not root.checkpoint_file_weight_filter(name)
+                        return archive.get_tensor(name)
+    
+                yield GuardedArchive()
+    
+        def forbid_bulk(*args, **kwargs):
+            raise AssertionError("mixed Engram file reached bulk payload loading")
+    
+        monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+        monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+>       _load_checkpoint(root, tmp_path, load_format)
+
+tests/models/test_deepseek_v4_1_engram.py:254: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1223: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:803: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe97a7df2a6c0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:32 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:32 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp5ixpsrw0 backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp5ixpsrw0 backend=nccl
+_____ test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows ______
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xe97a7def7420>, {'layers.1.engram.embed.weight': tensor([[1...._r0/layer-0.safetensors'), PosixPath('/c/pytest-ced-anchor-next/test_disk_engram_preparation_r0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_disk_engram_preparation_r0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe97a7dff1730>
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+        tiny_engram_checkpoint,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Accepted GPU history, images, padding and failures cross the eager boundary."""
+        make_model, weights, paths = tiny_engram_checkpoint
+        root, target, session = make_model("disk")
+        resident_root, resident, resident_session = make_model("device")
+>       _load_checkpoint(root, tmp_path)
+
+tests/models/test_deepseek_v4_1_engram.py:445: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1223: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:803: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe97a7dff3e30>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:36 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:36 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpc7surr8q backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpc7surr8q backend=nccl
+___________ test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows ___________
+
+tiny_engram_checkpoint = (<function tiny_engram_checkpoint.<locals>.make_model at 0xe979ac348f40>, {'layers.1.engram.embed.weight': tensor([[1....st0/layer-0.safetensors'), PosixPath('/c/pytest-ced-anchor-next/test_disk_engram_rows_the_host0/layer-1.safetensors')])
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_disk_engram_rows_the_host0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe97d480b2d50>
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+        tiny_engram_checkpoint, tmp_path, monkeypatch
+    ):
+        """The host hashes a step's prefill chunks and the reader reads their rows before
+        the GPU's hash; a decode row in the same step comes from the GPU's hash. With the
+        debug check on, every early ID equals the GPU's, and the rows equal the resident
+        table's: a first chunk, a later chunk with history, a mixed step (decode first,
+        an image token in its history) and a decode-only step."""
+        monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
+        make_model, weights, paths = tiny_engram_checkpoint
+        root, target, session = make_model("disk")
+        resident_root, resident, resident_session = make_model("device")
+>       _load_checkpoint(root, tmp_path)
+
+tests/models/test_deepseek_v4_1_engram.py:602: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_engram.py:192: in _load_checkpoint
+    root.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/vl_model.py:313: in process_weights_after_loading
+    self.language_model.process_weights_after_loading()
+vllm/models/deepseek_v4_1/nvidia/model.py:1223: in process_weights_after_loading
+    module.process_weights_after_loading()
+vllm/models/deepseek_v4_1/common/engram.py:803: in process_weights_after_loading
+    self.embed_tokens.open_disk_rows()
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe97a7dff3c80>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 192, columns = 16777215, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = True
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:36 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:36 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp9665ywks backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp9665ywks backend=nccl
+__________________ test_disk_rows_read_whole_table_sources[0] __________________
+
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_disk_rows_read_whole_tabl0')
+dist_init = None, tp_rank = 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("tp_rank", [0, 3])
+    @torch.inference_mode()
+    def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+        """Each rank reads its shard (its hash columns) of the global tables from unaligned
+        file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+        lookup."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity = 7
+        geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+        caps = native.Caps(
+            device=device,
+            max_tokens=capacity,
+            max_seqs=2,
+            max_requests=2,
+            vocab_size=32,
+            layer_id=1,
+            tp_size=4,
+            tp_rank=tp_rank,
+        )
+        layout = SimpleNamespace(
+            caps=(caps,),
+            lookup_plans=(None,),
+            geometry=geometry,
+            table_memory="disk",
+            projection_tp=False,
+        )
+        config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device(device):
+                module = Engram(config, None, layout, 0, False, "engram_disk_test")
+        finally:
+            torch.set_default_dtype(old_dtype)
+        embed = module.embed_tokens
+        row_values = torch.arange(embed.table_rows).remainder(7).add(1)
+        weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
+        scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
+        for name, tensor, offset, scale in (
+            ("weight.bin", weight, 4093, False),
+            ("scale.bin", scales, 123, True),
+        ):
+            path = tmp_path / name
+            with path.open("wb") as stream:
+                stream.write(bytes(offset))
+                stream.write(tensor.view(torch.uint8).numpy().tobytes())
+            embed._disk_sources.append((str(path), offset, scale))
+>       embed.open_disk_rows()
+
+tests/models/test_deepseek_v4_1_engram.py:1067: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe979ac3a84d0>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 168, columns = 1118481, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:39 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:39 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp57gh5il7 backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmp57gh5il7 backend=nccl
+__________________ test_disk_rows_read_whole_table_sources[3] __________________
+
+tmp_path = PosixPath('/c/pytest-ced-anchor-next/test_disk_rows_read_whole_tabl1')
+dist_init = None, tp_rank = 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("tp_rank", [0, 3])
+    @torch.inference_mode()
+    def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+        """Each rank reads its shard (its hash columns) of the global tables from unaligned
+        file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+        lookup."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity = 7
+        geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+        caps = native.Caps(
+            device=device,
+            max_tokens=capacity,
+            max_seqs=2,
+            max_requests=2,
+            vocab_size=32,
+            layer_id=1,
+            tp_size=4,
+            tp_rank=tp_rank,
+        )
+        layout = SimpleNamespace(
+            caps=(caps,),
+            lookup_plans=(None,),
+            geometry=geometry,
+            table_memory="disk",
+            projection_tp=False,
+        )
+        config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device(device):
+                module = Engram(config, None, layout, 0, False, "engram_disk_test")
+        finally:
+            torch.set_default_dtype(old_dtype)
+        embed = module.embed_tokens
+        row_values = torch.arange(embed.table_rows).remainder(7).add(1)
+        weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
+        scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
+        for name, tensor, offset, scale in (
+            ("weight.bin", weight, 4093, False),
+            ("scale.bin", scales, 123, True),
+        ):
+            path = tmp_path / name
+            with path.open("wb") as stream:
+                stream.write(bytes(offset))
+                stream.write(tensor.view(torch.uint8).numpy().tobytes())
+            embed._disk_sources.append((str(path), offset, scale))
+>       embed.open_disk_rows()
+
+tests/models/test_deepseek_v4_1_engram.py:1067: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/common/engram.py:571: in open_disk_rows
+    rows = EngramDiskRows(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.models.deepseek_v4_1.engram_rows.rows.EngramDiskRows object at 0xe97d4846c530>
+device = device(type='cuda', index=0), table_rows = 1662, shard_start = 0
+shard_end = 1662, max_lookups = 168, columns = 8947848, queue_depth = 128
+ids_timeout_s = 20.0, rows_timeout_s = 10.0, delay_s = 0.0, check_early = False
+timeline = False
+
+    def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                 ids_timeout_s: float = 20.0,
+                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                 check_early: bool = False, timeline: bool = False):
+        self.native = load()
+        self.device = _indexed(device)
+        self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+        self.columns = int(columns)
+        if not 0 < self.columns <= ALL_COLUMNS:
+            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+        self.max_lookups = int(max_lookups)
+        self.check_early = bool(check_early)
+        self.timeline_enabled = bool(timeline)
+        self._allocations = []
+        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+        self.control.host.zero_()
+        self._control = self.control.host.numpy().view(np.uint32)
+        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+>       self._reader = self.native.reader(
+            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+            float(ids_timeout_s), float(delay_s), self.check_early,
+            self.timeline_enabled,
+        )
+E       RuntimeError: io_uring initialization failed: Operation not permitted; enable io_uring in the kernel and container policy
+
+vllm/models/deepseek_v4_1/engram_rows/rows.py:137: RuntimeError
+---------------------------- Captured stdout setup -----------------------------
+INFO 10-26 07:04:39 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 10-26 07:04:39 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpljlg5z39 backend=nccl
+------------------------------ Captured log setup ------------------------------
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO     vllm.distributed.parallel_state:parallel_state.py:1953 world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpljlg5z39 backend=nccl
+_ test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[align-prefix-cache] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c49ccb0>
+mamba_cache_mode = 'align', num_speculative_blocks = 0, expected = 65536
+
+    @pytest.mark.parametrize(
+        ("mamba_cache_mode", "num_speculative_blocks", "expected"),
+        [
+            pytest.param("align", 0, 65_536, id="align-prefix-cache"),
+            pytest.param("none", 7, 8, id="no-prefix-cache-with-speculation"),
+        ],
+    )
+    def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
+        monkeypatch,
+        mamba_cache_mode: str,
+        num_speculative_blocks: int,
+        expected: int,
+    ):
+        """Mamba/GDN block-table rows index global positions, unlike DCP KV."""
+    
+        max_model_len = 1_048_576
+        attention_block_size = 1_536
+        mamba_block_size = 16
+        dcp_size = 8
+        full_attention_spec = FullAttentionSpec(
+            block_size=attention_block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.bfloat16,
+        )
+        mamba_spec = MambaSpec(
+            shapes=((1,),),
+            dtypes=(torch.bfloat16,),
+            block_size=mamba_block_size,
+            mamba_cache_mode=mamba_cache_mode,
+            num_speculative_blocks=num_speculative_blocks,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attention"], full_attention_spec),
+                KVCacheGroupSpec(["kda"], mamba_spec),
+            ],
+        )
+        parallel_config = SimpleNamespace(
+            decode_context_parallel_size=dcp_size,
+            cp_kv_cache_interleave_size=1,
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=parallel_config,
+            cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
+        )
+        runner = SimpleNamespace(
+            max_model_len=max_model_len,
+            is_encoder_decoder=False,
+            dcp_size=dcp_size,
+            vllm_config=vllm_config,
+            parallel_config=parallel_config,
+        )
+    
+        class _CapturedWidths(Exception):
+            pass
+    
+        captured: list[int] = []
+    
+        def capture_width(max_num_blocks: int, *_args, **_kwargs) -> int:
+            captured.append(max_num_blocks)
+            if len(captured) == 2:
+                raise _CapturedWidths
+            return max_num_blocks
+    
+        monkeypatch.setattr(model_runner_module, "get_block_table_width", capture_width)
+    
+        with pytest.raises(_CapturedWidths):
+>           GPUModelRunner.initialize_kv_cache(runner, kv_cache_config)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:266: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = namespace(max_model_len=1048576, is_encoder_decoder=False, dcp_size=8, vllm_config=namespace(parallel_config=namespace...kv_cache_layout=None, hisparse_host_num_blocks=None, hisparse_host_block_stride=None, hisparse_shared_host_pool=False))
+kv_cache_config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(layer_names=['attention'], kv_cache... kv_cache_layout=None, hisparse_host_num_blocks=None, hisparse_host_block_stride=None, hisparse_shared_host_pool=False)
+is_profiling = False, kv_cache_allocation_context = None
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        # GPUWorker finalizes the PD interleave before KV cache initialization.
+        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        kv_cache_config = deepcopy(kv_cache_config)
+        self.kv_cache_config = kv_cache_config
+    
+>       block_table_max_model_len = self._block_table_max_model_len()
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'types.SimpleNamespace' object has no attribute '_block_table_max_model_len'
+
+vllm/v1/worker/gpu/model_runner.py:720: AttributeError
+_ test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[no-prefix-cache-with-speculation] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c0ea420>
+mamba_cache_mode = 'none', num_speculative_blocks = 7, expected = 8
+
+    @pytest.mark.parametrize(
+        ("mamba_cache_mode", "num_speculative_blocks", "expected"),
+        [
+            pytest.param("align", 0, 65_536, id="align-prefix-cache"),
+            pytest.param("none", 7, 8, id="no-prefix-cache-with-speculation"),
+        ],
+    )
+    def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
+        monkeypatch,
+        mamba_cache_mode: str,
+        num_speculative_blocks: int,
+        expected: int,
+    ):
+        """Mamba/GDN block-table rows index global positions, unlike DCP KV."""
+    
+        max_model_len = 1_048_576
+        attention_block_size = 1_536
+        mamba_block_size = 16
+        dcp_size = 8
+        full_attention_spec = FullAttentionSpec(
+            block_size=attention_block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.bfloat16,
+        )
+        mamba_spec = MambaSpec(
+            shapes=((1,),),
+            dtypes=(torch.bfloat16,),
+            block_size=mamba_block_size,
+            mamba_cache_mode=mamba_cache_mode,
+            num_speculative_blocks=num_speculative_blocks,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attention"], full_attention_spec),
+                KVCacheGroupSpec(["kda"], mamba_spec),
+            ],
+        )
+        parallel_config = SimpleNamespace(
+            decode_context_parallel_size=dcp_size,
+            cp_kv_cache_interleave_size=1,
+        )
+        vllm_config = SimpleNamespace(
+            parallel_config=parallel_config,
+            cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
+        )
+        runner = SimpleNamespace(
+            max_model_len=max_model_len,
+            is_encoder_decoder=False,
+            dcp_size=dcp_size,
+            vllm_config=vllm_config,
+            parallel_config=parallel_config,
+        )
+    
+        class _CapturedWidths(Exception):
+            pass
+    
+        captured: list[int] = []
+    
+        def capture_width(max_num_blocks: int, *_args, **_kwargs) -> int:
+            captured.append(max_num_blocks)
+            if len(captured) == 2:
+                raise _CapturedWidths
+            return max_num_blocks
+    
+        monkeypatch.setattr(model_runner_module, "get_block_table_width", capture_width)
+    
+        with pytest.raises(_CapturedWidths):
+>           GPUModelRunner.initialize_kv_cache(runner, kv_cache_config)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:266: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = namespace(max_model_len=1048576, is_encoder_decoder=False, dcp_size=8, vllm_config=namespace(parallel_config=namespace...kv_cache_layout=None, hisparse_host_num_blocks=None, hisparse_host_block_stride=None, hisparse_shared_host_pool=False))
+kv_cache_config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(layer_names=['attention'], kv_cache... kv_cache_layout=None, hisparse_host_num_blocks=None, hisparse_host_block_stride=None, hisparse_shared_host_pool=False)
+is_profiling = False, kv_cache_allocation_context = None
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        # GPUWorker finalizes the PD interleave before KV cache initialization.
+        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        kv_cache_config = deepcopy(kv_cache_config)
+        self.kv_cache_config = kv_cache_config
+    
+>       block_table_max_model_len = self._block_table_max_model_len()
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'types.SimpleNamespace' object has no attribute '_block_table_max_model_len'
+
+vllm/v1/worker/gpu/model_runner.py:720: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c0eaf90>
+architecture = 'DeepseekV4ForCausalLM', init_fails = False
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+                runner._profile_deepseek_v4_attention(prepare)
+        else:
+>           runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c0e9820>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c133380>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForConditionalGeneration] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe97a7e5e00b0>
+architecture = 'DeepseekV4ForConditionalGeneration', init_fails = False
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+                runner._profile_deepseek_v4_attention(prepare)
+        else:
+>           runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c0eb3e0>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c131d00>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV41ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c0eaa20>
+architecture = 'DeepseekV41ForCausalLM', init_fails = False
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+                runner._profile_deepseek_v4_attention(prepare)
+        else:
+>           runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c0eb170>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c133b00>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c126ba0>
+architecture = 'DeepseekV4ForCausalLM', init_fails = False
+dummy_run_fails = True
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:639: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c126f30>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c133ec0>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForConditionalGeneration] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c126660>
+architecture = 'DeepseekV4ForConditionalGeneration', init_fails = False
+dummy_run_fails = True
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:639: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c125b50>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c170360>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV41ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c0ea240>
+architecture = 'DeepseekV41ForCausalLM', init_fails = False
+dummy_run_fails = True
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+                runner._profile_deepseek_v4_attention(prepare)
+        elif dummy_run_fails:
+            with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:639: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c0e8740>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c132c00>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c126030>
+architecture = 'DeepseekV4ForCausalLM', init_fails = True
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:636: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c124ef0>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c1704a0>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForConditionalGeneration] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c126840>
+architecture = 'DeepseekV4ForConditionalGeneration', init_fails = True
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:636: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c127fe0>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c170900>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+_ test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV41ForCausalLM] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c127dd0>
+architecture = 'DeepseekV41ForCausalLM', init_fails = True
+dummy_run_fails = False
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("init_fails", "dummy_run_fails"),
+        [(False, False), (False, True), (True, False)],
+    )
+    def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+        monkeypatch: pytest.MonkeyPatch,
+        architecture: str,
+        init_fails: bool,
+        dummy_run_fails: bool,
+    ):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture=architecture)
+        runner.max_num_tokens = 4096
+        events: list[object] = []
+    
+        def init_kv(_, *, num_blocks=None):
+            events.append(("init-kv", num_blocks))
+            if init_fails:
+                raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+    
+        monkeypatch.setattr(
+            model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+        )
+        monkeypatch.setattr(
+            model_runner_module,
+            "_teardown_profiling_state",
+            lambda _: events.append("cleanup"),
+        )
+    
+        def dummy_run(*args, **kwargs):
+            events.append(("dummy-run", args, kwargs))
+            if dummy_run_fails:
+                raise RuntimeError("expected DeepSeek V4 profile failure")
+            return torch.empty(1), torch.empty(1)
+    
+        runner._dummy_run = dummy_run
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    
+        prepare = lambda: events.append("prepare")
+    
+        if init_fails:
+            with pytest.raises(
+                RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+            ):
+>               runner._profile_deepseek_v4_attention(prepare)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:636: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.model_runner.GPUModelRunner object at 0xe9796c127500>
+prepare_profile_state = <function test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up.<locals>.<lambda> at 0xe9796c170cc0>
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+    
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+    
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    
+        # One block per KV cache group besides the null block: the groups
+        # overlay the same memory, so a block shared by every group would let
+        # one group read another's writes in its own format.
+>       groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                                     ^^^^^^^^^^^^^^^^
+E       AttributeError: 'GPUModelRunner' object has no attribute 'vllm_config'
+
+vllm/v1/worker/gpu/model_runner.py:1301: AttributeError
+________ test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[0] _________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c124fb0>
+num_speculative_steps = 0
+
+    @pytest.mark.parametrize("num_speculative_steps", [0, 2])
+    def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+        monkeypatch, num_speculative_steps
+    ):
+        from unittest.mock import Mock
+    
+        batch = SimpleNamespace(
+            req_ids=["request"],
+            num_reqs=1,
+            idx_mapping=torch.tensor([0]),
+            query_start_loc=torch.tensor([0, 1]),
+            num_draft_tokens_per_req=None,
+        )
+        states = SimpleNamespace(
+            draft_tokens=torch.tensor([[3, 4]]),
+            all_token_ids=SimpleNamespace(gpu=None),
+            num_computed_tokens=SimpleNamespace(gpu=None),
+            prompt_len=SimpleNamespace(np=None),
+        )
+        pp = SimpleNamespace(broadcast=Mock(), broadcast_drafts=Mock())
+        sampler_output = SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
+        runner = SimpleNamespace(
+            execute_model_state=model_runner_module.ExecuteModelState(
+                input_batch=batch,
+                attn_metadata=None,
+                slot_mappings_by_layer=None,
+                hidden_states=torch.ones(1, 8),
+                aux_hidden_states=None,
+                dp_sync=None,
+                finished_req_ids=set(),
+                ec_connector_output=None,
+                routed_experts=None,
+                cudagraph_stats=None,
+                num_spec_tokens_to_schedule=0,
+            ),
+            is_last_pp_rank=True,
+            pcp_manager=None,
+            pp_handler=pp,
+            sample=lambda *args: (sampler_output, torch.tensor([1]), torch.tensor([0])),
+            prompt_logprobs_worker=SimpleNamespace(compute_prompt_logprobs=lambda *a: {}),
+            model=SimpleNamespace(compute_logits=None),
+            req_states=states,
+            adaptive_verification=None,
+            boundary_checkpoint_state=None,
+            main_stream=None,
+            output_copy_stream=None,
+            check_ep_fault=False,
+            speculator=None,
+            num_speculative_steps=num_speculative_steps,
+            device=torch.device("cpu"),
+            postprocess_sampled=Mock(),
+            block_tables=None,
+            draft_tokens_handler=SimpleNamespace(set_draft_tokens=Mock()),
+            kv_connector=SimpleNamespace(post_forward=lambda *a: None),
+            eplb=SimpleNamespace(step=Mock()),
+        )
+        monkeypatch.setattr(model_runner_module, "AsyncOutput", lambda **kwargs: kwargs)
+    
+>       GPUModelRunner.sample_tokens(runner, None)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:787: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/eplb_utils.py:27: in wrapper
+    result = fn(self, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = namespace(execute_model_state=None, is_last_pp_rank=True, pcp_manager=None, pp_handler=namespace(broadcast=<Mock id='2...depend_on_boundary_checkpoints.<locals>.<lambda> at 0xe97d496fe7a0>), eplb=namespace(step=<Mock id='256707713450976'>))
+grammar_output = None
+
+    @torch.inference_mode()
+    @step_eplb_after()
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> AsyncOutput | ModelRunnerOutput | None:
+        if self.execute_model_state is None:
+            # The prior execute_model call must have failed.
+            return None
+    
+        input_batch = self.execute_model_state.input_batch
+        attn_metadata = self.execute_model_state.attn_metadata
+        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
+        hidden_states = self.execute_model_state.hidden_states
+        aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync = self.execute_model_state.dp_sync
+        finished_req_ids = self.execute_model_state.finished_req_ids
+        ec_connector_output = self.execute_model_state.ec_connector_output
+        routed_experts = self.execute_model_state.routed_experts
+        cudagraph_stats = self.execute_model_state.cudagraph_stats
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
+        boundary_logits_only = self.execute_model_state.boundary_logits_only
+        boundary_aux_block_id = self.execute_model_state.boundary_aux_block_id
+        self.execute_model_state = None
+    
+        if not self.is_last_pp_rank:
+            # Non-last PP rank: hidden_states is None because this rank produced
+            # IntermediateTensors instead of final hidden states. Receive the
+            # sampled tokens broadcast from the last rank and update local state.
+            assert self.pp_handler is not None
+            all_decode_next = self.pp_handler.receive(input_batch)
+            # Optimistically update num_computed_tokens for entire batch here.
+            # Will be adjusted for rejections if necessary in update_requests.
+            self.postprocess_num_computed_tokens(input_batch)
+            if not all_decode_next:
+                # Might contain non-final prefill chunks, which will be scheduled
+                # in the immediate next step (rather than in pp_size steps).
+                self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+    
+            # Post-step KV connector related operations.
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            # The first PP rank holds the encoder cache, so pass its EC output on.
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
+    
+        # Last rank: sample tokens
+        draft_hidden_states = hidden_states
+        assert draft_hidden_states is not None
+        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+            self.pcp_manager, hidden_states, input_batch
+        )
+        if self.pcp_manager is not None and aux_hidden_states is not None:
+            aux_hidden_states = [
+                self.pcp_manager.restore_hidden_states(states)
+                for states in aux_hidden_states
+            ]
+    
+        sampler_output, num_sampled, num_rejected = self.sample(
+            hidden_states, input_batch, grammar_output
+        )
+    
+        if self.pp_handler is not None:
+            # Broadcast to non-last PP ranks (handles spec decode multi-token).
+            self.pp_handler.broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+            )
+    
+        assert self.prompt_logprobs_worker is not None
+        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+            self.model.compute_logits,
+            hidden_states,
+            input_batch,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.prompt_len.np,
+        )
+    
+        # Prepare the model runner output.
+        model_runner_output = ModelRunnerOutput(
+            req_ids=input_batch.req_ids,
+            # NOTE(woosuk): req_id_to_index is unused in this model runner.
+            # Only for compatibility with the existing model runner and scheduler.
+            req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
+            sampled_token_ids=None,  # type: ignore
+            prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            cudagraph_stats=cudagraph_stats,
+        )
+        num_verified_draft_tokens = (
+            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
+            if self.adaptive_verification is not None
+            and input_batch.num_draft_tokens_per_req is not None
+            else None
+        )
+        # Start async output copy here so that it can overlap with speculator proposal.
+        boundary_state = (
+            None if boundary_logits_only else self.boundary_checkpoint_state
+        )
+        boundary_capture = None
+        if boundary_state is None:
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+                num_verified_draft_tokens=num_verified_draft_tokens,
+            )
+        else:
+            boundary_capture = torch.empty(
+                (3, input_batch.num_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS),
+                dtype=torch.int32,
+                device=self.device,
+            )
+    
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+        # The encoder runner exists only on the first PP rank, so later ranks
+        # have no cached embeddings to gather.
+        if (
+            self.speculator is not None
+            and self.speculator.supports_mm_inputs
+            and self.model_state.supports_mm_inputs
+        ):
+            # Get cached multimodal embeddings for draft forward.
+            # NOTE: This is done here because postprocess updates
+            # num_computed_prefill_tokens.
+            # The EAGLE/MTP drafter reads one position ahead of the target.
+            # TODO(TheEpicDolphin): Gather MM embeddings for all speculative
+            # steps during multi-module MTP.
+            mm_inputs = self.model_state.gather_mm_embeddings(
+                input_batch, draft_lookahead=1
+            )
+    
+        # Postprocess results and update request states.
+        # NOTE: This is intentionally done after creating the AsyncOutput,
+        # ensuring that `copy_event` is recorded before calling postprocess.
+        # This sequencing may slightly reduce latency as async D2H copy does not
+        # need to wait for the postprocess to finish.
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampler_output.sampled_token_ids,
+            num_sampled,
+            num_rejected,
+            None if boundary_logits_only else input_batch.query_start_loc,
+            boundary_capture,
+            logits_only=boundary_logits_only,
+        )
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            spec_hidden = None
+            if self.speculator is not None and not isinstance(
+                self.speculator, DFlashSpeculator
+            ):
+                spec_hidden = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    spec_hidden = self.model.get_mtp_target_hidden_states()
+            boundary_state.capture_auxiliary(
+                input_batch.idx_mapping, boundary_capture, hidden_states, spec_hidden
+            )
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+                boundary_checkpoint_tokens=boundary_capture[0],
+                num_verified_draft_tokens=num_verified_draft_tokens,
+            )
+    
+        draft_tokens_for_next_step: torch.Tensor | None = None
+        if (
+            self.speculator is not None
+            and boundary_logits_only
+            and num_spec_tokens_to_schedule > 0
+        ):
+            assert self.boundary_checkpoint_state is not None
+            draft_tokens_for_next_step = self.boundary_checkpoint_state.replay_draft(
+                self,
+                input_batch.req_ids[0],
+                int(input_batch.seq_lens_cpu_upper_bound[0]),
+                boundary_aux_block_id,
+                num_speculative_tokens=num_spec_tokens_to_schedule,
+            )
+            tilelang_inputs.scatter_rows(
+                input_batch.idx_mapping,
+                draft_tokens_for_next_step,
+                self.req_states.draft_tokens,
+            )
+        elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
+            assert self.sampler is not None
+            if isinstance(self.speculator, DraftModelSpeculator):
+                observed_rejected = num_rejected
+                if (
+                    sampler_output.sink is not None
+                    and self.speculator.acceptance_estimator is not None
+                ):
+                    # A rejected draft zero left the drafts unjudged.
+                    observed_rejected = num_rejected.masked_fill(
+                        sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                    )
+                self.speculator.observe_verification(
+                    input_batch.idx_mapping, num_sampled, observed_rejected
+                )
+            # Let the target override the hidden state fed to the drafter
+            # (_mtp_target_states).
+            spec_hidden_states = _mtp_target_states(self.model, draft_hidden_states)
+            if isinstance(self.sampler, GPUWatermarkSampler):
+                self.speculator.prepare_watermarking(
+                    self.sampler._get_contexts(input_batch.idx_mapping),
+                    self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                )
+            with use_workspace_lane(self._draft_workspace_lane):
+                if boundary_state is not None:
+                    self.speculator.boundary_checkpoint_capture = (
+                        boundary_state,
+                        input_batch.idx_mapping,
+                        boundary_capture,
+                    )
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    dp_sync=dp_sync,
+                    num_speculative_tokens=num_spec_tokens_to_schedule,
+                    mm_inputs=mm_inputs,
+                )
+                if boundary_state is not None:
+                    self.speculator.boundary_checkpoint_capture = None
+                draft_tokens = limit_draft_tokens(
+                    draft_tokens,
+                    num_spec_tokens_to_schedule,
+                    self.num_speculative_steps,
+                )
+            num_draft_tokens = draft_tokens.shape[1]
+            if num_draft_tokens > 0:
+                # Into the request states, and read back for the next step.
+                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+                    input_batch.idx_mapping,
+                    draft_tokens,
+                    self.req_states.draft_tokens,
+                    gather=True,
+                )
+            else:
+                draft_tokens_for_next_step = draft_tokens
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.record_confidences(
+                    self.speculator.draft_token_confidence_probs, input_batch
+                )
+        elif self.speculator is not None:
+            draft_tokens_for_next_step = self.req_states.draft_tokens[
+                input_batch.idx_mapping, :0
+            ]
+    
+        if self.num_speculative_steps > 0:
+            # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+            # not have a speculator (i.e. self.speculator is None)
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                (
+                    draft_tokens_for_next_step
+                    if draft_tokens_for_next_step is not None
+                    else self.req_states.draft_tokens[input_batch.idx_mapping]
+                ),
+            )
+    
+            if self.pp_handler is not None:
+                self.pp_handler.broadcast_drafts(
+                    self.req_states.draft_tokens, input_batch
+                )
+    
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            boundary_state.capture_attention(
+                input_batch.idx_mapping, boundary_capture, self.block_tables
+            )
+    
+>       if self.sink is not None:
+           ^^^^^^^^^
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'sink'
+
+vllm/v1/worker/gpu/model_runner.py:3401: AttributeError
+________ test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[2] _________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe9796c127560>
+num_speculative_steps = 2
+
+    @pytest.mark.parametrize("num_speculative_steps", [0, 2])
+    def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+        monkeypatch, num_speculative_steps
+    ):
+        from unittest.mock import Mock
+    
+        batch = SimpleNamespace(
+            req_ids=["request"],
+            num_reqs=1,
+            idx_mapping=torch.tensor([0]),
+            query_start_loc=torch.tensor([0, 1]),
+            num_draft_tokens_per_req=None,
+        )
+        states = SimpleNamespace(
+            draft_tokens=torch.tensor([[3, 4]]),
+            all_token_ids=SimpleNamespace(gpu=None),
+            num_computed_tokens=SimpleNamespace(gpu=None),
+            prompt_len=SimpleNamespace(np=None),
+        )
+        pp = SimpleNamespace(broadcast=Mock(), broadcast_drafts=Mock())
+        sampler_output = SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
+        runner = SimpleNamespace(
+            execute_model_state=model_runner_module.ExecuteModelState(
+                input_batch=batch,
+                attn_metadata=None,
+                slot_mappings_by_layer=None,
+                hidden_states=torch.ones(1, 8),
+                aux_hidden_states=None,
+                dp_sync=None,
+                finished_req_ids=set(),
+                ec_connector_output=None,
+                routed_experts=None,
+                cudagraph_stats=None,
+                num_spec_tokens_to_schedule=0,
+            ),
+            is_last_pp_rank=True,
+            pcp_manager=None,
+            pp_handler=pp,
+            sample=lambda *args: (sampler_output, torch.tensor([1]), torch.tensor([0])),
+            prompt_logprobs_worker=SimpleNamespace(compute_prompt_logprobs=lambda *a: {}),
+            model=SimpleNamespace(compute_logits=None),
+            req_states=states,
+            adaptive_verification=None,
+            boundary_checkpoint_state=None,
+            main_stream=None,
+            output_copy_stream=None,
+            check_ep_fault=False,
+            speculator=None,
+            num_speculative_steps=num_speculative_steps,
+            device=torch.device("cpu"),
+            postprocess_sampled=Mock(),
+            block_tables=None,
+            draft_tokens_handler=SimpleNamespace(set_draft_tokens=Mock()),
+            kv_connector=SimpleNamespace(post_forward=lambda *a: None),
+            eplb=SimpleNamespace(step=Mock()),
+        )
+        monkeypatch.setattr(model_runner_module, "AsyncOutput", lambda **kwargs: kwargs)
+    
+>       GPUModelRunner.sample_tokens(runner, None)
+
+tests/v1/worker/test_gpu_model_runner_v2.py:787: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/eplb_utils.py:27: in wrapper
+    result = fn(self, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = namespace(execute_model_state=None, is_last_pp_rank=True, pcp_manager=None, pp_handler=namespace(broadcast=<Mock id='2...depend_on_boundary_checkpoints.<locals>.<lambda> at 0xe9796c170900>), eplb=namespace(step=<Mock id='256707713460960'>))
+grammar_output = None
+
+    @torch.inference_mode()
+    @step_eplb_after()
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> AsyncOutput | ModelRunnerOutput | None:
+        if self.execute_model_state is None:
+            # The prior execute_model call must have failed.
+            return None
+    
+        input_batch = self.execute_model_state.input_batch
+        attn_metadata = self.execute_model_state.attn_metadata
+        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
+        hidden_states = self.execute_model_state.hidden_states
+        aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync = self.execute_model_state.dp_sync
+        finished_req_ids = self.execute_model_state.finished_req_ids
+        ec_connector_output = self.execute_model_state.ec_connector_output
+        routed_experts = self.execute_model_state.routed_experts
+        cudagraph_stats = self.execute_model_state.cudagraph_stats
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
+        boundary_logits_only = self.execute_model_state.boundary_logits_only
+        boundary_aux_block_id = self.execute_model_state.boundary_aux_block_id
+        self.execute_model_state = None
+    
+        if not self.is_last_pp_rank:
+            # Non-last PP rank: hidden_states is None because this rank produced
+            # IntermediateTensors instead of final hidden states. Receive the
+            # sampled tokens broadcast from the last rank and update local state.
+            assert self.pp_handler is not None
+            all_decode_next = self.pp_handler.receive(input_batch)
+            # Optimistically update num_computed_tokens for entire batch here.
+            # Will be adjusted for rejections if necessary in update_requests.
+            self.postprocess_num_computed_tokens(input_batch)
+            if not all_decode_next:
+                # Might contain non-final prefill chunks, which will be scheduled
+                # in the immediate next step (rather than in pp_size steps).
+                self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+    
+            # Post-step KV connector related operations.
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            # The first PP rank holds the encoder cache, so pass its EC output on.
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
+    
+        # Last rank: sample tokens
+        draft_hidden_states = hidden_states
+        assert draft_hidden_states is not None
+        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+            self.pcp_manager, hidden_states, input_batch
+        )
+        if self.pcp_manager is not None and aux_hidden_states is not None:
+            aux_hidden_states = [
+                self.pcp_manager.restore_hidden_states(states)
+                for states in aux_hidden_states
+            ]
+    
+        sampler_output, num_sampled, num_rejected = self.sample(
+            hidden_states, input_batch, grammar_output
+        )
+    
+        if self.pp_handler is not None:
+            # Broadcast to non-last PP ranks (handles spec decode multi-token).
+            self.pp_handler.broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+            )
+    
+        assert self.prompt_logprobs_worker is not None
+        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+            self.model.compute_logits,
+            hidden_states,
+            input_batch,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.prompt_len.np,
+        )
+    
+        # Prepare the model runner output.
+        model_runner_output = ModelRunnerOutput(
+            req_ids=input_batch.req_ids,
+            # NOTE(woosuk): req_id_to_index is unused in this model runner.
+            # Only for compatibility with the existing model runner and scheduler.
+            req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
+            sampled_token_ids=None,  # type: ignore
+            prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            cudagraph_stats=cudagraph_stats,
+        )
+        num_verified_draft_tokens = (
+            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
+            if self.adaptive_verification is not None
+            and input_batch.num_draft_tokens_per_req is not None
+            else None
+        )
+        # Start async output copy here so that it can overlap with speculator proposal.
+        boundary_state = (
+            None if boundary_logits_only else self.boundary_checkpoint_state
+        )
+        boundary_capture = None
+        if boundary_state is None:
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+                num_verified_draft_tokens=num_verified_draft_tokens,
+            )
+        else:
+            boundary_capture = torch.empty(
+                (3, input_batch.num_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS),
+                dtype=torch.int32,
+                device=self.device,
+            )
+    
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+        # The encoder runner exists only on the first PP rank, so later ranks
+        # have no cached embeddings to gather.
+        if (
+            self.speculator is not None
+            and self.speculator.supports_mm_inputs
+            and self.model_state.supports_mm_inputs
+        ):
+            # Get cached multimodal embeddings for draft forward.
+            # NOTE: This is done here because postprocess updates
+            # num_computed_prefill_tokens.
+            # The EAGLE/MTP drafter reads one position ahead of the target.
+            # TODO(TheEpicDolphin): Gather MM embeddings for all speculative
+            # steps during multi-module MTP.
+            mm_inputs = self.model_state.gather_mm_embeddings(
+                input_batch, draft_lookahead=1
+            )
+    
+        # Postprocess results and update request states.
+        # NOTE: This is intentionally done after creating the AsyncOutput,
+        # ensuring that `copy_event` is recorded before calling postprocess.
+        # This sequencing may slightly reduce latency as async D2H copy does not
+        # need to wait for the postprocess to finish.
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampler_output.sampled_token_ids,
+            num_sampled,
+            num_rejected,
+            None if boundary_logits_only else input_batch.query_start_loc,
+            boundary_capture,
+            logits_only=boundary_logits_only,
+        )
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            spec_hidden = None
+            if self.speculator is not None and not isinstance(
+                self.speculator, DFlashSpeculator
+            ):
+                spec_hidden = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    spec_hidden = self.model.get_mtp_target_hidden_states()
+            boundary_state.capture_auxiliary(
+                input_batch.idx_mapping, boundary_capture, hidden_states, spec_hidden
+            )
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+                boundary_checkpoint_tokens=boundary_capture[0],
+                num_verified_draft_tokens=num_verified_draft_tokens,
+            )
+    
+        draft_tokens_for_next_step: torch.Tensor | None = None
+        if (
+            self.speculator is not None
+            and boundary_logits_only
+            and num_spec_tokens_to_schedule > 0
+        ):
+            assert self.boundary_checkpoint_state is not None
+            draft_tokens_for_next_step = self.boundary_checkpoint_state.replay_draft(
+                self,
+                input_batch.req_ids[0],
+                int(input_batch.seq_lens_cpu_upper_bound[0]),
+                boundary_aux_block_id,
+                num_speculative_tokens=num_spec_tokens_to_schedule,
+            )
+            tilelang_inputs.scatter_rows(
+                input_batch.idx_mapping,
+                draft_tokens_for_next_step,
+                self.req_states.draft_tokens,
+            )
+        elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
+            assert self.sampler is not None
+            if isinstance(self.speculator, DraftModelSpeculator):
+                observed_rejected = num_rejected
+                if (
+                    sampler_output.sink is not None
+                    and self.speculator.acceptance_estimator is not None
+                ):
+                    # A rejected draft zero left the drafts unjudged.
+                    observed_rejected = num_rejected.masked_fill(
+                        sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                    )
+                self.speculator.observe_verification(
+                    input_batch.idx_mapping, num_sampled, observed_rejected
+                )
+            # Let the target override the hidden state fed to the drafter
+            # (_mtp_target_states).
+            spec_hidden_states = _mtp_target_states(self.model, draft_hidden_states)
+            if isinstance(self.sampler, GPUWatermarkSampler):
+                self.speculator.prepare_watermarking(
+                    self.sampler._get_contexts(input_batch.idx_mapping),
+                    self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                )
+            with use_workspace_lane(self._draft_workspace_lane):
+                if boundary_state is not None:
+                    self.speculator.boundary_checkpoint_capture = (
+                        boundary_state,
+                        input_batch.idx_mapping,
+                        boundary_capture,
+                    )
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    dp_sync=dp_sync,
+                    num_speculative_tokens=num_spec_tokens_to_schedule,
+                    mm_inputs=mm_inputs,
+                )
+                if boundary_state is not None:
+                    self.speculator.boundary_checkpoint_capture = None
+                draft_tokens = limit_draft_tokens(
+                    draft_tokens,
+                    num_spec_tokens_to_schedule,
+                    self.num_speculative_steps,
+                )
+            num_draft_tokens = draft_tokens.shape[1]
+            if num_draft_tokens > 0:
+                # Into the request states, and read back for the next step.
+                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+                    input_batch.idx_mapping,
+                    draft_tokens,
+                    self.req_states.draft_tokens,
+                    gather=True,
+                )
+            else:
+                draft_tokens_for_next_step = draft_tokens
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.record_confidences(
+                    self.speculator.draft_token_confidence_probs, input_batch
+                )
+        elif self.speculator is not None:
+            draft_tokens_for_next_step = self.req_states.draft_tokens[
+                input_batch.idx_mapping, :0
+            ]
+    
+        if self.num_speculative_steps > 0:
+            # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+            # not have a speculator (i.e. self.speculator is None)
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                (
+                    draft_tokens_for_next_step
+                    if draft_tokens_for_next_step is not None
+                    else self.req_states.draft_tokens[input_batch.idx_mapping]
+                ),
+            )
+    
+            if self.pp_handler is not None:
+                self.pp_handler.broadcast_drafts(
+                    self.req_states.draft_tokens, input_batch
+                )
+    
+        if boundary_state is not None:
+            assert boundary_capture is not None
+            boundary_state.capture_attention(
+                input_batch.idx_mapping, boundary_capture, self.block_tables
+            )
+    
+>       if self.sink is not None:
+           ^^^^^^^^^
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'sink'
+
+vllm/v1/worker/gpu/model_runner.py:3401: AttributeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/attention/test_b12x_v41_ced_metadata.py::test_ced_policy_staging_does_not_synchronize_gpu
+  /usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+    torch._C._cuda_set_sync_debug_mode(debug_mode)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-safetensors]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-fastsafetensors]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_engram_descriptor_loading_preserves_ordinary_weights[disk-instanttensor]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_rows_read_whole_table_sources[0]
+FAILED tests/models/test_deepseek_v4_1_engram.py::test_disk_rows_read_whole_table_sources[3]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[align-prefix-cache]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[no-prefix-cache-with-speculation]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[0]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[2]
+ERROR tests/v1/worker/test_gpu_model_runner_v2.py::test_profile_run_releases_generic_outputs_before_deepseek_profile
+SKIPPED [1] tests/v1/worker/test_gpu_tilelang_inputs.py:939: no budget below the scheduled drafts
+20 failed, 1075 passed, 1 skipped, 15 warnings, 1 error in 225.55s (0:03:45)
+=== CED test files on next-candidate: exit 1
+=== chunking check (record)
+[07:06:04] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[07:06:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[07:06:09] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 07:06:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 07:06:06  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 07:06:06  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 07:06:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 07:06:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 07:06:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+{"tree": "next-candidate", "prompt": 1025, "threshold": 512, "prefix": 0, "chunks": [512, 512, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.0078125, "rows_differing": 38}
+{"tree": "next-candidate", "prompt": 1025, "threshold": 384, "prefix": 0, "chunks": [384, 384, 257], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 1025, "threshold": 512, "prefix": 448, "chunks": [64, 512, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.0078125, "rows_differing": 38}
+{"tree": "next-candidate", "prompt": 1088, "threshold": 512, "prefix": 0, "chunks": [512, 512, 64], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.015625, "rows_differing": 78}
+{"tree": "next-candidate", "prompt": 1088, "threshold": 384, "prefix": 0, "chunks": [384, 384, 320], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 1088, "threshold": 512, "prefix": 448, "chunks": [64, 512, 64], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.015625, "rows_differing": 78}
+{"tree": "next-candidate", "prompt": 1152, "threshold": 512, "prefix": 0, "chunks": [512, 512, 128], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.015625, "rows_differing": 84}
+{"tree": "next-candidate", "prompt": 1152, "threshold": 384, "prefix": 0, "chunks": [384, 384, 384], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 1152, "threshold": 512, "prefix": 448, "chunks": [64, 512, 128], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.015625, "rows_differing": 84}
+{"tree": "next-candidate", "prompt": 1153, "threshold": 512, "prefix": 0, "chunks": [512, 512, 129], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 1153, "threshold": 384, "prefix": 0, "chunks": [384, 384, 384, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.1259765625, "rows_differing": 32}
+{"tree": "next-candidate", "prompt": 1153, "threshold": 512, "prefix": 448, "chunks": [64, 512, 129], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 600, "threshold": 512, "prefix": 448, "chunks": [64, 88], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.2421875, "rows_differing": 75}
+{"tree": "next-candidate", "prompt": 8145, "threshold": 8144, "prefix": 0, "chunks": [8144, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.001953125, "rows_differing": 33}
+{"tree": "next-candidate", "prompt": 16289, "threshold": 8144, "prefix": 0, "chunks": [8144, 8144, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.015625, "rows_differing": 34}
+{"tree": "next-candidate", "prompt": 16289, "threshold": 16288, "prefix": 0, "chunks": [16288, 1], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.015625, "rows_differing": 34}
+{"tree": "next-candidate", "prompt": 8208, "threshold": 8144, "prefix": 0, "chunks": [8144, 64], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.4921875, "rows_differing": 87}
+{"tree": "next-candidate", "prompt": 16352, "threshold": 8144, "prefix": 0, "chunks": [8144, 8144, 64], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.0156240463256836, "rows_differing": 78}
+{"tree": "next-candidate", "prompt": 16352, "threshold": 16288, "prefix": 0, "chunks": [16288, 64], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.0156240463256836, "rows_differing": 78}
+{"tree": "next-candidate", "prompt": 8272, "threshold": 8144, "prefix": 0, "chunks": [8144, 128], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 0.24609375, "rows_differing": 94}
+{"tree": "next-candidate", "prompt": 16416, "threshold": 8144, "prefix": 0, "chunks": [8144, 8144, 128], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.0156240463256836, "rows_differing": 91}
+{"tree": "next-candidate", "prompt": 16416, "threshold": 16288, "prefix": 0, "chunks": [16288, 128], "identical_to_single_chunk": false, "finite": true, "max_abs_difference": 1.0156240463256836, "rows_differing": 91}
+{"tree": "next-candidate", "prompt": 8273, "threshold": 8144, "prefix": 0, "chunks": [8144, 129], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 16417, "threshold": 8144, "prefix": 0, "chunks": [8144, 8144, 129], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tree": "next-candidate", "prompt": 16417, "threshold": 16288, "prefix": 0, "chunks": [16288, 129], "identical_to_single_chunk": true, "finite": true, "max_abs_difference": 0.0, "rows_differing": 0}
+{"tp3_vs_tp4_prompt": 16289, "identical": true}
+{"tp3_vs_tp4_prompt": 16352, "identical": true}
+{"tp3_vs_tp4_prompt": 16416, "identical": true}
+{"tp3_vs_tp4_prompt": 16417, "identical": true}
+{"summary": "chunking check", "per_chunk_anchor": true, "cases": 25, "not_identical_or_not_finite": 17}
+=== chunking check (record): exit 0
+{"steps": [["CED test files on next-candidate", 1], ["chunking check (record)", 0]]}
