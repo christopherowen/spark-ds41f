@@ -242,9 +242,11 @@ def command_stall(args: argparse.Namespace) -> int:
     skipped = [size for size in sizes if longest and size > longest - 1024]
     extra = json.loads(args.extra_body) if args.extra_body else {}
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    probes = tuple(float(offset) for offset in args.probes.split(",")) if args.probes else ()
     samples = stall.run(args.url, model, [s for s in sizes if s not in skipped], streams=args.streams,
                         max_tokens=args.max_tokens, warmup_s=args.warmup, tail_s=args.tail, repeats=args.repeats,
-                        vllm=not args.no_vllm, extra_body=extra,
+                        vllm=not args.no_vllm, extra_body=extra, probes=probes, probe_tokens=args.probe_tokens,
+                        probe_max_tokens=args.probe_max_tokens,
                         log=lambda message: print(message, file=sys.stderr, flush=True))
     rows = stall.summarize(samples)
     result = {"schema": stall.SCHEMA, "tool": {"name": "servebench", "version": __version__},
@@ -252,6 +254,8 @@ def command_stall(args: argparse.Namespace) -> int:
               "server": {"url": args.url, "model": model, "max_model_len": longest},
               "workload": {"sizes": sizes, "streams": args.streams, "max_tokens": args.max_tokens,
                            "warmup_s": args.warmup, "tail_s": args.tail, "repeats": args.repeats, "skipped": skipped,
+                           "probes": list(probes), "probe_tokens": args.probe_tokens,
+                           "probe_max_tokens": args.probe_max_tokens,
                            "extra_body": extra, "question": prefill.QUESTION},
               "stall": rows, "samples": samples}
     if args.output:
@@ -371,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="each stream's output budget; it must outlast warm-up and prefill")
     waits.add_argument("--warmup", type=float, default=20.0, help="seconds of decoding before the document")
     waits.add_argument("--tail", type=float, default=2.0, help="seconds of decoding after its first token")
+    waits.add_argument("--probes", default="",
+                       help="seconds after the document to send short cold requests, comma-separated "
+                            "(their time to first token while it prefills); leave them free slots")
+    waits.add_argument("--probe-tokens", type=int, default=500, help="each probe's prompt size in tokens")
+    waits.add_argument("--probe-max-tokens", type=int, default=64, help="each probe's output budget")
     waits.add_argument("--repeats", type=int, default=3)
     waits.add_argument("--model", help="model id (default: the server's first)")
     waits.add_argument("--extra-body", help="JSON merged into every request body")

@@ -1,0 +1,111 @@
+{
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp3-triangle"
+ },
+ "notes": "spark-ds41f-1025 with prefill yield (vLLM e0ccc837d + vllm/spark-ds41f-1025/0001-0002, mounted from overlay/): a long prompt's aligned chunk gives its step to waiting prompts that finish within one chunk and to held first tokens; 10 s limit.",
+ "set": {
+  "serve_args": [
+   "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+   "--served-model-name",
+   "deepseek-v4.1-flash",
+   "--host",
+   "0.0.0.0",
+   "--port",
+   "8000",
+   "--tokenizer-mode",
+   "deepseek_v41",
+   "--dtype",
+   "bfloat16",
+   "--tensor-parallel-size",
+   "3",
+   "--load-format",
+   "b12x",
+   "--block-size",
+   "256",
+   "--enable-prefix-caching",
+   "--enable-prompt-tokens-details",
+   "--enable-chunked-prefill",
+   "--max-model-len",
+   "1048576",
+   "--max-num-seqs",
+   "8",
+   "--max-parallel-prefills",
+   "1",
+   "--gpu-memory-utilization",
+   "0.82",
+   "--max-num-batched-tokens",
+   "8192",
+   "--kv-cache-memory-bytes",
+   "5268045824",
+   "--max-cudagraph-capture-size",
+   "48",
+   "--generation-config",
+   "vllm",
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":1.0}",
+   "--engram-config",
+   "{\"table_memory\":\"disk\",\"disk_resident_scales\":false,\"projection_tp\":true}",
+   "--attention-backend",
+   "TILELANG",
+   "--linear-backend",
+   "tilelang",
+   "--moe-backend",
+   "tilelang",
+   "--speculative-config",
+   "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":3,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
+   "--jit-monitor-mode",
+   "off",
+   "--compilation-config",
+   "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48]}",
+   "--prefix-cache-retention-interval",
+   "512",
+   "--long-prefill-token-threshold",
+   "8144",
+   "--async-scheduling",
+   "--reasoning-parser",
+   "deepseek_v41",
+   "--tool-call-parser",
+   "deepseek_v41",
+   "--enable-auto-tool-choice",
+   "--distributed-executor-backend",
+   "mp",
+   "--nnodes",
+   "3",
+   "--no-scheduler-reserve-full-isl",
+   "--no-enable-flashinfer-autotune",
+   "--limit-mm-per-prompt",
+   "{\"image\":4}",
+   "--mm-processor-cache-gb",
+   "0",
+   "--prefill-yield",
+   "short",
+   "--prefill-yield-limit-s",
+   "10"
+  ],
+  "container": {
+   "mounts": [
+    [
+     "{checkout}/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{checkout}/experiments/2026-10-26-concurrency-stalls/overlay/vllm/vllm/v1/core/sched/scheduler.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-10-26-concurrency-stalls/overlay/vllm/vllm/config/scheduler.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/config/scheduler.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-10-26-concurrency-stalls/overlay/vllm/vllm/engine/arg_utils.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/engine/arg_utils.py",
+     "ro"
+    ]
+   ]
+  }
+ }
+}

@@ -422,6 +422,30 @@ class StallTest(unittest.TestCase):
         finally:
             fake.close()
 
+    def test_probes_wait_for_the_prefill(self):
+        fake = FakeServer(prefill_stall_s=0.4)
+        try:
+            sample = stall.run(fake.url, "fake-model", [3000], streams=2, max_tokens=200000, warmup_s=0.2,
+                               tail_s=0.6, repeats=1, probes=(0.1, 0.5), probe_tokens=40,
+                               probe_max_tokens=4)[0]
+            self.assertIsNone(sample["error"])
+            during, after = sample["probes"]
+            self.assertTrue(during["during"])
+            self.assertGreaterEqual(during["ttft_s"], 0.25)  # waited for the document's prefill
+            self.assertFalse(after["during"])
+            self.assertLess(after["ttft_s"], 0.2)
+            self.assertEqual(sample["probe_ttft_s"]["n"], 1)
+            self.assertEqual(sample["probe_ttft_max_s"], during["ttft_s"])
+            rows = stall.summarize([sample, sample])
+            self.assertEqual(rows[0]["probe_ttft_p50_s"]["n"], 2)
+            metrics = {row["metric"] for row in stall.compare(rows, rows)["rows"]}
+            self.assertIn("short request TTFT p50 during 3,000 prefill (s)", metrics)
+            # Each probe was cold and short.
+            salts = [salt for salt, chars in fake.seen if chars < LONG_PROMPT and salt]
+            self.assertGreaterEqual(len(set(salts)), 2)
+        finally:
+            fake.close()
+
     def test_short_streams_fail_the_repeat(self):
         fake = FakeServer(prefill_stall_s=0.3)
         try:
