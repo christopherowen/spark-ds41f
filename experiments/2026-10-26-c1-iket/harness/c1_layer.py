@@ -2,7 +2,7 @@
 
 usage: c1_layer.py off|on --tp 4|3 --out DIR [--iket DIR] [--rows 6] [--live N]
                    [--layers L] [--sets S] [--replays N] [--graph] [--evict]
-                   [--routes ROUTES.json] [--start T] [--head] [--mla] [--ar]
+                   [--routes ROUTES.json] [--start T] [--head] [--mla] [--ar] [--front]
                    [--ctas N] [--iters N] [--skip REGEX]
 
 The layer is vLLM's PDL layer chain (tests/kernels/deepseek_v41_pdl_chains.py) at the
@@ -11,6 +11,10 @@ rank's shapes, with every routed expert set taken from DeepSeek's reference rout
 - the attention entry: mHC ``post_pre`` and its finalize, with its output's MXFP8 cast;
 - the fused Q-A/KV GEMM (replicated, 1792 x 5120), the q latent's RMSNorm, Q-B (cast,
   GEMM; 16 heads a rank at TP4, 24 at TP3, whose 64 heads are padded to 72);
+- with ``--front``, the rest of the attention front as the decode forward runs it: the kv
+  latent's RMSNorm, the q heads' RoPE after Q-B, and the kv latent's RoPE and SWA cache
+  record (128-record pages). A build with ``tilelang/front.py`` runs the norms, the
+  Q-B cast, the kv RoPE and the record as its one kernel instead;
 - with ``--mla``, sparse MLA decode at the rank's heads (a 128-entry window and 512
   indexed entries, the ``decode`` route), on its own inputs;
 - WO-A's split-K partials and reduce-cast (2 groups at TP4, 3 at TP3), then WO-B;
@@ -67,6 +71,26 @@ RANK = {
 }
 
 
+KV_LATENT, ROPE_DIM, ROPE_POSITIONS = 512, 64, 4096
+FRONT_EPS, SWA_PAGE = 1e-6, 128
+
+
+def rope_table():
+    """A RoPE cos/sin table, the RoPE test's: ``[positions, cos 32 | sin 32]``."""
+    inv = 1.0 / (10000 ** (torch.arange(0, ROPE_DIM, 2, device=DEVICE).double() / ROPE_DIM))
+    angles = torch.arange(ROPE_POSITIONS, device=DEVICE).double()[:, None] * inv
+    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
+
+
+def fused_front():
+    """The build's one-kernel attention front, if it has one."""
+    try:
+        from vllm.models.deepseek_v4_1.tilelang import front
+    except ImportError:
+        return None
+    return front
+
+
 def default_routes():
     """The json-count experiment's reference routes, beside this experiment's folder."""
     return Path(__file__).resolve().parents[2] / "2026-10-18-json-count" / "runs" / "ref-woa1.json"
@@ -97,7 +121,7 @@ class WeightSet:
     """One layer's weights at the rank's shapes: two mHC entries, the attention
     projections, the shared expert and the 384 routed experts."""
 
-    def __init__(self, tp, rows, gen):
+    def __init__(self, tp, rows, gen, front=False):
         from tests.kernels.deepseek_v41_pdl_chains import _block32, _Entry, _Projection
         from vllm.models.deepseek_v4_1.tilelang.activation import swiglu_clamp_kernel
         from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan
@@ -113,6 +137,11 @@ class WeightSet:
         self.q_norm = TileLangRMSNorm(Q_LATENT)
         self.q_norm.weight.data = (torch.randn(Q_LATENT, generator=gen, device=DEVICE) * 0.1 + 1.0).bfloat16()
         self.q_norm.declare_kernels()
+        if front:
+            self.kv_norm = TileLangRMSNorm(KV_LATENT, FRONT_EPS)
+            self.kv_norm.weight.data = (torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.1
+                                        + 1.0).bfloat16()
+            self.kv_norm.declare_kernels()
         self.q_b = _block32(q_b, Q_LATENT, gen)
         self.wo = TileLangWOProjection(_Projection(wo_a, 4096, gen), _Projection(HIDDEN, wo_b, gen),
                                        groups=shape["groups"])
@@ -138,11 +167,18 @@ class WeightSet:
 class Layer:
     """One layer's buffers over a weight set, and its launches (``run``)."""
 
-    def __init__(self, tp, rows, weights, ids, gen, aux, ar=False):
+    def __init__(self, tp, rows, weights, ids, gen, aux, ar=False, front=None):
         from vllm.models.deepseek_v4_1.tilelang import linear
         from vllm.models.deepseek_v4_1.tilelang.moe import workspace_bytes
 
         self.tp, self.rows, self.w, self.aux, self.ar = tp, rows, weights, aux, ar
+        # ``front``: (the RoPE table, the build's fused front or None).
+        self.front = front
+        if front is not None:
+            self.kvn = torch.empty((rows, KV_LATENT), dtype=torch.bfloat16, device=DEVICE)
+            self.positions = torch.randint(0, ROPE_POSITIONS, (rows,), generator=gen, device=DEVICE)
+            self.slots = torch.randperm(2 * SWA_PAGE, generator=gen, device=DEVICE)[:rows]
+            self.pages = torch.zeros((2, SWA_PAGE * 528), dtype=torch.uint8, device=DEVICE)
         shape = RANK[tp]
         inter = shape["inter"]
         self.ids = torch.tensor(ids, dtype=torch.int32, device=DEVICE).contiguous()
@@ -186,8 +222,11 @@ class Layer:
         a, f = w.attention_entry, w.ffn_entry
         a(x, streams, post, comb, pre)
         linear._block32_gemm(w.qa_kv, a.mx.values, a.mx.scales, self.qa, rows)
-        w.q_norm(self.qa[:, :Q_LATENT], out=self.qn)
-        self._project("q_b", w.q_b, self.qn, self.qb)
+        if self.front is None:
+            w.q_norm(self.qa[:, :Q_LATENT], out=self.qn)
+            self._project("q_b", w.q_b, self.qn, self.qb)
+        else:
+            self._front()
         if mla is not None:
             mla()
         xq, sf = self.casts["wo_b"]
@@ -215,9 +254,33 @@ class Layer:
             return self.out_ar, f.streams, f.post, f.comb, f.pre
         return self.out, f.streams, f.post, f.comb, f.pre
 
+    def _front(self):
+        """The attention front after the fused projection, as the build runs it."""
+        from vllm.models.deepseek_v4_1.tilelang import linear
+        from vllm.models.deepseek_v4_1.tilelang.cache_writer import write_cache
+        from vllm.models.deepseek_v4_1.tilelang.rope import rope_
+
+        rows, w, (table, fused) = self.rows, self.w, self.front
+        heads = RANK[self.tp]["heads"]
+        if fused is not None:
+            xq, sf = self.casts["q_b"]
+            fused.attention_front(self.qa, w.q_norm.weight, w.kv_norm.weight, FRONT_EPS, self.positions,
+                                  table, self.pages, self.slots, SWA_PAGE, self.qn, xq[:rows], sf[:rows],
+                                  self.kvn)
+            linear._block32_gemm(w.q_b, xq, sf, self.qb, rows)
+            rope_(self.qb.view(rows, heads, 512), self.positions, table, 1, False)
+            return
+        w.q_norm(self.qa[:, :Q_LATENT], out=self.qn)
+        w.kv_norm(self.qa[:, Q_LATENT:], out=self.kvn)
+        self._project("q_b", w.q_b, self.qn, self.qb)
+        rope_(self.qb.view(rows, heads, 512), self.positions, table, 1, False)
+        rope_(self.kvn, self.positions, table, 1, False)
+        write_cache(self.kvn, self.pages, self.slots, page_size=SWA_PAGE, cache_kind="swa")
+
     def outputs(self):
         a, f, rows = self.w.attention_entry, self.w.ffn_entry, self.rows
         out = {"q-a/kv": self.qa, "q latent": self.qn, "q-b": self.qb, "wo-b": self.wo_out,
+               **({"kv latent": self.kvn, "swa pages": self.pages} if self.front is not None else {}),
                "shared down": self.shared_out, "layer output": self.out}
         for name, entry in (("attention", a), ("ffn", f)):
             out[f"{name} y"] = entry.y
@@ -302,6 +365,7 @@ def main():
     ap.add_argument("--head", action="store_true")
     ap.add_argument("--mla", action="store_true")
     ap.add_argument("--ar", action="store_true", help="a copy off the PDL chain for each all-reduce")
+    ap.add_argument("--front", action="store_true", help="the attention front's norms, RoPEs, cache write")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     ap.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
@@ -321,10 +385,23 @@ def main():
     gen = torch.Generator(device=DEVICE).manual_seed(args.seed)
     started = time.monotonic()
     with set_current_vllm_config(VllmConfig()):
-        sets = [WeightSet(args.tp, args.rows, gen) for _ in range(args.sets)]
+        sets = [WeightSet(args.tp, args.rows, gen, args.front) for _ in range(args.sets)]
+        front = None
+        if args.front:
+            from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
+            from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+
+            fused = fused_front()
+            calls = [rope_call(RANK[args.tp]["heads"], 512, ROPE_DIM, 1, False)]
+            if fused is not None:
+                calls.append(fused.front_call(FRONT_EPS, SWA_PAGE, torch.int64))
+            else:
+                calls += [rope_call(1, KV_LATENT, ROPE_DIM, 1, False), writer_call("swa", SWA_PAGE, torch.int64)]
+            prepare.declare(lambda: calls)
+            front = (rope_table(), fused)
         aux = torch.cuda.Stream()
         chain_layers = [(args.first_layer + i) % LAYERS for i in range(args.layers)]
-        layers = [Layer(args.tp, args.rows, sets[i % args.sets], routes[ref], gen, aux, args.ar)
+        layers = [Layer(args.tp, args.rows, sets[i % args.sets], routes[ref], gen, aux, args.ar, front)
                   for i, ref in enumerate(chain_layers)]
         x = (torch.randn((args.rows, HIDDEN), generator=gen, device=DEVICE)).bfloat16()
         streams = torch.randn((args.rows, mhc.MULT * HIDDEN), generator=gen, device=DEVICE).bfloat16()

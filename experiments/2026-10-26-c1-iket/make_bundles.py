@@ -43,6 +43,7 @@ FUSION = "c1-fusion"
 FUSION2 = "c1-fusion2"
 MHCFOLD = "c1-mhcfold"
 MIXAUX = "c1-mixaux"
+FRONT = "c1-front"
 MHC_TESTS = "tests/kernels/test_deepseek_v41_tilelang_mhc.py"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
@@ -293,6 +294,32 @@ BUNDLES = {
              "TP4 and TP3 shapes",
         steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
                                      *(f"tp={tp} rows={rows} live={live} ar=on"
+                                       for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
+                14400)],
+    ),
+    "front-tests": dict(
+        ref=FRONT,
+        what="the attention front in one launch (q/kv norms, the Q-B cast, the kv RoPE and SWA "
+             "record): its bit-identity test against the five kernels, the RoPE and cache-writer "
+             "tests, every launched kernel source-checked",
+        tests=["tests/kernels/test_deepseek_v41_tilelang_front.py",
+               "tests/kernels/test_deepseek_v41_tilelang_rope.py",
+               "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py",
+               "tests/kernels/deepseek_v41_pdl_sources.py", "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("front, RoPE and cache-writer tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest",
+                 "tests/kernels/test_deepseek_v41_tilelang_front.py",
+                 "tests/kernels/test_deepseek_v41_tilelang_rope.py",
+                 "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py"], 3600)],
+    ),
+    "front-ab": dict(
+        ref=LEVER2_BASE,
+        builds={"front": FRONT},
+        what="the attention front in one launch against next-candidate on the layer harness with "
+             "the production front (--front) and all-reduce stand-ins, in alternation, four rounds: "
+             "c1, c8 and c16 at TP4 and TP3 shapes",
+        steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
+                                     *(f"tp={tp} rows={rows} live={live} ar=on front=on"
                                        for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
                 14400)],
     ),
