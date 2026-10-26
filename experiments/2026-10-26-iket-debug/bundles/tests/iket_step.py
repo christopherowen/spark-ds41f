@@ -1,8 +1,12 @@
 """DS4.1 decode steps end to end on one GPU, for IKET traces.
 
 usage: iket_step.py off|on --out DIR [--iket DIR] [--ctas N] [--iters N] [--skip REGEX]
+                    [--tp-shape 1|3|4] [--requests N] [--tokens N] [--drafts N]
                     [--eager] [--filled] [--batched N] [--chunk N] [--model DIR]
-                    [--drafts N] [--tokens N] [--overrides JSON]
+                    [--overrides JSON]
+
+``--tp-shape`` gives the layers one rank's shapes at TP4 (the ring) or TP3 (the
+triangle); ``--requests`` is the measured batch (c1, c8).
 
 vLLM's engine runs in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0) on DS4.1-Flash-1017's
 config with dummy weights, at TP1, with the production recipe's kernels and graphs: the
@@ -48,6 +52,15 @@ TEXT_OVERRIDES = {
     "candidate_source_layer_id": 4,
     "engram_layer_ids": [],
     "dspark_target_layer_ids": [3, 4, 5],
+}
+# One rank's shapes at a TP size, at TP1 (the c1 study's harness/c1_layer.py RANK): the
+# ring (TP4) and the triangle (TP3, whose 64 heads are padded to 72). The routed and
+# shared experts' columns, the heads and WO-A's groups shard; the vocabulary head and
+# embedding stay whole at TP1 (a rank's are a TP-th of them).
+TP_SHAPES = {
+    1: {},
+    3: {"num_attention_heads": 24, "o_groups": 3, "moe_intermediate_size": 768},
+    4: {"num_attention_heads": 16, "o_groups": 2, "moe_intermediate_size": 576},
 }
 PROMPTS = [
     "Explain in detail how a sparse mixture-of-experts layer routes each token to its experts, "
@@ -107,6 +120,8 @@ def main():
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--drafts", type=int, default=5)
     parser.add_argument("--tokens", type=int, default=8)
+    parser.add_argument("--requests", type=int, default=1,
+                        help="concurrent requests in the measured batch (c1, c8)")
     parser.add_argument("--ctas", type=int, default=0, help="VLLM_DS41_IKET_CTAS")
     parser.add_argument("--iters", type=int, default=0, help="VLLM_DS41_IKET_ITERS")
     parser.add_argument("--skip", default="", help="VLLM_DS41_IKET_SKIP")
@@ -117,11 +132,13 @@ def main():
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
+    parser.add_argument("--tp-shape", type=int, choices=sorted(TP_SHAPES), default=1,
+                        help="one rank's shapes at this TP size (TP_SHAPES)")
     parser.add_argument("--overrides", default="{}",
                         help="JSON: text-config overrides applied after the six-layer set "
-                             "(e.g. one rank's shapes at a TP size)")
+                             "and --tp-shape")
     args = parser.parse_args()
-    overrides = {**TEXT_OVERRIDES, **json.loads(args.overrides)}
+    overrides = {**TEXT_OVERRIDES, **TP_SHAPES[args.tp_shape], **json.loads(args.overrides)}
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -158,8 +175,8 @@ def main():
         tensor_parallel_size=1,
         block_size=256,
         max_model_len=8192,
-        # Two: the dead-row warmup launches for one request and for two.
-        max_num_seqs=2,
+        # At least two: the dead-row warmup launches for one request and for two.
+        max_num_seqs=max(2, args.requests),
         # A small profile run keeps the startup's share of a trace small; prefill
         # chunks are aligned, as CED's nonfinal-row skip requires (production: 8,192),
         # with room in the step for the decode rows beside one.
@@ -185,9 +202,9 @@ def main():
         },
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
-            # One and two requests' verification rows (1 + drafts each): fewer warmup
-            # launches, each of which reserves IKET records.
-            "cudagraph_capture_sizes": [args.drafts + 1, 2 * (args.drafts + 1)],
+            # One, two and the measured batch's requests' verification rows (1 + drafts
+            # each): fewer warmup launches, each of which reserves IKET records.
+            "cudagraph_capture_sizes": sorted({n * (args.drafts + 1) for n in (1, 2, args.requests)}),
         },
         generation_config="vllm",
         hf_overrides=functools.partial(shrink, overrides=overrides),
@@ -208,7 +225,9 @@ def main():
     marker(count)
     torch.cuda.synchronize()
     started = time.monotonic()
-    measured = llm.generate([PROMPTS[1]], greedy)[0]
+    prompts = [PROMPTS[1]] + [f"{PROMPTS[1]} Version {i + 1}." for i in range(1, args.requests)]
+    outputs = llm.generate(prompts, greedy)
+    measured = outputs[0]
     torch.cuda.synchronize()
     timings.append(time.monotonic() - started)
     marker(count)
@@ -220,8 +239,11 @@ def main():
         "mode": args.mode,
         "boot_s": round(boot, 1),
         "request_s": [round(t, 3) for t in timings],
+        "requests": args.requests,
+        "tokens": args.tokens,
         "prompt_tokens": len(measured.prompt_token_ids),
         "token_ids": list(measured.outputs[0].token_ids),
+        "generated": [len(output.outputs[0].token_ids) for output in outputs],
         "logprobs": [{str(t): float(p.logprob) for t, p in sorted(step.items())}
                      for step in measured.outputs[0].logprobs or []],
         "batched": args.batched,
@@ -233,6 +255,7 @@ def main():
         "filled": args.filled,
         "eager": args.eager,
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
+        "tp_shape": args.tp_shape,
         "text_overrides": overrides,
         "drafts": args.drafts,
     }
@@ -242,12 +265,14 @@ def main():
     # and GPU share memory: release the engine's first (run 26 ran out in the decode).
     free = torch.cuda.mem_get_info()[0]
     llm.llm_engine.engine_core.shutdown()
-    del llm, measured
+    del llm, measured, outputs
     gc.collect()
     torch.cuda.empty_cache()
     result["freed_gib_before_exit"] = round((torch.cuda.mem_get_info()[0] - free) / 2**30, 1)
+    result["allocated_gib_at_exit"] = round(torch.cuda.memory_allocated() / 2**30, 1)
     (out / "result.json").write_text(json.dumps(result, indent=1) + "\n")
-    print(f"engine shut down: {result['freed_gib_before_exit']} GiB freed", flush=True)
+    print(f"engine shut down: {result['freed_gib_before_exit']} GiB freed, "
+          f"{result['allocated_gib_at_exit']} GiB still allocated", flush=True)
 
 
 if __name__ == "__main__":

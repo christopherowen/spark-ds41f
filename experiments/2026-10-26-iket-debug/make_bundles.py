@@ -58,6 +58,44 @@ STEP_ENV = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
 }
 
+def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_|topk_topp)"):
+    """A bundle timing DS4.1 decode steps, kernel by kernel and phase by phase: iket_step.py
+    at TP1 with one rank's shapes at ``tp``, ``requests`` concurrent requests of ``tokens``
+    tokens, on under run-iket (``ctas`` CTAs a launch and ``iters`` iterations a loop
+    record ranges), then nsys of off with the graphs, the records against the dry run's
+    count, and the timeline and tables of the measured requests."""
+    shape = ["--tp-shape", str(tp), "--requests", str(requests), "--tokens", str(tokens)]
+    return dict(
+        ref=ref,
+        what=f"DS4.1 decode steps timed by kernel and phase: TP{tp} rank shapes at TP1 (six layers "
+             f"and the drafter, dummy weights, the production recipe's kernels and graphs), "
+             f"c{requests}, {tokens} tokens a request; on under run-iket ({ctas} CTAs a launch, "
+             f"{iters} iteration(s) a loop), nsys of off with the graphs, the timeline and tables",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            # The dry run alone, then the measured run sized from its largest process count
+            # (run-iket reads only the first process's: iket_profile.py).
+            ("decode steps, on, under run-iket",
+             ["{python}", "/b/iket_profile.py", "{out}", "--",
+              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", str(ctas),
+              "--iters", str(iters), "--skip", skip, *shape, "--out", "{out}/trace-run"], 7200),
+            ("records against the dry run's count",
+             ["{python}", "/b/trace_counts.py", "{out}/trace", "{out}/trace-run/iket/sources",
+              "--tracker", "{out}/dry/tracker"], 1800),
+            ("decode steps, nsys, off, graphs",
+             [*NSYS_PROFILE, "{out}/nsys-graphs", "--cuda-graph-trace=node", "{python}", STEP, "off",
+              *shape, "--out", "{out}/nsys-graphs-run"], 5400),
+            ("timeline and tables",
+             ["{python}", TABLE, "{out}/trace", "--sources", "{out}/trace-run/iket/sources",
+              "--between", "iket_step_marker_kernel", "--gap-us", "200",
+              "--nsys", "graphs={out}/nsys-graphs.sqlite", "--json", "{out}/table.json"], 1800),
+            ("nsys timeline", ["{python}", "/b/nsys_window.py", "{out}/nsys-graphs.sqlite",
+                               "--gap-us", "200"], 600),
+        ],
+    )
+
+
 # The decode step's instrumented kernels (run 18) by family. Each step-counts dry run
 # instruments one family, to find the kernel whose warps record past the static bound.
 COUNT_FAMILIES = {
@@ -161,12 +199,14 @@ BUNDLES = {
             # dry run's 424 a warp, runs 14-20; a cap under it crashed the exit dump).
             # The vision tower and the top-k/top-p sampler are not in a greedy text decode
             # step; left uninstrumented, their warps reserve no records.
+            # run-iket reads only the first process's count (run 28): iket_profile.py.
             ("decode steps, on, under run-iket",
-             [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
+             ["{python}", "/b/iket_profile.py", "{out}", "--",
               "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4",
               "--iters", "1", "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
-                                       "{out}/trace-run/iket/sources"], 1800),
+                                       "{out}/trace-run/iket/sources", "--tracker", "{out}/dry/tracker"],
+             1800),
             ("decode steps, nsys, off, eager",
              [*NSYS_PROFILE, "{out}/nsys-eager", "{python}", STEP, "off", "--eager",
               "--out", "{out}/nsys-eager-run"], 5400),
@@ -263,6 +303,7 @@ BUNDLES = {
                                "{out}/capped-run/iket/sources"], 1800),
         ],
     ),
+    **{f"step-tp{tp}-c{requests}": step_spec(IKET, tp, requests) for tp in (4, 3) for requests in (1, 8)},
     "tests": dict(
         ref=IKET,
         what="the IKET mode's tests alone",
@@ -358,7 +399,7 @@ sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 SCRIPTS = {"iket_hot.py": HERE / "harness" / "iket_hot.py", "iket_step.py": HERE / "harness" / "iket_step.py",
            "sass_check.py": HERE / "harness" / "sass_check.py",
            "trace_counts.py": HERE / "harness" / "trace_counts.py", "iket_table.py": HERE / "iket_table.py",
-           "nsys_window.py": HERE / "nsys_window.py"}
+           "nsys_window.py": HERE / "nsys_window.py", "iket_profile.py": HERE / "harness" / "iket_profile.py"}
 
 
 def git(repo, *args):
@@ -370,59 +411,66 @@ def show(repo, ref, path):
                           capture_output=True).stdout
 
 
+def write_bundle(repo, name, spec, bundle, image=IMAGE, base=BASE):
+    """Write bundle ``name`` (a BUNDLES entry's shape) to the directory ``bundle``: the
+    package files ``spec["ref"]`` changes from ``base``, the image's vLLM tree, as an
+    overlay, this experiment's scripts, and the steps."""
+    ref, tests = spec["ref"], spec.get("tests", [])
+    head = git(repo, "rev-parse", "--short=9", ref).strip()
+    status = [line.split("\t") for line in
+              git(repo, "diff", "--no-renames", "--name-status", base, ref).splitlines() if line]
+    package = [(kind, path) for kind, path in status if path.startswith("vllm/")]
+    bundle.mkdir(parents=True, exist_ok=True)
+    planned = {"run.py", "steps.json", "candidate.json", *SCRIPTS}
+    planned |= {f"overlay/{path}" for _, path in package}
+    planned |= {path.replace("/", "_") for path in tests}
+    # Files are overwritten in place, never deleted: a file this run would not
+    # write stops it, for a person to remove.
+    stale = sorted(str(p.relative_to(bundle)) for p in bundle.rglob("*")
+                   if p.is_file() and str(p.relative_to(bundle)) not in planned)
+    if stale:
+        raise SystemExit(f"{bundle} holds files this run would not write: {stale}")
+    for kind, path in package:
+        target = bundle / "overlay" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(MISSING.encode() if kind == "D" else show(repo, ref, path))
+    for path in tests:
+        (bundle / path.replace("/", "_")).write_bytes(show(repo, ref, path))
+    for target, source in SCRIPTS.items():
+        shutil.copy(source, bundle / target)
+    (bundle / "run.py").write_text(RUN)
+    (bundle / "steps.json").write_text(json.dumps(spec["steps"], indent=1) + "\n")
+    candidate = {
+        "description": f"{spec['what']} (vLLM {ref} {head}, {len(package)} package files over "
+                       f"{base}) on {image}.",
+        "image": image,
+        "env": {
+            "HF_HUB_OFFLINE": "1",
+            "IKET_BUNDLE": name,
+            "TILELANG_CACHE_DIR": f"/c/tilelang-iket-{name}",
+            "TRITON_CACHE_DIR": f"/c/triton-iket-{name}",
+            "VLLM_CACHE_ROOT": f"/c/vllm-iket-{name}",
+            "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm",
+            **spec.get("env", {}),
+        },
+        "workdir": "vllm",
+        "argv": ["/b/run.py"],
+        "verdict": "status",
+        "mounts": [["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
+                   *([target, f"/b/{target}"] for target in SCRIPTS), NSYS, *spec.get("mounts", []),
+                   *([path.replace("/", "_"), f"{ROOT}/{path}"] for path in tests)],
+    }
+    (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
+    return f"{name}: {ref} {head}, {len(package)} package files, {len(spec['steps'])} steps"
+
+
 def main():
     repo = sys.argv[1]
     only = sys.argv[sys.argv.index("--only") + 1:] if "--only" in sys.argv else []
     for name, spec in BUNDLES.items():
         if only and name not in only:
             continue
-        ref, tests = spec["ref"], spec.get("tests", [])
-        head = git(repo, "rev-parse", "--short=9", ref).strip()
-        status = [line.split("\t") for line in
-                  git(repo, "diff", "--no-renames", "--name-status", BASE, ref).splitlines() if line]
-        package = [(kind, path) for kind, path in status if path.startswith("vllm/")]
-        bundle = HERE / "bundles" / name
-        planned = {"run.py", "steps.json", "candidate.json", *SCRIPTS}
-        planned |= {f"overlay/{path}" for _, path in package}
-        planned |= {path.replace("/", "_") for path in tests}
-        # Files are overwritten in place, never deleted: a file this run would not
-        # write stops it, for a person to remove.
-        stale = sorted(str(p.relative_to(bundle)) for p in bundle.rglob("*")
-                       if p.is_file() and str(p.relative_to(bundle)) not in planned)
-        if stale:
-            raise SystemExit(f"{bundle} holds files this run would not write: {stale}")
-        for kind, path in package:
-            target = bundle / "overlay" / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(MISSING.encode() if kind == "D" else show(repo, ref, path))
-        for path in tests:
-            (bundle / path.replace("/", "_")).write_bytes(show(repo, ref, path))
-        for target, source in SCRIPTS.items():
-            shutil.copy(source, bundle / target)
-        (bundle / "run.py").write_text(RUN)
-        (bundle / "steps.json").write_text(json.dumps(spec["steps"], indent=1) + "\n")
-        candidate = {
-            "description": f"{spec['what']} (vLLM {ref} {head}, {len(package)} package files over the "
-                           f"release's {BASE}) on candidate 6's image.",
-            "image": IMAGE,
-            "env": {
-                "HF_HUB_OFFLINE": "1",
-                "IKET_BUNDLE": name,
-                "TILELANG_CACHE_DIR": f"/c/tilelang-iket-{name}",
-                "TRITON_CACHE_DIR": f"/c/triton-iket-{name}",
-                "VLLM_CACHE_ROOT": f"/c/vllm-iket-{name}",
-                "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm",
-                **spec.get("env", {}),
-            },
-            "workdir": "vllm",
-            "argv": ["/b/run.py"],
-            "verdict": "status",
-            "mounts": [["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
-                       *([target, f"/b/{target}"] for target in SCRIPTS), NSYS, *spec.get("mounts", []),
-                       *([path.replace("/", "_"), f"{ROOT}/{path}"] for path in tests)],
-        }
-        (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
-        print(f"{name}: {ref} {head}, {len(package)} package files, {len(spec['steps'])} steps")
+        print(write_bundle(repo, name, spec, HERE / "bundles" / name))
 
 
 if __name__ == "__main__":
