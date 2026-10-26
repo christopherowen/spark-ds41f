@@ -9,126 +9,104 @@
    "tokens": 2.269
   }
  },
- "experts": 13.8,
- "launches": 43,
  "levers": [
   {
-   "lever": "Routed experts as one continuous FC1-FC2 stream (FC1 tail, SwiGLU, FC2 ramp, FC2 at rate)",
-   "owner": "this study (prototype 1 is the stream GEMM, a part of it)",
-   "parts_us_per_layer": {
-    "SwiGLU kernel and its gaps": [
-     3.77,
-     3.77
-    ],
-    "FC2 ramp (half its fixed cost)": [
-     4.63,
-     4.63
-    ],
-    "FC1 tail (half its fixed cost)": [
-     7.1,
-     7.1
-    ],
-    "FC2 above the attainable rate an expert": [
-     6.04,
-     8.06
-    ]
-   },
-   "TP4": {
-    "saved_ms": 0.927,
-    "step_ms": 30.3,
-    "tok_s": 77.8,
-    "today_tok_s": 75.4,
-    "gain_percent": 3.15
-   },
-   "TP3": {
-    "saved_ms": 1.013,
-    "step_ms": 37.41,
-    "tok_s": 62.3,
-    "today_tok_s": 60.7,
-    "gain_percent": 2.78
-   }
-  },
-  {
-   "lever": "All-reduce: peer skew and in-kernel staging, at most the DRAM-idle time under collectives",
-   "owner": "sparknet (cluster-only; not prototyped here)",
-   "TP4": {
-    "saved_ms": 0.95,
-    "step_ms": 30.3,
-    "tok_s": 77.8,
-    "today_tok_s": 75.4,
-    "gain_percent": 3.24
-   },
-   "TP3": {
-    "saved_ms": 0.95,
-    "step_ms": 37.41,
-    "tok_s": 62.2,
-    "today_tok_s": 60.7,
-    "gain_percent": 2.61
-   }
-  },
-  {
    "lever": "L2 prefetch timed against its consumers",
-   "owner": "l2-prefetch-timing session (not counted here)",
+   "owner": "l2-prefetch-timing session (#615)",
+   "evidence": "1.67 ms of consumer excess (moe-overlap, PDL records); its prototype measured -1.5% c1",
    "TP4": {
     "saved_ms": 1.67,
-    "step_ms": 30.3,
     "tok_s": 79.8,
-    "today_tok_s": 75.4,
     "gain_percent": 5.83
    },
    "TP3": null
   },
   {
-   "lever": "LM heads at the attainable rate (#598 row 12)",
-   "owner": "unclaimed",
+   "lever": "Latency-bound small kernels (mHC non-byte, sparse MLA, q-norm and cast, dispatch, SwiGLU)",
+   "owner": "fusion survey (#583)",
+   "evidence": "layer tables: their cost, mHC's excess over its fn bytes",
+   "us_per_layer": {
+    "TP4": 33.9,
+    "TP3": 33.4
+   },
    "TP4": {
-    "saved_ms": 0.2,
-    "step_ms": 30.3,
-    "tok_s": 75.9,
-    "today_tok_s": 75.4,
-    "gain_percent": 0.66
+    "saved_ms": 1.358,
+    "tok_s": 78.9,
+    "gain_percent": 4.69
    },
    "TP3": {
-    "saved_ms": 0.267,
-    "step_ms": 37.41,
+    "saved_ms": 1.334,
+    "tok_s": 62.9,
+    "gain_percent": 3.7
+   }
+  },
+  {
+   "lever": "All-reduce: peer lateness and staging, at most the DRAM-idle time under collectives",
+   "owner": "sparknet; cluster only (ring: dgx4 last in 39% of collectives, 10-03)",
+   "evidence": "#598: 0.95 ms DRAM idle under collectives; IKET: the time is the peer wait",
+   "TP4": {
+    "saved_ms": 0.95,
+    "tok_s": 77.8,
+    "gain_percent": 3.24
+   },
+   "TP3": {
+    "saved_ms": 0.95,
+    "tok_s": 62.2,
+    "gain_percent": 2.61
+   }
+  },
+  {
+   "lever": "Stream boundaries' ramps and tails filled with known traffic (the next window's prefetch)",
+   "owner": "l2-prefetch-timing session",
+   "evidence": "bound: one launch a layer is this much slower than one launch for all layers, for an ideal read of the same bytes",
+   "us_per_layer": {
+    "TP4": 11.0,
+    "TP3": 5.3
+   },
+   "TP4": {
+    "saved_ms": 0.472,
+    "tok_s": 76.6,
+    "gain_percent": 1.58
+   },
+   "TP3": {
+    "saved_ms": 0.227,
+    "tok_s": 61.0,
+    "gain_percent": 0.61
+   }
+  },
+  {
+   "lever": "Routed experts restructured: continuous FC1-FC2, persistent or stream GEMMs, deeper stages, warp-specialized producer, fused SwiGLU",
+   "owner": "this study",
+   "evidence": "bound: the routed chain less an ideal one-launch read of the same bytes",
+   "us_per_layer": {
+    "TP4": 6.8,
+    "TP3": 6.2
+   },
+   "TP4": {
+    "saved_ms": 0.294,
+    "tok_s": 76.1,
+    "gain_percent": 0.98
+   },
+   "TP3": {
+    "saved_ms": 0.266,
     "tok_s": 61.1,
-    "today_tok_s": 60.7,
     "gain_percent": 0.72
    }
   },
   {
-   "lever": "Routed GEMMs: deeper stages, warp-specialized producer, fewer block syncs (steady state)",
-   "owner": "none: the steady stream is at 98% of the attainable rate",
+   "lever": "LM heads at the attainable rate",
+   "owner": "unclaimed",
+   "evidence": "layer tables: the head's excess over its bytes, two heads a step",
    "TP4": {
-    "saved_ms": 0.0,
-    "step_ms": 30.3,
-    "tok_s": 75.4,
-    "today_tok_s": 75.4,
-    "gain_percent": 0.0
+    "saved_ms": 0.083,
+    "tok_s": 75.6,
+    "gain_percent": 0.27
    },
    "TP3": {
-    "saved_ms": 0.0,
-    "step_ms": 37.41,
-    "tok_s": 60.7,
-    "today_tok_s": 60.7,
-    "gain_percent": 0.0
+    "saved_ms": 0.11,
+    "tok_s": 60.8,
+    "gain_percent": 0.3
    }
   }
- ],
- "this_study_and_unclaimed_combined": {
-  "TP4": {
-   "saved_ms": 2.077,
-   "step_ms": 30.3,
-   "tok_s": 80.9,
-   "today_tok_s": 75.4,
-   "gain_percent": 7.36
-  },
-  "TP3": {
-   "saved_ms": 2.23,
-   "step_ms": 37.41,
-   "tok_s": 64.5,
-   "today_tok_s": 60.7,
-   "gain_percent": 6.34
-  }
- }
+ ]
 }

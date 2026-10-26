@@ -17,35 +17,48 @@ waited for a cable that afternoon, the coordinator gave this study dgx1 alone. E
 below ran there from 13:50 CET, one bundle at a time under lab.py's GPU lock, from this
 branch's checkout in `~/spark-lab/agents/c1-iket/` ([Runs](#runs-on-dgx1)).
 
-## The short answer so far
+## The short answer
 
-- **The routed experts' waits are the weight stream itself.** In IKET's hot traces the
-  gate-up GEMM's warps spend 44% of their time waiting for TMA weight tiles. The GEMM
-  still streams at 256 GB/s (FC2: 266) against the attainable 266.6, so these waits
-  are DRAM time. More stages, a warp-specialized producer or fewer block syncs cannot
-  shorten the steady stream. The block sync after `cp_async_wait` (19.5%) comes after
-  the next K block's loads have issued, so it does not cut the bytes in flight.
-- **What c1 pays is each launch's ramp and tail, and the kernel between the GEMMs.**
-  At c1 a layer reads about 14 experts, a few waves of 48 SMs. In production, at TP4,
-  each layer's routed chain spends:
-  - 3.8 µs in the SwiGLU and its two idle gaps;
-  - 9.3 µs of FC2 fixed cost (a regression over 400 traced layers, r² 0.96);
-  - 6.2 µs an expert in FC2 against 5.7 at the attainable rate;
-  - FC1's fixed cost, about 14 µs in the bench.
+- **Where c1 kernels wait.** At a TP4 rank's shapes and the suite's routes:
+  - The routed FC1 GEMM's warps spend 65% of their time waiting: 36% for TMA weight
+    tiles, 20% at the block sync after the activation copies.
+  - FC2's CTAs live 4 µs each, and 13% of that is their prologue's base-exponent loads.
+  - The dense GEMMs wait 50-65% on their cp.async weight copies, and 14-21% at the sync
+    after them.
+  - The all-reduce waits at the barrier after its peers' flags: 68% of its time with the
+    peers ready, 90% with them 20 µs late.
+- **The routed experts' waits are DRAM time, and the chain is already close to an
+  ideal stream.** On one GPU, next-candidate's routed chain (dispatch, FC1, SwiGLU, FC2,
+  combine) runs within 0.9-6.8 µs a layer of an ideal one-launch read of the same
+  expert bytes:
+  - TP4: 251.8 against 245.0 µs at 13 experts, 446.3 against 441.6 at 24;
+  - TP3: 324.2 against 318.0, and 584.4 against 583.5.
 
-  Even a plain 18 MiB read pays about 11 µs of ramp and tail on GB10.
-- **One continuous FC1-FC2 stream is the largest lever this study owns.** It removes
-  FC1's tail, the SwiGLU launch and FC2's ramp, and brings FC2 to the attainable rate.
-  Ceiling: TP4 0.93 ms a step, 75.4 → 77.8 tok/s (+3.2%); TP3 1.01 ms, 60.7 → 62.3
-  (+2.8%). It sits inside #598's rows 5 and 11 (1.51 ms), not beside them.
-- **The all-reduces wait for late peers.** With its peers ready, the kernel spends 68%
-  of its time at the barrier after the peer-flag poll; with them 20 µs late, 90%. The
-  lateness is compute jitter between ranks (79%, the 10-07 attribution). Its ceiling is
-  #598's: at most the 0.95 ms of DRAM-idle time under collectives (+3.2%). It needs the
-  cluster, so it is not prototyped here.
-- **Prototype 1, the stream grouped GEMM, is built and waits for dgx4.** It is a part of
-  the continuous stream, bit-identical by construction, and has a bit-identity test.
-  Its gated A/B against next-candidate is ready (`bundles/stream-ab`).
+  So no restructuring of the routed experts recovers more than about 0.3 ms a step:
+  TP4 ≤ +1.0%, TP3 ≤ +0.7%. That covers a continuous FC1-FC2 stream, persistent or
+  stream GEMMs, deeper stages, a warp-specialized producer, a fused SwiGLU and fewer
+  syncs.
+- **What remains of #598's "launch fixed costs" is the ramp and tail of any DRAM
+  stream.** An ideal read pays it too: one launch a layer is 5-17 µs slower than one
+  launch for all layers. The next layer's experts are unknown until routing, so the
+  routed stream cannot cross it. Known traffic, such as the next prefetch window, can
+  fill it, and that is the L2 prefetch session's lever.
+- **Prototype 1, a stream grouped GEMM (one CTA an SM over runs of tiles), is slower:**
+  - v1 lost 0.4-1.8% in the full layer;
+  - v2 is 9-28 µs a layer slower than the grid chain;
+  - both kept the bits exactly.
+
+  It is dropped. Its lesson: one SM with two K blocks in flight cannot carry more than
+  its forty-eighth of the stream, so a schedule that idles SMs loses.
+- **The c1 levers this study can rank, from the measured tables** ([Ranked
+  levers](#ranked-levers-with-ceilings-at-c1)):
+  - L2 prefetch timing (owned elsewhere, +5.8% TP4);
+  - the latency-bound small kernels (at most +4.7% TP4, +3.7% TP3; the fusion
+    survey's);
+  - the all-reduce's peer waits (at most +3.2%, cluster only);
+  - filling stream boundaries with prefetch traffic (+1.6% / +0.6%);
+  - the routed-expert pipeline (+1.0% / +0.7%);
+  - the heads (+0.3%).
 
 ## Inputs
 
@@ -261,48 +274,93 @@ tail. A launch boundary on the weight stream costs about that, wherever it sits.
 routed chain has two in each layer, FC1's end and FC2's start, and the SwiGLU launch
 between them.
 
+## The routed experts against an ideal stream (the bound)
+
+`harness/stream_bound.py` (runs bound-2 on next-candidate, bound-stream-1 on the stream
+GEMM's build) times four CUDA graphs of eight layers at each rank's shapes, with the
+reference routes and no shared expert:
+- the routed chain as the plan runs it;
+- an ideal read of exactly the layer's live experts' FC1 and FC2 bytes, as one launch
+  a layer; as two launches a layer; and as one launch for all eight layers.
+
+The read kernel is a plain stream: 48 CTAs, contiguous 32 KB chunks, eight 16-byte
+loads a thread a chunk.
+
+| rank, experts a layer | chain µs a layer | GB/s | ideal, one launch a layer | ideal, all layers in one | chain - ideal | one launch - all |
+|---|---:|---:|---:|---:|---:|---:|
+| TP4, 13.25 | 251.8 | 240.7 | 245.0 | 234.0 | **6.8** | 11.0 |
+| TP4, 24.38 | 446.3 | 249.8 | 441.6 | 428.3 | **4.6** | 13.3 |
+| TP3, 13.25 | 324.2 | 248.9 | 318.0 | 312.7 | **6.2** | 5.3 |
+| TP3, 24.38 | 584.4 | 254.0 | 583.5 | 566.3 | **0.9** | 17.2 |
+| TP4, 13.25, stream GEMM v2 | 261.2 | 232.0 | 241.7 | 233.2 | 19.5 | 8.4 |
+
+- The grid chain's five launches cost 1-7 µs a layer more than one ideal launch of the
+  same bytes. Restructuring the routed experts is worth at most that: 43 MoE layers ×
+  6.8 µs = 0.29 ms a step at TP4 (+1.0%), and 0.27 ms at TP3 (+0.7%).
+- An ideal stream of one layer's bytes still pays 5-17 µs of ramp and tail against
+  one stream of every layer's bytes. The routed experts cannot cross that boundary: the
+  next layer's experts are known only after its routing. Traffic known in advance can
+  fill it, which the L2 prefetch session's schedule does.
+- The stream GEMM v2 (all 48 SMs) is 9-28 µs a layer slower than the grid chain at every
+  shape: 261.2 / 464.9 / 341.9 / 612.0 µs against 251.8 / 446.3 / 324.2 / 584.4.
+
 ## Ranked levers, with ceilings at c1
 
 `levers.py`, one lever at a time, from the suite's step (TP4 30.30 ms at 2.284 tokens a
-step, 75.4 tok/s; TP3 37.41 ms at 2.269, 60.7 tok/s) at its 13.8 experts a layer and
-43 MoE launches a step. Every saving is non-byte time in #598's terms, so none
-overlaps the byte floor.
+step, 75.4 tok/s; TP3 37.41 ms at 2.269, 60.7 tok/s). The inputs are the measured bound
+and layer tables above, over 43 MoE layers (40 target, 3 drafter) or the 40 target
+layers. Every saving is non-byte time in #598's terms, so none overlaps the byte floor
+or another row.
 
 | # | lever | owner | TP4 | TP3 | evidence |
 |---|---|---|---|---|---|
-| 1 | L2 prefetch timed against its consumers | l2-prefetch-timing session | 1.67 ms (+5.8%, 79.8 tok/s) | - | moe-overlap and PDL records; not counted here |
-| 2 | Routed experts as one continuous FC1-FC2 stream | this study | 0.93 ms (+3.2%, 77.8) | 1.01 ms (+2.8%, 62.3) | a layer: SwiGLU and gaps 3.8 µs, FC2 ramp 4.6, FC1 tail 7.1, FC2 above rate 6.0 (TP3 8.0) |
-| 2a | of which the stream GEMM (prototype 1) | this study | FC2 above rate and the launches' tails: about 0.3-0.5 ms | about 0.4-0.6 ms | to be measured (`stream-ab`) |
-| 3 | All-reduce: peer skew and staging | sparknet; cluster-only | at most 0.95 ms (+3.2%, 77.8) | at most 0.95 ms (+2.6%, 62.2) | #598: DRAM idles 0.95 ms under collectives; IKET: the time is the peer wait |
-| 4 | mHC boundary (project, finalize, post) | fusion survey | its 3.1% c1 restructure ceiling | - | 5.2% of the step; IKET: small compute- and load-bound kernels |
-| 5 | LM heads at the attainable rate | unclaimed | 0.20 ms (+0.7%, 75.9) | 0.27 ms (+0.7%, 61.1) | #598 row 12 |
-| 6 | Routed GEMMs' steady stream: deeper stages, warp-specialized producer, fewer syncs | none | 0 | 0 | 98% of the attainable rate; the syncs follow the loads' issue |
-| 7 | FC2's first weight loads before its PDL wait | - | at most 0.13 ms (+0.4%), part of row 2 | | the SwiGLU it would overlap lasts 3.1 µs |
+| 1 | L2 prefetch timed against its consumers | l2-prefetch-timing session (#615) | 1.67 ms (+5.8%, 79.8 tok/s) | - | moe-overlap and PDL records; its prototype measured −1.5% c1 step |
+| 2 | Latency-bound small kernels: mHC's non-byte time, sparse MLA, the norm and cast, dispatch, SwiGLU | fusion survey (#583) | at most 1.36 ms (+4.7%, 78.9) | at most 1.33 ms (+3.7%, 62.9) | layer tables: 34 µs a layer at either rank; an upper bound (fused kernels still cost something) |
+| 3 | All-reduce: peer lateness and staging | sparknet; cluster only | at most 0.95 ms (+3.2%, 77.8) | at most 0.95 ms (+2.6%, 62.2) | #598: DRAM idles 0.95 ms under collectives; IKET: the peer wait. 10-03 four-rank traces: each rank waits 1.0-1.7 ms a step for the last peer, and dgx4 is last in 39% of collectives (a ring-only lever, #616) |
+| 4 | Stream boundaries' ramps and tails filled with known traffic | l2-prefetch-timing session | 0.47 ms (+1.6%, 76.6) | 0.23 ms (+0.6%, 61.0) | the bound: one ideal launch a layer against one for all layers |
+| 5 | Routed experts restructured (continuous FC1-FC2, persistent or stream GEMMs, deeper stages, warp-specialized producer, fused SwiGLU) | this study | 0.29 ms (+1.0%, 76.1) | 0.27 ms (+0.7%, 61.1) | the bound: the chain less one ideal launch of the same bytes |
+| 6 | LM heads at the attainable rate | unclaimed | 0.08 ms (+0.3%, 75.6) | 0.11 ms (+0.3%, 60.8) | layer tables: 41 µs (TP4) and 55 µs (TP3) over a head's bytes |
 
-Rows 2, 3 and 5 together: TP4 80.9 tok/s, TP3 64.5. Row 2's split between ramp and
-tail (each half of a launch's fixed cost here) is an assumption until the `layer`
-traces measure it.
+Reconciled with #598:
+- Row 5 replaces this study's first estimate (+3.2%, from #598's rows 5 and 11). That
+  estimate assumed the attainable 266.6 GB/s within a layer; an ideal one-layer launch
+  reaches 247-254 GB/s.
+- Row 4 is the rest of #598's launch fixed costs, and only prefetch traffic can claim it.
+- Row 3 is #598's row 7. Rows 1 and 4 are most of #598's 3.4-3.7 ms of prefetch and
+  consumer time.
+- Row 2 overlaps the fusion survey's mHC and attention-front rows.
 
-Reconciled with #598: row 2 is a part of its rows 5 and 11 (launch fixed costs 1.24 ms,
-FC2's rate 0.27 ms). Its remaining 0.58 ms is each MoE chain's first ramp (FC1's start
-after the dispatch) and last tail (FC2's end before the combine). Neither goes away
-while the routed experts are their own launches. Row 3 is #598's row 7. Row 1 is most
-of #598's 3.4-3.7 ms of prefetch and consumer time.
+## Prototype 1: the stream grouped GEMM (dropped)
 
-## Prototype 1: the stream grouped GEMM
+vLLM branch `c1-stream` (worktree ~/projects/vllm-c1-stream), not pushed:
+`moe.grouped_fp8_fp4_gemm_stream`. v1 is 3360247fe and 06b74e7ff, and v2 adds 59b2ac540,
+over next-candidate 97e204cd9. Below 16 rows, the plan's gate-up and down GEMMs use it in
+place of the grid kernel. It was built before the bound existed, on the first estimate's
++3.2% ceiling.
 
-vLLM branch `c1-stream` (worktree ~/projects/vllm-c1-stream; 3360247fe and 06b74e7ff
-over next-candidate 97e204cd9), not pushed:
-`moe.grouped_fp8_fp4_gemm_stream`. Below 16 rows, the plan's gate-up and down GEMMs use
-it in place of the grid kernel.
+| run | arm | TP4, 13 experts | TP4, 24 experts | TP3, 13 experts | bits |
+|---|---|---:|---:|---:|---|
+| stream-ab-1 (layer harness, six rounds) | v1: runs of `ceil(items / 48)` | −0.36% (645.6 → 652.0 µs a layer) | −1.77% (840.2 → 855.4) | −0.53% (847.5 → 854.2) | equal in every round |
+| bound-stream-1 (the routed chain alone) | v2: every SM streams | 261.2 against 251.8 µs | 464.9 against 446.3 | 341.9 against 324.2 | - |
+| stream-tests-1 | v1 | 115 tests passed, bit-identity test included | | | four PDL tests not run (conftest fixture) |
+
+Why it loses:
+- v1 balanced the items onto fewer SMs: 39 of 48 for FC1 at 13 experts. One SM keeps
+  only two K blocks (16 KB) of weights in flight, too little for its share of the
+  stream on fewer SMs.
+- v2 streams on all 48 and is still slower. The likely reason, not traced: the grid
+  kernel's CTA turnover costs less than the stream kernel's longer issue path (a
+  division and shared-memory reads every K block, and the base words at each item),
+  and the stream keeps no more bytes in flight. The bound leaves at most 6.8 µs a layer
+  to win anyway.
 
 - The grid kernel launches a CTA for each (tile, column block) item: 324 for FC1 at six
   rows, of which about 126 are live. Each CTA fills its pipeline, streams one
   `[128, K]` weight slab and drains. The CTAs past the last used tile exit after their
   PDL wait.
 - The stream kernel launches 48 CTAs, one an SM. They split the live items into
-  contiguous runs of `ceil(items / 48)`. At 14 experts that is 3 FC1 items on each of
-  42 SMs, and 12 FC2 items on each of 47. A CTA's pipeline runs through its items' K
+  contiguous runs: v1 of `ceil(items / 48)` (3 FC1 items on each of 39 SMs at 13
+  experts), v2 differing by at most one item over all 48. A CTA's pipeline runs through its items' K
   blocks without draining: an item's first stages load while the previous item's last
   ones multiply. Its weight slabs are consecutive in memory.
 - Each item's tile multiplies its K blocks in order into a cleared FP32 accumulator,
@@ -310,15 +368,13 @@ it in place of the grid kernel.
   therefore has the grid kernel's bits. `test_stream_gemm_gives_the_grid_gemm_bits`
   compares both kernels bit for bit: TP4's and TP3's FC1 and FC2 shapes (TP4's FC2 has a
   64-wide K tail), at 1, 3, 6, 12 and 15 rows, padding rows included.
-- What it can remove: FC2's per-tile prologue and fill, about 0.4 µs an expert above
-  the attainable rate; the uneven last wave of both GEMMs; and the exiting CTAs. What it
-  cannot: each launch's own ramp and tail, and the SwiGLU between the GEMMs (row 2's
-  rest).
+- What it aimed at: FC2's per-tile prologue and fill, the uneven last wave of both
+  GEMMs, and the exiting CTAs.
 
 Bundles: `stream-tests` runs the routed-expert tests, the PDL tests and the source
-check. `stream-ab` runs the layer harness on next-candidate and the stream build in
-alternation, six rounds, at TP4 with 3 and 6 live rows and TP3 with 3, and compares
-bits and µs a layer. `layer-stream` traces its CTA timelines.
+check (with conftest from stream-tests-2 on). `stream-ab` runs the layer harness on
+next-candidate and the stream build in alternation, and compares bits and µs a layer.
+`layer-stream` and `lifetimes-stream` trace its CTA timelines.
 
 ## What runs next
 
