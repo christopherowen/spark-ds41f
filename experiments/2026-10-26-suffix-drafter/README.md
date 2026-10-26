@@ -105,9 +105,8 @@ Nothing is built.
   - two TileLang kernels.
 
   The lookahead is a recipe value, so at most 64 drafts is a lab comparison against 16 on the
-  same build (copy probe and agent replay), not a second build. A shared table is a second
-  phase, scoped to one tenant, and only if a replay of many unrelated sessions (AgentX, #574)
-  keeps its gain.
+  same build (copy probe and agent replay), not a second build. A shared table is dropped
+  (owner, 2026-10-26: no sharing between sessions); the drafter stays per request.
 
 ## 1. What a verified row costs
 
@@ -426,7 +425,7 @@ The post-build copy probe with thinking on measures it.
 | exact, at most 32 or 64, full | no-go | wasted rows: at 64, −6.5% (m 8) to +2.3% (m 24) at c1 and −2.8 to −21% at c8; at 32, 0.2-4.1 points below 16 (growing cap, same m) at c1 and 1.8-8.1 at c8 |
 | minimum match 8 | no-go | −0.6 to −1.2% at c8 (to −8% under independent routes): too many short wrong copies |
 | request-chained table | no-go | never better than exact (+4.6% against +4.9%), much worse on long copies |
-| global table (chained, shared across requests) | second phase, measured first | +1.8 points at c1 and +1.4 at c8 over exact alone, as exact-then-global at m 24; an upper bound (exact, unbounded, one developer's sessions); a cross-request side channel unless scoped to one tenant |
+| global table (chained, shared across requests) | dropped (owner, 2026-10-26: no sharing between sessions) | +1.8 points at c1 and +1.4 at c8 over exact alone, as exact-then-global at m 24; an upper bound (exact, unbounded, one developer's sessions); a cross-request side channel unless scoped to one tenant |
 
 ## 3. The design
 
@@ -558,10 +557,11 @@ it competes for rows with the others' drafts, which is the point. The dead-row c
 below 0.2) applies to copy rows too, so a long block's tail past `s^j < 0.2` (past draft 31 at
 `s = 0.95`) skips the routed experts.
 
-### Phase 2: a shared table, scoped to one tenant
+### Phase 2: a shared table, scoped to one tenant (dropped)
 
-Only if the replay of many unrelated sessions keeps the +1.8 points. The table sits beside
-the exact match, which stays first:
+**Dropped by the owner on 2026-10-26: no sharing between sessions.** The drafter stays per
+request; the design below is kept as the record of what was considered. The table would have
+sat beside the exact match, which stays first:
 - **the table:** a device table of 24-gram fingerprints (32 bits, so a collision misses rather
   than drafts) to the next token, bounded (8M entries, 64 MB), with the oldest entries
   overwritten;
