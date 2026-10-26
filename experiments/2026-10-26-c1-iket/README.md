@@ -426,6 +426,66 @@ too.
   leaves out: router, metadata, sampler, drafter. When they land, they attribute the
   remaining part of #616's 6.5 ms grid-to-serving gap.
 
+## Lever 2: the latency-bound small kernels, starting with the mHC boundary
+
+The coordinator then gave this study lever 2 (row 2 above), which nobody owned.
+
+**Bounds, from the layer tables and the production traces.** The mHC boundary is the
+largest small-kernel family:
+- In production (TP4, c1 greedy, the ports build before PDL), `project_streams` takes
+  1.16 ms a step and `finalize` 0.60 ms: 14.4 and 7.5 µs a boundary, 80 boundaries,
+  5.0% of the step.
+- In the harness with PDL, at either rank (mHC is replicated), it is 11.9 and 5.2 µs a
+  boundary: 1.37 ms a step.
+- The attention front is next: RoPE 0.26 ms, the cache write 0.25 ms, the q and kv
+  norms and casts 0.28 ms, metadata 0.31 ms a step.
+
+A boundary moves about 2.6 MB:
+- `fn`, FP32, 1.97 MB;
+- the four streams read and written, about 0.5 MB;
+- the collapse and the output.
+
+At 266.6 GB/s that is 9.7 µs of its 17.1 µs. So 7.4 µs a boundary, 0.59 ms a step
+(TP4 +2.0%, TP3 +1.6%), is non-byte time. Most of it is `finalize`'s 5.2 µs, six CTAs
+that reduce the partials, run the Sinkhorn and normalize.
+
+**Where `project_streams` waits** (IKET, TP4): 51% of a warp's life is the `fn` loads,
+15% the TF32 MMAs, 11% a block sync. It reads `fn` at about 200 GB/s across its 40 CTAs.
+
+**Two prototypes on `fn`'s loads, bit-identical** (vLLM branches from next-candidate
+c579b3fe1). Runs fusion-ab-2 and fusion2-ab-1: the layer harness with all-reduce stand-ins
+(`--ar`), four rounds, at c1 (6 rows, 3 live), c8 (24 rows) and c16 (48 rows), every
+buffer's bits equal:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A1: every stream's `fn` loaded at once, before the first GEMM (`c1-fusion` f17fb3646) | −0.82% | −0.51% | −0.44% | −0.75% | −0.56% | −0.12% | 106 passed, kernels source-checked |
+| A2: the next stream's `fn` loaded during the current stream's GEMMs (`c1-fusion2` b84e421b2) | −0.42% | −0.19% | −0.06% | +0.21% | −0.17% | −0.08% | 106 passed |
+
+Neither helps; A1 is a little slower, probably from its scalar loads and 96 extra
+registers a thread. The `fn`
+read is bound by DRAM, not by serialized round trips: about 200 GB/s over 40 SMs is
+already near the rate. Both are dropped.
+
+**What is left at the boundary** is `finalize`'s latency and the short serial phases
+around it: about 7 µs a boundary of non-byte time, including about 3 µs of
+`project_streams`' own GEMM and syncs.
+
+The next fusion to take is `finalize` folded into `project_streams`:
+- Each of the 40 CTAs arrives on a counter once its partials are written. The 40 fit
+  one an SM, so all are resident.
+- The last arrival reduces the partials in today's order and runs the Sinkhorn.
+- All 40 then normalize their own 128 columns and write the output and its cast.
+- Every wait has a deadline that traps.
+
+It saves the launch and part of the serial phases, about 3-4 µs a boundary: 0.24-0.32 ms
+a step, +0.8-1.1%. The risk is low: the same operations in the same order.
+
+The attention front's horizontal fusions follow at about the same size, about 8 µs a
+layer: both RoPEs with the cache write in one kernel (+0.3% for the RoPE pair alone),
+and both norms with their casts in one. The norms are TileKernels', so a bit-exact port
+comes first.
+
 ## Runs on dgx1
 
 dgx1, 2026-10-26, image `spark-ds41f:19f2c20ed4d6-next-6`, `scripts/lab.py kernel-local`
@@ -452,6 +512,14 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | lifetimes-stream-1 | 14:41 | lifetimes-stream (v2) | pass, 255 s |
 | stages-ab-1 | 14:43 | stages-ab | pass, 730 s: no arm above noise, bits equal |
 | stream-tests-2 | 14:47 | stream-tests (v2) | 119 passed, every launched kernel source-checked |
+| smoke-5 | 15:29 | smoke | pass, 116 s |
+| fusion-tests-1 | 15:33 | fusion-tests (A1) | 106 passed, every launched kernel source-checked |
+| fusion-ab-1 | 15:34 | fusion-ab (A1) | FAIL in 95 s: at 48 rows sparse MLA takes the extend route, which the harness did not run |
+| smoke-6 | 15:40 | smoke | pass, 117 s |
+| fusion-ab-2 | 15:43 | fusion-ab (A1) | pass, 577 s: bits equal, 0.1-0.8% slower |
+| smoke-7 | 16:04 | smoke | pass, 115 s |
+| fusion2-tests-1 | 16:06 | fusion2-tests (A2) | 106 passed |
+| fusion2-ab-1 | 16:07 | fusion2-ab (A2) | pass, 615 s: bits equal, within ±0.4% |
 
 ## Files
 
