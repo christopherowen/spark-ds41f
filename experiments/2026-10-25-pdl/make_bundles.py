@@ -22,6 +22,7 @@ does (as retire-conditionals' bundles do), so nothing in the image reaches it.
   (layer-c1.json, from critical_path.py --layer-sequence);
 - bundles/pdl-rows: the same A/B over pdl_rows.py, every row count the engine grid
   judges with the shared expert beside the routed experts and inline;
+  bundles/pdl-rows-focus: 15 rounds at the row counts where PDL was level or slower;
 - bundles/pdl-sources: sources_cpu.py, every chain kernel lowered at its decode shapes
   without device compilation and checked as the plugin checks launched kernels;
 - pdl-tp4.json, pdl-tp4-dev.json (PDL) and base-tp4.json, base-tp4-dev.json (BASE):
@@ -286,6 +287,32 @@ def main() -> None:
     for script in ("pdl_chain_ab.py", "pdl_rows.py"):
         shutil.copyfile(HERE / script, by_rows / script)
 
+    # The row counts where PDL was level or slower, with the power to see 0.4%: a fresh
+    # process a build and round sets the larger chains' time to about +-1%.
+    focus = bundle(
+        "pdl-rows-focus",
+        f"pdl-rows at 6, 16, 32, 48 and 72 rows, the shared expert on its side stream, fifteen rounds "
+        f"alternating next-candidate's build (vLLM {base} {base_commit}) and vLLM {head} {commit}: the "
+        "per-process spread at the larger row counts is about 1%, so fifteen rounds resolve a 0.4% "
+        "difference.",
+        [
+            "/b/pdl_chain_ab.py",
+            "15",
+            "/b/pdl_rows.py",
+            "--rows",
+            "6,16,32,48,72",
+            "--modes",
+            "aux",
+        ],
+        [["pdl_chain_ab.py", "/b/pdl_chain_ab.py"], ["pdl_rows.py", "/b/pdl_rows.py"]],
+        "status",
+    )
+    candidate = json.loads((focus / "candidate.json").read_text())
+    candidate["mounts"] += both_builds
+    write_json(focus / "candidate.json", candidate)
+    for script in ("pdl_chain_ab.py", "pdl_rows.py"):
+        shutil.copyfile(HERE / script, focus / script)
+
     # The chain kernels' sources, lowered at their decode shapes.
     sources = bundle(
         "pdl-sources",
@@ -350,6 +377,7 @@ def main() -> None:
         )
     print(
         "wrote overlay/, overlay-base/, bundles/pdl-tests, bundles/pdl-chain, bundles/pdl-rows, "
+        "bundles/pdl-rows-focus, "
         "bundles/pdl-sources, "
         "bundles/pdl-mechanism, "
         "pdl-tp4.json, pdl-tp4-dev.json, base-tp4.json, base-tp4-dev.json"

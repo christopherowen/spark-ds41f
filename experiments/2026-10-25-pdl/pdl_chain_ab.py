@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The layer-chain benchmark on the base build and on the PDL build, in alternation
+"""The layer-chain benchmark on the base build and on the PDL builds, in alternation
 on one GPU: time per layer and whether every buffer's bits agree.
 
 usage: pdl_chain_ab.py [ROUNDS [SCRIPT [ARGS...]]]
@@ -8,17 +8,18 @@ Each build is the image's vLLM tree with package files in place: /tmp/pdl-tree/b
 holds symbolic links to the image's files with the base build's files (mounted under
 /b/base: the files it changes over the image's tree) copied over theirs, and
 /tmp/pdl-tree/pdl/vllm is the base build with the PDL branch's files (/b/pdl: the files
-it changes over the base) copied over those. Each round runs
-benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py once per build, the base build's
-first in odd rounds and the PDL build's first in even rounds, each in a fresh process
-on the bundle's TileLang cache. SCRIPT and its ARGS replace that benchmark (pdl_rows.py:
+it changes over the base) copied over those. Every other directory under /b holding a
+vllm/ tree is one more PDL build the same way (a variant: its files over the base).
+Each round runs benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py once per build,
+each in a fresh process on the bundle's TileLang cache; the order rotates by one build
+a round (two builds: the base build first in odd rounds, the PDL build in even ones). SCRIPT and its ARGS replace that benchmark (pdl_rows.py:
 every row count, the shared expert beside the routed experts and inline); it prints the
 same lines. A probe first confirms that each tree imports its own mHC module, chained
-only in the PDL build.
+in every build but the base.
 
 Prints each run's lines (without their digests, which are compared here), then one
-JSON line per shape (medians over rounds, the difference, base - PDL in each round) and
-a {"bits": ...} line per shape. Exit status 0 only when every run
+JSON line per shape (medians over rounds; for each PDL build the difference from the
+base, and base - that build in each round) and a {"bits": ...} line per shape. Exit status 0 only when every run
 succeeded, every output is finite, every replay gave its eager bits, and every
 buffer's digest is equal across builds and runs.
 """
@@ -33,8 +34,21 @@ from pathlib import Path
 
 IMAGE_TREE = Path("/opt/spark-ds41f/candidate/vllm")
 TREES = Path("/tmp/pdl-tree")
-# Each build's files, in the order they are copied over the image's tree.
-LAYERS = {"base": [Path("/b/base")], "pdl": [Path("/b/base"), Path("/b/pdl")]}
+BUNDLE = Path("/b")
+BASE = BUNDLE / "base"
+
+
+def layers() -> dict[str, list[Path]]:
+    """Each build's files, in the order they are copied over the image's tree: the base
+    build's, then for a PDL build its own."""
+    variants = sorted(
+        (d for d in BUNDLE.iterdir() if d.is_dir() and d != BASE and (d / "vllm").is_dir()),
+        key=lambda d: (d.name != "pdl", d.name),
+    )  # fmt: skip
+    return {"base": [BASE], **{d.name: [BASE, d] for d in variants}}
+
+
+LAYERS = layers()
 MHC = "vllm/models/deepseek_v4_1/tilelang/mhc.py"
 BENCH = [
     "benchmarks/kernels/benchmark_deepseek_v41_pdl_chain.py",
@@ -115,14 +129,15 @@ def main() -> int:
         )
         print(f"{name} build imports: {probe.stdout.strip()} {probe.stderr[-500:]}")
         found = json.loads(probe.stdout or "{}")
-        want = {"chained": name == "pdl", "file": str(tree / MHC)}
+        want = {"chained": name != "base", "file": str(tree / MHC)}
         if found != want:
             raise SystemExit(
                 f"the {name} tree does not import the {name} build: {want}"
             )
     results = {name: [] for name in builds}
+    names = list(builds)
     for r in range(rounds):
-        order = ("base", "pdl") if r % 2 == 0 else ("pdl", "base")
+        order = names[r % len(names) :] + names[: r % len(names)]
         for name in order:
             results[name].append(run(builds[name], f"round {r + 1}: {name}", bench))
     ok = True
@@ -148,23 +163,24 @@ def main() -> int:
         summary = {"shape": shape, "rows": want["rows"]}
         for kind in ("warm_us", "cold_us"):
             base = statistics.median(row[kind] for row in rows["base"])
-            pdl = statistics.median(row[kind] for row in rows["pdl"])
-            summary[kind] = {
-                "base": round(base, 2),
-                "pdl": round(pdl, 2),
-                "saved": round(base - pdl, 2),
-                "saved_percent": round(100 * (base - pdl) / base, 2),
-                "rounds_saved": [
-                    round(b[kind] - p[kind], 2)
-                    for b, p in zip(rows["base"], rows["pdl"])
-                ],
-            }
+            summary[kind] = {"base": round(base, 2)}
+            for name in names[1:]:
+                other = statistics.median(row[kind] for row in rows[name])
+                summary[kind][name] = {
+                    "us": round(other, 2),
+                    "saved": round(base - other, 2),
+                    "saved_percent": round(100 * (base - other) / base, 2),
+                    "rounds_saved": [
+                        round(b[kind] - o[kind], 2)
+                        for b, o in zip(rows["base"], rows[name])
+                    ],
+                }
         summary["finite_and_replays_equal"] = good
         print(json.dumps(summary), flush=True)
         print(
             json.dumps(
                 {
-                    "bits": f"{shape}: base vs PDL build, all rounds",
+                    "bits": f"{shape}: base vs every PDL build, all rounds",
                     "differs_at": differ,
                 }
             ),
