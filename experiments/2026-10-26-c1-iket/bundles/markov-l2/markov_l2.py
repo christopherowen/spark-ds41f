@@ -21,13 +21,21 @@ per draft, and the bytes' time at 266.6 GB/s.
 import argparse
 import json
 import statistics
-from types import SimpleNamespace
 
 import torch
 
 RATE = 266.6e9
 RANK = 256
 SHAPES = {"tp4": 32320, "tp3": 43136, "tp1": 129280}
+
+
+class _Projection:
+    """A BF16 projection as the TileLang linear method holds one (its registry keeps
+    weak references, which a plain namespace does not allow)."""
+
+    def __init__(self, weight):
+        self.weight = weight
+        self.out_dtype = torch.float32
 
 
 def main():
@@ -44,7 +52,7 @@ def main():
         layers = {}
         for name, n in SHAPES.items():
             weight = (torch.randn((n, RANK), generator=gen, device="cuda") * 0.02).bfloat16()
-            layer = SimpleNamespace(weight=weight, out_dtype=torch.float32)
+            layer = _Projection(weight)
             TileLangLinearMethod().declare_layer_kernels(layer)
             layers[name] = layer
         prepare.freeze("markov_l2.py: every kernel was prepared before the first launch")
