@@ -1,0 +1,233 @@
+{
+ "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+ "ctas": 0,
+ "iters": 0,
+ "sites": [
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 47,
+   "last_line": 47,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.pdl",
+   "phase": "wait",
+   "kinds": [
+    "pdl"
+   ],
+   "first_line": 48,
+   "last_line": 48,
+   "statement": "cudaGridDependencySynchronize();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 50,
+   "last_line": 50,
+   "statement": "int expert = TileExpert[((int64_t)((int)blockIdx.y))];",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 54,
+   "last_line": 63,
+   "statement": "if (((int)threadIdx.x) < 32)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync#2",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 64,
+   "last_line": 64,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "load.global#3",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 71,
+   "last_line": 75,
+   "statement": "if (((expert < 384) && (0 <= expert)))",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync#3",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 82,
+   "last_line": 82,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "load",
+   "phase": "load",
+   "kinds": [
+    "cp_async",
+    "tma"
+   ],
+   "first_line": 83,
+   "last_line": 102,
+   "statement": "for (int s = 0; s < 2; ++s)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync#4",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 104,
+   "last_line": 104,
+   "statement": "__syncthreads();",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "load#2",
+   "phase": "load",
+   "kinds": [
+    "cp_async",
+    "tma"
+   ],
+   "first_line": 105,
+   "last_line": 125,
+   "statement": "if (ko < 4)",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.cp_async",
+   "phase": "wait",
+   "kinds": [
+    "cp_async"
+   ],
+   "first_line": 126,
+   "last_line": 126,
+   "statement": "tl::cp_async_wait<2>();",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync#5",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 127,
+   "last_line": 127,
+   "statement": "__syncthreads();",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.mbarrier",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 128,
+   "last_line": 128,
+   "statement": "loaded[(ko % 3)].wait((ko / 3));",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "wait.sync#6",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 131,
+   "last_line": 131,
+   "statement": "__syncthreads();",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "compute.mma",
+   "phase": "compute",
+   "kinds": [
+    "mma"
+   ],
+   "first_line": 132,
+   "last_line": 146,
+   "statement": "{",
+   "loops": 1,
+   "traced": true,
+   "events_per_warp_bound": null
+  },
+  {
+   "kernel": "moe_grouped_fp8_fp4_gemm_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 148,
+   "last_line": 163,
+   "statement": "for (int i_2 = 0; i_2 < 16; ++i_2)",
+   "loops": 0,
+   "traced": true,
+   "events_per_warp_bound": null
+  }
+ ]
+}

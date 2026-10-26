@@ -1,0 +1,774 @@
+# One stream at 100 tok/s, bottom-up: where c1 decode kernels wait (IKET)
+
+The first single-stream study (#598, `2026-10-26-c1-100tps`) worked top-down: the byte
+floor is 70% of a c1 step, and everything that is not a byte caps at 103.9 tok/s.
+This study works bottom-up from inside the kernels. IKET (#610, `2026-10-26-iket-debug`)
+times each TileLang kernel's load, wait, compute and store phases. The questions are
+where c1 decode kernels wait, what each wait is for, and what removing it is worth.
+
+Rules, as for every study now: native weights and reference precision; temperature 0
+bit-identical; no serving overhead (IKET stays off in production); a ceiling for each
+idea from measured traces before building; GPU work through `scripts/lab.py
+kernel-local` only, on the node the coordinator assigns.
+
+**Where the runs happened.** dgx1-4 were powered off at 08:10 CET on 2026-10-26 for
+re-cabling, and the smoke bundle queued on dgx4 at 08:35 never started. While production
+waited for a cable that afternoon, the coordinator gave this study dgx1 alone. Every run
+below ran there from 13:50 CET, one bundle at a time under lab.py's GPU lock, from this
+branch's checkout in `~/spark-lab/agents/c1-iket/` ([Runs](#runs-on-dgx1)).
+
+## The short answer
+
+- **Where c1 kernels wait.** At a TP4 rank's shapes and the suite's routes:
+  - The routed FC1 GEMM's warps spend 65% of their time waiting: 36% for TMA weight
+    tiles, 20% at the block sync after the activation copies.
+  - FC2's CTAs live 4 µs each, and 13% of that is their prologue's base-exponent loads.
+  - The dense GEMMs wait 50-65% on their cp.async weight copies, and 14-21% at the sync
+    after them.
+  - The all-reduce waits at the barrier after its peers' flags: 68% of its time with the
+    peers ready, 90% with them 20 µs late (IKET's hot traces, simulated peers).
+- **The routed experts' waits are DRAM time, and the chain is already close to an
+  ideal stream.** On one GPU, next-candidate's routed chain (dispatch, FC1, SwiGLU, FC2,
+  combine) runs within 0.9-6.8 µs a layer of an ideal one-launch read of the same
+  expert bytes:
+  - TP4: 251.8 against 245.0 µs at 13 experts, 446.3 against 441.6 at 24;
+  - TP3: 324.2 against 318.0, and 584.4 against 583.5.
+
+  So no restructuring of the routed experts recovers more than about 0.3 ms a step:
+  TP4 ≤ +1.0%, TP3 ≤ +0.7%. That covers a continuous FC1-FC2 stream, persistent or
+  stream GEMMs, deeper stages, a warp-specialized producer, a fused SwiGLU and fewer
+  syncs.
+- **What remains of #598's "launch fixed costs" is the ramp and tail of any DRAM
+  stream.** An ideal read pays it too: one launch a layer is 5-17 µs slower than one
+  launch for all layers. The next layer's experts are unknown until routing, so the
+  routed stream cannot cross it. Known traffic, such as the next prefetch window, can
+  fill it, and that is the L2 prefetch session's lever.
+- **Prototype 1, a stream grouped GEMM (one CTA an SM over runs of tiles), is slower:**
+  - v1 lost 0.4-1.8% in the full layer;
+  - v2 is 9-28 µs a layer slower than the grid chain;
+  - both kept the bits exactly.
+
+  It is dropped. Its lesson: one SM with two K blocks in flight cannot carry more than
+  its forty-eighth of the stream, so a schedule that idles SMs loses.
+- **The c1 levers this study can rank, from the measured tables** ([Ranked
+  levers](#ranked-levers-with-ceilings-at-c1)):
+  - L2 prefetch timing (owned elsewhere, +5.8% TP4);
+  - the latency-bound small kernels (at most +4.7% TP4, +3.7% TP3; the fusion
+    survey's);
+  - the all-reduce's peer waits (at most +3.2%, cluster only);
+  - filling stream boundaries with prefetch traffic (+1.6% / +0.6%);
+  - the routed-expert pipeline (+1.0% / +0.7%);
+  - the heads (+0.3%).
+
+## Inputs
+
+- TP4 production, c1: rank 0's torch-profiled traces of request-inventory-5
+  (`results/private/determinism/request-inventory-5/ports`): greedy (10 steps of
+  34.6 ms) and sampled (25 of 29.5 ms). These are the traces #598 and the fusion survey
+  (#583) read.
+- The release suite's single stream, spark-ds41f-1025 (candidate 6): TP4 33.003
+  steps/s at 2.284 tokens a step; TP3 26.730 at 2.269
+  (`manifests/suites/2026-10-25-spark-ds41f-1025-tp{4,3}-single-stream`).
+- The expert-rate bundle (#598, `runs/expert-rate-dgx4-2.txt`): FC1 and FC2 at 6-36
+  experts, and plain reads.
+- IKET's hot-kernel traces (#610, `runs/hot-5/table.json`): the routed experts, sparse
+  MLA, the mHC entry and the one-shot all-reduce, at TP3 shapes and 8 rows with random
+  routes (about 45 distinct experts).
+- vLLM next-candidate 97e204cd9 (PDL along the chain, late trigger from 16 rows).
+
+## Method
+
+**The per-rank layer harness** (`harness/c1_layer.py`). The production c1 step cannot
+be traced with IKET on the cluster. That needs a window, and run-iket allocates one
+pool for the whole process. A single GPU cannot hold DS4.1-Flash either. So the harness
+runs one c1 decode layer's kernels at one TP4 or TP3 rank's shapes on one GB10. It
+builds on vLLM's PDL layer chain (`tests/kernels/deepseek_v41_pdl_chains.py`):
+- the attention entry (mHC `post_pre` and finalize with its MXFP8 cast);
+- the fused Q-A/KV GEMM (replicated, 1792 × 5120), the q latent's RMSNorm, Q-B (16
+  heads a rank at TP4; 24 at TP3, whose 64 heads are padded to 72);
+- sparse MLA decode on the route production picks at six rows (the IKET hot harness's
+  inputs);
+- WO-A's split-K partials and reduce-cast (2 groups, or 3), WO-B;
+- the FFN entry; the shared expert on its own stream; the routed experts (dispatch,
+  FC1, SwiGLU and cast, FC2, combine);
+- with `--head`, the packed 12-bit head at the rank's vocabulary shard (32,320 rows or
+  43,136).
+
+Routes are real. Layer *i* takes the reference forward's layer *i* mod 40 routes for
+six consecutive greedy tokens (`2026-10-18-json-count/runs/ref-woa1.json`), with rows
+from `--live` on dead. Three live rows of six give about 14 distinct experts a layer,
+the suite's operating point. Weights rotate through four sets, so no layer finds the
+previous one's weights in L2. Every pass hashes every buffer it writes; equal digests
+between builds mean equal bits.
+
+**Traces** (`make_bundles.py`, bundle `layer`), for each rank's shapes:
+1. the off build's times, as a CUDA graph;
+2. nsys of the graph and of eager launches, for absolute kernel times;
+3. run-iket with every kernel instrumented, K loops unsampled: the phase table
+   (IKET's `iket_table.py`);
+4. warp lifetimes, per SM (bundles `lifetimes`, `lifetimes-stream`).
+
+Two things about run-iket, learned on the way:
+- It records warp lifetimes only for instrumented kernels. With every kernel skipped
+  its trace is empty (smoke run 2), and with only the combine instrumented it holds the
+  combine alone (smoke run 3).
+- So the lifetimes runs instrument everything, with one CTA a launch recording ranges
+  (`VLLM_DS41_IKET_CTAS=1`). Every warp's lifetime is recorded, and the other CTAs pass
+  a uniform branch at each event. In a persistent kernel the recording CTA runs slower
+  and becomes its tail, so the stream GEMM's lifetimes are not timings; the A/Bs are.
+
+**Validation.**
+- The IKET build writes the same bits with the mode off and with it on and every kernel
+  skipped (digest `51332953ab203838`, smoke run 2).
+- next-candidate itself writes the IKET build's bits at both ranks' shapes (layer-base-1
+  against layer-1: `cc4d115b6d040964` at TP4, `e2d08a7c6ba6b1cb` at TP3).
+- Graph replays write eager launches' bits in every run.
+
+**Analysis:**
+- `layer_table.py` gives each kernel family's cost, its excess over its bytes, its IKET
+  phase split and what its waits are for, from a `layer` run.
+- `cta_timeline.py` rebuilds from the lifetimes each launch's SM occupancy and the routed
+  GEMMs' weight stream over time. Under run-iket the eager launches and the recording
+  CTAs shift the timings, so its numbers are only qualitative; the bound and the A/Bs
+  carry the measurements.
+- `step_shares.py` gives each kernel family's share of the real TP4 step.
+- `routed_chain.py` gives the routed chain's anatomy and FC2's serving fit.
+- `levers.py` turns per-step savings into tok/s ceilings.
+
+## Each kernel family's share of a c1 step (TP4 production)
+
+`step_shares.py`, c1 greedy, 10 steps of 34.63 ms. "Critical" is the time a kernel runs
+with nothing but the L2 prefetch beside it, plus the idle gap before it (the fusion
+survey's measure).
+
+| family | launches | kernel µs | critical µs | share |
+|---|---:|---:|---:|---:|
+| routed FC1 | 40 | 9,802 | 9,051 | 26.1% |
+| routed FC2 | 40 | 5,357 | 5,377 | 15.5% |
+| all-reduce | 81 | 4,172 | 4,232 | 12.2% |
+| mHC (project, finalize, post) | 170 | 1,489 | 1,815 | 5.2% |
+| attention small kernels (indexer, metadata, cache, RoPE, compress) | 228 | 986 | 1,214 | 3.5% |
+| Q-B GEMM | 48 | 1,098 | 1,134 | 3.3% |
+| target LM head | 1 | 1,049 | 1,052 | 3.0% |
+| sparse MLA | 80 | 930 | 1,035 | 3.0% |
+| drafter LM head | 1 | 1,012 | 1,013 | 2.9% |
+| WO-A (partials, reduce-cast) | 80 | 901 | 986 | 2.9% |
+| WO-B and shared down GEMMs | 80 | 1,616 | 905 | 2.6% |
+| Q-A/KV GEMM | 40 | 775 | 818 | 2.4% |
+| casts and norms | 303 | 606 | 624 | 1.8% |
+| DSpark main projection | 2 | 359 | 361 | 1.0% |
+| routed dispatch, SwiGLU, combine | 120 | 372 | 276 | 0.8% |
+| shared gate/up GEMM | 40 | 515 | 52 | 0.1% |
+| other target kernels (all-gathers, router gate, compressors, Engram `wkv`, small) | | | 1,149 | 3.3% |
+| the drafter, but its LM head | | | 1,989 | 5.7% |
+| launch gaps and host | | | 1,550 | 4.5% |
+
+The sampled window is in `step_shares.json`: 29.45 ms, FC1 16.4%, the all-reduces
+13.8%, FC2 10.5%.
+
+## The c1 layer at one rank's shapes, measured (dgx1)
+
+`layer_table.py` over run layer-1 (TP4 and TP3, 3 of 6 rows live, 13.25 distinct experts
+a layer) and layer-live6-1 (TP4, all 6 rows live, 24.38). Columns:
+- **cost:** each kernel's end less the previous main-chain kernel's end, in CUDA graph
+  replays, summed over a family's launches in a layer, median over layers;
+- **excess:** cost less the family's bytes at 266.6 GB/s;
+- **phases:** IKET's split of a warp's life with the PDL wait taken out;
+- **waits:** what each wait range waits for, named from its statement.
+
+The dense GEMMs read cold weights here; in production the L2 prefetch fills them first.
+
+**TP4, 13.25 experts a layer: 519.8 µs a layer**
+
+| kernel | TP4 production share | cost µs | excess µs | wait | load | compute | store | the waits are for |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| MoE block: dispatch, FC1, SwiGLU, FC2, combine, with the shared expert beside them | 42.5% | 287.6 | 32.5 | | | | | |
+| routed FC1 (its window also carries the shared gate/up's bytes) | 26.1% | 181.0 | | 65% | 8% | 16% | 0% | TMA weight tiles 36%; the sync after cp.async 20%; cp.async 6% |
+| routed FC2 | 15.5% | 82.1 | 8.3 | 46% | 30% | 16% | 3% | the sync after cp.async 19%; TMA weight tiles 10%; cp.async 9% |
+| routed combine (waits for the shared down GEMM, which runs after FC2 under PDL at six rows) | 0.8% | 15.5 | | 0% | 89% | 0% | 3% | |
+| routed dispatch | | 6.4 | | 42% | 1% | 0% | 52% | its block syncs |
+| routed SwiGLU and cast | | 1.6 | | 0% | 60% | 4% | 3% | |
+| WO-B GEMM | 2.6% | 46.6 | 7.2 | 80% | 12% | 5% | 0% | cp.async weight copies 65%; the sync after them 14% |
+| Q-B GEMM | 3.3% | 45.0 | 5.6 | 74% | 19% | 4% | 0% | cp.async 57%; sync 16% |
+| WO-A partials and reduce-cast | 2.9% | 40.2 | 8.7 | 68% | 17% | 3% | 0% | cp.async 49%; sync 15% |
+| Q-A/KV GEMM | 2.4% | 39.6 | 5.1 | 86% | 8% | 6% | 0% | cp.async 62%; sync 19% |
+| mHC project and finalize (4 launches) | 5.2% | 22.3 | 7.6 | 11% | 44% | 15% | 3% | block syncs |
+| sparse MLA (split and combine) | 3.0% | 15.6 | | 22% | 27% | 20% | 3% | block syncs 19% |
+| q-latent norm and Q-B cast | 1.8% | 2.8 | | 3% | 16% | 4% | 53% | |
+| LM head (once a step) | 3.0% | 972.4 | 41.3 | 40% | 25% | 7% | 0% | cp.async 24%; sync 14% |
+
+**TP3, 13.25 experts: 673.7 µs a layer.** MoE block 350.9 µs, 28.7 over its bytes. FC1
+224.5 µs, and FC2 100.3 µs (6.7 over). WO-B 76.6 (17.6 over), Q-B 68.1 (9.1),
+WO-A 60.5 (13.3), Q-A/KV 38.6 (4.2), mHC 22.1 (7.4), MLA 17.3. LM head 1,297.8 µs (55.2
+over). The phase splits match TP4's within a few points.
+
+**TP4, 24.38 experts: 703.0 µs a layer.** MoE block 465.6 µs, 34.7 over its bytes; FC1
+298.8, FC2 140.1 (8.2 over).
+
+What the tables say:
+- **The MoE block's non-byte time is a fixed ~33 µs a layer.** At TP4 it is 32.5 µs at
+  13 experts and 34.7 at 24; at TP3, 28.7. It is the launch boundaries' ramps and tails
+  and the small kernels between them, not a per-expert loss. Each expert streams at the
+  attainable rate once the GEMMs run.
+- **FC2 gives away about 8 µs a layer to its tiles.** Each CTA lives 4 µs (TP4), and
+  13% of that is the base-exponent loads of its prologue.
+- **The shared expert's down GEMM finishes after FC2,** and the combine waits for it:
+  about 12 µs a layer on the chain at TP4. Its bytes count in the floor anyway. PDL's
+  order at six rows trades this against FC1's last wave keeping DRAM to itself
+  (next-candidate 97e204cd9).
+- **The latency-bound kernels add about 37 µs a layer at TP4:** mHC's non-byte 7.6,
+  MLA 15.6, the norm and cast, dispatch, SwiGLU, combine. They are the fusion survey's
+  territory.
+
+## Earlier evidence: IKET's hot traces at 45 experts
+
+Before dgx1 was free, the study worked from IKET's hot traces (#610 run 5: TP3 shapes,
+8 rows, mean warp shares). Each row
+draws six random experts, so a layer reads about 45 distinct experts (the expectation
+for 8 × 6 draws from 384); the rates below use that number. These are not c1's routes;
+the c1 tables are in the section above.
+
+| kernel | step share (TP4) | wait | load | compute | store | the wait is for |
+|---|---:|---:|---:|---:|---:|---|
+| routed gate-up GEMM (FC1) | 26.1% | 73% | 8% | 13% | 0% | TMA weight tiles 44% (`loaded[s].wait`); the block sync after `cp_async_wait` 19.5% (the slowest warp's activation and scale-code copies); `cp_async_wait` 6% |
+| routed down GEMM (FC2) | 15.5% | 54% | 21% | 14% | 2% | TMA weight tiles 21%; the sync after `cp_async_wait` 19%; besides the waits, the tile's prologue loads (expert, routes, base exponents) take 16% |
+| one-shot all-reduce | 12.2% | 68% | 1% | 14% | 8% | the barrier after six lanes poll the peers' flags (90% with peers 20 µs late) |
+| mHC `project_streams` | (5.2% with the rest of mHC) | 5% | 34% | 45% | 2% | little: TF32 MMA and the streams' loads |
+| mHC `finalize` | | 15% | 19% | 21% | 10% | warp 0's mix reduction; 35% unattributed |
+| sparse MLA split | 3.0% | 16% | 11% | 31% | 5% | MMA, the softmax reduction; 38% unattributed (27 ranges) |
+| SwiGLU and cast | 0.8% (with dispatch, combine) | 0% | 64% | 13% | 3% | none: reading gate/up |
+| MoE dispatch | | 40% | 2% | 0% | 34% | its nine block syncs |
+
+What the waits mean for c1:
+- **Weight-tile waits are DRAM time.** At 45 experts, FC1's 576 CTAs stream
+  182.6 MB in 712.9 µs (256 GB/s) and FC2's 1,920 CTAs 91.4 MB in 344.0 µs (266 GB/s).
+  The expert-rate bundle gives FC1 11.6 µs an expert at every count from 9 to 36 at six
+  rows: 262 GB/s, 98% of the attainable rate. There is no wave staircase, so the
+  steady stream has no wait to remove.
+- **The block syncs do not cut the bytes in flight.** Each K block's loads are issued at
+  the top of the iteration, before `cp_async_wait`, its sync and the MMA. A warp held
+  at the sync holds no load back. With three stages, two K blocks of weights (16 KB) are
+  in flight per SM, so the 48 SMs keep about 770 KB in flight against the 266 GB/s
+  stream. A faster per-SM rate matters only while fewer SMs stream: in the ramp and the
+  tail.
+- **The per-tile prologue matters where tiles are few.** An FC2 tile streams 37-51 KB.
+  Its prologue (reading its expert, routes and base exponents, then a block sync) and
+  its store are about 2.7 µs of an 11.6 µs CTA under the profiler. At 45 experts, 40
+  waves of tiles hide that behind other SMs' streams. At c1's 14 experts they hide it
+  less: in serving, FC2 costs 6.2 µs an expert against 5.7 at the attainable rate.
+
+## The routed chain in production (TP4)
+
+`routed_chain.py`, c1 greedy, 400 layers; medians a layer:
+
+| launch | µs | idle gap before, µs | critical µs |
+|---|---:|---:|---:|
+| dispatch | 3.3 | 0.0 | 0.5 (hidden behind the shared expert) |
+| FC1 | 253.9 | 0.0 | 231.5 |
+| SwiGLU and cast | 3.1 | 0.19 | 3.1 |
+| FC2 | 140.5 | 0.48 | 140.5 |
+| combine | 2.7 | 0.19 | 2.7 |
+
+FC2 on FC1 across the 400 layers: FC2 = 1.6 + 0.540 × FC1 µs (r² 0.96). With FC1 at the
+bench's 14.2 µs + 11.41 µs an expert, that is FC2 = 9.3 µs + 6.16 µs an expert in
+serving. The bench gives 14.5 + 5.77 under event timing, and the attainable rate 5.72.
+Sampled (1,000 layers, 11.5 experts a layer): 3.1 µs + 6.45 µs an expert.
+
+GB10 streams with a fixed cost even with no GEMM around it. A plain read reaches 221.5
+GB/s on 18 MiB and 253.7 on 110 MiB (the expert-rate bundle), about 11 µs of ramp and
+tail. That is what made the boundary between FC1 and FC2 look like a lever. The bound
+below measures it: the chain's five launches cost only 1-7 µs a layer more than one
+ideal launch of the same bytes, so the plain-read ramps overlap well inside the chain.
+
+## The routed experts against an ideal stream (the bound)
+
+`harness/stream_bound.py` (runs bound-2 on next-candidate, bound-stream-1 on the stream
+GEMM's build) times four CUDA graphs of eight layers at each rank's shapes, with the
+reference routes and no shared expert:
+- the routed chain as the plan runs it;
+- an ideal read of exactly the layer's live experts' FC1 and FC2 bytes, as one launch
+  a layer; as two launches a layer; and as one launch for all eight layers.
+
+The read kernel is a plain stream: 48 CTAs, contiguous 32 KB chunks, eight 16-byte
+loads a thread a chunk.
+
+| rank, experts a layer | chain µs a layer | GB/s | ideal, one launch a layer | ideal, all layers in one | chain - ideal | one launch - all |
+|---|---:|---:|---:|---:|---:|---:|
+| TP4, 13.25 | 251.8 | 240.7 | 245.0 | 234.0 | **6.8** | 11.0 |
+| TP4, 24.38 | 446.3 | 249.8 | 441.6 | 428.3 | **4.6** | 13.3 |
+| TP3, 13.25 | 324.2 | 248.9 | 318.0 | 312.7 | **6.2** | 5.3 |
+| TP3, 24.38 | 584.4 | 254.0 | 583.5 | 566.3 | **0.9** | 17.2 |
+| TP4, 13.25, stream GEMM v2 | 261.2 | 232.0 | 241.7 | 233.2 | 19.5 | 8.4 |
+
+- The grid chain's five launches cost 1-7 µs a layer more than one ideal launch of the
+  same bytes. Restructuring the routed experts is worth at most that: 43 MoE layers ×
+  6.8 µs = 0.29 ms a step at TP4 (+1.0%), and 0.27 ms at TP3 (+0.7%).
+- An ideal stream of one layer's bytes still pays 5-17 µs of ramp and tail against
+  one stream of every layer's bytes. The routed experts cannot cross that boundary: the
+  next layer's experts are known only after its routing. Traffic known in advance can
+  fill it, which the L2 prefetch session's schedule does.
+- The stream GEMM v2 (all 48 SMs) is 9-28 µs a layer slower than the grid chain at every
+  shape: 261.2 / 464.9 / 341.9 / 612.0 µs against 251.8 / 446.3 / 324.2 / 584.4.
+
+## Ranked levers, with ceilings at c1
+
+`levers.py`, one lever at a time, from the suite's step (TP4 30.30 ms at 2.284 tokens a
+step, 75.4 tok/s; TP3 37.41 ms at 2.269, 60.7 tok/s). The inputs are the measured bound
+and layer tables above, over 43 MoE layers (40 target, 3 drafter) or the 40 target
+layers. Every saving is non-byte time in #598's terms, so none overlaps the byte floor
+or another row.
+
+| # | lever | owner | TP4 | TP3 | evidence |
+|---|---|---|---|---|---|
+| 1 | L2 prefetch timed against its consumers | l2-prefetch-timing session (#615) | 1.67 ms (+5.8%, 79.8 tok/s) | - | moe-overlap and PDL records; its prototype measured −1.5% c1 step |
+| 2 | Latency-bound small kernels: mHC's non-byte time, sparse MLA, the norm and cast, dispatch, SwiGLU | fusion survey (#583) | at most 1.36 ms (+4.7%, 78.9) | at most 1.33 ms (+3.7%, 62.9) | layer tables: 34 µs a layer at either rank; an upper bound (fused kernels still cost something) |
+| 3 | All-reduce: peer lateness and staging | sparknet; cluster only | at most 0.95 ms (+3.2%, 77.8) | at most 0.95 ms (+2.6%, 62.2) | #598: DRAM idles 0.95 ms under collectives; IKET: the peer wait. 10-03 four-rank traces: each rank waits 1.0-1.7 ms a step for the last peer, and dgx4 is last in 39% of collectives (a ring-only lever, #616) |
+| 4 | Stream boundaries' ramps and tails filled with known traffic | l2-prefetch-timing session | 0.47 ms (+1.6%, 76.6) | 0.23 ms (+0.6%, 61.0) | the bound: one ideal launch a layer against one for all layers |
+| 5 | Routed experts restructured (continuous FC1-FC2, persistent or stream GEMMs, deeper stages, warp-specialized producer, fused SwiGLU) | this study | 0.29 ms (+1.0%, 76.1) | 0.27 ms (+0.7%, 61.1) | the bound: the chain less one ideal launch of the same bytes |
+| 6 | LM heads at the attainable rate | unclaimed | 0.08 ms (+0.3%, 75.6) | 0.11 ms (+0.3%, 60.8) | layer tables: 41 µs (TP4) and 55 µs (TP3) over a head's bytes |
+
+Reconciled with #598:
+- Row 5 replaces this study's first estimate (+3.2%, from #598's rows 5 and 11). That
+  estimate assumed the attainable 266.6 GB/s within a layer; an ideal one-layer launch
+  reaches 247-254 GB/s.
+- Row 4 is the rest of #598's launch fixed costs, and only prefetch traffic can claim it.
+- Row 3 is #598's row 7. Rows 1 and 4 are most of #598's 3.4-3.7 ms of prefetch and
+  consumer time.
+- Row 2 overlaps the fusion survey's mHC and attention-front rows.
+
+Row 2 measured (lever 2, below):
+- With PDL, a removed launch on the chain is worth about 1 µs, not its traced
+  pre-PDL time.
+- The mHC boundary gives nothing more at c1: four bit-identical restructurings are all
+  within noise.
+- The attention front in one launch gives +0.7% TP4 and +0.9% TP3 at c1.
+- What is left of row 2 is the other launches that can merge: the index-source layers'
+  compressor and indexer chains, and the q RoPE after Q-B.
+
+IKET's per-rank decode-step table (#610, `iket-step-timings` in the shared notes) adds no
+new lever. A request's step against the grid's dummy step:
+- The target's verification head runs eagerly after the graph, and the grid skips it.
+  That is 1.0 ms at a TP4 shard: its own 248 MB at 266.6 GB/s, so it is already in
+  #598's floor.
+- The request's rows reach more experts: +0.96 ms of bytes.
+- Request-only kernels add 0.17 ms.
+- The per-layer kernels run slower with real rows: +0.13 ms, 31% of it exposed.
+
+## Prototype 1: the stream grouped GEMM (dropped)
+
+vLLM branch `c1-stream` (worktree ~/projects/vllm-c1-stream), not pushed:
+`moe.grouped_fp8_fp4_gemm_stream`. v1 is 3360247fe and 06b74e7ff, and v2 adds 59b2ac540,
+over next-candidate 97e204cd9. Below 16 rows, the plan's gate-up and down GEMMs use it in
+place of the grid kernel. It was built before the bound existed, on the first estimate's
++3.2% ceiling.
+
+| run | arm | TP4, 13 experts | TP4, 24 experts | TP3, 13 experts | bits |
+|---|---|---:|---:|---:|---|
+| stream-ab-1 (layer harness, six rounds) | v1: runs of `ceil(items / 48)` | −0.36% (645.6 → 652.0 µs a layer) | −1.77% (840.2 → 855.4) | −0.53% (847.5 → 854.2) | equal in every round |
+| bound-stream-1 (the routed chain alone) | v2: every SM streams | 261.2 against 251.8 µs | 464.9 against 446.3 | 341.9 against 324.2 | - |
+| stream-tests-1 | v1 | 115 tests passed, bit-identity test included | | | four PDL tests not run (conftest fixture) |
+
+Why it loses:
+- v1 balanced the items onto fewer SMs: 39 of 48 for FC1 at 13 experts. One SM keeps
+  only two K blocks (16 KB) of weights in flight, too little for its share of the
+  stream on fewer SMs.
+- v2 streams on all 48 and is still slower. The likely reason, not traced: the grid
+  kernel's CTA turnover costs less than the stream kernel's longer issue path (a
+  division and shared-memory reads every K block, and the base words at each item),
+  and the stream keeps no more bytes in flight. The bound leaves at most 6.8 µs a layer
+  to win anyway.
+
+- The grid kernel launches a CTA for each (tile, column block) item: 324 for FC1 at six
+  rows, of which about 126 are live. Each CTA fills its pipeline, streams one
+  `[128, K]` weight slab and drains. The CTAs past the last used tile exit after their
+  PDL wait.
+- The stream kernel launches 48 CTAs, one an SM. They split the live items into
+  contiguous runs: v1 of `ceil(items / 48)` (3 FC1 items on each of 39 SMs at 13
+  experts), v2 differing by at most one item over all 48. A CTA's pipeline runs through its items' K
+  blocks without draining: an item's first stages load while the previous item's last
+  ones multiply. Its weight slabs are consecutive in memory.
+- Each item's tile multiplies its K blocks in order into a cleared FP32 accumulator,
+  with the grid kernel's MMAs, operands and expanded scale words. Every output
+  therefore has the grid kernel's bits. `test_stream_gemm_gives_the_grid_gemm_bits`
+  compares both kernels bit for bit: TP4's and TP3's FC1 and FC2 shapes (TP4's FC2 has a
+  64-wide K tail), at 1, 3, 6, 12 and 15 rows, padding rows included.
+- What it aimed at: FC2's per-tile prologue and fill, the uneven last wave of both
+  GEMMs, and the exiting CTAs.
+
+Bundles: `stream-tests` runs the routed-expert tests, the PDL tests and the source
+check (with conftest from stream-tests-2 on). `stream-ab` runs the layer harness on
+next-candidate and the stream build in alternation, and compares bits and µs a layer.
+`layer-stream` and `lifetimes-stream` trace its CTA timelines.
+
+## The weight-stream variants (stages-ab)
+
+With the stream GEMM losing, the other routed-pipeline levers were run as one variable
+each against next-candidate. Run stages-ab-1 is the layer harness in rotation over five
+builds, four rounds, every buffer's bits equal in every build. It gives µs saved a layer
+(median of rounds; the rounds spread about ±10 µs a layer, so the resolution is about
+±0.5%):
+
+| arm (vLLM branch) | TP4, 13 experts | TP4, 24 experts | TP3, 13 experts |
+|---|---:|---:|---:|
+| the grid GEMMs at four stages in decode (`c1-stages4` 4d77b5e71) | −0.7 µs (−0.11%) | +1.8 (+0.22%) | −0.9 (−0.11%) |
+| base words loaded after the first stages are issued (`c1-prologue` 4981583ba) | −0.2 (−0.02%) | +4.9 (+0.59%) | +0.5 (+0.05%) |
+| the stream GEMM on all 48 SMs (`c1-stream` 59b2ac540) | −4.2 (−0.65%) | −15.3 (−1.81%) | −15.7 (−1.87%) |
+| that at four stages (`c1-stream-s4` 8023b0d85) | −2.3 (−0.36%) | −13.1 (−1.56%) | −8.5 (−1.02%) |
+
+None beats next-candidate beyond the run's resolution, which is what the bound predicts.
+A fourth stage keeps three K blocks in flight an SM and gains nothing, so the grid
+kernel's stream is not short of bytes in flight. The prologue reorder is within noise
+too.
+
+## Recommendation for the release after next
+
+- **Take no routed-expert pipeline change.** The chain is within 1-7 µs a layer of an
+  ideal stream (at most +1% at c1), and none of the five variants measured above the
+  noise.
+- **Spend the c1 effort where the measured non-byte time is:**
+  1. **The L2 prefetch schedule** (#615): already prototyped, −1.5% at c1. The bound
+     adds a reason: an ideal stream pays 5-17 µs of ramp and tail at each layer's MoE
+     boundary, and prefetch traffic known in advance is what can fill it.
+  2. **The latency-bound small kernels:** 34 µs a layer at either rank, at most 1.3 ms a
+     step. They are mHC's non-byte time, sparse MLA, the norm and cast, dispatch and
+     SwiGLU, and the fusion survey's attention-front and mHC boundary fusions target
+     them.
+  3. **The all-reduce's late peers** on the ring (dgx4 last in 39% of collectives): a
+     cluster study, at most +3.2%.
+- **For the 100 tok/s question this confirms #598 from the other side.** The weight
+  stream itself is at the attainable rate, inside the kernels as well as overall. A
+  step only gets shorter through fewer bytes (the exact byte cuts, a stronger drafter's
+  tokens a step) or through less non-byte time between the streams.
+- **IKET's per-rank decode-step tables** (#610's step bundles at TP4 and TP3 rank
+  shapes, on dgx3) are still running. They cover the per-step kernels this harness
+  leaves out: router, metadata, sampler, drafter. When they land, they attribute the
+  remaining part of #616's 6.5 ms grid-to-serving gap.
+
+## Lever 2: the latency-bound small kernels, starting with the mHC boundary
+
+The coordinator then gave this study lever 2 (row 2 above), which nobody owned.
+
+**Bounds, from the layer tables and the production traces.** The mHC boundary is the
+largest small-kernel family:
+- In production (TP4, c1 greedy, the ports build before PDL), `project_streams` takes
+  1.16 ms a step and `finalize` 0.60 ms: 14.4 and 7.5 µs a boundary, 80 boundaries,
+  5.0% of the step.
+- In the harness with PDL, at either rank (mHC is replicated), it is 11.9 and 5.2 µs a
+  boundary: 1.37 ms a step.
+- The attention front is next: RoPE 0.26 ms, the cache write 0.25 ms, the q and kv
+  norms and casts 0.28 ms, metadata 0.31 ms a step.
+
+A boundary moves about 2.6 MB:
+- `fn`, FP32, 1.97 MB;
+- the four streams read and written, about 0.5 MB;
+- the collapse and the output.
+
+At 266.6 GB/s that is 9.7 µs of its 17.1 µs. So 7.4 µs a boundary, 0.59 ms a step
+(TP4 +2.0%, TP3 +1.6%), is non-byte time. Most of it is `finalize`'s 5.2 µs, six CTAs
+that reduce the partials, run the Sinkhorn and normalize.
+
+**Where `project_streams` waits** (IKET, TP4): 51% of a warp's life is the `fn` loads,
+15% the TF32 MMAs, 11% a block sync. It reads `fn` at about 200 GB/s across its 40 CTAs.
+
+**Two prototypes on `fn`'s loads, bit-identical** (vLLM branches from next-candidate
+c579b3fe1). Runs fusion-ab-2 and fusion2-ab-1: the layer harness with all-reduce stand-ins
+(`--ar`), four rounds, at c1 (6 rows, 3 live), c8 (24 rows) and c16 (48 rows), every
+buffer's bits equal:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A1: every stream's `fn` loaded at once, before the first GEMM (`c1-fusion` f17fb3646) | −0.82% | −0.51% | −0.44% | −0.75% | −0.56% | −0.12% | 106 passed, kernels source-checked |
+| A2: the next stream's `fn` loaded during the current stream's GEMMs (`c1-fusion2` b84e421b2) | −0.42% | −0.19% | −0.06% | +0.21% | −0.17% | −0.08% | 106 passed |
+
+Neither helps; A1 is a little slower, probably from its scalar loads and 96 extra
+registers a thread. The `fn`
+read is bound by DRAM, not by serialized round trips: about 200 GB/s over 40 SMs is
+already near the rate. Both are dropped.
+
+**What is left at the boundary** is `finalize`'s latency and the short serial phases
+around it: about 7 µs a boundary of non-byte time, including about 3 µs of
+`project_streams`' own GEMM and syncs.
+
+**A3: `finalize` folded into `project_streams`** (`c1-mhcfold` 169744c3f, bit-identical).
+Up to `FOLD_ROWS` (64) tokens an entry is one launch:
+- One CTA per split (40, fewer than the SMs, so all resident) takes every token tile in
+  turn and writes the partials.
+- Then a grid barrier: an acq_rel arrival count, the last arrival releases a
+  generation, and a `%globaltimer` deadline traps. The dependents' PDL trigger follows
+  the barrier.
+- Then `finalize`'s work with its operations in its order. Token `t`'s mixes run on
+  CTA `t % 40`'s warp 0, through the same macros `finalize` now uses. The other warps
+  normalize and cast the CTA's own 128 columns of every token.
+
+Runs mhcfold-tests-1 and mhcfold-ab-1, against next-candidate:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A3: `finalize` folded in (`c1-mhcfold` 169744c3f) | +0.17% | +0.08% | −0.28% | +0.29% | +0.03% | −0.04% | 136 passed, kernels source-checked |
+
+The tests include a new one: at 1-64 tokens in all three modes, the fold writes every
+output of `project_streams` then `finalize` bit for bit, twice on one barrier.
+
+The fold saves about 1 µs a boundary, against the 3-4 µs estimated. That is within
+noise at c1 and c8. At c16 it loses on TP4: the 40 resident CTAs serialize three token
+tiles that the two-kernel grid runs side by side. Not worth adopting alone.
+
+The per-kernel chain costs show why (layer-1, both ranks):
+- `project_streams` costs 11.9 µs a boundary, `finalize` 5.2 µs.
+- With PDL, `finalize`'s CTAs already wait on the GPU, so its launch was worth about
+  1 µs.
+- Most of the rest is the mix chain on one warp: the split partials reduced, then 20
+  Sinkhorn iterations.
+
+Nothing reads those mixes before the next entry: the post-mix and combination fold the
+next sublayer's output in, and the new pre-mix is the next collapse's.
+
+IKET's `finalize` trace (layer-1, TP4) shows where warp 0's time goes:
+- the Sinkhorn's 4-lane reductions take 2.27 µs: 40 dependent two-shuffle reductions,
+  each followed by a division;
+- the split partials' reduction takes 0.8 µs, and the other warps wait for it at the
+  block sync before they start on the rows.
+
+**A4: the mix chain on a side stream** (`c1-mixaux` 6139240b7, bit-identical). Up to
+64 tokens, `finalize` runs in two parts with its operations in its order:
+- the rows (`y` and its cast, on all four warps) after the projection on the chain;
+- the mixes on a side stream, forked after the projection, from partials kept outside
+  the shared workspace.
+
+Every mHC operation that reads mixes joins the side stream first. In a decode step the
+next entry follows the all-reduce's ordinary edge, so that join costs no PDL overlap.
+
+Runs mixaux-tests-1 and mixaux-ab-1, against c579b3fe1:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A4: the mix chain on a side stream (`c1-mixaux` 6139240b7) | +0.23% | −0.20% | −0.14% | −0.70% | −0.05% | −0.06% | 122 passed, kernels source-checked |
+
+The new test checks that the two parts write the whole kernel's outputs bit for bit, at
+both widths and 1-64 tokens. TP3 c1's rounds spread from +2.6 to −16.6 µs.
+
+No gain, so warp 0's chain was not the critical path. What `finalize` adds after the
+projection is the PDL dependency wait plus its rows' L2 round trips: the split
+reductions, then the collapse and the weight, then the stores. Every kernel boundary on
+the chain pays these. Production wiring would also have needed joins before the CED
+boundary's and sequence-parallel row gathers of the mixes.
+
+**The mHC boundary is done for c1.** Its byte part is DRAM-bound. Four bit-identical
+restructurings of the rest are all within noise:
+- `fn`'s loads, two ways;
+- the fold;
+- the side stream.
+
+What remains is the fusion survey's cluster idea, which one GPU cannot measure: the
+post, the collapse and the norm in the all-reduce's reduce phase.
+
+**A5: the attention front in one launch** (`c1-front` 8a70cb9a9, bit-identical). With
+PDL a removed launch is worth about 1 µs, so the front's small kernels are worth about
+as much as their count. After the fused Q-A/KV projection, a decode step ran five of
+them on the two latents:
+- TileKernels' RMSNorm of each latent;
+- `per_token_cast` of the normalized q latent, for Q-B;
+- the kv latent's RoPE;
+- its SWA cache record.
+
+`attention_front` is one kernel in their place.
+- q CTAs run a TileLang port of TileKernels' `norm_forward_and_per_token_cast`: its row
+  split, fragment layouts and reducers, and its own cast helpers. They write the BF16 q
+  latent and its MXFP8 cast, which equals `per_token_cast` of that row.
+- kv CTAs run the same norm, then from registers `rope_kernel`'s rotation and
+  `cache_writer_kernel`'s record, with those kernels' arithmetic.
+
+The kv norm's thread layout makes this fit. The 64 rotated columns are the last vector
+of lanes 8-15, which are exactly `rope_kernel`'s lanes. A 32-column record group is
+four adjacent lanes, and two shuffles give its amax. The q heads' RoPE stays after
+Q-B.
+
+The harness gained `--front`: the kv norm, both RoPEs and the SWA record, as the decode
+forward runs them. Runs front-tests-1 and front-ab-1, against c579b3fe1:
+
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A5: the attention front in one launch (`c1-front` 8a70cb9a9) | **+0.72%** | **+0.35%** | +0.07% | **+0.90%** | +0.23% | −0.03% | 49 passed, kernels source-checked |
+
+The tests include a new one: every output byte against the five kernels (BF16 q latent,
+E4M3 values, UE8M0 scales, rotated kv latent, cache pages), at 1-65 rows, with int64
+and int32 slots, a skipped slot, and zero, large and tiny rows.
+
+Every c1 round gained, on both ranks: 4.7 µs a layer at TP4 (rounds 1.8-7.7 µs) and
+7.7 µs at TP3 (rounds 6.6-13.1 µs). Every TP4 c8 round gained too. Over 43 layers that is
+about 0.20 ms of the TP4 step (+0.7%, 75.4 to 75.9 tok/s) and 0.33 ms of TP3's (+0.9%,
+60.7 to 61.2). At c16 it is neutral.
+
+It is the first lever-2 fusion to pay.
+
+**Wired into the attention forward** (`c1-front` 0060836b4). At decode rows with cache
+pages, `DeepseekV4Attention._front` runs the one kernel after the fused projection. It
+does not run under sequence parallelism, past one decode tile, under memory profiling,
+or with breakable graphs. The separate norms, Q-B cast, kv RoPE and cache write then do
+not launch.
+
+Q-B now reads its input's cast from the input's producer, like the fused Q-A/KV:
+- at decode rows, the front kernel writes it;
+- on every other path, `cast_mxfp8` writes it, the same `per_token_cast` Q-B ran itself
+  before. That cast is declared with the layer's kernels.
+
+Run front-wiring-tests-1 passed: the attention model tests (with a new routing test),
+the front, RoPE, cache-writer and TileLang linear tests. It targets the release after
+next. A serving bench on the cluster is the gate it still needs.
+
+**In a whole decode step** (IKET's step tool, #610: six target layers covering every
+attention role, plus the drafter, at a rank's shapes; dgx1 TP4 and dgx2 TP3 in
+parallel). The vLLM refs are next-candidate and the front, each with IKET's mode merged
+(`c1-step-base` bd175503b, `c1-step-front` 3732f532f).
+- **The step tool runs breakable CUDA graphs.** vLLM turns them on for DS4.1 unless
+  `VLLM_USE_BREAKABLE_CUDAGRAPH` is set; the serving recipe sets it to 0. The first
+  pair of runs (step-*-tp4-1, step-*-tp3-1) therefore never launched the front. Its
+  wiring stays off in that mode on purpose. The `-full` bundles set the variable to
+  0, as the recipe does.
+- **End to end, the front matches next-candidate.**
+  - With breakable graphs off, the TP4 tokens are equal, and the logprobs are equal
+    exactly at positions 1-31.
+  - Position 0's top-5 logprobs differ between any two runs, even of one build (IKET
+    found the same).
+  - At TP3, the dummy engine's reads of memory nothing writes split the two builds'
+    tokens, in both graph modes.
+  - With that memory filled (`--filled`: filled-base-tp3-1 on dgx2, filled-front-tp3-1
+    on dgx1, two runs each), all four runs give the same tokens and the same logprobs
+    at positions 1-31.
+- **The step's chain** (`step_chain.py`: each launch's increment of the step's end).
+  - The front launches 9 times a step, replacing 36 launches.
+  - The five kernels' chain cost falls from 109.0 to 84.1 µs a step at TP4, and from
+    107.3 to 82.3 at TP3, the front's 29.7-29.9 µs included.
+  - That is 2.8 µs a layer saved. It is a floor: a removed launch also lets its
+    successor start sooner, which the layer harness counts (4.7 and 7.7 µs a layer).
+
+**The compressor and indexer chain bounds small.** In the TP4 step (breakable graphs
+off), the indexer's kernels cost about 40 µs a step over the two index-source layers:
+- top-k segments 14.4 µs;
+- the MXFP4 query quantization 9.8 µs;
+- scoring 6.3 µs;
+- the top-k merge and page tables, about 6 µs.
+
+`compress` adds about 3 µs per KV-source layer. Over the model's eight index-source and
+four KV-source layers that is at most about 0.17 ms a step (0.5% at TP4). At about 1 µs
+a removed launch, perhaps half of it would go, and merging the top-k passes risks
+changing which tied positions are kept. Not worth building ahead of anything else.
+
+The steady steps also sit idle about 111 µs between kernels. That is host time before
+per-step kernels (draft budget 22 µs, padding rows 16, CED requests 13, adaptive
+offsets 11, post-update 7). It is an engine-level lever.
+
+## A6: the DSpark Markov bias projection, five times a step
+
+The step table's vocab-wide BF16 GEMM (5 launches a step, 91% waiting on its weight
+stream) is the drafter's Markov bias projection. `markov_w2` is a BF16 `[vocab, 256]`
+weight; each draft projects the previous token's rank-256 embedding through it. It runs
+through the BF16 head's 16-row tile: `bf16_gemm` with a 64-wide N tile, K in one block,
+2 stages.
+
+At a rank's shard the weight fits L2: 16.5 MB at TP4 and 22.1 MB at TP3, in GB10's 24 MB.
+`markov_l2.py` times one row: once after a 128 MiB read evicts L2, then five drafts back
+to back with an argmax between, as drafting runs them. It also re-reads the weight five
+times with `stream_bound.py`'s ideal read kernel, which shows how fast L2 can serve it:
+**12.3 µs** for the TP4 shard (about 1.35 TB/s) and 20-25 µs for TP3's.
+
+**`bf16_rows_gemm`** (`c1-markov` 3544e79bb, bit-identical). For up to 16 rows, 96 CTAs
+stay resident (two on each SM). Each takes every 96th N tile and pipelines their K
+blocks one after another, so its copies run ahead across tiles. Each tile is cleared,
+gets `bf16_gemm`'s GEMMs over its K blocks in order, and is stored: every output has the
+same accumulation. A BF16 head runs its 16-row tile on it when its K is at most 512,
+it has at least 192 N tiles, and its weight fits L2.
+
+Drafts in µs (markov-l2-5 and markov-l2-rows-2, dgx2, the production head path):
+
+| shard | the head's 16-row tile | `bf16_rows_gemm` | a step |
+|---|---|---|---:|
+| TP4 (16.5 MB) | 101.4, 36.4, 28.7, 28.9, 28.7 | 109.6, 27.6, 16.3, 18.9, 18.5 | −33 µs (+0.1%) |
+| TP3 (22.1 MB) | 136.7, 57.0, 38.9, 39.1, 38.9 | 146.5, 62.5, 31.7, 35.0, 36.4 | +1.5 µs |
+
+**Dropped.** The head's tile already reads mostly from L2: 28.7 µs a draft at TP4,
+against the ideal read's 12.3. The persistent kernel closes most of that gap. But it
+streams the first draft from DRAM about 8 µs slower, so the step gains about 0.1% at
+TP4 and nothing at TP3.
+
+The first measurement went through the TileLang linear path instead (markov-l2-2 to
+-4, markov-l2-rows-1: `bf16_gemm`'s default 64-row tiles). There every draft took 69.5
+µs, and an `evict_last` prefetch changed only the first. That projection is not the one
+production runs.
+
+## Runs on dgx1 and dgx2
+
+dgx1, 2026-10-26, and from 18:57 CET also dgx2, both with image
+`spark-ds41f:19f2c20ed4d6-next-6` and `scripts/lab.py kernel-local`. Each node ran from
+its own `~/spark-lab/agents/c1-iket/spark-ds41f`, with outputs in
+`~/spark-lab/agents/c1-iket/out/`. `run_queue.sh` ran the bundles in order and stopped at
+a failed smoke run. Receipts (`output.txt`, `verdict.json`, and for the traces the
+derived tables) are in `runs/`. The step runs keep their results, step diffs and
+`step_chain.json`. Runs are on dgx1 unless the table names dgx2.
+
+| run | started (CET) | bundle | result |
+|---|---|---|---|
+| smoke-1 | 13:50 | smoke | FAIL in 4 s: the harness read its default routes at import |
+| smoke-2 | 13:58 | smoke | pass, 171 s; the lifetimes trace was empty (no kernel instrumented) |
+| stream-tests-1 | 14:01 | stream-tests (v1) | 115 passed, bit-identity test included; four PDL layer-chain tests lacked conftest's fixture |
+| layer-1 | 14:02 | layer | pass, 572 s: the TP4 and TP3 tables |
+| smoke-3 | 14:11 | smoke | pass, 113 s; the lifetimes held the combine alone |
+| stream-ab-1 | 14:12 | stream-ab (v1) | pass, 453 s: bits equal, v1 0.4-1.8% slower |
+| bound-1 | 14:13 | bound | FAIL in 46 s: inputs cast after the kernel cache froze |
+| layer-stream-1 | 14:21 | layer-stream (v1) | pass, 417 s |
+| lifetimes-1 | 14:22 | lifetimes | pass, 255 s |
+| layer-live6-1 | 14:29 | layer-live6 | pass, 302 s: TP4 at 24 experts |
+| smoke-4 | 14:29 | smoke | pass, 115 s |
+| bound-stream-1 | 14:33 | bound-stream (v2) | pass, 50 s |
+| layer-base-1 | 14:38 | layer-base | pass, 78 s: next-candidate's digests equal the IKET build's at both ranks |
+| bound-2 | 14:40 | bound | pass, 41 s: the bound |
+| lifetimes-stream-1 | 14:41 | lifetimes-stream (v2) | pass, 255 s |
+| stages-ab-1 | 14:43 | stages-ab | pass, 730 s: no arm above noise, bits equal |
+| stream-tests-2 | 14:47 | stream-tests (v2) | 119 passed, every launched kernel source-checked |
+| smoke-5 | 15:29 | smoke | pass, 116 s |
+| fusion-tests-1 | 15:33 | fusion-tests (A1) | 106 passed, every launched kernel source-checked |
+| fusion-ab-1 | 15:34 | fusion-ab (A1) | FAIL in 95 s: at 48 rows sparse MLA takes the extend route, which the harness did not run |
+| smoke-6 | 15:40 | smoke | pass, 117 s |
+| fusion-ab-2 | 15:43 | fusion-ab (A1) | pass, 577 s: bits equal, 0.1-0.8% slower |
+| smoke-7 | 16:04 | smoke | pass, 115 s |
+| fusion2-tests-1 | 16:06 | fusion2-tests (A2) | 106 passed |
+| fusion2-ab-1 | 16:07 | fusion2-ab (A2) | pass, 615 s: bits equal, within ±0.4% |
+| smoke-8 | 16:47 | smoke | pass, 115 s |
+| mhcfold-tests-1 | 16:49 | mhcfold-tests (A3) | 136 passed, every launched kernel source-checked |
+| mhcfold-ab-1 | 16:51 | mhcfold-ab (A3) | pass, 626 s: bits equal, +0.3% at c1 at most, −0.3% at TP4 c16 |
+| smoke-9 | 17:21 | smoke | pass, 116 s |
+| mixaux-tests-1 | 17:23 | mixaux-tests (A4) | 122 passed, every launched kernel source-checked |
+| mixaux-ab-1 | 17:25 | mixaux-ab (A4) | pass, 618 s: bits equal, within noise (+0.2% to −0.7%) |
+| smoke-10 | 17:36 | smoke | pass, 116 s |
+| front-tests-1 | 17:38 | front-tests (A5) | 49 passed, every launched kernel source-checked |
+| front-ab-1 | 17:39 | front-ab (A5) | pass, 634 s: bits equal, +0.72% TP4 c1, +0.90% TP3 c1 |
+| smoke-11 | 18:04 | smoke | pass, 116 s |
+| front-wiring-tests-1 | 18:06 | front-wiring-tests (A5 wired) | 86 passed, every launched kernel source-checked |
+| step-base-tp4-1, step-front-tp4-1 | 18:59, 19:09 | IKET step tool, TP4 | pass; breakable graphs auto-enabled, so the front did not launch; tokens equal |
+| step-base-tp3-1, step-front-tp3-1 (dgx2) | 19:00, 19:10 | IKET step tool, TP3 | pass; breakable graphs; tokens split by the dummy engine's unwritten reads |
+| step-base-tp4-full-1, step-front-tp4-full-1 | 19:29, 19:39 | step tool, breakable off | pass: the front launched 9 times a step, its family −25 µs a step, tokens equal, logprobs equal at 1-31 |
+| step-base-tp3-full-1, step-front-tp3-full-1 (dgx2) | 19:29, 19:39 | step tool, breakable off | pass: the front family −25 µs a step |
+| filled-base-tp3-1 (dgx2), filled-front-tp3-1 | 19:59 | two filled-memory runs each | all four: tokens equal, logprobs equal at 1-31 |
+| markov-l2-1 | 20:02 | markov-l2 | FAIL in 7 s: a plain namespace cannot be referenced weakly |
+| markov-l2-2 | 20:10 | markov-l2 | pass, on the linear path: 69.5 µs a TP4 draft |
+| markov-l2-3 (dgx2) | 20:20 | markov-l2 | pass, linear path: an `evict_last` prefetch changes only the first draft |
+| markov-l2-4 (dgx2) | 20:29 | markov-l2 | pass, linear path: the ideal read re-reads the TP4 shard in 12.3 µs |
+| markov-tests-1 | 20:41 | markov-tests (linear route) | 40 passed: `bf16_rows_gemm` gives `bf16_gemm`'s bits |
+| markov-l2-rows-1 (dgx2) | 20:41 | markov-l2-rows (linear route) | pass: TP4 drafts 2-5 in 12-27 µs on the linear path |
+| markov-l2-5, markov-l2-rows-2 (dgx2) | 20:52 | markov-l2 on the production head path | pass: −33 µs a TP4 step, none at TP3; dropped |
+| markov-tests-2 | 20:52 | markov-tests (head route) | 72 passed: `bf16_gemm`'s and the head tile's bits, kernels source-checked |
+
+## Files
+
+| file | what |
+|---|---|
+| `harness/c1_layer.py` | the per-rank c1 layer harness |
+| `harness/stream_bound.py` | the routed chain against an ideal read of the same bytes |
+| `layer_table.py` | per-kernel cost, excess over bytes, IKET phases and waits, from a `layer` run |
+| `cta_timeline.py` | SM occupancy and weight stream from run-iket's warp lifetimes (qualitative under the profiler) |
+| `step_shares.py`, `step_shares.json` | kernel families' shares of the TP4 production step |
+| `routed_chain.py`, `routed_chain.json` | the routed chain in production; FC2's serving fit |
+| `levers.py`, `levers.json` | ceilings in tok/s from the measured bound and tables |
+| `ab.py` | base against prototype builds on the harness, in rotation |
+| `make_bundles.py`, `bundles/` | the kernel-lab bundles (IKET experiment's mechanics) |
+| `run_queue.sh` | the node-side driver: the bundles one after another |

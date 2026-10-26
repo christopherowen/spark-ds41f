@@ -1,0 +1,112 @@
+{
+ "suite": {
+  "TP4": {
+   "steps_per_s": 33.003,
+   "tokens": 2.284
+  },
+  "TP3": {
+   "steps_per_s": 26.73,
+   "tokens": 2.269
+  }
+ },
+ "levers": [
+  {
+   "lever": "L2 prefetch timed against its consumers",
+   "owner": "l2-prefetch-timing session (#615)",
+   "evidence": "1.67 ms of consumer excess (moe-overlap, PDL records); its prototype measured -1.5% c1",
+   "TP4": {
+    "saved_ms": 1.67,
+    "tok_s": 79.8,
+    "gain_percent": 5.83
+   },
+   "TP3": null
+  },
+  {
+   "lever": "Latency-bound small kernels (mHC non-byte, sparse MLA, q-norm and cast, dispatch, SwiGLU)",
+   "owner": "fusion survey (#583)",
+   "evidence": "layer tables: their cost, mHC's excess over its fn bytes",
+   "us_per_layer": {
+    "TP4": 33.9,
+    "TP3": 33.4
+   },
+   "TP4": {
+    "saved_ms": 1.358,
+    "tok_s": 78.9,
+    "gain_percent": 4.69
+   },
+   "TP3": {
+    "saved_ms": 1.334,
+    "tok_s": 62.9,
+    "gain_percent": 3.7
+   }
+  },
+  {
+   "lever": "All-reduce: peer lateness and staging, at most the DRAM-idle time under collectives",
+   "owner": "sparknet; cluster only (ring: dgx4 last in 39% of collectives, 10-03)",
+   "evidence": "#598: 0.95 ms DRAM idle under collectives; IKET: the time is the peer wait",
+   "TP4": {
+    "saved_ms": 0.95,
+    "tok_s": 77.8,
+    "gain_percent": 3.24
+   },
+   "TP3": {
+    "saved_ms": 0.95,
+    "tok_s": 62.2,
+    "gain_percent": 2.61
+   }
+  },
+  {
+   "lever": "Stream boundaries' ramps and tails filled with known traffic (the next window's prefetch)",
+   "owner": "l2-prefetch-timing session",
+   "evidence": "bound: one launch a layer is this much slower than one launch for all layers, for an ideal read of the same bytes",
+   "us_per_layer": {
+    "TP4": 11.0,
+    "TP3": 5.3
+   },
+   "TP4": {
+    "saved_ms": 0.472,
+    "tok_s": 76.6,
+    "gain_percent": 1.58
+   },
+   "TP3": {
+    "saved_ms": 0.227,
+    "tok_s": 61.0,
+    "gain_percent": 0.61
+   }
+  },
+  {
+   "lever": "Routed experts restructured: continuous FC1-FC2, persistent or stream GEMMs, deeper stages, warp-specialized producer, fused SwiGLU",
+   "owner": "this study",
+   "evidence": "bound: the routed chain less an ideal one-launch read of the same bytes",
+   "us_per_layer": {
+    "TP4": 6.8,
+    "TP3": 6.2
+   },
+   "TP4": {
+    "saved_ms": 0.294,
+    "tok_s": 76.1,
+    "gain_percent": 0.98
+   },
+   "TP3": {
+    "saved_ms": 0.266,
+    "tok_s": 61.1,
+    "gain_percent": 0.72
+   }
+  },
+  {
+   "lever": "LM heads at the attainable rate",
+   "owner": "unclaimed",
+   "evidence": "layer tables: the head's excess over its bytes, two heads a step",
+   "TP4": {
+    "saved_ms": 0.083,
+    "tok_s": 75.6,
+    "gain_percent": 0.27
+   },
+   "TP3": {
+    "saved_ms": 0.11,
+    "tok_s": 60.8,
+    "gain_percent": 0.3
+   }
+  }
+ ]
+}
