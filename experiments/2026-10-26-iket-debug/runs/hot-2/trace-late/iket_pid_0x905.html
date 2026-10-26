@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>iket_pid_0x905</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+    #status {
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #1a73e8; color: white;
+      padding: 8px 16px; font-family: sans-serif; font-size: 14px;
+      z-index: 10; text-align: center;
+    }
+    #file-picker {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #1a73e8; color: white;
+      padding: 16px; font-family: sans-serif; font-size: 14px;
+      z-index: 10; text-align: center;
+    }
+    #file-picker label {
+      cursor: pointer; background: white; color: #1a73e8;
+      padding: 8px 20px; border-radius: 4px; font-weight: bold;
+    }
+    #file-picker label:hover { background: #e8e8e8; }
+    iframe {
+      position: fixed; top: 36px; left: 0; right: 0; bottom: 0;
+      width: 100%; height: calc(100% - 36px); border: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Loading trace &mdash; waiting for Perfetto UI to be ready...</div>
+  <div id="file-picker">
+    Opened via file:// &mdash; select the companion trace file:
+    <label>Choose iket_pid_0x905.pftrace.gz<input type="file" id="file-input" accept=".gz,.pftrace" hidden></label>
+  </div>
+  <iframe id="pf" src="about:blank" style="display:none" allow="clipboard-write"></iframe>
+  <script>
+    const traceUrl = "iket_pid_0x905.pftrace.gz";
+    const isLocal = window.location.protocol === 'file:';
+    const iframe = document.getElementById('pf');
+    const status = document.getElementById('status');
+    const filePicker = document.getElementById('file-picker');
+    const fileInput = document.getElementById('file-input');
+    let sent = false;
+
+    async function decompress(bytes) {
+      const ds = new DecompressionStream('gzip');
+      const writer = ds.writable.getWriter();
+      writer.write(bytes);
+      writer.close();
+      const reader = ds.readable.getReader();
+      const chunks = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      let totalLength = 0;
+      for (const c of chunks) totalLength += c.length;
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const c of chunks) { result.set(c, offset); offset += c.length; }
+      return result;
+    }
+
+    async function resolveTrace(raw) {
+      const sizeMB = (raw.length / 1048576).toFixed(1);
+      const isGzip = raw[0] === 0x1f && raw[1] === 0x8b;
+      if (isGzip) {
+        status.textContent = `Decompressing trace (${sizeMB} MB compressed)...`;
+        return await decompress(raw);
+      }
+      return raw;
+    }
+
+    // =====================================================================
+    // HTTP mode: iframe + postMessage (for web server deployments)
+    // =====================================================================
+    function initHttpMode() {
+      iframe.src = 'https://ui.perfetto.dev';
+      iframe.style.display = '';
+
+      async function tryPost() {
+        if (sent) return;
+        try {
+          status.textContent = 'Downloading compressed trace...';
+          const resp = await fetch(traceUrl);
+          if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+          const raw = new Uint8Array(await resp.arrayBuffer());
+          const traceData = await resolveTrace(raw);
+          status.textContent = 'Sending trace to Perfetto UI...';
+          iframe.contentWindow.postMessage({
+            perfetto: { buffer: traceData.buffer, title: "iket_pid_0x905", keepApiOpen: true }
+          }, 'https://ui.perfetto.dev');
+          sent = true;
+          status.textContent = 'Trace loaded.';
+          setTimeout(() => status.style.display = 'none', 2000);
+        } catch (e) {
+          // not ready yet or fetch error, retry
+        }
+      }
+
+      window.addEventListener('message', (e) => {
+        if (e.origin !== 'https://ui.perfetto.dev') return;
+        if (e.data && e.data.perfettoUiReady) tryPost();
+      });
+
+      iframe.addEventListener('load', () => {
+        status.textContent = 'Perfetto UI loaded &mdash; loading trace...';
+        const poll = setInterval(() => {
+          if (sent) { clearInterval(poll); return; }
+          tryPost();
+        }, 500);
+        setTimeout(() => clearInterval(poll), 30000);
+      });
+    }
+
+    // =====================================================================
+    // File mode: file picker + iframe with targetOrigin '*' (for file://)
+    // =====================================================================
+    function initFileMode() {
+      iframe.src = 'https://ui.perfetto.dev';
+      iframe.style.display = '';
+      status.style.display = 'none';
+      filePicker.style.display = 'block';
+
+      let traceData = null;
+
+      fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        filePicker.style.display = 'none';
+        status.style.display = '';
+        status.textContent = 'Reading file...';
+
+        const raw = new Uint8Array(await file.arrayBuffer());
+        traceData = await resolveTrace(raw);
+        if (iframeLoaded) onReady();
+        else status.textContent = 'Waiting for Perfetto UI to load...';
+      });
+
+      let iframeLoaded = false;
+
+      function sendTrace() {
+        if (sent || !traceData) return;
+        iframe.contentWindow.postMessage({
+          perfetto: { buffer: traceData.buffer, title: "iket_pid_0x905", keepApiOpen: true }
+        }, '*');
+        sent = true;
+        status.textContent = 'Trace sent. If it did not load, click Retry.';
+        // Show retry button after a moment
+        setTimeout(() => {
+          if (status.style.display !== 'none') {
+            status.innerHTML = 'Trace sent. <button id="retry-btn" style="cursor:pointer;background:white;color:#1a73e8;border:none;padding:4px 12px;border-radius:3px;font-weight:bold;margin-left:8px">Retry</button>';
+            document.getElementById('retry-btn').onclick = () => {
+              sent = false;
+              sendTrace();
+            };
+          }
+        }, 3000);
+      }
+
+      function onReady() {
+        if (!traceData || sent) return;
+        // Wait 5s after iframe load for Perfetto to fully initialize
+        status.textContent = 'Perfetto UI loaded — sending trace in 10s...';
+        setTimeout(() => sendTrace(), 10000);
+      }
+
+      iframe.addEventListener('load', () => {
+        iframeLoaded = true;
+        if (traceData) onReady();
+      });
+    }
+
+    // =====================================================================
+    if (isLocal) {
+      initFileMode();
+    } else {
+      initHttpMode();
+    }
+  </script>
+</body>
+</html>

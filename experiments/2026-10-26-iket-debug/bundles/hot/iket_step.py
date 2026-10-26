@@ -105,6 +105,10 @@ def main():
         max_model_len=8192,
         max_num_seqs=1,
         max_num_batched_tokens=2048,
+        # Aligned chunks, as CED's nonfinal-row skip requires (production: 8,192).
+        long_prefill_token_threshold=2048,
+        max_parallel_prefills=1,
+        async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
         enable_prefix_caching=False,
         attention_backend="TILELANG",

@@ -101,6 +101,17 @@ def test_ranges_close_on_every_path():
     )
 
 
+def test_range_ends_wait_for_barriers():
+    # A deferred-blocking barrier holds a warp only at its next memory access: each
+    # range end loads shared memory before it reads the timer.
+    out, sites = _ranges(KERNEL)
+    lines = [line.strip() for line in out.splitlines()]
+    ends = [i for i, line in enumerate(lines) if line == "TL_IKET_EVENT(31);"]
+    assert len(ends) == len(sites)
+    assert all(lines[i - 1] == "TL_IKET_SETTLE();" for i in ends)
+    assert out.startswith("#define TL_IKET_SETTLE() asm volatile(")
+
+
 def test_pragma_stays_with_its_loop():
     out, _ = _ranges(KERNEL)
     lines = out.splitlines()

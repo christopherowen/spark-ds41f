@@ -60,6 +60,16 @@ MAX_EVENTS = 30
 MAX_NAME_BYTES = 32
 RANGE_END = 31
 _CUDA_POSTPROC = "tilelang_callback_cuda_postproc"
+# ptxas emits a block barrier as BAR.SYNC.DEFER_BLOCKING: the warp goes on issuing
+# until an instruction touches memory, so a range end's %globaltimer read would run
+# before the barrier releases the warp, and the wait would land after the range
+# (sparknet's flag wait, peers 20 us late: warps closed the barrier's range at 1 us
+# and stalled in the next event's store to 24 us). A volatile shared load (IKET's
+# own slot) first holds the timer read until the barrier is through.
+_SETTLE = (
+    '#define TL_IKET_SETTLE() asm volatile("{\\n\\t.reg .b32 s;\\n\\t'
+    'ld.volatile.shared.u32 s, [0x20];\\n\\t}" ::: "memory")\n'
+)
 
 # (phase, kind, patterns): the first kind a statement matches names its phase.
 _PATTERNS = [
@@ -427,15 +437,22 @@ def annotate(
                 f'{indent}{guard}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
             )
         )
-        inserts.append(
-            (item.last.end, 0, f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n")
+        # Settled: a barrier inside the range (a block sync, TileLang's AllReduce)
+        # holds the range's end, not the next statement's.
+        end = (
+            f"{indent}{guard}TL_IKET_SETTLE();\n"
+            f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n"
         )
+        inserts.append((item.last.end, 0, end))
     out, last = [], 0
     # At one offset a range's end goes before the next range's start.
     for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
         out += [code[last:offset], text]
         last = offset
-    return "".join(out) + code[last:], sites
+    annotated = "".join(out) + code[last:]
+    if "TL_IKET_SETTLE();" in annotated:
+        annotated = _SETTLE + annotated
+    return annotated, sites
 
 
 _lock = threading.Lock()
