@@ -105,10 +105,11 @@ lowest through three cold 1M prefills. Details are in the
   spark-ds41f-1022, 6-7 of 8 seeded requests sent eight at once differed between runs; in
   this release, 6-8 of 8. This release's sampled text also differs from spark-ds41f-1022's by
   design (0228's fresh draws per block-verification round).
-- **The ring admits 6.21 full 1M contexts** (6,512,700 KV tokens; 8,580,566 at the 8,192
-  budget), from the same 10.5 GiB pool. The owner keeps the 16,384 budget for its prefill
-  (2026-10-25) and notes that the KV-capacity arithmetic in earlier records is wrong; 6.21 is
-  the measured figure. The cause is the ring's 16,384-token prefill budget (the
+- **vLLM's startup figure for the ring reads 6.21 full 1M contexts** (6,512,700 KV tokens;
+  8,580,566 at the 8,192 budget), from the same 10.5 GiB pool, which holds 11 full 1M contexts
+  at either budget ([KV capacity](../../docs/memory-profiles.md#kv-capacity), #586). The owner
+  keeps the 16,384 budget for its prefill (2026-10-25) and notes that the KV-capacity
+  arithmetic in earlier records is wrong. The figure's drop comes from the ring's 16,384-token prefill budget (the
   owner's "do 16" of 2026-10-23, for the CED skip's +5-6% prefill), not the TileLang work:
   every saved boot at 16,384 reports 6,512,700, candidate 4's image included (run
   `tilelang-ports-controls`), and every boot at 8,192 reports 8,580,566. vLLM charges each
@@ -136,7 +137,7 @@ a decision only the owner can make.
 
 | Report | Decision | Why, and the evidence |
 | --- | --- | --- |
-| The ring's KV capacity at the 16,384 budget (found in this release's checks) | **Decided** (owner, 2026-10-25): keep 16,384 | The ring admits 6.21 full 1M contexts at the 16,384 budget (8.18 at 8,192); the release publishes the measured figure. The owner keeps 16,384 for its prefill and notes that the KV-capacity arithmetic used so far is wrong; the earlier 8.18 figure is not a capacity this release loses. Not a regression of the candidate's code. |
+| The ring's KV capacity at the 16,384 budget (found in this release's checks) | **Decided** (owner, 2026-10-25): keep 16,384 | vLLM's startup figure for the ring reads 6.21 full 1M contexts at the 16,384 budget (8.18 at 8,192); the pool holds 11 at either budget (#586). The owner keeps 16,384 for its prefill and notes that the KV-capacity arithmetic used so far is wrong; the earlier 8.18 figure is not a capacity this release loses. Not a regression of the candidate's code. |
 | Candidate 5's release tests: 6 failures in two stale test files (found in this release's checks) | **In** (fixed in candidate 6) | vLLM 0489-0490, test files only. |
 | #455 `prompt_tokens_details` absent (JordiPosthumus) | **In** (fixed) | #469's `--enable-prompt-tokens-details` is in the candidate's recipe and replayed on the promotion branch. Live on candidate 5 (run `candidate-5-recheck-tp4`): a 2,710-token request reports `prompt_tokens_details` with `cached_tokens` 0 (2,560 created), its repeat `cached_tokens` 2,560. Close after the deploy. |
 | #469 the prompt-cache report (PR) | **In** | Replayed on the promotion branch; supersedes the PR. Close after the deploy. |
