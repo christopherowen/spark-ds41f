@@ -146,7 +146,13 @@ BUNDLES = {
                                   "import iket.cli, pathlib, shutil, sys; "
                                   "src = pathlib.Path(iket.cli.__file__).parent; "
                                   "shutil.copytree(src, sys.argv[1], ignore=shutil.ignore_patterns('__pycache__'))",
-                                  "{out}/iket-cli"], 300)],
+                                  "{out}/iket-cli"], 300),
+               ("copy iket.profiler's Python", ["{python}", "-c",
+                                                "import iket.profiler, pathlib, shutil, sys; "
+                                                "src = pathlib.Path(iket.profiler.__file__).parent; "
+                                                "shutil.copytree(src, sys.argv[1], ignore=shutil.ignore_patterns("
+                                                "'__pycache__', '*.so', 'perfetto_trace_pb2.py'))",
+                                                "{out}/iket-profiler"], 300)],
     ),
     "step-off": dict(
         ref=IKET,
