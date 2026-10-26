@@ -10,7 +10,8 @@ The mode is debug only and off in production. Off means no IKET import, no TileL
 callback, and generated code identical to the build without the mode.
 
 - vLLM: branch `iket-debug` (worktree ~/projects/vllm-iket, local only), cut from
-  next-candidate 577091997, head 52862f2ca. Not part of next-candidate.
+  next-candidate 577091997, head 736e86a25: the mode, then the MoE output fix (below)
+  cherry-picked from next-candidate's e846e64dc. Not part of next-candidate.
 - TileLang: no change. The image's pin (tile-ai/tilelang b95ee4ff, 0.1.15) and the fork's
   `deepseek-v41-sm120` hold the same IKET code.
 
@@ -340,35 +341,158 @@ What a whole-engine trace needed:
   When the mode is off, no callback is registered, so every module is TileLang's own
   output.
 
-### Step 4 status: the trace waits for dgx4
+### Step 4 results: c1 and c8 decode steps at the ring's and the triangle's rank shapes (dgx3)
 
-dgx1-4 went down for re-cabling at 08:15 CET on 2026-10-26, before the decode-step trace
-ran. Run 27 (bundle `step` at spark-ds41f a1010216, vLLM 52862f2ca) was queued and
-withdrawn, never started. Everything it needs is in place and checked piece by piece:
-- with the CUDA graphs the dry run recommends 80 timestamps a warp, a 10.3 GB pool (run
-  26);
-- the hot kernels' capped run shows that sampled records fit their slots (run 25);
-- the harness now frees the engine's 53 GB before run-iket decodes at exit (run 26 ran
-  out there).
+dgx3, vLLM 736e86a25 (with the MoE output fix below), bundles `step-tp{4,3}-c{1,8}`:
+run 42, and run 43 for TP3 c1 (run 42's TP3 c1 dry run hung; see "Found on the way").
+Receipts are in `runs/step-*-42` and `runs/step-tp3-c1-43`: `tables.md` (the output),
+`table.json`, `step-diff.json`, and both runs' `result-*.json`.
+- **The requests:** c1 is a 32-token prompt and 32 tokens, as one prefill and 16 decode
+  steps (dummy weights accept about 1.9 tokens a step). c8 is eight such requests
+  together.
+- **The grid:** after the requests, nine runs of the engine grid's dummy step at the same
+  shape (one or eight requests, six verification rows each), about the requests'
+  context.
+- Both are traced under IKET, and timed with nsys without it.
+- **Earlier c1 runs:** runs 32 and 33 (vLLM 734932a56, `runs/step-tp4-c1-32`,
+  `runs/step-tp3-c1-33`) predate the fix. Each layer read the previous layer's MoE
+  output from the workspace arena after the mHC entry had overwritten it: finite, but
+  wrong. So their routing was wrong too, and their routed GEMMs came out 0.2 ms
+  shorter.
 
-Re-run with `make_bundles.py`'s `step` bundle once dgx4 is back. It traces, counts the
-records, takes nsys of off with and without the graphs, and writes the decode-step
-table and both nsys timelines.
+| a decode step (nsys, no IKET) | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
+|---|---:|---:|---:|---:|
+| GPU busy, requests | 14.26 ms | 15.48 ms | 17.12 ms | 18.45 ms |
+| GPU busy, the grid's step | 8.76 ms | 9.57 ms | 11.38 ms | 12.31 ms |
+| the grid's own timer (`engine_grid`): step / target / drafter | 10.06 / 2.19 / 6.73 ms | 10.80 / 2.71 / 6.99 ms | 12.83 / 3.47 / 8.18 ms | 13.81 / 4.02 / 8.53 ms |
 
-The production-mode reference, from nsys of off with the graphs (run 18,
-`runs/step-18/nsys-graphs-window.md`):
-- The measured request is a 32-token prompt and 8 tokens: 2,636 launches in 226 ms.
-  The GPU is busy 137 ms (61%).
-- Two dense segments of about 70 ms each, 97-99% busy: the prefill, and the one decode
-  step DSpark needs. With dummy weights every draft is accepted, so eight tokens take
-  two passes.
-- An 83 ms host gap separates them. The harness asks for top-5 logprobs; the gap is not
-  investigated.
-- At TP1 the packed BF16 vocabulary head dominates: 4.1 ms a launch, 32% of the GPU
-  time. Production at TP4 splits it four ways. Then come the FP8 linear GEMMs (22%),
-  the routed experts (17%) and the L2 prefetch (8%).
-- Without the graphs (`nsys-eager-window.md`, no adaptive verification): 2,066
-  launches in 190 ms, also 61% busy.
+The vocabulary head is whole at TP1: each launch is 4.0-4.7 ms, where a TP4 rank's
+quarter is about 1.0 ms. So the absolute steps above are long by about 3 ms (the
+target's head) plus 3 ms (the drafter's head), and the vocabulary-wide BF16 GEMM is
+TP times a rank's too. Every other kernel is at a rank's shapes. The model has 40
+target layers and the drafter's 3, where this harness has 6 and 3.
+
+**A decode step by phase** (nsys, no IKET; kernel time a step, then the part exposed:
+time a kernel runs alone on the GPU, so on the step's critical path):
+
+| phase | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
+|---|---:|---:|---:|---:|
+| packed vocabulary head (two launches, whole) | 8084 / 8084 us | 8126 / 8126 | 8850 / 8850 | 8868 / 8868 |
+| vocabulary-wide BF16 GEMM (whole) | 1353 / 1353 | 1342 / 1342 | 1465 / 1465 | 1465 / 1465 |
+| dense GEMMs (MXFP8, FP8 weights, BF16 partials, split-K) | 2126 / 1187 | 2845 / 1790 | 2760 / 2043 | 3592 / 2915 |
+| routed experts (router, dispatch, GEMMs, SwiGLU, combine) | 1427 / 1281 | 1937 / 1566 | 2061 / 1832 | 2473 / 2214 |
+| L2 prefetch (a side stream) | 1671 / 226 | 1788 / 226 | 1399 / 120 | 1376 / 115 |
+| mHC and norms | 593 / 89 | 693 / 91 | 1083 / 336 | 1138 / 364 |
+| attention (sparse MLA, indexer, compressor, cache, rope, metadata) | 539 / 145 | 555 / 143 | 699 / 421 | 745 / 441 |
+| sampler, verification, sink rejection, the harness's logprobs | 185 / 185 | 188 / 188 | 358 / 358 | 354 / 354 |
+| inputs, copies, others | 69 / 69 | 65 / 65 | 85 / 85 | 88 / 88 |
+
+**Where a decode step's time goes inside the kernels** (IKET, 17 decode steps; spans a
+step, then the phase split of the launch's last recording warp; loop ranges are
+estimates, see Sampling above). TP4 c1:
+
+| kernel (grid) | launches | span a step | last warp: wait / load / compute | its longest wait |
+|---|---:|---:|---|---|
+| packed vocabulary head (1, 4040) | 2 | 8079 us | 56% / 31% / 10% | the block sync after its cp.async waits |
+| L2 prefetch (2) | 25 | 1599 us | load (a side stream; 86% overlapped) | |
+| BF16 GEMM (2020), vocabulary-wide (2020 x 64 = 129,280 rows: also whole at TP1) | 5 | 1315 us | 89% / 0% / 5% | its mbarrier wait |
+| routed gate-up GEMM (9, 30) | 8.6 | 806 us | 54% / 21% / 30% | the TMA weight tile's mbarrier |
+| routed down GEMM (40, 30) | 8.6 | 487 us | 14% / 20% / 0% | |
+| MXFP8 GEMMs (80, 64, 28, 36, 40, 40) | 48 | 1561 us | 27-77% wait | `cp_async_wait`, then the sync after it |
+| mHC project streams (40) | 18 | 300 us | 19% / 32% / 17% | the block sync |
+
+TP3's is the same order, with larger routed GEMMs. At c8 one of the two head launches
+computes more (24% of its last warp, against 10%). The routed GEMMs' grids grow from
+(9, 30) and (40, 30) to (9, 288) and (40, 288), and the down GEMM's last warp spends 56%
+loading (TP4).
+
+**What a decode step adds to the grid's step** (`step_diff.py`, nsys; kernel time,
+then exposed):
+
+| a decode step less the grid's | TP4 c1 | TP3 c1 | TP4 c8 | TP3 c8 |
+|---|---:|---:|---:|---:|
+| the target's verification head: a second packed-head launch the grid does not run | +4.08 / +4.08 ms | +4.11 / +4.11 | +4.34 / +4.34 | +4.34 / +4.34 |
+| the routed GEMMs (dummy rows reach 6 experts, the requests' rows more) | +1.17 / +1.13 | +1.64 / +1.43 | +1.21 / +1.13 | +1.58 / +1.51 |
+| the other per-layer kernels (mHC, router, sparse MLA, SwiGLU, combine, rope) | +0.21 / +0.03 | +0.30 / -0.12 | +0.10 / -0.18 | +0.18 / -0.08 |
+| L2 prefetch (a side stream) | +0.13 / -0.01 | +0.17 / -0.01 | +0.18 / +0.01 | +0.12 / 0.00 |
+| the vocabulary-wide BF16 GEMM (whole) | +0.08 / +0.08 | +0.07 / +0.07 | +0.10 / +0.10 | +0.10 / +0.10 |
+| kernels only a request runs: sampler, sink rejection, verification, inputs | +0.07 / +0.07 | +0.07 / +0.07 | +0.12 / +0.12 | +0.11 / +0.11 |
+| the harness's top-5 logprobs (`token_ranks`, `topk_log_softmax`, `topk_ids`) | +0.09 / +0.09 | +0.09 / +0.09 | +0.11 / +0.11 | +0.11 / +0.11 |
+| kernels only the grid runs (its dummy fills) | -0.11 / -0.11 | -0.12 / -0.12 | -0.14 / -0.14 | -0.15 / -0.15 |
+| **total (GPU busy)** | **+5.50 ms** | **+5.91** | **+5.74** | **+6.14** |
+
+A negative exposed time means the grid's step ran those kernels alone for longer than
+the requests' step did.
+
+- **The verification head.** A request's decode step runs the packed head twice. The
+  target's runs on its verified rows, eagerly after the target's graph (`ced_copy_rows`,
+  the head, then `logits_rows`, `sink_cut`, `local_stats`, `verify`). The drafter's runs
+  inside its graph. The grid's dummy step runs only the drafter's.
+- **The routed GEMMs** match #616's routing estimate. TP4 c1's +1.17 ms over this
+  harness's 9 MoE layers is about 5.6 ms over the model's 43 (+1.13 ms exposed: 5.4
+  ms), against #616's 5.3 ms.
+- **Applied to #616's c1 gap** (TP4, 1025: 11.9 ms, of which routing explains about
+  5.3 ms and about 6.5 ms is unattributed GPU work), this accounts for:
+  - about 1.0 ms of the target's verification head at a TP4 rank's shard (4.08 / 4),
+    all on the critical path;
+  - about 0.07 ms of sampler, sink rejection, verification and inputs, all exposed
+    (serving asks no logprobs);
+  - about 1.0 ms of slower per-layer kernels over 43 layers (0.21 ms x 43 / 9), of
+    which about 0.1 ms is exposed;
+  - about 0.6 ms more L2 prefetch over 43 layers, on its side stream (none exposed);
+  - 0.02 ms of the vocabulary-wide BF16 GEMM at a rank's quarter.
+
+  That is about 1.2 ms on the critical path, of up to 2.7 ms of kernel time. The
+  1.3-1.7 ms from runs 32 and 33 scaled the vocabulary-wide BF16 GEMM's difference by
+  43 / 9 with the per-layer kernels. That GEMM runs five times a step, not once a
+  layer, and it was most of what was exposed. The other 5.3 ms is not in a one-GPU step
+  at these shapes. It must lie in what this harness leaves out: Engram (layers 1 and
+  14), the collectives with real peers, and the request's real context.
+- **c8 against c1:** a c8 step adds 0.2-0.3 ms more than a c1 step does. The head's
+  launches run longer (4.4 ms against 4.0), and the request-only kernels take 0.12 ms.
+  The routed difference stays about the same, because the grid's eight dummy requests
+  already reach more experts (0.68 ms against 0.11 at c1).
+
+**c8 found a vLLM bug: at TP1 the routed experts' output lived in the workspace arena**
+(runs 33-41; summaries in `runs/c8-nan-*` and `runs/nan-*`):
+- **The symptom:** `route_partials` asserts that its gate logits contain NaN or Inf.
+  - At c8 it fires at boot, in vLLM's sampler warmup (eight 7-row requests).
+  - At c3 and c4 it fires in the requests.
+  - It happens without IKET, at the whole model's shapes, and with other dummy weights.
+- **Trees:**
+  - next-candidate c579b3fe1 fails (`nan-next`).
+  - 1025's runtime tree fails the same way (26382f5cf, `nan-1025`; 0489-0490 change
+    only tests). It predates both, so there is nothing to bisect.
+- **The cause:**
+  - `FusedMoEKernelModularImpl.apply` (`fused_moe/modular_kernel.py`) returned
+    `output = workspace[2]` whenever it was handed a workspace.
+  - The MoE runner hands it one when the shared expert needs scratch
+    (`prepare_workspace`), so the layer's output was a view into the workspace arena.
+  - With the shared expert folded into the TileLang combine, the output is BF16, so
+    nothing casts it. At TP1 no all-reduce copies it either.
+  - The next decoder layer's mHC entry (`TileKernelsMHC.pre`) leases its scratch from
+    offset 0 of the same arena (`get_simultaneous`). It overwrote the routed output
+    while its CTAs were still reading it.
+- **The evidence:**
+  - Eager, with a hook on every module and on each layer's functional `mhc.pre`: layer
+    1's `mhc.pre` turns its `previous_output` (layer 0's MoE output) non-finite.
+  - That tensor lies in workspace lane 0 at c1 too (run 40), where it is silently wrong
+    rather than NaN. At three or more requests the corruption reaches NaN, on rows that
+    vary from run to run.
+- **Production:** TP4 and TP3 are not exposed. The routed output goes through the TP
+  all-reduce, whose paths all write a fresh tensor (sparknet's one-shot and
+  hierarchical, the two-shot, the rank-order path), and the drafter runs at the
+  target's TP. TP1 engines are exposed: single-GPU tests and harnesses like this one.
+- **The fix** is vLLM branch `moe-output-fresh` e846e64dc, over next-candidate
+  c579b3fe1.
+  - The output is always a fresh tensor. The experts still write it directly
+    (`output_alias`), so no copy is added.
+  - Its test, `tests/kernels/moe/test_moe_output_outlives_workspace.py`, fails on
+    c579b3fe1 and passes with the fix.
+  - With the fix, c1 shows no alias, and c3 (eager and graphs) and c8 run (`nan-fix`,
+    run 41).
+- **Reproduction:** bundle `nan-next` (`harness/iket_step.py off --tp-shape 4
+  --requests 3 --eager --nan-hooks`), about 2 minutes.
 
 ## Tracing a multi-rank serving step later (not run)
 
@@ -432,6 +556,83 @@ What a serving trace on the cluster would take:
    buffer: the exit dump then crashes in `iket::to_json(WarpBuffer)`. ptxas predicates
    short guarded blocks freely, so a guard on an event only saves slots if the event
    cannot be predicated: the IKET mode's zero-or-one loops.
+6. **run-iket sizes records from one process's dry run** (NVIDIA's tool). It reads
+   `recommended_max_ts_cnt_per_warp` from the first `pid_*` directory it lists and
+   stops (`iket.cli.run_iket`). The step harness starts two children that load CUDA and
+   launch nothing (count 0). When one lists first, every warp gets a 16-byte header and
+   no slots, and the exit dump crashes (run 28 on dgx3: a 0.46 GB pool against 10.3 GB
+   needed). `harness/iket_profile.py` runs the dry run alone and passes the largest
+   count over its processes to the measured run.
+7. **run-iket's perfetto and html postprocesses do not scale either** (NVIDIA's tool).
+   They build the whole trace in memory: for a decode-step run's 2.6 GB of decoded
+   records they took more than 100 GB (run 29). The json postprocess only copies
+   `iket.decoded_results.json`, so the step bundles postprocess nothing and read that
+   file.
+8. **A run-iket dry run sometimes stops launching** (runs 30 and 42 on dgx3; under
+   investigation).
+   - **Run 42's TP3 c1 dry run:**
+     - It made the measured request's first 463 launches exactly as run 33's passing
+       dry run did. The last was `padding_rows_kernel`, after the drafter's graph.
+     - It then never reached the next graph launch's callback. In the passing run that
+       launch follows in the same millisecond, with no wait between.
+     - It logged nothing more until `iket_profile.py`'s 1800 s timeout killed it.
+   - **Catching it:** run 43 repeats that dry run eight times (`dry-loop-tp3-c1`)
+     under `hangcatch.sh`. When a dry run's log stops growing, it records GPU power and
+     clocks, each thread's state, wait channel and kernel stack, py-spy, and gdb
+     backtraces.
+   - **What the catcher has shown so far:** a dry run's exit is silent for minutes after
+     its last line (`Finalize Dump Json`). Its exit handler spends them in
+     `iket::to_json`, with the GPU idle.
+
+## Timing a decode step with your own vLLM branch
+
+`step_bundle.py` writes a kernel-local bundle that times DS4.1 decode steps by kernel
+and phase, from any vLLM ref that carries the IKET mode.
+1. Cherry-pick vLLM branch `iket-debug`'s commits onto your branch. The mode is
+   `vllm/models/deepseek_v4_1/tilelang/iket.py`, its variables in `vllm/envs.py`, the
+   hook in `vllm/v1/worker/gpu_worker.py` and a test.
+2. Write the bundle, here for one TP4 (ring) rank at c1:
+
+   ```sh
+   python3 experiments/2026-10-26-iket-debug/step_bundle.py ~/projects/<your-vllm> <ref> <bundle-dir> \
+     --tp 4 --requests 1
+   ```
+
+   `--tp 3` gives a triangle rank's shapes, and `--requests 8` is c8.
+3. On your test node, from a spark-ds41f checkout that has this folder:
+
+   ```sh
+   python3 scripts/lab.py kernel-local <bundle-dir> --out <out>
+   ```
+
+4. Read `<out>/output.txt`, in this order:
+   - the timeline;
+   - the engine steps (split at each `prepare_pos_seq_lens_kernel`; the step that
+     prepares prefill inputs is the prefill);
+   - the overview over the decode steps: each kernel shape's launches and span a step,
+     its share, and its last warp's phase split;
+   - the waits the launches' last warps spend most time in;
+   - each kernel's phase and range tables;
+   - the nsys timeline of the same request without IKET;
+   - a decode step against the engine grid's dummy step at its shape (`step_diff.py`).
+     It gives each kernel's time a step in both, the difference, and its exposed time,
+     with IKET's phase split beside it.
+
+   The numbers are in `table.json` and `step-diff.json`, under the node's compile cache
+   (`~/.cache/spark-lab/compile/iket/<bundle>-<stamp>/`). A c1 bundle takes 8-10 minutes
+   on a free GPU.
+
+What the numbers are:
+- **Shapes.** One GPU runs six layers and the drafter with one rank's shapes. The
+  vocabulary head and the embedding stay whole: a rank's are a TP-th of them, so the
+  head's share of a step is TP times too large.
+- **Dummy weights.** Routing, and how many drafts the target accepts, are not real.
+- **Under run-iket,** kernels run slower (GEMMs +26-40%, tiny kernels about 3x) and so
+  does the host. Read shares and in-kernel phases from IKET, and take absolute times
+  from the nsys timeline of the same steps without IKET (the bundle's last step).
+- **Sampling.** Four CTAs a launch record ranges, and loops record their middle
+  iteration. A loop range with literal bounds is scaled to the whole loop and marked
+  "est."; other loop ranges hold their one iteration.
 
 ## Reading a trace
 

@@ -1,0 +1,130 @@
+1:=== output /c/iket/step-20261026T125158Z
+2:=== decode steps, on, under run-iket
+3:[run-iket] ============= Dry run application first to collect some info... =============
+1870:engine shut down: 8.3 GiB freed
+1871:[run-iket] Auto-computed context buffer size: 0.46 GB (489,203,357 bytes)
+1872:[run-iket] ============= Run application for real profiling... =============
+3739:engine shut down: 8.2 GiB freed
+3746:[run-iket] Launch GPU workload exits abnormally with return code: -11 => Tool: iket, Job: iket
+3747:[run-iket] Please run "/c/iket/step-20261026T125158Z/trace/iket/rerun.sh" to reproduce the issue!
+3748:=== decode steps, on, under run-iket: exit 245 in 379 s
+3749:=== what sized the buffer
+3750:pid_0x105: recommended_max_ts_cnt_per_warp 0
+3751:pid_0x39: recommended_max_ts_cnt_per_warp 80
+3752:pid_0xa0: recommended_max_ts_cnt_per_warp 0
+3760:=== what sized the buffer: exit 1 in 0 s
+3761:=== decode steps, nsys, off, eager
+5531:engine shut down: 8.2 GiB freed
+5655:=== decode steps, nsys, off, eager: exit 0 in 142 s
+5656:=== decode steps, nsys, off, graphs
+5838:engine shut down: 8.3 GiB freed
+5959:=== decode steps, nsys, off, graphs: exit 0 in 36 s
+5960:=== decode-step table
+5968:=== decode-step table: exit 1 in 0 s
+5969:=== nsys timeline, eager
+6013:=== nsys timeline, eager: exit 0 in 0 s
+6014:=== nsys timeline, graphs
+6062:=== nsys timeline, graphs: exit 0 in 0 s
+!!!!!!! Segfault encountered !!!!!!!
+  File "<unknown>", line 0, in iket::to_json(nlohmann::json_abi_v3_11_2::basic_json<std::map, std::vector, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, bool, long, 
+  File "<unknown>", line 0, in exit
+  File "<unknown>", line 0, in _start
+  File "<unknown>", line 0, in 0xffffffffffffffff
+
+[run-iket] Launch GPU workload exits abnormally with return code: -11 => Tool: iket, Job: iket
+[run-iket] Please run "/c/iket/step-20261026T125158Z/trace/iket/rerun.sh" to reproduce the issue!
+=== nsys timeline, eager
+
+## Timeline: 2066 launches in 193387.5 us; the GPU is busy 116964.9 us (60%) and idle 76422.7 us in 1791 gaps; gaps over 200 us split it into 5 segments
+
+| segment | launches | wall us | busy us | busy | first kernel |
+|---:|---:|---:|---:|---:|---|
+| 0 | 28 | 1355.0 | 70.4 | 5% | fill_rows_kernel |
+| 1 | 1210 | 73719.1 | 70385.2 | 95% | mhc_project_streams_kernel |
+| 2 | 1 | 5.7 | 5.7 | 100% | padding_rows_kernel |
+| 3 | 22 | 763.7 | 43.3 | 6% | expand_idx_mapping_kernel |
+| 4 | 805 | 50150.0 | 46460.3 | 93% | mhc_project_streams_kernel |
+
+| idle us | after | before |
+|---:|---|---|
+| 66543.2 | scatter_rows_gather_kernel | padding_rows_kernel |
+| 336.5 | padding_rows_kernel | expand_idx_mapping_kernel |
+| 263.9 | indexSelectSmallIndex | mhc_project_streams_kernel |
+| 250.4 | vectorized_gather_kernel | mhc_project_streams_kernel |
+| 187.8 | mhc_finalize_kernel | gemm_mxfp8_kernel |
+| 127.6 | mhc_finalize_kernel | gemm_mxfp8_kernel |
+| 120.6 | apply_write_kernel | apply_write_kernel |
+| 117.4 | padding_rows_kernel | prepare_prefill_inputs_kernel |
+| 106.1 | ced_requests_kernel | metadata_builder_kernel |
+| 106.0 | apply_write_kernel | apply_write_kernel |
+
+## Kernels by total duration (2066 launches, 0 in graphs)
+
+| kernel | launches | in graphs | total us | share | mean us |
+|---|---:|---:|---:|---:|---:|
+| vocab_packed_projection_kernel | 10 | 0 | 40523.8 | 32.9% | 4052.38 |
+| gemm_mxfp8_kernel | 240 | 0 | 31624.6 | 25.7% | 131.77 |
+| moe_grouped_fp8_fp4_gemm_kernel | 90 | 0 | 22916.5 | 18.6% | 254.63 |
+| gemm_fp8w_bf16_partials_kernel | 45 | 0 | 10077.4 | 8.2% | 223.94 |
+| gemm_bf16_kernel | 25 | 0 | 6690.0 | 5.4% | 267.60 |
+| gemm_bf16_partials_kernel | 65 | 0 | 1523.0 | 1.2% | 23.43 |
+| mhc_project_streams_kernel | 90 | 0 | 1467.7 | 1.2% | 16.31 |
+| sparse_mla_kernel | 45 | 0 | 1158.7 | 0.9% | 25.75 |
+| moe_swiglu_cast_kernel_kernel | 45 | 0 | 886.0 | 0.7% | 19.69 |
+| moe_dispatch_kernel | 45 | 0 | 866.4 | 0.7% | 19.25 |
+| router_partials_kernel | 45 | 0 | 659.3 | 0.5% | 14.65 |
+| mhc_finalize_kernel | 90 | 0 | 632.7 | 0.5% | 7.03 |
+| gemm_bf16_splitk_kernel | 10 | 0 | 400.9 | 0.3% | 40.09 |
+| gemm_mxfp8_partials_kernel | 15 | 0 | 264.7 | 0.2% | 17.65 |
+| norm_forward_and_per_token_cast_kernel_kernel | 130 | 0 | 256.4 | 0.2% | 1.97 |
+=== nsys timeline, eager: exit 0 in 0 s
+=== nsys timeline, graphs
+
+## Timeline: 2193 launches in 321478.6 us; the GPU is busy 115578.8 us (36%) and idle 205899.7 us in 1357 gaps; gaps over 200 us split it into 9 segments
+
+| segment | launches | wall us | busy us | busy | first kernel |
+|---:|---:|---:|---:|---:|---|
+| 0 | 29 | 1245.3 | 46.2 | 4% | fill_rows_kernel |
+| 1 | 663 | 38326.1 | 36706.6 | 96% | mhc_project_streams_kernel |
+| 2 | 15 | 1358.3 | 116.3 | 9% | insert_kernel |
+| 3 | 1 | 2.8 | 2.8 | 100% | post_update_kernel |
+| 4 | 29 | 1231.3 | 458.0 | 37% | prepare_dflash_inputs_kernel |
+| 5 | 570 | 32202.6 | 31820.4 | 99% | unrolled_elementwise_kernel |
+| 6 | 1 | 6.1 | 6.1 | 100% | padding_rows_kernel |
+| 7 | 23 | 906.6 | 49.1 | 5% | assign_draft_budget_kernel |
+| 8 | 862 | 46975.2 | 46373.2 | 99% | mhc_project_streams_kernel |
+
+| idle us | after | before |
+|---:|---|---|
+| 103926.0 | resample_kernel | insert_kernel |
+| 93280.1 | scatter_rows_kernel | padding_rows_kernel |
+| 649.3 | sink_policy_kernel | post_update_kernel |
+| 371.6 | indexSelectSmallIndex | mhc_project_streams_kernel |
+| 316.3 | padding_rows_kernel | assign_draft_budget_kernel |
+| 235.6 | post_update_kernel | prepare_dflash_inputs_kernel |
+| 234.2 | vectorized_gather_kernel | mhc_project_streams_kernel |
+| 211.1 | padding_rows_kernel | unrolled_elementwise_kernel |
+| 177.5 | insert_kernel | sink_candidates_kernel |
+| 154.4 | flatten_sampled_kernel | topk_ids_kernel |
+
+## Kernels by total duration (2193 launches, 1665 in graphs)
+
+| kernel | launches | in graphs | total us | share | mean us |
+|---|---:|---:|---:|---:|---:|
+| vocab_packed_projection_kernel | 10 | 5 | 40566.6 | 30.8% | 4056.66 |
+| gemm_mxfp8_kernel | 240 | 207 | 29402.1 | 22.3% | 122.51 |
+| moe_grouped_fp8_fp4_gemm_kernel | 90 | 78 | 22815.9 | 17.3% | 253.51 |
+| l2_prefetch_kernel | 108 | 108 | 12702.3 | 9.6% | 117.61 |
+| gemm_fp8w_bf16_partials_kernel | 45 | 39 | 8011.4 | 6.1% | 178.03 |
+| gemm_bf16_kernel | 25 | 25 | 6628.6 | 5.0% | 265.14 |
+| gemm_bf16_partials_kernel | 65 | 55 | 1701.3 | 1.3% | 26.17 |
+| mhc_project_streams_kernel | 90 | 78 | 1499.4 | 1.1% | 16.66 |
+| sparse_mla_kernel | 45 | 39 | 1367.6 | 1.0% | 30.39 |
+| moe_dispatch_kernel | 45 | 39 | 781.7 | 0.6% | 17.37 |
+| mhc_finalize_kernel | 90 | 78 | 735.5 | 0.6% | 8.17 |
+| gemm_bf16_splitk_kernel | 10 | 8 | 528.2 | 0.4% | 52.82 |
+| router_partials_kernel | 45 | 39 | 475.4 | 0.4% | 10.56 |
+| moe_swiglu_cast_kernel_kernel | 45 | 39 | 407.6 | 0.3% | 9.06 |
+| rope_kernel | 135 | 114 | 301.9 | 0.2% | 2.24 |
+=== nsys timeline, graphs: exit 0 in 0 s
+{"output": "/c/iket/step-20261026T125158Z", "steps": [["decode steps, on, under run-iket", 245], ["what sized the buffer", 1], ["decode steps, nsys, off, eager", 0], ["decode steps, nsys, off, graphs", 0], ["decode-step table", 1], ["nsys timeline, eager", 0], ["nsys timeline, graphs", 0]]}
