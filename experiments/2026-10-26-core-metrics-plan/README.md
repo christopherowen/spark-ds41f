@@ -52,7 +52,11 @@ cheap.
     served: a gap of 11.9 ms.
   - About 5.3 ms of the gap is the distinct experts real text reaches (13.8 against the
     dummy's 6 a layer).
-  - About 6.5 ms is GPU work the dummy step does not do, and no record attributes it yet.
+  - Of the other ~6.5 ms, #610's one-GPU decode-step diff puts about 1.2 ms on the critical
+    path. Most of it, about 1.0 ms, is the target's verification head, which the grid's
+    dummy step does not run.
+  - The remaining ~5.3 ms is not in a one-GPU step: Engram, collectives with real peers, real
+    context. Only an all-rank serving trace can attribute it.
   - At c16 the gap is 91 ms of a 123 ms step.
 - **Single-stream TTFT is 4.2 steps on 1025, against 3.2 on r6x.** The extra step is sink
   rejection's held first token (the 1022 record measured it: +41 ms isolated). It is 24% of
@@ -88,7 +92,7 @@ cheap.
 | memguard (`scripts/memguard.sh`) | MemAvailable every 0.25 s at startup, 2 s serving; kills below 5 / 3 GiB | the node's journal, breaches only | yes | the startup low itself: every boot's margin over 5 GiB is lost unless it breaches |
 | vLLM startup KV line, `scripts/kv_capacity.py` | pool blocks and the admission ceiling (11 full 1M contexts on the ring, #586) | serving log; arithmetic | yes | pool use under load |
 | torch-profiler traces (lab `profile` job) | every kernel of every rank; parsed by `floor.py` (#598), `step_shares.py` (#614), `schedule_bounds.py` (#615), `ceilings.py` (#583) | `results/private/determinism/<run>/` | lab only; Python stacks inflate host gaps | all-rank alignment (every parser reads rank 0); a standard per-release summary |
-| IKET (#610) | in-kernel load, wait, compute and store phases | run-iket traces | debug flag, off | the decode-step trace has not run yet (dgx1-4 re-cabling) |
+| IKET (#610) | in-kernel load, wait, compute and store phases. Decode steps at c1 and c8, TP4 and TP3 rank shapes, ran on dgx3 (runs 42-47). `step_diff.py` diffs a step against the grid's dummy step, kernel by kernel, with each kernel's exposed time. | run-iket and nsys traces (`step_bundle.py`, `time-*` bundles) | debug flag, off | one GPU (six target layers and the drafter): no real peers, Engram or long context |
 | sparknet RoCE trace | one-shot all-reduce phases: staging, wait, reduce, per-peer arrival | `/dev/shm/sparknet-trace-*.bin` | opt-in traced kernel | all-gathers; a link to the torch traces |
 | `experiments/2026-10-20-ttft-gap/ttft_trace.py` | TTFT split into the rest of the running step, the step decided ahead, the own step, delivery | experiment runs | lab only | not a servebench step, so not in any suite |
 | Engram timeline (`SPARK3_ENGRAM_TIMELINE=1`) | per layer and rank: reads, GPU wait | jsonl | debug flag | Engram's share of short-prompt TTFT |
@@ -169,11 +173,35 @@ requests and rows a request, interpolated in both.
 - **c1 (TP4, 1025):** 11.9 ms, 39% of the step.
   - The dummy rows read 6 experts a layer; the suite's live rows reach about 13.8. At FC1
     and FC2's marginal 17.2 µs an expert-layer (#598's dgx4 fits), that is about 5.3 ms.
-  - The other ~6.5 ms is GPU work. The traced c1 step is 96% covered by kernels (#614's
-    `step_shares.json`), and no record says which kernels the dummy step skips.
+  - The other ~6.5 ms is GPU work: the traced c1 step is 96% covered by kernels (#614's
+    `step_shares.json`).
+  - **#610 attributes part of it** (draft, runs 46-47 on dgx3). It ran six target layers
+    and the drafter at a TP4 rank's shapes, with the recipe's environment, sizing and
+    capture ladder. The c1 step is 14.30 ms of GPU busy against the grid's 8.87 (+5.43 ms).
+    Scaled to the whole model:
+    - **Routing:** the routed GEMMs' +1.19 ms over 9 MoE layers is about 5.7 ms over 43, a
+      cross-check of the 5.3 ms above.
+    - **The target's verification head:** about 1.0 ms, a rank's quarter of the second
+      packed-head launch. The grid's dummy step runs only the drafter's head. This one runs
+      eagerly after the target's graph, all on the critical path.
+    - **Sampler, sink rejection, verification and inputs:** about 0.07 ms, all exposed.
+    - **Slower per-layer kernels:** about 1.0 ms of kernel time over 43 layers, about 0.1 ms
+      exposed.
+    - **More L2 prefetch:** about 0.5 ms on its side stream, none exposed.
+    - **Total:** about 1.2 ms on the critical path, of up to 2.6 ms of kernel time.
+  - **The remaining ~5.3 ms is not in a one-GPU step at these shapes:** Engram, collectives
+    with real peers, real context. That part needs an all-rank serving trace.
 - **c8 and c16:** the grid at 13 requests and 2.8 rows is 31.9 ms against a 123 ms step:
   the grid sees 26% of it. On TP3 c8 it sees 28%. Real text at 36 rows reaches tens of
   experts a layer more than 6.
+  - **Grid artifact (#610):** on TP4's 16-stream engine, an 8-request grid step runs the
+    drafter's packed head over two row tiles and samples 16 rows, about 1.4 ms that a real
+    8-request step does not pay.
+  - The interpolation at 13 requests weights the 8-request shapes by 0.37, so about 0.5 ms
+    of TP4's 31.9 ms is this artifact. That is small against the 91 ms gap. TP3's grid and
+    every c1 grid are clean.
+  - The grid verifies 6 rows a request where adaptive verification runs 2-3. Interpolating
+    at the served rows covers that.
 - **The grid split itself** (1x3 rows at 4K, TP4 1025): 17.98 ms = 14.02 target forward +
   2.54 drafter + 1.42 the rest. The drafter is 14% of the dummy step.
 
@@ -380,8 +408,13 @@ must clear, from section 2.1 where measured.
      c1 sampled, c8 and a 16K prefill, about 15 minutes.
    - It records floor.py's budget, trace_waits.py's host gaps, collective waits and late
      peers, and prefill_shares.py's exposed communication, as release notes, not a gate.
-   - The same job traces one grid shape at the c1 rows on the same boot. A kernel-family
-     diff then attributes the ~6.5 ms of the c1 gap that routing does not explain.
+   - #610's `step_diff.py` already diffs a decode step against the grid's on one GPU. It
+     attributes about 1.2 ms of the c1 gap's ~6.5 ms non-routing part, mostly the target's
+     verification head.
+   - The remaining ~5.3 ms (Engram, real peers, real context) needs that diff on a serving
+     trace of every rank. So the release profile job should also trace one grid shape at the
+     c1 rows on the same boot, with every rank (#610's README says what a multi-rank trace
+     needs).
 3. **Rows a step** (servebench S; vLLM M).
    - servebench's `prom` scrapes the per-position counters on every run step.
    - vLLM counts live and dead rows: the cut index rides on the accepted-count copy the
@@ -496,8 +529,10 @@ Receipts in [runs/](runs/):
     this record measures none of that.
   - Pairs are few: three single-stream, four c16.
 - **The grid-to-serving split is an estimate.**
-  - The 5.3 ms of routing takes #598's 13.8 experts a layer and its FC1 and FC2 fits.
-  - The rest is a residual.
+  - The 5.3 ms of routing takes #598's 13.8 experts a layer and its FC1 and FC2 fits. #610's
+    one-GPU diff, scaled from 9 MoE layers to 43, gives 5.7 ms.
+  - Of the rest, #610 attributes about 1.2 ms of critical path from six layers on one GPU,
+    scaled to the model. About 5.3 ms is still a residual.
   - At c8 and c16 the expert counts are not measured at all.
 - **Trace figures come from profiled windows.**
   - Python stacks inflate host gaps; the traced c1 step is 34.6 ms against 30.3 ms served.
