@@ -346,14 +346,15 @@ _FOR = re.compile(
 
 
 def _iterations(header: str, iters: int) -> str | None:
-    """True in at most ``iters`` evenly spread iterations of a TVM ``for`` loop
-    (``for (int v = start; v < bound; ++v)``), or None for another header."""
+    """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
+    start; v < bound; ++v)``), each in the middle of its share of the loop, so one
+    sample is the middle iteration, not the pipeline's fill; None for another header."""
     loop = _FOR.match(header)
     if loop is None:
         return None
     v, start, bound = (part.strip() for part in loop.groups())
     stride = f"max(1, (int)((({bound}) - ({start}) + {iters - 1}) / {iters}))"
-    return f"((int)(({v}) - ({start})) % {stride} == 0)"
+    return f"((int)(({v}) - ({start})) % {stride} == {stride} / 2)"
 
 
 def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:

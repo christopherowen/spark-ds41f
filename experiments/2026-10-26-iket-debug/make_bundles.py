@@ -113,7 +113,8 @@ BUNDLES = {
         ref=IKET,
         what="decode steps end to end at TP1 (six layers and the drafter, dummy weights, the "
              "production recipe's kernels and graphs): on under run-iket (four CTAs a launch and "
-             "two iterations a loop record ranges), nsys durations off, and the decode-step table",
+             "the middle iteration of each loop record ranges; the vision tower and the sampler's "
+             "top-k/top-p kernel uninstrumented), nsys durations off, and the decode-step table",
         env=STEP_ENV,
         mounts=[HUB],
         steps=[
@@ -125,7 +126,7 @@ BUNDLES = {
             # step; left uninstrumented, their warps reserve no records.
             ("decode steps, on, under run-iket",
              [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
-              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "2",
+              "{python}", STEP, "on", "--iket", "{out}/trace-run/iket", "--ctas", "4", "--iters", "1",
               "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
                                        "{out}/trace-run/iket/sources"], 1800),

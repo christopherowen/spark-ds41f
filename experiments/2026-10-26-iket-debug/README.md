@@ -56,7 +56,18 @@ When on:
 - Kernels still go through declare, prepare and freeze (`tilelang.prepare` in its thread
   pool, then `freeze`). Preparation compiles every one of them, so a boot is a cold boot.
 - `<dir>/sources/<kernel>.<hash>.cu` and `.json` hold each instrumented module and its
-  sites: range name, phase, kinds, source lines and first statement.
+  sites: range name, phase, kinds, source lines, first statement, loop depth and a static
+  bound on a warp's events.
+
+Three optional knobs, read only when the mode is on. An engine-wide trace needs them;
+the hot kernels did not:
+- `VLLM_DS41_IKET_CTAS=N`: only about N CTAs of a launch record ranges, evenly spread.
+  The flag is uniform per CTA, so ranges stay balanced.
+- `VLLM_DS41_IKET_ITERS=N`: a range inside a `for` loop records in at most N of its
+  iterations, evenly spread. The guard uses the loop variable, so it is uniform within
+  an iteration.
+- `VLLM_DS41_IKET_SKIP=REGEX`: kernels whose name matches compile uninstrumented. run-iket
+  still records their warps' lifetimes.
 
 Where the marks come from: a pass, not the kernel sources. The pass runs in TileLang's
 `tilelang_callback_cuda_postproc` hook, over each module's generated CUDA, then hands the

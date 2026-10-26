@@ -139,7 +139,9 @@ def test_sampled_ctas_guard_every_event():
 
 def test_sampled_iterations_guard_loop_ranges():
     out, sites = iket.annotate(KERNEL, _token, iters=2)
-    stride = "((int)((ko) - (0)) % max(1, (int)(((4) - (0) + 1) / 2)) == 0)"
+    # Iterations 1 and 3 of four: the middle of each half.
+    block = "max(1, (int)(((4) - (0) + 1) / 2))"
+    stride = f"((int)((ko) - (0)) % {block} == {block} / 2)"
     lines = [line.strip() for line in out.splitlines()]
     in_loop = [s["range"] for s in sites if s["loops"]]
     assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]

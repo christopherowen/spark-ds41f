@@ -159,7 +159,7 @@ def main():
         async_scheduling=True,
         kv_cache_memory_bytes=2 << 30,
         # The startup check wants this share free; run-iket's pool takes some.
-        gpu_memory_utilization=0.6,
+        gpu_memory_utilization=0.5,
         enable_prefix_caching=False,
         attention_backend="TILELANG",
         linear_backend="tilelang",
@@ -172,7 +172,9 @@ def main():
         },
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
-            "cudagraph_capture_sizes": [1, 2, 4, 6, 8, 12],
+            # One and two requests' verification rows (1 + drafts each): fewer warmup
+            # launches, each of which reserves IKET records.
+            "cudagraph_capture_sizes": [args.drafts + 1, 2 * (args.drafts + 1)],
         },
         generation_config="vllm",
         hf_overrides=shrink,
