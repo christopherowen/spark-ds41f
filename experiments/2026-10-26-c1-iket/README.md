@@ -26,7 +26,7 @@ branch's checkout in `~/spark-lab/agents/c1-iket/` ([Runs](#runs-on-dgx1)).
   - The dense GEMMs wait 50-65% on their cp.async weight copies, and 14-21% at the sync
     after them.
   - The all-reduce waits at the barrier after its peers' flags: 68% of its time with the
-    peers ready, 90% with them 20 µs late.
+    peers ready, 90% with them 20 µs late (IKET's hot traces, simulated peers).
 - **The routed experts' waits are DRAM time, and the chain is already close to an
   ideal stream.** On one GPU, next-candidate's routed chain (dispatch, FC1, SwiGLU, FC2,
   combine) runs within 0.9-6.8 µs a layer of an ideal one-launch read of the same
@@ -117,14 +117,20 @@ Two things about run-iket, learned on the way:
   a uniform branch at each event. In a persistent kernel the recording CTA runs slower
   and becomes its tail, so the stream GEMM's lifetimes are not timings; the A/Bs are.
 
-**Validation.** The IKET build writes the same bits with the mode off and with it on and
-every kernel skipped (digest `51332953ab203838`, smoke run 2). Graph replays write eager
-launches' bits in every run.
+**Validation.**
+- The IKET build writes the same bits with the mode off and with it on and every kernel
+  skipped (digest `51332953ab203838`, smoke run 2).
+- next-candidate itself writes the IKET build's bits at both ranks' shapes (layer-base-1
+  against layer-1: `cc4d115b6d040964` at TP4, `e2d08a7c6ba6b1cb` at TP3).
+- Graph replays write eager launches' bits in every run.
 
 **Analysis:**
-- `cta_timeline.py` rebuilds from step 3 each launch's SM occupancy and, for the routed
-  GEMMs, the weight stream over time. It splits each launch's busy time into ramp,
-  steady stream and tail against the attainable 266.6 GB/s.
+- `layer_table.py` gives each kernel family's cost, its excess over its bytes, its IKET
+  phase split and what its waits are for, from a `layer` run.
+- `cta_timeline.py` rebuilds from the lifetimes each launch's SM occupancy and the routed
+  GEMMs' weight stream over time. Under run-iket the eager launches and the recording
+  CTAs shift the timings, so its numbers are only qualitative; the bound and the A/Bs
+  carry the measurements.
 - `step_shares.py` gives each kernel family's share of the real TP4 step.
 - `routed_chain.py` gives the routed chain's anatomy and FC2's serving fit.
 - `levers.py` turns per-step savings into tok/s ceilings.
@@ -219,8 +225,8 @@ What the tables say:
 Before dgx1 was free, the study worked from IKET's hot traces (#610 run 5: TP3 shapes,
 8 rows, mean warp shares). Each row
 draws six random experts, so a layer reads about 45 distinct experts (the expectation
-for 8 × 6 draws from 384); the rates below use that number. These are not c1's routes. The c1 tables at both ranks' shapes are the
-`layer` bundle's job.
+for 8 × 6 draws from 384); the rates below use that number. These are not c1's routes;
+the c1 tables are in the section above.
 
 | kernel | step share (TP4) | wait | load | compute | store | the wait is for |
 |---|---:|---:|---:|---:|---:|---|
@@ -270,9 +276,9 @@ Sampled (1,000 layers, 11.5 experts a layer): 3.1 µs + 6.45 µs an expert.
 
 GB10 streams with a fixed cost even with no GEMM around it. A plain read reaches 221.5
 GB/s on 18 MiB and 253.7 on 110 MiB (the expert-rate bundle), about 11 µs of ramp and
-tail. A launch boundary on the weight stream costs about that, wherever it sits. The
-routed chain has two in each layer, FC1's end and FC2's start, and the SwiGLU launch
-between them.
+tail. That is what made the boundary between FC1 and FC2 look like a lever. The bound
+below measures it: the chain's five launches cost only 1-7 µs a layer more than one
+ideal launch of the same bytes, so the plain-read ramps overlap well inside the chain.
 
 ## The routed experts against an ideal stream (the bound)
 
