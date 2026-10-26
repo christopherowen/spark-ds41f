@@ -39,6 +39,7 @@ NEXT = "next-candidate"
 STREAM = "c1-stream"
 STREAM_IKET = "c1-stream-iket"
 FUSION = "c1-fusion"
+FUSION2 = "c1-fusion2"
 MHC_TESTS = "tests/kernels/test_deepseek_v41_tilelang_mhc.py"
 MOE_TESTS = "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
 PDL_TESTS = "tests/kernels/test_deepseek_v41_tilelang_pdl.py"
@@ -227,6 +228,26 @@ BUNDLES = {
         what="the mHC entry with every stream's fn block loaded at once against next-candidate on the "
              "layer harness with all-reduce stand-ins, in alternation, four rounds: c1 (6 rows, 3 live), "
              "c8 (24 rows) and c16 (48 rows) at TP4 and TP3 shapes",
+        steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
+                                     *(f"tp={tp} rows={rows} live={live} ar=on"
+                                       for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
+                14400)],
+    ),
+    "fusion2-tests": dict(
+        ref=FUSION2,
+        what="the mHC entry loading the next stream's fn block during the current stream's GEMMs: "
+             "the mHC and PDL tests, every launched kernel source-checked",
+        tests=[MHC_TESTS, PDL_TESTS, "tests/kernels/deepseek_v41_pdl_sources.py",
+               "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("mHC and PDL tests, every launched kernel source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest", MHC_TESTS, PDL_TESTS], 3600)],
+    ),
+    "fusion2-ab": dict(
+        ref=NEXT,
+        builds={"mhcfn2": FUSION2},
+        what="the mHC entry loading the next stream's fn block during the current stream's GEMMs "
+             "against next-candidate on the layer harness with all-reduce stand-ins, in alternation, "
+             "four rounds: c1, c8 and c16 at TP4 and TP3 shapes",
         steps=[("A/B, four rounds", ["{python}", "/b/ab.py", "4",
                                      *(f"tp={tp} rows={rows} live={live} ar=on"
                                        for tp in (4, 3) for rows, live in ((6, 3), (24, 24), (48, 48)))],
