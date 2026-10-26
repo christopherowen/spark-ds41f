@@ -321,11 +321,13 @@ BUNDLES = {
              "their scales zeroed, then filled with 0x77, and c1 filled",
         env=STEP_ENV,
         mounts=[HUB],
+        # Run 34: filled experts stop at boot the same way. So: the whole model's shapes,
+        # and fewer requests.
         steps=[
-            (f"off, TP4, c{requests}, uint8 {fill}",
-             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--uint8-fill", fill,
-              "--out", f"{{out}}/c{requests}-{fill}"], 1800)
-            for requests, fill in ((8, "0"), (8, "0x77"), (1, "0x77"))
+            (f"off, TP{tp}, c{requests}",
+             ["{python}", STEP, "off", "--tp-shape", str(tp), "--requests", str(requests),
+              "--out", f"{{out}}/tp{tp}-c{requests}"], 1800)
+            for tp, requests in ((1, 8), (4, 4), (4, 3))
         ],
     ),
     "tests": dict(
