@@ -174,8 +174,8 @@ def main():
             "draft_tensor_parallel_size": 1, "attention_backend": "TILELANG",
             "draft_sample_method": "greedy", "rejection_sample_method": "block",
             # Adaptive verification needs full graphs; eager, every draft is verified.
-            "enable_adaptive_verification": not args.eager,
-            "adaptive_verification_row_cost": 0.035,
+            **({} if args.eager else {"enable_adaptive_verification": True,
+                                      "adaptive_verification_row_cost": 0.035}),
         },
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"],
