@@ -1,7 +1,7 @@
 # DSpark block verification ends each block at the dead-row cut
 
-Base: vLLM `next-candidate` 1bc005688. Branch: vLLM `block-verify-cut` (three commits on
-it). One variable: the sampled verification of a request with dead rows. The recipe is
+Base: vLLM `next-candidate` 1bc005688. Branch: vLLM `block-verify-cut`, head ab8d398c0
+(five commits on it). One variable: the sampled verification of a request with dead rows. The recipe is
 unchanged (`config/cluster.json`: `draft_sample_method: greedy`,
 `rejection_sample_method: block`, `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`).
 
@@ -117,6 +117,8 @@ the capped scan reaches every position with probability 1.
 | 2a529d88c | `verify_kernel` and `resample_kernel` take a compile-time `cut` variant, which reads the step's cut buffer, so a captured graph reads the cut on every replay. Drafts from the cut on are placeholders, and a count at the cut draws the bonus. `rejection_sample` passes the cut to the TileLang kernels and no longer caps in their insertion. `RejectionSampler` passes the cut to verification on every step, and to the sink's candidates, for which a draw at the cut was the bonus. The step declares the cut variants beside the warmup's uncut ones, and the capped insertion only for draft-by-draft methods. Block verification with draft logits, a watermark or FP64 draws (the Triton kernels) is refused with dead rows. |
 | c51d23db8 | Tests (below). |
 | 4ce2b98ad | `benchmark_tilelang_rejection.py --dead-rows`. |
+| 21ce222ba | The insert-port test's stand-in for `insert_resampled` takes no cut (dgx4 run 1). |
+| ab8d398c0 | The benchmark compares block sums bit for bit against a release with the softmax fix (dgx4 run 1). |
 
 Kept:
 - **The count kernel's clamp** (`get_num_sampled_and_rejected`). It is still the commit
@@ -209,9 +211,63 @@ included.
   rows, both dtypes, sampled and mixed) passed the gate. Every output was bit for bit
   that of the placeholder drafts, and every greedy request's was next-candidate's.
 
-### Run 2
+### Run 2, 14:47-14:50 CET: everything passes
 
-vLLM ab8d398c0: both bundles again. Pending.
+vLLM ab8d398c0, spark-ds41f b8feb25a. The TileLang cache was warm from run 1, which
+is why the run took minutes.
+
+**`cut-tests`** ([output](runs/run-2/cut-tests-output.txt),
+[verdict](runs/run-2/cut-tests-verdict.json)): pass in 83 s.
+
+| Step | Result |
+| --- | --- |
+| verification tests | 663 passed |
+| rejection sampler tests | 154 passed, 1 skipped (needs two GPUs) |
+| sink kernel tests | 115 passed |
+| sink tests | 44 passed |
+| preparation tests | 71 passed |
+
+**`cut-bench`** ([output](runs/run-2/cut-bench-output.txt),
+[table](runs/run-2/cut-bench-table.md), [verdict](runs/run-2/cut-bench-verdict.json)):
+- Both steps exited 0. `verdict.json` records `"exit": 0`; its `"passed": false` is the
+  "exit" verdict reading a benchmark's last line as a pytest summary.
+- All 140 cases pass the gate against next-candidate's kernels: 80 without dead rows,
+  60 with them, at 1-96 rows (c1 is 6 rows, c8 48, c16 96), FP32 and BF16 logits,
+  sampled and mixed temperatures. None is slower at 95%.
+- Before timing, every output was held as above: without dead rows, to next-candidate's
+  (bit for bit wherever the arithmetic is shared); with them, to the placeholder
+  drafts' bit for bit, and each greedy request to next-candidate's.
+
+Ours against next-candidate, the medians' ratio:
+
+| Kernel | Dead rows | Median | Range over the 20 cases |
+| --- | --- | ---: | --- |
+| rejection_sample | no | +0.79% | -1.65% to +2.94% |
+| local_stats (unchanged code) | no | +0.01% | -2.05% to +1.98% |
+| verify | no | +0.25% | -9.33% to +4.67% |
+| resample | no | -0.11% | -8.54% to +11.07% |
+| **rejection_sample, as served** | **yes** | **-0.06%** | -8.57% to +2.23% |
+| verify | yes | +1.21% | -25.05% to +9.10% |
+| resample | yes | +0.83% | -1.45% to +6.15% |
+
+The single kernels take 2-40 us, so the cases scatter widely; the unchanged
+`local_stats` shows the floor of that noise. The served path, the whole verification
+with dead rows (the TileLang path against next-candidate's uncut kernels and capped
+insertion), is level.
+
+## Conclusion
+
+- The fix is correct: the outcome is bit for bit the truncated block's (sampled) or
+  next-candidate's (greedy), whatever the dead rows hold, and the distribution test
+  passes at every position up to each cut.
+- It is free: no case slower than next-candidate at the verification shapes c1-c16.
+- What it changes: the realized sampled text where a cut falls below the verified
+  drafts, and the outcome's robustness to non-finite dead rows. The sampled law, and so
+  acceptance and throughput, stay the same; see the release comparison's expectations
+  below.
+
+vLLM `block-verify-cut` head ab8d398c0: 2a529d88c, c51d23db8, 4ce2b98ad, 21ce222ba,
+ab8d398c0.
 
 ## What the release comparison should expect
 
