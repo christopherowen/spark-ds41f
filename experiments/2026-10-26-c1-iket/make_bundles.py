@@ -331,6 +331,12 @@ BUNDLES = {
                  "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py",
                  "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"], 3600)],
     ),
+    "markov-l2": dict(
+        ref=LEVER2_BASE,
+        what="the DSpark Markov bias projection (BF16 [vocab, 256], one row) at TP4, TP3 and whole "
+             "shapes: cold after an L2 eviction against five drafts back to back",
+        steps=[("Markov projection, cold and five drafts", ["{python}", "/b/markov_l2.py"], 1800)],
+    ),
     "front-ab": dict(
         ref=LEVER2_BASE,
         builds={"front": FRONT},
@@ -355,6 +361,7 @@ BUNDLES = {
 SCRIPTS = {
     "ab.py": HERE / "ab.py",
     "c1_layer.py": HERE / "harness" / "c1_layer.py",
+    "markov_l2.py": HERE / "harness" / "markov_l2.py",
     "stream_bound.py": HERE / "harness" / "stream_bound.py",
     "cta_timeline.py": HERE / "cta_timeline.py",
     "iket_hot.py": IKET_DIR / "harness" / "iket_hot.py",
