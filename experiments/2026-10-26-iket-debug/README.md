@@ -407,6 +407,27 @@ a kernel runs alone on the GPU, so on the step's critical path):
   in what this harness leaves out: Engram, the collectives with real peers, and the
   request's real context.
 
+**c8 does not run yet: the dummy engine makes NaNs with three or more requests**
+(`c8-nan` bundle, runs 33-37; summaries in `runs/c8-nan-*`):
+- **Where it shows:** `route_partials` asserts that its gate logits contain NaN or Inf.
+  At c8 that happens at boot, in vLLM's sampler warmup (`_warmup_kernels`, eight 7-row
+  requests). At c3 and c4 it happens in the requests.
+- **Not my choices:**
+  - It is the same without IKET.
+  - It is the same with the whole model's shapes (TP1).
+  - It is the same with the uint8 dummy weights filled with 0x77 instead of zeroed.
+  - c1 and c2 run.
+- **The first non-finite tensor** (eager, a hook on every module) is the input of layer
+  1's `attn.fused_wqa_wkv`: NaN in 36, then 31, of the c3 prefill's 104 rows, scattered
+  over all three prompts. Layer 0's module outputs are finite.
+- **So** something between layer 0's output and layer 1's attention, in functional mHC
+  or norm code that the hooks do not see, reads memory that was never written when a
+  batch holds three or more requests. The rows change from run to run.
+- **Open:** whether production's real weights hide the same read is not known.
+
+Root-causing it is a follow-up. The c8 bundles (`step-tp4-c8`, `step-tp3-c8`) are ready
+for when it is fixed.
+
 ## Tracing a multi-rank serving step later (not run)
 
 What run-iket does that matters here:
@@ -510,10 +531,15 @@ and phase, from any vLLM ref that carries the IKET mode.
    - the overview over the decode steps: each kernel shape's launches and span a step,
      its share, and its last warp's phase split;
    - the waits the launches' last warps spend most time in;
-   - each kernel's phase and range tables.
+   - each kernel's phase and range tables;
+   - the nsys timeline of the same request without IKET;
+   - a decode step against the engine grid's dummy step at its shape (`step_diff.py`).
+     It gives each kernel's time a step in both, the difference, and its exposed time,
+     with IKET's phase split beside it.
 
-   The numbers are in `table.json`, under the node's compile cache
-   (`~/.cache/spark-lab/compile/iket/<bundle>-<stamp>/`).
+   The numbers are in `table.json` and `step-diff.json`, under the node's compile cache
+   (`~/.cache/spark-lab/compile/iket/<bundle>-<stamp>/`). A c1 bundle takes 8-10 minutes
+   on a free GPU.
 
 What the numbers are:
 - **Shapes.** One GPU runs six layers and the drafter with one rank's shapes. The
