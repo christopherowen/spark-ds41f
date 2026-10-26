@@ -79,11 +79,25 @@ prefetch off and 39-41 at grid 2).
 | --- | ---: | ---: | --- |
 | S1 WO issued after the fused Q-A/KV (swa layers) | 1.29% | 0.23% | NEXT's fill ends about 8 us before Q-B; the norms, cast and Q-B (8.8 of 10.5 MB in L2) leave DRAM idle until WO is issued: 22.7 us a layer (p50) |
 | S2 FFN issued after WO-A | 0.83% | 0.15% | WO-B's L2-fed time once WO's fill has ended, plus what S1 frees: 9.8 us a layer |
-| S3 WO after the index query (own layers) | 0.32% | 0.09% | the top-k chain and sparse MLA, 49 us at c1 |
-| S3b an IDX window in WO's old place (own layers) | 0.25% | 0.05% | the compression stretch before the indexer's Q-B, where the lost WO fill runs now |
+| S3 owner layers: an IDX window (compressor, indexer projections) after Q-B, WO right after the compressor behind it | 0.66% | 0.16% | an estimate, not a bound (below): IDX lands the compressor's first bytes and the indexer's 5.6 MB; WO's fill then has 88 us (c1) to 114 us (c8) to WO-A, enough for its 20 MB |
 | S4a NEXT between the Engram projection and its all-gather | 0.17% | 0.04% | the all-gather and gate, 34 us |
 | S4b an ENGRAM window in NEXT's place before an Engram layer | 0.46% | 0.08% | the all-reduce, mHC post, row wait and all-gather before the projection, 104 us |
 | S6 the rest of Q-B in NEXT's budget | 0.76% | 0.13% | the same idle time as S1 (one or the other) |
+
+S3 is accounted differently from the others. An owner layer's lines are lost, not late, so
+a new point must land more than the roughly 13 of 20 MB that survive today. The first
+point tried, WO after the index query, gives its fill only the 49 us top-k chain at c1:
+about 10.5 MB, a loss against today (the first typed commit, 9e6d9d78a). Issued right after
+the compressor, WO's fill starts once IDX has landed and reaches WO-A in time
+(353085fb7). The S3 row is today's lost-line excess minus the bytes the new point leaves
+unlanded, plus the compressor's and the indexer Q-B's own gains.
+
+A fill-landing model on the same traces (fills progressing at one rate while DRAM is idle
+and another beside DRAM-bound kernels) does not fit: the prefetch kernels run at about
+210 GB/s whatever the main chain does (c1: 91.8 us for WO with 26.8 us of it beside
+DRAM-bound kernels; c8 alike), so a fill kernel's end is when its requests were issued,
+not when its lines landed. The bounds above use only the main chain's idle time and the
+consumers' measured excess.
 
 Options the brief named, bounded elsewhere or here:
 - **Issuing FFN or NEXT earlier inside their windows:** at most 0.30% at c1 (the PDL
@@ -110,17 +124,18 @@ Options the brief named, bounded elsewhere or here:
 | --- | --- |
 | 5816ad749 | the schedule benchmark (below); no package file |
 | 980aed9a4 | **chained** (S1, S2): WO issued right after the fused Q-A/KV in a layer without an indexer, so its fill queues behind NEXT's; FFN issued between WO-A and WO-B (`TileLangWOProjection(after_a=...)`) |
-| 9e6d9d78a | **typed** (S3, S3b, S4a, S4b): an owner layer issues WO after the index query and an IDX window (compressor, indexer wk, wq_b, head weights) after Q-B; before an Engram layer the MoE hook issues an ENGRAM window (the projection's first 20 MB) and the Engram layer issues NEXT between its projection's GEMM and all-gather |
+| 9e6d9d78a | **typed** (S4a, S4b, and a first S3): an owner layer issues an IDX window (compressor, indexer wk, wq_b, head weights) after Q-B and WO after the index query; before an Engram layer the MoE hook issues an ENGRAM window (the projection's first 20 MB) and the Engram layer issues NEXT between its projection's GEMM and all-gather |
 | 95a067b0d | tests of every layer type's issue points and plans, on fake layers (`tests/models/test_deepseek_v4_1_l2_schedule.py`) |
 | 71314ad6e | benchmark fixes found by reading it before its first run |
+| 353085fb7 | **typed, final** (S3): the owner layer's WO right after its compressor, behind IDX, not after the index query (above) |
 
 Risks the traces cannot settle, for the cluster A/B:
 - S1 starts the WO fill while Q-B's 8.8 MB of NEXT lines are unread. Under LRU the fill
   evicts the consumed mHC and Q-A/KV lines first; if GB10's L2 does not, Q-B slows.
-- S3 moves the owner layers' WO fill from beside the compressor and indexer projections
-  (DRAM-bound, so the fill costs nothing there) onto the top-k chain, which slows beside a
-  fill as sparse MLA does (11.3 to 14.8 us). At +20-30% on a 50 us chain that is 10-15 us
-  of the 26 us a layer S3 recovers.
+- S3 moves the owner layers' WO fill from beside the compressor's projection
+  (DRAM-bound, so the fill costs nothing there) onto the compression, indexer and top-k
+  kernels, which slow beside a fill as sparse MLA does (11.3 to 14.8 us). At +20-30% on
+  about 110 us that is 20-30 us of the 60 us a layer S3 should recover.
 - S1 and S2 move fill time off sparse MLA and the attention all-reduce, which both slow
   beside a fill: a gain the bounds do not count, and dgx4's spin stand-ins cannot show.
 
@@ -140,6 +155,11 @@ RESULTS PENDING.
 - [traces.py](traces.py), [schedule_bounds.py](schedule_bounds.py),
   [schedule_bounds.json](schedule_bounds.json): the trace analysis.
 - [make_bundles.py](make_bundles.py): overlays, bundles, arms and specs from the vLLM branch.
+- [harness_check.py](harness_check.py): the benchmark's bookkeeping checked on the CPU, no
+  torch: the chain's own `_Layer.run()` with recording fakes, through the benchmark's
+  `roles()`, `windows()` and `summarize()`. Per schedule it prints each window's fills and
+  their anchors; every fill must find all its consumers.
+  `python3 -I experiments/2026-10-26-l2-prefetch-schedule/harness_check.py VLLM_TREE`.
 - [overlay/](overlay), [overlay-chained/](overlay-chained), [overlay-typed/](overlay-typed):
   next-candidate's 66 package files over the image's tree, and the files each prototype
   changes from it. [bench/](bench): the benchmark and its chain.

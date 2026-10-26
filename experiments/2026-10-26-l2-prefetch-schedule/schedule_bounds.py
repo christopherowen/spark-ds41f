@@ -47,6 +47,7 @@ FFN = (("mHC", 2.0e6), ("router", 3.9e6), ("shared gate/up", 5.9e6), ("shared do
 FFN_DRAFT = (("mHC", 2.0e6), ("router", 1.3e6), ("shared gate/up", 5.9e6), ("shared down", 2.9e6))
 NEXT = (("mHC", 2.0e6), ("fused Q-A/KV", 9.2e6), ("Q-B", 8.8e6))
 Q_B_TAIL = 1.7e6  # Q-B bytes past the NEXT budget, read from DRAM in every layer
+L2_US_PER_MB = 1.0  # a GEMM's L2 read, as Q-B's floor shows
 BUSY = (
     "gemm_mxfp8",
     "gemm_bf16_splitk",
@@ -251,26 +252,44 @@ def bounds(calls, rows, floors, n_steps):
                 out["S1 WO after Q-A/KV (swa layers)"] += gain
                 shift = reach  # the WO fill ends about this much earlier
                 detail["S1 reach us"].append(reach)
-            if wo is not None and L["kind"] == "own":
-                # S3: owner layers lose the WO lines to the compressor and indexer
-                # projections; a WO fill issued after the indexer's head-weight projection
-                # lands over the top-k chain and sparse MLA
-                stretch = idle.idle(main[L["wproj"] + 1]["end"], main[L["woa"]]["ts"])
-                out["S3 WO after the indexer projections (own layers)"] += min(
-                    wo_ex, stretch * R / BW
+            if wo is not None and L["kind"] == "own" and L["idx_qb"] is not None:
+                # S3: an owner layer loses its WO lines to the compressor's projection.
+                # IDX (compressor 10.5 MB, the indexer's Q-B and head weights 5.6 MB)
+                # is issued after Q-B and WO right after the compressor, behind IDX.
+                # IDX lands the compressor's first bytes over the RoPE and cache
+                # writes before its projection, and the indexer's 5.6 MB over the
+                # compression after it; the indexer's Q-B then reads L2. WO's fill
+                # starts when IDX has landed and runs to WO-A; bytes it has not
+                # landed by then (WO-A's L2 time lands more for WO-B) are WO's new
+                # excess. Unlike S1 and S2 this is an estimate: the new excess
+                # can exceed the lost-line excess it replaces.
+                comp = next(i for i in range(L["qb"] + 1, L["woa"])
+                            if is_(main[i], "gemm_bf16_splitk"))  # fmt: skip
+                qb_end, iq = main[L["qb"]]["end"], main[L["idx_qb"]]
+                pre = idle.idle(qb_end, main[comp]["ts"])
+                comp_gain = min(main[comp]["dur"], pre * R / BW)
+                # IDX's indexer bytes land over the idle time after the projection
+                t, need = main[comp]["end"], 5.6e6
+                landed_at = t + need / R * 1e6
+                after = idle.idle(main[comp]["end"], iq["ts"])
+                idx_floor = 5.3 * L2_US_PER_MB + 1.0
+                idx_gain = max(0.0, iq["dur"] - idx_floor) * min(1.0, after * R / need)
+                # WO's reach: idle time from IDX's landing to WO-A, with the indexer's
+                # Q-B now read from L2
+                compress = next(i for i in range(comp + 1, L["woa"])
+                                if is_(main[i], "compress"))  # fmt: skip
+                start = max(landed_at, main[compress]["end"])
+                reach = idle.idle(start, main[L["woa"]]["ts"])
+                if iq["ts"] >= start:
+                    reach += idx_floor
+                woa_floor = floors.get(("WO", "WO-A", "T"), 12.0)
+                missing = max(0.0, 20.0e6 - (reach + woa_floor) * 1e-6 * R)
+                new_excess = missing / BW * 1e6
+                out["S3 owner layers: IDX after Q-B, WO after the compressor"] += (
+                    wo_ex - new_excess + comp_gain + idx_gain
                 )
-                detail["S3 top-k stretch us"].append(stretch)
-            if L["kind"] == "own" and L["idx_qb"] is not None:
-                # S3b: an IDX window (indexer Q-B and head weights) in the old WO slot.
-                # Owner layers only: there the WO fill that now runs over this stretch
-                # loses its lines; in an indexer-only layer they survive, so the
-                # stretch is already used.
-                k = main[L["idx_qb"]]
-                floor = 5.2e6 / 1e12 * 1e6 + 1.0  # ~1 us/MB from L2, as Q-B's floor shows
-                start = main[L["qb"]]["end"]
-                reach = idle.idle(start, k["ts"])
-                out["S3b IDX window (indexer Q-B)"] += min(max(0.0, k["dur"] - floor),
-                                                          reach * R / BW)  # fmt: skip
+                detail["S3 WO reach us"].append(reach)
+                detail["S3 WO new excess us"].append(new_excess)
             if ffn is not None:
                 # S2: FFN issued after WO-A, so it starts when the WO fill ends
                 wo_end = (wo["end"] - shift) if wo is not None else 0.0

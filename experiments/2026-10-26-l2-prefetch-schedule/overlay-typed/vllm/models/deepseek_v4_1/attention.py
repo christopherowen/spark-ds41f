@@ -732,6 +732,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             else None
         )
         latent, slots = self.compressor(hidden_states, main, state)
+        self._issue_wo_prefetch(rows, after="compressor")
         # Index K consumes the ordinary-normalized PRE-RoPE latent.
         key = indexer.k_norm(indexer.wk(latent))
         key = self._rope(key, positions, "index_key")
@@ -836,7 +837,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         qr, positions, hidden_states, index_weights, 0, rows, swa
                     )
                 index_query = (*query, split, reference)
-                self._issue_wo_prefetch(rows, after="index query")
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
         return self._o_proj(output, sp_rows=sp_rows)
 
@@ -846,14 +846,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         - right after the fused Q-A/KV projection in a layer without an indexer,
           where its fill queues behind the NEXT window's on the prefetch stream and
           runs over the norms and Q-B, which read L2;
-        - after the index query in a layer that owns a compressor and an indexer,
-          whose projections between Q-B and WO-A would evict WO's lines; the IDX
-          window, those projections' own, takes WO's place after Q-B;
+        - right after the compressor in a layer that owns one and an indexer: the
+          compressor's projection between Q-B and WO-A would evict WO's lines. The
+          IDX window, those projections' own, takes WO's place after Q-B, and WO's
+          fill queues behind it, over the compression, the indexer's projections
+          (from L2) and its top-k;
         - after Q-B in a layer that holds only an indexer."""
         if self.indexer is None:
             point = "q-a/kv"
         elif self.compressor is not None:
-            point = "index query"
+            point = "compressor"
         else:
             point = "q-b"
         if after == point:

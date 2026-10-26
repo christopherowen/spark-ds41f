@@ -99,7 +99,8 @@ SPINS = {
         idx_mid=7.0,
         idx_post=50.5,
         own_pre=8.5,
-        own_mid=47.0,
+        own_compress=13.0,
+        own_mid=34.0,
         own_mid2=4.5,
         own_post=46.5,
         attn_ar=44.0,
@@ -114,7 +115,8 @@ SPINS = {
         idx_mid=7.0,
         idx_post=69.5,
         own_pre=9.5,
-        own_mid=46.0,
+        own_compress=13.5,
+        own_mid=32.5,
         own_mid2=4.5,
         own_post=72.5,
         attn_ar=58.0,
@@ -134,8 +136,8 @@ EXPERT_POOL = {6: 20, 48: 48, 96: 80}
 #   follows NEXT's on the side stream, over the norms and the L2-fed Q-B), FFN right
 #   after WO-A (over WO-B);
 # - typed: chained, and the layers whose lines are lost before use get their own
-#   points: an owner layer's WO after the indexer's head-weight projection, with an
-#   IDX window (compressor, indexer Q-B and head weights) in WO's old place; before an
+#   points: an owner layer's WO right after the compressor (queued behind an IDX
+#   window, compressor, indexer Q-B and head weights, in WO's old place); before an
 #   Engram layer an ENGRAM window (the Engram projection's first bytes) where NEXT
 #   was, and NEXT right after the Engram projection;
 # - off: no window (for reference).
@@ -344,14 +346,15 @@ class _Layer:
             if self.kind == "own":
                 spin(s["own_pre"])  # RoPE, cache writes
                 self.compressor(a.y, self.latent, self.comp_scratch)
-                spin(s["own_mid"])  # compression, index keys, cache writes
+                spin(s["own_compress"])  # the compressor's compression kernel
+                if typed:
+                    issue("WO")
+                spin(s["own_mid"])  # index keys, cache writes
             else:
                 spin(s["idx_pre"])
             self.casts["index_q_b"].project(self.index_q_b, qn, self.iq)
             spin(s["idx_mid"] if self.kind == "idx" else s["own_mid2"])
             self.weights_proj(a.y, self.iw, self.wproj_scratch)
-            if typed and self.kind == "own":
-                issue("WO")
             spin(
                 s["idx_post"] if self.kind == "idx" else s["own_post"]
             )  # top-k, sparse MLA

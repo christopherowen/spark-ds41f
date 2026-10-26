@@ -33,15 +33,15 @@ def issued(monkeypatch):
     "indexer, compressor, expected",
     [
         # window-only and reuse layers: WO behind NEXT's fill
-        (None, None, {"q-a/kv": ["wo"], "q-b": [], "index query": []}),
-        # owner layers: IDX in WO's old place, WO over the top-k and sparse MLA
+        (None, None, {"q-a/kv": ["wo"], "q-b": [], "compressor": []}),
+        # owner layers: IDX in WO's old place, WO behind it after the compressor
         (
             "indexer",
             "compressor",
-            {"q-a/kv": [], "q-b": ["idx"], "index query": ["wo"]},
+            {"q-a/kv": [], "q-b": ["idx"], "compressor": ["wo"]},
         ),
         # indexer-only layers keep WO after Q-B
-        ("indexer", None, {"q-a/kv": [], "q-b": ["wo"], "index query": []}),
+        ("indexer", None, {"q-a/kv": [], "q-b": ["wo"], "compressor": []}),
     ],
 )
 def test_wo_and_idx_points_by_layer_type(issued, indexer, compressor, expected):

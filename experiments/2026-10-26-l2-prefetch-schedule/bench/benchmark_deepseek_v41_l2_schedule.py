@@ -165,8 +165,7 @@ def roles(ks: list[dict], chain: ScheduleChain) -> None:
 WINDOW = {
     "fused Q-A/KV": "WO",
     "Q-B": "WO",  # IDX in a typed schedule's owner layer
-    "head weights": "WO",
-    "head weights reduce": "WO",
+    "compressor": "WO",  # a typed schedule's owner layer
     "WO-A": "FFN",
     "WO-A reduce": "FFN",
     "WO-B": "FFN",

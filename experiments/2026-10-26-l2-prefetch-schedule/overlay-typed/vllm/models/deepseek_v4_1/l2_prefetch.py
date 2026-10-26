@@ -19,10 +19,11 @@ issued while the one before it still fills starts when that one ends):
   WO    this layer's WO-A and WO-B. Issued right after the fused Q-A/KV
         projection in a layer without an indexer: the fill follows NEXT's and
         runs over the norms and Q-B, which read L2, instead of starting after
-        Q-B. A layer that owns a compressor and an indexer issues it after the
-        index query, over the indexer's top-k and sparse MLA: issued after Q-B,
-        its lines did not survive those projections. A layer with only an
-        indexer issues it after Q-B.
+        Q-B. A layer that owns a compressor and an indexer issues it right after
+        the compressor: issued after Q-B, its lines did not survive the
+        compressor's projection. Queued behind IDX, its fill runs over the
+        compression, the indexer's projections (from L2) and its top-k. A layer
+        with only an indexer issues it after Q-B.
   IDX   an owner layer's compressor and indexer projections, in the order they
         run. Issued after Q-B, in WO's old place.
   FFN   router, mHC FFN mix, shared expert. Issued between WO-A and WO-B: the
