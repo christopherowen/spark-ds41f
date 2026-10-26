@@ -606,6 +606,32 @@ fresh process per build:
       down GEMM (15-17 us) then starts only when the routed one drains: it ends 14-16 us after
       it in every traced layer, on the critical path, about what PDL saved in the rest of the
       layer.
+12. **Fix candidates**, each one commit on 1bc005688, timed side by side with base and PDL
+    ([bundles/pdl-fix](bundles/pdl-fix): every grid row count, ten rounds rotating through the
+    builds; [bundles/pdl-fix-trace](bundles/pdl-fix-trace); [ab_table.py](ab_table.py)):
+    - **swiglu-wait** (`pdl-swiglu-wait` 0830e4c43): the routed SwiGLU waits and does not
+      trigger, so the routed down GEMM is not launched early. The shared down GEMM still ends
+      after the routed one: the race is lost earlier, in the routed gate/up GEMM's tail. Below
+      PDL from 2 to 32 rows (288b36f7; [runs/fix-288b36f7.txt](runs/fix-288b36f7.txt)).
+    - **shared-join** (`pdl-shared-join` 9d8c41128): the plan resolves the shared output
+      before the routed down GEMM, not the combine. The shared down GEMM is back before the
+      routed one, but its 15 us now sit between the routed SwiGLU and the routed down GEMM.
+      Level with PDL from 16 rows up and below it at 3-12 rows.
+    - **late-trigger** (`pdl-late-trigger` f03af5bf8): both grouped GEMMs wait first and
+      trigger after their K loop. The shared expert runs in the gate/up GEMM's tail again, as in
+      the base build (48 rows: its down GEMM ends at 2784 us, before the routed SwiGLU at 2792).
+      Ten rounds (05267c89; [runs/fix-05267c89.txt](runs/fix-05267c89.txt)): above PDL from 16
+      to 96 rows (+0.25 to +0.28% at 16-32 against +0.12 to +0.19%; 48 rows +0.05% against
+      -0.10%; 72 and 96 rows +0.16 and +0.12% against -0.01 and +0.00%) and at 2-3 rows, level
+      at 8-12, but below it at 6 rows (+0.77% +- 0.12 against +1.10% +- 0.19).
+    - **late-join** (late-trigger with shared-join): nothing over late-trigger.
+    - **late-fc1** (`pdl-late-fc1` 88014054e): the trigger after the K loop in the routed
+      gate/up GEMM only, the boundary where the race is lost; the routed down GEMM keeps its
+      early trigger, since the combine after it waits for the shared output anyway. Its trace
+      (b83ea330; [runs/fix-trace-b83ea330.txt](runs/fix-trace-b83ea330.txt)) has the shared
+      down GEMM back before the routed one at 16 and 48 rows.
+
+    Every build's buffers have the base build's bits in every round.
 
 The cluster checks stay queued as [screen.json](screen.json) and [profile.json](profile.json).
 

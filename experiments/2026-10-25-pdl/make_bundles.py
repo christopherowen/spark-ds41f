@@ -367,6 +367,8 @@ def main() -> None:
              "side stream, ten rounds rotating", ["/b/pdl_chain_ab.py", "10", "/b/pdl_rows.py", "--modes", "aux"]),
             ("pdl-fix-trace", "The 16- and 48-row chains under the torch profiler, two rounds rotating",
              ["/b/pdl_chain_ab.py", "2", "/b/pdl_trace.py", "--rows", "16,48"]),
+            ("pdl-fix-trace-small", "The 3- and 6-row chains under the torch profiler, three rounds rotating",
+             ["/b/pdl_chain_ab.py", "3", "/b/pdl_trace.py", "--rows", "3,6"]),
             ("pdl-fix-focus", "The decode layer's chain at 2, 3, 6, 16, 48 and 96 rows, the shared expert on its "
              "side stream, fifteen rounds rotating",
              ["/b/pdl_chain_ab.py", "15", "/b/pdl_rows.py", "--rows", "2,3,6,16,48,96", "--modes", "aux"]),
