@@ -190,7 +190,7 @@ class KernelBackendTest(unittest.TestCase):
         inputs = spark.build_inputs(self.lock)
         for name in kernel_backend.SOURCES:
             self.assertNotIn(name, inputs)
-        self.assertEqual(spark.build_contexts(inputs), spark.BUILD_CONTEXTS)
+        self.assertEqual(spark.build_contexts(inputs), (*spark.BUILD_CONTEXTS, "b12x-source"))
         self.assertEqual(spark.smoke_script(self.lock), spark.SMOKE_SCRIPT)
 
     def test_tilelang_candidate_passes_doctor(self):
@@ -384,7 +384,8 @@ class KernelBackendTest(unittest.TestCase):
         _, lock, _, patch = self.ready()
         with patch:
             inputs = spark.build_inputs(lock)
-        self.assertEqual(spark.build_projects(inputs), (*spark.BUILD_PROJECTS, *kernel_backend.SOURCES))
+        self.assertEqual(spark.build_projects(inputs),
+                         (*spark.BUILD_PROJECTS, *spark.LEGACY_BUILD_PROJECTS, *kernel_backend.SOURCES))
         self.assertEqual(inputs["tilelang"]["version"], "0.1.15")
         self.assertEqual(inputs["tile_kernels"]["version"], "2.0.0")
         self.assertEqual(spark.build_contexts(inputs)[-2:], ("tilelang-source", "tile_kernels-source"))
@@ -480,9 +481,11 @@ class KernelBackendTest(unittest.TestCase):
                 continue
             if "sources" in data and "source_manifest" in data:
                 with self.subTest(lock=relative):
-                    self.assertEqual(spark.build_projects(data["sources"]), spark.BUILD_PROJECTS)
+                    # Every lock before the TileLang family lists B12X.
+                    self.assertEqual(spark.build_projects(data["sources"]),
+                                     (*spark.BUILD_PROJECTS, *spark.LEGACY_BUILD_PROJECTS))
                     inputs = spark.build_inputs(data)
-                    self.assertEqual(spark.build_contexts(inputs), spark.BUILD_CONTEXTS)
+                    self.assertEqual(spark.build_contexts(inputs), (*spark.BUILD_CONTEXTS, "b12x-source"))
             elif "serve_args" in data and "container" in data and "kernel_backend" not in data:
                 with self.subTest(profile=relative):
                     self.assertEqual(kernel_backend.source_problems(data, {"sources": {}}, {}), [])

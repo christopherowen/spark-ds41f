@@ -1,7 +1,8 @@
 # Image build
 
 `docker/Dockerfile` builds the promoted image: Local Inference Lab's
-karmic-kraken-beta vLLM and B12X with the local patch series, plus TileLang,
+karmic-kraken-beta vLLM and B12X (while the lock lists it; see
+[Locks without B12X](#locks-without-b12x)) with the local patch series, plus TileLang,
 DeepSeek's TileKernels and sparknet for the promoted TileLang kernel family
 (the `runtime-tilelang-sparknet` stage), on the canonical
 vLLM ARM64 nightly `af1c0149`. Only vLLM's `_C_stable_libtorch` and
@@ -28,7 +29,7 @@ bin/spark build smoke          # rerun the GPU import smoke
 `upstreams.lock.json` and the source manifest it names determine every build
 input:
 
-- the vLLM, B12X and NCCL revisions;
+- the vLLM and NCCL revisions, and B12X's while the lock lists it;
 - the patch-series fingerprints, recorded patch heads, and trees;
 - the CUTLASS revision;
 - the CuTe DSL wheel lock;
@@ -91,7 +92,8 @@ refuses commits that differ from the source manifest. `build image` passes
 their contexts, `TILELANG_*` and `TILE_KERNELS_*` arguments (revision, patch
 head, tree and version), the compile jobs as `TILELANG_COMPILE_JOBS`, and
 `RUNTIME_STAGE=runtime-tilelang`. That stage starts from the B12X runtime
-stage, builds wheels of both, replaces the base image's `tilelang` 0.1.12,
+stage (`TILELANG_BASE_STAGE=runtime`; `runtime-core` for a lock without B12X),
+builds wheels of both, replaces the base image's `tilelang` 0.1.12,
 installs TileKernels without dependencies, and checks the installed files,
 versions and every shared `apache-tvm-ffi` and `tilelang` requirement. The
 image gains `local.spark-ds41f.tilelang.*` and `local.spark-ds41f.tile_kernels.*`
@@ -100,6 +102,20 @@ labels, and the GPU smoke imports both packages.
 Without those sources the command has no new argument, BuildKit skips the
 TileLang stages and their contexts, and the image is the unchanged `runtime`
 stage.
+
+## Locks without B12X
+
+`runtime-core` holds everything but B12X (the vLLM tree and its two rebuilt
+extensions, NCCL, the CuTe DSL wheels, liburing for the io_uring readers vLLM
+builds at first use); `runtime` adds B12X on it, with its labels and its checks. A
+lock that lists `b12x` (spark-ds41f-1025 and earlier) builds as before, in the
+same `vllm-<12>-b12x-<12>-<input hash>` directory. From the release after next the
+lock leaves B12X out: `prepare` makes no `src/b12x` or `context/b12x-source` (the
+directory is `vllm-<12>-<input hash>`), `build image` passes
+`TILELANG_BASE_STAGE=runtime-core`, so BuildKit never reads a `b12x-source`
+context, the image has no `local.spark-ds41f.b12x.*` labels, and the GPU smoke
+imports no B12X module and checks that B12X is not installed. A lock without B12X
+must list the TileLang sources ([docs/upstreams.md](../docs/upstreams.md#locks-without-b12x)).
 
 ## Resource policy on DGX Spark
 

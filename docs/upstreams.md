@@ -20,6 +20,8 @@ local-inference-lab/vllm integration/karmic-kraken-beta
 local-inference-lab/b12x integration/karmic-kraken-beta (archived; its last commit)
         + its series; serving uses only its checkpoint loader
           (--load-format b12x) and the modules vLLM still imports
+          (spark-ds41f-1025; locks from the release after next leave
+          B12X out, see "Locks without B12X")
                     |
 tile-ai/tilelang main (0.1.15)
         + patches (SM120/SM121 block-scaled MMA: MXFP8, FP8 x FP4, MXFP4)
@@ -47,7 +49,7 @@ Inference Lab integration branch is the serving source.
 |---|---|---|---|
 | `vllm` | `local-inference-lab/vllm` (`integration/karmic-kraken-beta`) | `christopherowen/vllm` | serving source; canonical `vllm-project/vllm` main is parked |
 | `vllm_base_image` | `docker.io/vllm/vllm-openai` | not applicable | official CUDA/Torch/native-extension foundation |
-| `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`, archived) | none (archived) | the checkpoint loader (`--load-format b12x`) and modules vLLM still imports; no B12X kernel runs in serving |
+| `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`, archived) | none (archived) | spark-ds41f-1025 and earlier: the checkpoint loader (`--load-format b12x`) and modules vLLM still imports; no B12X kernel runs in serving. Not listed from the release after next |
 | `nccl` | `NVIDIA/nccl` (tag `v2.30.7-1`) | not created yet | the base image's NCCL version, rebuilt for SM121 with `patches/nccl` |
 | `tilelang` | `tile-ai/tilelang` (`main`) | `christopherowen/tilelang` | the promoted kernel compiler, with `patches/tilelang` for SM120/SM121 |
 | `tile_kernels` | `deepseek-ai/TileKernels` (`main`) | not created yet | DeepSeek's TileLang kernels: MoE gate, casts, mHC |
@@ -80,12 +82,33 @@ small patch series, build a new immutable image tag, and record it as an experim
 Do not advance `upstreams.lock.json` merely because a newer commit exists.
 
 Shared runtime packages move forward, never back. CuTe DSL is used by vLLM,
-quack-kernels, B12X, FlashInfer and the cuDNN frontend; the locked wheel set in
+quack-kernels, FlashInfer, the cuDNN frontend and B12X (while a lock lists it); the
+locked wheel set in
 `requirements/cutlass-dsl-aarch64.txt` must satisfy every one of them and must
 not be older than the version the vLLM base image installs. When a component
 pins an older version, patch the component's pin forward and qualify it rather
 than downgrading the others. The image build checks each consumer's declared
 requirement and fails on a mismatch.
+
+## Locks without B12X
+
+From the release after next, the lock has no `b12x` entry: its vLLM series ports what
+serving still took from B12X (the direct loader, the packed BF16 head's packer, Engram's
+token map, geometry and caps, and a TileLang gather for resident Engram tables;
+[experiments/2026-10-26-retire-b12x](../experiments/2026-10-26-retire-b12x/README.md)).
+`bin/spark build` handles both kinds of lock:
+
+- A lock that lists `b12x` (spark-ds41f-1025 and earlier) builds exactly as before: the
+  same build directory, the `b12x-source` context, Dockerfile stage `runtime` (B12X on
+  `runtime-core`) under the TileLang runtime, and the `local.spark-ds41f.b12x.*` labels.
+- A lock without it prepares no B12X project or context, builds the TileLang runtime on
+  `runtime-core` (`TILELANG_BASE_STAGE`), records no B12X labels, and its image smoke
+  checks that B12X is not installed. Such a lock must list the TileLang sources.
+
+To make such a lock, drop `sources.b12x` from the candidate's lock (the source manifest's
+`b12x` record is then not read) and `local.spark-ds41f.b12x.tree` from its profile's
+`container.expected_labels`. The recipe loads with `--load-format direct` and an empty
+`VLLM_PLUGINS`.
 
 ## Contributing back
 

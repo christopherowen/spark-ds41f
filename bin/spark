@@ -2426,7 +2426,11 @@ BUILD_ROOT = ROOT / ".work/build"
 # Bump when the directory layout or context export changes, so older
 # directories are re-prepared.
 BUILD_LAYOUT = 2
-BUILD_PROJECTS = ("vllm", "b12x", "nccl")
+BUILD_PROJECTS = ("vllm", "nccl")
+# Built while the lock lists it: B12X, which spark-ds41f-1025's lock and earlier
+# ones list. A lock without it builds an image without B12X (the TileLang runtime
+# on Dockerfile stage runtime-core).
+LEGACY_BUILD_PROJECTS = ("b12x",)
 # Built only when the lock lists them (the TileLang kernel backend); each adds
 # its own <name>-source context.
 OPTIONAL_BUILD_PROJECTS = ("tilelang", "tile_kernels")
@@ -2435,10 +2439,10 @@ OPTIONAL_BUILD_PROJECTS = ("tilelang", "tile_kernels")
 INDEPENDENT_BUILD_PROJECTS = ("sparknet",)
 # The vLLM capability of images whose TileLang family runs sparknet's collectives.
 SPARKNET_CAPABILITY = "tilelang-sparknet-collectives"
-BUILD_PARTS = ("vllm", "b12x", "nccl", "cutlass", "wheels")
-BUILD_CONTEXTS = (
-    "vllm-source", "b12x-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions"
-)
+BUILD_PARTS = ("vllm", "nccl", "cutlass", "wheels")
+BUILD_CONTEXTS = ("vllm-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions")
+# The projects a lock may list or leave out, each with a <name>-source context.
+LISTED_BUILD_PROJECTS = (*LEGACY_BUILD_PROJECTS, *OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS)
 # git am with a fixed committer and committer date reproduces the recorded
 # patch heads byte for byte.
 PATCH_COMMITTER = ("Christopher Owen", "3221756+christopherowen@users.noreply.github.com")
@@ -2470,28 +2474,43 @@ print("GPU import smoke passed")
 # A TileLang-only vLLM series (kernel_backend.TILELANG_ONLY) deletes B12X's RoCE
 # collectives with the kernel-family switch.
 B12X_ROCE_IMPORT = "import vllm.distributed.device_communicators.b12x_roce_all_reduce  # noqa: F401\n"
+B12X_MLA_IMPORT = "import vllm.v1.attention.backends.mla.b12x_mla_sparse  # noqa: F401\n"
+# An image whose lock does not list B12X: the package must be absent, and the DS4.1
+# modules that used it (Engram, the packed head's packer) import without it.
+WITHOUT_B12X_SMOKE = """\
+import importlib.util
+
+assert importlib.util.find_spec("b12x") is None, "B12X is installed"
+import vllm.models.deepseek_v4_1.common.engram  # noqa: F401
+import vllm.models.deepseek_v4_1.tilelang.vocab_pack  # noqa: F401
+
+print("B12X is not installed; the DS4.1 modules import without it")
+"""
 
 
 def build_projects(sources: dict) -> tuple[str, ...]:
-    """The required projects, then each optional one the lock or inputs list."""
-    return BUILD_PROJECTS + tuple(
-        name for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in sources
-    )
+    """The required projects, then each the lock or inputs list (B12X, TileLang, sparknet)."""
+    return BUILD_PROJECTS + tuple(name for name in LISTED_BUILD_PROJECTS if name in sources)
 
 
 def build_contexts(inputs: dict) -> tuple[str, ...]:
-    return BUILD_CONTEXTS + tuple(
-        f"{name}-source" for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in inputs
-    )
+    return BUILD_CONTEXTS + tuple(f"{name}-source" for name in LISTED_BUILD_PROJECTS if name in inputs)
 
 
 def runtime_stage(inputs: dict) -> str | None:
     """The Dockerfile stage the image ends with; None keeps the B12X runtime."""
+    if "b12x" not in inputs and "tilelang" not in inputs:
+        raise SystemExit("an image without B12X is the TileLang runtime; the lock must list the TileLang sources")
     if "sparknet" in inputs:
         if "tilelang" not in inputs:
             raise SystemExit("sparknet is installed on the TileLang runtime; the lock must list the TileLang sources")
         return "runtime-tilelang-sparknet"
     return "runtime-tilelang" if "tilelang" in inputs else None
+
+
+def tilelang_base_stage(inputs: dict) -> str:
+    """The Dockerfile stage the TileLang runtime builds on: B12X's while the lock lists it."""
+    return "runtime" if "b12x" in inputs else "runtime-core"
 
 
 def missing_patches(source: dict) -> list[str]:
@@ -2510,15 +2529,19 @@ def missing_patches(source: dict) -> list[str]:
 
 
 def smoke_script(upstreams: dict) -> str:
-    """The GPU import smoke, extended for an image with the TileLang sources."""
+    """The GPU import smoke, extended for an image with the TileLang sources; for a lock
+    without B12X (a TileLang image), it imports no B12X module and checks B12X is absent."""
     if "tilelang" not in upstreams["sources"]:
         return SMOKE_SCRIPT
     version = upstreams["sources"]["tilelang"]["version"]
     manifest = read_json(upstreams["source_manifest"])
     capabilities = manifest["vllm"].get("capabilities", [])
+    b12x = "b12x" in upstreams["sources"]
     script = SMOKE_SCRIPT
-    if kernel_backend.TILELANG_ONLY in capabilities:
+    if kernel_backend.TILELANG_ONLY in capabilities or not b12x:
         script = script.replace(B12X_ROCE_IMPORT, "")
+    if not b12x:
+        script = script.replace(B12X_MLA_IMPORT, "")
     script += (
         "import importlib.metadata\n\n"
         "import tilelang\n"
@@ -2538,6 +2561,8 @@ def smoke_script(upstreams: dict) -> str:
             "print(\"sparknet proxy ABI\", load().roce_abi_version())\n"
             "print(\"sparknet import smoke passed\")\n"
         )
+    if not b12x:
+        script += WITHOUT_B12X_SMOKE
     return script
 
 
@@ -2615,11 +2640,11 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
 
 
 def build_directory(inputs: dict) -> Path:
-    """One directory per set of build inputs: same lock, same directory."""
+    """One directory per set of build inputs: same lock, same directory (a lock that
+    lists B12X keeps the name it always had)."""
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
-    return BUILD_ROOT / (
-        f"vllm-{inputs['vllm']['revision'][:12]}-b12x-{inputs['b12x']['revision'][:12]}-{digest[:8]}"
-    )
+    b12x = f"-b12x-{inputs['b12x']['revision'][:12]}" if "b12x" in inputs else ""
+    return BUILD_ROOT / f"vllm-{inputs['vllm']['revision'][:12]}{b12x}-{digest[:8]}"
 
 
 def project_problems(source: Path, record: dict) -> list[str]:
@@ -2845,7 +2870,7 @@ def command_build_prepare(args: argparse.Namespace) -> int:
     _, _, upstreams = configuration(args)
     parts = args.only.split(",") if args.only else None
     if parts:
-        optional = (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS)
+        optional = LISTED_BUILD_PROJECTS
         unknown = sorted(set(parts) - set(BUILD_PARTS) - set(optional))
         if unknown:
             raise SystemExit(f"unknown build parts: {', '.join(unknown)}")
@@ -3079,7 +3104,8 @@ def command_build_image(args: argparse.Namespace) -> int:
                 build_args[f"{prefix}_VERSION"] = record["version"]
         stage = runtime_stage(inputs)
         if stage is not None:
-            build_args.update(RUNTIME_STAGE=stage, TILELANG_COMPILE_JOBS=str(jobs))
+            build_args.update(RUNTIME_STAGE=stage, TILELANG_COMPILE_JOBS=str(jobs),
+                              TILELANG_BASE_STAGE=tilelang_base_stage(inputs))
         for key, value in build_args.items():
             rendered += ["--build-arg", f"{key}={value}"]
         if os.environ.get("GITHUB_TOKEN"):
