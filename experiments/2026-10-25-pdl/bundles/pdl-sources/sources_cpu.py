@@ -3,14 +3,14 @@
 plugin checks them (tests/kernels/deepseek_v41_pdl_sources.py).
 
 usage (in the serving image, the PDL branch's package files and the plugin mounted over
-the tree, no GPU): python3 sources_cpu.py
+the tree; bundles/pdl-sources): python3 sources_cpu.py
 
 Each call is a chain kernel at a TP4 decode shape (and the warp-specialized GEMMs, which
 must have no PDL). TileLang lowers it for sm_121 with the factory's own pass configs and
 without device compilation (tilelang.lower(enable_device_compile=False), as
-tilelang.tools.compile_only does). A call whose factory needs a GPU to choose its
-arguments is reported as skipped. One JSON line per call, then a summary; exit status 1
-if any source has a violation.
+tilelang.tools.compile_only does). Some factories need a GPU to choose their arguments,
+so the bundle runs with one. One JSON line per call, then a summary; exit status 1 if any
+call fails to lower or any source has a violation.
 """
 
 import json
@@ -128,7 +128,8 @@ def calls():
     add_calls("indexer candidates", dict(enumerate(indexer.IndexerV41Plan.calls(
         8192, 256, candidates=True, candidate_blocks=True))))  # fmt: skip
     add("compress gather", compress.gather_partial_state_kernel, 16, 64)
-    add("compress", compress.compress_kernel, 4, 16, 64)
+    for ratio in (1, 2):
+        add(f"compress at ratio {ratio}", compress.compress_kernel, ratio, 16, 64)
     add("SwiGLU clamp", activation.swiglu_clamp_kernel, 576, 10.0)
     add("router partials", router.route_partials, 6, 384, 8, False, False)
     add("routing masks", router.routing_masks_kernel, None, True)
@@ -161,15 +162,18 @@ def lower(function, args, kwargs):
 
 
 def main() -> int:
-    checked = waiting = failed = skipped = 0
+    checked = waiting = failed = unlowered = 0
     for label, function, args, kwargs in calls():
         try:
             source, warp_specialized = lower(function, args, kwargs)
-        except Exception as error:  # a factory that needs the GPU to pick its arguments
-            skipped += 1
+        except Exception as error:  # reported, and the run fails
+            unlowered += 1
             print(
                 json.dumps(
-                    {"call": label, "skipped": f"{type(error).__name__}: {error}"[:300]}
+                    {
+                        "call": label,
+                        "unlowered": f"{type(error).__name__}: {error}"[:300],
+                    }
                 ),
                 flush=True,
             )
@@ -187,11 +191,11 @@ def main() -> int:
                 "checked": checked,
                 "with_pdl": waiting,
                 "with_violations": failed,
-                "skipped": skipped,
+                "unlowered": unlowered,
             }
         )
     )
-    return 1 if failed else 0
+    return 1 if failed or unlowered else 0
 
 
 if __name__ == "__main__":
