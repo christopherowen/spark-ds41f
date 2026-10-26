@@ -265,8 +265,9 @@ differs only in cabling, transport and memory sizing):
   argument as torch does;
 - 1,048,576-token per-request limit, eight admitted sequences, and a 4.90625
   GiB-per-rank cache that holds five full 1M contexts at once, or all eight
-  sequences at up to 697,600 tokens ([KV capacity](docs/memory-profiles.md#kv-capacity));
-- one concurrent prefill, 4,096 batched tokens, and fail-closed 5 GiB startup
+  sequences at up to 666,880 tokens (spark-ds41f-1025's startup line: 4,009,281
+  tokens, 3.82x; [KV capacity](docs/memory-profiles.md#kv-capacity));
+- one concurrent prefill, 8,192 batched tokens, and fail-closed 5 GiB startup
   and 3 GiB steady memory guards;
 - FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): only the
   sampler uses FlashInfer, and the pass saved no configs.
@@ -353,7 +354,7 @@ stops at 500K; one cold 1,000,000-token prefill was measured on its own.
 | Decode, 4 streams | 111.5 | 116.0 (**+4.0%** ±1.9) |
 | Poisson arrivals at 0.42 req/s, output (tok/s) | 117.6 | 118.3 (+0.7% ±22) |
 | One conversation at a time (tok/s, `single-stream`) | 57.0 | 59.7 (+4.7% ±6.3) |
-| KV pool | 2,845,543 tokens (5.43x 512K) | 4,765,898 tokens (4.55x 1M) |
+| KV pool, startup line (4,096 batched tokens) | 2,845,543 tokens (5.43x 512K; holds 7 at once) | 4,765,898 tokens (4.55x 1M; holds 5 at once) |
 
 All 256 greedy responses are identical to r6v's. During the cold 1M prefill dgx1's
 lowest MemAvailable was 5.93 GiB, above its 3 GiB steady guard.
@@ -571,7 +572,7 @@ Four nodes (TP4 1M recipe, 16 sequences at 1,048,576 tokens):
 | One-stream prose / code step time | 34.00 / 37.72 ms | **31.79 / 34.75 ms** |
 | Source-text prefill, 32K / 256K (tok/s) | 5,117 ± 1.7% / 4,873 ± 2.5% | **5,836 ± 4.2% / 5,471 ± 3.1%** |
 | Source-text prefill, 500K / 1M | 4,645 ± 1.7% / 4,026 ± 0.9% | **5,072 ± 1.3% / 4,370 ± 0.6%** |
-| KV capacity, 10.5 GiB per rank | 11 full 1M contexts at once (vLLM's startup line: 8,580,566 tokens) | same |
+| KV capacity, 10.5 GiB per rank | 11 full 1M contexts at once (the startup line at 8,192 batched tokens: 8,580,566 tokens) | same |
 | Lowest MemAvailable | 20.4 GiB (dgx1) | 19.35 GiB (dgx1) |
 
 TileLang is never behind: it is ahead on single-stream step time, at eight

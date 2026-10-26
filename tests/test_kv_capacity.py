@@ -45,12 +45,15 @@ class ReportedTest(unittest.TestCase):
         self.assertEqual(row("tp4-ring", max_num_batched_tokens=16384)["reported_tokens"], 6_512_700)
 
     def test_triangle(self):
-        self.assertEqual(row("tp3-triangle")["reported_tokens"], 4_765_898)
+        # spark-ds41f-1025 at the recipe's 8,192; spark-ds41f-1022 at 4,096.
+        self.assertEqual(row("tp3-triangle", max_num_batched_tokens=8192)["reported_tokens"], 4_009_281)
+        self.assertEqual(row("tp3-triangle", max_num_batched_tokens=4096)["reported_tokens"], 4_765_898)
         self.assertEqual(row("tp3-triangle-4k")["reported_tokens"], 1_348_708)
 
     def test_r6v_half_million_context(self):
-        # r6v's TP3 recipe: 3.5 GiB at 524,288 tokens.
-        reported = row("tp3-triangle", max_model_len=524_288, kv_cache_memory_bytes=3_758_096_384)
+        # r6v's TP3 recipe: 3.5 GiB at 524,288 tokens and 4,096 batched tokens.
+        reported = row("tp3-triangle", max_model_len=524_288, kv_cache_memory_bytes=3_758_096_384,
+                       max_num_batched_tokens=4096)
         self.assertEqual(reported["reported_tokens"], 2_845_543)
 
 
@@ -68,9 +71,11 @@ class CapacityTest(unittest.TestCase):
                 self.assertEqual(ring["every_sequence_tokens"], each)
 
     def test_triangle(self):
-        triangle = row("tp3-triangle")
-        self.assertEqual(triangle["full_contexts"], 5)
-        self.assertEqual(triangle["every_sequence_tokens"], 697_600)
+        for budget, each in ((8192, 666_880), (4096, 697_600)):
+            with self.subTest(budget=budget):
+                triangle = row("tp3-triangle", max_num_batched_tokens=budget)
+                self.assertEqual(triangle["full_contexts"], 5)
+                self.assertEqual(triangle["every_sequence_tokens"], each)
         small = row("tp3-triangle-4k")
         self.assertEqual(small["full_contexts"], 8)
         self.assertEqual(small["every_sequence_tokens"], 262_144)
@@ -82,7 +87,8 @@ class CapacityTest(unittest.TestCase):
         self.assertAlmostEqual(row("tp4-ring", max_num_batched_tokens=8192)["vllm_capacity_contexts"], 11.48, 2)
         self.assertAlmostEqual(row("tp4-ring", max_num_batched_tokens=16384)["vllm_capacity_contexts"], 11.02, 2)
         self.assertEqual(row("tp4-ring", max_num_batched_tokens=16384)["vllm_capacity_tokens"], 11_554_122)
-        self.assertEqual(row("tp3-triangle")["vllm_capacity_tokens"], 5_609_861)
+        self.assertEqual(row("tp3-triangle", max_num_batched_tokens=8192)["vllm_capacity_tokens"], 5_366_846)
+        self.assertEqual(row("tp3-triangle", max_num_batched_tokens=4096)["vllm_capacity_tokens"], 5_609_861)
 
     def test_budget_override(self):
         rows = kv_capacity.report(RECIPE, MODEL, ["tp4-ring"], budget=16384)

@@ -6,7 +6,7 @@ usage: kv_capacity.py [--cluster-config FILE] [--model-config FILE] [--shape NAM
 
 vLLM's startup line "GPU KV cache size: N tokens, Maximum concurrency for L tokens per
 request: Cx" is C x L, with C the requests at the per-request limit L that the pool holds.
-Up to spark-ds41f-1025 its vLLM charged every request the window caches' own peak: the
+Through spark-ds41f-1025 its vLLM charges every request the window caches' own peak: the
 128-token window plus a whole batch for each of the two steps async scheduling keeps
 unsettled. Those two batches are the whole pool's, not every request's. Per request the
 pool holds:
@@ -25,7 +25,7 @@ the longest context at which all ``max_num_seqs`` fit at once.
 
 The layout follows vLLM's DS4.1 caches (``vllm/models/deepseek_v4_1``) and its
 block-outermost packing (``_get_packed_kv_cache_groups``). ``reported`` is the figure the
-startup line printed up to spark-ds41f-1025; ``vllm_capacity`` the one it prints with vLLM
+startup line prints through spark-ds41f-1025; ``vllm_capacity`` the next candidate's, with vLLM
 0491 (each request its window, the pool the two batches once) after 0492 (a window group
 holding a drafter layer retains the drafter's extra token).
 """
@@ -198,9 +198,9 @@ def main() -> int:
               f"all {row['max_num_seqs']} sequences up to {row['every_sequence_tokens']:,} tokens each")
         print(f"  a request at the limit: {row['resident_blocks']:,} blocks; the prompt being filled: "
               f"{row['prompt_blocks_in_flight']:,} more")
-        print(f"  vLLM's startup line: {row['reported_tokens']:,} tokens ({row['reported_contexts']:.2f}x) "
-              f"up to spark-ds41f-1025; {row['vllm_capacity_tokens']:,} ({row['vllm_capacity_contexts']:.2f}x) "
-              f"with vLLM 0491 and 0492")
+        print(f"  the startup line through spark-ds41f-1025: {row['reported_tokens']:,} tokens "
+              f"({row['reported_contexts']:.2f}x); the next candidate's (vLLM 0491, 0492): "
+              f"{row['vllm_capacity_tokens']:,} ({row['vllm_capacity_contexts']:.2f}x)")
     return 0
 
 

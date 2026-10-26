@@ -18,8 +18,9 @@ off unless configured (#401); `SPARK_DS41F_*` variables; the sink log states its
 `prompt_logprobs` request no longer kills the engine under sink rejection (0266) and
 `logprob_token_ids` work under speculative decoding (0267); at most 32 top logprobs. The recipe
 moves to the spark-ds41f names (container, image, labels, `/opt/spark-ds41f`, `/cache/spark-ds41f`,
-`spark-ds41f-kernel-memory`), sets the ring's long-prefill budget to 16,384 (6.21 full 1M contexts
-admitted, from 8.18), pins glibc malloc (#439), reports prompt-cache hits (#469), turns the JIT
+`spark-ds41f-kernel-memory`), sets the ring's long-prefill budget to 16,384 (its startup line reads
+6.21 full 1M contexts, from 8.18; the pool holds 11 at either budget,
+[KV capacity](memory-profiles.md#kv-capacity)), pins glibc malloc (#439), reports prompt-cache hits (#469), turns the JIT
 monitor off and drops 21 settings for kernels serving does not run. Temperature-0 text outputs are
 identical to spark-ds41f-1022's; image answers differ and score the same.
 Against spark-ds41f-1022 in candidate 6's release comparison (one session, 2026-10-25
@@ -79,8 +80,8 @@ faster (sampled 3.0% and 4.5%), prefill level, one conversation at a time 74.1 t
 [manifests/suites/2026-10-19-karmic-kraken-r6x-tp4](../manifests/suites/2026-10-19-karmic-kraken-r6x-tp4/).
 On the triangle, `tp3-triangle` serves r6x at **1,048,576 tokens** since 2026-10-19
 ([experiments/2026-10-19-r6x-tp3-1m](../experiments/2026-10-19-r6x-tp3-1m/README.md)): a
-4.90625 GiB KV pool that holds five full 1M contexts at once (vLLM's startup line: 4,765,898
-tokens, 4.55x; [KV capacity](memory-profiles.md#kv-capacity)), outputs identical to r6u's TP3
+4.90625 GiB KV pool that holds five full 1M contexts at once (r6x's startup line at its 4,096
+budget: 4,765,898 tokens, 4.55x; [KV capacity](memory-profiles.md#kv-capacity)), outputs identical to r6u's TP3
 path; its `benchmark_reference` is
 [manifests/suites/2026-10-19-karmic-kraken-r6x-tp3](../manifests/suites/2026-10-19-karmic-kraken-r6x-tp3/).
 r6v's recipe and lock are frozen in `experiments/2026-10-18-r6x/r6v` as the rollback.

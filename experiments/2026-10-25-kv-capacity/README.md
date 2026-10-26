@@ -9,7 +9,8 @@ cluster use: the figures come from the code, the recipe, the checkpoint's `confi
 
 - **The ring's 10.5 GiB pool holds 11 full 1M contexts at once at either budget**: 11.03 at
   16,384 batched tokens and 11.49 at 8,192. All 16 sequences fit at once up to 718,848 tokens
-  each at 16,384 (749,568 at 8,192). The triangle's 4.90625 GiB holds 5 (5.35); its 4 KiB
+  each at 16,384 (749,568 at 8,192). The triangle's 4.90625 GiB holds 5 at either of its
+  budgets: 5.12 at the 8,192 it serves since spark-ds41f-1025 (#602), 5.35 at 4,096. Its 4 KiB
   shape holds all eight sequences at its 262,144-token limit.
 - **The published 6.21 and 8.18 are vLLM's startup figure**, not the capacity. It charges
   every request the window caches' worst case, a prompt's two whole chunks in flight, as if
@@ -67,8 +68,9 @@ max_num_batched_tokens` (`vllm/config/vllm.py:746`), two batches under async sch
 | 16,384 | cdiv(127 + 32,768, 128) + 1 = 258 | 4,096 + 15 x 258 + 1 = 7,967 | 49,483 / 7,967 = 6.211 | 6,512,700 |
 
 The same arithmetic gives every capacity figure the records quote, to the token: the
-triangle's 4,765,898 (4.55x), the 4 KiB shape's 1,348,708 (5.14x) and r6v's 2,845,543 at
-512K (5.43x). `tests/test_kv_capacity.py` pins all five.
+triangle's 4,765,898 (4.55x) at 4,096 and spark-ds41f-1025's 4,009,281 (3.82x) at 8,192, the
+4 KiB shape's 1,348,708 (5.14x) and r6v's 2,845,543 at 512K (5.43x).
+`tests/test_kv_capacity.py` pins all six.
 
 ## What a request holds
 
@@ -94,8 +96,9 @@ prompt's extra) / 4,142:
 | Shape and budget | Usable blocks | Prompt in flight | Contexts at once | All sequences at once |
 | --- | ---: | ---: | ---: | ---: |
 | `tp4-ring`, 16,384 | 49,482 | 3,810 | 11.03 → **11** | 16 x 718,848 tokens |
-| `tp4-ring`, 8,192 | 49,482 | 1,890 | 11.49 → **11** | 16 x 749,568 tokens |
-| `tp3-triangle`, 4,096 | 23,120 | 945 | 5.35 → **5** | 8 x 697,600 tokens |
+| `tp4-ring`, 8,192 (through spark-ds41f-1022) | 49,482 | 1,890 | 11.49 → **11** | 16 x 749,568 tokens |
+| `tp3-triangle`, 8,192 (since spark-ds41f-1025) | 23,120 | 1,905 | 5.12 → **5** | 8 x 666,880 tokens |
+| `tp3-triangle`, 4,096 (through spark-ds41f-1022) | 23,120 | 945 | 5.35 → **5** | 8 x 697,600 tokens |
 | `tp3-triangle-4k`, 4,096, 262,144 tokens | 10,366 | 945 | 8.80 → 8 sequences | 8 x 262,144 tokens |
 | r6v TP3, 3.5 GiB, 524,288 tokens | 16,493 | 945 | 7.43 → **7** | |
 
@@ -149,7 +152,8 @@ It applies cleanly on candidate 6's series (0489-0490 touch two unrelated test f
   the full-sequence gate, pool sizing.
 
 The ring's startup line becomes 11,554,122 tokens, 11.02x at 16,384 (12,040,153, 11.48x at
-8,192); the triangle's 5,609,861, 5.35x. These are with 0492 before 0491, the next
+8,192); the triangle's 5,366,846, 5.12x at its 8,192 (5,609,861, 5.35x at 4,096). These
+are with 0492 before 0491, the next
 candidate's order: 0492 makes the three window groups holding a drafter layer retain one
 more token ([drafter window retention](../2026-10-25-drafter-window-retention/README.md)),
 which costs 65 tokens of the figure (0491 alone: 11,554,187). vLLM's own grouping and
@@ -199,12 +203,11 @@ each tree's expectations. In the lab the gate file runs in the next candidate's 
   .venv/bin/python scripts/kv_capacity.py --cluster-config experiments/2026-10-25-spark-ds41f-candidate/cluster.json --json
   ```
 
-- **Not on main, for the promotion to carry**: spark-ds41f-1025's release notes ("The ring
-  admits 6.21 full 1M contexts ...", its KV capacity row and its decision row) and its
-  baseline's `kv_cache_tokens` note. Baselines are immutable, so the note stays as
-  recorded. For the release notes: "The ring's 10.5 GiB pool holds 11 full 1M contexts at
-  once at either budget (vLLM's startup line reports 6,512,700 tokens, 6.21x: it charges
-  every request a prompt's two chunks in flight; see experiments/2026-10-25-kv-capacity)."
+- **spark-ds41f-1025's published records** keep the startup figure: its release notes' KV
+  capacity row names it as the startup figure beside this record's corrected count, while
+  their "The ring admits 6.21 full 1M contexts" sentences and the baseline's
+  `kv_cache_tokens` note stay as published (baselines are immutable). `docs/current-state.md`
+  now says what 1025's startup line reads and what the pool holds.
 
 ## Follow-ups (not done here)
 
