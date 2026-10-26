@@ -70,6 +70,19 @@ class ClassificationTest(unittest.TestCase):
                     release_tests.load_config(path)
 
 
+class BundleTest(unittest.TestCase):
+    def test_o_direct_test_directories_are_on_the_node_cache(self):
+        """The Engram rows' and the direct loader's tests read with O_DIRECT, which the
+        image's overlay filesystem refuses: their files go under /c, the node's cache."""
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text('{"files": []}')
+            release_tests.bundle(str(manifest), "image:tag", str(Path(directory) / "bundle"), "label")
+            env = __import__("json").loads((Path(directory) / "bundle" / "candidate.json").read_text())["env"]
+        self.assertEqual(env["ENGRAM_ROWS_TEST_DIR"], "/c/engram-rows-test")
+        self.assertEqual(env["DIRECT_IO_TEST_DIR"], "/c/direct-io-test")
+
+
 class OfflineSkipTest(unittest.TestCase):
     def test_only_missing_resources_skip(self):
         missing = offline_skip.missing_resource

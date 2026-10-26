@@ -155,8 +155,10 @@ def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
         # DSpark cost curves, carve-out) changes what modules do at import.
         "env": {"HF_HUB_OFFLINE": "1", "PYTHONPATH": "/b",
                 "TILELANG_CACHE_DIR": "/c/tilelang-release-tests",
-                # Disk Engram rows need O_DIRECT on a real filesystem.
-                "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test"},
+                # Disk Engram rows and the direct loader's checkpoints need O_DIRECT on
+                # a real filesystem (the image's overlay refuses it).
+                "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test",
+                "DIRECT_IO_TEST_DIR": "/c/direct-io-test"},
         # Under the image's own source root (scripts/lab.py, image_source_root).
         "workdir": "vllm",
         # The disk Engram reader and the direct loader use io_uring, which Docker's
