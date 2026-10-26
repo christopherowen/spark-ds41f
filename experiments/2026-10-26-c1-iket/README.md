@@ -471,19 +471,51 @@ already near the rate. Both are dropped.
 around it: about 7 µs a boundary of non-byte time, including about 3 µs of
 `project_streams`' own GEMM and syncs.
 
-The next fusion to take is `finalize` folded into `project_streams`:
-- Each of the 40 CTAs arrives on a counter once its partials are written. The 40 fit
-  one an SM, so all are resident.
-- The last arrival reduces the partials in today's order and runs the Sinkhorn.
-- All 40 then normalize their own 128 columns and write the output and its cast.
-- Every wait has a deadline that traps.
+**A3: `finalize` folded into `project_streams`** (`c1-mhcfold` 169744c3f, bit-identical).
+Up to `FOLD_ROWS` (64) tokens an entry is one launch:
+- One CTA per split (40, fewer than the SMs, so all resident) takes every token tile in
+  turn and writes the partials.
+- Then a grid barrier: an acq_rel arrival count, the last arrival releases a
+  generation, and a `%globaltimer` deadline traps. The dependents' PDL trigger follows
+  the barrier.
+- Then `finalize`'s work with its operations in its order. Token `t`'s mixes run on
+  CTA `t % 40`'s warp 0, through the same macros `finalize` now uses. The other warps
+  normalize and cast the CTA's own 128 columns of every token.
 
-It saves the launch and part of the serial phases, about 3-4 µs a boundary: 0.24-0.32 ms
-a step, +0.8-1.1%. The risk is low: the same operations in the same order.
+Runs mhcfold-tests-1 and mhcfold-ab-1, against next-candidate:
 
-The attention front's horizontal fusions follow at about the same size, about 8 µs a
-layer: both RoPEs with the cache write in one kernel (+0.3% for the RoPE pair alone),
-and both norms with their casts in one. The norms are TileKernels', so a bit-exact port
+| arm | TP4 c1 | TP4 c8 | TP4 c16 | TP3 c1 | TP3 c8 | TP3 c16 | tests |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A3: `finalize` folded in (`c1-mhcfold` 169744c3f) | +0.17% | +0.08% | −0.28% | +0.29% | +0.03% | −0.04% | 136 passed, kernels source-checked |
+
+The tests include a new one: at 1-64 tokens in all three modes, the fold writes every
+output of `project_streams` then `finalize` bit for bit, twice on one barrier.
+
+The fold saves about 1 µs a boundary, against the 3-4 µs estimated. That is within
+noise at c1 and c8. At c16 it loses on TP4: the 40 resident CTAs serialize three token
+tiles that the two-kernel grid runs side by side. Not worth adopting alone.
+
+The per-kernel chain costs show why (layer-1, both ranks):
+- `project_streams` costs 11.9 µs a boundary, `finalize` 5.2 µs.
+- With PDL, `finalize`'s CTAs already wait on the GPU, so its launch was worth about
+  1 µs.
+- Most of the rest is the mix chain on one warp: the split partials reduced, then 20
+  Sinkhorn iterations.
+
+Nothing reads those mixes before the next entry: the post-mix and combination fold the
+next sublayer's output in, and the new pre-mix is the next collapse's.
+
+**Next: the mix chain off the PDL chain.** `finalize`'s warp 0 moves to a kernel on a
+side stream, forked after the entry and joined at the next entry. That entry already
+follows the all-reduce's ordinary edge, so the join should cost nothing there. It is
+bit-identical (the same macros) and bounded at about 3-4 µs a boundary: +0.9% TP4,
++0.7% TP3 at c1.
+
+**Then the attention front.** At about 1 µs a removed launch, the front is worth about
+as many microseconds as the launches it removes. One kernel for both norms, the Q-B
+cast, and the kv RoPE with the cache write removes four launches a layer (about 0.6% at
+c1). The kv latent is read only by its RoPE and the cache write, so it can stay on chip.
+The norms are TileKernels', so a bit-exact port of `norm_forward_and_per_token_cast`
 comes first.
 
 ## Runs on dgx1
@@ -520,6 +552,9 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | smoke-7 | 16:04 | smoke | pass, 115 s |
 | fusion2-tests-1 | 16:06 | fusion2-tests (A2) | 106 passed |
 | fusion2-ab-1 | 16:07 | fusion2-ab (A2) | pass, 615 s: bits equal, within ±0.4% |
+| smoke-8 | 16:47 | smoke | pass, 115 s |
+| mhcfold-tests-1 | 16:49 | mhcfold-tests (A3) | 136 passed, every launched kernel source-checked |
+| mhcfold-ab-1 | 16:51 | mhcfold-ab (A3) | pass, 626 s: bits equal, +0.3% at c1 at most, −0.3% at TP4 c16 |
 
 ## Files
 
