@@ -9,8 +9,8 @@ computes, waits and stores. A trace shows, warp by warp, how long each phase tak
 The mode is debug only and off in production. Off means no IKET import, no TileLang
 callback, and generated code identical to the build without the mode.
 
-- vLLM: branch `iket-debug` (worktree ~/projects/vllm-iket), cut from next-candidate
-  577091997. Not part of next-candidate.
+- vLLM: branch `iket-debug` (worktree ~/projects/vllm-iket, local only), cut from
+  next-candidate 577091997, head 52862f2ca. Not part of next-candidate.
 - TileLang: no change. The image's pin (tile-ai/tilelang b95ee4ff, 0.1.15) and the fork's
   `deepseek-v41-sm120` hold the same IKET code.
 
@@ -267,7 +267,7 @@ What a whole-engine trace needed:
   stay exact.
   - Unsampled, the hot kernels alone wrote a 1.39 GB trace.json from 61 launches: the
     expert GEMMs' K loops put up to 36 iterations of ranges in every warp.
-- **Bounded records (`VLLM_DS41_IKET_ITERS=1`, `--max-ts-cnt-per-warp 128`).** run-iket's
+- **Bounded records (`VLLM_DS41_IKET_ITERS=1`).** run-iket's
   device pool is a bump allocator for the whole process (`ContextBuffer::Allocate`).
   Every instrumented launch reserves the run's largest per-warp record for each of its
   warps (`compute_required_buffer_size`), whether or not the warp records anything. Graph
@@ -278,16 +278,39 @@ What a whole-engine trace needed:
   - With a fixed 8 GB pool, the run exhausted it during the encoder's profile run:
     8.49 GB in, a 695 MB request failed.
 
-  With CTA sampling, lane 0 recording and the middle iteration of each loop, the
-  sources' static bound is at most 64 timestamps a warp (sparse MLA: 32 ranges). The
-  dry run still recommends more: 352 and 424 in the engine runs, and 152 where the hot
-  kernels' warps recorded at most 86. Run 14 had 26.6 million instrumented warps, 19.7
-  million of them in eager launches (the profile run, the warmups and prefill; the
-  routed gate-up GEMM alone 9.1 million). At 424 that is a 52 GB pool, more than GB10
-  has beside the engine. The memory watchdog stopped the run at 7 GiB available.
-  So the step bundle sets the record size: 128 timestamps, twice the static bound, a
-  16 GB pool. The trace's per-warp counts (`trace_counts.py`) show whether any warp
-  came near it.
+  With CTA sampling and the middle iteration of each loop, the sources' static bound is
+  at most 64 timestamps a warp (sparse MLA: 32 ranges). Yet the dry run recommended 424
+  for the decode steps (runs 14-20). With 26.6 million instrumented warps, 19.7 million
+  of them in eager launches (the profile run, the warmups and prefill; the routed
+  gate-up GEMM alone 9.1 million), that is a 52 GB pool, more than GB10 has beside the
+  engine. Capping it (`--max-ts-cnt-per-warp 128`) crashed the exit dump in
+  `iket::to_json(WarpBuffer)`, with the graphs (run 15) and without (run 18).
+
+  Finding the cause:
+  - It is not graph replays. The tracker lists each replay as a launch of its own
+    (`graph_exec_<id>:<replay>`), and an eager run recommends 424 too.
+  - Every kernel family exceeds its bound (run 20: GEMMs 368, MoE 224, attention 424,
+    mHC 64, inputs 24, sampler 96).
+  - The hot kernels reproduce it (runs 21-23). Their warps record at most 42 timestamps.
+    The dry run's own count (`max_count`, logged at `--log-level debug`) is 187, and a
+    cap of 64 crashes the same way.
+  - Their SASS has the answer (`sass_check.py`): ptxas predicated many guarded events
+    (`@!P1 PMTRIG`; sparse MLA: 32 of 64). run-iket patches an event's shared store,
+    and a warp that issues the store takes a slot, predicated off or not.
+  - Dropping the lane guard (lane 0 alone recorded, which made every guard
+    lane-dependent) took the count to 109; ptxas still predicated 26 of sparse MLA's
+    events behind uniform guards (run 24).
+  - In zero-or-one loops (vLLM 52862f2ca), no event is predicated, the dry run counts
+    43 against 42 records, and the run capped at 64 completes with the same records
+    (run 25).
+
+  For the decode steps the dry run now recommends 80 a warp (run 26), a 10.3 GB pool
+  with the CUDA graphs.
+- **Room for the exit dump.** run-iket decodes its records when the process exits,
+  on the host: run 26's measured run finished its requests, wrote a 4.0 GB
+  `iket.data.json`, and ran out of memory decoding it (the watchdog stopped it at
+  7 GiB available) while the engine still held 53 GB. The harness now shuts the engine
+  down and empties PyTorch's cache once its result is written.
 - **Room on the GPU.** The pool counts against vLLM's startup check, so the harness sets
   `gpu_memory_utilization=0.5`. The KV pool is fixed by bytes. The profile run is kept
   small: 256-token chunks in a 512-token step. Graphs are captured for one and two
@@ -317,7 +340,35 @@ What a whole-engine trace needed:
   When the mode is off, no callback is registered, so every module is TileLang's own
   output.
 
-<step 4 results>
+### Step 4 status: the trace waits for dgx4
+
+dgx1-4 went down for re-cabling at 08:15 CET on 2026-10-26, before the decode-step trace
+ran. Run 27 (bundle `step` at spark-ds41f a1010216, vLLM 52862f2ca) was queued and
+withdrawn, never started. Everything it needs is in place and checked piece by piece:
+- with the CUDA graphs the dry run recommends 80 timestamps a warp, a 10.3 GB pool (run
+  26);
+- the hot kernels' capped run shows that sampled records fit their slots (run 25);
+- the harness now frees the engine's 53 GB before run-iket decodes at exit (run 26 ran
+  out there).
+
+Re-run with `make_bundles.py`'s `step` bundle once dgx4 is back. It traces, counts the
+records, takes nsys of off with and without the graphs, and writes the decode-step
+table and both nsys timelines.
+
+The production-mode reference, from nsys of off with the graphs (run 18,
+`runs/step-18/nsys-graphs-window.md`):
+- The measured request is a 32-token prompt and 8 tokens: 2,636 launches in 226 ms.
+  The GPU is busy 137 ms (61%).
+- Two dense segments of about 70 ms each, 97-99% busy: the prefill, and the one decode
+  step DSpark needs. With dummy weights every draft is accepted, so eight tokens take
+  two passes.
+- An 83 ms host gap separates them. The harness asks for top-5 logprobs; the gap is not
+  investigated.
+- At TP1 the packed BF16 vocabulary head dominates: 4.1 ms a launch, 32% of the GPU
+  time. Production at TP4 splits it four ways. Then come the FP8 linear GEMMs (22%),
+  the routed experts (17%) and the L2 prefetch (8%).
+- Without the graphs (`nsys-eager-window.md`, no adaptive verification): 2,066
+  launches in 190 ms, also 61% busy.
 
 ## Tracing a multi-rank serving step later (not run)
 
@@ -374,12 +425,20 @@ What a serving trace on the cluster would take:
    bump allocation for the whole process, and every warp of every instrumented launch
    reserves the run's largest warp record. Sample, with `VLLM_DS41_IKET_CTAS` and
    `VLLM_DS41_IKET_ITERS`, so that record stays small.
+5. **A predicated event takes a record slot** (NVIDIA's tool). run-iket's patch on an
+   event's shared store uses a slot each time a warp issues it, whether its predicate
+   holds or not, and its dry run counts the same way. A trace never shows those
+   slots, and a `--max-ts-cnt-per-warp` below the dry run's count overflows a warp's
+   buffer: the exit dump then crashes in `iket::to_json(WarpBuffer)`. ptxas predicates
+   short guarded blocks freely, so a guard on an event only saves slots if the event
+   cannot be predicated: the IKET mode's zero-or-one loops.
 
 ## Reading a trace
 
 ```sh
 python3 experiments/2026-10-26-iket-debug/iket_table.py RUN_DIR \
-  --sources IKET_DIR/sources [--nsys off=off.sqlite on=on.sqlite] [--kernels REGEX] [--json OUT]
+  --sources IKET_DIR/sources [--nsys off=off.sqlite on=on.sqlite] [--kernels REGEX] \
+  [--between iket_step_marker_kernel [--gap-us 200]] [--json OUT]
 ```
 
 `RUN_DIR` is run-iket's `--output-dir`; the tool reads its largest `*.trace.json`. The
@@ -393,3 +452,24 @@ The table groups launches by kernel name, grid and block. Each group has:
 - the phase split of the warp that ends last, the one the launch waits for.
 
 `--nsys` adds each group's median nsys duration for comparison.
+
+With sampling, the manifests in `--sources` say how each kernel was sampled:
+- With sampled CTAs, warp, range and last-warp numbers come from the CTAs that recorded
+  ranges. The span stays the whole launch's.
+- With sampled iterations, a range inside a loop holds only its sampled iteration. It
+  is marked `(sampled iterations)`, and the loop's other iterations count as
+  unattributed.
+
+`--between MARKER` keeps the launches between a marker kernel's first and last launch
+(`iket_step.py` brackets its measured request with `iket_step_marker`). The output then
+starts with a timeline:
+- wall time, and the GPU's busy time (the union of the launches' spans);
+- the idle gaps, with the kernels on either side of the largest;
+- the segments that gaps over `--gap-us` separate (here, the engine's steps).
+
+`nsys_window.py FILE.sqlite` prints the same timeline from an nsys export, with the
+kernels by total duration and how many ran in graphs:
+
+```sh
+python3 experiments/2026-10-26-iket-debug/nsys_window.py nsys-graphs.sqlite --gap-us 200
+```
