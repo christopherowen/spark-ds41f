@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from abc import abstractmethod
+from typing import TYPE_CHECKING, Protocol, cast
+
+import torch
+
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizeMethodBase,
+)
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+
+logger = init_logger(__name__)
+
+
+class _WorkspaceMoEApply(Protocol):
+    def __call__(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        *,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+    ) -> torch.Tensor: ...
+
+
+class FusedMoEMethodBase(QuantizeMethodBase):
+    def __init__(self, moe: FusedMoEConfig):
+        super().__init__()
+        self.moe: FusedMoEConfig = moe
+        self.moe_quant_config: FusedMoEQuantConfig | None = None
+        self.moe_kernel: mk.FusedMoEKernel | None = None
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        # NOTE(rob): temporary attribute to indicate support for
+        # completed migration to the new internal MK interface.
+        return self.moe_kernel is not None
+
+    @property
+    def mk_can_overlap_shared_experts(self) -> bool:
+        # NOTE(rob): temporary attribute to indicate support for
+        # completed migration to the new internal MK interface.
+        return (
+            self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
+        )
+
+    @property
+    def modular_experts(self) -> "mk.FusedMoEExperts | None":
+        """A modular kernel's experts, else None."""
+        impl = getattr(self.moe_kernel, "impl", None)
+        if isinstance(impl, mk.FusedMoEKernelModularImpl):
+            return impl.fused_experts
+        return None
+
+    def declare_layer_kernels(self, layer: "RoutedExperts") -> None:
+        """Let a modular kernel's experts declare their JIT kernels, after loading
+        (DeepSeek V4.1's kernel preparation calls this on every layer's method)."""
+        declare = getattr(self.modular_experts, "declare_kernels", None)
+        if declare is not None:
+            declare()
+
+    @property
+    def output_dtype(self) -> torch.dtype:
+        """Dtype produced by the routed experts: a modular kernel's experts say."""
+        impl = getattr(self.moe_kernel, "impl", None)
+        if isinstance(impl, mk.FusedMoEKernelModularImpl):
+            return impl.fused_experts.output_dtype
+        return self.moe.in_dtype
+
+    @abstractmethod
+    def create_weights(
+        self,
+        layer: "RoutedExperts",
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        raise NotImplementedError
+
+    def uses_weight_scale_2_pattern(self) -> bool:
+        """
+        Returns True if this quantization method uses 'weight_scale_2' pattern
+        for per-tensor weight scales (e.g., FP4 variants), False otherwise.
+
+        This method should be overridden by subclasses that use the
+        'weight_scale_2' pattern instead of the standard 'weight_scale' pattern.
+        """
+        return False
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        """
+        Given layer hidden size and intermediate size per partition and MoE
+        configurations, round up hidden_size and intermediate_size_per_partition
+        if necessary.
+
+        Args:
+            hidden_size: Layer hidden-size
+            intermediate_size_per_partition: Intermediate size per partition for
+                the layer.
+            act_dtype: Data type of the layer activations.
+            moe_parallel_config: Fused MoE parallelization strategy configuration.
+
+        Return:
+            A tuple of (rounded_hidden_size, rounded_intermediate_size_per_partition),
+            where:
+                - rounded_hidden_size is the possibly rounded up hidden size.
+                - rounded_intermediate_size_per_partition is the possibly rounded
+                  up intermediate size per partition.
+        """
+        from .all2all_utils import maybe_roundup_layer_hidden_size
+
+        return maybe_roundup_layer_hidden_size(
+            hidden_size, act_dtype, moe_parallel_config
+        ), intermediate_size_per_partition
+
+    @abstractmethod
+    def get_fused_moe_quant_config(
+        self, layer: "RoutedExperts"
+    ) -> FusedMoEQuantConfig | None:
+        raise NotImplementedError
+
+    @property
+    def topk_indices_dtype(self) -> torch.dtype | None:
+        if self.moe_kernel is not None:
+            return self.moe_kernel.prepare_finalize.topk_indices_dtype()
+        return None
+
+    @property
+    def skip_forward_padding(self) -> bool:
+        """Whether to skip the padding in the forward before applying the moe method."""
+        return False
+
+    @property
+    def has_unpadded_output(self) -> bool:
+        """
+        Indicates that the hidden_states output might be the unpadded
+        hidden_states shape rather than the full padded shape.
+        """
+        return False
+
+    @property
+    def supports_eplb(self) -> bool:
+        return False
+
+    @property
+    def method_name(self) -> str:
+        return self.__class__.__name__
+
+    @property
+    def is_monolithic(self) -> bool:
+        if self.moe_kernel is None:
+            if hasattr(self, "experts_cls"):
+                return self.experts_cls.is_monolithic()
+            else:
+                return False
+        return self.moe_kernel.is_monolithic
+
+    def prepare_workspace(
+        self, hidden_states: torch.Tensor, shared_workspace_size: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]:
+        """Reserve disjoint routed/shared scratch before either branch runs.
+
+        Any modular kernel leases both from the workspace manager in one call,
+        so the shared experts never draw a view that overlaps the routed
+        experts' buffers while the two branches run on different streams.
+        The layer's output is a tensor of its own, shaped as ``hidden_states``,
+        so when the experts write it in place the lease holds no output buffer
+        (the third view is None).
+        """
+        kernel = self.moe_kernel
+        impl = getattr(kernel, "impl", None)
+        if not isinstance(impl, mk.FusedMoEKernelModularImpl):
+            raise NotImplementedError(
+                "This MoE backend cannot coordinate arena-backed shared-expert scratch"
+            )
+        rows = hidden_states.shape[0]
+        hidden_dim = self.moe.hidden_dim
+        # Workspace geometry follows the prepared activation storage width.
+        if (
+            impl.fused_experts.quant_dtype == "nvfp4"
+            and not impl.fused_experts.expects_unquantized_inputs
+        ):
+            hidden_dim //= 2
+        workspace, shared_workspace = impl._allocate_buffers(
+            hidden_states.dtype,
+            impl.fused_experts.output_dtype,
+            hidden_states.device,
+            rows,
+            rows,
+            self.moe.intermediate_size_per_partition,
+            hidden_dim,
+            self.moe.experts_per_token,
+            self.moe.num_experts,
+            self.moe.num_local_experts,
+            None,
+            self.moe.activation,
+            shared_workspace_size,
+            output_shape=tuple(hidden_states.shape),
+        )
+        assert shared_workspace is not None
+        return workspace, shared_workspace
+
+    def apply_with_workspace(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+    ) -> torch.Tensor:
+        apply = cast(_WorkspaceMoEApply, self.apply)
+        return apply(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+            workspace=workspace,
+        )
+
+    def apply(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """
+        Apply the MoE operation using modular kernels.
+
+        Args:
+            layer: RoutedExperts instance containing weight parameters
+            x: Input tensor
+            topk_weights: Expert weights from router
+            topk_ids: Selected expert IDs from router
+            shared_experts_input: Input for shared experts (if any)
+
+        Returns:
+            Output tensor from routed experts.
+        """
+        raise NotImplementedError
+
+    def apply_monolithic(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
+        """
+        Apply the MoE operation using monolithic kernels.
+
+        Args:
+            layer: RoutedExperts instance containing weight parameters
+            x: Input tensor
+            router_logits: Router logits (routing done internally)
+
+        Returns:
+            Finalized routed states or a deferred-finalize output.
+        """
+        raise NotImplementedError

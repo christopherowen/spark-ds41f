@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:36:55 +0100
+Subject: [PATCH 535/535] [MoE] A lease prepared for the caller's output holds
+ no output buffer
+
+Since the layer's output is a tensor of its own, which the experts write in
+place (output_alias), the arena's output buffer was leased and never used:
+buffer 0 of the routed lease still held M_full x K of the output dtype (for
+DeepSeek V4.1's TileLang experts, whose workspace13 is empty, that is all it
+held: 10 KiB a row). The fresh output came on top of it.
+
+_allocate_buffers takes the caller's output shape and leases no output buffer
+when it is the experts' output and they write a matching alias (not on ROCm
+without aiter, which copies from its own buffer); prepare_workspace passes
+hidden_states' shape, and the per-call lease the alias's. A lease without an
+output buffer refuses a call without a matching output. Outputs are unchanged:
+the experts wrote the caller's tensor before and still do.
+
+Tests: the lease's size with and without the output, the cases that keep the
+buffer, the experts writing the caller's output into a lease without one; the
+FlashInfer NVFP4 workspace tests assert the new contract (they still asserted
+the output was workspace[2]).
+---
+ tests/kernels/moe/test_flashinfer_moe.py      |  17 ++-
+ .../moe/test_moe_output_outlives_workspace.py | 112 ++++++++++++++++++
+ .../layers/fused_moe/fused_moe_method_base.py |  10 +-
+ .../layers/fused_moe/modular_kernel.py        | 106 +++++++++++++----
+ .../layers/fused_moe/routed_experts.py        |   2 +-
+ 5 files changed, 213 insertions(+), 34 deletions(-)
+
+diff --git a/tests/kernels/moe/test_flashinfer_moe.py b/tests/kernels/moe/test_flashinfer_moe.py
+index 7d19a664a..7075cbe37 100644
+--- a/tests/kernels/moe/test_flashinfer_moe.py
++++ b/tests/kernels/moe/test_flashinfer_moe.py
+@@ -315,10 +315,13 @@ def test_preallocated_moe_output_matches_activation_packing(
+ 
+     workspace, shared = FusedMoEMethodBase.prepare_workspace(method, hidden, 512)
+ 
+-    assert workspace[2].shape == hidden.shape
++    # The layer's output is a tensor of its own, so the lease holds no output buffer.
++    assert workspace[2] is None
+     assert shared.numel() == 512
+     assert shared.untyped_storage().data_ptr() not in {
+-        buffer.untyped_storage().data_ptr() for buffer in workspace
++        buffer.untyped_storage().data_ptr()
++        for buffer in workspace
++        if buffer is not None
+     }
+ 
+ 
+@@ -391,11 +394,17 @@ def test_flashinfer_nvfp4_shared_workspace_graph(rows, workspace_init):
+     torch.accelerator.synchronize()
+     allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
+     for _ in range(3):
+-        workspace[2].fill_(float("nan"))
++        replayed.fill_(float("nan"))
+         graph.replay()
+     torch.accelerator.synchronize()
+     assert torch.accelerator.memory_stats()["allocation.all.allocated"] == allocations
+-    assert replayed.data_ptr() == workspace[2].data_ptr()
++    # The output lives outside the workspace arena (never a view of its lease).
++    assert workspace[2] is None
++    assert replayed.untyped_storage().data_ptr() not in {
++        buffer.untyped_storage().data_ptr()
++        for buffer in workspace
++        if buffer is not None
++    }
+     assert torch.all(shared == 37)
+     torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
+ 
+diff --git a/tests/kernels/moe/test_moe_output_outlives_workspace.py b/tests/kernels/moe/test_moe_output_outlives_workspace.py
+index eb771598d..3807846fa 100644
+--- a/tests/kernels/moe/test_moe_output_outlives_workspace.py
++++ b/tests/kernels/moe/test_moe_output_outlives_workspace.py
+@@ -7,10 +7,14 @@ DeepSeek V4.1 at TP1 (no all-reduce to copy the output) returned the routed
+ experts' output from ``workspace[2]``; the next decoder layer's mHC entry leased its
+ scratch from the same bytes and overwrote that output while reading it (NaN gate
+ logits with three or more requests in a batch).
++
++Since the experts write the caller's output, a lease prepared for it holds no output
++buffer either: the arena keeps only the experts' scratch.
+ """
+ 
+ from types import SimpleNamespace
+ 
++import pytest
+ import torch
+ 
+ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+@@ -60,3 +64,111 @@ def test_output_is_not_a_workspace_view():
+     # A later lease of the arena leaves the output as it was.
+     arena.fill_(0xFF)
+     assert bool((out == 1).all())
++
++
++ROWS, HIDDEN, SCRATCH = 6, 64, 96
++
++
++class _Experts:
++    """Experts with no workspace13, SCRATCH elements of workspace2 and a
++    (rows, hidden) BF16 output, as DeepSeek V4.1's TileLang experts lay them out."""
++
++    output_dtype = torch.bfloat16
++    a2_scale = None
++
++    def workspace_dtype(self, dtype):
++        return dtype
++
++    def workspace_shapes(self, M, N, K, *rest):
++        return (0,), (SCRATCH,), (M, K)
++
++    def moe_problem_size(self, a1q, w1, w2, topk_ids):
++        return w1.shape[0], a1q.shape[0], w1.shape[1], a1q.shape[1], topk_ids.shape[1]
++
++    def apply(self, *, output, **kwargs):
++        output.fill_(1.0)
++
++
++def _lease(monkeypatch, output_shape):
++    """A prepared routed and shared lease on a CPU arena: its routed views and the
++    arena's size in bytes."""
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    from vllm.v1.worker import workspace as ws
++
++    impl = object.__new__(mk.FusedMoEKernelModularImpl)
++    impl.fused_experts = _Experts()
++    manager = ws.WorkspaceManager(torch.device("cpu"))
++    monkeypatch.setattr(ws, "dbo_current_ubatch_id", lambda: 0)
++    monkeypatch.setattr(mk, "current_workspace_manager", lambda: manager)
++    monkeypatch.setattr(mk.current_platform, "is_cpu", lambda: False)
++    monkeypatch.setattr(mk.current_platform, "is_rocm", lambda: False)
++    views, shared = impl._allocate_buffers(
++        torch.bfloat16,
++        torch.bfloat16,
++        torch.device("cpu"),
++        ROWS,
++        ROWS,
++        128,
++        HIDDEN,
++        2,
++        4,
++        4,
++        None,
++        MoEActivation.SILU,
++        512,
++        output_shape=output_shape,
++    )
++    assert shared is not None and shared.numel() == 512
++    return impl, views, manager.available_bytes()
++
++
++def test_a_lease_for_the_callers_output_holds_no_output_buffer(monkeypatch):
++    _, views, size = _lease(monkeypatch, (ROWS, HIDDEN))
++    assert views[2] is None
++    _, leased, leased_size = _lease(monkeypatch, None)
++    assert leased[2].shape == (ROWS, HIDDEN)
++    # The output buffer (already 256-byte aligned) is the whole difference.
++    assert leased_size - size == ROWS * HIDDEN * 2
++
++
++def test_an_output_the_experts_cannot_write_keeps_its_buffer(monkeypatch):
++    # Another shape than the experts' output, or experts that write a buffer of
++    # their own (ROCm without aiter), lease the output buffer as before.
++    _, views, _ = _lease(monkeypatch, (ROWS, HIDDEN + 1))
++    assert views[2] is not None and views[2].shape == (ROWS, HIDDEN)
++    monkeypatch.setattr(
++        mk.FusedMoEKernelModularImpl,
++        "_experts_write_output_alias",
++        staticmethod(lambda: False),
++    )
++    _, views, _ = _lease(monkeypatch, (ROWS, HIDDEN))
++    assert views[2] is not None
++
++
++def test_the_experts_write_the_callers_output_into_a_lease_without_one(monkeypatch):
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++    impl, views, _ = _lease(monkeypatch, (ROWS, HIDDEN))
++    states = torch.randn(ROWS, HIDDEN, dtype=torch.bfloat16)
++    kwargs = dict(
++        in_dtype=torch.bfloat16,
++        a1q=states,
++        a1q_scale=None,
++        w1=torch.empty(4, 128),
++        w2=torch.empty(4, HIDDEN),
++        topk_weights=torch.ones(ROWS, 2),
++        topk_ids=torch.zeros(ROWS, 2, dtype=torch.int64),
++        activation=MoEActivation.SILU,
++        global_num_experts=4,
++        local_num_experts=4,
++        expert_map=None,
++        apply_router_weight_on_input=False,
++        expert_tokens_meta=None,
++        workspace=views,
++    )
++    output = torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)
++    assert impl._fused_experts(**kwargs, output_alias=output) is output
++    assert bool((output == 1).all())
++    # Without the caller's output the lease has nowhere to write: refused.
++    with pytest.raises(ValueError, match="holds no output buffer"):
++        impl._fused_experts(**kwargs, output_alias=None)
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+index ebd5391a8..81c2882df 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+@@ -35,7 +35,7 @@ class _WorkspaceMoEApply(Protocol):
+         shared_experts: "SharedExperts | None",
+         shared_experts_input: torch.Tensor | None,
+         *,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+     ) -> torch.Tensor: ...
+ 
+ 
+@@ -181,12 +181,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+ 
+     def prepare_workspace(
+         self, hidden_states: torch.Tensor, shared_workspace_size: int
+-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
++    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]:
+         """Reserve disjoint routed/shared scratch before either branch runs.
+ 
+         Any modular kernel leases both from the workspace manager in one call,
+         so the shared experts never draw a view that overlaps the routed
+         experts' buffers while the two branches run on different streams.
++        The layer's output is a tensor of its own, shaped as ``hidden_states``,
++        so when the experts write it in place the lease holds no output buffer
++        (the third view is None).
+         """
+         kernel = self.moe_kernel
+         impl = getattr(kernel, "impl", None)
+@@ -216,6 +219,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+             None,
+             self.moe.activation,
+             shared_workspace_size,
++            output_shape=tuple(hidden_states.shape),
+         )
+         assert shared_workspace is not None
+         return workspace, shared_workspace
+@@ -228,7 +232,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+         topk_ids: torch.Tensor,
+         shared_experts: "SharedExperts | None",
+         shared_experts_input: torch.Tensor | None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+     ) -> torch.Tensor:
+         apply = cast(_WorkspaceMoEApply, self.apply)
+         return apply(
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 5fbc781dc..db67ac48f 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1134,13 +1134,20 @@ class FusedMoEKernelModularImpl:
+         expert_tokens_meta: ExpertTokensMetadata | None,
+         activation: MoEActivation,
+         shared_workspace_size: int = 0,
+-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]:
++        output_shape: tuple[int, ...] | None = None,
++    ) -> tuple[
++        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor | None
++    ]:
+         """
+         Allocate temporary and output buffers for the fused experts op.
+         Inputs:
+         - in_dtype: input type used for workspace tensors.
+         - out_dtype: output type of the fused experts tensor.
+         - device: the device of the workspace and output tensors.
++        - output_shape: the shape of the output the caller will pass as
++          ``output_alias`` (an ``out_dtype`` tensor of its own), if any. When the
++          experts will write it directly, no output buffer is leased and the
++          third routed view is None.
+         See `workspace_shapes` for a description of the remainder of arguments.
+         Returns routed views and an optional disjoint shared-expert scratch view.
+         """
+@@ -1172,10 +1179,19 @@ class FusedMoEKernelModularImpl:
+             activation,
+         )
+ 
++        # The caller's own output, written in place, makes the arena's output
++        # buffer dead weight: it would hold M_full x K for nothing.
++        lease_output = not (
++            output_shape is not None
++            and tuple(output_shape) == tuple(fused_out_shape)
++            and self._experts_write_output_alias()
++        )
+         shared_output_storage = out_dtype is in_dtype or out_dtype is workspace_dtype
+         specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]
+         if shared_output_storage:
+-            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
++            max_shape_size = max(
++                prod(workspace13_shape), prod(fused_out_shape) if lease_output else 0
++            )
+             specs = (
+                 ((max_shape_size,), workspace_dtype),
+                 (workspace2_shape, workspace_dtype),
+@@ -1184,7 +1200,7 @@ class FusedMoEKernelModularImpl:
+             specs = (
+                 (workspace13_shape, workspace_dtype),
+                 (workspace2_shape, workspace_dtype),
+-                (fused_out_shape, out_dtype),
++                *(((fused_out_shape, out_dtype),) if lease_output else ()),
+             )
+         if shared_workspace_size:
+             specs = (*specs, ((shared_workspace_size,), torch.uint8))
+@@ -1199,15 +1215,29 @@ class FusedMoEKernelModularImpl:
+             )
+         else:
+             buffers = current_workspace_manager().get_simultaneous(*specs)
++        fused_out: torch.Tensor | None = None
+         if shared_output_storage:
+             workspace13 = _resize_cache(buffers[0], workspace13_shape)
+             workspace2 = buffers[1]
+-            fused_out = _resize_cache(buffers[0], fused_out_shape)
++            if lease_output:
++                fused_out = _resize_cache(buffers[0], fused_out_shape)
+         else:
+-            workspace13, workspace2, fused_out = buffers[:3]
++            workspace13, workspace2 = buffers[:2]
++            if lease_output:
++                fused_out = buffers[2]
+         shared_workspace = buffers[-1] if shared_workspace_size else None
+         return (workspace13, workspace2, fused_out), shared_workspace
+ 
++    @staticmethod
++    def _experts_write_output_alias() -> bool:
++        """Whether the experts write a matching ``output_alias`` directly rather
++        than an output buffer of their own (which the finalize then copies)."""
++        if current_platform.is_rocm():
++            from vllm._aiter_ops import rocm_aiter_ops
++
++            return rocm_aiter_ops.is_fused_moe_enabled()
++        return True
++
+     def _maybe_apply_shared_experts(
+         self,
+         shared_experts: SharedExperts | None,
+@@ -1326,7 +1356,7 @@ class FusedMoEKernelModularImpl:
+         apply_router_weight_on_input: bool,
+         expert_tokens_meta: ExpertTokensMetadata | None,
+         output_alias: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
+             a1q, w1, w2, topk_ids
+@@ -1342,6 +1372,16 @@ class FusedMoEKernelModularImpl:
+         if M_full == 0:
+             return torch.empty_like(a1q, dtype=output_dtype)
+ 
++        # The caller's output, if the experts could write it in place: a lease
++        # sized for it holds no output buffer (_allocate_buffers).
++        alias_shape = (
++            tuple(output_alias.shape)
++            if output_alias is not None
++            and output_alias.dtype == output_dtype
++            and output_alias.device == a1q.device
++            and output_alias.is_contiguous()
++            else None
++        )
+         if workspace is None:
+             workspace, _ = self._allocate_buffers(
+                 in_dtype,
+@@ -1356,28 +1396,42 @@ class FusedMoEKernelModularImpl:
+                 local_num_experts,
+                 expert_tokens_meta,
+                 activation,
++                output_shape=alias_shape,
+             )
+         workspace13, workspace2, fused_out = workspace
+ 
+-        use_output_alias = (
+-            output_alias is not None
+-            and output_alias.shape == fused_out.shape
+-            and output_alias.dtype == fused_out.dtype
+-            and output_alias.device == fused_out.device
+-            and output_alias.is_contiguous()
+-        )
+-
+-        # If caller's output buffer already matches fused_out shape/dtype, alias
+-        # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
+-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
+-        # double-copy MoE write-back path).
+-        if current_platform.is_rocm():
+-            from vllm._aiter_ops import rocm_aiter_ops
+-
+-            if use_output_alias and rocm_aiter_ops.is_fused_moe_enabled():
+-                fused_out = output_alias
+-        elif use_output_alias:
++        if fused_out is None:
++            _, _, fused_out_shape = self.fused_experts.workspace_shapes(
++                M_full,
++                N,
++                K,
++                top_k,
++                global_num_experts,
++                local_num_experts,
++                expert_tokens_meta,
++                activation,
++            )
++            if alias_shape != tuple(fused_out_shape):
++                raise ValueError(
++                    "The MoE workspace holds no output buffer, but the caller's "
++                    f"output ({alias_shape}) is not the experts' "
++                    f"{tuple(fused_out_shape)} {output_dtype} output"
++                )
+             fused_out = output_alias
++        else:
++            use_output_alias = (
++                output_alias is not None
++                and output_alias.shape == fused_out.shape
++                and output_alias.dtype == fused_out.dtype
++                and output_alias.device == fused_out.device
++                and output_alias.is_contiguous()
++            )
++            # If caller's output buffer already matches fused_out shape/dtype,
++            # alias to skip the redundant copy in TopKWeightAndReduceNoOP.apply
++            # downstream. This eliminates ~94% of __amd_rocclr_copyBuffer events
++            # (Copy 2 of the double-copy MoE write-back path).
++            if use_output_alias and self._experts_write_output_alias():
++                fused_out = output_alias
+ 
+         self.fused_experts.apply(
+             output=fused_out,
+@@ -1480,7 +1534,7 @@ class FusedMoEKernelModularImpl:
+         apply_router_weight_on_input: bool = False,
+         shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         """
+         This function computes a Mixture of Experts (MoE) layer using two sets
+@@ -1767,7 +1821,7 @@ class FusedMoEKernel:
+         apply_router_weight_on_input: bool,
+         shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+         return self.impl.apply(
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 64769e8f5..0d4865766 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -1221,7 +1221,7 @@ class RoutedExperts(PluggableLayer):
+         topk_ids: torch.Tensor,
+         shared_experts: "SharedExperts | None" = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         """
+         Execute routed experts using the quantization method's apply function.

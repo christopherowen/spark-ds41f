@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:39:22 +0100
+Subject: [PATCH 536/536] Entrypoints: the SageMaker routes' import leaves the
+ root logging as it was
+
+model_hosting_container_standards sets the root logger to
+SAGEMAKER_CONTAINER_LOG_LEVEL (else LOG_LEVEL, else ERROR) and raises every
+root handler below that level to it, when it is first imported. The API
+server imports it for the SageMaker routes, so with neither variable set,
+vllm serve's log dropped every third-party warning that propagates to the
+root logger (vLLM's own loggers have their own handler).
+
+vllm.entrypoints.serve.sagemaker.standards imports it for both routers and
+puts the root logger's level and its handlers' levels back, unless one of the
+two variables is set, which keeps the library's documented behavior. The
+routes are unchanged.
+
+Test: in a fresh interpreter, a third-party warning reaches a root handler
+after the server's imports, with the root levels unchanged; with
+SAGEMAKER_CONTAINER_LOG_LEVEL=ERROR the library's level applies.
+---
+ .../serve/test_sagemaker_root_logging.py      | 78 +++++++++++++++++++
+ vllm/entrypoints/serve/lora/api_router.py     |  2 +-
+ .../entrypoints/serve/sagemaker/api_router.py |  2 +-
+ vllm/entrypoints/serve/sagemaker/standards.py | 36 +++++++++
+ 4 files changed, 116 insertions(+), 2 deletions(-)
+ create mode 100644 tests/entrypoints/serve/test_sagemaker_root_logging.py
+ create mode 100644 vllm/entrypoints/serve/sagemaker/standards.py
+
+diff --git a/tests/entrypoints/serve/test_sagemaker_root_logging.py b/tests/entrypoints/serve/test_sagemaker_root_logging.py
+new file mode 100644
+index 000000000..1953bfcef
+--- /dev/null
++++ b/tests/entrypoints/serve/test_sagemaker_root_logging.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The API server's imports leave the process's root logging as it was.
++
++model_hosting_container_standards sets the root logger to ERROR, and raises every
++root handler to it, when it is first imported; the server imports it for the
++SageMaker routes, so third-party warnings were dropped from ``vllm serve``'s log.
++vllm.entrypoints.serve.sagemaker.standards puts the levels back unless
++SAGEMAKER_CONTAINER_LOG_LEVEL or LOG_LEVEL asks for the library's behavior.
++
++Each case runs in a fresh interpreter: the side effect happens once, at the first
++import in a process. (Not in tests/entrypoints/serve/sagemaker/, whose conftest needs
++pytest_asyncio and a Hugging Face model.)
++"""
++
++import json
++import logging
++import os
++import subprocess
++import sys
++import textwrap
++
++SCRIPT = textwrap.dedent(
++    """
++    import json
++    import logging
++
++    root = logging.getLogger()
++    handler = logging.StreamHandler()  # a deployment's root handler
++    root.addHandler(handler)
++    before = [root.level, handler.level]
++
++    import vllm.entrypoints.cli.serve  # noqa: F401  the server's imports
++    import model_hosting_container_standards  # noqa: F401
++
++    seen = []
++
++    class Probe(logging.Handler):
++        def emit(self, record):
++            seen.append(record.getMessage())
++
++    root.addHandler(Probe())
++    logging.getLogger("a_third_party_library").warning("a third-party warning")
++    print(json.dumps({"before": before, "after": [root.level, handler.level],
++                      "seen": seen}))
++    """
++)
++
++
++def _run(**variables: str) -> dict:
++    env = {
++        name: value
++        for name, value in os.environ.items()
++        if name not in ("SAGEMAKER_CONTAINER_LOG_LEVEL", "LOG_LEVEL")
++    }
++    env.update(variables)
++    result = subprocess.run(
++        [sys.executable, "-c", SCRIPT],
++        capture_output=True,
++        text=True,
++        env=env,
++        timeout=900,
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-4000:]
++    return json.loads(result.stdout.strip().splitlines()[-1])
++
++
++def test_a_warning_reaches_the_root_logger_after_the_servers_imports():
++    report = _run()
++    assert report["after"] == report["before"]
++    assert report["seen"] == ["a third-party warning"]
++
++
++def test_an_explicit_sagemaker_log_level_still_applies():
++    report = _run(SAGEMAKER_CONTAINER_LOG_LEVEL="ERROR")
++    assert report["after"] == [logging.ERROR, logging.ERROR]
++    assert report["seen"] == []
+diff --git a/vllm/entrypoints/serve/lora/api_router.py b/vllm/entrypoints/serve/lora/api_router.py
+index 95dff9792..86108a269 100644
+--- a/vllm/entrypoints/serve/lora/api_router.py
++++ b/vllm/entrypoints/serve/lora/api_router.py
+@@ -2,7 +2,6 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
+-import model_hosting_container_standards.sagemaker as sagemaker_standards
+ from fastapi import APIRouter, Depends, FastAPI, Request
+ from fastapi.responses import JSONResponse, Response
+ 
+@@ -14,6 +13,7 @@ from vllm.entrypoints.serve.lora.protocol import (
+     LoadLoRAAdapterRequest,
+     UnloadLoRAAdapterRequest,
+ )
++from vllm.entrypoints.serve.sagemaker.standards import sagemaker_standards
+ from vllm.entrypoints.serve.utils.api_utils import validate_json_request
+ from vllm.logger import init_logger
+ 
+diff --git a/vllm/entrypoints/serve/sagemaker/api_router.py b/vllm/entrypoints/serve/sagemaker/api_router.py
+index 142256c26..5b056fdee 100644
+--- a/vllm/entrypoints/serve/sagemaker/api_router.py
++++ b/vllm/entrypoints/serve/sagemaker/api_router.py
+@@ -5,7 +5,6 @@ from collections.abc import Awaitable, Callable
+ from http import HTTPStatus
+ from typing import Any
+ 
+-import model_hosting_container_standards.sagemaker as sagemaker_standards
+ import pydantic
+ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+ from fastapi.responses import JSONResponse, Response
+@@ -17,6 +16,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+ from vllm.entrypoints.serve.engine.serving import BaseServing
+ from vllm.entrypoints.serve.instrumentator.basic import base
+ from vllm.entrypoints.serve.instrumentator.health import health
++from vllm.entrypoints.serve.sagemaker.standards import sagemaker_standards
+ from vllm.entrypoints.serve.utils.api_utils import validate_json_request
+ from vllm.tasks import SupportedTask
+ 
+diff --git a/vllm/entrypoints/serve/sagemaker/standards.py b/vllm/entrypoints/serve/sagemaker/standards.py
+new file mode 100644
+index 000000000..e233599be
+--- /dev/null
++++ b/vllm/entrypoints/serve/sagemaker/standards.py
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``model_hosting_container_standards.sagemaker``, imported without changing the
++process's root logging.
++
++When it is first imported, ``model_hosting_container_standards`` (its
++``logging_config``) sets the root logger to ``SAGEMAKER_CONTAINER_LOG_LEVEL``, else
++``LOG_LEVEL``, else ERROR, and raises every root handler below that level to it.
++The API server imports it for the SageMaker routes, so with neither variable set,
++third-party warnings, which propagate to the root logger, were dropped from the
++server's log (vLLM's own loggers have their own handler). Unless one of the
++variables is set, the root logger's level and its handlers' levels are put back
++after the import; a variable that is set keeps the library's documented behavior.
++"""
++
++import logging
++import os
++from types import ModuleType
++
++LEVEL_VARIABLES = ("SAGEMAKER_CONTAINER_LOG_LEVEL", "LOG_LEVEL")
++
++
++def _import_sagemaker_standards() -> ModuleType:
++    root = logging.getLogger()
++    level = root.level
++    handler_levels = [(handler, handler.level) for handler in root.handlers]
++    import model_hosting_container_standards.sagemaker as standards
++
++    if not any(name in os.environ for name in LEVEL_VARIABLES):
++        root.setLevel(level)
++        for handler, handler_level in handler_levels:
++            handler.setLevel(handler_level)
++    return standards
++
++
++sagemaker_standards = _import_sagemaker_standards()
