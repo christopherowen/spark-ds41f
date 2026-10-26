@@ -201,7 +201,10 @@ def main() -> int:
 
     index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())
     with safe_open(args.checkpoint / index["weight_map"]["head.weight"], framework="pt") as archive:
-        head = archive.get_tensor("head.weight").to(DEVICE)
+        # clone() reads the mmapped tensor into anonymous memory first: on GB10 (R580, 64K
+        # pages) a large copy to the GPU from untouched, unaligned mmap pages never
+        # completes (vLLM's copy_weight clones for the same reason).
+        head = archive.get_tensor("head.weight").clone().to(DEVICE)
     print(json.dumps({"head": list(head.shape), "dtype": str(head.dtype), "sha256": sha256(head)}),
           flush=True)
     rows = tuple(int(value) for value in args.logits_rows.split(",") if value)

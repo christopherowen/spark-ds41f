@@ -4,10 +4,12 @@
 image and the lock, from the release after next. The next candidate (vLLM `next-candidate`,
 1bc005688) is frozen and untouched; this work is on top of it.
 
-**Status (2026-10-26, 09:00 CET):** the vLLM branch and the spark-ds41f tooling are done and
-pass the CPU checks below. **No GPU check has run yet:** dgx4 went into the production ring
-(the coordinator's re-cabling, 08:10 CET) before any bundle started. The bundles are ready
-(`bundles/*-ea60f8afe`); see [Verification](#verification).
+**Status (2026-10-26, 15:30 CET): done, every dgx2 check passes.** On dgx2 (kernel-local;
+the coordinator moved the checks there from dgx4): the packer and the head's logits, and the
+Engram helpers, are bit-identical to B12X's on the 1017 checkpoint; with B12X uninstalled,
+one TP4 rank's direct load has today's weight digest and the release-test gate passes; and
+the import sweeps show that nothing in vLLM needs B12X at import any more. See
+[Results](#results).
 
 ## Inventory (next-candidate 1bc005688)
 
@@ -64,8 +66,9 @@ Which vLLM modules fail to import without B12X is measured by the import sweeps 
 ## vLLM branch `retire-b12x`
 
 Local branch on next-candidate 1bc005688 (worktree `~/projects/vllm-retire-b12x`, shared
-object store), head **ea60f8afe**; patches in [vllm/](vllm/series), numbered 0520-0526
-provisionally.
+object store), head **4672ecc3d**; patches in [vllm/](vllm/series), numbered 0520-0526
+provisionally. (The bundles ran at ea60f8afe, which differs from 4672ecc3d only in 0526's
+test file; the targeted rerun covers it.)
 
 1. **0520 6c05a5b01** The packed BF16 head packs with TileLang in vLLM; B12X's packed
    projection goes. `vocab_pack.py`: `PackedBf16Weight`, `pack`, `unpack`, `is_supported`
@@ -84,10 +87,12 @@ provisionally.
    `DeepseekV41Backend` (`"DSV41"`), `"DSV41_COMPRESSOR"`, `cache_dtype_str="dsv41"`,
    `vllm::dsv41_attention`, `vllm::dsv41_prepare_global_kv`.
 6. **0525 9ff3d4adb** The DSpark drafter's NVFP4 head switches go.
-7. **0526 ea60f8afe** Tests: fifteen tests of B12X's own preparation objects skip without
-   B12X (as vLLM's other B12X tests do); the coordinator's other tests run.
+7. **0526 4672ecc3d** Tests: eighteen tests of B12X's own preparation objects (fifteen
+   directly, three through the coordinator tests' `_tuning_progress` helper, found by the
+   B12X-absent gate) skip without B12X, as vLLM's other B12X tests do; the coordinator's
+   other tests run.
 
-41 files, +1181 / -1766. ruff (0.16.6) is clean on every line changed.
+41 files, +1183 / -1766. ruff (0.16.6) is clean on every line changed.
 
 ## spark-ds41f: image, lock and tooling
 
@@ -121,7 +126,7 @@ recipe keeps `--load-format direct` and `VLLM_PLUGINS=""`.
   on 5,008 values; the same errors for invalid arguments.
 - spark-ds41f unit suite (below).
 
-### Bundles (dgx4, `scripts/lab.py kernel-local`; not yet run)
+### Bundles (`scripts/lab.py kernel-local`)
 
 [make_bundles.py](make_bundles.py) writes them for a vLLM ref over candidate 6's image
 (spark-ds41f:19f2c20ed4d6-next-6, tree 6f8e062f = 3bdf9558c): every package file the ref
@@ -131,8 +136,9 @@ changes is mounted, every module it deletes is mounted as one that fails to impo
 |---|---|---|
 | `compare-ea60f8afe` | installed | [pack_compare.py](checks/pack_compare.py): the TileLang packer against B12X's on B12X's test weights (zeros, subnormals, infinities, NaN, out-of-window values, many exceptions), partial in-place blocks, and the 1017 `head.weight` sharded as vLLM shards it at TP1, TP3 (padded rows zero) and TP4, in place and out of place: every field byte for byte, the round trip, the in-place storage; then the TileLang projection's BF16 and FP32 logits from both packed weights, bit for bit. [engram_compare.py](checks/engram_compare.py): the token map of the checkpoint's tokenizer, the geometry of its config, the caps of every TP3 and TP4 rank, and the resident gather against B12X's lookup kernel on synthetic shards and on 65,536 real rows of layer 1's table, bit for bit |
 | `checkpoint-absent-ea60f8afe` | uninstalled | the packer alone on the 1017 head (its packed bytes' and logits' SHA-256, against `compare`'s), then TP4 rank 0's direct load and weight digest against 2026-10-25's `a4893a5e...` ([rank_digest.py](checks/rank_digest.py) over `final-names`' rank_load.py) |
-| `sweep-next-candidate-1bc005688`, `sweep-retire-b12x-ea60f8afe` | installed, then uninstalled | [import_sweep.py](checks/import_sweep.py): every `vllm` module imported; the failures that appear only without B12X are what needs B12X at import; a meta-path hook records which vLLM module imported each B12X module |
-| `gate-absent-ea60f8afe` | uninstalled | the release-test gate (101 files of `config/release-tests.json`) with dgx4's compute-sanitizer |
+| `sweep-next-candidate-1bc005688`, `sweep-retire-b12x-ea60f8afe` | installed, then uninstalled | [import_sweep.py](checks/import_sweep.py): every `vllm` module imported; the failures that appear only without B12X are what needs B12X at import; a meta-path hook records which vLLM module imported each B12X module ([sweep_report.py](checks/sweep_report.py) compares the two runs) |
+| `gate-absent-ea60f8afe` | uninstalled | the release-test gate (101 files of `config/release-tests.json`) with the host's compute-sanitizer |
+| `targeted-absent-4672ecc3d` | uninstalled | the gate's entries for the files the gate run failed, at the final head |
 
 "Uninstalled" is [without_b12x.py](checks/without_b12x.py): in the throwaway container,
 `pip uninstall b12x`, a `PYTHONPATH` without the B12X tree, and a check in a fresh
@@ -140,10 +146,95 @@ interpreter that `find_spec("b12x")` is `None`, no `b12x` distribution exists an
 `sys.path` entry holds a `b12x` package. (Earlier bundles over next-candidate dropped the
 B12X tree from `PYTHONPATH` only; the site-packages install stayed importable.)
 
-Run order: `compare`, `checkpoint-absent`, the two sweeps, then `gate-absent`, each with
-`run-bundles` style queuing on the GPU lock. A real DS4.1 serve needs at least the
-triangle; on one node the strongest checks are these (model layers and tests, one rank's
-load, the head on the real checkpoint, every module's import).
+A real DS4.1 serve needs at least the triangle; on one node the strongest checks are these
+(model layers and tests, one rank's load, the head on the real checkpoint, every module's
+import).
+
+### Results
+
+Images: candidate 6's `spark-ds41f:19f2c20ed4d6-next-6` (`sha256:82b071b57485`) with the
+branch mounted. Outputs in [runs/](runs/).
+
+**compare (dgx2, `compare-ea60f8afe-r2`, 14:31-14:32 CET, pass, B12X installed).**
+- The 1017 `head.weight` ([129280, 5120] BF16, SHA-256 `12f45f83...`) as vLLM shards it,
+  packed by vLLM's TileLang packer and by B12X's: every field byte for byte, the round trip
+  exact, the in-place pack in the weight's own storage. Exponent window 112..126 on every
+  shard.
+
+  | Shard | Rows | Exceptions | B12X pack | TileLang pack | Logits (BF16 and FP32, 1/6/64 rows) |
+  |---|---|---|---|---|---|
+  | TP1 | 129,280 | 104,397 | 150 ms | 33 ms | 6/6 bit-identical |
+  | TP3 rank 0, 1, 2 (rank 2: 128 zero padding rows) | 43,136 | 34,800 / 33,875 / 35,722 | 16 ms | 11 ms | 6/6 each |
+  | TP4 rank 0-3, in place | 32,320 | 26,148 / 25,456 / 25,500 / 27,293 | 12 ms | 8 ms | 6/6 each |
+  | TP4 rank 0-3, out of place | 32,320 | (same) | 10 ms | 6 ms | - |
+
+  (Warm kernels; a cold first call compiles the three TileLang kernels in about 5.5 s.)
+- B12X's own test weights (zeros, subnormals, values far outside the window, infinities, a
+  NaN), a partial in-place block (2,500 rows), 1,000 rows at K = 384 with many exceptions, no
+  exceptions, all zeros, one exception: byte-identical; the three refusals raise the same
+  exception types.
+- Engram: the token map of the checkpoint's tokenizer (129,280 entries, compressed size
+  99,092), the geometry of its config (table rows 384,006,168 and 384,016,682), the caps of
+  every TP3 and TP4 rank and five refusals: equal. The resident gather against B12X's lookup
+  kernel: 24 synthetic cases (4 shards, the padded last shard among them; live counts 0, 1,
+  9, 16, 17 and -1; NaN and the scale edges) and 65,536 checkpoint rows of layer 1's table:
+  bit for bit.
+
+**Import sweeps (dgx2, pass).**
+
+| | modules | fail with B12X | fail without B12X | fail only without B12X | import B12X |
+|---|---|---|---|---|---|
+| next-candidate 1bc005688 | 2,785 | 49 | 54 | `b12x_loader`, `deepseek_v4_1.common.engram`, and through it `deepseek_v4_1.nvidia.{model,dspark,vl_model}` | `vllm.utils.b12x` (34 modules, at import), `engram` (`b12x.sequence.engram`), `b12x_loader` (19) |
+| retire-b12x ea60f8afe | 2,788 | 51 | 51 | none | `vllm.utils.b12x` only (33 modules, at import, when installed) |
+
+The two trees' failures with B12X differ by exactly the two modules the branch deletes. Of
+the branch's 51, six are deletion stubs (four for next-candidate's own deletions, two for
+this branch's) and 45 are unrelated and the same in both trees: optional packages the image
+lacks (Ray, XPU and ROCm kernels, Cohere, gRPC, LMCache, Helion and others), a transformers
+version mismatch (11 Pixtral modules) and duplicate custom-op registrations (12). Without
+B12X, the branch's only B12X lookup is `vllm.utils.b12x`'s `find_spec`.
+
+**checkpoint-absent (dgx2, `checkpoint-absent-ea60f8afe-r2`, 15:19-15:20 CET, pass, B12X
+uninstalled).**
+- The packer alone, on the same synthetic weights and 1017 head shards: all 20 cases give
+  the same packed values, exception lists and 48 logits hashes as `compare-r2` (with B12X).
+- TP4 rank 0 through the direct loader (final-names' `rank_load.py`): weight digest
+  `a4893a5ed2f95f53...`, equal to 2026-10-25's from both loaders; 96,081 tensors (71.6 GiB)
+  in 23.6 s, 3.26 GB/s; 89/89 sampled tensors equal to safetensors' reads; loader overhead
+  0.90 GiB.
+
+**gate-absent (dgx2, `gate-absent-ea60f8afe`, 14:32-15:19 CET, B12X uninstalled, dgx2's
+compute-sanitizer mounted).** The release-test gate (101 files): **6,091 passed, 189
+skipped, 4 failed.**
+- Three tests of B12X's tuning coordinator (`test_b12x_startup.py`:
+  `test_all_local_winners_consolidate_once_with_empty_world_rank`,
+  `test_cancelled_consolidation_discards_every_partial_winner`,
+  `test_cancel_drains_pending_winners_then_orders_collective_warmup`) build B12X's
+  `TuningRequirement` through the `_tuning_progress` helper, which my scan of test bodies
+  missed: fixed in 0526 (4672ecc3d), the helper skips without B12X.
+- `test_deepseek_v41_tilelang.py::test_indexer_reads_only_visible_rows`: not B12X. Its
+  compute-sanitizer child (`deepseek_v41_indexer_reads.py`) could not import the candidate
+  tree: the release-test bundle sets `PYTHONPATH=/b`, and only pytest's own interpreter adds
+  its working directory. Candidate 6's gate bundle mounted no sanitizer, so the test
+  skipped there. The bundles now put the vLLM tree on `PYTHONPATH` (still without the B12X
+  tree). `scripts/release_tests.py bundle` has the same gap if a sanitizer is ever mounted.
+- Targeted rerun of both files at 4672ecc3d (`targeted-absent-4672ecc3d`, 15:21-15:22 CET,
+  B12X uninstalled, the fixed `PYTHONPATH`): **pass, 51 passed, 24 skipped.**
+  `test_indexer_reads_only_visible_rows` ran compute-sanitizer's initcheck and passed
+  (24.7 s); the three coordinator tests skip ("could not import 'b12x'"). With the 6,091
+  passes above, the gate passes without B12X at 4672ecc3d.
+
+**Uninstall check.** In every B12X-absent bundle, `without_b12x.py` reported
+`Successfully uninstalled b12x-1.3.0`, `find_spec("b12x")` `None`, no `b12x` distribution and
+no B12X tree on `sys.path`. The B12X-absent packer (`checkpoint-absent`, synthetic cases)
+gave the same packed hashes as the run with B12X.
+
+**Interrupted (recorded, no result).** dgx4 08:03: `pack-dev` stopped by the planned
+power-off. dgx4 13:50 `compare-ea60f8afe` and dgx2 14:29 `checkpoint-absent-ea60f8afe`: my
+check script moved safetensors' mmapped `head.weight` straight to the GPU, which hangs on
+GB10 (R580, 64K pages: large copies from untouched mmap pages never complete; the host spins,
+the GPU idles); I killed both containers. The `-r2` bundles clone the tensors first, as
+vLLM's `copy_weight` does. (The synthetic cases before the hang had all passed.)
 
 ### Needs the cluster
 
@@ -154,6 +245,7 @@ are compared bit for bit above, and the disk path is unchanged.
 
 ## What still cannot drop B12X
 
-Nothing on the DS4.1 serving path, once the bundles confirm it. Outside it: other models'
+Nothing on the DS4.1 serving path (the end-to-end serve without B12X is the release after
+next's own candidate on the cluster). Outside it: other models'
 B12X kernel families and their tests (they need B12X when used, and import without it),
 and the Kimi-K3 and DeepSeek-V4-Flash MXFP4-CSF experts (B12X's fused MoE).

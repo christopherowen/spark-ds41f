@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write this experiment's kernel-lab bundles (dgx4, scripts/lab.py kernel-local).
 
-usage: make_bundles.py VLLM_REPO [--head REF] [--only NAME ...]
+usage: make_bundles.py VLLM_REPO [--head REF] [--tag TAG] [--only NAME ...]
 
 Every bundle runs on candidate 6's image (spark-ds41f:19f2c20ed4d6-next-6), whose vLLM tree
 is BASE (3bdf9558c: tilelang-ports 26382f5cf with test patches 0489-0490). A vLLM ref is
@@ -15,12 +15,14 @@ every test file it changes over the image's copy.
   (its packed bytes and logits hashed, for comparison with compare's), then one TP4 rank's
   load through the direct loader and its weight digest against 2026-10-25's.
 - gate-absent (HEAD, B12X uninstalled): the release-test gate of config/release-tests.json
-  (scripts/release_tests.py gate and bundle), dgx4's compute-sanitizer mounted.
+  (scripts/release_tests.py gate and bundle), the host's compute-sanitizer mounted;
+  targeted-absent: the same for the gate files named by --files.
 - sweep-next-candidate and sweep-retire-b12x (NEXT and HEAD): checks/import_sweep.py over
   every vllm module with B12X installed, then again after uninstalling it.
 
-Each bundle is written to bundles/<name>-<vLLM commit>, which must not exist yet: a new
-vLLM head gets new directories, and nothing is ever cleared.
+Each bundle is written to bundles/<name>-<vLLM commit>[-<tag>], which must not exist yet: a
+new vLLM head, or a --tag for changed checks on the same head, gets new directories, and
+nothing is ever cleared.
 """
 import argparse
 import json
@@ -103,9 +105,12 @@ def put_tree(repo: str, ref: str, bundle: Path, candidate: dict) -> tuple[int, i
     return package, deleted, tests
 
 
+TAG = ""  # set from --tag
+
+
 def fresh(repo: str, ref: str, name: str) -> Path:
     head = git(repo, "rev-parse", "--short=9", ref).strip()
-    bundle = HERE / "bundles" / f"{name}-{head}"
+    bundle = HERE / "bundles" / f"{name}-{head}{TAG and '-' + TAG}"
     bundle.mkdir(parents=True)  # refuses an existing directory
     return bundle
 
@@ -141,8 +146,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("repo")
     parser.add_argument("--head", default="retire-b12x")
+    parser.add_argument("--tag", default="")
     parser.add_argument("--only", nargs="*", default=())
+    parser.add_argument("--files", nargs="*", default=(),
+                        help="gate files of the targeted-absent bundle")
     args = parser.parse_args()
+    global TAG
+    TAG = args.tag
     repo, head = args.repo, args.head
     checks = HERE / "checks"
     wanted = lambda name: not args.only or name in args.only  # noqa: E731
@@ -181,25 +191,41 @@ def main() -> None:
                  ["import sweep, B12X uninstalled",
                   ["/b/without_b12x.py", "/b/import_sweep.py", f"{name}-uninstalled"], 3600]],
                 [checks / "import_sweep.py", checks / "without_b12x.py"])
-    if wanted("gate-absent"):
-        bundle = fresh(repo, head, "gate-absent")
+    for name in ("gate-absent", "targeted-absent"):
+        if not wanted(name) or (name == "targeted-absent" and not args.files):
+            continue
+        bundle = fresh(repo, head, name)
         manifest = bundle.parent / f"{bundle.name}.manifest.json"
         release_tests.gate(repo, head, str(manifest))
-        release_tests.bundle(str(manifest), IMAGE, str(bundle), "retire-b12x-absent")
+        if name == "targeted-absent":
+            # The gate's entries for the named files only, with their deselects.
+            record = json.loads(manifest.read_text())
+            unknown = sorted(set(args.files) - set(record["files"]))
+            assert not unknown, f"not gate files: {unknown}"
+            record["files"] = {path: record["files"][path] for path in args.files}
+            record["deselect"] = {node: reason for node, reason in record["deselect"].items()
+                                  if node.split("::")[0] in args.files}
+            manifest.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+        release_tests.bundle(str(manifest), IMAGE, str(bundle), f"retire-b12x-{name}")
         shutil.copyfile(checks / "without_b12x.py", bundle / "without_b12x.py")
         candidate = json.loads((bundle / "candidate.json").read_text())
         candidate["argv"] = ["/b/without_b12x.py", *candidate["argv"]]
         candidate["mounts"] += [["without_b12x.py", "/b/without_b12x.py"], SANITIZER]
         candidate["env"]["TILELANG_CACHE_DIR"] = "/c/tilelang-retire-b12x"
         candidate["env"]["COMPUTE_SANITIZER"] = f"{SANITIZER[1]}/compute-sanitizer"
+        # The sanitizer test's script runs in its own interpreter, which finds the candidate
+        # vLLM tree only on PYTHONPATH (pytest adds its working directory; a child does not).
+        candidate["env"]["PYTHONPATH"] = WITHOUT_PATH
         counts = put_tree(repo, head, bundle, candidate)
         hash_ = git(repo, "rev-parse", "--short=9", head).strip()
+        scope = ("config/release-tests.json's gate" if name == "gate-absent"
+                 else f"the gate's entries for {', '.join(args.files)}")
         candidate["description"] = (
-            f"Release tests with B12X uninstalled: config/release-tests.json's gate at vLLM "
-            f"{head} ({hash_}) over {BASE} ({counts[0]} package files, {counts[1]} deleted, "
-            f"{counts[2]} test files); per-test outcomes under /c/release-tests.")
+            f"Release tests with B12X uninstalled: {scope} at vLLM {head} ({hash_}) over "
+            f"{BASE} ({counts[0]} package files, {counts[1]} deleted, {counts[2]} test files); "
+            "per-test outcomes under /c/release-tests.")
         (bundle / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
-        print(f"gate-absent: {hash_}, {counts}")
+        print(f"{name}: {hash_}, {counts}")
 
 
 if __name__ == "__main__":

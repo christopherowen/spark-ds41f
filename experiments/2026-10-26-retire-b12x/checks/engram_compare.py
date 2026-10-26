@@ -152,13 +152,15 @@ def main() -> int:
 
     index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())
     name = f"layers.{config['engram_layer_ids'][0]}.engram.embed"
+    # Cloned into anonymous memory before the GPU copy (see pack_compare.py: GB10's hang on
+    # large copies from untouched mmap pages).
     with safe_open(args.checkpoint / index["weight_map"][f"{name}.weight"], framework="pt") as archive:
         rows = archive.get_slice(f"{name}.weight")
         total = rows.get_shape()[0]
         start = total // 3
-        weight = rows[start:start + 65536].contiguous()
+        weight = rows[start:start + 65536].clone()
     with safe_open(args.checkpoint / index["weight_map"][f"{name}.scale"], framework="pt") as archive:
-        scale = archive.get_slice(f"{name}.scale")[start:start + 65536].contiguous()
+        scale = archive.get_slice(f"{name}.scale")[start:start + 65536].clone()
     table = weight.view(torch.uint8).to(DEVICE).view(torch.float8_e4m3fn)
     scales = scale.view(torch.uint8).to(DEVICE)
     ids = torch.randint(start - 100, start + 65536 + 100, (max_tokens, HEADS), generator=generator)
