@@ -599,8 +599,26 @@ Every c1 round gained, on both ranks: 4.7 µs a layer at TP4 (rounds 1.8-7.7 µs
 about 0.20 ms of the TP4 step (+0.7%, 75.4 to 75.9 tok/s) and 0.33 ms of TP3's (+0.9%,
 60.7 to 61.2). At c16 it is neutral.
 
-It is the first lever-2 fusion to pay. Wiring it into the attention forward's decode
-path is next.
+It is the first lever-2 fusion to pay.
+
+**Wired into the attention forward** (`c1-front` 0060836b4). At decode rows with cache
+pages, `DeepseekV4Attention._front` runs the one kernel after the fused projection. It
+does not run under sequence parallelism, past one decode tile, under memory profiling,
+or with breakable graphs. The separate norms, Q-B cast, kv RoPE and cache write then do
+not launch.
+
+Q-B now reads its input's cast from the input's producer, like the fused Q-A/KV:
+- at decode rows, the front kernel writes it;
+- on every other path, `cast_mxfp8` writes it, the same `per_token_cast` Q-B ran itself
+  before. That cast is declared with the layer's kernels.
+
+Run front-wiring-tests-1 passed: the attention model tests (with a new routing test),
+the front, RoPE, cache-writer and TileLang linear tests. It targets the release after
+next. A serving bench on the cluster is the gate it still needs.
+
+**The next small-kernel fusion to take**, at about 1 µs a removed launch, is the one that
+removes the most launches: each index-source layer's compressor and indexer chain (17-23
+small kernels). Then the q heads' RoPE, into the Q-B GEMM's store.
 
 ## Runs on dgx1
 
@@ -645,6 +663,8 @@ from `~/spark-lab/agents/c1-iket/spark-ds41f`, outputs in `~/spark-lab/agents/c1
 | smoke-10 | 17:36 | smoke | pass, 116 s |
 | front-tests-1 | 17:38 | front-tests (A5) | 49 passed, every launched kernel source-checked |
 | front-ab-1 | 17:39 | front-ab (A5) | pass, 634 s: bits equal, +0.72% TP4 c1, +0.90% TP3 c1 |
+| smoke-11 | 18:04 | smoke | pass, 116 s |
+| front-wiring-tests-1 | 18:06 | front-wiring-tests (A5 wired) | 86 passed, every launched kernel source-checked |
 
 ## Files
 
