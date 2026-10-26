@@ -18,6 +18,9 @@ until grep -q "all done" "$here/run-$1.log" 2>/dev/null; do
   age=$(( $(date +%s) - ${mtime%.*} ))
   [ "$age" -ge 150 ] || continue
   [ "$seen" != "$path:$size" ] || continue
+  # A log that ends in the tracker's Finalize lines is a process exiting: its exit handler
+  # serializes the tracker (iket::to_json) for minutes without logging (run 43).
+  ! tail -n 1 "$path" | grep -q "Finalize" || continue
   # The harness itself: a python whose script is /b/iket_step.py (not run-iket or iket_profile.py).
   harness=""
   for p in $(pgrep -f "/b/iket_step.py on"); do
