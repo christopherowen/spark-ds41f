@@ -393,9 +393,10 @@ def annotate(
     spread, record their ranges (run-iket still records every warp's lifetime):
     a kernel with many CTAs and loop-carried ranges otherwise writes millions of
     records a launch. With ``iters`` > 0 a range inside a ``for`` loop records in
-    at most that many of its iterations, evenly spread: run-iket reserves the
-    run's largest warp record for every warp of every instrumented launch, so a
-    long loop of ranges in one kernel sizes the whole run's buffer. A module with
+    at most that many of its iterations, evenly spread, and only lane 0 of a warp
+    records (where lanes diverge each group of them would record): run-iket
+    reserves the run's largest warp record for every warp of every instrumented
+    launch, so one long or divergent kernel sizes the whole run's buffer. A module with
     no ``__global__`` definition comes back unchanged; a kernel with a
     preprocessor conditional in its body is left as it is."""
     found: list[_Range] = []
@@ -430,19 +431,31 @@ def annotate(
     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
     inserts: list[tuple[int, int, str]] = []
     for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):
-        if not ctas:
-            break
-        # Uniform in a CTA, so a range opens and closes in every warp or in none.
-        sample = (
-            f"  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y) * "
-            "gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z / "
-            f"{ctas}u)) == 0u;\n"
-        )
-        inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
+        sample = ""
+        if ctas:
+            # Uniform in a CTA, so a range opens and closes in every warp or in none.
+            sample += (
+                "  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y)"
+                " * gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z"
+                f" / {ctas}u)) == 0u;\n"
+            )
+        if iters:
+            # A warp records an event each time a group of its lanes runs it; where its
+            # lanes diverge that is many records for one statement. Lane 0 alone keeps
+            # a warp's record within the sites' bound.
+            sample += (
+                "  unsigned __tl_iket_laneid;\n"
+                '  asm volatile("mov.u32 %0, %%laneid;" : "=r"(__tl_iket_laneid));\n'
+                "  const bool __tl_iket_lane0 = __tl_iket_laneid == 0u;\n"
+            )
+        if sample:
+            inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
     for item in found:
-        # Each condition holds through a range: the CTA's, and its loops' iterations
-        # (a loop variable does not change inside one iteration).
+        # Each condition holds through a range: the CTA's, lane 0's, and its loops'
+        # iterations (a loop variable does not change inside one iteration).
         conditions = ["__tl_iket_cta"] if ctas else []
+        if iters:
+            conditions.append("__tl_iket_lane0")
         unsampled = []
         for header in item.loops if iters else ():
             condition = _iterations(header, iters)
