@@ -214,8 +214,8 @@ BUNDLES = {
     "hot-sampled": dict(
         ref=IKET,
         what="what sizes run-iket's buffer: the hot kernels under run-iket unsampled and with "
-             "four CTAs a launch and two iterations a loop, the tracker kept; its per-warp "
-             "maximum against the traces' and the static bounds",
+             "four CTAs a launch, the middle iteration of each loop and lane 0 recording, the "
+             "tracker kept; its per-warp maximum against the traces' and the static bounds",
         steps=[
             ("unsampled, under run-iket",
              [*PROFILE, "{out}/full", "profile", "--keep", "--postprocess", "json", "--",
@@ -224,7 +224,7 @@ BUNDLES = {
             ("sampled, under run-iket",
              [*PROFILE, "{out}/sampled", "profile", "--keep", "--postprocess", "json", "--",
               "{python}", HOT, "on", "--iket", "{out}/sampled-run/iket", "--out", "{out}/sampled-run",
-              "--iters", "3", "--sample-ctas", "4", "--sample-iters", "2"], 3600),
+              "--iters", "3", "--sample-ctas", "4", "--sample-iters", "1"], 3600),
             ("unsampled counts", ["{python}", "/b/trace_counts.py", "{out}/full",
                                   "{out}/full-run/iket/sources"], 1800),
             ("sampled counts", ["{python}", "/b/trace_counts.py", "{out}/sampled",
