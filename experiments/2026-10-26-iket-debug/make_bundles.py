@@ -123,17 +123,16 @@ BUNDLES = {
             # instrumented launch gets the run's largest warp record (5,016 timestamps
             # unsampled: 898 GB). Sampled CTAs and iterations bound that record: lane 0
             # records, and each range at most once a loop, so no warp records more than 64
-            # (the sources' static bounds). With the graphs, the dry run recommends 424 all
-            # the same (52 GB for 26.6M instrumented warps, more than GB10 has beside the
-            # engine), and capped at 128 the run's exit dump crashed in a warp record
-            # (iket::to_json, run 15). A graph's kernel nodes seem to keep their records
-            # across replays, so this trace runs without graphs, capped at twice the bound;
-            # the trace's counts show whether any warp reaches it.
+            # (the sources' static bounds). The dry run recommends 424 all the same, with
+            # the graphs and without, and capped at 128 the run's exit dump crashes in a
+            # warp record (iket::to_json, runs 15 and 18). With the graphs that is a 52 GB
+            # pool (26.6M instrumented warps), more than GB10 has beside the engine;
+            # without them, 15.1M warps take 28 GB. So this trace runs without graphs and
+            # uncapped; the trace's counts show which warps record more than the bound.
             # The vision tower and the top-k/top-p sampler are not in a greedy text decode
             # step; left uninstrumented, their warps reserve no records.
             ("decode steps, on, eager, under run-iket",
-             [*PROFILE, "{out}/trace", "profile", "--keep", "--max-ts-cnt-per-warp", "128",
-              "--postprocess", "all", "--",
+             [*PROFILE, "{out}/trace", "profile", "--keep", "--postprocess", "all", "--",
               "{python}", STEP, "on", "--eager", "--iket", "{out}/trace-run/iket", "--ctas", "4",
               "--iters", "1", "--skip", "^(vision_|topk_topp)", "--out", "{out}/trace-run"], 7200),
             ("what sized the buffer", ["{python}", "/b/trace_counts.py", "{out}/trace",
