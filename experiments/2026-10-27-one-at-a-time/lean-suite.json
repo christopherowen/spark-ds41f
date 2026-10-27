@@ -1,0 +1,66 @@
+{
+ "name": "program-lean",
+ "version": 1,
+ "description": "The program's lean screen, about 16 minutes a build on the ring: model behaviour on 64 prompts at 16 streams (it also heat-soaks the GPU; arms after the first score the first arm's text), the engine grid (the text-independent step cost at 1-16 requests), a closed loop at 8 streams and the single stream (each request a different prompt, thinking off), 240 s each after 60 s warm-up, and cold real-text prefill at 32K and 131K, three repeats. Built for experiments/2026-10-26-cluster-program; not a release suite.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "limit": 64,
+    "concurrency": 16,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1
+   }
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 8,
+    "warmup": 60,
+    "duration": 240,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 1,
+    "warmup": 60,
+    "duration": 240,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}
