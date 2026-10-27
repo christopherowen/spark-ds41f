@@ -273,7 +273,7 @@ class ArmsTest(unittest.TestCase):
         import make_arms
 
         arms = make_arms.arms()
-        for name, threshold in (("slots-24-tp4.json", 16288), ("slots-12-tp3.json", 8144)):
+        for name, threshold in (("slots-24-tp4.json", 16288), ("slots-12-tp3.json", 6096)):
             options = arms[name]["serve_options"]
             rows = int(options["--max-num-seqs"]) * 6
             self.assertEqual(int(options["--max-num-batched-tokens"]) - rows, threshold)

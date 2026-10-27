@@ -21,10 +21,11 @@ site's own battery rather than `bin/spark bench`, no soak). The qualified
 
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. The selected
-profile's pool holds five full 1,048,576-token contexts at once at its 8,192-token budget,
-or all eight sequences at up to 666,880 tokens each (since r6x, whose expert scale codes
+profile's pool holds five full 1,048,576-token contexts at once at its 6,144-token budget,
+or all eight sequences at up to 682,240 tokens each (since r6x, whose expert scale codes
 freed the memory; r6v's 3.5 GiB pool held seven full 524,288-token contexts).
-spark-ds41f-1025's startup line reports 4,009,281 KV tokens, 3.82 contexts (spark-ds41f-1022
+spark-ds41f-1025's startup line reports 4,009,281 KV tokens, 3.82 contexts at 8,192 (4,354,971,
+4.15 at 6,144; spark-ds41f-1022
 at 4,096: 4,765,898, 4.55; r6v: 2,845,543, 5.43): it charges every request a prompt's chunks
 in flight ([KV capacity](#kv-capacity)). dgx1's 5 GiB startup guard bounds the pool: 5.875
 GiB ended below it at graph capture (experiments/2026-10-19-r6x-tp3-1m).
@@ -61,10 +62,11 @@ sizes it:
 | Shape | Batched tokens | Pool blocks | Full-length contexts at once | All sequences at once | spark-ds41f-1025's startup line | The next candidate's (vLLM 0491) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `tp4-ring` | 16,384 | 49,483 | 11 (11.03) | 16 x 718,848 tokens | 6,512,700 tokens (6.21x) | 11,554,122 tokens (11.02x) |
-| `tp3-triangle` | 8,192 | 23,121 | 5 (5.12) | 8 x 666,880 tokens | 4,009,281 tokens (3.82x) | 5,366,846 tokens (5.12x) |
+| `tp3-triangle` | 6,144 | 23,121 | 5 (5.24) | 8 x 682,240 tokens | 4,354,971 tokens (4.15x) | 5,488,353 tokens (5.23x) |
 | `tp3-triangle-4k`, 262,144 tokens | 4,096 | 10,367 | 8 (8.80) | 8 x 262,144 tokens | 1,348,708 tokens (5.14x) | 2,304,107 tokens (8.79x) |
 
-History, the budgets served through spark-ds41f-1022:
+History: spark-ds41f-1025 served the triangle at 8,192 (5 full contexts, 5.12; 8 x 666,880
+tokens; startup line 4,009,281 tokens, 3.82x). The budgets served through spark-ds41f-1022:
 
 | Shape | Batched tokens | Full-length contexts at once | All sequences at once | spark-ds41f-1022's startup line |
 | --- | ---: | ---: | ---: | ---: |

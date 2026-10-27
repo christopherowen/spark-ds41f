@@ -31,8 +31,10 @@ Against spark-ds41f-1022 in candidate 6's release comparison (one session, 2026-
 identical, teacher-forced KL 0.
 `tp4-ring`'s `benchmark_reference` is
 [manifests/suites/2026-10-25-spark-ds41f-1025-tp4](../manifests/suites/2026-10-25-spark-ds41f-1025-tp4/)
-(candidate 6's first arm of its release comparison). `tp3-triangle` runs an 8,192-token
-prefill budget (spark-ds41f-1022: 4,096), and its `benchmark_reference` is
+(candidate 6's first arm of its release comparison). `tp3-triangle` ran an 8,192-token
+prefill budget in spark-ds41f-1025 (spark-ds41f-1022: 4,096); the recipe now sets 6,144, for a
+median step beside a long prompt 21% shorter at about 3% of prefill (owner, 2026-10-27), and
+the next release qualifies it. Its `benchmark_reference` is
 [manifests/suites/2026-10-25-spark-ds41f-1025-tp3](../manifests/suites/2026-10-25-spark-ds41f-1025-tp3/)
 (candidate 6's arm of its two-arm TP3 comparison). Against spark-ds41f-1022 on the triangle:
 prefill +25.5% to +28.2% from 32K to 500K and +22.5% at 1M; decode grid -1.65% (better); c8,
@@ -281,7 +283,7 @@ own list ([setup.md](setup.md#a-site-profile-replaces-serve_args-wholesale)).
 
 The trade-off is memory per request, not at startup. The tower's weights load whenever
 images are allowed at all, and vLLM encodes a request's images within a per-step budget
-derived from the batched-token budget (8,192 tokens on the triangle, 16,384 on the ring), so
+derived from the batched-token budget (6,144 tokens on the triangle, 16,384 on the ring), so
 the encoder's working memory per step does not grow with the count. The request does: every
 image becomes prompt tokens that hold blocks of the fixed KV pool (`kv_cache_memory_bytes`)
 for the life of the request, beside every other stream's context, and lengthen its

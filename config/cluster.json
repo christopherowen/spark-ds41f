@@ -257,7 +257,7 @@
       "benchmark_reference": "manifests/suites/2026-10-25-spark-ds41f-1025-tp4"
     },
     "tp3-triangle": {
-      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate).",
+      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate). From the release after spark-ds41f-1025 it is 6,144 (owner, 2026-10-27), the prepared fallback (rc6/rc-tp3-6144.json): against 8,192 it gives up about 3% of prefill (1M 3,797 against 3,907 tok/s) for a median step beside a long prompt 21% shorter (1.143 s against 1.444 s; experiments/2026-10-19-prefill-budget-tp3). A site triangle measured the same trade on candidate 8 (#503: about 2% prefill at 131K for 24% longer stalls), with decode unchanged at every budget. The startup line at 6,144 reads 4,354,971 tokens; the pool still holds 5 full 1M contexts.",
       "nodes": 3,
       "nodes_config": "config/nodes.json",
       "fabric": {
@@ -266,7 +266,7 @@
       "sizing": {
         "max_model_len": 1048576,
         "max_num_seqs": 8,
-        "max_num_batched_tokens": 8192,
+        "max_num_batched_tokens": 6144,
         "kv_cache_memory_bytes": 5268045824,
         "prefix_cache_retention_interval": 512
       },

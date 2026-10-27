@@ -71,7 +71,7 @@ class CapacityTest(unittest.TestCase):
                 self.assertEqual(ring["every_sequence_tokens"], each)
 
     def test_triangle(self):
-        for budget, each in ((8192, 666_880), (4096, 697_600)):
+        for budget, each in ((8192, 666_880), (6144, 682_240), (4096, 697_600)):
             with self.subTest(budget=budget):
                 triangle = row("tp3-triangle", max_num_batched_tokens=budget)
                 self.assertEqual(triangle["full_contexts"], 5)

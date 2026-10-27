@@ -175,9 +175,9 @@ class RecipeTest(unittest.TestCase):
             args.insert(resolved["serve_args"].index("--enable-prompt-tokens-details"),
                         "--enable-prompt-tokens-details")
             args[args.index("--jit-monitor-mode") + 1] = "off"
-            # Each shape's long-prefill budget: the ring's 16,384, and the triangle's 8,192 from
-            # its own qualification (owner, 2026-10-25: "if 8k fits").
-            budget = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("8192", "8144")}[shape]
+            # Each shape's long-prefill budget: the ring's 16,384, and the triangle's 6,144 for
+            # shorter stalls beside a long prompt (owner, 2026-10-27).
+            budget = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("6144", "6096")}[shape]
             for flag, value in zip(("--max-num-batched-tokens", "--long-prefill-token-threshold"), budget):
                 args[args.index(flag) + 1] = value
             resolved, released = host_mounts(resolved), host_mounts(released)
@@ -372,9 +372,10 @@ class RecipeTest(unittest.TestCase):
         # the memory); everything else of r6h's sizing, drafts and capture ladder stays.
         self.assertEqual(argument(resolved, "--max-model-len"), "1048576")
         self.assertEqual(argument(resolved, "--kv-cache-memory-bytes"), "5268045824")
-        # spark-ds41f-1025's TP3 qualification doubled the long-prefill budget to 8,192.
-        self.assertEqual(argument(resolved, "--max-num-batched-tokens"), "8192")
-        self.assertEqual(argument(resolved, "--long-prefill-token-threshold"), "8144")
+        # spark-ds41f-1025 doubled the long-prefill budget to 8,192; the release after it serves
+        # 6,144 for shorter stalls beside a long prompt (owner, 2026-10-27).
+        self.assertEqual(argument(resolved, "--max-num-batched-tokens"), "6144")
+        self.assertEqual(argument(resolved, "--long-prefill-token-threshold"), "6096")
 
         def without_budget(args):
             out = list(args)
@@ -435,7 +436,7 @@ class RecipeTest(unittest.TestCase):
 
         triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
         expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp3-triangle": ("8", "48", triangle, "8144"),
+                    "tp3-triangle": ("8", "48", triangle, "6096"),
                     "tp3-triangle-4k": ("8", "48", triangle, "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, (streams, largest, ladder, threshold) in expected.items():
@@ -462,7 +463,7 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual(argument(resolved, "--max-cudagraph-capture-size"), "36", name)
             self.assertEqual(ladder, [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 36], name)
             self.assertEqual(argument(resolved, "--long-prefill-token-threshold"),
-                             {"tp3-triangle": "8156", "tp3-triangle-4k": "4060"}[name], name)
+                             {"tp3-triangle": "6108", "tp3-triangle-4k": "4060"}[name], name)
             self.assertEqual(recipe.capture_problems(resolved), ([], []), name)
         # Every stream count from 1 to 32, at every draft count up to 7, ends where it should.
         for drafts in range(8):
@@ -525,7 +526,7 @@ class RecipeTest(unittest.TestCase):
         """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
         third of the model, so its headroom differs): changing one must not move another.
         The threshold is the budget less streams x (1 + drafts)."""
-        expected = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("8192", "8144"),
+        expected = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("6144", "6096"),
                     "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
