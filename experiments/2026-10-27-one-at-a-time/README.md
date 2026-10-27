@@ -21,10 +21,20 @@ in one session.
 | no-0506 | attention scratch in its own workspace lane | same bits, same speed | determinism, c8 / c1 |
 | no-0526 | CED replays the prompt's last 128 rows | correct CED at any chunking; cost | c8 / c1, prefill |
 | no-0528 | block verification ends at the dead-row cut | correct sampled verification; cost | sampled digest, c8 / c1 |
+| no-0502 | no per-allocation KV zeroing (`uses_only_written_slots=False` on the three cache specs: the manager zeroes each allocated block again) | same bits, cheaper allocation | determinism, c8 / c1, TTFT |
+| nopdl-no-0510 | mHC finalize writes the MXFP8 cast, the projections stop casting | same bits, shorter layers | determinism, c1, prefill |
+| nopdl-no-pagetables | sparse-MLA page tables over live pages (0513-0519) | same bits, cheaper metadata at long context | determinism, c1, prefill |
 
-Not isolated yet: 0502 (KV zeroing), 0508 (softmax fix), 0510 (mHC cast) and the live
-page tables (0513-0519). Each conflicts with later commits when reverted and needs a hand
-revert or a switch.
+The `nopdl-` arms are measured on candidate 9's no-PDL arm (`rc9/rc-tp4-nopdl.json`) and
+compared with it: PDL was written over these fixes (it chains the kernels they changed), so
+neither reverts alone with PDL in place. 0510's revert there keeps 0504's tile heights and
+0511's deferred combine and takes the MoE input unquantized again; the determinism gate
+against the no-PDL arm checks that hand resolution, since 0510 claims the same bits.
+
+Not isolated: 0508 (the softmax fix in the logprob and verification kernels). 0528 was
+written over its arithmetic, so a revert means merging two kernel rewrites by hand; its
+cost is the kernel's own (`benchmarks/kernels/benchmark_tilelang_rejection.py`), and it is
+a correctness fix.
 
 ## Each run (`<label>.json`)
 
