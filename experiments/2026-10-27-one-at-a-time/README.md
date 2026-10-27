@@ -64,6 +64,11 @@ the removals, with the arm in the middle.
 | block-scales | MXFP8 GEMMs load the 32x32 block-scale grid at `SFB[row // 32]` | `bundles/block32-base` and `bundles/block32-scales` print block-32 GEMM output digests (seeded TP4 shapes, 1-16 decode rows and prefill rows); they must match line for line. `block32-scales-tests`: the branch's GEMM tests | same bits, decode faster |
 | expert-codes | 2-bit scale codes for experts whose block scales span at most 4 values | `bundles/expert-codes`: the branch's MoE tests, the mixed 2-bit/4-bit launch against the uncoded GEMM bit for bit | same bits, decode faster |
 
+`x7-gemm.json` (kernel only): `bundles/x7-gemm`, copied from the decode-bytes experiment
+with candidate 9's image. The X7 tile load against the production decode GEMM on real
+DS4.1-1017 projections: bit-exact outputs at 1-16 rows and per-call times, cold and
+L2-warm. A serving arm follows only if it matches and is faster.
+
 Kernel bundle outputs stay on the nodes under `~/spark-lab/results/<run>/<bundle>-<node>/`.
 
 ## Results
