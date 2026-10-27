@@ -52,6 +52,25 @@ a correctness fix.
 - A correctness fix: kept; its cost (arm faster than candidate 9) is reported, and a cost
   beyond the bracket spread is a reason to make it cheaper.
 
+## Additions on candidate 9 (`make_bundles.py`)
+
+Two byte levers, each alone on candidate 9's image, built from their uncommitted vLLM
+worktrees at e2b2b0b59 by `make_bundles.py BLOCK_SCALES_WORKTREE EXPERT_CODES_WORKTREE`.
+Each spec runs kernel-lab bundles before any boot, then the same gates and lean suite as
+the removals, with the arm in the middle.
+
+| arm | change | kernel check | claim |
+|---|---|---|---|
+| block-scales | MXFP8 GEMMs load the 32x32 block-scale grid at `SFB[row // 32]` | `bundles/block32-base` and `bundles/block32-scales` print block-32 GEMM output digests (seeded TP4 shapes, 1-16 decode rows and prefill rows); they must match line for line. `block32-scales-tests`: the branch's GEMM tests | same bits, decode faster |
+| expert-codes | 2-bit scale codes for experts whose block scales span at most 4 values | `bundles/expert-codes`: the branch's MoE tests, the mixed 2-bit/4-bit launch against the uncoded GEMM bit for bit | same bits, decode faster |
+
+Kernel bundle outputs stay on the nodes under `~/spark-lab/results/<run>/<bundle>-<node>/`.
+
 ## Results
 
-Not run.
+PDL (rc9/pdl-ab-tp4.json, 2026-10-27, no-PDL then PDL then PDL again): same bits (128/128
+greedy, teacher-forced KL 0, equal determinism, sampled and control digests). Decode grid
+1.3% faster (±0.17%, repeat drift 0.7%); c1 engine steps +1.9%; distinct streams +3.4% at
+c4, +1.4% at c8, +0.4% at c16; 262K prefill 0.4-0.7% slower. Kept.
+
+Leave-one-out arms: queued 2026-10-27, not finished.

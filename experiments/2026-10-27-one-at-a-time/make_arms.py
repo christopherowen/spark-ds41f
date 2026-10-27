@@ -90,16 +90,20 @@ def write_json(path: Path, data: dict) -> None:
 
 
 def arms(label: str, files: list[str], notes: str, base: str = "rc-tp4",
-         base_label: str = "candidate-9") -> None:
+         base_label: str = "candidate-9", adds: bool = False,
+         kernels: list[dict] | None = None) -> None:
     """The arm (candidate 9's, with ``files`` mounted from overlay/<label>), its dev twin,
-    and the spec comparing it with ``base`` (an arm in rc9/) before and after it."""
+    and the spec comparing it with ``base`` (an arm in rc9/) before and after it. ``adds``:
+    the overlay adds a change rather than reverting one. ``kernels``: kernel-lab bundles
+    the spec runs before any boot."""
     mounts = [["{checkout}/cache", "/cache", "rw"]]
     for path in files:
         mounts.append([f"{{checkout}}/{FOLDER}/overlay/{label}/{path}", f"{IMAGE_ROOT}/{path}", "ro"])
     what = label.removeprefix("nopdl-").removeprefix("no-")
     against = "candidate 9 without PDL" if base != "rc-tp4" else "candidate 9"
     write_json(HERE / f"{label}-tp4.json", {
-        "notes": f"{against[0].upper()}{against[1:]}, without {what}: {notes} (overlay/{label}, make_arms.py).",
+        "notes": f"{against[0].upper()}{against[1:]}, {'with' if adds else 'without'} {what}: {notes} "
+                 f"(overlay/{label}, {'make_bundles.py' if adds else 'make_arms.py'}).",
         "extends": {"config": f"{CANDIDATE}/rc-tp4.json"},
         "set": {"container": {"mounts": mounts}},
     })
@@ -120,6 +124,7 @@ def arms(label: str, files: list[str], notes: str, base: str = "rc-tp4",
         "run": f"one-at-a-time-{label}",
         "jobs": [
             {"kind": "sync"},
+            *([{"kind": "kernel", "bundles": kernels}] if kernels else []),
             {"kind": "measure", "bench": False, "bracket": False, "extras": gates,
              "arms": [{"config": f"{CANDIDATE}/{base}.json", "label": base_label},
                       {"config": f"{label}-tp4.json", "label": label}]},

@@ -1,0 +1,92 @@
+{
+ "experiment": "experiments/2026-10-27-one-at-a-time",
+ "run": "one-at-a-time-block-scales",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "kernel",
+   "bundles": [
+    {
+     "bundle": "experiments/2026-10-27-one-at-a-time/bundles/block32-base",
+     "node": "dgx1"
+    },
+    {
+     "bundle": "experiments/2026-10-27-one-at-a-time/bundles/block32-scales",
+     "node": "dgx2"
+    },
+    {
+     "bundle": "experiments/2026-10-27-one-at-a-time/bundles/block32-scales-tests",
+     "node": "dgx3"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/sampled_digest.py",
+     [
+      "--tokens",
+      "192"
+     ],
+     "sampled"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "experiments/2026-10-26-spark-ds41f-candidate/rc9/rc-tp4.json",
+     "label": "candidate-9"
+    },
+    {
+     "config": "block-scales-tp4.json",
+     "label": "block-scales"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "suite": "experiments/2026-10-27-one-at-a-time/lean-suite.json",
+   "arms": [
+    {
+     "config": "experiments/2026-10-26-spark-ds41f-candidate/rc9/rc-tp4-dev.json",
+     "label": "candidate-9"
+    },
+    {
+     "config": "block-scales-tp4-dev.json",
+     "label": "block-scales"
+    },
+    {
+     "config": "experiments/2026-10-26-spark-ds41f-candidate/rc9/rc-tp4-dev.json",
+     "label": "candidate-9-again"
+    }
+   ]
+  }
+ ]
+}
