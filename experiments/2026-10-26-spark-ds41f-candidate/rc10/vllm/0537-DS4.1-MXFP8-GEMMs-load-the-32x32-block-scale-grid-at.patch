@@ -1,0 +1,526 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:26:40 +0100
+Subject: [PATCH 537/537] [DS4.1] MXFP8 GEMMs load the 32x32 block-scale grid
+ at SFB[row // 32]
+
+The block-32 FP8 projections packed their UE8M0 block scales once per output
+row (pack_scale_words(..., rows=N)): the 32x32 grid repeated 32 times, so a
+decode step read 32 copies of every scale word beside the weight. The GEMMs
+now take the grid itself and load SFB[row // 32]; the expanded tensor
+satisfies expanded[row] == block[row // 32], so every loaded word, and so
+every output bit, is the one the broadcast gave. Grouped weights are stacked
+in N, so the same index serves them; WO-A's raw exponent grid is read the
+same way. _block32_scale_words refuses a scale grid whose rows are not one
+per 32 outputs.
+
+Candidate 9 measurements (one-at-a-time experiment, 2026-10-28): block-32
+GEMM output digests equal over 182 cases (seven TP4 shapes, 1-16 decode rows
+and prefill rows); serving determinism, greedy and sampled digests equal;
+decode grid 1.3% faster, 131K prefill 1.1% faster, beyond the repeat.
+---
+ .../test_deepseek_v41_block_scale_words.py    | 240 ++++++++++++++++++
+ .../test_deepseek_v41_tilelang_linear.py      |   6 +-
+ vllm/models/deepseek_v4_1/l2_prefetch.py      |   3 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  59 +++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  18 +-
+ .../deepseek_v4_1/tilelang/scale_pack.py      |  27 ++
+ 6 files changed, 316 insertions(+), 37 deletions(-)
+ create mode 100644 tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/scale_pack.py
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+new file mode 100644
+index 000000000..59c5666f3
+--- /dev/null
++++ b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+@@ -0,0 +1,240 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU identity of the packed 32x32 block-scale grid.
++
++``pack_scale_words(grid, rows=N)`` repeats each block row onto 32 output rows.
++The MXFP8 GEMM stores ``pack_scale_words(grid)`` and loads ``SFB[row // 32]``.
++The loader below reads that function from its file, so the test does not import
++TileLang or launch a kernel.
++"""
++
++import ast
++import importlib.util
++from pathlib import Path
++
++import torch
++
++_SCALE_PACK = (
++    Path(__file__).resolve().parents[3]
++    / "vllm/models/deepseek_v4_1/tilelang/scale_pack.py"
++)
++
++
++def _load_pack_scale_words():
++    spec = importlib.util.spec_from_file_location("ds41_scale_pack", _SCALE_PACK)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module.pack_scale_words
++
++
++pack_scale_words = _load_pack_scale_words()
++
++
++def test_block_scale_words_match_the_per_row_broadcast():
++    """expanded[row] == block[row // 32], including the 576-wide 4-byte pad."""
++    n = 128
++    # 512 is a whole number of scale words. 576 is 18 exponents, padded to 20.
++    for k, exponents, padded in ((512, 16, 16), (576, 18, 20)):
++        gen = torch.Generator(device="cpu").manual_seed(k)
++        grid = torch.randint(
++            0, 256, (n // 32, k // 32), generator=gen, dtype=torch.uint8
++        )
++        expanded = pack_scale_words(grid, rows=n)
++        block = pack_scale_words(grid)
++        assert grid.shape == (n // 32, exponents)
++        assert expanded.shape == (n, padded // 4)
++        assert block.shape == (n // 32, padded // 4)
++        assert torch.equal(expanded, block.repeat_interleave(32, dim=0))
++        for row in range(n):
++            assert torch.equal(expanded[row], block[row // 32]), row
++        if padded != exponents:
++            pad = expanded.view(torch.uint8).reshape(n, padded)[:, exponents:]
++            assert torch.equal(pad, torch.full_like(pad, 127))
++
++
++def _block_scale_words(block_k: int) -> int:
++    """``gemm.block_scale_words``: words a K block reads, including a straddle."""
++    return (block_k + block_k % 128 + 127) // 128
++
++
++def _const(node):
++    return node.value if isinstance(node, ast.Constant) else None
++
++
++def _block_ks(node):
++    """block_K integers in a config, including ``dict(block_K=...)`` calls."""
++    found = []
++    for child in ast.walk(node):
++        if (
++            isinstance(child, ast.Call)
++            and isinstance(child.func, ast.Name)
++            and child.func.id == "dict"
++        ):
++            for kw in child.keywords:
++                if kw.arg == "block_K":
++                    block_k = _const(kw.value)
++                    if block_k is not None:
++                        found.append(block_k)
++        if not isinstance(child, ast.Dict):
++            continue
++        for key, value in zip(child.keys, child.values):
++            if _const(key) == "block_K":
++                block_k = _const(value)
++                if block_k is not None:
++                    found.append(block_k)
++    return found
++
++
++def _serving_tiles():
++    """(K, block_K) pairs the decode and split-K tables actually launch."""
++    gemm = (
++        Path(__file__).resolve().parents[3]
++        / "vllm/models/deepseek_v4_1/tilelang/gemm.py"
++    )
++    tree = ast.parse(gemm.read_text())
++    tiles = set()
++    for node in tree.body:
++        if not (
++            isinstance(node, ast.AnnAssign)
++            and isinstance(node.target, ast.Name)
++            and node.target.id in ("DECODE_FP8_CONFIGS", "SPLIT_FP8")
++        ):
++            continue
++        table = node.value
++        for key, value in zip(table.keys, table.values):
++            if not isinstance(key, ast.Tuple) or len(key.elts) < 2:
++                continue
++            k = _const(key.elts[1])
++            if k is None:
++                continue
++            for block_k in _block_ks(value):
++                tiles.add((k, block_k))
++    # Shapes with no sweep entry take pick_block_K: 128, else the widest
++    # multiple of 64 up to 192 that divides K. 576 is the straddle.
++    for k in (64, 192, 256, 384, 512, 576, 640, 768, 1024, 1280, 2048, 4096, 5120, 6144):
++        for block_k in (128, *range(192, 0, -64)):
++            if k % block_k == 0:
++                tiles.add((k, block_k))
++                break
++    return tiles
++
++
++def test_every_serving_k_tile_loads_the_scale_words_it_consumes():
++    """A K tile's scale words stay inside the row, with no clamp filling a gap.
++
++    ``SFB[row // 32, min(word0 + w, sf_words - 1)]`` repeats the last word when
++    the index runs past the row. That is exact only when the words the tile
++    consumes are already in range. A block that straddles a 128-element boundary
++    needs both words in the shared buffer.
++    """
++    tiles = _serving_tiles()
++    # These are sweep entries, not the default 128-wide tile. A walker that
++    # misses ``dict(block_K=...)`` would drop them.
++    assert {(576, 64), (576, 192), (1280, 256), (5120, 256)} <= tiles
++    short = []
++    for k, block_k in sorted(tiles):
++        assert k % block_k == 0, (k, block_k)
++        sf_words = (k + 127) // 128
++        block_words = _block_scale_words(block_k)
++        for ko in range(k // block_k):
++            start = ko * block_k
++            first = start // 128
++            last = (start + block_k - 1) // 128
++            if last >= sf_words or last - first + 1 > block_words:
++                short.append((k, block_k, ko, first, last, block_words, sf_words))
++            # mxf8f6f4 reads one byte per K32 atom:
++            # (k_start + 32 * ki) // 32 % 4 inside word word0.
++            k_start = start % 128
++            word0 = start // 128
++            for ki in range(block_k // 32):
++                byte = (k_start + 32 * ki) // 32 % 4
++                exponent = (word0 + (k_start + 32 * ki) // 128) * 4 + byte
++                if exponent >= k // 32:
++                    short.append((k, block_k, ko, ki, exponent))
++    assert short == []
++
++
++def _sfb_indexes(path: Path) -> list[tuple[str, ast.AST]]:
++    """First index of every ``SFB[...]`` load, with the function that owns it."""
++    tree = ast.parse(path.read_text())
++    found = []
++    for node in tree.body:
++        if not isinstance(node, ast.FunctionDef):
++            continue
++        for child in ast.walk(node):
++            if not isinstance(child, ast.Subscript):
++                continue
++            if not isinstance(child.value, ast.Name) or child.value.id != "SFB":
++                continue
++            index = child.slice
++            if isinstance(index, ast.Tuple) and index.elts:
++                index = index.elts[0]
++            found.append((node.name, index))
++    return found
++
++
++def _is_floor_div_32(node: ast.AST) -> bool:
++    return (
++        isinstance(node, ast.BinOp)
++        and isinstance(node.op, ast.FloorDiv)
++        and isinstance(node.right, ast.Constant)
++        and node.right.value == 32
++    )
++
++
++def test_every_sfb_load_clamps_the_row_then_divides_by_32():
++    """The GEMM reads the packed grid. Clamping after the divide would treat
++    ``N - 1`` as a block-row index and walk off the last block.
++
++    Both loads name the clamped row, then take ``row // 32``. A load that
++    indexes ``SFB`` by the output row itself is the old per-row broadcast.
++    """
++    gemm = (
++        Path(__file__).resolve().parents[3]
++        / "vllm/models/deepseek_v4_1/tilelang/gemm.py"
++    )
++    loads = _sfb_indexes(gemm)
++    assert [name for name, _ in loads] == ["_mxfp8_gemm", "_mxfp8_gemm_partials"]
++    tree = ast.parse(gemm.read_text())
++    clamps = {}
++    for node in tree.body:
++        if not isinstance(node, ast.FunctionDef):
++            continue
++        for child in ast.walk(node):
++            if (
++                isinstance(child, ast.Assign)
++                and len(child.targets) == 1
++                and isinstance(child.targets[0], ast.Name)
++                and child.targets[0].id == "row"
++            ):
++                clamps.setdefault(node.name, child.value)
++    for name, index in loads:
++        assert _is_floor_div_32(index), name
++        assert isinstance(index.left, ast.Name) and index.left.id == "row"
++        clamp = clamps[name]
++        assert isinstance(clamp, ast.Call)
++        func = clamp.func
++        assert isinstance(func, ast.Attribute) and func.attr == "min"
++        # Clamp the output row, then divide. A divide inside the clamp, or a
++        # second divide of an already-blocked index, reads the wrong block row.
++        assert not any(isinstance(child, ast.FloorDiv) for child in ast.walk(clamp))
++
++    linear = (
++        Path(__file__).resolve().parents[3]
++        / "vllm/models/deepseek_v4_1/tilelang/linear.py"
++    )
++    tree = ast.parse(linear.read_text())
++    store = None
++    for node in tree.body:
++        if isinstance(node, ast.FunctionDef) and node.name == "_block32_scale_words":
++            store = node
++    assert store is not None
++    calls = [
++        child
++        for child in ast.walk(store)
++        if isinstance(child, ast.Call)
++        and isinstance(child.func, ast.Name)
++        and child.func.id == "pack_scale_words"
++    ]
++    assert len(calls) == 1
++    assert calls[0].keywords == []
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index d15eba720..7a5aa4ce4 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -77,7 +77,8 @@ def _mxfp8(x):
+ )
+ def test_mxfp8_gemm(n, k):
+     weight, exps, weight_values = _block32_weight(n, k, 1)
+-    weight_sf = pack_scale_words(exps, rows=n)
++    # Packed block grid. The GEMM loads SFB[row // 32].
++    weight_sf = pack_scale_words(exps)
+     x = torch.randn((max(ROWS), k), generator=_gen(2), device=DEVICE).bfloat16()
+     xq, sf, x_values = _mxfp8(x)
+     ref = x_values @ weight_values.T
+@@ -126,7 +127,8 @@ def test_mxfp8_decode_tile_repeats(n=2048, k=2048, runs=100):
+     unspecialized pipeline.
+     """
+     weight, exps, _ = _block32_weight(n, k, 5)
+-    weight_sf = pack_scale_words(exps, rows=n)
++    # Packed block grid. The GEMM loads SFB[row // 32].
++    weight_sf = pack_scale_words(exps)
+     x = torch.randn((DECODE_ROWS, k), generator=_gen(6), device=DEVICE).bfloat16()
+     xq, sf, _ = _mxfp8(x)
+     words = sf.contiguous().view(torch.uint32)
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index b234260e5..6301a373f 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -60,7 +60,8 @@ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+         return []
+     segments = [
+         _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
+-        # The TileLang block-32 projections read per-row scale words beside it.
++        # Scale bytes beside the weight: packed 32-row block words, or WO-A's
++        # raw 32x32 exponent grid. The GEMM indexes either with row // 32.
+         _l2pf.tensor_segment(
+             f"{name}.tilelang_weight_sf",
+             getattr(linear, "tilelang_weight_sf", None),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 85819043c..2931c327d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -12,8 +12,9 @@ per-block promotion loop is needed.
+ 
+ Scales reach ``T.mma_gemm_blockscaled`` as uint32 words, each packing the
+ UE8M0 exponents of four consecutive K32 blocks of one row (byte ``j`` covers
+-K block ``4 * word + j``). The weight's 32x32 block scales are broadcast to
+-per-row words once on the host.
++K block ``4 * word + j``). The weight's 32x32 block scales are stored as that
++packed grid; the GEMM loads ``SFB[row // 32]``, the word a per-row broadcast
++would have copied to that row. Activation scales stay one word per row.
+ """
+ 
+ import tilelang
+@@ -21,6 +22,7 @@ import tilelang.language as T
+ import torch
+ 
+ from . import pdl
++from .scale_pack import pack_scale_words
+ 
+ SF_BLOCK = 32  # K elements per UE8M0 scale
+ SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
+@@ -64,10 +66,13 @@ def _mxfp8_gemm(
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+-    M is dynamic. ``SFA`` / ``SFB`` hold ``ceil(K / 128)`` packed UE8M0 words
+-    per row. ``block_K`` is any multiple of 64 dividing K; a block that starts
+-    off a 128-element boundary reads the two words it straddles and tells the
+-    MMA where it starts (``k_start``), so no operand is padded.
++    M is dynamic. ``SFA`` holds ``ceil(K / 128)`` packed UE8M0 words per
++    activation row. ``SFB`` holds those words once per 32 output rows (the
++    packed 32x32 block-scale grid): row ``r`` reads ``SFB[r // 32]``, including
++    inside a group, where groups are stacked in N. ``block_K`` is any multiple
++    of 64 dividing K; a block that starts off a 128-element boundary reads the
++    two words it straddles and tells the MMA where it starts (``k_start``), so
++    no operand is padded.
+ 
+     With ``padded_rows``, ``A`` and ``SFA`` have ``Mp >= M`` rows, a multiple
+     of ``block_M`` (the decode workspace): every activation tile is loaded
+@@ -81,10 +86,12 @@ def _mxfp8_gemm(
+     weight larger than L2 is read once per panel rather than once per row of
+     tiles; it only changes the order tiles run in.
+ 
+-    With ``groups`` > 1 the projection is grouped (the attention's WO-A): ``A`` is
+-    ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
+-    and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
+-    columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
++    With ``groups`` > 1 the projection is grouped: ``A`` is ``[M, groups * K]``,
++    ``B`` stacks the groups' ``[N, K]`` weights, ``SFB`` stacks their block-scale
++    rows (the same words as broadcasting each group), and ``C`` is
++    ``[M, groups * N]``. Output columns of group ``g`` read only A's columns
++    ``g * K`` to ``(g + 1) * K``. One launch covers every group. ``N`` is a
++    multiple of 32, so a group starts on a block-scale row.
+ 
+     With ``shards`` > 1 each of the ``shards`` equal K ranges is summed from
+     zero and the shards are added in order: the arithmetic of
+@@ -98,6 +105,7 @@ def _mxfp8_gemm(
+     assert K % block_K == 0 and block_K % 64 == 0, (
+         "block_K must divide K and be a multiple of 64"
+     )
++    assert N % 32 == 0, "block scales are one row per 32 output rows"
+     assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
+         "grouped tiles must not straddle a group"
+     )
+@@ -118,7 +126,7 @@ def _mxfp8_gemm(
+         A: T.Tensor((Mp, groups * K), in_dtype),
+         B: T.Tensor((total_N, K), in_dtype),
+         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
+-        SFB: T.Tensor((total_N, sf_words), T.uint32),
++        SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
+         C: T.Tensor((M, total_N), out_dtype),
+     ):
+         with T.Kernel(
+@@ -147,6 +155,9 @@ def _mxfp8_gemm(
+                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
+                 T.copy(B[bx * block_N, ko * block_K], B_shared)
+                 # Edge tiles clamp their scale rows; those rows are never stored.
++                # SFB is the packed block grid, so the clamped row is divided by
++                # 32. That is the per-row broadcast's word, and it stays on the
++                # last block row when the tile runs past N.
+                 word0 = ko * block_K // SF_WORD_K
+                 for i, w in T.Parallel(block_M, block_words):
+                     SFA_shared[i, w] = SFA[
+@@ -154,8 +165,9 @@ def _mxfp8_gemm(
+                         a_word + T.min(word0 + w, sf_words - 1),
+                     ]
+                 for j, w in T.Parallel(block_N, block_words):
++                    row = T.min(bx * block_N + j, total_N - 1)
+                     SFB_shared[j, w] = SFB[
+-                        T.min(bx * block_N + j, total_N - 1),
++                        row // 32,
+                         T.min(word0 + w, sf_words - 1),
+                     ]
+                 # The staged words start at the block's first word; k_start
+@@ -209,6 +221,7 @@ def _mxfp8_gemm_partials(
+     workspace). A narrow projection has few N tiles; its shards fill the GPU.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0 and (K // block_K) % shards == 0
++    assert N % 32 == 0, "block scales are one row per 32 output rows"
+     shard_blocks = K // block_K // shards
+     M = T.dynamic("M")
+     Mp = T.dynamic("Mp")
+@@ -221,7 +234,7 @@ def _mxfp8_gemm_partials(
+         A: T.Tensor((Mp, K), in_dtype),
+         B: T.Tensor((N, K), in_dtype),
+         SFA: T.Tensor((Mp, sf_words), T.uint32),
+-        SFB: T.Tensor((N, sf_words), T.uint32),
++        SFB: T.Tensor((N // 32, sf_words), T.uint32),
+         P: T.Tensor((shards, M, N), T.float32),
+     ):
+         with T.Kernel(
+@@ -245,8 +258,10 @@ def _mxfp8_gemm_partials(
+                         T.min(word0 + w, sf_words - 1),
+                     ]
+                 for j, w in T.Parallel(block_N, block_words):
++                    # Same block-grid address as gemm_mxfp8; clamp, then // 32.
++                    row = T.min(bx * block_N + j, N - 1)
+                     SFB_shared[j, w] = SFB[
+-                        T.min(bx * block_N + j, N - 1),
++                        row // 32,
+                         T.min(word0 + w, sf_words - 1),
+                     ]
+                 T.mma_gemm_blockscaled(
+@@ -1083,22 +1098,6 @@ def bf16_gemm_splitk(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def pack_scale_words(exponents: torch.Tensor, rows: int | None = None) -> torch.Tensor:
+-    """Pack ``[..., K / 32]`` UE8M0 bytes into ``[..., ceil(K / 128)]`` uint32 words.
+-
+-    With ``rows``, a ``[rows / 32, K / 32]`` block-scale grid is first
+-    broadcast to every row. Rows whose exponent count is not a multiple of
+-    four gain unread padding bytes (TP4's 576-wide rows: 18 bytes become 20).
+-    """
+-    exponents = exponents.view(torch.uint8)
+-    if rows is not None and exponents.shape[0] != rows:
+-        exponents = exponents.repeat_interleave(rows // exponents.shape[0], dim=0)
+-    pad = -exponents.shape[-1] % 4
+-    if pad:
+-        exponents = torch.nn.functional.pad(exponents, (0, pad), value=127)
+-    return exponents.contiguous().view(torch.uint32)
+-
+-
+ def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     """``[..., K / 32]`` UE8M0 bytes as a base exponent per row and 4-bit codes.
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index ca8850ab3..071f67d7a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -475,10 +475,20 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+ 
+ 
+ def _block32_scale_words(layer) -> None:
+-    """The 32x32 block scales become per-row words of four K32 exponents."""
+-    layer.tilelang_weight_sf = pack_scale_words(
+-        layer.weight_scale_inv.view(torch.uint8), rows=layer.weight.shape[0]
+-    )
++    """Pack the 32x32 block-scale grid. The GEMM indexes it with ``row // 32``.
++
++    ``pack_scale_words(..., rows=N)`` repeats this grid once per output row.
++    Storing the grid keeps ``SFB[row // 32, word]`` equal to that expanded word.
++    Grouped weights are stacked in N, so the same index is the broadcast's word.
++    """
++    scales = layer.weight_scale_inv.view(torch.uint8)
++    rows = layer.weight.shape[0]
++    if scales.shape[0] * 32 != rows:
++        raise ValueError(
++            f"block scales have {scales.shape[0]} rows for {rows} outputs; "
++            "the GEMM reads one scale row per 32 output rows"
++        )
++    layer.tilelang_weight_sf = pack_scale_words(scales)
+ 
+ 
+ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_pack.py b/vllm/models/deepseek_v4_1/tilelang/scale_pack.py
+new file mode 100644
+index 000000000..7205b10dc
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_pack.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pack UE8M0 block scales into the words an MXFP8 GEMM loads.
++
++This module is torch only, so a CPU test can import it without TileLang.
++"""
++
++import torch
++
++
++def pack_scale_words(exponents: torch.Tensor, rows: int | None = None) -> torch.Tensor:
++    """Pack ``[..., K / 32]`` UE8M0 bytes into ``[..., ceil(K / 128)]`` uint32 words.
++
++    With ``rows``, a ``[rows / 32, K / 32]`` block-scale grid is first
++    broadcast to every row. The MXFP8 GEMM stores the grid without that
++    broadcast and loads ``SFB[row // 32]``; those two tensors satisfy
++    ``expanded[row] == block[row // 32]``. Rows whose exponent count is not a
++    multiple of four gain unread padding bytes (TP4's 576-wide rows: 18 bytes
++    become 20).
++    """
++    exponents = exponents.view(torch.uint8)
++    if rows is not None and exponents.shape[0] != rows:
++        exponents = exponents.repeat_interleave(rows // exponents.shape[0], dim=0)
++    pad = -exponents.shape[-1] % 4
++    if pad:
++        exponents = torch.nn.functional.pad(exponents, (0, pad), value=127)
++    return exponents.contiguous().view(torch.uint32)

@@ -514,3 +514,22 @@ reserved).
 Candidate 7's expected deltas (above) apply unchanged. 0534 changes test files only, 0535 no
 bits, and 0536 only what `vllm serve` logs: warnings from libraries that log through the root
 logger appear again.
+
+## Candidate 10 ([rc10/](rc10))
+
+Candidate 9 plus the one change the one-at-a-time experiment
+([../2026-10-27-one-at-a-time](../2026-10-27-one-at-a-time/README.md)) measured as a net gain
+that candidate 9 did not already hold.
+
+- **0537:** the MXFP8 GEMMs load the 32x32 block-scale grid at `SFB[row // 32]` instead of a
+  per-row broadcast (vLLM mxfp8-block-scales, 58938a074). On candidate 9: block-32 GEMM digests
+  equal over 182 cases, serving digests equal, decode grid 1.3% faster, 131K prefill 1.1% faster.
+- **Series:** candidate 9's plus 0537 ([rc10/vllm/series](rc10/vllm/series),
+  [rc10/make_series.py](rc10/make_series.py)): patch head `ebfa73d3`, tree `24313745`.
+  [rc10/source.json](rc10/source.json) adds the capability `tilelang-block-scale-grid`.
+- **Held back:** 2-bit expert scale codes (bit-exact, prefill 2.7-2.8% and c8 1.6% slower).
+  Being reworked, each alone on candidate 10: 0528 (decode 1.2%), 0526 (131K prefill 0.5%),
+  0506 (131K prefill 0.4%) and the expert codes.
+- **Qualification** ([rc10/candidate-tp4.json](rc10/candidate-tp4.json)): the image built on
+  dgx4 and copied to the ring; candidate 9's checks on candidate 9 and candidate 10 (digests must
+  be equal); the lean suite on candidate 9, candidate 10, candidate 9 again.
