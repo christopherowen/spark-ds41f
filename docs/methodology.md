@@ -73,6 +73,13 @@ Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
 counts, and variability across complete runs. Performance is not accepted at the
 expense of model quality or silent request rejection.
 
+Report the stall beside a long prefill (the decode step other streams wait while a
+long prompt prefills) in seconds first: the median and worst step, with the
+plain-decode step it is compared to. A multiple of the plain step goes in brackets
+only. The multiple moves with the plain step, not the stall: a site whose plain
+step is 73 ms read 21.5x for a 1.57 s median stall that reads about 16x against
+our 0.100 s (#503), and a change that speeds up plain decode would raise it.
+
 Every target-hardware startup must be fail-closed. Pre-arm the configured
 startup memory guard before each container launch, verify it remains active
 through API readiness, and reject the run on any driver allocation failure or
