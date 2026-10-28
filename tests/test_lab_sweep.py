@@ -26,11 +26,17 @@ lab = load("lab_for_sweep", "scripts/lab.py")
 lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
 
 
+SITE_SHAPE = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
+
+
 def setUpModule() -> None:
     # Planning resolves the recipe at the site's shape; the example map is a triangle.
-    patcher = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    SITE_SHAPE.start()
+
+
+def tearDownModule() -> None:
+    # As in test_lab: pytest skips unittest's module cleanups, not tearDownModule.
+    SITE_SHAPE.stop()
 
 BASE_PATH = "config/cluster.json"
 EXPERIMENT = "experiments/2026-10-06-prefetch-fill-rate"

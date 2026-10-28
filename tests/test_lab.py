@@ -204,12 +204,19 @@ class BootTimeTest(unittest.TestCase):
         self.assertIsNone(lab.ready_seconds(["boot failed"]))
 
 
+SITE_SHAPE = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
+
+
 def setUpModule() -> None:
     # These tests ran against the default profile when it was TP3 on config/nodes.json;
     # the recipe resolves the same shape for them.
-    patcher = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    SITE_SHAPE.start()
+
+
+def tearDownModule() -> None:
+    # pytest runs tearDownModule but not unittest's module cleanups, and a patch left
+    # running would choose the site's shape for the modules after this one.
+    SITE_SHAPE.stop()
 
 
 # A production profile other than the recipe: the archived TP4 r6k file (a
