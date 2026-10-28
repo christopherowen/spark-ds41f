@@ -1,0 +1,808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:16:55 +0100
+Subject: [PATCH 549/549] [V2] Copy drafts in the runner: wide verification and
+ the copy state's report
+
+The runner sizes verification (request drafts, rejection and greedy
+verification, adaptive verification, the sink, the sampler and structured
+output rows, the kernel declarations) for num_verification_tokens; the
+speculator keeps DSpark's block. After DSpark drafts, the copy drafter
+replaces a copying request's drafts and confidences; adaptive verification
+keeps them with the planned confidences a later step's budget reads (one
+buffer, one TP broadcast; a new request's rows reset), and the async output
+carries the copy allocation to the scheduler. Block verification of a step
+where no request was scheduled more than DSpark's block runs its TileLang
+kernels at the block's width into the lookahead's output (kernel_steps), so
+DSpark's steps run the kernels they ran before. The warmup decodes one request
+at the lookahead and the rest at the block, as the scheduler lays them out.
+test_tilelang_rejection.py reruns at VLLM_TEST_VERIFICATION_STEPS=16.
+---
+ .../spec_decode/test_adaptive_verification.py | 73 +++++++++++++++-
+ .../v1/spec_decode/test_tilelang_rejection.py | 65 ++++++++++----
+ tests/v1/worker/test_prepare_kernels.py       |  2 +
+ vllm/v1/worker/gpu/async_utils.py             | 27 ++++++
+ vllm/v1/worker/gpu/model_runner.py            | 85 +++++++++++++++++--
+ .../gpu/spec_decode/adaptive_verification.py  | 30 +++++--
+ .../gpu/spec_decode/rejection_sampler.py      | 40 ++++++---
+ .../spec_decode/rejection_sampler_utils.py    |  4 +
+ .../gpu/spec_decode/tilelang_rejection.py     | 14 ++-
+ vllm/v1/worker/gpu/warmup.py                  | 19 +++--
+ 10 files changed, 308 insertions(+), 51 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 110a956ff..b54928687 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -71,7 +71,10 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+     leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
+     manager = make_manager(local.numpy().copy(), row_cost=1.0)
+     manager.req_states.device = torch.device("cpu")
+-    manager._confidence_probs = torch.empty_like(local)
++    # Without copy drafts the planned confidences are the current ones.
++    manager._confidence_buffer = torch.empty((1, *local.shape))
++    manager._confidence_probs = manager._confidence_buffer[0]
++    manager._planned_probs = manager._confidence_buffer[-1]
+     manager._pending_resets = []
+ 
+     class CopyBuffer:
+@@ -127,6 +130,74 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+     assert local.item() < 0.5  # The caller's proposal confidence is not mutated.
+ 
+ 
++def test_planned_confidences_reach_the_budget_and_the_current_the_ranking(
++    monkeypatch,
++):
++    """Copy drafts: the host budget reads a later proposal's planned confidences,
++    the device ranking the current ones; one broadcast keeps both TP-wide, and a
++    new request's planned row starts at 1 like its current one."""
++    steps = 4
++    current = torch.tensor([[0.9, 0.9, 0.0, 0.0]])
++    planned = torch.tensor([[0.9, 0.9, 0.9, 0.9]])
++    manager = make_manager(np.ones((2, steps), dtype=np.float32))
++    manager.req_states.device = torch.device("cpu")
++    manager._confidence_buffer = torch.full((2, 2, steps), -1.0)
++    manager._confidence_probs = manager._confidence_buffer[0]
++    manager._planned_probs = manager._confidence_buffer[-1]
++    manager._pending_resets = []
++    manager._new_rows = []
++
++    class CopyBuffer:
++        def __init__(self):
++            self.np = np.ones((2, steps), dtype=np.float32)
++            self.gpu = torch.empty((2, steps))
++
++        def copy_to_cpu(self):
++            self.np[:] = self.gpu.numpy()
++
++    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
++    manager._stale_idx = 0
++    manager._copy_events = [
++        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
++    ]
++    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
++    broadcasts = []
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            world_size=2, broadcast=lambda t, src: broadcasts.append(t)
++        ),
++    )
++    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
++    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
++    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
++
++    def scatter_rows(idx_mapping, source, state, gather=False):
++        state[idx_mapping, : source.shape[1]] = source
++
++    def fill_rows(rows, state, value):
++        state[rows] = value
++
++    monkeypatch.setattr(adaptive_module.tilelang_inputs, "scatter_rows", scatter_rows)
++    monkeypatch.setattr(adaptive_module.tilelang_inputs, "fill_rows", fill_rows)
++    monkeypatch.setattr(
++        adaptive_module, "async_tensor_h2d", lambda v, **_: torch.tensor(v)
++    )
++    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
++    for _ in range(2):
++        manager.record_confidences(current, batch, planned=planned)
++    assert [t is manager._confidence_buffer for t in broadcasts] == [True, True]
++    torch.testing.assert_close(manager._confidence_probs[0], current[0])
++    np.testing.assert_array_equal(
++        manager._stale_confidences[manager._stale_idx].np[0], planned[0].numpy()
++    )
++    # A request takes slot 1: both of its rows start at 1.
++    manager.add_request(1)
++    manager.apply_staged_writes()
++    assert (manager._confidence_buffer[:, 1] == 1).all()
++
++
+ @pytest.mark.parametrize(
+     "target_support,varlen_decode,allowed",
+     [
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+index 12f0bffee..47ff0745b 100644
+--- a/tests/v1/spec_decode/test_tilelang_rejection.py
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -29,6 +29,7 @@ per-request seeds, and logits with ties, infinities and NaN."""
+ 
+ import itertools
+ import math
++import os
+ 
+ import pytest
+ import torch
+@@ -49,7 +50,9 @@ pytestmark = pytest.mark.skipif(
+ 
+ DEVICE = torch.device("cuda")
+ VOCAB = 129280  # DeepSeek V4.1
+-STEPS = 5  # DSpark's num_speculative_steps
++# DSpark's num_speculative_steps; VLLM_TEST_VERIFICATION_STEPS=16 reruns the file
++# at copy drafts' verification lookahead.
++STEPS = int(os.environ.get("VLLM_TEST_VERIFICATION_STEPS", "5"))
+ SLOTS = 160
+ # A sum of the other columns' exponentials within this of its value (the
+ # exponentials' and the sums' roundings: tests/v1/worker/
+@@ -96,8 +99,9 @@ def _assert_close(ours: float, ref: float, bound: float, what: str) -> None:
+ 
+ def _counts(rows: int) -> list[int]:
+     """Logits rows of the requests covering ``rows`` rows: 1 to STEPS + 1 each (0 to
+-    5 drafts, adaptive verification's shorter blocks included)."""
+-    pattern = itertools.cycle([6, 1, 4, 6, 2, 5, 3, 6])
++    STEPS drafts, adaptive verification's shorter blocks included)."""
++    full = STEPS + 1
++    pattern = itertools.cycle([full, 1, 4, full, 2, 5, 3, full])
+     counts: list[int] = []
+     while sum(counts) < rows:
+         counts.append(min(next(pattern), rows - sum(counts)))
+@@ -981,6 +985,33 @@ def test_rejection_sample_rows_do_not_depend_on_the_batch():
+         assert torch.equal(sampled[0, : count.item()], whole[r, : count.item()])
+ 
+ 
++@pytest.mark.parametrize("temps", ["sampled", "mixed"])
++@pytest.mark.parametrize("dead_rows", [False, True])
++def test_a_step_without_a_copy_verifies_at_the_block(temps, dead_rows):
++    """Copy drafts widen the sampled tokens to the lookahead (16); a step whose
++    requests verify at most DSpark's block (5) runs the kernels at the block's
++    width (``kernel_steps``), into the wide output: the same tokens and counts,
++    bit for bit, as verification compiled at the block."""
++    batch = _batch([6, 1, 4, 6, 2, 5, 3, 6] * 2, temps, 71, VOCAB)
++    logits = _logits(batch, VOCAB, torch.float32, "peaked", 71)
++    cut = _cut(batch, 71) if dead_rows else None
++
++    def run(steps, kernel_steps=None):
++        return rs.rejection_sample(
++            logits, None, batch["drafts"], batch["cu"], batch["pos"],
++            batch["idx_mapping"], batch["expanded"], batch["local"],
++            batch["temperature"], batch["seeds"], steps,
++            use_block_verification=True, dead_row_cut=cut, kernel_steps=kernel_steps,
++        )  # fmt: skip
++
++    block, block_counts = run(5)
++    wide, wide_counts = run(16, kernel_steps=5)
++    assert wide.shape == (block.shape[0], 17)
++    _assert_same(wide_counts, block_counts, "counts")
++    for r, n in enumerate(block_counts.tolist()):
++        assert torch.equal(wide[r, :n], block[r, :n]), r
++
++
+ def test_rejection_sample_without_requests():
+     """No launch: TileLang's grids may not be empty."""
+     index = torch.empty(0, dtype=torch.int64, device=DEVICE)
+@@ -1260,20 +1291,22 @@ def test_capping_after_the_scan_is_not_the_truncated_block():
+     """The positive control of the truncated-block tests: verifying every draft and
+     capping each count at its cut plus one afterwards commits other tokens or
+     counts than the truncated block for some sampled requests (the dead rows'
+-    thresholds decide where a block ends), here with random dead rows."""
+-    batch = _batch(_counts(480), "sampled", 61, VOCAB)
+-    cut = _cut(batch, 61)
+-    clean = _logits(batch, VOCAB, torch.float32, "peaked", 61)
+-    logits = _garbage(clean, batch, cut, "random", 61)
+-    sampled, counts = _rejection_sample(logits, batch)
+-    counts = torch.minimum(counts, cut + 1)
+-    expected, expected_counts = _rejection_sample(*_truncated(clean, batch, cut))
++    thresholds decide where a block ends), here with random dead rows, over a few
++    batches (at the copy lookahead most blocks end before their cut)."""
+     differ = 0
+-    for r in range(cut.shape[0]):
+-        n = int(expected_counts[r])
+-        differ += int(counts[r]) != n or not torch.equal(
+-            sampled[r, :n], expected[r, :n]
+-        )
++    for seed in range(61, 69):
++        batch = _batch(_counts(480), "sampled", seed, VOCAB)
++        cut = _cut(batch, seed)
++        clean = _logits(batch, VOCAB, torch.float32, "peaked", seed)
++        logits = _garbage(clean, batch, cut, "random", seed)
++        sampled, counts = _rejection_sample(logits, batch)
++        counts = torch.minimum(counts, cut + 1)
++        expected, expected_counts = _rejection_sample(*_truncated(clean, batch, cut))
++        for r in range(cut.shape[0]):
++            n = int(expected_counts[r])
++            differ += int(counts[r]) != n or not torch.equal(
++                sampled[r, :n], expected[r, :n]
++            )
+     assert differ > 0
+ 
+ 
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index f7d24a3cc..8cfca62b6 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -156,6 +156,7 @@ def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
+         _register_kv_cache_warmups=lambda *_: None,
+         speculator=SimpleNamespace(enable_adaptive_verification=True),
+         adaptive_verification=None,
++        copy_drafter=None,
+         batch_sharder=None,
+         num_speculative_steps=steps,
+         draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
+@@ -255,6 +256,7 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+                 enable_adaptive_verification=True, draft_logits=None
+             ),
+             adaptive_verification=None,  # built later, by initialize_kv_cache
++            copy_drafter=None,
+             batch_sharder=None,
+             num_speculative_steps=steps,
+             draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 7099c6198..5cc5aec58 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -145,6 +145,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+         self.copy_event = torch.cuda.Event(blocking=True)
+         self._has_fault: torch.Tensor | None = None
++        # Copy drafts: the allocation the drafter reports after it proposed.
++        self.copy_draft_alloc: torch.Tensor | None = None
++        self.copy_draft_alloc_np: np.ndarray | None = None
++        self.copy_draft_alloc_event: torch.cuda.Event | None = None
+ 
+         # Sink rejection replaces the sampled tokens by the committed ones
+         # with draft zero in front (vllm.v1.worker.gpu.sample.sink).
+@@ -207,6 +211,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+             self.copy_event.record(copy_stream)
+ 
++    def attach_copy_draft_alloc(
++        self,
++        copy_draft_alloc: torch.Tensor,
++        copy_stream: torch.cuda.Stream,
++        main_stream: torch.cuda.Stream,
++    ) -> None:
++        """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
++        written by this step's proposal after the outputs' copy began, to the host
++        behind that proposal. The drafter reuses its buffer next step: the copy
++        reads a snapshot."""
++        self.copy_draft_alloc = copy_draft_alloc.clone()
++        self.copy_draft_alloc_event = torch.cuda.Event(blocking=True)
++        with stream(copy_stream, main_stream):
++            copy_stream.wait_stream(main_stream)
++            self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
++            self.copy_draft_alloc_event.record(copy_stream)
++
+     def get_output(self) -> ModelRunnerOutput:
+         self.copy_event.synchronize()
+ 
+@@ -227,6 +248,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             self.model_runner_output.num_verified_draft_tokens = (
+                 self.num_verified_draft_tokens_np.tolist()
+             )
++        if self.copy_draft_alloc_np is not None:
++            assert self.copy_draft_alloc_event is not None
++            self.copy_draft_alloc_event.synchronize()
++            self.model_runner_output.copy_draft_alloc = (
++                self.copy_draft_alloc_np.tolist()
++            )
+ 
+         if self.sampling_mask_tensors is not None:
+             self.model_runner_output.sampling_masks = (
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 85e0a2093..5a8afd1e4 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -197,6 +197,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+     maybe_create_adaptive_verification_manager,
+     resolve_adaptive_cudagraph_mode,
+ )
++from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+     DraftBlockTableLayout,
+@@ -347,7 +348,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Speculative decoding.
+         self.speculator = None
+         self.use_aux_hidden_state_outputs = False
+-        self.num_speculative_steps = vllm_config.num_speculative_tokens
++        # The most drafts a request verifies in a step, which sizes every buffer
++        # a verified row touches; copy drafts widen it past the drafter's block
++        # (num_draft_steps), which stays the speculator's.
++        self.num_speculative_steps = vllm_config.num_verification_tokens
++        self.num_draft_steps = vllm_config.num_speculative_tokens
++        self.copy_drafter: CopyDrafter | None = None
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+@@ -399,6 +405,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             device=self.device,
+             num_prefill_lookahead=num_prefill_lookahead,
+         )
++        copy_drafts = (
++            self.speculative_config.copy_drafts
++            if self.speculative_config is not None
++            else None
++        )
++        if copy_drafts is not None and self.speculator is not None:
++            if vllm_config.use_request_boundary_checkpoints:
++                raise ValueError(
++                    "copy_drafts does not support request-boundary checkpoints"
++                )
++            self.copy_drafter = CopyDrafter(
++                copy_drafts,
++                self.req_states,
++                num_draft_steps=self.num_draft_steps,
++                device=self.device,
++            )
+         self.adaptive_verification: AdaptiveVerificationManager | None = None
+         self.input_buffers = InputBuffers(
+             max_num_reqs=self.max_num_reqs,
+@@ -538,10 +560,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.vllm_config, self.model, self.encoder_cache, self.device
+             )
+ 
++        # A decoding request's rows at most (its verification), and the rows of
++        # a request at the drafter's block, every request's width without copy
++        # drafts (the uniform decode batch).
+         self.decode_query_len = (
+             self.num_speculative_steps
+             + self.model_state.num_new_sampled_tokens_per_step
+         )
++        self.uniform_decode_query_len = (
++            self.num_draft_steps + self.model_state.num_new_sampled_tokens_per_step
++        )
+ 
+         if self.parallel_config.enable_batch_sharded_sampling:
+             if hasattr(self.model, "compute_logits_local"):
+@@ -793,7 +821,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ),
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
++            planned_confidences=self.copy_drafter is not None,
+         )
++        if self.copy_drafter is not None and self.adaptive_verification is None:
++            # The draft budget decides how many of a copy's drafts a step
++            # verifies; the drafter's checkpoint must carry a confidence head.
++            raise ValueError(
++                "copy_drafts requires adaptive verification, which this drafter "
++                "does not provide"
++            )
+ 
+         self.block_tables = BlockTables(
+             block_sizes=block_sizes,
+@@ -1531,6 +1567,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.add_request(req_index)
++            if self.copy_drafter is not None:
++                # A slot's copy state starts afresh with each request it holds.
++                self.copy_drafter.add_request(req_index)
+ 
+             if self.pooling_runner is not None:
+                 assert new_req_data.pooling_params is not None
+@@ -1567,6 +1606,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.model_state.apply_staged_writes()
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.apply_staged_writes()
++            if self.copy_drafter is not None:
++                self.copy_drafter.apply_staged_writes()
+         if self.sampler is not None:
+             self.sampler.apply_staged_writes()
+ 
+@@ -1630,7 +1671,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         draft_tokens = self._drafter_spec_tokens(scheduler_output)
+         # batch_idx -> req_id
+         req_ids = sort_batch_req_ids(
+-            num_tokens_per_req, draft_tokens, self.decode_query_len
++            num_tokens_per_req, draft_tokens, self.uniform_decode_query_len
+         )
+ 
+         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
+@@ -2159,6 +2200,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 + tilelang_inputs.fill_rows_calls(torch.int64, torch.float32)
+             )
+         self.req_states.register_warmups()
++        if self.copy_drafter is not None:
++            self.copy_drafter.register_warmups()
+         if not samples:
+             return
+         assert self.sampler is not None
+@@ -2744,7 +2787,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             allow_ubatching=(
+                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
+             ),
+-            uniform_decode=uniform_tok_count == self.decode_query_len,
++            uniform_decode=uniform_tok_count == self.uniform_decode_query_len,
+         )
+ 
+         if batch_desc.num_tokens == 0:
+@@ -2798,7 +2841,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     routed_experts=None,
+                     cudagraph_stats=cudagraph_stats,
+                     num_spec_tokens_to_schedule=scheduler_output.resolve_num_spec_tokens_to_schedule(
+-                        self.num_speculative_steps
++                        self.num_draft_steps
+                     ),
+                     boundary_logits_only=True,
+                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
+@@ -3093,7 +3136,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cudagraph_stats=cudagraph_stats,
+             num_spec_tokens_to_schedule=(
+                 scheduler_output.resolve_num_spec_tokens_to_schedule(
+-                    self.num_speculative_steps
++                    self.num_draft_steps
+                 )
+             ),
+         )
+@@ -3356,7 +3399,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 draft_tokens = limit_draft_tokens(
+                     draft_tokens,
+                     num_spec_tokens_to_schedule,
+-                    self.num_speculative_steps,
++                    self.num_draft_steps,
++                )
++            confidences = self.speculator.draft_token_confidence_probs
++            planned_confidences = None
++            if self.copy_drafter is not None:
++                # A request whose context repeats its own earlier text takes the
++                # copy in place of DSpark's drafts.
++                assert self.adaptive_verification is not None
++                verified = (
++                    self.adaptive_verification.get_verified_draft_counts(
++                        input_batch.num_reqs
++                    )
++                    if input_batch.num_draft_tokens_per_req is not None
++                    else None
++                )
++                draft_tokens, confidences, planned_confidences = (
++                    self.copy_drafter.propose(
++                        input_batch.idx_mapping,
++                        draft_tokens,
++                        confidences,
++                        num_sampled,
++                        verified,
++                        self._dead_row_cut if verified is not None else None,
++                    )
++                )
++                async_output.attach_copy_draft_alloc(
++                    self.copy_drafter.alloc[: input_batch.num_reqs],
++                    self.output_copy_stream,
++                    self.main_stream,
+                 )
+             num_draft_tokens = draft_tokens.shape[1]
+             if num_draft_tokens > 0:
+@@ -3371,7 +3442,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 draft_tokens_for_next_step = draft_tokens
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+-                    self.speculator.draft_token_confidence_probs, input_batch
++                    confidences, input_batch, planned=planned_confidences
+                 )
+         elif self.speculator is not None:
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index a5a5d7333..f98789329 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -116,6 +116,7 @@ class AdaptiveVerificationManager:
+         num_bonus_tokens: int,
+         max_total_logits: int,
+         row_cost: float,
++        planned_confidences: bool = False,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -142,12 +143,17 @@ class AdaptiveVerificationManager:
+         self.query_start_loc = query_start_loc
+         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+         max_num_reqs = req_states.max_num_reqs
+-        # Current per-slot confidences
+-        self._confidence_probs = torch.empty(
+-            (max_num_reqs, self.num_speculative_steps),
++        # Current per-slot confidences, and with copy drafts (planned_confidences)
++        # the confidences a later step's budget reads: a copy's are those of the
++        # proposal after the current one, whose rows the scheduler lays out from
++        # the same copy state. One buffer, so one broadcast keeps both TP-wide.
++        self._confidence_buffer = torch.empty(
++            (1 + planned_confidences, max_num_reqs, self.num_speculative_steps),
+             dtype=torch.float32,
+             device=device,
+         )
++        self._confidence_probs = self._confidence_buffer[0]
++        self._planned_probs = self._confidence_buffer[-1]
+         self._batch_draft_capacity = torch.empty(
+             max_num_reqs, dtype=torch.int32, device=device
+         )
+@@ -184,6 +190,9 @@ class AdaptiveVerificationManager:
+                 self._new_rows, dtype=torch.int64, device=self._confidence_probs.device
+             )
+             tilelang_inputs.fill_rows(rows, self._confidence_probs, 1.0)
++            if self._confidence_buffer.shape[0] > 1:
++                # Nothing of the slot's previous request reaches a later budget.
++                tilelang_inputs.fill_rows(rows, self._planned_probs, 1.0)
+             self._new_rows.clear()
+ 
+     def warm_tail_shapes(
+@@ -222,9 +231,11 @@ class AdaptiveVerificationManager:
+         self,
+         confidence_probs: torch.Tensor,
+         input_batch: "InputBatch",
++        planned: torch.Tensor | None = None,
+     ) -> None:
+         """Publish this step's raw confidences for the ranking kernel and start
+-        copying them to the CPU, where a later step's budget reads them."""
++        copying them to the CPU, where a later step's budget reads them; with
++        copy drafts, ``planned`` holds what that budget reads instead."""
+         ready_idx = self._stale_idx ^ 1
+         with gpu_sync_allowed():
+             self._copy_events[ready_idx].synchronize()
+@@ -238,14 +249,19 @@ class AdaptiveVerificationManager:
+         tilelang_inputs.scatter_rows(
+             input_batch.idx_mapping, confidence_probs, self._confidence_probs
+         )
++        assert (planned is not None) == (self._confidence_buffer.shape[0] > 1)
++        if planned is not None:
++            tilelang_inputs.scatter_rows(
++                input_batch.idx_mapping, planned, self._planned_probs
++            )
+         # Replicated projections may differ through unordered floating-point
+         # reductions. Both CPU graph selection and GPU request compaction must
+         # consume one TP-wide confidence snapshot to issue matching collectives.
+         tp_group = get_tp_group()
+         if tp_group.world_size > 1:
+-            tp_group.broadcast(self._confidence_probs, src=0)
++            tp_group.broadcast(self._confidence_buffer, src=0)
+         write_slot = self._stale_confidences[write_idx]
+-        write_slot.gpu.copy_(self._confidence_probs)
++        write_slot.gpu.copy_(self._planned_probs)
+ 
+         current_stream = torch.cuda.current_stream(self.req_states.device)
+         self._copy_stream.wait_stream(current_stream)
+@@ -473,6 +489,7 @@ def maybe_create_adaptive_verification_manager(
+     adaptive_verification_row_cost: float = 0.02,
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
++    planned_confidences: bool = False,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -540,4 +557,5 @@ def maybe_create_adaptive_verification_manager(
+         num_bonus_tokens,
+         max_total_logits=max_total_logits,
+         row_cost=adaptive_verification_row_cost,
++        planned_confidences=planned_confidences,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 7137d251f..a57fcb799 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -136,7 +136,11 @@ class RejectionSampler:
+         self.sink: SinkSampler | None = None
+         if watermark_key is not None:
+             assert isinstance(sampler, GPUWatermarkSampler)
+-        self.num_speculative_steps = spec_config.num_speculative_tokens
++        # The most drafts a request verifies (copy drafts widen DSpark's block),
++        # and the drafter's block: a step with no copy verifies at most that many,
++        # and block verification runs its kernels at that width.
++        self.num_speculative_steps = spec_config.num_verification_tokens
++        self.num_draft_steps = spec_config.num_speculative_tokens
+         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
+         rejection_sample_method = spec_config.rejection_sample_method
+         self.use_block_verification: bool = False
+@@ -199,15 +203,16 @@ class RejectionSampler:
+             )
+         if has_draft_logits or self.watermark_key is not None:
+             return
+-        register_rejection_sample_warmups(
+-            logits=(*logits, *processed_logits),
+-            vocab_size=vocab_size,
+-            num_speculative_steps=self.num_speculative_steps,
+-            synthetic_mode=self.synthetic_conditional_rates is not None,
+-            use_block_verification=self.use_block_verification,
+-            use_fp64=self.sampler.use_fp64_gumbel,
+-            dead_rows=dead_rows,
+-        )
++        for steps in dict.fromkeys((self.num_speculative_steps, self.num_draft_steps)):
++            register_rejection_sample_warmups(
++                logits=(*logits, *processed_logits),
++                vocab_size=vocab_size,
++                num_speculative_steps=steps,
++                synthetic_mode=self.synthetic_conditional_rates is not None,
++                use_block_verification=self.use_block_verification,
++                use_fp64=self.sampler.use_fp64_gumbel,
++                dead_rows=dead_rows,
++            )
+         tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
+         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         register_topk_scores_warmup(
+@@ -290,10 +295,13 @@ class RejectionSampler:
+         expanded_local_pos: torch.Tensor,
+         dead_row_cut: torch.Tensor | None = None,
+         sink: _SinkChunk | None = None,
++        kernel_steps: int | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         """With ``dead_row_cut`` ([num_reqs] int32), each request commits at most its
+         cut plus one: block verification ends its block at the cut, the other
+-        methods cap the count (the insertion of the resampled token stores it so)."""
++        methods cap the count (the insertion of the resampled token stores it so).
++        ``kernel_steps``: the drafts every request of the step verifies at most,
++        the width block verification's kernels run at."""
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -329,6 +337,7 @@ class RejectionSampler:
+             use_fp64=self.sampler.use_fp64_gumbel,
+             use_block_verification=self.use_block_verification,
+             dead_row_cut=dead_row_cut,
++            kernel_steps=kernel_steps,
+             **self._watermarking_kwargs(
+                 draft_sampled, expanded_idx_mapping, expanded_local_pos
+             ),
+@@ -374,6 +383,14 @@ class RejectionSampler:
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
++        # Copy drafts: a step where no request was scheduled more than the
++        # drafter's block (no copy) verifies at that width, as without them.
++        kernel_steps = None
++        drafts = input_batch.num_draft_tokens_per_req
++        if self.num_draft_steps < self.num_speculative_steps and (
++            drafts is None or int(drafts.max(initial=0)) <= self.num_draft_steps
++        ):
++            kernel_steps = self.num_draft_steps
+ 
+         if logits.shape[0] <= max_chunk_logits:
+             # One chunk covers the batch. Adaptive verification compacts the logits
+@@ -421,6 +438,7 @@ class RejectionSampler:
+                 input_batch.expanded_local_pos[lo:hi],
+                 None if dead_row_cut is None else dead_row_cut[start:end],
+                 sink,
++                kernel_steps,
+             )
+             if sink is not None:
+                 alternates = sink.alternates
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 253ca50a4..4fb8822c7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1336,6 +1336,9 @@ def rejection_sample(
+     # the other methods, which verify each draft from its own row, cap the count at
+     # the cut + 1.
+     dead_row_cut: torch.Tensor | None = None,
++    # Block verification's TileLang kernels at this many drafts for a step whose
++    # requests verify no more (copy drafts: DSpark's block without a copy).
++    kernel_steps: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+     assert draft_logits is None or (
+@@ -1372,6 +1375,7 @@ def rejection_sample(
+                 seed,
+                 num_speculative_steps,
+                 dead_row_cut,
++                kernel_steps,
+             )
+         )
+         # A block that ends at the cut commits at most the cut + 1: no cap.
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+index 486bb870b..71ecf351f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -1112,6 +1112,7 @@ def verify_and_resample(
+     num_speculative_steps: int,
+     # [num_reqs] int32
+     dead_row_cut: torch.Tensor | None = None,
++    kernel_steps: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """``rejection_sample``'s launches before the insertion, with one-hot drafts,
+     block verification, FP32 draws and no watermark: the sampled tokens
+@@ -1119,9 +1120,14 @@ def verify_and_resample(
+     token, their counts ([num_reqs], int32), and the block winners of that token's
+     resampling (``[num_reqs, cdiv(V, 1024)]`` indices, int64, and scores, FP32).
+     With ``dead_row_cut``, each request's block ends at its cut: a count is at most
+-    the cut, and the token after it comes from a live row."""
++    the cut, and the token after it comes from a live row. ``kernel_steps``: a step
++    whose requests verify at most this many drafts runs the kernels at that width
++    (copy drafts: DSpark's block on a step without a copy); the sampled tokens keep
++    every column."""
+     num_reqs = cu_num_logits.shape[0] - 1
+     num_logits, vocab_size = target_logits.shape
++    steps = num_speculative_steps if kernel_steps is None else kernel_steps
++    assert steps <= num_speculative_steps
+ 
+     # The per-vocab-block logits stats: target argmax for greedy requests, target
+     # max and summed exponentials for the others.
+@@ -1139,7 +1145,7 @@ def verify_and_resample(
+         expanded_idx_mapping,
+         expanded_local_pos,
+         temperature,
+-        num_speculative_steps,
++        steps,
+     )
+ 
+     # Verification up to the first rejected or bonus token.
+@@ -1151,7 +1157,7 @@ def verify_and_resample(
+     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
+     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
+     verify(
+-        sampled,
++        sampled[:, : steps + 1],
+         num_sampled,
+         target_rejected_logsumexp,
+         draft_rejected_logsumexp,
+@@ -1166,7 +1172,7 @@ def verify_and_resample(
+         temperature,
+         seed,
+         pos,
+-        num_speculative_steps,
++        steps,
+         dead_row_cut,
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 556f0f1a7..b78621519 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -335,6 +335,7 @@ def _warmup_kernels(
+         return
+     num_spec_steps = model_runner.num_speculative_steps
+     decode_query_len = model_runner.decode_query_len
++    uniform_query_len = model_runner.uniform_decode_query_len
+     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
+     # length exceeds decode_query_len, preventing it from being misclassified as
+     # a uniform decode batch.
+@@ -463,7 +464,10 @@ def _warmup_kernels(
+         draft_zero = _sink_draft_zero(model_runner)
+ 
+         def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
+-            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
++            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`:
++            the first at the verification width, the others at the drafter's
++            block (they differ with copy drafts), as the scheduler lays them
++            out within its decode rows."""
+             cached_req_data = CachedRequestData.make_empty()
+             cached_req_data.req_ids = [req_ids[i] for i in indices]
+             cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
+@@ -472,8 +476,9 @@ def _warmup_kernels(
+ 
+             step_num_scheduled_tokens: dict[str, int] = {}
+             step_spec_tokens: dict[str, list[int]] = {}
+-            for i, use_spec in zip(indices, spec_flags):
+-                num_tokens = decode_query_len if use_spec else 1
++            for position, (i, use_spec) in enumerate(zip(indices, spec_flags)):
++                query_len = decode_query_len if position == 0 else uniform_query_len
++                num_tokens = query_len if use_spec else 1
+                 after = req_computed[i] + num_tokens
+                 deltas = [
+                     block_count(after, spec) - held
+@@ -489,7 +494,9 @@ def _warmup_kernels(
+                 if draft_zero:
+                     step_spec_tokens[req_ids[i]] = [0] * (num_tokens)
+                 elif use_spec:
+-                    step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
++                    step_spec_tokens[req_ids[i]] = [0] * (
++                        query_len - decode_query_len + num_spec_steps
++                    )
+ 
+             decode_output = SchedulerOutput.make_empty()
+             decode_output.scheduled_cached_reqs = cached_req_data
+@@ -505,8 +512,8 @@ def _warmup_kernels(
+             worker_execute_model(decode_output)
+             worker_sample_tokens(None)
+ 
+-            for i, use_spec in zip(indices, spec_flags):
+-                req_computed[i] += decode_query_len if use_spec else 1
++            for i in indices:
++                req_computed[i] += step_num_scheduled_tokens[req_ids[i]]
+ 
+         all_indices = list(range(num_reqs))
+         use_spec_decode = num_spec_steps > 0

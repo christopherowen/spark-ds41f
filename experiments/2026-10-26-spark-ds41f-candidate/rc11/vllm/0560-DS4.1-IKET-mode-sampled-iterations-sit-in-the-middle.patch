@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 04:19:01 +0100
+Subject: [PATCH 560/560] [DS4.1] IKET mode: sampled iterations sit in the
+ middle of their share of the loop
+
+---
+ tests/kernels/test_deepseek_v41_tilelang_iket.py | 4 +++-
+ vllm/models/deepseek_v4_1/tilelang/iket.py       | 7 ++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 488e82a5f..4837d69da 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -139,7 +139,9 @@ def test_sampled_ctas_guard_every_event():
+ 
+ def test_sampled_iterations_guard_loop_ranges():
+     out, sites = iket.annotate(KERNEL, _token, iters=2)
+-    stride = "((int)((ko) - (0)) % max(1, (int)(((4) - (0) + 1) / 2)) == 0)"
++    # Iterations 1 and 3 of four: the middle of each half.
++    block = "max(1, (int)(((4) - (0) + 1) / 2))"
++    stride = f"((int)((ko) - (0)) % {block} == {block} / 2)"
+     lines = [line.strip() for line in out.splitlines()]
+     in_loop = [s["range"] for s in sites if s["loops"]]
+     assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 0cbee5cd7..696211bf3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -346,14 +346,15 @@ _FOR = re.compile(
+ 
+ 
+ def _iterations(header: str, iters: int) -> str | None:
+-    """True in at most ``iters`` evenly spread iterations of a TVM ``for`` loop
+-    (``for (int v = start; v < bound; ++v)``), or None for another header."""
++    """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
++    start; v < bound; ++v)``), each in the middle of its share of the loop, so one
++    sample is the middle iteration, not the pipeline's fill; None for another header."""
+     loop = _FOR.match(header)
+     if loop is None:
+         return None
+     v, start, bound = (part.strip() for part in loop.groups())
+     stride = f"max(1, (int)((({bound}) - ({start}) + {iters - 1}) / {iters}))"
+-    return f"((int)(({v}) - ({start})) % {stride} == 0)"
++    return f"((int)(({v}) - ({start})) % {stride} == {stride} / 2)"
+ 
+ 
+ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:

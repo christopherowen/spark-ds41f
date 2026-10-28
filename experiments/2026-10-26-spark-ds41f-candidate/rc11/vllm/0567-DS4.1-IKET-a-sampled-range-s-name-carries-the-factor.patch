@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:28:39 +0100
+Subject: [PATCH 567/567] DS4.1 IKET: a sampled range's name carries the factor
+ to its whole loops (*N)
+
+---
+ .../test_deepseek_v41_tilelang_iket.py        |  3 ++-
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 23 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index f7a91915a..b76f929e5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -150,7 +150,8 @@ def test_sampled_iterations_guard_loop_ranges():
+     stride = f"((int)((ko) - (0)) % {block} == {block} / 2)"
+     lines = [line.strip() for line in out.splitlines()]
+     in_loop = [s["range"] for s in sites if s["loops"]]
+-    assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
++    # Each name carries the factor from its two sampled iterations to the loop's four.
++    assert in_loop == ["wait.cp_async*2", "wait.sync#2*2", "compute.mma*2"]
+     # The loop's trips scale its sampled iterations; a site outside it has none.
+     assert {s["loop_trips"] for s in sites if s["loops"]} == {4}
+     assert not any("loop_trips" in s for s in sites if not s["loops"])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 8539d9920..41689ab11 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -381,6 +381,18 @@ def _loop_trips(headers: tuple[str, ...]) -> int | None:
+     return total
+ 
+ 
++def _sampled_factor(headers: tuple[str, ...], iters: int) -> float | None:
++    """A sampled range's iterations over those it records: the loops' trips over at most
++    ``iters`` of each; None if a loop has no literal bounds."""
++    total, sampled = 1, 1
++    for header in headers:
++        trips = _trips(header)
++        if trips is None or trips < 1:
++            return None
++        total, sampled = total * trips, sampled * min(trips, iters)
++    return total / sampled
++
++
+ def _iterations(header: str, iters: int) -> str | None:
+     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
+     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
+@@ -464,6 +476,17 @@ def annotate(
+     if len({item.name for item in found}) > MAX_EVENTS:
+         for item in found:
+             item.name = item.base
++    elif iters:
++        # A trace holds a sampled loop's chosen iterations, and does not say which
++        # specialization of a kernel a launch ran: a range's name carries the factor
++        # from those iterations to its loops' all, where their bounds are literals.
++        for item in found:
++            factor = _sampled_factor(item.loops, iters)
++            if factor is None or factor <= 1:
++                continue
++            name = f"{item.name}*{factor:g}"
++            if len(name.encode()) <= MAX_NAME_BYTES:
++                item.name = name
+     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
+     inserts: list[tuple[int, int, str]] = []
+     for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):

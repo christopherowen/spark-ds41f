@@ -533,3 +533,48 @@ that candidate 9 did not already hold.
 - **Qualification** ([rc10/candidate-tp4.json](rc10/candidate-tp4.json)): the image built on
   dgx4 and copied to the ring; candidate 9's checks on candidate 9 and candidate 10 (digests must
   be equal); the lean suite on candidate 9, candidate 10, candidate 9 again.
+
+## Candidate 11 ([rc11/](rc11))
+
+The release candidate the owner asked for on 2026-10-28: candidate 10, GLP dual serving
+(`glp-3`), and the correctness and performance work that meets the release bar (temperature-0
+bits exact; a correctness fix, or a measured gain). Anything that fails its check is held back
+for rework, or dropped, and the series is rewritten without it before the qualification runs.
+
+- **Series:** candidate 10's plus 0538-0567 (vLLM `candidate-11`, head 04d945fe9;
+  [rc11/vllm/series](rc11/vllm/series), [rc11/make_series.py](rc11/make_series.py)): patch head
+  `cea2566d`, tree `5454dab7` (reproduced locally with the build's `git am`; `git diff --check`
+  clean). Each part is its branch's commits, cherry-picked:
+
+  | Patches | Part | Why it is in | Its check |
+  | --- | --- | --- | --- |
+  | 0538 | coded-arrive: the grouped MoE GEMM's stage arrivals wait for each thread's copies | correctness: the coded-scale expand could read rows not yet landed | `c10-coded-arrive` (queued) |
+  | 0539-0540 | DeepSeek API effort aliases and prompt semantics (response_format, tool_choice none, the assistant prefix) | correctness of the API | `c10-api-semantics` (queued); oracle passed |
+  | 0541 | GLP steering per request under a second served name (`glp-3`'s 0538) | the owner's request; stock rows bit-identical | `glp-3` qualified and released on 1025 (decode +0.27%, level) |
+  | 0542 | GLP's launch joins the decode chain's PDL (new) | performance: outside the chain, 39 launches a step broke candidate 9's PDL overlap | this qualification's lean bracket; PDL source check |
+  | 0543-0544 | the attention front in one launch | performance: +0.72% c1 in the harness, bit-identical | `c10-front` (queued) |
+  | 0545 | prefill yield (`--prefill-yield short`, 10 s) | TTFT behind a long prefill | `c10-yield` (queued) |
+  | 0546-0550 | copy drafts beside DSpark, **off** (`copy_drafts` unset) | built for the copy A/B; without it every size, kernel and graph is the release's | `c10-copy` (queued); enabled only if it gains |
+  | 0551-0567 | IKET debug mode (`VLLM_DS41_IKET`), off | optional debugging: off, it registers four variables and imports nothing | its test: off adds neither IKET module |
+
+  Conflicts: GLP's imports in `nvidia/model.py` and `model_state.py` (candidate 10 had retired
+  the B12X attention import GLP's context named); copy drafts beside prefill yield in
+  `scheduler.py` (two new methods at one place; the yield deferral runs before the copy
+  widening, which skips prefill chunks); IKET's variables beside GLP's in `envs.py`.
+- **Arm** ([rc11/rc-tp4.json](rc11/rc-tp4.json)): candidate 10's with the `glp` block of
+  `../2026-10-28-glp-dual-serving/cluster.json` (the second served name
+  `deepseek-v4.1-flash-weightless`, the published file mounted) and prefill yield.
+- **Release tests:** `scripts/release_tests.py check` for 19f2c20ed..04d945fe9: 170 selected,
+  115 gate (seven new gate files in `config/release-tests.json`: block-scale words, front, IKET,
+  weightless, copy drafts and its scheduler, prefill yield), 55 excluded, 0 problems.
+  Manifest [rc11/release-tests-gate-manifest.json](rc11/release-tests-gate-manifest.json),
+  bundle [rc11/bundles/release-tests](rc11/bundles/release-tests).
+- **Held back:** expert codes v2 (queued alone; joins only if it gains), X7 (a kernel
+  experiment), the Markov L2 window (a probe; at most +0.5%). The cost check decides whether
+  0506, 0526 and 0528 need rework; they stay, being correctness fixes.
+- **Qualification** ([rc11/candidate-tp4.json](rc11/candidate-tp4.json)): the image built on
+  dgx4 and copied to the ring; the release tests on dgx4; candidate 10's checks on candidate 10
+  and candidate 11 (stock digests must be equal: GLP leaves unmarked rows bit-identical, prefill
+  yield moves no chunk boundary); `dual_probe.py --speed` and AdvBench on candidate 11; the lean
+  suite with the 131K stall probe (`../2026-10-28-candidate-10-levers/yield-suite.json`) on
+  candidate 10, candidate 11, candidate 10 again. It runs after the queued A/Bs.

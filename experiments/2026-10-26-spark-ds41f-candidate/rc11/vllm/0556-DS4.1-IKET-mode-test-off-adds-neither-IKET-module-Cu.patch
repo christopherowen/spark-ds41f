@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:49:22 +0100
+Subject: [PATCH 556/556] [DS4.1] IKET mode test: off adds neither IKET module
+ (CuTe DSL's own loads with vLLM)
+
+---
+ tests/kernels/test_deepseek_v41_tilelang_iket.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index f2251ac46..7367ccd6f 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -226,7 +226,9 @@ print(json.dumps({
+     "sum": c.double().sum().item(),
+     "bits": hashlib.sha256(c.cpu().numpy().tobytes()).hexdigest(),
+     "source_instrumented": "__iket_meta_info" in kernel.get_kernel_source(),
+-    "modules": sorted(m for m in sys.modules if m.endswith(".iket") or ".iket." in m),
++    # The modules the mode adds; CuTe DSL's own experimental IKET loads with vLLM.
++    "modules": sorted(m for m in sys.modules if m.startswith("tilelang.tools.cuda")
++                      or m == "vllm.models.deepseek_v4_1.tilelang.iket"),
+     "callback": tvm_ffi.get_global_func(callback, allow_missing=True) is not None,
+     "cache_enabled": tilelang_env.is_cache_enabled(),
+     "cache_dir": os.environ.get("TILELANG_CACHE_DIR"),

@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:26:48 +0100
+Subject: [PATCH 566/566] DS4.1 IKET: each site's loop trips in the manifest,
+ to scale sampled iterations
+
+---
+ .../test_deepseek_v41_tilelang_iket.py        |  4 ++++
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 23 +++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 6955d33eb..f7a91915a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -151,6 +151,9 @@ def test_sampled_iterations_guard_loop_ranges():
+     lines = [line.strip() for line in out.splitlines()]
+     in_loop = [s["range"] for s in sites if s["loops"]]
+     assert in_loop == ["wait.cp_async", "wait.sync#2", "compute.mma"]
++    # The loop's trips scale its sampled iterations; a site outside it has none.
++    assert {s["loop_trips"] for s in sites if s["loops"]} == {4}
++    assert not any("loop_trips" in s for s in sites if not s["loops"])
+     # Each in-loop range: its start and end events, and its settle.
+     events = [line for line in lines if line.startswith(f"TL_IKET_WHEN({stride}) ")]
+     assert len(events) == 2 * len(in_loop)
+@@ -177,6 +180,7 @@ def test_while_loop_ranges_have_no_bound():
+         ["while (1)"]
+     ]
+     assert {s["events_per_warp_bound"] for s in sites} == {None}
++    assert [s["loop_trips"] for s in sites if "unsampled_loops" in s] == [None]
+     # Without it, each range opens and closes once in the sampled iteration.
+     sites = iket.annotate(KERNEL, _token, iters=1)[1]
+     assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 4da4fd41c..8539d9920 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -360,6 +360,27 @@ _FOR = re.compile(
+ )
+ 
+ 
++def _trips(header: str) -> int | None:
++    """The iterations of a TVM ``for`` loop with literal bounds; None otherwise."""
++    loop = _FOR.match(header)
++    start, bound = (loop.group(2).strip(), loop.group(3).strip()) if loop else ("", "")
++    if not (start.isdigit() and bound.isdigit()):
++        return None
++    return int(bound) - int(start)
++
++
++def _loop_trips(headers: tuple[str, ...]) -> int | None:
++    """The iterations of nested loops: the product of their trips, None if one has no
++    literal bounds."""
++    total = 1
++    for header in headers:
++        trips = _trips(header)
++        if trips is None:
++            return None
++        total *= trips
++    return total
++
++
+ def _iterations(header: str, iters: int) -> str | None:
+     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
+     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
+@@ -481,6 +502,8 @@ def annotate(
+                 "last_line": code.count("\n", 0, item.last.end - 1) + 1,
+                 "statement": " ".join(item.first.text.split())[:160],
+                 "loops": len(item.loops),
++                # A trace holds the sampled iterations; these scale them to the loops.
++                **({"loop_trips": _loop_trips(item.loops)} if item.loops else {}),
+                 **({"unsampled_loops": unsampled} if unsampled else {}),
+                 "traced": item.name in traced,
+             }

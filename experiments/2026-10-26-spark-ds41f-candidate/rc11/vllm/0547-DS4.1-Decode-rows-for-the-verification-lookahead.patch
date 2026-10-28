@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:16:41 +0100
+Subject: [PATCH 547/547] [DS4.1] Decode rows for the verification lookahead
+
+A request verifying num_verification_tokens drafts stays on the decode plan
+(reorder threshold 1 + lookahead), the attention's decode capacity and the
+DSpark context graphs cover max_decode_rows, the ratio-2 compressor's state
+ring holds every verified row, and sequence-parallel prefill starts above
+max_decode_rows. All unchanged without copy drafts.
+---
+ .../test_deepseek_v41_tilelang_compress.py    | 91 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  6 ++
+ vllm/models/deepseek_v4_1/compressor.py       |  3 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  5 +-
+ vllm/v1/attention/backend.py                  |  7 +-
+ .../gpu/spec_decode/dflash/speculator.py      |  3 +-
+ 6 files changed, 108 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index 0bd74170a..cf0d36f09 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -3,6 +3,8 @@
+ """DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and torch
+ references of the state ring."""
+ 
++from types import SimpleNamespace
++
+ import pytest
+ import torch
+ 
+@@ -265,3 +267,92 @@ def test_token_independent_of_batch_and_graphs(ratio):
+         graph.replay()
+         torch.cuda.synchronize()
+         assert torch.equal(out[:rows], together)
++
++
++def _verify_block_then_resume(draft_tokens, page, accepted):
++    """One request verifies a block of ``1 + draft_tokens`` rows from an even
++    position, writing every row's state to its ring; the next step resumes after
++    ``accepted`` drafts. Returns the carry that step gathers (value, gate, tag) and
++    the block's state at the position it carries from."""
++    g = torch.Generator(device="cpu").manual_seed(draft_tokens * 100 + accepted)
++    rows, first, block = 1 + draft_tokens, 40, 3
++
++    def request(position, tokens):
++        starts = torch.full((REQUESTS + 1,), tokens, dtype=torch.int32)
++        starts[0] = 0
++        positions = torch.full((REQUESTS,), -1, dtype=torch.int64)
++        positions[0] = position
++        state_slots = torch.full((CAPACITY,), -1, dtype=torch.int64)
++        state_slots[:tokens] = block * page + (position + torch.arange(tokens)) % page
++        return {
++            "starts": starts.to(DEVICE),
++            "positions": positions.to(DEVICE),
++            "state_slots": state_slots.to(DEVICE),
++            "counts": torch.tensor([tokens, 1], dtype=torch.int32, device=DEVICE),
++        }
++
++    table = torch.full((REQUESTS, 4), 1, dtype=torch.int32, device=DEVICE)
++    table[0, 0] = block
++    pool = torch.zeros(BLOCKS, page * STATE, device=DEVICE)
++    values = torch.randn(CAPACITY, DIM, generator=g).to(DEVICE)
++    gates = torch.randn(CAPACITY, DIM, generator=g).to(DEVICE)
++    weight = (torch.rand(DIM, generator=g) + 0.5).to(DEVICE)
++    slots = torch.arange(CAPACITY, dtype=torch.int64, device=DEVICE)
++
++    def carry(step):
++        pv = torch.zeros((REQUESTS, DIM), device=DEVICE)
++        pg = torch.zeros_like(pv)
++        tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
++        ids = torch.full_like(tags, 7)
++        gather_partial_state(
++            pool, table, step["starts"], step["positions"], step["counts"],
++            pv, pg, tags, ids, page=page,
++        )  # fmt: skip
++        return pv, pg, tags, ids
++
++    a = request(first, rows)
++    pv, pg, tags, ids = carry(a)
++    out = torch.zeros(CAPACITY, DIM, dtype=torch.bfloat16, device=DEVICE)
++    emitted = torch.zeros(CAPACITY, dtype=torch.bool, device=DEVICE)
++    eslots = torch.zeros(CAPACITY, dtype=torch.int64, device=DEVICE)
++    compress(
++        rows, 2, values, gates, weight, a["starts"], a["positions"], ids, slots,
++        a["counts"], out, emitted, eslots, pending_values=pv, pending_gates=pg,
++        tags=tags, pool=pool, state_slots=a["state_slots"], page=page,
++    )  # fmt: skip
++    resumed = first + accepted + 1
++    pv, pg, tags, _ = carry(request(resumed, 1))
++    row = resumed - 1 - first
++    return (pv[0], pg[0], int(tags[0])), (values[row], gates[row], resumed - 1)
++
++
++@pytest.mark.parametrize("draft_tokens", [5, 16, 64])
++def test_a_rejected_block_leaves_every_accepted_prefix_its_carry(draft_tokens):
++    """The ring a request's verification writes before acceptance is known keeps
++    the state of every position a resumed step can carry from: the state ring
++    (CompressorStateCache) has a slot for each of its rows and one more, so a block
++    of the verification lookahead (copy drafts: 16, or 64) overwrites none of them."""
++    from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
++
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(num_verification_tokens=draft_tokens),
++        compilation_config=SimpleNamespace(static_forward_context={}),
++    )
++    page = CompressorStateCache(config, f"ring-{draft_tokens}").block_size
++    assert page > draft_tokens + 1
++    for accepted in range(0, draft_tokens + 1, 2):  # odd positions carry
++        (value, gate, tag), (want_v, want_g, want_tag) = _verify_block_then_resume(
++            draft_tokens, page, accepted
++        )
++        assert tag == want_tag
++        assert torch.equal(value, want_v) and torch.equal(gate, want_g), accepted
++
++
++def test_a_short_ring_loses_a_wide_blocks_carry():
++    """The control: DSpark's ring of 8 under a block of 17 rows. A resumed step
++    early in the block carries a later row's state, which shares its slot."""
++    lost = 0
++    for accepted in range(0, 9, 2):
++        (value, _, _), (want_v, _, _) = _verify_block_then_resume(16, 8, accepted)
++        lost += not torch.equal(value, want_v)
++    assert lost > 0
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..d3952249f 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -488,6 +488,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             else 1
+         )
+         decode_rows = self.config.scheduler_config.max_num_seqs * query_width
++        # A copying request verifies past the drafter's block (copy drafts),
++        # within the scheduler's decode-row envelope.
++        decode_rows += self.config.max_decode_rows - (
++            self.config.scheduler_config.max_num_seqs
++            * self.config.uniform_decode_query_len
++        )
+         # Graph buffers include padding beyond the live decode-token bound.
+         decode_rows = max(
+             decode_rows,
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 4be84e918..f167a08b3 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -28,7 +28,8 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
+         self.prefix = prefix
+         self.kv_cache = torch.tensor([])
+         spec = config.speculative_config
+-        draft_tokens = spec.num_speculative_tokens if spec is not None else 0
++        # Every draft a request verifies in a step (copy drafts widen it).
++        draft_tokens = spec.num_verification_tokens if spec is not None else 0
+         # Drafts, the bonus token, and the previous row must coexist until
+         # rejection selects the accepted boundary, as in upstream V4.1.
+         self.block_size = max(8, 1 << (draft_tokens + 1).bit_length())
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index e24cc2912..cfa158d5c 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -138,11 +138,10 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) ->
+     if reason is not None:
+         logger.info("DeepSeek V4.1 prefill sequence parallelism off: %s", reason)
+         return 0
+-    spec = vllm_config.speculative_config
+     decode_rows = max(
+         vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+-        vllm_config.scheduler_config.max_num_seqs
+-        * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
++        # Every decode row the scheduler lays out, copy drafts' included.
++        vllm_config.max_decode_rows,
+         parallel.tensor_parallel_size,
+     )
+     rows = decode_rows + 1
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 255637ef8..e6693e883 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -653,10 +653,13 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+                 speculative_config is not None
+                 and speculative_config.num_speculative_tokens is not None
+             ):
+-                max_num_queries_for_spec = (
++                # A copying request verifies up to num_verification_tokens
++                # drafts (copy drafts), every other one the drafter's block.
++                max_num_queries_for_spec = max(
+                     1
+                     + (2 if speculative_config.parallel_drafting else 1)
+-                    * speculative_config.num_speculative_tokens
++                    * speculative_config.num_speculative_tokens,
++                    1 + speculative_config.num_verification_tokens,
+                 )
+                 self.reorder_batch_threshold = max(
+                     self.reorder_batch_threshold,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 0a2032ee1..4f503a1f7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -195,7 +195,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 self.context_positions,
+                 self._context_slot_mappings,
+                 self._layer_group_idx,
+-                self.max_num_reqs * (1 + self.num_speculative_steps),
++                # A decode step's target rows, copy drafts' included.
++                self.vllm_config.max_decode_rows,
+             )
+ 
+     def load_draft_model(
