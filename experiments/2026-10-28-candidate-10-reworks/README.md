@@ -61,6 +61,11 @@ laptop, but its tokenizer tests need vLLM's dependencies, which only the image h
 `make_api_bundles.py` runs them there: `api-c10` (candidate 10's own copies, the control)
 on dgx1, `api-semantics` (the branch's tests and sources) on dgx2.
 
+Result (run `c10-api-semantics`, 2026-10-28): both bundles passed on candidate 10's image:
+`api-c10` 141 tests (dgx1), `api-semantics` 160 (dgx2; the control's plus the branch's 19
+for the effort aliases, response_format, tool_choice none and the assistant prefix). The
+tokenizer tests the laptop could not run pass. 0539-0540 stay in candidate 11.
+
 ## Markov projection in persisting L2 (`markov-l2.json`, kernel lab only)
 
 Byte lever 7 of the decode-bytes study: the DSpark Markov projection (a TP4 rank's 16.5 MB
