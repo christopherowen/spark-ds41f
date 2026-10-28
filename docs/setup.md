@@ -482,6 +482,27 @@ entries to lift it (vLLM's default is 999 per prompt);
 trade-off. `bin/spark doctor` compares the running command against the
 profile, so the change is visible in its report before the next start.
 
+### Carrying a site change of your own
+
+`build image --apply`, `cluster sync --apply` and `cluster start --apply` refuse a
+checkout with uncommitted files on any node, and `cluster sync` deploys only a
+commit published on `origin`: every node runs a commit anyone can name. A change
+you keep for your site therefore lives on a branch of your own fork, not in the
+working tree:
+
+1. Fork the repository, commit the change on a branch (for example `site`), and
+   push it to the fork.
+2. In `config/cluster.json`, set `deployment.repository` to the fork's URL and
+   `deployment.branch` to that branch. Point every node's `origin` at the fork
+   (`git remote set-url origin <fork>`); the launch checks each against
+   `deployment.repository`.
+3. Deploy the branch's commit: `bin/spark --cluster-config <profile> cluster sync --apply`
+   from the head's checkout on that branch.
+
+For each release, rebase the branch onto the new `main`, push, and sync again.
+A change that would help other sites belongs in a pull request here instead, so
+the branch can drop it.
+
 ### Check
 
 `bin/spark doctor` reports `configuration OK`.
