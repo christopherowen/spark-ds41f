@@ -1,4 +1,4 @@
-From ee78356dfc92106cf6951ad91b359106e0ef21f0 Mon Sep 17 00:00:00 2001
+From 6bfd56bb1e749a27b2c98963afe995c9f2361ff3 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 03:04:30 +0100
 Subject: [PATCH] DeepSeek-V4.1: GLP steering per request, under a second
@@ -49,8 +49,10 @@ independence, and the row marks).
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
  .../kernels/test_deepseek_v41_tilelang_glp.py | 280 +++++++++++-------
+ tests/models/test_deepseek_v4_1_engram.py     |   2 +
  tests/models/test_deepseek_v4_1_glp.py        | 249 ++++++++--------
  tests/test_weightless.py                      | 130 ++++++++
+ .../attention/test_b12x_v41_ced_metadata.py   |   4 +
  .../openai/chat_completion/batch_serving.py   |   3 +-
  .../openai/chat_completion/serving.py         |   5 +-
  vllm/entrypoints/openai/completion/serving.py |   5 +-
@@ -65,7 +67,7 @@ Co-authored-by: Cursor <cursoragent@cursor.com>
  .../models/deepseek_v4_1/tilelang/glp_rows.py |  76 +++++
  vllm/v1/core/kv_cache_utils.py                |  14 +-
  vllm/weightless.py                            |  47 +++
- 17 files changed, 939 insertions(+), 380 deletions(-)
+ 19 files changed, 945 insertions(+), 380 deletions(-)
  create mode 100644 tests/test_weightless.py
  create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp_rows.py
  create mode 100644 vllm/weightless.py
@@ -405,6 +407,26 @@ index 43a5cecdd..ff5ae29fc 100644
 +            torch.zeros(2, dtype=torch.int32, device="cuda"),
 +            torch.zeros(4, dtype=torch.int32, device="cuda"),
 +        )
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 1a39bf880..a6b9556b0 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -452,6 +452,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+     _prepare_engram(resident_session, resident)
+ 
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state = None
+     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
+     state.disk_engram_models = (target,)
+@@ -618,6 +619,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+ 
+     prompt = [5, 9, 13, 17, 19, 23]
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state = None
+     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
+     state.disk_engram_models = (target,)
 diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
 index f4cec3331..544d66cfc 100644
 --- a/tests/models/test_deepseek_v4_1_glp.py
@@ -871,6 +893,42 @@ index 000000000..11a39a5bc
 +        generate_block_hash_extra_keys(salted, 0, 16, 0)[0]
 +        != generate_block_hash_extra_keys(steered, 0, 16, 0)[0]
 +    )
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index bc52f85c6..26f749f0c 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -196,6 +196,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
+     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
+     monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state, starts, seq = _state([4096, 4096])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
+@@ -257,6 +258,7 @@ def test_skipped_chunks_require_the_complete_successor(monkeypatch):
+     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
+     monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
+     state._ced_skip_min_rows, state._ced_chunk_align = 200, 4096
+@@ -588,6 +590,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
+     monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
+     monkeypatch.setattr(DefaultModelState, "remove_request", lambda *args: None)
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state, starts, seq = _state([1], [1025])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {"stream": 256}
+@@ -628,6 +631,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
+     monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
+     monkeypatch.setattr(DefaultModelState, "prepare_attn", lambda *args: {})
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.steering, state.steered_requests = None, None
+     state.ced_state, starts, seq = _state([256])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
 diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
 index 06b3dbfd4..70e08e444 100644
 --- a/vllm/entrypoints/openai/chat_completion/batch_serving.py

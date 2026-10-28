@@ -9,7 +9,7 @@ downloading the GLP file.
   `spark-ds41f:19f2c20ed4d6-next-6`), spark-ds41f main c1cf4990.
 - **vLLM:** branch `glp-dual-serving` (local, not pushed), one commit on the 1025 head:
   [vllm/0538](vllm/0538-DeepSeek-V4.1-GLP-steering-per-request-under-a-secon.patch), head
-  ee78356d, tree ebb7aaa8. [vllm/series](vllm/series) is 1025's series plus 0538, and
+  6bfd56bb, tree 3e48d992 (`glp-1` was ee78356d, tree ebb7aaa8). [vllm/series](vllm/series) is 1025's series plus 0538, and
   [source.json](source.json) and [upstreams.lock.json](upstreams.lock.json) are its lock.
   0538 is provisional: 0537 is taken by the copy-drafter branch, and the series is
   renumbered where it joins a release.
@@ -121,19 +121,28 @@ following. It runs with the release tests ([bundles/release-tests](bundles/relea
 - zero tokens, and the kernels' declarations;
 - the row marks.
 
+In `glp-1`'s run (below), 5,738 release tests passed, 160 skipped and 6 failed. All six
+failures were in the patch's tests, not its code. Four tests in
+`test_b12x_v41_ced_metadata.py` and two in `test_deepseek_v4_1_engram.py` build
+`DeepseekV41ModelState` with `__new__` and set the attributes it reads; they lacked the
+two the patch adds, `steering` and `steered_requests`. Patch 0538 now sets both to `None`
+in those six tests (head `6bfd56bb`, tree `3e48d992`; image `glp-2`). The vLLM code is
+unchanged from `glp-1`.
+
 ## Runs
 
 | Spec | What | Gate |
 | --- | --- | --- |
-| [qualify-tp4.json](qualify-tp4.json) | build `spark-ds41f:19f2c20ed4d6-glp-1` on dgx2 and copy it to the ring; the release tests on dgx2; boot [synthetic-tp4.json](synthetic-tp4.json); the determinism gate, `dual_probe.py --speed`, 16 distinct streams | release tests pass or skip; determinism hashes equal 1025's (`3eab5112` / `db25fde3` with log probabilities, `c9cf9dbe` / `c6bb4f4e` as text): stock with steering configured is 1025; every `dual_probe.py` check passes |
+| [qualify-tp4.json](qualify-tp4.json) | build `spark-ds41f:19f2c20ed4d6-glp-2` on dgx2 and copy it to the ring; the release tests on dgx2; boot [rc-tp4.json](rc-tp4.json), the published file; the determinism gate, `dual_probe.py --speed`, 16 distinct streams | release tests pass or skip; determinism hashes equal 1025's (`3eab5112` / `db25fde3` with log probabilities, `c9cf9dbe` / `c6bb4f4e` as text): stock with steering configured is 1025; every `dual_probe.py` check passes |
 | [release-tp4.json](release-tp4.json) | `release` and `single-stream` suites: the candidate, 1025, the candidate again | no metric worse than 1025 beyond the repeat's interval: the cost of steering configured and unused |
 
-- **The synthetic arm.** [synthetic-tp4.json](synthetic-tp4.json) mounts
-  `cache/glp/synthetic-0.gguf`, a random unit direction per layer
-  ([make_glp.py](../2026-10-23-next-release/glp/make_glp.py), seed 0; sha256 `2a49af60…`, on
-  all four nodes since 2026-10-23), in place of the published file. It has the same layers,
-  α, kernels and row marks, so it qualifies the mechanism and its cost. It does not show the
-  published vector's behaviour.
+- **The synthetic arm (`glp-1` only).** Before the published file could be downloaded,
+  `glp-1`'s runs booted [synthetic-tp4.json](synthetic-tp4.json) and its `-dev` variant.
+  These mount `cache/glp/synthetic-0.gguf` in place of the published file: a random unit
+  direction per layer ([make_glp.py](../2026-10-23-next-release/glp/make_glp.py), seed 0;
+  sha256 `2a49af60…`, on all four nodes since 2026-10-23). It has the same layers, α,
+  kernels and row marks, so it qualifies the mechanism and its cost. It does not show the
+  published vector's behaviour. `glp-2`'s runs boot the published file.
 - **What `dual_probe.py` checks** (stock and steered, greedy, compared on token IDs and
   log probabilities):
   - both names are listed and echoed;
@@ -145,10 +154,22 @@ following. It runs with the release tests ([bundles/release-tests](bundles/relea
   time per engine step comes from vLLM's draft counters, which removes the confound of
   steered text changing draft acceptance.
 
-**Not run yet.** The cluster has been held since 2026-10-27 21:47 UTC by another lab queue
-(window `dgx1-1793137674`, running the `one-at-a-time` experiment's benches), so nothing
-here has touched a GPU. Both specs pass `scripts/lab.py run --dry-run`. They need this
-experiment on `origin/main`, because a window and its `sync` job deploy only that.
+**`glp-1` qualification on the synthetic file (2026-10-28, lab window
+`dgx1-1793137674`).**
+
+- Release tests: 6 failed. All six were the test stubs described under Tests.
+- Determinism and greedy: identical in every scenario. The hashes equal 1025's
+  (`3eab5112` / `db25fde3`, `c9cf9dbe` / `c6bb4f4e`), so stock with steering configured is
+  1025.
+- `dual_probe.py`: every check passes. Steering changed all 8 prompts' replies.
+- Speed, as time per engine step: stock 28.97 ms and steered 29.09 ms at 1 stream; stock
+  149.85 ms and steered 150.08 ms at 16 streams. In tokens per second: 66.8 and 67.1 at
+  1 stream, 279.2 and 276.0 at 16. The 16 distinct streams gave 256.7 tokens/s.
+
+`glp-1`'s release run (synthetic arms) was already running when the published file
+arrived, and it was left to finish. Its vLLM code is `glp-2`'s, so it measures the same
+cost. `glp-2`'s two specs boot the published file. Specs run only from `origin/main`,
+because a window and its `sync` job deploy only that.
 
 ## Promotion (owner's acceptance after the runs)
 
@@ -165,7 +186,6 @@ Following AGENTS.md, one commit would do all of the following:
 
 That waits for:
 
-- the published file on every node, and one more boot of [rc-tp4.json](rc-tp4.json)
-  through `dual_probe.py` on it (the behaviour change on refusal prompts is the card's,
-  not ours);
+- `glp-2`'s runs, which boot [rc-tp4.json](rc-tp4.json) with the published file through
+  `dual_probe.py` (the behaviour change on refusal prompts is the card's, not ours);
 - a TP3 run (`tp3-triangle` shares the recipe) before the triangle serves it.
