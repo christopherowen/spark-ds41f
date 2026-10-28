@@ -466,4 +466,28 @@ print("sparknet proxy ABI", load().roce_abi_version())
 print("sparknet build checks passed")
 PY
 
+# An experiment's runtime without FlashInfer's precompiled kernels (an arm's
+# "build": {"flashinfer_kernels": false}): the base image's flashinfer-cubin and
+# flashinfer-jit-cache are removed; flashinfer-python stays, since vLLM imports it.
+# The image is no smaller, because the base image's layers still hold the files.
+FROM runtime-tilelang-sparknet AS runtime-no-flashinfer-kernels
+
+LABEL local.spark-ds41f.flashinfer-kernels="removed"
+
+RUN python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache
+RUN python3 - <<'PY'
+import importlib.metadata as metadata
+import importlib.util
+
+for package, module in (("flashinfer-cubin", "flashinfer_cubin"), ("flashinfer-jit-cache", "flashinfer_jit_cache")):
+    try:
+        metadata.version(package)
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        raise SystemExit(f"{package} is still installed")
+    assert importlib.util.find_spec(module) is None, f"{module} still imports"
+print("flashinfer-python", metadata.version("flashinfer-python"), "without its precompiled kernels")
+PY
+
 FROM ${RUNTIME_STAGE}

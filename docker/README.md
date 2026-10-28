@@ -117,6 +117,16 @@ context, the image has no `local.spark-ds41f.b12x.*` labels, and the GPU smoke
 imports no B12X module and checks that B12X is not installed. A lock without B12X
 must list the TileLang sources ([docs/upstreams.md](../docs/upstreams.md#locks-without-b12x)).
 
+## Without FlashInfer's precompiled kernels
+
+An experiment's arm with `"build": {"flashinfer_kernels": false}` builds
+`RUNTIME_STAGE=runtime-no-flashinfer-kernels`: the `runtime-tilelang-sparknet`
+image with the base image's flashinfer-cubin and flashinfer-jit-cache uninstalled
+and checked absent, labelled `local.spark-ds41f.flashinfer-kernels=removed`.
+flashinfer-python stays, since vLLM imports it. The image is no smaller, because
+the base image's layers still hold the files. Any other runtime is refused
+([experiments/2026-10-27-no-flashinfer-kernels](../experiments/2026-10-27-no-flashinfer-kernels/README.md)).
+
 ## Resource policy on DGX Spark
 
 `build image --apply` runs only on an idle Spark:

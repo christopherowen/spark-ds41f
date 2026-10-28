@@ -439,6 +439,24 @@ class KernelBackendTest(unittest.TestCase):
                          "SPARKNET_TREE=bd4191b3241383e8ecb705ad291f2da5b064370f",
                          "--build-context sparknet-source=", "--build-context tilelang-source="):
             self.assertIn(expected, output.getvalue())
+        without_kernels = copy.deepcopy(cluster)
+        without_kernels["build"] = {"flashinfer_kernels": False}
+        output = io.StringIO()
+        with mock.patch.object(spark, "configuration", return_value=(without_kernels, self.nodes, lock)), \
+                mock.patch.object(spark, "build_problems", return_value=[]), \
+                mock.patch.object(spark, "repository_dirty", return_value=""), \
+                mock.patch.object(spark, "repository_revision", return_value="0" * 40), \
+                contextlib.redirect_stdout(output):
+            spark.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False))
+        self.assertIn("RUNTIME_STAGE=runtime-no-flashinfer-kernels", output.getvalue())
+        self.assertIn("SPARKNET_TREE=bd4191b3241383e8ecb705ad291f2da5b064370f", output.getvalue())
+        self.assertEqual(spark.final_stage({"build": {"flashinfer_kernels": True}}, "runtime-tilelang-sparknet"),
+                         "runtime-tilelang-sparknet")
+        for stage in ("runtime-tilelang", None):
+            with self.assertRaises(SystemExit):
+                spark.final_stage(without_kernels, stage)
+        with self.assertRaises(SystemExit):
+            spark.final_stage({"build": {"flashinfer_kernels": "no"}}, "runtime-tilelang-sparknet")
         script = spark.smoke_script(lock)
         compile(script, "smoke", "exec")
         for expected in ("from sparknet.integration.vllm import SparknetOneShotAllReduce",
