@@ -1063,5 +1063,16 @@ class SteeringTest(unittest.TestCase):
         finally:
             spark.run_ssh = original
 
+    def test_an_unreachable_node_is_not_reported_as_missing_the_file(self) -> None:
+        original = spark.run_ssh
+        spark.run_ssh = lambda nodes, node, *argv: spark.subprocess.CompletedProcess(
+            argv, 255, "", "ssh: connect to host dgx3 port 22: Connection refused\n")
+        try:
+            problems = spark.node_steering_problems(self.cluster(), {}, {"name": "dgx3"})
+        finally:
+            spark.run_ssh = original
+        self.assertEqual(problems, ["dgx3: cannot check the GLP steering file: "
+                                    "ssh: connect to host dgx3 port 22: Connection refused"])
+
     def test_a_file_outside_a_hub_cache_is_copied(self) -> None:
         self.assertIn("copy it from another node", spark.steering_download("{checkout}/cache/glp/synthetic-0.gguf"))

@@ -423,7 +423,10 @@ def node_steering_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
     if source is None:
         return []
     path = host_path(cluster, source)
-    if run_ssh(nodes, node, "test", "-r", path).returncode:
+    result = run_ssh(nodes, node, "test", "-r", path)
+    if result.returncode == 255:
+        return [f"{node['name']}: cannot check the GLP steering file: {result.stderr.strip()}"]
+    if result.returncode:
         return [f"{node['name']}: GLP steering file is missing or unreadable: {path}; "
                 f"{steering_download(source)}"]
     return []
