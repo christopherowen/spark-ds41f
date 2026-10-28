@@ -253,6 +253,42 @@ The conditional arms must leave the streams bit-identical to the launch, or the 
 fails. If the shared condition costs much less than the launches, patch 0538 takes it
 for captured steps. A step that runs eagerly keeps the launch.
 
+Result (2026-10-28 17:12 UTC, both nodes pass and agree). Microseconds a stand-in step
+spends over no steering:
+
+| rows | launch, unmarked | PyTorch conditional, unmarked | launch, marked | PyTorch conditional, marked |
+| --- | --- | --- | --- | --- |
+| 2 | 23–29 | 278–282 | 156–157 | 518 |
+| 16 | 24–28 | 274 | 155–156 | 513 |
+| 96 | 91–133 | 255–371 | 645–776 | 844–1,076 |
+
+- **Unused, the 39 launches cost 23 to 133 µs a step:** about 0.1% of a real decode
+  step (29 ms at 1 stream). That bounds what any skip can save.
+- **PyTorch's conditional nodes cost ten times the launches they skip.** They are
+  bit-identical, but they are not an option.
+- **The shared condition failed to build** (`cudaErrorInvalidValue` from the
+  `cuda-python` node calls) on both nodes. With at most about 0.1% to gain, it was not
+  pursued: patch 0538 keeps the launch.
+- **Marked, steering costs about 4 µs a layer at 2 rows and 17–20 µs at 96 rows.** The
+  96-row figure is about one read and write of the rows' streams at the GPU's memory
+  bandwidth.
+
+**`glp-3` release on the published file (2026-10-28 14:35–17:11 UTC, stock name only,
+against 1025).** Greedy output was identical for 256 of 256 prompts; token distributions
+and draft acceptance were identical. Every metric is within the run's own repeat:
+
+| metric | change | ±95% | repeat |
+| --- | --- | --- | --- |
+| decode geometric mean | +0.27% | 0.18% | +0.12% |
+| c16 | +0.30% | 0.70% | −0.29% |
+| c8 | −0.11% | 0.77% | −0.26% |
+| Poisson | +0.02% | 17.91% | −0.01% |
+| prefill, 32K–1M | −0.11% to +0.17% | 0.29–1.54% | |
+| single stream | −0.19% | 3.66% | −0.20% |
+
+So `glp-1`'s +0.78% and +1.37% decode-grid changes were mostly drift. The
+microbenchmark puts the real cost of the unused launches at about 0.1%.
+
 `glp-1`'s release run (synthetic arms) was already running when the published file
 arrived, and it was left to finish. `glp-2`'s qualification was queued and then withdrawn
 before it ran, for `glp-3`: the two options, the `glp` block and AdvBench. `glp-3`'s
