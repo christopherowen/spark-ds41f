@@ -1,7 +1,7 @@
 {
  "name": "release",
- "version": 2,
- "description": "Release measurement, about 51 minutes a build: the screen with all 256 prompts, eight streams as well, Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput under a 2 s time to first token and 100 ms per output token, and real-text prefill from 32K to 1M. Its grid needs the dev-mode collective RPC.",
+ "version": 3,
+ "description": "Release measurement, about 60 minutes a build: the screen with all 256 prompts, eight streams as well, Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput under a 2 s time to first token and 100 ms per output token, decode stalls while a cold 131K prompt prefills at three depths of the sixteen slots (3 and 11 streams, with short probes sent 2-14 s into it, whose time to first token is what a new conversation waits; 15 streams, which fills every slot during the prefill), and real-text prefill from 32K to 1M. Its grid needs the dev-mode collective RPC.",
  "steps": [
   {
    "id": "model",
@@ -65,6 +65,66 @@
       "thinking": false
      }
     }
+   }
+  },
+  {
+   "id": "stall-3",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 3,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall-11",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 11,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall-15",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 15,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3
    }
   },
   {

@@ -127,8 +127,8 @@ Never compare with a reference measured in another session.
 
 | Suite | Steps | Time a build |
 | --- | --- | --- |
-| `release` (TP4) | model behaviour on 256 prompts at 16 streams; the engine grid (20 fixed decode shapes, 100 replays); closed loops at 16 and 8 streams; Poisson arrivals at 0.7 requests/s with goodput under 2 s first token and 100 ms a token; real-text prefill at 32K, 128K, 256K, 512K and 1,000,000 tokens, three repeats | about 51 min |
-| `release-tp3` (TP3) | the same at three nodes: 8 streams, 512K context, grid up to 8 requests, closed loops at 8 and 4, Poisson at 0.42 requests/s | about 51 min |
+| `release` (TP4) | model behaviour on 256 prompts at 16 streams; the engine grid (20 fixed decode shapes, 100 replays); closed loops at 16 and 8 streams; Poisson arrivals at 0.7 requests/s with goodput under 2 s first token and 100 ms a token; decode stalls during a 131K prefill at 3, 11 and 15 streams (3 and 11 with short probes' first-token wait), three repeats; real-text prefill at 32K, 128K, 256K, 512K and 1,000,000 tokens, three repeats | about 60 min |
+| `release-tp3` (TP3) | the same at three nodes: 8 streams, 512K context, grid up to 8 requests, closed loops at 8 and 4, Poisson at 0.42 requests/s, stalls at 3, 6 and 7 streams | about 61 min |
 | `single-stream` | one conversation at a time on distinct prompts, 300 s measured | about 6 min |
 | `sampled` | closed loops at 16, 8 and 1 stream at the recipe's temperature 1 and top-p 1, fixed per-request seed | about 18 min |
 
