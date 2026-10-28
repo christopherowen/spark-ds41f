@@ -119,3 +119,14 @@ suite's heat-soak, grid and prefill). null-overlay mounts candidate 9's own copi
 11 files those arms replace: it differs from candidate 9 only in being an overlay arm.
 `cost_check.py` compares each arm's boots with candidate 9's (Welch over boots). A cost is
 real only if the arm beats candidate 9 and null-overlay does not; only then is it reworked.
+
+## X7 decoded a word at a time (`x7-word.json`)
+
+The X7 kernel was bit-exact but 1.9-10x production's time: each thread decoded 64 elements a
+K block one by one (four shared loads, a popcount and a guarded escape read each), and on
+the narrow shapes (18 CTAs for shared gate/up) that per-CTA work, not the bytes, set the
+time; X8, the same pipeline copying E4M3, matched production. `x7w` builds the bytes
+eight at a time (an unescaped exponent is 8 + code, so a byte is sign, 1, code, mantissa:
+four bytes from four nibbles and their code bits with masks and a multiply-spread), then
+rewrites only the escaped elements; block_N 16 is tried too, for more CTAs. Same bundle,
+same bit-exact checks, a run of its own.

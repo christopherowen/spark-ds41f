@@ -15,7 +15,10 @@ This bundle builds three decode GEMMs with the production MMA
 - ``x7``: the same pipeline reading X7 planes (7/8 of the bytes) and block scales;
   each stage's tile is decoded into the MMA's shared B tile after it lands. One warp
   takes a 16-row cluster: a lane counts its half-row's escapes, a warp scan gives
-  each lane its first escape, and the tile decodes element by element.
+  each lane its first escape, and the tile decodes element by element;
+- ``x7w``: ``x7`` decoding eight elements a step (an unescaped byte is sign, 1, code,
+  mantissa, built four at a time from a nibble word and three code bytes), then a pass
+  that rewrites only the escaped elements.
 
 On real weights of DeepSeek-V4.1-Flash-1017 (layer 10, a TP4 rank's slices, read from
 the node's hub) it checks that ``x8`` and ``x7`` give ``prod``'s output bit for bit at
@@ -52,9 +55,11 @@ def u32(v):
     return T.uint32(v)
 
 
-def _gemm(N, K, x7, block_M=16, block_N=64, num_stages=3):
+def _gemm(N, K, x7, block_M=16, block_N=64, num_stages=3, word=False):
     """``C[M, N] = (A * SFA) @ (W * SFB)^T`` with W as E4M3 tiles (x7=False) or X7
-    planes (x7=True) and SFB the [N / 32, K / 128] block-scale words."""
+    planes (x7=True) and SFB the [N / 32, K / 128] block-scale words. ``word``: the X7
+    tile decodes eight elements a step from one nibble word and three code bytes, then
+    patches the escapes."""
     threads = 2 * block_N  # two lanes a row, one per 64-element half
     assert K % BLOCK_K == 0 and N % block_N == 0 and block_N % CLUSTER == 0
     k_blocks = K // BLOCK_K
@@ -69,6 +74,8 @@ def _gemm(N, K, x7, block_M=16, block_N=64, num_stages=3):
     p_copies = tilelang.cdiv(p_segments, threads)
     b_segments = block_N * 8  # 16-byte copies of one stage's E4M3 tile
     b_copies = tilelang.cdiv(b_segments, threads)
+    word_items = block_N * 16  # (row, nibble word): eight elements each
+    group_items = block_N * 4  # (row, 32-element group): one escape mask each
 
     @T.macro
     def load(A, SFA, W, P, SFB, A_shared, B_stage, P_shared, SFA_shared, SFB_shared,
@@ -168,29 +175,75 @@ def _gemm(N, K, x7, block_M=16, block_N=64, num_stages=3):
                     start[i, 2 * h] = first
                     start[i, 2 * h + 1] = first + popc(m0)
                     T.sync_threads()
-                    for i2, j in T.Parallel(block_N, BLOCK_K):
-                        g = j // 32
-                        t = T.cast(j % 32, T.uint32)
-                        nib = (P_shared[s, i2, j // 8] >> T.cast(j % 8 * 4, T.uint32)) & u32(15)
-                        w0 = P_shared[s, i2, 16 + 3 * g]
-                        w1 = P_shared[s, i2, 17 + 3 * g]
-                        w2 = P_shared[s, i2, 18 + 3 * g]
-                        code = (((w0 >> t) & u32(1)) | (((w1 >> t) & u32(1)) << u32(1))
-                                | (((w2 >> t) & u32(1)) << u32(2)))
-                        rank = start[i2, g] + popc((w0 & w1 & w2) & ((u32(1) << t) - u32(1)))
-                        # Signed test: TVM's bounds solver negates the constant of a
-                        # guarded read's condition, and -7 has no uint32 literal.
-                        exponent = T.if_then_else(
-                            T.cast(code, T.int32) == 7,
-                            (ESC[rank >> 3]
-                             >> T.cast((rank & 7) * 4, T.uint32)) & u32(15),
-                            code + u32(BASE),
-                        )
-                        B_tile[i2, j] = T.reinterpret(
-                            T.cast(((nib >> u32(3)) << u32(7)) | (exponent << u32(3))
-                                   | (nib & u32(7)), T.uint8),
-                            T.float8_e4m3fn,
-                        )
+                    if word:
+                        # An unescaped exponent is 8 + code, so a byte is sign, 1, the
+                        # code and the mantissa: four bytes at once from four nibbles
+                        # and their code bits (bit q of a spread lands in byte q).
+                        for c in T.unroll(word_items // threads):
+                            e = c * threads + tx
+                            i2 = e // 16
+                            w = e % 16
+                            nibw = P_shared[s, i2, w]
+                            shift = T.cast(w % 4 * 8, T.uint32)
+                            for h in T.unroll(2):
+                                n4 = (nibw >> u32(16 * h)) & u32(0xFFFF)
+                                n4 = (n4 | (n4 << u32(8))) & u32(0x00FF00FF)
+                                n4 = (n4 | (n4 << u32(4))) & u32(0x0F0F0F0F)
+                                packed = (((n4 & u32(0x08080808)) << u32(4)) | u32(0x40404040)
+                                          | (n4 & u32(0x07070707)))
+                                for b in T.unroll(3):
+                                    bits = (P_shared[s, i2, 16 + 3 * (w // 4) + b] >> shift
+                                            >> u32(4 * h)) & u32(15)
+                                    packed = packed | (((bits * u32(0x00204081)) & u32(0x01010101))
+                                                       << u32(3 + b))
+                                for q in T.unroll(4):
+                                    B_tile[i2, w * 8 + h * 4 + q] = T.reinterpret(
+                                        T.cast((packed >> u32(8 * q)) & u32(255), T.uint8),
+                                        T.float8_e4m3fn,
+                                    )
+                        T.sync_threads()
+                        for c in T.unroll(group_items // threads):
+                            e = c * threads + tx
+                            i2 = e // 4
+                            g = e % 4
+                            mask = (P_shared[s, i2, 16 + 3 * g] & P_shared[s, i2, 17 + 3 * g]
+                                    & P_shared[s, i2, 18 + 3 * g])
+                            if mask != u32(0):
+                                for t in T.serial(32):
+                                    if (mask >> T.cast(t, T.uint32)) & u32(1) != u32(0):
+                                        rank = start[i2, g] + popc(mask & ((u32(1) << T.cast(t, T.uint32)) - u32(1)))
+                                        exponent = (ESC[rank >> 3] >> T.cast((rank & 7) * 4, T.uint32)) & u32(15)
+                                        j = g * 32 + t
+                                        nib = (P_shared[s, i2, j // 8] >> T.cast(j % 8 * 4, T.uint32)) & u32(15)
+                                        B_tile[i2, j] = T.reinterpret(
+                                            T.cast(((nib >> u32(3)) << u32(7)) | (exponent << u32(3))
+                                                   | (nib & u32(7)), T.uint8),
+                                            T.float8_e4m3fn,
+                                        )
+                    else:
+                        for i2, j in T.Parallel(block_N, BLOCK_K):
+                            g = j // 32
+                            t = T.cast(j % 32, T.uint32)
+                            nib = (P_shared[s, i2, j // 8] >> T.cast(j % 8 * 4, T.uint32)) & u32(15)
+                            w0 = P_shared[s, i2, 16 + 3 * g]
+                            w1 = P_shared[s, i2, 17 + 3 * g]
+                            w2 = P_shared[s, i2, 18 + 3 * g]
+                            code = (((w0 >> t) & u32(1)) | (((w1 >> t) & u32(1)) << u32(1))
+                                    | (((w2 >> t) & u32(1)) << u32(2)))
+                            rank = start[i2, g] + popc((w0 & w1 & w2) & ((u32(1) << t) - u32(1)))
+                            # Signed test: TVM's bounds solver negates the constant of a
+                            # guarded read's condition, and -7 has no uint32 literal.
+                            exponent = T.if_then_else(
+                                T.cast(code, T.int32) == 7,
+                                (ESC[rank >> 3]
+                                 >> T.cast((rank & 7) * 4, T.uint32)) & u32(15),
+                                code + u32(BASE),
+                            )
+                            B_tile[i2, j] = T.reinterpret(
+                                T.cast(((nib >> u32(3)) << u32(7)) | (exponent << u32(3))
+                                       | (nib & u32(7)), T.uint8),
+                                T.float8_e4m3fn,
+                            )
                     T.sync_threads()
                     T.mma_gemm_blockscaled(
                         A_shared[s, :, :], B_tile, C_local,
@@ -392,21 +445,21 @@ def main():
             c_ref = torch.empty((m, n), dtype=torch.bfloat16, device=DEVICE)
             ref(a, wf[0], sfa, copies[0][1], c_ref)
             best = {}
-            for kind in ("x8", "x7"):
-                for block_n in (32, 64):
+            for kind in ("x8", "x7", "x7w"):
+                for block_n in (16, 32, 64):
                     for stages in (2, 3):
                         if n % block_n:
                             continue
-                        kern = gemm(n, k, kind == "x7", 16, block_n, stages)
+                        kern = gemm(n, k, kind != "x8", 16, block_n, stages, kind == "x7w")
                         c = torch.empty((m, n), dtype=torch.bfloat16, device=DEVICE)
-                        if kind == "x7":
+                        if kind != "x8":
                             kern(a, sfa, copies[0][2], copies[0][3], copies[0][4], copies[0][5], c)
                         else:
                             kern(a, sfa, wf[0], copies[0][5], c)
                         torch.cuda.synchronize()
                         same = torch.equal(c.view(torch.int16), c_ref.view(torch.int16))
                         ok &= same
-                        if kind == "x7":
+                        if kind != "x8":
                             calls = [lambda c_=copies[i], o=c: kern(a, sfa, c_[2], c_[3], c_[4], c_[5], o)
                                      for i in range(CALLS)]
                         else:
@@ -433,9 +486,9 @@ def main():
                 summary["prod_warm_us"] = round(timed([lambda: ref(a, wf[0], sfa, copies[0][1], c_ref)] * CALLS,
                                                       flush)[0], 2)
                 for kind, line in best.items():
-                    kern = gemm(n, k, kind == "x7", 16, line["block_N"], line["stages"])
+                    kern = gemm(n, k, kind != "x8", 16, line["block_N"], line["stages"], kind == "x7w")
                     o = torch.empty((m, n), dtype=torch.bfloat16, device=DEVICE)
-                    if kind == "x7":
+                    if kind != "x8":
                         call = lambda: kern(a, sfa, copies[0][2], copies[0][3], copies[0][4], copies[0][5], o)
                     else:
                         call = lambda: kern(a, sfa, wf[0], copies[0][5], o)
