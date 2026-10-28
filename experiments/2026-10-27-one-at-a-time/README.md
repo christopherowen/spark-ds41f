@@ -86,8 +86,8 @@ candidate 9 against candidate 9 again):
 | 0504 (MoE prefill block_M 64) | equal (determinism, greedy, sampled) | prefill +4.2% at 32K (±1.3%), +4.4% at 131K (±0.4%), repeat under 0.5%; decode, c8, c1 same | keep |
 | 0511 (SP prefill MoE combine writes the exchange slots) | equal | prefill +2.8% at 32K (±1.0%), +2.7% at 131K (±0.3%), repeat under 0.2%; decode grid 1.2% faster (±0.15%, repeat 0.2%); c8, c1 same | keep |
 | 0510 (mHC finalize writes the MXFP8 cast; against no-PDL) | equal | decode grid 1.4% faster (±0.16%, repeat 0.16%); prefill 131K +0.85% (±0.4%); 32K, c8, c1 same | keep |
-| 0513-0519 (sparse-MLA page tables over live pages; against no-PDL) | equal | nothing beyond the repeat: decode grid 0.4% faster against 0.6% repeat drift, every 64K/256K/1016K row same; prefill, c8, c1 same | unproven: drop, or show the workload it pays on |
-| 0502 (no per-allocation KV zeroing) | equal | nothing beyond the repeat: decode grid +0.7% against -0.8% repeat drift; c8, c1, prefill same; c8 TTFT p99 4.3% lower with it (no interval) | unproven: measure allocation-heavy TTFT, else drop |
+| 0513-0519 (sparse-MLA page tables over live pages; against no-PDL) | equal | nothing beyond the repeat: decode grid 0.4% faster against 0.6% repeat drift, every 64K/256K/1016K row same; prefill, c8, c1 same | keep: 131K prefill likely 0.5-0.8% faster with them (see the cost check's correction below) |
+| 0502 (no per-allocation KV zeroing) | equal | nothing beyond the repeat: decode grid +0.7% against -0.8% repeat drift; c8, c1, prefill same; c8 TTFT p99 4.3% lower with it (no interval) | kept at the owner's word (2026-10-28): same bits, no gain shown |
 | 0505 (two unread budget-sized buffers dropped) | equal | speed same as claimed (decode, c8, c1, prefill all within the repeat). Memory: the startup KV pool is pinned (--kv-cache-memory-bytes), so no-0505-memory.json found it equal (11,554,122 tokens on all three boots); the suite's lowest MemAvailable (conditions.json) was lower without 0505 on every node against both candidate 9 boots: 0.4 GiB (dgx1), 0.6 (dgx2), 0.85 (dgx3), 0.4-0.6 (dgx4) | keep: more memory headroom, same bits and speed |
 | 0506 (attention scratch in its own workspace lane) | equal | same speed as claimed: decode, c8, c1, 32K same; 131K prefill 0.4% slower with it (±0.1%, repeat 0.1%) | keep; memory: lowest MemAvailable 0.1-0.4 GiB lower without it on dgx1-dgx3 against both candidate 9 boots, dgx4 mixed (weaker than 0505's) |
 | 0526 (CED replays the prompt's last 128 rows) | equal | correctness fix; cost 0.5% at 131K prefill (±0.1%, repeat 0.1%); decode, c8, c1, 32K same | keep, cost reported |
@@ -119,6 +119,29 @@ suite's heat-soak, grid and prefill). null-overlay mounts candidate 9's own copi
 11 files those arms replace: it differs from candidate 9 only in being an overlay arm.
 `cost_check.py` compares each arm's boots with candidate 9's (Welch over boots). A cost is
 real only if the arm beats candidate 9 and null-overlay does not; only then is it reworked.
+
+Result (run `one-at-a-time-cost-check`, 2026-10-28, 11 boots; grid is step time against the
+first candidate 9 boot, lower is better; candidate 9's boots spread 0.12% sd on the grid,
+0.54% at 32K, 0.40% at 131K):
+
+| arm | grid | 32K prefill | 131K prefill | cost? |
+|---|---|---|---|---|
+| null-overlay | +0.09% ±0.34%, same | +0.16% ±1.32%, same | +0.20% ±1.08%, same | (control) |
+| no-0506 | +0.52% ±0.30%, slower without it | same | same | none: with 0506 decode is 0.5% faster |
+| no-0526 | +0.60% ±0.35%, slower without it | same | same | none: with 0526 decode is 0.6% faster |
+| no-0528 | +0.80% and -0.11% (two boots disagree; ±5.5%) | same | same | none shown |
+
+No arm beat candidate 9 on any metric, so none of the three charged costs is real: the 131K
+costs of 0506 (0.4%) and 0526 (0.5%) were the single-boot arms' position in the run, and
+0528's 1.2% grid cost did not repeat. All three stay; nothing is reworked.
+
+Correction to the page tables' row above (0513-0519): the 131K prefill of the run's three
+boots was 7,443 tok/s (no-PDL), 7,402 (without the page tables), 7,462 (no-PDL again). Without
+them it was slower than both no-PDL boots, by 0.54% and 0.80%, against a 0.25% repeat; the
+verdict's margin was 0.55%. The arms placed mid-run in the candidate 9 runs came out faster at
+131K, not slower. So the page tables likely gain 0.5-0.8% at 131K prefill (where their
+kernels cut a 16K chunk's table writes from 1,405 to 46 us); they stay. 0502's hints (the
+64K/256K grid rows, c8 TTFT p99) repeat between candidate 9's own two boots: nothing there.
 
 ## X7 decoded a word at a time (`x7-word.json`)
 
