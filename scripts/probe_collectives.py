@@ -4,6 +4,12 @@
 Run one rank per node using commands rendered by `spark topology probe`.
 The surrounding container supplies a 600-second timeout and a 12 GiB limit (two NCCL groups plus compilation).
 This checks uniform TP collectives, not EP all-to-all or arbitrary send/recv.
+Inputs are contiguous [rows, width] with whole 16-byte rows, like the model's
+[tokens, hidden] activations. The old 1- and 17-element scalar-row fixtures are
+unsupported by the TileLang rank-order fallback: its world-size row padding
+must start and end on 16-byte packs. They are deliberately not claimed tested;
+one/17 packed rows and one/17 real 5120-wide rows replace them. No direct-adapter
+scalar test is used: it would bypass the TP-group path being qualified.
 """
 
 from __future__ import annotations
@@ -44,6 +50,50 @@ def port_counters():
     return counters
 
 
+def transport_identity(env) -> str:
+    """Keep physical switched identity distinct from sparknet's direct kernel mode."""
+    topology = env.get('SPARKNET_ROCE_TOPOLOGY')
+    identity = env.get('SPARK_DEPLOYMENT_TRANSPORT')
+    if identity is not None:
+        expected = {'oneshot-switched': 'direct', 'nccl-switched': None}
+        if identity not in expected or topology != expected[identity]:
+            raise ValueError('deployment transport identity disagrees with one-shot topology')
+        return identity
+    return f'oneshot-{topology}' if topology else 'nccl-ring'
+
+
+def packed_shape(elements: int, itemsize: int) -> tuple[int, int]:
+    """Preserve total payload, using model-width rows or single-pack rows.
+
+    TileLang's rank-order all-reduce pads dimension 0 to the TP world size;
+    columns.zero_ requires both the padding address and byte count aligned to
+    16 bytes. Model activations are [tokens, hidden] with packed rows, not scalar
+    rows. Prefer the DS4.1 hidden width (5120); exact byte-boundary fixtures use
+    one pack per row instead, without rounding or multiplying their payload.
+    """
+    if itemsize not in (2, 4) or elements <= 0 or elements * itemsize % 16:
+        raise ValueError('probe payload must contain positive whole 16-byte packs (BF16/FP32)')
+    width = 5120 if elements % 5120 == 0 else 16 // itemsize
+    return elements // width, width
+
+
+def correctness_shapes(itemsize: int, limits=()) -> list[tuple[int, int]]:
+    """Tiny packed rows, real hidden-width rows, and exact byte dispatch edges."""
+    pack = 16 // itemsize
+    lengths = {pack, 17 * pack, 1024, 2 * 1024 * 1024,
+               5120, 17 * 5120, 205 * 5120}
+    for limit in limits:
+        lengths.update((limit + offset) // itemsize for offset in (-16, 0, 16)
+                       if limit + offset > 0)
+    shapes = set()
+    for length in lengths:
+        try:
+            shapes.add(packed_shape(length, itemsize))
+        except ValueError:
+            continue
+    return sorted(shapes)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, required=True)
@@ -80,6 +130,8 @@ def main() -> None:
         set_custom_all_reduce,
     )
 
+    # Check the deployment's identity before touching a device or opening a QP.
+    deployment_transport = transport_identity(os.environ)
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     # sparknet's one-shot transports (oneshot-*) are named SPARKNET_ROCE_*; the
@@ -123,17 +175,18 @@ def main() -> None:
 
     checks = []
     before = adapter._runtime.stats()["ops_posted"] if adapter else 0
+    # Every HCA in the pair must carry payload at least once: a dead path is
+    # invisible in the summed counters but stalls a switched all-reduce.
+    carried_hcas = set()
+    custom_cases = 0
     for dtype in (torch.bfloat16, torch.float32):
-        lengths = {1, 17, 1024, 2 * 1024 * 1024}
+        limits = ()
         if adapter:
-            for limit in (adapter._runtime.max_size, adapter._runtime.max_gather_bytes,
-                          getattr(adapter._runtime, "dispatch_max_bytes", adapter._runtime.max_size)):
-                # Exercise the exact dispatch boundary and both adjacent
-                # 16-byte packs for each operation/dtype.
-                lengths.update((limit // dtype.itemsize + offset) for offset in
-                               (-16 // dtype.itemsize, 0, 16 // dtype.itemsize))
-        for length in sorted(lengths):
-            pattern = (torch.arange(length, device=device) % 7).to(dtype)
+            limits = (adapter._runtime.max_size, adapter._runtime.max_gather_bytes,
+                      getattr(adapter._runtime, "dispatch_max_bytes", adapter._runtime.max_size))
+        for shape in correctness_shapes(dtype.itemsize, limits):
+            length = shape[0] * shape[1]
+            pattern = (torch.arange(length, device=device) % 7).to(dtype).reshape(shape)
             local = pattern + args.rank + 1
             scattered = torch.cat([local + 8 * peer for peer in range(args.world_size)])
 
@@ -179,10 +232,11 @@ def main() -> None:
             for v in inputs[1:]: reference = reference + v.float()
             reference = reference.to(dtype)
             for length in args.lengths:
-                local = inputs[args.rank].to(device).repeat((length+63)//64)[:length].contiguous()
+                local = inputs[args.rank].to(device).repeat((length+63)//64)[:length].contiguous().reshape(
+                    packed_shape(length, dtype.itemsize))
                 output = group.all_reduce(local)
                 torch.cuda.synchronize()
-                observed = output[:64].cpu()
+                observed = output.flatten()[:64].cpu()
                 row = {'dtype':str(dtype), 'elements_per_rank':length,
                        'prefix_sha256':hashlib.sha256(observed.view(torch.uint8).numpy().tobytes()).hexdigest(),
                        'rank_order_fp32_prefix_sha256':hashlib.sha256(reference.view(torch.uint8).numpy().tobytes()).hexdigest(),
@@ -198,7 +252,8 @@ def main() -> None:
         # analysis takes the slowest rank per sample, then the median.
         for dtype in (torch.bfloat16, torch.float32):
             for length in args.lengths:
-                local = torch.full((length,), args.rank + 1, device=device, dtype=dtype)
+                local = torch.full(packed_shape(length, dtype.itemsize), args.rank + 1,
+                                   device=device, dtype=dtype)
                 scattered = torch.cat([local + 8 * p for p in range(args.world_size)])
                 operations = {
                     'all_reduce': lambda: group.all_reduce(local),
@@ -256,6 +311,10 @@ def main() -> None:
                             proxy_before['bytes_posted_per_hca'])}
                         if bool(sum(row['proxy_payload_bytes'].values())) != expected_custom:
                             raise RuntimeError(f'{name}: actual transport counters disagree with dispatch policy')
+                        if expected_custom:
+                            custom_cases += 1
+                            carried_hcas.update(h for h, posted
+                                                in row['proxy_payload_bytes'].items() if posted)
                     if ports_before is not None:
                         ports_after = port_counters()
                         row['port_deltas'] = {
@@ -270,6 +329,11 @@ def main() -> None:
                     del graph, outputs
                 del local, scattered
 
+    if custom_cases and adapter is not None:
+        idle = [h for h in adapter._runtime.stats()['hcas'] if h not in carried_hcas]
+        if idle:
+            raise RuntimeError(f'the oneshot proxy never posted payload on {idle}; '
+                               'every HCA in the switched pair must carry traffic')
     if adapter:
         adapter.check_health()
         if adapter._runtime.stats()["ops_posted"] <= before:
@@ -278,7 +342,7 @@ def main() -> None:
     else:
         proxy_stats = None
     print(json.dumps({"rank": args.rank, "world_size": args.world_size,
-                      "transport": f"oneshot-{roce_topology}" if roce_enabled else "nccl-ring",
+                      "transport": deployment_transport,
                       "proxy": proxy_stats,
                       "passed": True, "checks": checks, "numerical_checks": numerical_checks, "timings": timings}), flush=True)
     destroy_model_parallel()
