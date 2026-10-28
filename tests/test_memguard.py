@@ -31,6 +31,7 @@ class MemguardTest(unittest.TestCase):
         self.state = self.root / "state"
         self.actions = self.root / "actions"
         self.ready = self.root / "ready"
+        self.evidence = self.root / "evidence"
         self._write_command(
             "docker",
             """#!/usr/bin/env bash
@@ -46,6 +47,9 @@ case "$1" in
   kill)
     printf 'kill %s\n' "$*" >>"$FAKE_ACTIONS"
     printf 'false\n' >"$FAKE_STATE"
+    ;;
+  logs)
+    printf 'engine log line\n'
     ;;
   *)
     exit 2
@@ -148,6 +152,7 @@ fi
                 "MEMGUARD_PHASE": phase,
                 "WAIT_FOR_CONTAINER_SECONDS": str(wait_seconds),
                 "READY_FILE": str(self.ready),
+                "MEMGUARD_EVIDENCE_DIR": str(self.evidence),
                 "FAKE_STATE": str(self.state),
                 "FAKE_ACTIONS": str(self.actions),
                 "FAKE_MEM_AVAILABLE_KIB": str(available_kib if available_kib is not None
@@ -218,6 +223,44 @@ fi
         actions = self.actions.read_text(encoding="utf-8")
         self.assertIn("kill kill --signal KILL candidate", actions)
         self.assertNotIn("low headroom", actions)
+
+    def test_a_drop_past_both_lines_in_one_interval_says_why_there_was_no_warning(self) -> None:
+        # #628's ring: flat well above the warn line, then one interval below the kill line.
+        result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady",
+                           warn_gib=8, mem_sequence=[16, 16, 4], sleep_limit=10)
+
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertNotIn("low headroom", actions)
+        self.assertIn("(short by 1048576 KiB); warn line 8388608 KiB; previous sample 16777216 KiB ",
+                      actions)
+        self.assertIn("(down 12582912 KiB); no warning: it fell from above the warn line to below the "
+                      "kill line between two samples", actions)
+
+    def test_a_warned_kill_names_no_missing_warning(self) -> None:
+        result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady",
+                           warn_gib=8, mem_sequence=[6, 4], sleep_limit=10)
+
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertIn("low headroom on candidate during steady", actions)
+        self.assertIn("previous sample 6291456 KiB", actions)
+        self.assertNotIn("no warning", actions)
+
+    def test_a_kill_saves_the_evidence_docker_rm_would_destroy(self) -> None:
+        result = self._run(state="true", available_gib=4, wait_seconds=0, phase="steady")
+
+        self.assertEqual(result.returncode, 1)
+        saved = list(self.evidence.glob("candidate-*"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual({path.name for path in saved[0].iterdir()},
+                         {"meminfo.txt", "ps-rss.txt", "inspect.json", "container.log"})
+        if Path("/usr/bin/timeout").exists() or Path("/bin/timeout").exists():
+            self.assertEqual((saved[0] / "container.log").read_text(encoding="utf-8"),
+                             "engine log line\n")
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertLess(actions.index("kill kill --signal KILL candidate"),
+                        actions.index(f"evidence for the kill of candidate: {saved[0]}"))
 
     def test_prelaunch_guard_rejects_low_memory_without_starting_container(
         self,

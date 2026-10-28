@@ -193,13 +193,25 @@ starts, starts the ranks, waits for the API, and switches to the 3 GiB steady
 guard. A node whose available memory falls below the guard has its container
 killed on the first sample below the line, which protects SSH and the host
 rather than an unready service. The kill is logged to the journal (tag
-`spark-memguard`) with the sample, the line and the shortfall.
+`spark-memguard`) with the sample, the line and the shortfall, and with the
+previous sample, how long before it was taken and how far MemAvailable fell
+since.
+
+After the kill the guard saves what `docker rm -f` would otherwise destroy to
+`/var/log/spark-memguard/<container>-<UTC time>/` (`MEMGUARD_EVIDENCE_DIR`):
+`meminfo.txt` (`/proc/meminfo` read just before the kill), `ps-rss.txt` (the
+largest host processes), `inspect.json` and `container.log` (the last 2000
+lines). The journal names that directory. Saving never delays the kill.
 
 A host may set a warn line above the steady guard, `host.memguard_warn_gib`
 (default 0: none). The steady guard then logs `low headroom on <container>
 during steady` once each time MemAvailable falls below that line, and again
 only after it has recovered above it. The warn line only reports; it never
-delays or replaces the kill.
+delays or replaces the kill. A fall from above the warn line to below the kill
+line within one interval kills without a warning; the kill message then says
+so (`no warning: it fell from above the warn line to below the kill line
+between two samples`), so a missing warning reads as a fast drop, not a broken
+guard.
 
 `bin/spark bench` also refuses to measure a cluster whose live configuration
 differs from the selected profile.
