@@ -526,6 +526,28 @@ both `hub/blobs` and the repository's folder. The original checkpoint
 `dba1be0a40aa45a94ad051997016db3960a90277`) still serves with `"model": "v41-flash"`;
 its config, tokenizer and tensor layout are the same, and every weight shard differs.
 
+### GLP steering file
+
+A profile that also serves the steered model, `deepseek-v4.1-flash-weightless` (the
+[GLP dual-serving candidate](../experiments/2026-10-28-glp-dual-serving/README.md)),
+reads one more file on every node: the GLP direction it steers with (785 KiB). The
+repository is gated. With the Hugging Face account whose token is on the node, accept
+its agreement once on the
+[repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75),
+then download the pinned revision on every node:
+
+```sh
+hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75 \
+  glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf \
+  --revision 2715ffd51f59899115853e1118db080536966c44
+```
+
+The file is 803,392 bytes. The profile mounts it read-only from the snapshot
+path, so a node without a token can take a copy of that path (with its
+`hub/blobs` target) from another node instead. `bin/spark doctor --live` and the
+launch preflight report a node that lacks it, with this command
+([doctor](doctor.md#glp-steering-file)).
+
 ## 6. Image
 
 On one idle node (the build host), from a clean checkout of `main`:
