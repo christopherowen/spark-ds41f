@@ -1,0 +1,275 @@
+From 4115f102d0355f223f046b9fe8ab6cad6dca32a0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:26:24 +0100
+Subject: [PATCH 5/5] [Spec] Copy drafts benchmark: the copy kernels and
+ verification at the lookahead
+
+CUDA-graph timings with the L2 flushed: copy_match and copy_select for 1, 8 and
+16 requests over 4K to 1M-token contexts, the history in UVA and in device
+memory, gated at 1% of the release suite's step at that concurrency; greedy and
+block verification compiled at the copy lookahead (16) against the block (5)
+on DSpark's 6-row steps (the same commits; gated: no slower), and the wide
+steps of one 17-row request beside them.
+---
+ benchmarks/kernels/benchmark_copy_drafts.py | 249 ++++++++++++++++++++
+ 1 file changed, 249 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_copy_drafts.py
+
+diff --git a/benchmarks/kernels/benchmark_copy_drafts.py b/benchmarks/kernels/benchmark_copy_drafts.py
+new file mode 100644
+index 000000000..e51dc90d4
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_copy_drafts.py
+@@ -0,0 +1,249 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CUDA-graph timings of copy drafting's kernels and of the verification it widens,
++on DeepSeek V4.1's vocabulary, with the L2 flushed before every replay.
++
++- ``copy``: one step's ``copy_match`` and ``copy_select`` for 1, 8 and 16 requests
++  over contexts of 4K, 64K, 256K and 1M tokens, the history in UVA memory as the
++  runner holds it (``RequestState.all_token_ids``) and in device memory. A request's
++  context ends with a copy of earlier text, so every request finds a source. Gate:
++  a step's copy kernels within 1% of the release suite's step at that concurrency
++  (33.0 ms at one stream, 85.7 ms at eight, and 2 x 85.7 at sixteen; TP4, 1025).
++- ``verify``: the runner's verification of a step, greedy (``greedy_rejection_sample``)
++  and block verification at temperature 1 (``rejection_sample``), at the copy
++  lookahead (16 drafts) and at DSpark's block (5), on steps of 6-row requests
++  (DSpark's, 1, 8 and 16 of them) and on the wide steps of copy drafting (one
++  request of 17 rows beside them). At the lookahead, block verification of a step
++  without a copy runs its kernels at the block's width into the lookahead's output,
++  as the rejection sampler launches it. Gate: on DSpark's steps the lookahead's
++  verification is no slower than the block's (the paired 95% interval's lower end
++  above 2 us fails), so copy drafting costs nothing where it does not copy.
++
++One JSON line a case; with ``--gate`` the exit status is the verdict.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
++from vllm.v1.worker.gpu.spec_decode import tilelang_copy
++from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
++    greedy_rejection_sample,
++    vocab_parallel_pairs,
++)
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
++
++VOCAB = 129280
++MIN_MATCH, LOOKAHEAD, BLOCK, INITIAL = 16, 16, 5, 8
++STEP_MS = {1: 33.0, 8: 85.7, 16: 2 * 85.7}
++CONTEXTS = (4096, 65536, 262144, 1048576)
++FLUSH = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
++
++
++def timed(launch, replays=21, flush=True):
++    """Median and minimum microseconds of one replay of ``launch``'s graph."""
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        launch()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        launch()
++    samples = []
++    for _ in range(replays):
++        if flush:
++            FLUSH.zero_()
++        begin = torch.cuda.Event(enable_timing=True)
++        end = torch.cuda.Event(enable_timing=True)
++        begin.record()
++        graph.replay()
++        end.record()
++        end.synchronize()
++        samples.append(begin.elapsed_time(end) * 1000)
++    return statistics.median(samples), min(samples)
++
++
++def copy_case(num_reqs, context, uva):
++    g = torch.Generator(device="cpu").manual_seed(num_reqs * 7 + context)
++    shape = (16, context + 64)
++    if uva:
++        history_buffer = StagedWriteTensor(
++            shape,
++            dtype=torch.int32,
++            device=torch.device("cuda"),
++            uva_instead_of_gpu=True,
++        )
++        history = history_buffer.gpu
++    else:
++        history = torch.empty(shape, dtype=torch.int32, device="cuda")
++    total_len = torch.zeros(16, dtype=torch.int32, device="cuda")
++    for slot in range(num_reqs):
++        tokens = torch.randint(0, VOCAB, (context,), generator=g, dtype=torch.int32)
++        # The tail repeats text from the first quarter: a copy to find.
++        start = int(torch.randint(0, context // 4 + 1, (1,), generator=g))
++        tail = min(600, context // 2)
++        tokens[context - tail :] = tokens[start : start + tail]
++        history[slot, :context].copy_(tokens.to(history.device))
++        total_len[slot] = context
++    idx = torch.arange(num_reqs, dtype=torch.int64, device="cuda")
++    levels = tilelang_copy.num_levels(MIN_MATCH)
++    sources = torch.empty(
++        (num_reqs, tilelang_copy.CHUNKS, levels), dtype=torch.int32, device="cuda"
++    )
++    int_state = torch.zeros((16, 2), dtype=torch.int32, device="cuda")
++    float_state = torch.zeros((16, 2), dtype=torch.float32, device="cuda")
++    dspark = torch.zeros((num_reqs, BLOCK), dtype=torch.int64, device="cuda")
++    dconf = torch.full((num_reqs, BLOCK), 0.5, device="cuda")
++    ones = torch.ones(num_reqs, dtype=torch.int32, device="cuda")
++    outs = (
++        torch.empty((num_reqs, LOOKAHEAD), dtype=torch.int64, device="cuda"),
++        torch.empty((num_reqs, LOOKAHEAD), device="cuda"),
++        torch.empty((num_reqs, LOOKAHEAD), device="cuda"),
++        torch.empty(num_reqs, dtype=torch.int32, device="cuda"),
++    )
++
++    def launch():
++        tilelang_copy.copy_match(idx, history, total_len, sources, MIN_MATCH)
++        tilelang_copy.copy_select(
++            idx, history, total_len, sources, dspark, dconf, ones, ones, ones,
++            int_state, float_state, *outs, MIN_MATCH, INITIAL,
++        )  # fmt: skip
++
++    median, low = timed(launch)
++    found = int((outs[3] > BLOCK).sum())
++    assert found == num_reqs, f"{found} of {num_reqs} requests found their copy"
++    budget = STEP_MS[num_reqs] * 10  # 1% of the step, in us
++    result = {
++        "case": "copy",
++        "requests": num_reqs,
++        "context": context,
++        "history": "uva" if uva else "device",
++        "us": round(median, 2),
++        "min_us": round(low, 2),
++        "budget_us": round(budget, 1),
++        "slower": median > budget,
++    }
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def verify_inputs(counts, seed):
++    """A step's verification inputs: requests of ``counts`` rows, logits lifted at
++    each row's next input by a margin that varies by row."""
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    rows = sum(counts)
++    sizes = torch.tensor(counts, device="cuda")
++    drafts = torch.randint(0, VOCAB, (rows,), generator=g, device="cuda")
++    logits = torch.randn(rows, VOCAB, generator=g, device="cuda") * 4
++    if rows > 1:
++        r = torch.arange(rows - 1, device="cuda")
++        margin = torch.tensor([0.0, 3.0, 6.0, 9.0, 14.0, 40.0], device="cuda")
++        logits[r, drafts[1:]] += margin[r % 6]
++    states = len(counts) + 9
++    mapping = torch.randperm(states, generator=g, device="cuda")[: len(counts)]
++    return {
++        "logits": logits,
++        "drafts": drafts.int(),
++        "cu": torch.cat((sizes.new_zeros(1), sizes.cumsum(0))).int(),
++        "pos": torch.randint(0, 1 << 20, (rows,), generator=g, device="cuda"),
++        "idx_mapping": mapping,
++        "expanded": mapping.repeat_interleave(sizes),
++        "local": torch.cat([torch.arange(c, device="cuda") for c in counts]).int(),
++        "temperature": torch.ones(states, device="cuda"),
++        "seeds": torch.randint(
++            -(2**63), 2**63 - 1, (states,), generator=g, device="cuda"
++        ),
++    }
++
++
++def verify_launch(method, x, steps, wide):
++    """The runner's verification of the step at the copy lookahead (``steps`` 16)
++    or the block (5). Block verification on a step without a copy runs at the
++    block's width inside the lookahead's output, as the rejection sampler
++    launches it (``kernel_steps``)."""
++    if method == "greedy":
++        pairs = vocab_parallel_pairs(x["logits"], VOCAB, 0, 1)
++        return lambda: greedy_rejection_sample(pairs, x["drafts"], x["cu"], steps)
++    kernel_steps = None if wide or steps == BLOCK else BLOCK
++    return lambda: rejection_sample(
++        x["logits"], None, x["drafts"], x["cu"], x["pos"], x["idx_mapping"],
++        x["expanded"], x["local"], x["temperature"], x["seeds"], steps,
++        use_block_verification=True, kernel_steps=kernel_steps,
++    )  # fmt: skip
++
++
++def verify_case(method, num_reqs, wide, seed):
++    counts = ([1 + LOOKAHEAD] if wide else [1 + BLOCK]) + [1 + BLOCK] * (num_reqs - 1)
++    x = verify_inputs(counts, seed)
++    widths = (LOOKAHEAD,) if wide else (LOOKAHEAD, BLOCK)
++    launches = {steps: verify_launch(method, x, steps, wide) for steps in widths}
++    # The lookahead's commits are the block's on the block's steps.
++    if not wide:
++        a = launches[LOOKAHEAD]()
++        b = launches[BLOCK]()
++        assert torch.equal(a[1], b[1]), "committed counts differ by compiled width"
++        for r, n in enumerate(a[1].tolist()):
++            assert torch.equal(a[0][r, :n], b[0][r, :n]), "committed tokens differ"
++    samples = {steps: [] for steps in widths}
++    for sample in range(8):
++        order = widths if sample % 2 == 0 else widths[::-1]
++        for steps in order:
++            samples[steps].append(timed(launches[steps], replays=7)[0])
++    result = {
++        "case": "verify",
++        "method": method,
++        "requests": num_reqs,
++        "rows": sum(counts),
++        "wide": wide,
++        "lookahead_us": round(statistics.median(samples[LOOKAHEAD]), 2),
++    }
++    slower = False
++    if not wide:
++        paired = [a - b for a, b in zip(samples[LOOKAHEAD], samples[BLOCK])]
++        mean = statistics.fmean(paired)
++        half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++        result["block_us"] = round(statistics.median(samples[BLOCK]), 2)
++        result["interval_us"] = [round(mean - half, 2), round(mean + half, 2)]
++        slower = mean - half > 2.0
++    result["slower"] = slower
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--seed", type=int, default=7123)
++    parser.add_argument("--cases", default="copy,verify")
++    args = parser.parse_args()
++    results = []
++    cases = args.cases.split(",")
++    if "copy" in cases:
++        for uva in (True, False):
++            for num_reqs in (1, 8, 16):
++                for context in CONTEXTS:
++                    results.append(copy_case(num_reqs, context, uva))
++    if "verify" in cases:
++        for method in ("greedy", "block"):
++            for num_reqs in (1, 8, 16):
++                for wide in (False, True):
++                    results.append(verify_case(method, num_reqs, wide, args.seed))
++    failed = [
++        {k: r[k] for k in ("case", "requests") if k in r}
++        | {k: r[k] for k in ("context", "history", "method", "rows") if k in r}
++        for r in results
++        if r["slower"]
++    ]
++    print(json.dumps({"summary": "copy drafts", "slower": failed}), flush=True)
++    if args.gate and failed:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.54.0 (Apple Git-157)
+

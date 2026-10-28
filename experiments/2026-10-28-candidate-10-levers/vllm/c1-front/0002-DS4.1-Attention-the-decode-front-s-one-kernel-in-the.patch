@@ -1,0 +1,228 @@
+From 067db217965ed2a6474a5060e09601f0d2e67a2e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:59:17 +0100
+Subject: [PATCH 2/2] [DS4.1] Attention: the decode front's one kernel in the
+ forward
+
+At decode rows with cache pages (no sequence parallelism, no breakable
+graphs), the attention forward runs attention_front after the fused Q-A/KV
+projection: it writes the normalized q latent and its MXFP8 cast, and the
+rotated kv latent's SWA record, so the separate norms, cast, kv RoPE and
+cache write do not launch. Q-B now reads its input's cast from the input's
+producer: the front kernel's, or cast_mxfp8 (the per_token_cast it ran itself
+before) on every other path.
+
+Test: the routing (decode rows run the one kernel at the SWA slots and page
+size and hand Q-B its cast; sequence-parallel rows, rows past a decode tile
+and memory profiling do not).
+---
+ tests/models/test_deepseek_v4_1_attention.py | 38 +++++++++
+ vllm/models/deepseek_v4_1/attention.py       | 83 ++++++++++++++++++--
+ 2 files changed, 115 insertions(+), 6 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 465c2fb3d..373bcc2e0 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -142,3 +142,41 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
+         # Preparation must remain visible to later consumers as well; mutable
+         # alias-list functionalization used to copy stale clones back here.
+         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
++
++
++def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
++    """At decode rows with cache pages, the front after the fused projection is
++    ``attention_front``'s one launch, at the SWA slots and page size, and Q-B gets its
++    cast; sequence-parallel rows, rows past a decode tile and memory profiling (no
++    cache pages) run the separate kernels."""
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang import front
++
++    module = _tilelang_layer(layer_id=3)
++    module.q_lora_rank = 1280
++    module.q_norm = SimpleNamespace(weight=torch.ones(1280), variance_epsilon=1e-6)
++    module.kv_norm = SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6)
++    module.swa_cache_layer = SimpleNamespace(
++        prefix="swa", kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=128
++    )
++    launches = []
++    monkeypatch.setattr(front, "attention_front", lambda *args: launches.append(args))
++    slots = torch.arange(100, dtype=torch.int64)
++    metadata = {"swa": SimpleNamespace(slot_mapping=slots)}
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    positions = torch.zeros(6, dtype=torch.int64)
++    qr, kv, cast = module._front(torch.zeros(6, 1792), positions, None)
++    (args,) = launches
++    assert args[7].tolist() == list(range(6)) and args[8] == 128
++    assert args[9] is qr and args[12] is kv
++    assert cast.rows is qr and args[10] is cast.values and args[11] is cast.scales
++    assert qr.shape == (6, 1280) and kv.shape == (6, 512)
++    assert module._front(torch.zeros(6, 1792), positions, object()) is None
++    assert module._front(torch.zeros(65, 1792), positions, None) is None
++    metadata = None
++    assert module._front(torch.zeros(6, 1792), positions, None) is None
++    assert len(launches) == 1
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 55b2f53ee..d127ae810 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -10,7 +10,10 @@ import regex as re
+ import torch
+ from torch import nn
+ 
+-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.compilation.breakable_cudagraph import (
++    eager_break_during_capture,
++    is_breakable_cudagraph_enabled,
++)
+ from vllm.config import CacheConfig
+ from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+ from vllm.forward_context import get_forward_context
+@@ -36,6 +39,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
+     tilelang_builder_kernels,
+ )
+ from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang.gemm import DECODE_ROWS
+ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS
+ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+ from vllm.utils.math_utils import cdiv
+@@ -393,6 +397,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._l2pf_ffn = None
+         for linear in (self.fused_wqa_wkv, self.wq_b):
+             _native_linear(linear)
++        # Q-B reads its input's MXFP8 cast from the input's producer: the front's one
++        # kernel at decode sizes (``_front``), TileKernels' cast otherwise.
++        self.wq_b.tilelang_mxfp8_input = True
+         self.rotary_emb = build_deepseek_v4_rope(
+             hf,
+             head_dim=512,
+@@ -543,9 +550,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         """Declare every TileLang kernel this layer can launch, its WO projection's
+         included (the worker calls this after loading, before any distributed
+         work)."""
++        from vllm.models.deepseek_v4_1.tilelang.linear import _warm_casts
++
+         self._attention_geometry()
+         calls = self._tilelang_calls()
+-        prepare.declare(lambda: calls)
++        # Q-B's input cast where the front's one kernel does not write it.
++        prepare.declare(lambda: calls, warm=lambda: _warm_casts(self.q_lora_rank))
+         declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
+         if declare_wo is not None:
+             declare_wo()
+@@ -568,6 +578,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         in its call site's call form."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
++        from vllm.models.deepseek_v4_1.tilelang.front import front_call
+         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+ 
+         calls = []
+@@ -636,6 +647,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # _write_v41_cache: SWA records of every layer, indexed records of the
+         # compressor's latents, at the builders' (and compressor's) slot dtype.
+         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
++        # _front: the decode front's one kernel.
++        calls.append(
++            front_call(
++                self.q_norm.variance_epsilon,
++                self.swa_cache_layer.block_size,
++                SLOT_DTYPE,
++            )
++        )
+         if self.compressor is not None:
+             calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
+         else:
+@@ -770,11 +789,55 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             columns.copy_columns(weights, front[:, q + 512 :])
+         return columns.split_columns(sp_rows.gather(front), widths)
+ 
++    def _front(self, qr_kv, positions, sp_rows):
++        """The decode front after the fused projection in one launch
++        (``tilelang.front``): the normalized q latent and its MXFP8 cast, and the
++        normalized kv latent rotated, with its SWA record written. None where the
++        separate kernels run: sequence-parallel or prefill rows past a decode tile,
++        memory profiling (no cache pages), and breakable graphs, which write the
++        record from live metadata in an eager segment (``_cache_context_kv``)."""
++        from vllm.models.deepseek_v4_1.tilelang.front import attention_front
++        from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
++
++        rows = qr_kv.shape[0]
++        if (
++            sp_rows is not None
++            or rows > DECODE_ROWS
++            or is_breakable_cudagraph_enabled()
++        ):
++            return None
++        metadata = get_forward_context().attn_metadata
++        if not isinstance(metadata, dict):
++            return None
++        swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
++        qr = torch.empty(
++            (rows, self.q_lora_rank), dtype=qr_kv.dtype, device=qr_kv.device
++        )
++        kv = torch.empty((rows, 512), dtype=qr_kv.dtype, device=qr_kv.device)
++        q_cast = empty_mxfp8(qr)
++        attention_front(
++            qr_kv,
++            self.q_norm.weight,
++            self.kv_norm.weight,
++            self.q_norm.variance_epsilon,
++            positions,
++            self.rotary_emb.cos_sin_cache,
++            self.swa_cache_layer.kv_cache,
++            swa.slot_mapping[:rows],
++            self.swa_cache_layer.block_size,
++            qr,
++            q_cast.values,
++            q_cast.scales,
++            kv,
++        )
++        return qr, kv, q_cast
++
+     def _forward(self, positions, hidden_states):
+         if not self._ready:
+             raise RuntimeError("V4.1 attention metadata is not prepared")
+         sp_rows = sp_prefill.current()
+         index_weights = None
++        front = None
+         if sp_rows is not None and self.compressor is None:
+             # Sequence-parallel prefill without a compressor: the row-wise front
+             # (projection, norms, index weights) runs on this rank's rows, and
+@@ -797,9 +860,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             rows = hidden_states.shape[0]
+             with kernels.mxfp8_inputs(gathered):
+                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+-            qr, kv = self.q_norm(qr), self.kv_norm(kv)
+-        q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++            front = self._front(qr_kv, positions, sp_rows)
++            if front is None:
++                qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++                qr, kv = self.q_norm(qr), self.kv_norm(kv)
++        if front is None:
++            q_cast = kernels.cast_mxfp8(qr)
++        else:
++            qr, kv, q_cast = front
++        with kernels.mxfp8_inputs(q_cast):
++            q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         l2_prefetch.issue(self._l2pf_wo, rows)
+         q = self._rope(q, positions, "q")
+         output = torch.empty_like(q)
+@@ -813,7 +883,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         else:
+             original_swa = metadata[self.swa_cache_layer.prefix]
+             swa = self._query_metadata(original_swa)
+-            self._cache_context_kv(kv, positions)
++            if front is None:  # the front's kernel wrote the record
++                self._cache_context_kv(kv, positions)
+             if swa is original_swa and hidden_states is not None:
+                 self._prepare_global_kv(positions, hidden_states)
+             index_query = None
+-- 
+2.54.0 (Apple Git-157)
+
