@@ -88,4 +88,15 @@ candidate 9 against candidate 9 again):
 | 0510 (mHC finalize writes the MXFP8 cast; against no-PDL) | equal | decode grid 1.4% faster (±0.16%, repeat 0.16%); prefill 131K +0.85% (±0.4%); 32K, c8, c1 same | keep |
 | 0513-0519 (sparse-MLA page tables over live pages; against no-PDL) | equal | nothing beyond the repeat: decode grid 0.4% faster against 0.6% repeat drift, every 64K/256K/1016K row same; prefill, c8, c1 same | unproven: drop, or show the workload it pays on |
 | 0502 (no per-allocation KV zeroing) | equal | nothing beyond the repeat: decode grid +0.7% against -0.8% repeat drift; c8, c1, prefill same; c8 TTFT p99 4.3% lower with it (no interval) | unproven: measure allocation-heavy TTFT, else drop |
-| 0505 (two unread budget-sized buffers dropped) | equal | speed same as claimed (decode, c8, c1, prefill all within the repeat); the memory claim was not measured: the run had no startup_lines.py probe | pending: a startup-memory run (candidate 9 / no-0505 with startup_lines.py) |
+| 0505 (two unread budget-sized buffers dropped) | equal | speed same as claimed (decode, c8, c1, prefill all within the repeat); the memory claim was not measured: the run had no startup_lines.py probe | pending: no-0505-memory.json (startup KV pool) |
+| 0506 (attention scratch in its own workspace lane) | equal | same speed as claimed: decode, c8, c1, 32K same; 131K prefill 0.4% slower with it (±0.1%, repeat 0.1%) | keep |
+| 0526 (CED replays the prompt's last 128 rows) | equal | correctness fix; cost 0.5% at 131K prefill (±0.1%, repeat 0.1%); decode, c8, c1, 32K same | keep, cost reported |
+| 0528 (block verification ends at the dead-row cut) | greedy and logprob digests equal; the seeded sampled digest differs (the fix: sampled verification) | correctness fix; cost: decode grid 1.2% slower with it (±0.16%, repeat 0.4%); c8, c1, prefill same | keep; the cost is beyond the repeat, so make it cheaper |
+
+Additions:
+
+| change | bits | result | decision |
+|---|---|---|---|
+| block-scales (SFB[row // 32]) | kernel: block32-base and block32-scales digests equal over 182 cases (7 TP4 shapes x 26 row counts), branch GEMM tests pass; serving: determinism, greedy, sampled digests equal | decode grid 1.3% faster (±0.16%, repeat 0.3%); 131K prefill 1.1% faster (±0.5%, repeat 0.3%); c8, c1, 32K same | promote candidate |
+| expert-codes (2-bit scale codes for narrow experts) | kernel: 114 MoE tests pass, the mixed 2-bit/4-bit launch equals the uncoded GEMM bit for bit; serving: determinism, greedy, sampled digests equal | slower: prefill 2.7% at 32K (±1.4%), 2.8% at 131K (±0.1%), c8 1.6% (±1.2%), repeats under 0.3%; decode grid within its 1.8% repeat drift | fix or drop: the expand costs more than the bytes it saves |
+| x7-gemm (kernel only) | first run (2026-10-28): X7 pack round trip exact on real Q-B weights (8.7% fewer bytes than production), the X8 control kernel bit-exact; the X7 kernel did not compile (TVM's bounds solver negated the uint32 constant of `code == 7`). The test is now signed; rerun queued | - | pending |

@@ -178,8 +178,10 @@ def _gemm(N, K, x7, block_M=16, block_N=64, num_stages=3):
                         code = (((w0 >> t) & u32(1)) | (((w1 >> t) & u32(1)) << u32(1))
                                 | (((w2 >> t) & u32(1)) << u32(2)))
                         rank = start[i2, g] + popc((w0 & w1 & w2) & ((u32(1) << t) - u32(1)))
+                        # Signed test: TVM's bounds solver negates the constant of a
+                        # guarded read's condition, and -7 has no uint32 literal.
                         exponent = T.if_then_else(
-                            code == u32(7),
+                            T.cast(code, T.int32) == 7,
                             (ESC[rank >> 3]
                              >> T.cast((rank & 7) * 4, T.uint32)) & u32(15),
                             code + u32(BASE),
