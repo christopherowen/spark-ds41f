@@ -567,15 +567,9 @@ Revert: `docker image rm "$image"` on each node.
 ## 7. First start
 
 The first start JIT-compiles kernels into `cache/spark-ds41f/jit/`, so it takes
-longer than later ones. Prebuild FlashInfer's sampling module on each node so
-that compile happens outside the memory-guarded startup:
+longer than later ones.
 
-```sh
-experiments/2026-09-23-canonical-minimal/prebuild_flashinfer.sh \
-  "$image" spark-ds41f/flashinfer
-```
-
-Then, from the head node, with a clean checkout of a published commit:
+From the head node, with a clean checkout of a published commit:
 
 ```sh
 bin/spark --cluster-config config/cluster.json cluster sync --apply
