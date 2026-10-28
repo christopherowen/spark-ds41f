@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import statistics
 import sys
 import tempfile
 import threading
@@ -235,6 +236,18 @@ class StatsTest(unittest.TestCase):
         self.assertEqual((dropped, max(kept)), (2, 21.6))
         self.assertEqual(stats.trim_slow([1.0, 1.0, 1.0, 1.0, 1.0, 2.0])[1], 0)  # no spread: keep all
 
+    def test_median_interval_is_exact(self):
+        ten = stats.median_interval(list(range(10, 0, -1)))
+        # Ten values: the 2nd and 9th order statistics cover 1 - 2 * 11/1024.
+        self.assertEqual((ten["median"], ten["low"], ten["high"]), (5.5, 2, 9))
+        self.assertAlmostEqual(ten["coverage"], 1 - 22 / 1024)
+        self.assertEqual(stats.median_interval([1, 2, 3, 4, 5])["low"], None)  # no 95% pair below six
+        self.assertAlmostEqual(stats.median_interval([1, 2, 3, 4, 5, 6])["coverage"], 1 - 2 / 64)
+        self.assertIsNone(stats.median_interval([]))
+        hundred = stats.median_interval([float(v) for v in range(100)])
+        self.assertEqual((hundred["low"], hundred["high"]), (39.0, 60.0))
+        self.assertGreaterEqual(hundred["coverage"], 0.95)
+
     def test_welch_and_verdict(self):
         same = stats.welch([10, 10.1, 9.9, 10.0], [10.05, 9.95, 10.0, 10.1])
         self.assertEqual(stats.verdict(same["change_pct"], same["ci95_pct"], True, 3), "same")
@@ -257,6 +270,25 @@ class PromTest(unittest.TestCase):
         self.assertEqual(out["output_tokens_per_step"], 3)
         self.assertEqual(out["generation_tps"], 150)
         self.assertAlmostEqual(out["accepted_per_draft"], 1.8)
+
+
+    def test_positions_scrape_and_window(self):
+        fake = FakeServer()
+        try:
+            behaviour.generate(fake.url, "fake-model", prompts.default_prompts()[:2], concurrency=1, max_tokens=8)
+            scraped = prom.scrape(fake.url, prom.VLLM)
+            counters = dict(fake.counters)
+        finally:
+            fake.close()
+        self.assertEqual({k: scraped[k] for k in ("accepted_at_0", "accepted_at_1", "verified_at_0", "verified_at_1")},
+                         {"accepted_at_0": counters["pos0"], "accepted_at_1": counters["pos1"],
+                          "verified_at_0": counters["drafts"], "verified_at_1": counters["drafts"]})
+        self.assertGreater(counters["pos1"], 0)
+        start = {"drafts": 0, "accepted_at_0": 0, "accepted_at_1": 0, "verified_at_0": 0, "verified_at_1": 0}
+        end = {"drafts": 10, "accepted_at_0": 8, "accepted_at_1": 5, "verified_at_0": 10, "verified_at_1": 7}
+        window = prom.window(start, end, 1.0)
+        self.assertEqual((window["survival_at_0"], window["survival_at_1"]), (0.8, 0.5))
+        self.assertEqual((window["coverage_at_0"], window["coverage_at_1"]), (1.0, 0.7))
 
 
 class PromptsTest(unittest.TestCase):
@@ -392,6 +424,103 @@ class LiveTest(unittest.TestCase):
             self.assertIn("output tok/s", metrics)
             self.assertIn("engine steps/s", metrics)
             self.assertIn("output tokens/step", metrics)
+            # Every run keeps its request table, on the run's clock with its window.
+            table = outputs[0]["request_table"]
+            self.assertEqual(table["columns"], list(report.TABLE_COLUMNS))
+            self.assertEqual(table["window"], [0.2, 0.8])
+            row = dict(zip(table["columns"], table["rows"][0]))
+            self.assertEqual((row["index"], row["completion_tokens"], row["first_tokens"], row["chunks"]),
+                             (0, 8, CHUNK_TOKENS, 8 // CHUNK_TOKENS))
+            self.assertLess(row["sent"], row["first"])
+            self.assertLessEqual(row["first"], row["last"])
+            self.assertEqual(row["prompt"], outputs[1]["request_table"]["rows"][0][1])  # the same seeded order
+            paired = result["paired"]
+            self.assertGreater(paired["pairs"], 0)
+            self.assertEqual(paired["same_chunks"], paired["pairs"])
+            self.assertIn("decode tok/s, paired", metrics)
+            self.assertIn("paired:", report.format_comparison(result, "base", "candidate"))
+
+
+class PairedTest(unittest.TestCase):
+    """Requests paired by index: text that varies by prompt cancels."""
+
+    @staticmethod
+    def record(rates, ttfts, *, window=(10.0, 1000.0), prompt=lambda i: f"d{i:03d}", errors=(), tokens=256):
+        rows, now = [], 10.0
+        for i, (rate, ttft) in enumerate(zip(rates, ttfts)):
+            first = now + ttft
+            last = first + (tokens - 1) / rate
+            rows.append([i, prompt(i), 0, now, first, last, last + 0.001, 20, tokens, 1, 110,
+                         "boom" if i in errors else None])
+            now = last + 0.01
+        batches = [statistics.fmean(rates[k:k + 8]) for k in range(0, len(rates), 8)]
+        return {"workload": {"mode": "closed", "concurrency": 1, "prompts_sha256": "x"},
+                "summary": {"output_tps": stats.describe(batches) | {"batches": batches},
+                            "latency": {"ttft_s": {"p50": 0.13, "p99": 0.16}}},
+                "request_table": {"columns": list(report.TABLE_COLUMNS), "window": list(window), "rows": rows}}
+
+    # Eighty prompts whose decode speed spreads ±20% with the text, and their TTFTs.
+    TEXT = [75.0 * (1 + 0.2 * math.sin(1.7 * i)) for i in range(80)]
+    TTFT = [0.13 * (1 + 0.1 * math.cos(i)) for i in range(80)]
+
+    def jitter(self, scale: float, seed: int) -> list[float]:
+        return [1 + scale * math.sin(seed + 2.3 * i) for i in range(80)]
+
+    def test_a_small_change_resolves_and_the_same_build_does_not(self):
+        base = self.record(self.TEXT, self.TTFT)
+        faster = self.record([v * 1.005 * j for v, j in zip(self.TEXT, self.jitter(0.0005, 1))],
+                          [t * 0.98 for t in self.TTFT])
+        again = self.record([v * j for v, j in zip(self.TEXT, self.jitter(0.0005, 2))], self.TTFT)
+        result = report.paired(base, faster)
+        self.assertEqual((result["pairs"], result["prompt_mismatches"]), (80, 0))
+        self.assertAlmostEqual(result["decode_tps"]["change_pct"], 0.5, delta=0.06)
+        self.assertGreater(result["decode_tps"]["low_pct"], 0.3)
+        self.assertAlmostEqual(result["ttft_s"]["change_pct"], -2.0, delta=0.01)
+        rows = {row["metric"]: row for row in report.compare(base, faster)["rows"]}
+        self.assertEqual((rows["decode tok/s, paired"]["verdict"], rows["TTFT, paired"]["verdict"]), ("better", "better"))
+        self.assertEqual(rows["output tok/s"]["verdict"], "same")  # the window interval holds the text
+        same = report.paired(base, again)["decode_tps"]
+        self.assertLess(same["low_pct"], 0)
+        self.assertGreater(same["high_pct"], 0)
+        order = [row["metric"] for row in report.compare(base, faster)["rows"]]
+        self.assertEqual(order[order.index("output tok/s") + 1], "decode tok/s, paired")
+
+    def test_only_both_windows_matching_prompts_and_successes_pair(self):
+        base = self.record(self.TEXT, self.TTFT, errors={50})
+        other = self.record(self.TEXT, self.TTFT, window=(30.0, 1000.0), prompt=lambda i: "x" if i == 40 else f"d{i:03d}")
+        result = report.paired(base, other)
+        early = sum(1 for row in other["request_table"]["rows"] if row[3] < 30.0)
+        self.assertEqual(result["prompt_mismatches"], 1)
+        self.assertEqual(result["pairs"], 80 - 1 - early)
+        self.assertEqual(result["decode_tps"]["n"], 80 - 1 - early - 1)  # the failed request has no rate
+        self.assertIsNone(report.paired(base, {k: v for k, v in other.items() if k != "request_table"}))
+
+    def test_runs_without_tables_pair_by_window(self):
+        base = self.record(self.TEXT, self.TTFT)
+        cand = self.record([v * 1.02 for v in self.TEXT], self.TTFT)
+        for side in (base, cand):
+            del side["request_table"]
+        result = report.compare(base, cand)
+        rows = {row["metric"]: row for row in result["rows"]}
+        self.assertNotIn("decode tok/s, paired", rows)
+        self.assertAlmostEqual(rows["output tok/s, window-paired"]["change_pct"], 2.0, places=6)
+        self.assertEqual(rows["output tok/s, window-paired"]["pairs"], 10)
+        self.assertIn("window-paired", result["note"])
+
+    def test_rows_a_step(self):
+        card = report.rows_a_step({"server": {
+            "output_tokens_per_step": {"mean": 2.28}, "accepted_per_draft": {"mean": 1.28},
+            "draft_tokens_per_draft": {"mean": 3.09}, "survival_at_0": {"mean": 0.75},
+            "coverage_at_0": {"mean": 1.0}, "survival_at_1": {"mean": 0.52}, "coverage_at_1": {"mean": 0.9}}})
+        self.assertAlmostEqual(card["decoding_requests_per_step"], 1.0)
+        self.assertAlmostEqual(card["verified_rows_per_step"], 4.09)
+        self.assertAlmostEqual(card["row_yield"], 2.28 / 4.09)
+        self.assertAlmostEqual(card["wasted_rows_per_step"], 4.09 - 2.28)
+        self.assertEqual([p["position"] for p in card["positions"]], [0, 1])
+        self.assertEqual(report.rows_a_step({"server": {}})["positions"], [])
+        text = suite.format_accounting({"cand": {"c1": card}, "ref": {"c1": report.rows_a_step({"server": {}})}})
+        self.assertIn("0:0.750/1.000 1:0.520/0.900", text)
+        self.assertIn("(no speculative counters)", text)
 
 
 class StallTest(unittest.TestCase):
@@ -691,6 +820,40 @@ class SuiteTest(unittest.TestCase):
         rows = suite.with_floor(outcome(-1.2, -2.0), outcome(0.2, 0.1))
         self.assertEqual([row["verdict"] for row in rows], ["better", "worse"])  # faster steps; fewer tok/s
         self.assertIn("against the run's own repeat", suite.format_floor(rows, "base", "cand", "again"))
+
+    def test_paired_rows_take_the_recorded_floor(self):
+        def outcome(change, half=0.05, repeat_window=0.1):
+            return {"steps": {"c1": ("servebench/1", {"rows": [
+                {"metric": "output tok/s", "change_pct": repeat_window, "ci95_pct": 3.7},
+                {"metric": "decode tok/s, paired", "change_pct": change, "ci95_pct": half,
+                 "low_pct": change - half, "high_pct": change + half, "higher_is_better": True}]}),
+                "poisson": ("servebench/1", {"rows": [
+                    {"metric": "decode tok/s, paired", "change_pct": change, "ci95_pct": half,
+                     "low_pct": change - half, "high_pct": change + half, "higher_is_better": True}]})}}
+        floors = {"c1": 0.35}
+        # One candidate boot: floor 0.35, margin ~0.354. The repeat's own 0.02% would have
+        # called the 0.3% "better".
+        rows = suite.with_floor(outcome(0.30), outcome(0.02), floors=floors)
+        paired = next(r for r in rows if r["metric"] == "decode tok/s, paired")
+        self.assertEqual((paired["step"], paired["boots"], paired["verdict"]), ("c1", 1, "same"))
+        self.assertAlmostEqual(paired["floor_pct"], 0.35)
+        self.assertAlmostEqual(paired["margin_pct"], math.hypot(0.05, 0.35))
+        self.assertNotIn("poisson", {r["step"] for r in rows})  # no recorded floor, no paired verdict
+        # Both boots: the mean change against a floor smaller by sqrt(3/4).
+        rows = suite.with_floor(outcome(0.40), outcome(0.02), floors=floors, reference_to_repeat=outcome(0.30))
+        paired = next(r for r in rows if r["metric"] == "decode tok/s, paired")
+        self.assertEqual(paired["boots"], 2)
+        self.assertAlmostEqual(paired["change_pct"], 0.35)
+        self.assertAlmostEqual(paired["floor_pct"], 0.35 * math.sqrt(0.75))
+        self.assertEqual(paired["verdict"], "better")
+        # A noisy repeat widens the floor.
+        rows = suite.with_floor(outcome(0.40), outcome(0.6), floors=floors, reference_to_repeat=outcome(0.30))
+        self.assertEqual(next(r for r in rows if r["metric"] == "decode tok/s, paired")["verdict"], "same")
+        rows = suite.with_floor(outcome(-1.0), outcome(0.02), floors=floors, reference_to_repeat=outcome(-0.8))
+        self.assertEqual(next(r for r in rows if r["metric"] == "decode tok/s, paired")["verdict"], "worse")
+        text = suite.format_floor(rows, "ref", "cand", "cand-again")
+        self.assertIn("both candidate boots; window tok/s +0.10% ±3.70%", text)
+        self.assertIn("in quadrature", text)
 
     def test_suite_runs_and_compares(self):
         servers = [FakeServer(), FakeServer(variant=True)]

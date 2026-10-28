@@ -3,7 +3,9 @@
 An adapter maps the quantities the report uses to a server's metric names. With the vLLM
 adapter a window's throughput splits into engine steps per second times output tokens
 per step, and speculative decoding's acceptance is reported on its own: the step rate
-is the engine's speed, and tokens per step moves with the text.
+is the engine's speed, and tokens per step moves with the text. A quantity given as
+(name, label) is one series per value of that label, scraped as ``<quantity>_<value>``:
+the counters by draft position.
 """
 
 import re
@@ -23,6 +25,9 @@ VLLM = {
     "requests_finished": "vllm:request_success_total",
     "requests_running": "vllm:num_requests_running",
     "requests_waiting": "vllm:num_requests_waiting",
+    # Per draft position: accepted, and verified (drafted rows the target checked).
+    "accepted_at": ("vllm:spec_decode_num_accepted_tokens_per_pos", "position"),
+    "verified_at": ("vllm:spec_decode_num_draft_tokens_per_pos", "position"),
 }
 
 
@@ -80,7 +85,16 @@ def scrape(base_url: str, names: dict[str, str], timeout: float = 10.0) -> dict[
     if text is None:
         return None
     series = parse(text)
-    return {key: series[name] for key, name in names.items() if name in series}
+    out = {}
+    for key, name in names.items():
+        if isinstance(name, tuple):
+            # Prometheus clients may expose a counter with a ``_total`` suffix.
+            metric, label = name
+            for value, number in (by_label(text, metric + "_total", label) or by_label(text, metric, label)).items():
+                out[f"{key}_{value}"] = number
+        elif name in series:
+            out[key] = series[name]
+    return out
 
 
 def require_idle(base_url: str, purpose: str) -> None:
@@ -110,6 +124,12 @@ def window(start: dict | None, end: dict | None, seconds: float) -> dict:
     if delta.get("drafts"):
         out["accepted_per_draft"] = delta.get("accepted_tokens", 0) / delta["drafts"]
         out["draft_tokens_per_draft"] = delta.get("draft_tokens", 0) / delta["drafts"]
+        # By draft position k: survival (accepted at k a draft: the drafts whose first k + 1
+        # tokens all held) and coverage (verified at k a draft).
+        for key, value in delta.items():
+            for prefix, name in (("accepted_at_", "survival_at_"), ("verified_at_", "coverage_at_")):
+                if key.startswith(prefix):
+                    out[name + key[len(prefix):]] = value / delta["drafts"]
     if "preemptions" in delta:
         out["preemptions"] = delta["preemptions"]
     if delta.get("prefix_cache_queries"):

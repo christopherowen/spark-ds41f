@@ -21,7 +21,11 @@ Sections, most trustworthy first:
 1. determinism and references;
 2. quality;
 3. decode on text-independent workloads: the sixteen-prompt acceptance sweep, paired
-   prompt by prompt, and distinct prompts at 1, 4, 8 and 16 concurrent streams;
+   prompt by prompt, and distinct prompts at 1, 4, 8 and 16 concurrent streams. The single
+   stream's verdict row pairs its prompts too (the same prompt in the same turn on both
+   arms): the median ratio with its exact interval and a boot floor in quadrature (one
+   boot against another: 0.35% from 31 single-stream A/A pairs; the release has no repeat);
+   the old row with the interval over prompts stays beside it;
 4. prefill by size;
 5. latency: short-prompt TTFT and mixed traffic;
 6. the bench's decode points. Each is one prompt repeated on N streams, so a release
@@ -33,9 +37,15 @@ import math
 import os
 import statistics
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from servebench import stats  # noqa: E402
 
 BUDGET = 3.0  # percent, for metrics without an interval
 DISTINCT = (1, 4, 8, 16)
+C1_BOOT_FLOOR = 0.35  # percent: one boot against another (scripts/servebench_suite_table.py AA_FLOOR_PCT)
 
 
 def bench(run, arm):
@@ -90,6 +100,20 @@ def paired(run, base, arm, field):
     return 100 * (math.exp(mean) - 1), 100 * half, len(logs)
 
 
+def paired_c1(run, base, arm):
+    """The single stream's prompts in turn, paired by turn: the median tok/s ratio as a
+    change, its exact interval's side toward no change, and the margin with the boot floor."""
+    def by_sample(a):
+        return {x["sample"]: x["tps"] for x in lines(run, "c1-distinct", a) if "sample" in x and x.get("tps")}
+    pa, pb = by_sample(base), by_sample(arm)
+    interval = stats.median_interval([math.log(pb[k] / pa[k]) for k in sorted(set(pa) & set(pb))])
+    if interval is None or interval["low"] is None:
+        return None
+    change = 100 * math.expm1(interval["median"])
+    side = change - 100 * math.expm1(interval["low"]) if change >= 0 else 100 * math.expm1(interval["high"]) - change
+    return change, side, math.hypot(side, C1_BOOT_FLOOR), interval["n"]
+
+
 def main():
     run, arms = sys.argv[1], sys.argv[2:]
     if len(arms) < 2:
@@ -123,6 +147,12 @@ def main():
                 if field != "tps":
                     word = "higher" if delta > half else "lower" if delta < -half else "same"
                 print(f"  {label:28s} paired over {n} prompts: {delta:+6.1f}% ±{half:.1f}%  {word}")
+        c1 = paired_c1(run, base, arm)
+        if c1:
+            change, side, margin, n = c1
+            word = "faster" if change > margin else "slower" if change < -margin else "same"
+            print(f"  {'1 stream tok/s, paired':28s} over {n} prompts: {change:+6.2f}% ±{side:.2f}%, "
+                  f"margin {margin:.2f}% with the boot floor  {word}")
         for streams in DISTINCT:
             a_s, b_s = summary(run, f"c{streams}-distinct", base), summary(run, f"c{streams}-distinct", arm)
             if a_s and b_s:

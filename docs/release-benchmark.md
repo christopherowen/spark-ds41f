@@ -195,7 +195,18 @@ the deployment's identity in the run; it refuses a cluster that differs from its
 
 The first block gives the verdicts: previous release to candidate, each headline metric
 judged against the candidate's own repeat. **better** or **worse** means the change exceeds
-its 95% interval plus the repeat's own change; **same** means it does not. The blocks after
+its 95% interval plus the repeat's own change; **same** means it does not.
+
+The closed loops' verdict row is **decode tok/s, paired**. Each request is paired with the
+same prompt on the other build, and the row gives the median ratio over both candidate
+boots. Its margin is the interval over requests and a boot floor in quadrature. The floor
+is the recorded A/A bound (`AA_FLOOR_PCT` in the table script: 0.35% at one stream), or the
+repeat when larger, shrunk by sqrt(3/4) for two candidate boots. The window row
+(output tok/s) stays beside it, with its old interval. Together they resolve changes of
+about 0.3% at one stream, where the window row's ±3.7% resolved none
+([experiments/2026-10-26-paired-verdict](../experiments/2026-10-26-paired-verdict/README.md)).
+A rows-a-step block follows: for each arm and closed loop, tokens and verified rows a
+step, row yield, wasted rows, and survival and coverage by draft position. The blocks after
 it show every metric of every step for each pair.
 
 - **Engine grid:** step time at fixed shapes with no generated text, draft acceptance or

@@ -176,7 +176,10 @@ before the first boot. `run --dry-run` prints the problems.
   the first score the first arm's text in model steps. The table
   (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
   every other arm, and the first arm with the last as the run's own repeat. Order arms
-  candidate, reference, candidate again.
+  candidate, reference, candidate again. Its verdict block judges the closed loops' paired
+  decode row (requests paired by prompt) over both candidate boots against the recorded
+  A/A floor, so a lean A/B resolves about 0.3% at one stream
+  ([experiments/2026-10-26-paired-verdict](../experiments/2026-10-26-paired-verdict/README.md)).
 - **Companion suites:** `"suite": ["release-tp3", "single-stream"]` runs the release suite,
   then each further suite on the same boot of each arm, into
   `results/private/suites/<run>-<suite>/<label>` with its own table

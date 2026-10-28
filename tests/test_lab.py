@@ -9,6 +9,8 @@ import io
 import importlib.machinery
 import importlib.util
 import json
+import math
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -1403,12 +1405,23 @@ class ReleaseProfileTest(unittest.TestCase):
                 (det / f"sweep-{arm}.jsonl").write_text("".join(
                     json.dumps({"prompt": p, "tps": 80.0 + p + (5 if arm == "cand" else 0),
                                 "accepted_per_draft": 1.5}) + "\n" for p in range(16)))
+                # Twelve prompts in turn whose speeds differ by text (±20%); the candidate is
+                # 1.5% faster on each, within 0.1%. Unpaired, the text hides it.
+                speeds = [70.0 * (1 + 0.04 * ((k * 5) % 11 - 5)) * (1.015 + 0.001 * (k % 3 - 1) if arm == "cand" else 1)
+                          for k in range(12)]
+                mean = statistics.fmean(speeds)
+                (det / f"c1-distinct-{arm}.jsonl").write_text("".join(
+                    json.dumps({"sample": k, "streams": 1, "tps": v}) + "\n" for k, v in enumerate(speeds)) + json.dumps(
+                    {"summary": "c1", "tps_mean": mean,
+                     "ci95_pct": 100 * 2.2 * statistics.stdev(speeds) / math.sqrt(12) / mean}) + "\n")
             out = subprocess.run([sys.executable, str(ROOT / "scripts/release_table.py"), "rel", "base", "cand"],
                                  cwd=root, text=True, capture_output=True, check=True).stdout
         self.assertIn("16 different prompts at once tok/s", out)
         self.assertRegex(out, r"16 different prompts at once tok/s.*\+10\.0%.*faster")
         self.assertRegex(out, r"32,768 tokens.*same")
         self.assertRegex(out, r"acceptance sweep tok/s.*paired over 16 prompts.*faster")
+        self.assertRegex(out, r"1 stream tok/s, paired\s+over 12 prompts:\s+\+1\.5\d% ±0\.\d\d%, margin 0\.3\d%.*faster")
+        self.assertRegex(out, r"1 stream, 12 prompts in turn tok/s.*\+1\.5%.*same")
         self.assertIn("5/5", out)
 
 

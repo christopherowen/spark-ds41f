@@ -48,13 +48,33 @@ server scenario, GuideLLM and AIPerf.
   every sub-window boundary: output tok/s = engine steps/s x output tokens per step.
   The step rate is the engine's speed; tokens per step moves with draft acceptance, that
   is with the text. A precision change that alters the text shows in the second, a
-  kernel change in the first.
+  kernel change in the first. The speculative counters by draft position are read too:
+  survival (accepted at position k a draft) and coverage (verified at k a draft).
+- **Pairs.** Every run keeps a compact table of its requests (`request_table`). The seed
+  fixes the prompt order, so two runs of one workload send the same prompt as their i-th
+  request. `compare` pairs the requests both runs sent in their windows. It gives the
+  median ratio of each pair's decode rate (output tokens after the first, from the first
+  chunk to the last) and of its time to first token, with an exact (sign-test) interval.
+  A window holds whichever prompts fell in it, and greedy text gives each prompt its own
+  acceptance, so windows differ by text more than builds do. At one stream the window
+  interval is ±3.7% where the same build repeats within 0.13%. Pairs cancel the text.
+  A run without a table (one kept before tables existed) is paired window by window
+  instead. With a real change the faster build's windows drift onto later prompts, so
+  that interval also holds text: about ±2% for a 2% change at one stream.
 - **Latency.** Time to first token, time per output token and per-user tok/s
   (percentiles over requests started in the window); with `--slo-ttft` / `--slo-tpot`,
   SLO attainment and goodput (requests per second meeting both limits).
 - **Compare.** Batch-mean metrics get a Welch interval; percentile metrics are judged
-  against a tolerance (default 3%) and marked "no interval". The comparison warns when
-  the two runs' workloads differ.
+  against a tolerance (default 3%) and marked "no interval"; paired rows are judged by
+  their exact interval. The comparison warns when the two runs' workloads differ.
+- **Boots.** A paired interval is a few hundredths of a percent, but a boot moves a build
+  by a few tenths. A suite's verdict block (`suite.with_floor`) therefore judges the paired
+  decode row against a recorded A/A floor that the caller supplies by step: the 95% bound
+  of one boot against another. The run's own repeat widens it when larger. With a second
+  candidate boot, the change is the mean over both boots and the floor shrinks by
+  sqrt(3/4). The margin is the interval and the floor in quadrature. A single repeat is one
+  draw of the boot noise: judged against it alone, a build differs from itself half the
+  time.
 
 ## Suites
 
@@ -202,9 +222,11 @@ candidate measured against that build.
 ## Output
 
 `--output` writes `servebench/1` JSON: tool, server, workload (with the prompt set's
-SHA-256), and summary (`output_tps`, `server`, `server_batches`, `latency`,
-`inflight_mean`, `requests_per_s`, `requests`). `--save-requests` adds every request's
-timeline. `engine` writes `servebench-engine/1`, `model` `servebench-model/1`; a path
+SHA-256), summary (`output_tps`, `server`, `server_batches`, `latency`,
+`inflight_mean`, `requests_per_s`, `requests`) and `request_table`: one row a request
+(index, prompt, slot, sent, first, last and end times from the run's start, prompt and
+completion tokens, the first chunk's tokens, output chunks, error) and the window on the
+same clock. `--save-requests` adds every request's timeline. `engine` writes `servebench-engine/1`, `model` `servebench-model/1`; a path
 ending in `.gz` is compressed. The last stdout line is a one-line summary
 (`{"summary": ...}`) for tables.
 

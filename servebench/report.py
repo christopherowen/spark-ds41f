@@ -1,7 +1,152 @@
-"""Turning a raw run into a summary, and comparing two summaries."""
+"""Turning a raw run into a summary, and comparing two summaries.
+
+Every run keeps a compact table of its requests. Two runs of one workload send the same
+prompt as their i-th request (the seed fixes the order), so their requests pair by index.
+A closed loop's window holds whichever prompts fell in it, and greedy text gives each
+prompt its own acceptance: windows differ by text more than builds do (the window
+interval at one stream is ±3.7% where the same build repeats within 0.13%). The paired
+rows compare each request's decode rate (output tokens after the first, over the time from
+the first to the last) and its time to first token with the same request on the other
+build: the median of the ratios with an exact interval over requests."""
+
+import math
 
 from . import prom, stats
 from .client import tokens_at
+
+TABLE_COLUMNS = ("index", "prompt", "slot", "sent", "first", "last", "end", "prompt_tokens",
+                 "completion_tokens", "first_tokens", "chunks", "error")
+
+
+def request_table(raw: dict) -> dict:
+    """One row per request (``TABLE_COLUMNS``), times in seconds from the run's start; the
+    window, when the run has one, on the same clock. ``last`` is the last output chunk,
+    ``first_tokens`` the output tokens of the first and ``chunks`` the output chunks (the
+    engine steps that gave the request tokens, with per-chunk usage)."""
+    origin = raw["start"]
+
+    def at(moment):
+        return None if moment is None else round(moment - origin, 4)
+
+    rows = []
+    for r in sorted(raw["records"], key=lambda r: r.get("index", 0)):
+        events = r["events"]
+        rows.append([r.get("index"), r.get("prompt_id"), r.get("slot"), at(r["sent"]), at(r["first"]),
+                     at(events[-1][0]) if events else None, at(r["end"]), r["prompt_tokens"],
+                     r["completion_tokens"], events[0][1] if events else None, len(events), r["error"]])
+    window = [at(moment) for moment in raw["window"]] if raw.get("window") else None
+    return {"columns": list(TABLE_COLUMNS), "window": window, "rows": rows}
+
+
+def _requests(run: dict) -> tuple[dict, list | None] | None:
+    table = run.get("request_table")
+    if not table:
+        return None
+    return {row[0]: dict(zip(table["columns"], row)) for row in table["rows"]}, table.get("window")
+
+
+def _decode_rate(r: dict) -> float | None:
+    tokens = (r["completion_tokens"] or 0) - (r["first_tokens"] or 0)
+    if r["error"] or r["first"] is None or r["last"] is None or tokens <= 0 or r["last"] <= r["first"]:
+        return None
+    return tokens / (r["last"] - r["first"])
+
+
+def _ttft(r: dict) -> float | None:
+    return None if r["error"] or r["first"] is None else r["first"] - r["sent"]
+
+
+def paired(base: dict, candidate: dict, confidence: float = 0.95) -> dict | None:
+    """Decode rate and time to first token, request by request, over the requests both runs
+    sent inside their windows (the same index and prompt): the median ratio as a change in
+    %, with its exact interval (``low_pct``, ``high_pct``). None unless both runs kept their
+    request tables. ``same_chunks`` counts pairs streamed in as many chunks on both builds
+    (the same text and drafting give the same steps)."""
+    sides = _requests(base), _requests(candidate)
+    if not all(sides):
+        return None
+    (a, window_a), (b, window_b) = sides
+
+    def inside(r: dict, window: list | None) -> bool:
+        return window is None or window[0] <= r["sent"] < window[1]
+
+    pairs, mismatched = [], 0
+    for index in sorted(set(a) & set(b)):
+        x, y = a[index], b[index]
+        if x["prompt"] != y["prompt"]:
+            mismatched += 1
+        elif inside(x, window_a) and inside(y, window_b):
+            pairs.append((x, y))
+    out = {"pairs": len(pairs), "prompt_mismatches": mismatched,
+           "same_chunks": sum(x["chunks"] == y["chunks"] for x, y in pairs)}
+    for name, value in (("decode_tps", _decode_rate), ("ttft_s", _ttft)):
+        values = [(value(x), value(y)) for x, y in pairs]
+        values = [(u, v) for u, v in values if u and v]
+        interval = stats.median_interval([math.log(v / u) for u, v in values], confidence)
+        if interval is None:
+            continue
+        change = 100 * math.expm1(interval["median"])
+        entry = {"n": interval["n"], "base": stats.median_interval([u for u, _ in values])["median"],
+                 "candidate": stats.median_interval([v for _, v in values])["median"], "change_pct": change,
+                 "low_pct": None, "high_pct": None, "ci95_pct": None, "coverage": interval["coverage"]}
+        if interval["low"] is not None:
+            low, high = 100 * math.expm1(interval["low"]), 100 * math.expm1(interval["high"])
+            entry |= {"low_pct": low, "high_pct": high, "ci95_pct": max(change - low, high - change)}
+        out[name] = entry
+    return out
+
+
+def window_paired(base: dict, candidate: dict, confidence: float = 0.95) -> dict | None:
+    """Output tok/s window by window (window k of one run against window k of the other),
+    for runs that kept no request table: the median ratio with its exact interval. With a
+    real change the faster build's windows drift onto later prompts, so the interval holds
+    that text as well (about ±2% at one stream for a 2% change)."""
+    a = base["summary"].get("output_tps", {}).get("batches")
+    b = candidate["summary"].get("output_tps", {}).get("batches")
+    if not a or not b or len(a) != len(b):
+        return None
+    interval = stats.median_interval([math.log(v / u) for u, v in zip(a, b) if u and v], confidence)
+    if interval is None or interval["low"] is None:
+        return None
+    change = 100 * math.expm1(interval["median"])
+    low, high = 100 * math.expm1(interval["low"]), 100 * math.expm1(interval["high"])
+    return {"n": interval["n"], "change_pct": change, "low_pct": low, "high_pct": high,
+            "ci95_pct": max(change - low, high - change), "coverage": interval["coverage"]}
+
+
+def _bounded_verdict(entry: dict, higher_is_better: bool) -> str:
+    """better / worse when the (asymmetric) interval excludes no change; else same."""
+    if entry["low_pct"] is None:
+        return "same (no interval)"
+    if entry["low_pct"] > 0 or entry["high_pct"] < 0:
+        return "better" if (entry["low_pct"] > 0) == higher_is_better else "worse"
+    return "same"
+
+
+def rows_a_step(summary: dict) -> dict:
+    """A run's step accounting from its counters (window means): every decoding request
+    drafts every step, so it adds 1 + accepted tokens and 1 + verified rows (the target row
+    and its verified drafts). Row yield is tokens per verified row; wasted rows are verified
+    rows that gave no token (rejected rows and the rows after them). Per draft position:
+    survival (accepted there a draft) and coverage (verified there a draft)."""
+    server = summary.get("server", {})
+
+    def mean(key):
+        value = server.get(key)
+        return value.get("mean") if isinstance(value, dict) else None
+
+    tokens, accepted, verified = (mean(k) for k in ("output_tokens_per_step", "accepted_per_draft",
+                                                    "draft_tokens_per_draft"))
+    out = {"tokens_per_step": tokens, "accepted_per_draft": accepted, "verified_per_draft": verified}
+    if tokens and accepted is not None and verified is not None:
+        requests = tokens / (1 + accepted)
+        rows = requests * (1 + verified)
+        out |= {"decoding_requests_per_step": requests, "verified_rows_per_step": rows,
+                "row_yield": tokens / rows, "wasted_rows_per_step": rows - tokens}
+    positions = sorted({int(key.rsplit("_", 1)[1]) for key in server if key.startswith("survival_at_")})
+    out["positions"] = [{"position": k, "survival": mean(f"survival_at_{k}"), "coverage": mean(f"coverage_at_{k}")}
+                        for k in positions]
+    return out
 
 
 def summarize(raw: dict, *, slo_ttft_s: float | None = None, slo_tpot_ms: float | None = None) -> dict:
@@ -147,7 +292,37 @@ def compare(base: dict, candidate: dict, *, tolerance_pct: float = 3.0) -> dict:
             change = 100 * (b / a - 1)
             rows.append({"metric": label, "base": a, "candidate": b, "change_pct": change,
                          "ci95_pct": None, "verdict": stats.verdict(change, None, higher, tolerance_pct)})
-    return {"warnings": warnings, "rows": rows}
+    result = {"warnings": warnings, "rows": rows}
+    pairs = paired(base, candidate)
+    if pairs is not None:
+        # Each paired row goes after the window metric it sharpens.
+        for name, label, after, higher in (("decode_tps", "decode tok/s, paired", "output tok/s", True),
+                                           ("ttft_s", "TTFT, paired", "TTFT p99 s", False)):
+            if name in pairs:
+                entry = pairs[name]
+                row = {"metric": label, "base": entry["base"], "candidate": entry["candidate"],
+                       "change_pct": entry["change_pct"], "ci95_pct": entry["ci95_pct"],
+                       "low_pct": entry["low_pct"], "high_pct": entry["high_pct"], "pairs": entry["n"],
+                       "higher_is_better": higher, "verdict": _bounded_verdict(entry, higher)}
+                at = next((i + 1 for i, r in enumerate(rows) if r["metric"] == after), len(rows))
+                rows.insert(at, row)
+        result["paired"] = pairs
+        result["note"] = (f"paired: {pairs['pairs']} requests in both windows, each the same prompt on both builds; "
+                          f"{pairs['same_chunks']} streamed in as many chunks on both"
+                          + (f"; {pairs['prompt_mismatches']} indices held different prompts (different prompt sets?)"
+                             if pairs["prompt_mismatches"] else ""))
+    elif base["workload"].get("mode") == "closed":
+        windows = window_paired(base, candidate)
+        if windows is not None:
+            row = {"metric": "output tok/s, window-paired", "base": None, "candidate": None,
+                   "change_pct": windows["change_pct"], "ci95_pct": windows["ci95_pct"],
+                   "low_pct": windows["low_pct"], "high_pct": windows["high_pct"], "pairs": windows["n"],
+                   "higher_is_better": True, "verdict": _bounded_verdict(windows, True)}
+            at = next((i + 1 for i, r in enumerate(rows) if r["metric"] == "output tok/s"), len(rows))
+            rows.insert(at, row)
+            result["note"] = (f"window-paired: {windows['n']} windows, window k against window k (a run without "
+                              "request tables); the faster build's windows drift onto later prompts")
+    return result
 
 
 def _batch_samples(run: dict, path: tuple) -> list[float] | None:

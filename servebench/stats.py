@@ -1,5 +1,5 @@
 """Small-sample statistics without numpy: Student t intervals, Welch comparisons,
-nearest-rank percentiles."""
+nearest-rank percentiles, exact intervals for a median."""
 
 import math
 import statistics
@@ -71,6 +71,28 @@ def trim_slow(values: list[float], k: float = 5.0) -> tuple[list[float], int]:
         return list(values), 0
     kept = [v for v in values if v <= middle + k * mad]
     return kept, len(values) - len(kept)
+
+
+def median_interval(values: list[float], confidence: float = 0.95) -> dict | None:
+    """The median and its distribution-free interval: the order statistics k and n + 1 - k,
+    where k is the deepest rank whose binomial (sign-test) tail stays within (1 - confidence) / 2.
+    ``coverage`` is the interval's exact coverage (at least ``confidence``). The interval is
+    None below six values, where no pair of order statistics covers 95%."""
+    values = sorted(v for v in values if v is not None)
+    n = len(values)
+    if not n:
+        return None
+    tail, trimmed = 0.0, 0
+    while trimmed < n // 2:
+        mass = math.comb(n, trimmed) / 2 ** n
+        if tail + mass > (1 - confidence) / 2:
+            break
+        tail += mass
+        trimmed += 1
+    out = {"n": n, "median": statistics.median(values), "low": None, "high": None, "coverage": None}
+    if trimmed:
+        out |= {"low": values[trimmed - 1], "high": values[n - trimmed], "coverage": 1 - 2 * tail}
+    return out
 
 
 def welch(base: list[float], candidate: list[float], confidence: float = 0.95) -> dict | None:

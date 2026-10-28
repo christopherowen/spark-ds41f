@@ -19,8 +19,11 @@ production server should not expose: a suite with one runs against a development
 import datetime
 import hashlib
 import json
+import math
 import time
 from pathlib import Path
+
+from . import report
 
 SCHEMA = "servebench-suite/1"
 BUILTIN = Path(__file__).with_name("suites")
@@ -134,15 +137,63 @@ def compare(read_json, base_dir: str, candidate_dir: str, compare_one) -> dict:
             "labels": [base.get("label"), candidate.get("label")], "steps": steps}
 
 
-HEADLINE = ("decode geometric mean", "output tok/s", "prefill ")
+def step_accounting(read_json, run_dir: str) -> dict:
+    """Rows a step (report.rows_a_step) of every completed ``run`` step of a suite run."""
+    index = json.loads((Path(run_dir) / "suite.json").read_text())
+    out = {}
+    for step in index["steps"]:
+        path = Path(run_dir) / step["output"]
+        if step["command"] == "run" and step["exit"] == 0 and path.is_file():
+            out[step["id"]] = report.rows_a_step(read_json(str(path))["summary"])
+    return out
 
 
-def with_floor(reference_to_candidate: dict, repeat: dict) -> list[dict]:
+def format_accounting(by_label: dict) -> str:
+    """One line per run step and arm: tokens and verified rows a step, row yield, wasted rows,
+    and per draft position survival / coverage."""
+    lines = ["rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)",
+             f"{'step':8s} {'arm':24s} {'tokens':>7s} {'requests':>8s} {'rows':>6s} {'yield':>6s} {'wasted':>7s}"
+             "  by position (survival/coverage)"]
+    steps = []
+    for cards in by_label.values():
+        steps += [step for step in cards if step not in steps]
+    for step in steps:
+        for label, cards in by_label.items():
+            card = cards.get(step)
+            if card is None:
+                continue
+            if "verified_rows_per_step" not in card:
+                lines.append(f"{step:8s} {label[:24]:24s} {'-':>7s}  (no speculative counters)")
+                continue
+            positions = " ".join(f"{p['position']}:{p['survival']:.3f}/{p['coverage']:.3f}" for p in card["positions"]
+                                 if p["survival"] is not None and p["coverage"] is not None)
+            lines.append(f"{step:8s} {label[:24]:24s} {card['tokens_per_step']:7.3f} "
+                         f"{card['decoding_requests_per_step']:8.2f} {card['verified_rows_per_step']:6.2f} "
+                         f"{card['row_yield']:6.3f} {card['wasted_rows_per_step']:7.2f}  {positions or '-'}")
+    return "\n".join(lines)
+
+
+HEADLINE = ("decode geometric mean", "decode tok/s, paired", "output tok/s", "prefill ")
+PAIRED = "decode tok/s, paired"
+
+
+def with_floor(reference_to_candidate: dict, repeat: dict, *, floors: dict | None = None,
+               reference_to_repeat: dict | None = None) -> list[dict]:
     """Headline rows of a reference -> candidate suite comparison, judged against the run's
     own repeat (candidate -> candidate again on another boot). A boot carries a few tenths
     of a percent of its own that no within-run interval sees (2026-10-14: the same build
     moved -0.44% to +0.52% on the grid between boots), so a change counts only beyond its
-    interval plus the repeat's own change."""
+    interval plus the repeat's own change.
+
+    A paired row's interval is a few hundredths of a percent, so the boot is nearly all of
+    its uncertainty, and one repeat is a single draw of it: judged against that alone, a
+    build would differ from itself about half the time. ``floors`` gives such rows a
+    recorded A/A bound by step id: the 95% bound of one boot against another (in %) over
+    past repeats. The run's own repeat widens it when larger. With ``reference_to_repeat``
+    the change is the mean over both candidate boots, whose boot term is smaller by
+    sqrt(3/4). The margin is the interval and the boot term in quadrature."""
+    floors = floors or {}
+    second = (reference_to_repeat or {}).get("steps", {})
     rows = []
     for step, outcome in reference_to_candidate["steps"].items():
         if "skipped" in outcome or step not in repeat["steps"] or "skipped" in repeat["steps"][step]:
@@ -151,26 +202,56 @@ def with_floor(reference_to_candidate: dict, repeat: dict) -> list[dict]:
         if "rows" not in result:
             continue
         again = {row["metric"]: row for row in repeat["steps"][step][1].get("rows", [])}
-        for row in result["rows"]:
+        other = ({row["metric"]: row for row in second[step][1].get("rows", [])}
+                 if step in second and "skipped" not in second[step] else {})
+        window = next((r for r in result["rows"] if r["metric"] == "output tok/s"), None)
+        # The paired row is the step's verdict row; the window row follows it.
+        for row in sorted(result["rows"], key=lambda r: r["metric"] != PAIRED):
             if not row["metric"].startswith(HEADLINE) or row["metric"] not in again or row["ci95_pct"] is None:
                 continue
-            floor = abs(again[row["metric"]]["change_pct"])
-            lower_is_better = row["metric"].startswith("decode")  # step times
-            margin = row["ci95_pct"] + floor
-            if abs(row["change_pct"]) <= margin:
-                verdict = "same"
+            if row["metric"] == PAIRED and step not in floors:
+                continue  # its interval alone would miscall; only a recorded floor judges it
+            repeat_pct = again[row["metric"]]["change_pct"]
+            # Grid rows are step times; every other row says which way is better.
+            higher_is_better = row.get("higher_is_better", not row["metric"].startswith("decode geometric"))
+            out = {"step": step, "metric": row["metric"], "change_pct": row["change_pct"],
+                   "ci95_pct": row["ci95_pct"], "repeat_pct": repeat_pct, "boots": 1, "floor_pct": None}
+            if row["metric"] == PAIRED and step in floors:
+                boots = [row] + ([other[PAIRED]] if PAIRED in other and other[PAIRED]["low_pct"] is not None else [])
+                out["boots"] = len(boots)
+                out["change_pct"] = sum(b["change_pct"] for b in boots) / len(boots)
+                # The interval's side toward no change decides; each side keeps its own width.
+                below = max(b["change_pct"] - b["low_pct"] for b in boots)
+                above = max(b["high_pct"] - b["change_pct"] for b in boots)
+                out["ci95_pct"] = below if out["change_pct"] >= 0 else above
+                aa = max(floors[step], abs(repeat_pct))
+                out["floor_pct"] = aa * math.sqrt((1 + 1 / out["boots"]) / 2)
+                out["margin_pct"] = math.hypot(out["ci95_pct"], out["floor_pct"])
+                if window is not None:
+                    out["window"] = {"change_pct": window["change_pct"], "ci95_pct": window["ci95_pct"]}
             else:
-                verdict = "better" if (row["change_pct"] < 0) == lower_is_better else "worse"
-            rows.append({"step": step, "metric": row["metric"], "change_pct": row["change_pct"],
-                         "ci95_pct": row["ci95_pct"], "repeat_pct": again[row["metric"]]["change_pct"],
-                         "verdict": verdict})
+                out["margin_pct"] = row["ci95_pct"] + abs(repeat_pct)
+            if abs(out["change_pct"]) <= out["margin_pct"]:
+                out["verdict"] = "same"
+            else:
+                out["verdict"] = "better" if (out["change_pct"] > 0) == higher_is_better else "worse"
+            rows.append(out)
     return rows
 
 
 def format_floor(rows: list[dict], reference: str, candidate: str, repeat: str) -> str:
     lines = [f"verdicts: {reference} -> {candidate}, against the run's own repeat ({candidate} -> {repeat})",
-             f"{'metric':32s} {'change':>8s} {'±95%':>7s} {'repeat':>8s}  verdict"]
+             f"{'metric':36s} {'change':>8s} {'±95%':>7s} {'repeat':>8s} {'floor':>7s} {'margin':>7s}  verdict"]
     for row in rows:
-        lines.append(f"{row['step'] + ': ' + row['metric']:32s} {row['change_pct']:+7.2f}% {row['ci95_pct']:6.2f}% "
-                     f"{row['repeat_pct']:+7.2f}%  {row['verdict']}")
+        floor = f"{row['floor_pct']:6.2f}%" if row["floor_pct"] is not None else f"{'-':>7s}"
+        line = (f"{row['step'] + ': ' + row['metric']:36s} {row['change_pct']:+7.2f}% {row['ci95_pct']:6.2f}% "
+                f"{row['repeat_pct']:+7.2f}% {floor} {row['margin_pct']:6.2f}%  {row['verdict']}")
+        if row["floor_pct"] is not None:
+            line += f" ({'both candidate boots; ' if row['boots'] == 2 else ''}"
+            line += (f"window tok/s {row['window']['change_pct']:+.2f}% ±{row['window']['ci95_pct']:.2f}%)"
+                     if row.get("window") else "recorded A/A floor)")
+        lines.append(line)
+    if any(row["floor_pct"] is not None for row in rows):
+        lines.append("paired rows: margin = ±95% (over requests) and floor (the recorded A/A bound, or the "
+                     "repeat when larger, for the boots averaged) in quadrature; other rows: ±95% + |repeat|")
     return "\n".join(lines)

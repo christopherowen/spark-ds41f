@@ -52,6 +52,8 @@ def command_run(args: argparse.Namespace) -> int:
                                        "prompts_sha256": prompts.digest(prompt_set),
                                        "extra_body": extra},
         "summary": summary,
+        # Small (a row a request): compare pairs two runs' requests by it.
+        "request_table": report.request_table(raw),
     }
     if raw.get("documents"):
         result["documents"] = raw["documents"]
