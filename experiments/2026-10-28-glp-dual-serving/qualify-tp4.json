@@ -1,0 +1,92 @@
+{
+ "experiment": "experiments/2026-10-28-glp-dual-serving",
+ "run": "glp-1-qualify-tp4",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "image",
+   "config": "image-dgx2.json",
+   "node": "dgx2",
+   "copies": [
+    [
+     "dgx2",
+     "dgx1-internal"
+    ],
+    [
+     "dgx2",
+     "dgx3-internal"
+    ],
+    [
+     "dgx1",
+     "dgx4-internal"
+    ]
+   ]
+  },
+  {
+   "kind": "kernel",
+   "bundles": [
+    {
+     "node": "dgx2",
+     "bundle": "experiments/2026-10-28-glp-dual-serving/bundles/release-tests"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "dual_probe.py",
+     [
+      "--speed"
+     ],
+     "dual"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "16",
+      "--samples",
+      "4",
+      "--tokens",
+      "256"
+     ],
+     "c16-distinct"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "synthetic-tp4.json",
+     "label": "glp-1-synthetic"
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,1921 @@
+From ee78356dfc92106cf6951ad91b359106e0ef21f0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:04:30 +0100
+Subject: [PATCH] DeepSeek-V4.1: GLP steering per request, under a second
+ served model name
+
+GLP steering was a property of the engine: WEIGHTLESS_STEER_PATH steered
+every request, and each covered layer folded every row explicitly (decode
+grid +2.4%, prefill -1.9% in spark-ds41f's next-release qualification).
+It is now a property of rows. With WEIGHTLESS_STEER_MODEL set, only the
+requests made to that served model name are steered, so one engine serves
+the model and its steered variant side by side; unset, every request is,
+as before.
+
+Each covered layer runs one TileLang launch over the step's rows. A block
+whose row is not marked returns after loading its mark, so unmarked rows
+keep their bits whatever else the step carries. A marked row's write (the
+ranks' unreduced parts added in rank order, as rank_order_sum does) is
+folded as mHC's post kernel folds it, every stream projected in the
+reduction order of the projection this replaces, and the result left as
+the row's residual with comb the identity and post zero: the next layer's
+fused post/pre, an Engram layer's post, the drafter's auxiliary states and
+the final collapse all fold it back exactly (a negative zero may come back
+positive). The model loop's forward is the unsteered one again; it only
+calls the steering and keeps the marks aligned with the rows the layers
+hold (this rank's under sequence parallelism, the decoder's under CED).
+
+The marks are an int32 buffer of the steering module, refilled in place
+before every step by the model state from each request's mark (a UVA
+array the host writes on add_request) and the step's query bounds on the
+GPU, which adaptive verification sets; captured graphs read the replayed
+step's marks.
+
+The OpenAI server marks a request to the steered name in its sampling
+parameters' extra_args (clearing a caller's mark), and its response
+reports the name asked for. Chat completions (and messages), completions,
+responses and tokenization serve the name; every other server, and beam
+search, refuses it rather than serving it unsteered. The scheduler keys a
+marked request's first prefix block apart, as a cache salt does, since
+steered rows write other KV.
+
+Tests: tests/models/test_deepseek_v4_1_glp.py (the module, its marks and
+dispatch), tests/test_weightless.py (marks, names, refusals, cache keys),
+tests/kernels/test_deepseek_v41_tilelang_glp.py (on SM12x: a marked row
+within one rounding of the FP64 projection of mHC's fold, folded back
+exactly at world sizes 1-4, unmarked rows bit for bit untouched, batch
+independence, and the row marks).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../kernels/test_deepseek_v41_tilelang_glp.py | 280 +++++++++++-------
+ tests/models/test_deepseek_v4_1_glp.py        | 249 ++++++++--------
+ tests/test_weightless.py                      | 130 ++++++++
+ .../openai/chat_completion/batch_serving.py   |   3 +-
+ .../openai/chat_completion/serving.py         |   5 +-
+ vllm/entrypoints/openai/completion/serving.py |   5 +-
+ vllm/entrypoints/openai/responses/serving.py  |   5 +-
+ vllm/entrypoints/serve/engine/serving.py      |  37 ++-
+ vllm/entrypoints/serve/tokenize/serving.py    |   3 +
+ vllm/envs.py                                  |   8 +-
+ vllm/models/deepseek_v4_1/glp.py              | 171 +++++++----
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  42 ++-
+ .../deepseek_v4_1/nvidia/model_state.py       |  36 +++
+ vllm/models/deepseek_v4_1/tilelang/glp.py     | 208 ++++++++-----
+ .../models/deepseek_v4_1/tilelang/glp_rows.py |  76 +++++
+ vllm/v1/core/kv_cache_utils.py                |  14 +-
+ vllm/weightless.py                            |  47 +++
+ 17 files changed, 939 insertions(+), 380 deletions(-)
+ create mode 100644 tests/test_weightless.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+ create mode 100644 vllm/weightless.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_glp.py b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+index 43a5cecdd..ff5ae29fc 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_glp.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""GLP steering's TileLang projection against FP64 and the FP32 torch projection
+-it replaces (``h - (alpha (h @ d)) d`` in FP32, then BF16)."""
++"""GLP steering's TileLang launch: a marked row's fold, as mHC's post kernel folds
++it, projected within one rounding of FP64 and handed on so that the next fold
++gives it back; an unmarked row untouched; and the step's row marks."""
+ 
+ import pytest
+ import torch
+@@ -15,142 +16,221 @@ if not (
+ 
+ pytest.importorskip("tilelang")
+ 
+-from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+-    INF,
+-    NAN,
+-    assert_same_nonfinite,
+-)
++from tests.kernels.deepseek_v41_contracts import NAN  # noqa: E402
+ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
+-from vllm.models.deepseek_v4_1.tilelang import glp, prepare  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import glp, glp_rows, prepare  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
++    RankOrderParts,
++)
++from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post  # noqa: E402
+ 
+ STREAMS, HIDDEN = 4, 5120
+ 
+ 
+-def _inputs(tokens: int, seed: int = 0, layers: int = 3):
++def _inputs(tokens: int, world: int = 1, seed: int = 0):
+     generator = torch.Generator(device="cuda").manual_seed(seed)
+-    streams = torch.randn(
+-        tokens, STREAMS, HIDDEN, generator=generator, device="cuda"
+-    ).bfloat16()
+-    directions = torch.randn(layers, HIDDEN, generator=generator, device="cuda")
+-    directions /= directions.double().norm(dim=-1, keepdim=True).float()
+-    return streams, directions
+-
+-
+-def _project(streams, direction, alpha: float) -> torch.Tensor:
+-    out = torch.empty_like(streams)
+-    glp.glp_project(
+-        streams, direction, torch.tensor([alpha], device="cuda"), out
+-    )
++
++    def randn(*shape):
++        return torch.randn(*shape, generator=generator, device="cuda")
++
++    parts = (randn(world, tokens, HIDDEN) / world).bfloat16()
++    residual = randn(tokens, STREAMS, HIDDEN).bfloat16()
++    post = torch.rand(tokens, STREAMS, generator=generator, device="cuda") * 2
++    comb = torch.rand(tokens, STREAMS, STREAMS, generator=generator, device="cuda")
++    comb /= comb.sum(dim=1, keepdim=True)
++    direction = randn(HIDDEN)
++    direction /= direction.double().norm().float()
++    return parts, residual, post, comb, direction
++
++
++def _write(parts: torch.Tensor) -> torch.Tensor:
++    return parts[0] if parts.shape[0] == 1 else RankOrderParts(parts).sum()
++
++
++def _fold(parts, residual, post, comb) -> torch.Tensor:
++    """mHC's post kernel: the fold the next layer's post/pre computes."""
++    out = torch.empty_like(residual)
++    _mhc_post(_write(parts), residual, post, comb, out)
+     return out
+ 
+ 
++def _steer(parts, residual, post, comb, rows, direction, alpha: float):
++    """The launch on copies: the steered residual, post and comb."""
++    residual, post, comb = residual.clone(), post.clone(), comb.clone()
++    glp.glp_steer(
++        parts,
++        residual,
++        post,
++        comb,
++        rows,
++        direction,
++        torch.tensor([alpha], device="cuda"),
++    )
++    return residual, post, comb
++
++
+ def _fp64(streams, direction, alpha: float) -> torch.Tensor:
+     h, d = streams.double(), direction.double()
+     return h - (alpha * (h @ d)).unsqueeze(-1) * d
+ 
+ 
+-def _fp32_torch(streams, direction, alpha: float) -> torch.Tensor:
+-    """The projection as GLP steering first ran it, in eager torch."""
+-    h = streams.float()
+-    return (h - (alpha * (h @ direction)).unsqueeze(-1) * direction).bfloat16()
+-
+-
+ def _ulp(x: torch.Tensor) -> torch.Tensor:
+     """BF16's spacing at ``|x|`` (eight significant bits)."""
+     _, exponent = torch.frexp(x.abs().clamp_min(2.0**-126))
+     return torch.ldexp(torch.ones_like(x), exponent - 8)
+ 
+ 
++def _marks(tokens: int, seed: int = 0) -> torch.Tensor:
++    generator = torch.Generator().manual_seed(seed)
++    return torch.randint(0, 2, (tokens,), generator=generator, dtype=torch.int32).cuda()
++
++
+ @pytest.mark.parametrize("tokens", [1, 7, 96, 384, 2048])
+ @pytest.mark.parametrize("alpha", [0.75, 1.0, 2.0])
+-def test_within_one_rounding_of_fp64(tokens, alpha):
+-    streams, directions = _inputs(tokens, seed=tokens)
+-    out = _project(streams, directions[1], alpha)
+-    exact = _fp64(streams, directions[1], alpha)
+-    assert out.dtype == torch.bfloat16 and out.shape == streams.shape
++def test_a_marked_row_is_its_fold_projected_within_one_rounding(tokens, alpha):
++    parts, residual, post, comb, direction = _inputs(tokens, seed=tokens)
++    rows = torch.ones(tokens, dtype=torch.int32, device="cuda")
++    steered, _, _ = _steer(parts, residual, post, comb, rows, direction, alpha)
++    exact = _fp64(_fold(parts, residual, post, comb), direction, alpha)
+     # One rounding to BF16, plus the FP32 dot product's own error where an output
+-    # cancels to nearly zero (about 1e-8 here; 2^-24 bounds it).
+-    assert ((out.double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
+-    # At least as often correctly rounded as the FP32 torch projection.
+-    rounded = exact.bfloat16()
+-    ours = (out != rounded).double().mean().item()
+-    torch_path = (_fp32_torch(streams, directions[1], alpha) != rounded)
+-    assert ours <= torch_path.double().mean().item() + 1e-4, (ours, torch_path)
+-
+-
+-def test_the_direction_is_removed():
+-    """At alpha 1 what remains along d is only the outputs' BF16 rounding: no more than
+-    the correctly rounded projection leaves, and a small part of what was there."""
+-    streams, directions = _inputs(256)
+-    d = directions[2].double()
+-    before = (streams.double() @ d).abs()
+-    after = (_project(streams, directions[2], 1.0).double() @ d).abs()
+-    rounded = (_fp64(streams, directions[2], 1.0).bfloat16().double() @ d).abs()
+-    assert after.max().item() <= 1.25 * rounded.max().item() + 1e-4
+-    assert after.mean().item() <= 0.05 * before.mean().item()
+-
+-
+-def test_alpha_zero_and_a_zero_direction_change_nothing():
+-    streams, directions = _inputs(96)
+-    assert torch.equal(_project(streams, directions[0], 0.0), streams)
+-    zero = torch.zeros(HIDDEN, device="cuda")
+-    assert torch.equal(_project(streams, zero, 0.75), streams)
+-
+-
+-def test_rows_independent_of_batch():
+-    streams, directions = _inputs(130)
+-    full = _project(streams, directions[1], 0.75)
++    # cancels to nearly zero (2^-24 bounds it).
++    assert ((steered.double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
++
++
++@pytest.mark.parametrize("world", [1, 2, 3, 4])
++def test_the_next_fold_gives_a_marked_row_back(world):
++    parts, residual, post, comb, direction = _inputs(130, world=world, seed=world)
++    rows = _marks(130, seed=world)
++    steered, post2, comb2 = _steer(parts, residual, post, comb, rows, direction, 0.75)
++    marked = rows.bool()
++    eye = torch.eye(STREAMS, device="cuda").expand(int(marked.sum()), -1, -1)
++    assert torch.equal(comb2[marked], eye)
++    assert torch.equal(post2[marked], torch.zeros_like(post2[marked]))
++    # Equal values: a negative zero may come back positive.
++    assert torch.equal(_fold(parts, steered, post2, comb2)[marked], steered[marked])
++
++
++def _bits(t: torch.Tensor) -> torch.Tensor:
++    return t.view(torch.int16 if t.dtype == torch.bfloat16 else torch.int32)
++
++
++def test_an_unmarked_row_is_untouched():
++    parts, residual, post, comb, direction = _inputs(130)
++    rows = _marks(130, seed=3)
++    steered, post2, comb2 = _steer(parts, residual, post, comb, rows, direction, 0.75)
++    kept = ~rows.bool()
++    for before, after in ((residual, steered), (post, post2), (comb, comb2)):
++        assert torch.equal(_bits(after)[kept], _bits(before)[kept])
++    unmarked = torch.zeros(130, dtype=torch.int32, device="cuda")
++    none, _, _ = _steer(parts, residual, post, comb, unmarked, direction, 0.75)
++    assert torch.equal(_bits(none), _bits(residual))
++
++
++def test_a_row_is_independent_of_the_batch_and_the_other_marks():
++    parts, residual, post, comb, direction = _inputs(130)
++    every = torch.ones(130, dtype=torch.int32, device="cuda")
++    full, _, _ = _steer(parts, residual, post, comb, every, direction, 0.75)
+     for tokens in (1, 7, 64, 129):
+-        assert torch.equal(
+-            _project(streams[:tokens], directions[1], 0.75), full[:tokens]
+-        ), tokens
++        part, _, _ = _steer(
++            parts[:, :tokens],
++            residual[:tokens],
++            post[:tokens],
++            comb[:tokens],
++            every[:tokens],
++            direction,
++            0.75,
++        )
++        assert torch.equal(part, full[:tokens]), tokens
++    some = _marks(130, seed=5)
++    mixed, _, _ = _steer(parts, residual, post, comb, some, direction, 0.75)
++    assert torch.equal(mixed[some.bool()], full[some.bool()])
+ 
+ 
+ def test_repeatable():
+-    streams, directions = _inputs(384)
+-    first = _project(streams, directions[1], 0.75)
++    parts, residual, post, comb, direction = _inputs(384)
++    rows = _marks(384)
++    first = _steer(parts, residual, post, comb, rows, direction, 0.75)
+     for _ in range(3):
+-        assert torch.equal(_project(streams, directions[1], 0.75), first)
++        again = _steer(parts, residual, post, comb, rows, direction, 0.75)
++        assert all(torch.equal(a, b) for a, b in zip(again, first))
+ 
+ 
+-def test_a_row_of_the_layer_stack_is_read_in_place():
+-    """The model passes ``directions[layer]``, a view into the stack."""
+-    streams, directions = _inputs(16, layers=5)
+-    for layer in range(5):
+-        assert torch.equal(
+-            _project(streams, directions[layer], 0.75),
+-            _project(streams, directions[layer].clone(), 0.75),
+-        )
++def test_alpha_zero_leaves_the_fold():
++    parts, residual, post, comb, direction = _inputs(96)
++    rows = torch.ones(96, dtype=torch.int32, device="cuda")
++    steered, _, _ = _steer(parts, residual, post, comb, rows, direction, 0.0)
++    assert torch.equal(steered, _fold(parts, residual, post, comb))
+ 
+ 
+-def test_nonfinite_like_the_torch_projection():
+-    """A NaN or an infinity in a stream reaches its whole row, as through
+-    ``h @ d``; other rows keep their bits."""
+-    streams, directions = _inputs(8)
+-    clean = _project(streams, directions[1], 0.75)
+-    for token, stream, col, value in ((0, 1, 3, NAN), (2, 0, 9, INF), (5, 3, 17, -INF)):
+-        streams[token, stream, col] = value
+-    out = _project(streams, directions[1], 0.75)
+-    assert_same_nonfinite(out, _fp32_torch(streams, directions[1], 0.75))
+-    poisoned = {(0, 1), (2, 0), (5, 3)}
+-    for token in range(8):
+-        for stream in range(STREAMS):
+-            if (token, stream) not in poisoned:
+-                assert torch.equal(out[token, stream], clean[token, stream])
++def test_a_nonfinite_value_stays_in_its_row():
++    parts, residual, post, comb, direction = _inputs(8)
++    rows = torch.ones(8, dtype=torch.int32, device="cuda")
++    clean, _, _ = _steer(parts, residual, post, comb, rows, direction, 0.75)
++    residual[2, 1, 17] = NAN
++    out, _, _ = _steer(parts, residual, post, comb, rows, direction, 0.75)
++    assert torch.isnan(out[2]).any()
++    others = [t for t in range(8) if t != 2]
++    assert torch.equal(out[others], clean[others])
+ 
+ 
+ def test_no_tokens_launch_nothing():
+-    streams, directions = _inputs(0)
+-    out = torch.empty_like(streams)
+-    glp.glp_project(streams, directions[0], torch.tensor([0.75], device="cuda"), out)
++    parts, residual, post, comb, direction = _inputs(0)
++    rows = torch.zeros(0, dtype=torch.int32, device="cuda")
++    _steer(parts, residual, post, comb, rows, direction, 0.75)
+ 
+ 
+ def test_declared_as_the_forward_calls_it():
+     registry = JitWarmupRegistry(vllm_config=None)
+     with registry.activate():
+-        glp.declare(STREAMS, HIDDEN)
+-    calls = [
+-        (function, args, kwargs)
+-        for function, args, kwargs in prepare.declared_calls(registry)
++        glp.declare(STREAMS, HIDDEN, (1, 4))
++    calls = list(prepare.declared_calls(registry))
++    assert calls == [
++        (glp.glp_steer_kernel, (STREAMS, HIDDEN, 1), {}),
++        (glp.glp_steer_kernel, (STREAMS, HIDDEN, 4), {}),
+     ]
+-    assert calls == [(glp.glp_project_kernel, (STREAMS, HIDDEN), {})]
++
++
++# The step's row marks.
++
++
++def _host_marks(starts: list[int], idx: list[int], marks: list[int], rows: int):
++    out = [0] * rows
++    for r, state in enumerate(idx):
++        for t in range(starts[r], starts[r + 1]):
++            out[t] = marks[state]
++    return out
++
++
++@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
++def test_rows_take_their_requests_marks_and_padding_none(idx_dtype):
++    # Three requests in states 4, 0 and 2 (marked 1, 0, 1), then graph padding.
++    starts, idx, marks = [0, 3, 4, 10], [4, 0, 2], [0, 0, 1, 0, 1, 0]
++    rows = torch.full((16,), 7, dtype=torch.int32, device="cuda")
++    glp_rows.mark_rows(
++        rows,
++        torch.tensor(idx, dtype=idx_dtype, device="cuda"),
++        torch.tensor(starts, dtype=torch.int32, device="cuda"),
++        torch.tensor(marks, dtype=torch.int32, device="cuda"),
++    )
++    assert rows.tolist() == _host_marks(starts, idx, marks, 16)
++
++
++def test_no_requests_mark_no_row():
++    rows = torch.ones(8, dtype=torch.int32, device="cuda")
++    glp_rows.mark_rows(
++        rows,
++        torch.zeros(0, dtype=torch.int64, device="cuda"),
++        torch.zeros(1, dtype=torch.int32, device="cuda"),
++        torch.ones(4, dtype=torch.int32, device="cuda"),
++    )
++    assert rows.tolist() == [0] * 8
++
++
++def test_query_bounds_must_cover_the_requests():
++    with pytest.raises(ValueError, match="query bounds"):
++        glp_rows.mark_rows(
++            torch.zeros(4, dtype=torch.int32, device="cuda"),
++            torch.zeros(2, dtype=torch.int64, device="cuda"),
++            torch.zeros(2, dtype=torch.int32, device="cuda"),
++            torch.zeros(4, dtype=torch.int32, device="cuda"),
++        )
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index f4cec3331..544d66cfc 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -30,7 +30,9 @@ STEER_ENV = (
+     "WEIGHTLESS_STEER_PATH",
+     "WEIGHTLESS_STEER_ALPHA",
+     "WEIGHTLESS_STEER_LAYERS",
++    "WEIGHTLESS_STEER_MODEL",
+ )
++MAX_TOKENS = 64
+ 
+ 
+ def _string(text: str) -> bytes:
+@@ -190,12 +192,12 @@ def test_a_transferred_vector_is_read(tmp_path):
+ def test_no_path_means_no_steering_module(monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
+     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
+-    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS) is None
++    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS) is None
+ 
+ 
+ def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+     assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
+     assert steering.directions.dtype == torch.float32
+     for layer in range(NUM_LAYERS):
+@@ -211,7 +213,7 @@ def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
+     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
+-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+     assert steering.alpha.item() == pytest.approx(0.5)
+     assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
+     assert steering.directions[1].abs().sum() == 0
+@@ -232,20 +234,20 @@ def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
+     for name, value in env.items():
+         monkeypatch.setenv(name, value)
+     with pytest.raises(ValueError, match=message):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+ 
+ 
+ def test_a_missing_file_is_refused(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
+     with pytest.raises(FileNotFoundError):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+ 
+ 
+ def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
+     path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
+     with pytest.raises(ValueError, match="no glp.alpha_default"):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+ 
+ 
+ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+@@ -256,159 +258,140 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+     assert envs.compile_factors() != unsteered
+ 
+ 
+-# The projection: one TileLang launch (tilelang/glp.py) on the model's BF16
+-# streams, at the serving width. Its precision against FP64 is
+-# tests/kernels/test_deepseek_v41_tilelang_glp.py's.
++def test_the_steered_model_name_alone_is_refused(monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "model-weightless")
++    with pytest.raises(ValueError, match="names no GLP file"):
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+ 
+-WIDE = 5120
+-on_gpu = pytest.mark.skipif(
+-    not torch.cuda.is_available()
+-    or torch.cuda.get_device_capability()[0] != 12,
+-    reason="the TileLang projection targets SM120/SM121",
+-)
+ 
++def test_without_a_model_name_every_row_is_marked(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    assert not steering.per_request
++    assert steering.rows.dtype == torch.int32
++    assert steering.rows.shape == (MAX_TOKENS,)
++    assert bool((steering.rows == 1).all())
++    assert steering.layers == frozenset(LAYERS)
+ 
+-def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
+-    directions = torch.zeros(NUM_LAYERS, WIDE)
+-    for layer in layers:
+-        directions[layer] = torch.from_numpy(unit(layer, WIDE))
+-    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
+ 
++def test_with_a_model_name_rows_start_unmarked(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "model-weightless")
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    assert steering.per_request
++    assert bool((steering.rows == 0).all())
+ 
+-def streams(tokens: int = 7) -> torch.Tensor:
+-    generator = torch.Generator().manual_seed(0)
+-    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
+ 
++def test_a_step_reads_a_view_of_the_marks(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    rows = steering.step_rows(5)
++    assert rows.shape == (5,)
++    assert rows.data_ptr() == steering.rows.data_ptr()
++    with pytest.raises(ValueError, match="at most 64 rows"):
++        steering.step_rows(MAX_TOKENS + 1)
+ 
+-def direction(layer: int) -> torch.Tensor:
+-    return torch.from_numpy(unit(layer, WIDE)).double().cuda()
+ 
++# A layer's step: one TileLang launch (tilelang/glp.py) for a covered layer. The
++# kernel's results are tests/kernels/test_deepseek_v41_tilelang_glp.py's.
+ 
+-@on_gpu
+-@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
+-def test_projection_scales_only_the_direction(alpha):
+-    d = direction(2)
+-    h = streams()
+-    out = steering(alpha)(h, 2).double()
+-    # One BF16 rounding of each output element bounds the error.
+-    torch.testing.assert_close(
+-        out @ d, (1 - alpha) * (h.double() @ d), atol=0.05, rtol=0
+-    )
+-    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
+-    torch.testing.assert_close(rest(out), rest(h.double()), atol=0.05, rtol=0.01)
+-
+-
+-@on_gpu
+-def test_every_stream_is_projected_so_their_mean_is_too():
+-    d = direction(5)
+-    h = streams()
+-    out = steering(1.0)(h, 5).double()
+-    torch.testing.assert_close(
+-        out @ d, torch.zeros(7, STREAMS, dtype=torch.float64, device="cuda"),
+-        atol=0.05, rtol=0,
+-    )
+-    mean = h.double().mean(dim=1)
+-    torch.testing.assert_close(
+-        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
++WIDE = 5120
++
++
++def steering(layers=LAYERS, per_request=True) -> glp.GLPSteering:
++    directions = torch.zeros(NUM_LAYERS, WIDE)
++    for layer in layers:
++        directions[layer] = torch.from_numpy(unit(layer, WIDE))
++    return glp.GLPSteering(
++        directions, 0.75, STREAMS, list(layers), MAX_TOKENS, per_request
+     )
+ 
+ 
+-@on_gpu
+-@pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
+-def test_projection_never_adds_to_a_stream(alpha):
+-    h = streams()
+-    out = steering(alpha)(h, 1)
+-    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
++def _layer_outputs(tokens: int = 3):
++    generator = torch.Generator().manual_seed(1)
++    x = torch.randn(tokens, WIDE, generator=generator).bfloat16()
++    residual = torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16()
++    post_mix = torch.rand(tokens, STREAMS, generator=generator)
++    res_mix = torch.rand(tokens, STREAMS, STREAMS, generator=generator)
++    return x, residual, post_mix, res_mix
+ 
+ 
+-@on_gpu
+-def test_an_unsteered_layer_is_unchanged():
+-    h = streams()
+-    out = steering(0.75)(h, 3)
+-    assert out.dtype == torch.bfloat16
+-    assert torch.equal(out, h)
++@pytest.fixture
++def launches(monkeypatch):
++    calls = []
++    monkeypatch.setattr(glp.tilelang_glp, "glp_steer", lambda *args: calls.append(args))
++    return calls
+ 
+ 
+-@on_gpu
+-def test_alpha_is_read_when_the_projection_runs():
+-    module = steering(1.0)
+-    h = streams()
+-    full = module(h, 1)
+-    module.alpha.fill_(0.0)
+-    assert torch.equal(module(h, 1), h)
+-    assert not torch.equal(full, h)
++def test_a_layer_the_file_does_not_cover_launches_nothing(launches):
++    x, residual, post_mix, res_mix = _layer_outputs()
++    steering().steer(
++        3, x, residual, post_mix, res_mix, torch.ones(3, dtype=torch.int32)
++    )
++    assert launches == []
++
++
++def test_a_covered_layer_steers_its_write_in_place(launches):
++    module = steering()
++    x, residual, post_mix, res_mix = _layer_outputs()
++    rows = torch.tensor([0, 1, 0], dtype=torch.int32)
++    module.steer(5, x, residual, post_mix, res_mix, rows)
++    ((parts, *rest),) = launches
++    assert parts.shape == (1, 3, WIDE) and torch.equal(parts[0], x)
++    assert rest[0] is residual and rest[1] is post_mix and rest[2] is res_mix
++    assert rest[3] is rows
++    assert torch.equal(rest[4], module.directions[5])
++    assert rest[5] is module.alpha
++
++
++def test_the_ranks_unreduced_parts_are_handed_on_as_they_are(launches):
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++
++    x, residual, post_mix, res_mix = _layer_outputs()
++    packed = torch.stack([x, x, x])
++    steering().steer(
++        1,
++        RankOrderParts(packed),
++        residual,
++        post_mix,
++        res_mix,
++        torch.ones(3, dtype=torch.int32),
++    )
++    assert launches[0][0] is packed
+ 
+ 
+-@on_gpu
+-def test_only_the_models_streams_are_projected():
+-    module = steering(1.0)
+-    with pytest.raises(ValueError, match="BF16 streams"):
+-        module(streams().float(), 1)
++@pytest.mark.parametrize(
++    "change",
++    [
++        lambda o: (o[0], o[1].float(), o[2], o[3], o[4]),
++        lambda o: (o[0], o[1][:, :2], o[2], o[3], o[4]),
++        lambda o: (o[0][:2], o[1], o[2], o[3], o[4]),
++        lambda o: (o[0], o[1], o[2], o[3], o[4][:2]),
++    ],
++)
++def test_only_the_models_streams_and_their_marks_are_steered(launches, change):
++    outputs = (*_layer_outputs(), torch.ones(3, dtype=torch.int32))
+     with pytest.raises(ValueError, match="BF16 streams"):
+-        module(streams()[:, :2], 1)
++        steering().steer(1, *change(outputs))
++    assert launches == []
+ 
+ 
+-def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
++@pytest.mark.parametrize("unreduced, worlds", [(False, (1,)), (True, (1, 4))])
++def test_the_steering_is_declared_for_the_writes_it_takes(
++    monkeypatch, unreduced, worlds
++):
++    import vllm.distributed
++
+     declared = []
+     monkeypatch.setattr(
+         glp.tilelang_glp, "declare", lambda *shape: declared.append(shape)
+     )
+-    directions = torch.zeros(NUM_LAYERS, WIDE)
+-    glp.GLPSteering(directions, 0.75, STREAMS).declare_kernels()
+-    assert declared == [(STREAMS, WIDE)]
+-
+-
+-# The model loop's step.
+-
+-
+-class _FoldingMHC(torch.nn.Module):
+-    def __init__(self):
+-        super().__init__()
+-        self.calls = 0
+-
+-    def post(self, x, residual, post_mix, res_mix):
+-        self.calls += 1
+-        return (
+-            post_mix.unsqueeze(-1) * x.float().unsqueeze(1)
+-            + res_mix @ residual.float()
+-        ).to(residual.dtype)
+-
+-
+-def _layer_outputs(device="cpu"):
+-    generator = torch.Generator().manual_seed(1)
+-    x = torch.randn(3, WIDE, generator=generator).bfloat16()
+-    residual = torch.randn(3, STREAMS, WIDE, generator=generator).bfloat16()
+-    post_mix = torch.rand(3, STREAMS, generator=generator)
+-    res_mix = torch.rand(3, STREAMS, STREAMS, generator=generator)
+-    return tuple(t.to(device) for t in (x, residual, post_mix, res_mix))
+-
+-
+-def test_unsteered_layer_outputs_pass_through_untouched():
+-    mhc = _FoldingMHC()
+-    outputs = _layer_outputs()
+-    passed = glp.steer_post_layer(None, mhc, 1, *outputs)
+-    assert all(a is b for a, b in zip(passed, outputs))
+-    assert mhc.calls == 0
+-
+-
+-@on_gpu
+-def test_steered_layer_outputs_are_the_projected_fold():
+-    mhc = _FoldingMHC()
+-    outputs = _layer_outputs("cuda")
+-    module = steering(1.0)
+-    hidden_states, residual, post_mix, res_mix = glp.steer_post_layer(
+-        module, mhc, 5, *outputs
+-    )
+-    assert (residual, post_mix, res_mix) == (None, None, None)
+-    assert mhc.calls == 1
+-    fold = _FoldingMHC().post(*outputs)
+-    assert torch.equal(hidden_states, module(fold, 5))
+-    torch.testing.assert_close(
+-        hidden_states.double() @ direction(5),
+-        torch.zeros(3, STREAMS, dtype=torch.float64, device="cuda"),
+-        atol=0.05,
+-        rtol=0,
++    monkeypatch.setattr(glp.sp_prefill, "unreduced_enabled", lambda: unreduced)
++    monkeypatch.setattr(
++        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 4
+     )
++    steering().declare_kernels()
++    assert declared == [(STREAMS, WIDE, worlds)]
+ 
+ 
+ # A real GLP file, when one is named (it is not redistributed with the tests).
+diff --git a/tests/test_weightless.py b/tests/test_weightless.py
+new file mode 100644
+index 000000000..11a39a5bc
+--- /dev/null
++++ b/tests/test_weightless.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Requests to the steered model name: the server's mark, the response's model
++name, the servers that refuse the name, and the prefix cache's key."""
++
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from vllm import weightless
++from vllm.entrypoints.serve.engine.serving import BaseServing
++from vllm.sampling_params import BeamSearchParams, SamplingParams
++from vllm.v1.core.kv_cache_utils import generate_block_hash_extra_keys
++
++STOCK, STEERED = "model", "model-weightless"
++
++
++@pytest.fixture(autouse=True)
++def steered_name(monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", STEERED)
++
++
++class _Models:
++    lora_requests: dict = {}
++
++    def is_base_model(self, name):
++        return name in (STOCK, STEERED)
++
++    def model_name(self, lora_request=None):
++        return STOCK if lora_request is None else lora_request.lora_name
++
++
++def _server(serves_steered_model: bool) -> BaseServing:
++    server = BaseServing(_Models(), model_config=None)
++    server.serves_steered_model = serves_steered_model
++    return server
++
++
++def _request(model, **fields):
++    return SimpleNamespace(model=model, **fields)
++
++
++def test_marks_set_and_clear():
++    assert weightless.mark(None, True) == {weightless.EXTRA_ARGS_KEY: True}
++    assert weightless.mark({"a": 1, weightless.EXTRA_ARGS_KEY: True}, False) == {"a": 1}
++    assert weightless.mark({weightless.EXTRA_ARGS_KEY: True}, False) is None
++    assert weightless.is_marked(SamplingParams(extra_args={"weightless_steer": True}))
++    assert not weightless.is_marked(SamplingParams())
++    assert not weightless.is_marked(None)
++
++
++def test_no_steered_name_means_no_model_is_steered(monkeypatch):
++    monkeypatch.delenv("WEIGHTLESS_STEER_MODEL")
++    assert not weightless.is_steered_model(STEERED)
++    assert not weightless.is_steered_model(None)
++    params = SamplingParams(extra_args={"a": 1})
++    _server(True)._mark_steering(_request(STEERED), params)
++    assert params.extra_args == {"a": 1}
++
++
++def test_a_request_to_the_steered_name_is_marked():
++    params = SamplingParams(extra_args={"a": 1})
++    _server(True)._mark_steering(_request(STEERED), params)
++    assert params.extra_args == {"a": 1, weightless.EXTRA_ARGS_KEY: True}
++
++
++def test_a_callers_mark_on_the_model_is_cleared():
++    params = SamplingParams(extra_args={weightless.EXTRA_ARGS_KEY: True})
++    _server(True)._mark_steering(_request(STOCK), params)
++    assert not weightless.is_marked(params)
++
++
++def test_beam_search_parameters_are_never_marked():
++    params = BeamSearchParams(beam_width=2, max_tokens=4)
++    _server(True)._mark_steering(_request(STEERED), params)
++    assert not hasattr(params, "extra_args") or not params.extra_args
++
++
++def test_a_response_reports_the_name_it_was_asked_for():
++    server = _server(True)
++    assert server._served_model_name(_request(STEERED), None) == STEERED
++    assert server._served_model_name(_request(STOCK), None) == STOCK
++    assert server._served_model_name(_request(None), None) == STOCK
++    lora = SimpleNamespace(lora_name="adapter")
++    assert server._served_model_name(_request(STEERED), lora) == "adapter"
++
++
++def test_servers_that_cannot_mark_refuse_the_steered_name():
++    refused = asyncio.run(_server(False)._check_model(_request(STEERED)))
++    assert refused is not None and refused.error.param == "model"
++    assert asyncio.run(_server(False)._check_model(_request(STOCK))) is None
++    assert asyncio.run(_server(True)._check_model(_request(STEERED))) is None
++
++
++def test_beam_search_refuses_the_steered_name():
++    server = _server(True)
++    beam = _request(STEERED, use_beam_search=True)
++    assert asyncio.run(server._check_model(beam)) is not None
++    stock = _request(STOCK, use_beam_search=True)
++    assert asyncio.run(server._check_model(stock)) is None
++
++
++def _cached_request(params, cache_salt=None):
++    return SimpleNamespace(
++        sampling_params=params,
++        cache_salt=cache_salt,
++        mm_features=[],
++        lora_request=None,
++        prompt_embeds=None,
++    )
++
++
++def test_a_steered_prefix_is_cached_apart():
++    steered = _cached_request(SamplingParams(extra_args={"weightless_steer": True}))
++    stock = _cached_request(SamplingParams())
++    assert generate_block_hash_extra_keys(stock, 0, 16, 0) == (None, 0)
++    keys, _ = generate_block_hash_extra_keys(steered, 0, 16, 0)
++    assert keys == (weightless.BLOCK_HASH_KEY,)
++    # The first block keys the chain, as a cache salt does.
++    assert generate_block_hash_extra_keys(steered, 16, 32, 0) == (None, 0)
++
++
++def test_no_cache_salt_takes_the_steered_key():
++    salted = _cached_request(SamplingParams(), cache_salt="weightless_steer")
++    steered = _cached_request(SamplingParams(extra_args={"weightless_steer": True}))
++    assert (
++        generate_block_hash_extra_keys(salted, 0, 16, 0)[0]
++        != generate_block_hash_extra_keys(steered, 0, 16, 0)[0]
++    )
+diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+index 06b3dbfd4..70e08e444 100644
+--- a/vllm/entrypoints/openai/chat_completion/batch_serving.py
++++ b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+@@ -139,7 +139,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+             raw_request.state.request_metadata = request_metadata
+ 
+         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+-        model_name = self.models.model_name(lora_request)
++        model_name = self._served_model_name(request, lora_request)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+         max_model_len = self.model_config.max_model_len
+ 
+@@ -159,6 +159,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+             sampling_params = single_request.to_sampling_params(
+                 max_tokens, self.default_sampling_params
+             )
++            self._mark_steering(request, sampling_params)
+             self._log_inputs(
+                 sub_request_id,
+                 engine_prompt,
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 630ea3e20..3c175defa 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -117,6 +117,8 @@ def _make_completion_tokens_details(
+ 
+ 
+ class OpenAIServingChat(GenerateBaseServing):
++    serves_steered_model = True
++
+     def __init__(
+         self,
+         engine_client: EngineClient,
+@@ -289,7 +291,7 @@ class OpenAIServingChat(GenerateBaseServing):
+ 
+         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+ 
+-        model_name = self.models.model_name(lora_request)
++        model_name = self._served_model_name(request, lora_request)
+ 
+         # Extract data_parallel_rank from header (router can inject it)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+@@ -329,6 +331,7 @@ class OpenAIServingChat(GenerateBaseServing):
+                     max_tokens,
+                     self.default_sampling_params,
+                 )
++            self._mark_steering(request, sampling_params)
+ 
+             self._log_inputs(
+                 sub_request_id,
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 950a64b7f..2162687f9 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -54,6 +54,8 @@ logger = init_logger(__name__)
+ 
+ 
+ class OpenAIServingCompletion(GenerateBaseServing):
++    serves_steered_model = True
++
+     def __init__(
+         self,
+         engine_client: EngineClient,
+@@ -176,6 +178,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+                     max_tokens,
+                     self.default_sampling_params,
+                 )
++            self._mark_steering(request, sampling_params)
+ 
+             request_id_item = f"{request_id}-{i}"
+ 
+@@ -218,7 +221,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+ 
+         result_generator = merge_async_iterators(*generators)
+ 
+-        model_name = self.models.model_name(lora_request)
++        model_name = self._served_model_name(request, lora_request)
+         num_prompts = len(engine_inputs)
+ 
+         # Streaming response
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 2c61205e2..c1b4f3115 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -93,6 +93,8 @@ logger = init_logger(__name__)
+ 
+ 
+ class OpenAIServingResponses(GenerateBaseServing):
++    serves_steered_model = True
++
+     def __init__(
+         self,
+         engine_client: EngineClient,
+@@ -347,7 +349,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+             prev_response = None
+ 
+         lora_request = self._maybe_get_adapters(request)
+-        model_name = self.models.model_name(lora_request)
++        model_name = self._served_model_name(request, lora_request)
+ 
+         render_result = await self._render_resolved_response_inputs(
+             request,
+@@ -415,6 +417,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+             sampling_params = request.to_sampling_params(
+                 default_max_tokens, self.default_sampling_params
+             )
++            self._mark_steering(request, sampling_params)
+ 
+             trace_headers = (
+                 None
+diff --git a/vllm/entrypoints/serve/engine/serving.py b/vllm/entrypoints/serve/engine/serving.py
+index 23e392720..f497d0390 100644
+--- a/vllm/entrypoints/serve/engine/serving.py
++++ b/vllm/entrypoints/serve/engine/serving.py
+@@ -1,10 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from http import HTTPStatus
++from typing import ClassVar
+ 
+ from fastapi import Request
+ 
+-from vllm import PromptType, SamplingParams, envs
++from vllm import PromptType, SamplingParams, envs, weightless
+ from vllm.config import ModelConfig
+ from vllm.entrypoints.openai.models.serving import (
+     OpenAIModelRegistry,
+@@ -27,6 +28,10 @@ from vllm.utils import random_uuid
+ 
+ 
+ class BaseServing:
++    # Whether this server marks requests to the steered model name
++    # (vllm/weightless.py); one that does not refuses the name.
++    serves_steered_model: ClassVar[bool] = False
++
+     def __init__(
+         self,
+         models: OpenAIServingModels | OpenAIModelRegistry,
+@@ -43,6 +48,14 @@ class BaseServing:
+     ) -> ErrorResponse | None:
+         error_response = None
+ 
++        if weightless.is_steered_model(request.model) and (
++            not self.serves_steered_model or getattr(request, "use_beam_search", False)
++        ):
++            return self.create_error_response(
++                message=f"The model `{request.model}` is served by chat completions, "
++                "completions, responses and messages, without beam search.",
++                param="model",
++            )
+         if self._is_model_supported(request.model):
+             return None
+         if request.model in self.models.lora_requests:
+@@ -67,6 +80,28 @@ class BaseServing:
+             param="model",
+         )
+ 
++    def _mark_steering(
++        self, request: AnyRequest, sampling_params: SamplingParams | BeamSearchParams
++    ) -> None:
++        """Mark a request to the steered model name in its sampling parameters,
++        and clear any mark its caller set."""
++        if weightless.steered_model() is None or not isinstance(
++            sampling_params, SamplingParams
++        ):
++            return
++        sampling_params.extra_args = weightless.mark(
++            sampling_params.extra_args, weightless.is_steered_model(request.model)
++        )
++
++    def _served_model_name(
++        self, request: AnyRequest, lora_request: LoRARequest | None
++    ) -> str:
++        """The model name a response reports: the steered name for a request to
++        it, otherwise the first served name or the adapter's."""
++        if lora_request is None and weightless.is_steered_model(request.model):
++            return request.model
++        return self.models.model_name(lora_request)
++
+     def _is_model_supported(self, model_name: str | None) -> bool:
+         if not model_name:
+             return True
+diff --git a/vllm/entrypoints/serve/tokenize/serving.py b/vllm/entrypoints/serve/tokenize/serving.py
+index c2232324c..53ae726b8 100644
+--- a/vllm/entrypoints/serve/tokenize/serving.py
++++ b/vllm/entrypoints/serve/tokenize/serving.py
+@@ -30,6 +30,9 @@ logger = init_logger(__name__)
+ 
+ 
+ class ServingTokenization(BaseServing):
++    # Steering changes no token: the steered name tokenizes as the model does.
++    serves_steered_model = True
++
+     def __init__(
+         self,
+         models: OpenAIServingModels | OpenAIModelRegistry,
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b83105166..495458b2e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -230,6 +230,7 @@ if TYPE_CHECKING:
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_ALPHA: str | None = None
+     WEIGHTLESS_STEER_LAYERS: str | None = None
++    WEIGHTLESS_STEER_MODEL: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+     VLLM_MIMO_L2_PREFETCH: bool = False
+@@ -1941,11 +1942,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
+     ),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
+-    # and overrides of its alpha and steered layers. Part of the compile key, as
+-    # every variable here is: steering adds the fold and projection to the graph.
++    # and overrides of its alpha and steered layers, and the served model name
++    # whose requests alone are steered (vllm/weightless.py; unset, every request
++    # is). Part of the compile key, as every variable here is: steering adds its
++    # launch to every covered layer.
+     "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
+     "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
+     "WEIGHTLESS_STEER_LAYERS": lambda: os.getenv("WEIGHTLESS_STEER_LAYERS") or None,
++    "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
+     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+index e79d863ea..2c233c95b 100644
+--- a/vllm/models/deepseek_v4_1/glp.py
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -17,9 +17,15 @@ site, and a file for it is refused.
+ Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
+ module and its forward is unchanged. The reader is fail-closed: a file this
+ runtime cannot apply exactly stops the boot rather than serving unsteered or
+-steering at another site. On, the projection is one TileLang launch per layer
+-(``tilelang/glp.py``), declared for kernel preparation with the model's other
+-kernels.
++steering at another site.
++
++On, steering is a property of rows. Each covered layer runs one TileLang launch
++(``tilelang/glp.py``) that folds and projects the rows ``GLPSteering.rows`` marks,
++in place, and leaves every other row untouched. Without WEIGHTLESS_STEER_MODEL
++every row is marked, so every request is steered. With it, only the rows of
++requests made to that served model name are (``vllm.weightless``): one engine
++serves the model and its steered variant side by side, and a request to the
++other names gets the same bits as with steering off.
+ """
+ 
+ import argparse
+@@ -34,7 +40,9 @@ from torch import nn
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.models.deepseek_v4_1 import sp_prefill
+ from vllm.models.deepseek_v4_1.tilelang import glp as tilelang_glp
++from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ 
+ logger = init_logger(__name__)
+ 
+@@ -248,79 +256,120 @@ def read_glp(
+ 
+ 
+ class GLPSteering(nn.Module):
+-    """Projects a layer's direction off its folded hyper-connection streams."""
+-
+-    def __init__(self, directions: torch.Tensor, alpha: float, hc_mult: int):
++    """Steers the marked rows of a covered layer's outputs, in place."""
++
++    def __init__(
++        self,
++        directions: torch.Tensor,
++        alpha: float,
++        hc_mult: int,
++        layers: list[int],
++        max_tokens: int,
++        per_request: bool,
++    ):
+         super().__init__()
+         self.hc_mult = hc_mult
+-        # One float32 row per model layer; unsteered layers are zero rows, so
+-        # the traced graph does not depend on which layers a file covers.
++        self.layers = frozenset(layers)
++        # Rows are marked by the model state for the requests made to the steered
++        # model name; with one model name, every row is.
++        self.per_request = per_request
++        # One float32 row per model layer; unsteered layers are zero rows.
+         self.register_buffer("directions", directions, persistent=False)
+         # A tensor, not a Python float, which would be a graph constant.
+         self.register_buffer(
+-            "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
++            "alpha", torch.tensor([alpha], dtype=torch.float32), persistent=False
++        )
++        # The step's row marks (int32, 0 or 1), refilled in place before every
++        # step, so a captured graph reads the replayed step's.
++        self.register_buffer(
++            "rows",
++            torch.full((max_tokens,), 0 if per_request else 1, dtype=torch.int32),
++            persistent=False,
+         )
+ 
+     def declare_kernels(self) -> None:
+-        """The projection of the model's streams, the only shape the forward runs."""
+-        tilelang_glp.declare(self.hc_mult, self.directions.shape[1])
+-
+-    def forward(self, streams: torch.Tensor, layer: int) -> torch.Tensor:
+-        """``streams`` ([T, hc_mult, hidden], BF16) with layer ``layer``'s direction
+-        projected off every stream."""
+-        if streams.dtype != torch.bfloat16 or streams.shape[1:] != (
+-            self.hc_mult,
+-            self.directions.shape[1],
++        """The steering of the model's streams, for a layer's write and, when
++        sequence-parallel steps hand it on unreduced, for the ranks' parts."""
++        worlds = [1]
++        if sp_prefill.unreduced_enabled():
++            from vllm.distributed import get_tensor_model_parallel_world_size
++
++            world = get_tensor_model_parallel_world_size()
++            if world > 1:
++                worlds.append(world)
++        tilelang_glp.declare(self.hc_mult, self.directions.shape[1], tuple(worlds))
++
++    def step_rows(self, num_tokens: int) -> torch.Tensor:
++        """The marks of a step's ``num_tokens`` rows, a view of ``rows``."""
++        if num_tokens > self.rows.shape[0]:
++            raise ValueError(
++                f"GLP steering marks at most {self.rows.shape[0]} rows, "
++                f"not {num_tokens}"
++            )
++        return self.rows[:num_tokens]
++
++    def steer(
++        self,
++        layer: int,
++        hidden_states,
++        residual: torch.Tensor,
++        post_mix: torch.Tensor,
++        res_mix: torch.Tensor,
++        rows: torch.Tensor,
++    ) -> None:
++        """Steer layer ``layer``'s outputs in the rows ``rows`` marks.
++
++        A marked row's write is folded into its streams and projected, and the
++        result left as its ``residual``, with ``res_mix`` the identity and
++        ``post_mix`` zero, so the next layer's fold gives it back. Other rows, and
++        every row of a layer the file does not cover, are untouched.
++        """
++        if layer not in self.layers:
++            return
++        parts = (
++            hidden_states.packed
++            if isinstance(hidden_states, RankOrderParts)
++            else hidden_states.unsqueeze(0)
++        )
++        tokens = residual.shape[0]
++        if (
++            residual.dtype != torch.bfloat16
++            or residual.shape[1:] != (self.hc_mult, self.directions.shape[1])
++            or parts.shape[1:] != (tokens, self.directions.shape[1])
++            or rows.shape != (tokens,)
+         ):
+             raise ValueError(
+-                f"GLP steering projects [T, {self.hc_mult}, "
+-                f"{self.directions.shape[1]}] BF16 streams, not "
+-                f"{list(streams.shape)} {streams.dtype}"
++                f"GLP steering takes [T, {self.hc_mult}, {self.directions.shape[1]}] "
++                f"BF16 streams with a write and a mark per row, not streams "
++                f"{list(residual.shape)} {residual.dtype}, write {list(parts.shape)} "
++                f"and marks {list(rows.shape)}"
+             )
+-        streams = streams.contiguous()
+-        out = torch.empty_like(streams)
+-        tilelang_glp.glp_project(
+-            streams, self.directions[layer], self.alpha.view(1), out
++        tilelang_glp.glp_steer(
++            parts,
++            residual,
++            post_mix,
++            res_mix,
++            rows,
++            self.directions[layer],
++            self.alpha,
+         )
+-        return out
+-
+-
+-def steer_post_layer(
+-    glp: GLPSteering | None,
+-    mhc: nn.Module,
+-    layer: int,
+-    hidden_states,
+-    residual: torch.Tensor,
+-    post_mix: torch.Tensor,
+-    res_mix: torch.Tensor,
+-):
+-    """Layer outputs for the next layer, steered when ``glp`` is set.
+-
+-    Unsteered, the outputs pass through untouched, for the next layer's fused
+-    post/pre. Steered, the layer's write is folded into its streams here,
+-    projected, and passed on as the next layer's input with no residual: the
+-    layer then reads Engram and runs its pre on the folded streams, as an Engram
+-    layer does.
+-    """
+-    if glp is None:
+-        return hidden_states, residual, post_mix, res_mix
+-    return (
+-        glp(mhc.post(hidden_states, residual, post_mix, res_mix), layer),
+-        None,
+-        None,
+-        None,
+-    )
+ 
+ 
+ def glp_steering(
+-    num_layers: int, hidden_size: int, hc_mult: int
++    num_layers: int, hidden_size: int, hc_mult: int, max_tokens: int
+ ) -> GLPSteering | None:
+     """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
+ 
+     WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
+     WEIGHTLESS_STEER_LAYERS restricts steering to a comma list of the file's
+-    layers. Both are refused when malformed.
++    layers. Both are refused when malformed. WEIGHTLESS_STEER_MODEL limits
++    steering to the requests made to that served model name.
+     """
++    if envs.WEIGHTLESS_STEER_PATH is None and envs.WEIGHTLESS_STEER_MODEL is not None:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_MODEL names {envs.WEIGHTLESS_STEER_MODEL!r} but "
++            "WEIGHTLESS_STEER_PATH names no GLP file to steer it with"
++        )
+     path = envs.WEIGHTLESS_STEER_PATH
+     if path is None:
+         return None
+@@ -348,8 +397,16 @@ def glp_steering(
+     stack = torch.zeros((num_layers, hidden_size), dtype=torch.float32)
+     for layer in layers:
+         stack[layer] = torch.from_numpy(directions[layer])
+-    logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
+-    return GLPSteering(stack, alpha, hc_mult)
++    per_request = envs.WEIGHTLESS_STEER_MODEL is not None
++    logger.info(
++        "GLP steering on: alpha %s, layers %s, %s",
++        alpha,
++        layers,
++        f"requests to {envs.WEIGHTLESS_STEER_MODEL!r}"
++        if per_request
++        else "every request",
++    )
++    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens, per_request)
+ 
+ 
+ def main() -> None:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 3b2dfd7a2..44d523e98 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -67,7 +67,7 @@ from .. import kernels, l2_prefetch, sp_prefill
+ from ..attention import DeepseekV4Attention
+ from ..ced import ced_decoder_start, gather_rows, scatter_rows
+ from ..common.engram import Engram, EngramLayout, NgramHashState
+-from ..glp import glp_steering, steer_post_layer
++from ..glp import glp_steering
+ from .b12x_attention import DeepseekV41B12xAttention
+ 
+ if typing.TYPE_CHECKING:
+@@ -549,7 +549,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
+         # which leaves the forward as it is.
+         self.glp = glp_steering(
+-            config.num_hidden_layers, config.hidden_size, config.hc_mult
++            config.num_hidden_layers,
++            config.hidden_size,
++            config.hc_mult,
++            vllm_config.scheduler_config.max_num_batched_tokens,
+         )
+         # A captured forward's outputs, written in place: the hidden states and one
+         # row block per auxiliary layer (set with them), for the CUDA graph sizes.
+@@ -822,6 +825,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 )
+             hidden_states = sp_shard(hidden_states)
+             input_ids = sp_shard(input_ids)
++        # GLP steering's row marks for the rows the layers hold: this rank's under
++        # sequence parallelism, the decoder's once CED compacts the step.
++        steer_rows: torch.Tensor | None = None
++        if self.glp is not None:
++            steer_rows = self.glp.step_rows(full_num_tokens)
++            if self.use_sequence_parallel:
++                steer_rows = sp_shard(steer_rows)
++            elif sp is not None:
++                steer_rows = sp.local_slice(steer_rows)
+ 
+         residual, post_mix, res_mix = None, None, None
+         pre_mix: torch.Tensor | None = None
+@@ -841,6 +853,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             positions = gather_rows(positions, ced_indices)
+             if input_ids is not None:
+                 input_ids = gather_rows(input_ids, ced_indices)
++            if steer_rows is not None:
++                steer_rows = gather_rows(
++                    self.glp.step_rows(full_num_tokens), ced_indices
++                )
+             decoder_compacted = True
+         aux_hidden_states: list[torch.Tensor] = []
+         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+@@ -876,18 +892,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 positions = gather_rows(positions, ced_indices)
+                 if input_ids is not None:
+                     input_ids = gather_rows(input_ids, ced_indices)
++                if steer_rows is not None:
++                    steer_rows = gather_rows(
++                        self.glp.step_rows(full_num_tokens), ced_indices
++                    )
+                 decoder_compacted = True
+-            hidden_states, residual, post_mix, res_mix = steer_post_layer(
+-                self.glp, layer.mhc, idx, hidden_states, residual, post_mix, res_mix
+-            )
+-            if idx + 1 in self.aux_hidden_state_layers:
+-                # Reconstruct the aux hidden state for draft models; steering has
+-                # already folded it.
+-                aux_recon = (
+-                    hidden_states
+-                    if residual is None
+-                    else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
++            if self.glp is not None:
++                self.glp.steer(
++                    idx, hidden_states, residual, post_mix, res_mix, steer_rows
+                 )
++            if idx + 1 in self.aux_hidden_state_layers:
++                # Reconstruct the aux hidden state for draft models
++                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                 aux_out = (
+                     self._graph_out(len(aux_hidden_states), full_num_tokens)
+                     if sp is None
+@@ -915,7 +931,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             # Reuse if the last layer was captured as an aux hidden state
+             if self.end_layer in self.aux_hidden_state_layers:
+                 hidden_states = final_aux_recon
+-            elif residual is not None:
++            else:
+                 hidden_states = layer.mhc.post(
+                     hidden_states, residual, post_mix, res_mix
+                 )
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 03e042bfc..37df7dc09 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -7,6 +7,7 @@ import torch
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
++from vllm import weightless
+ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -22,6 +23,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+@@ -212,6 +214,24 @@ class DeepseekV41ModelState(DefaultModelState):
+         # the outputs it recomputes), for the host's hash of its prefill chunks.
+         self._prefill_tokens: dict[str, np.ndarray] = {}
+         self._host_engram_hash = None
++        # GLP steering of the requests made to the steered model name: each
++        # request state's mark, and the steering whose rows a step marks from them.
++        self.steering = next(
++            (
++                module.glp
++                for module in model.modules()
++                if isinstance(module, DeepseekV4Model)
++                and module.glp is not None
++                and module.glp.per_request
++            ),
++            None,
++        )
++        self.steered_requests: UvaBackedTensor | None = None
++        if self.steering is not None:
++            self.steered_requests = UvaBackedTensor(self.max_num_reqs, torch.int32)
++            from vllm.models.deepseek_v4_1.tilelang import glp_rows, prepare
++
++            prepare.declare(lambda: [prepare.call(glp_rows.mark_rows_kernel, "int64")])
+ 
+     def prepare_streaming_update(self, req_id: str) -> None:
+         """Keep decoder history when the runner refreshes a live request."""
+@@ -227,6 +247,8 @@ class DeepseekV41ModelState(DefaultModelState):
+                 new_req_data.prefill_token_ids, dtype=np.int32
+             )
+         sampling = new_req_data.sampling_params
++        if self.steered_requests is not None:
++            self.steered_requests.np[req_index] = weightless.is_marked(sampling)
+         if sampling is not None and sampling.prompt_logprobs is not None:
+             self._ced_prompt_logprobs.add(new_req_data.req_id)
+         else:
+@@ -384,6 +406,17 @@ class DeepseekV41ModelState(DefaultModelState):
+             if self._ced_batch is not input_batch:
+                 self._stage_ced(input_batch)
+             model_inputs["ced_indices"] = self.get_ced_indices()
++        if self.steering is not None:
++            from vllm.models.deepseek_v4_1.tilelang.glp_rows import mark_rows
++
++            # The step's rows of steered requests; padding rows unmarked.
++            num_reqs = input_batch.num_reqs
++            mark_rows(
++                self.steering.step_rows(input_batch.num_tokens_after_padding),
++                input_batch.idx_mapping[:num_reqs],
++                input_batch.query_start_loc[: num_reqs + 1],
++                self.steered_requests.copy_to_uva(),
++            )
+         window = self.lookback_token_ids
+         if window is None:
+             return model_inputs
+@@ -459,6 +492,9 @@ class DeepseekV41ModelState(DefaultModelState):
+             self.ced_state.replay_start.zero_()
+             self._ced_batch = None
+             model_inputs["ced_indices"] = None
++        if self.steering is not None:
++            # Captured unmarked; a replay reads the step's marks in place.
++            self.steering.rows.zero_()
+         if self.lookback_token_ids is not None:
+             # The captured graph reads this buffer; replays refill it in place.
+             self.lookback_token_ids.fill_(-1)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+index 407131030..a3e71224f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/glp.py
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -1,23 +1,28 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""GLP steering's projection, ``h <- h - alpha (h . d) d``, in one launch.
+-
+-``streams`` ([T, hc_mult, hidden], BF16) are a layer's folded hyper-connection
+-streams, ``direction`` ([hidden], FP32) the layer's unit row (zero for a layer the
+-file does not steer) and ``alpha`` ([1], FP32) a buffer, so a file's contents never
+-change the traced graph. One block projects one stream of one token: its 320
+-threads each load sixteen values of the stream in two loads of eight, widen them to
+-FP32, and the block reduces ``h . d`` in a fixed order (each thread's values in
+-sequence, then the warp's lanes, then the warps) before every thread writes
+-``bf16(h - (alpha (h . d)) d)``. One shape for every batch, so a row's reduction order
+-never depends on what else the step carries. Of ten variants measured against the
+-compiled torch projection (experiments/2026-10-23-next-release, glp-variants), 320
+-threads is faster at every serving shape: one stream 2.2 against 2.6 us, sixteen
+-streams 6.9 against 7.9 us, a 16K-token prefill chunk -1.3%. 640 threads was faster on
+-prefill but only level at sixteen streams, and slower there in the next run; 128 threads
+-(0261) was slower on prefill. Alpha zero and a zero direction return the stream
+-unchanged; a non-finite value in a stream reaches its whole row, as it does through
+-``h @ d``.
++"""GLP steering of the rows a step marks, in one launch a layer.
++
++A layer leaves its write ``x`` and the mixes that fold it into the streams for the
++next layer's fused post/pre: ``h[n] = bf16(post[n] x + sum_m comb[m, n] residual[m])``.
++For each marked row (``rows[t] != 0``) one block folds the write as ``post_streams``
++does (the ranks' unreduced parts of ``x`` first added in rank order, as
++``rank_order_sum`` does), projects every stream, ``h <- h - alpha (h . d) d``, and
++writes the projected streams back as the row's ``residual``, with ``comb`` the
++identity and ``post`` zero. The next layer's fold of that row then gives the
++projected streams back exactly (``1 * r + 0 * ...`` in FP32 is ``r``; only a
++negative zero becomes positive), whichever path reads it: the fused post/pre, an
++Engram layer's post, the drafter's auxiliary states or the final collapse.
++
++A row that is not marked is not read or written: its block returns after loading
++its mark, so unsteered rows keep their bits whatever else the step carries.
++
++``direction`` ([hidden], FP32) is the layer's unit row and ``alpha`` ([1], FP32) a
++buffer, so a file's contents never change the traced graph. A block's 320 threads
++each own sixteen columns of every stream (two loads of eight); a stream's ``h . d``
++is reduced in a fixed order (each thread's values in sequence, then the warp's
++lanes, then the warps), the order of the projection this replaces
++(experiments/2026-10-23-next-release, glp-variants), so a row's result never
++depends on the batch.
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -32,84 +37,151 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 320, vec: int = 8):
++def glp_steer_kernel(
++    hc_mult: int, hidden: int, world: int, threads: int = 320, vec: int = 8
++):
+     assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert 1 <= world <= 4
+     chunks = hidden // (threads * vec)
+     warps = threads // 32
++    span = chunks * vec
+     tokens = T.dynamic("tokens")
+ 
+     @T.prim_func
+-    def glp_project(
+-        streams: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    def glp_steer(
++        parts: T.Tensor((world, tokens, hidden), T.bfloat16),
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        rows: T.Tensor((tokens,), T.int32),
+         direction: T.Tensor((hidden,), T.float32),
+         alpha: T.Tensor((1,), T.float32),
+-        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+     ):
+-        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++        with T.Kernel(tokens, threads=threads) as t:
+             tx = T.get_thread_binding()
+-            xs = T.alloc_local((chunks * vec,), T.float32)
+-            ds = T.alloc_local((chunks * vec,), T.float32)
+-            acc = T.alloc_local((1,), T.float32)
+-            partial = T.alloc_shared((warps,), T.float32)
+-            scale = T.alloc_shared((1,), T.float32)
+-            acc[0] = T.float32(0)
++            # The whole block leaves an unmarked row, before any barrier.
++            if rows[t] == 0:
++                T.thread_return()
++            hs = T.alloc_local((hc_mult * span,), T.float32)
++            ds = T.alloc_local((span,), T.float32)
++            xs = T.alloc_local((vec,), T.float32)
++            rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
++            pv = T.alloc_local((world * vec,), T.bfloat16)
++            pm = T.alloc_local((hc_mult,), T.float32)
++            cm = T.alloc_local((hc_mult * hc_mult,), T.float32)
++            acc = T.alloc_local((hc_mult,), T.float32)
++            fold = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            partial = T.alloc_shared((hc_mult, warps), T.float32)
++            scale = T.alloc_shared((hc_mult,), T.float32)
++            for n in T.unroll(hc_mult):
++                pm[n] = post[t, n]
++                acc[n] = T.float32(0)
++            for m in T.unroll(hc_mult):
++                for n in T.unroll(hc_mult):
++                    cm[m * hc_mult + n] = comb[t, m, n]
+             for c in T.serial(chunks):
+-                for i in T.vectorized(vec):
+-                    xs[c * vec + i] = streams[t, h, (c * threads + tx) * vec + i]
+-                for i in T.vectorized(vec):
+-                    ds[c * vec + i] = direction[(c * threads + tx) * vec + i]
+-                for i in T.serial(vec):
+-                    acc[0] += xs[c * vec + i] * ds[c * vec + i]
+-            acc[0] = T.warp_reduce_sum(acc[0])
+-            if tx % 32 == 0:
+-                partial[tx // 32] = acc[0]
++                for r in T.unroll(world):
++                    for v in T.vectorized(vec):
++                        pv[r * vec + v] = parts[r, t, (c * threads + tx) * vec + v]
++                for m in T.unroll(hc_mult):
++                    for v in T.vectorized(vec):
++                        rv[m * vec + v] = residual[t, m, (c * threads + tx) * vec + v]
++                for v in T.vectorized(vec):
++                    ds[c * vec + v] = direction[(c * threads + tx) * vec + v]
++                # rank_order_sum: the first part as is, then the others in order.
++                for v in T.unroll(vec):
++                    xs[v] = T.Cast(T.float32, pv[v])
++                    for r in T.serial(world - 1):
++                        xs[v] = xs[v] + T.Cast(T.float32, pv[(r + 1) * vec + v])
++                    xs[v] = T.Cast(T.float32, T.Cast(T.bfloat16, xs[v]))
++                # post_streams: the first stream's rounded product, then FMAs in order.
++                for n in T.unroll(hc_mult):
++                    for v in T.unroll(vec):
++                        fold = cm[n] * T.Cast(T.float32, rv[v])
++                        fold = T.fma(pm[n], xs[v], fold)
++                        for m in T.unroll(1, hc_mult):
++                            fold = T.fma(
++                                cm[m * hc_mult + n],
++                                T.Cast(T.float32, rv[m * vec + v]),
++                                fold,
++                            )
++                        hs[n * span + c * vec + v] = T.Cast(
++                            T.float32, T.Cast(T.bfloat16, fold)
++                        )
++            for n in T.unroll(hc_mult):
++                for i in T.serial(span):
++                    acc[n] += hs[n * span + i] * ds[i]
++                acc[n] = T.warp_reduce_sum(acc[n])
++                if tx % 32 == 0:
++                    partial[n, tx // 32] = acc[n]
+             T.sync_threads()
+-            if tx == 0:
+-                acc[0] = T.float32(0)
+-                for warp in T.serial(warps):
+-                    acc[0] += partial[warp]
+-                scale[0] = alpha[0] * acc[0]
++            if tx < hc_mult:
++                total = T.float32(0)
++                for w in T.serial(warps):
++                    total += partial[tx, w]
++                scale[tx] = alpha[0] * total
+             T.sync_threads()
+             for c in T.serial(chunks):
+-                for i in T.vectorized(vec):
+-                    out[t, h, (c * threads + tx) * vec + i] = T.cast(
+-                        xs[c * vec + i] - scale[0] * ds[c * vec + i], T.bfloat16
+-                    )
+-
+-    return glp_project
++                for n in T.unroll(hc_mult):
++                    for v in T.vectorized(vec):
++                        residual[t, n, (c * threads + tx) * vec + v] = T.Cast(
++                            T.bfloat16,
++                            hs[n * span + c * vec + v] - scale[n] * ds[c * vec + v],
++                        )
++            if tx < hc_mult * hc_mult:
++                comb[t, tx // hc_mult, tx % hc_mult] = T.if_then_else(
++                    tx // hc_mult == tx % hc_mult, T.float32(1), T.float32(0)
++                )
++            if tx < hc_mult:
++                post[t, tx] = T.float32(0)
++
++    return glp_steer
+ 
+ 
+ @cache
+-def _kernel(hc_mult: int, hidden: int):
+-    return glp_project_kernel(hc_mult, hidden)
+-
+-
+-@torch.library.custom_op("vllm::dsv41_tilelang_glp_project", mutates_args=("out",))
+-def glp_project(
+-    streams: torch.Tensor,
++def _kernel(hc_mult: int, hidden: int, world: int):
++    return glp_steer_kernel(hc_mult, hidden, world)
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_glp_steer", mutates_args=("residual", "post", "comb")
++)
++def glp_steer(
++    parts: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    rows: torch.Tensor,
+     direction: torch.Tensor,
+     alpha: torch.Tensor,
+-    out: torch.Tensor,
+ ) -> None:
+-    """Project ``direction`` off ``streams`` ([T, hc_mult, hidden], BF16) into
+-    ``out``, scaled by ``alpha`` ([1], FP32)."""
+-    tokens, hc_mult, hidden = streams.shape
++    """Steer the rows ``rows`` (int32, [T]) marks: fold ``parts`` ([world, T, H],
++    BF16, the layer's write or the ranks' unreduced parts of it) into ``residual``
++    ([T, hc_mult, H], BF16) with ``post`` ([T, hc_mult]) and ``comb`` ([T, hc_mult,
++    hc_mult]), project ``direction`` off every stream scaled by ``alpha`` ([1]),
++    and leave the result as the row's ``residual`` with ``comb`` the identity and
++    ``post`` zero. Unmarked rows are untouched."""
++    world, tokens, hidden = parts.shape
+     if tokens == 0:
+         return
+-    _kernel(hc_mult, hidden)(streams, direction, alpha, out)
++    _kernel(residual.shape[1], hidden, world)(
++        parts, residual, post, comb, rows, direction, alpha
++    )
+ 
+ 
+-@glp_project.register_fake
+-def _glp_project_fake(streams, direction, alpha, out):
++@glp_steer.register_fake
++def _glp_steer_fake(parts, residual, post, comb, rows, direction, alpha):
+     return None
+ 
+ 
+-def declare(hc_mult: int, hidden: int) -> None:
+-    """Declare the projection of ``hc_mult`` streams of ``hidden``, and keep it."""
++def declare(hc_mult: int, hidden: int, worlds: tuple[int, ...]) -> None:
++    """Declare the steering of ``hc_mult`` streams of ``hidden`` for a write of
++    each of ``worlds`` parts, and keep them."""
+     prepare.declare(
+-        lambda: [prepare.call(glp_project_kernel, hc_mult, hidden)],
+-        bind=lambda: _kernel(hc_mult, hidden),
++        lambda: [prepare.call(glp_steer_kernel, hc_mult, hidden, w) for w in worlds],
++        bind=lambda: [_kernel(hc_mult, hidden, w) for w in worlds],
+     )
+ 
+ 
+-__all__ = ["declare", "glp_project", "glp_project_kernel"]
++__all__ = ["declare", "glp_steer", "glp_steer_kernel"]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp_rows.py b/vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+new file mode 100644
+index 000000000..60eb618de
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering's row marks for a step, from its requests' marks.
++
++``rows[t]`` is ``marks[idx_mapping[r]]`` for the request ``r`` whose query holds
++row ``t`` (``query_start_loc[r] <= t < query_start_loc[r + 1]``), and 0 for a row
++past the last query (graph padding). The query bounds are read on the GPU, as the
++step's attention reads them: adaptive verification places a verifying request's
++rows there, not on the host. A thread a row scans the step's requests; a step
++holds at most ``max_num_seqs`` of them.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from functools import cache
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++
++_THREADS = 128
++_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def mark_rows_kernel(idx_dtype: str):
++    tokens = T.dynamic("tokens")
++    num_reqs = T.dynamic("num_reqs")
++    starts_len = T.dynamic("starts_len")
++    max_reqs = T.dynamic("max_reqs")
++
++    @T.prim_func
++    def mark_rows(
++        rows: T.Tensor((tokens,), T.int32),
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        query_start_loc: T.Tensor((starts_len,), T.int32),
++        marks: T.Tensor((max_reqs,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(tokens, _THREADS), threads=_THREADS) as b:
++            t = b * _THREADS + T.get_thread_binding()
++            mark = T.alloc_var(T.int32, init=0)
++            if t < tokens:
++                for r in T.serial(num_reqs):
++                    if (query_start_loc[r] <= t) & (t < query_start_loc[r + 1]):
++                        mark = marks[idx_mapping[r]]
++                rows[t] = mark
++
++    return mark_rows
++
++
++@cache
++def _bound(idx_dtype: str):
++    """The kernel for ``idx_dtype``, resolved once (after the kernel cache freezes,
++    an undeclared key raises by name)."""
++    return mark_rows_kernel(idx_dtype)
++
++
++def mark_rows(
++    rows: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    marks: torch.Tensor,
++) -> None:
++    """Fill ``rows`` (int32) with the marks of the requests whose queries hold
++    them; ``query_start_loc`` has one more entry than ``idx_mapping``."""
++    if rows.numel() == 0:
++        return
++    if query_start_loc.shape[0] != idx_mapping.shape[0] + 1:
++        raise ValueError(
++            f"{idx_mapping.shape[0]} requests need {idx_mapping.shape[0] + 1} "
++            f"query bounds, not {query_start_loc.shape[0]}"
++        )
++    _bound(_DTYPES[idx_mapping.dtype])(rows, idx_mapping, query_start_loc, marks)
++
++
++__all__ = ["mark_rows", "mark_rows_kernel"]
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 1cd43af1f..75dc6ff74 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
+ from functools import partial
+ from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
+ 
+-from vllm import envs
++from vllm import envs, weightless
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+ from vllm.multimodal.utils import get_mm_features_in_window
+@@ -625,9 +625,19 @@ def generate_block_hash_extra_keys(
+     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
+         request, start_token_idx, end_token_idx
+     )
++    # Steered rows write other KV than the same tokens unsteered.
++    steering_keys: list[Any] = (
++        [weightless.BLOCK_HASH_KEY]
++        if start_token_idx == 0 and weightless.is_marked(request.sampling_params)
++        else []
++    )
+ 
+     extra_keys: list[Any] = (
+-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
++        lora_extra_keys
++        + mm_extra_keys
++        + cache_salt_keys
++        + prompt_embeds_keys
++        + steering_keys
+     )
+ 
+     if not extra_keys:
+diff --git a/vllm/weightless.py b/vllm/weightless.py
+new file mode 100644
+index 000000000..2cc891998
+--- /dev/null
++++ b/vllm/weightless.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Requests to the steered model name (WEIGHTLESS_STEER_MODEL).
++
++One engine serves a model and, under a second served model name, the model
++steered by a GLP file (``vllm/models/deepseek_v4_1/glp.py``). The OpenAI server
++marks a request to the steered name in its sampling parameters' ``extra_args``;
++the scheduler keys the request's cached prefix blocks by the mark, since steered
++rows write different KV; the worker marks the request's rows for the steering
++kernels. Unmarked requests are served as with steering off.
++"""
++
++from typing import Any
++
++import vllm.envs as envs
++
++EXTRA_ARGS_KEY = "weightless_steer"
++# A block hash extra key no other kind of key can equal (cache salts and LoRA
++# names are strings).
++BLOCK_HASH_KEY = ("weightless_steer",)
++
++
++def steered_model() -> str | None:
++    """The served model name whose requests are steered, or None."""
++    return envs.WEIGHTLESS_STEER_MODEL
++
++
++def is_steered_model(model_name: str | None) -> bool:
++    name = steered_model()
++    return name is not None and model_name == name
++
++
++def mark(extra_args: dict[str, Any] | None, steered: bool) -> dict[str, Any] | None:
++    """``extra_args`` with the request's mark set, or cleared: only the server
++    marks a request, never its caller."""
++    extra = dict(extra_args or {})
++    if steered:
++        extra[EXTRA_ARGS_KEY] = True
++    else:
++        extra.pop(EXTRA_ARGS_KEY, None)
++    return extra or None
++
++
++def is_marked(sampling_params: Any) -> bool:
++    """Whether ``sampling_params`` (or None) belong to a steered request."""
++    extra = getattr(sampling_params, "extra_args", None)
++    return bool(extra and extra.get(EXTRA_ARGS_KEY))
+-- 
+2.54.0 (Apple Git-157)
+
