@@ -533,6 +533,26 @@ that candidate 9 did not already hold.
 - **Qualification** ([rc10/candidate-tp4.json](rc10/candidate-tp4.json)): the image built on
   dgx4 and copied to the ring; candidate 9's checks on candidate 9 and candidate 10 (digests must
   be equal); the lean suite on candidate 9, candidate 10, candidate 9 again.
+- **Result (run `candidate-10-tp4`, 2026-10-28 17:13-19:05 UTC): qualified.**
+  - Bits: every digest equals candidate 9's (determinism with and without logprobs, 16K,
+    seeded sampled, prompt logprobs, images, CED cross-shape, control spellings and controls);
+    model behaviour 64/64 greedy responses identical, teacher-forced KL 0 over 16,384
+    positions. One controls digest differs, `penalties-sampled/c8`: candidate 10's
+    (`fb36e3be`) is candidate 9's in its own qualification and both PDL arms; candidate 9 gave
+    `9df5dee2` on this boot. The scenario does not repeat across boots (candidate 5 gave two
+    values as well), so it is not a bit change.
+  - Speed against candidate 9 (paired verdict; repeat candidate 9 to candidate 9 again):
+
+    | Metric | Candidate 10 | Change | ±95% | Repeat |
+    | --- | ---: | ---: | ---: | ---: |
+    | engine grid, decode geometric mean (20 shapes) | | 1.36% faster | 0.16% | 0.10% |
+    | c1 decode tok/s, paired | 77.50 | +0.90% | 0.08% | |
+    | c8 decode tok/s, paired | 24.32 | +0.25% | 0.03% | +0.31% |
+    | c1 TTFT, paired | 0.122 s | level | 0.37% | |
+    | prefill 32K / 131K tok/s | 7,344 / 7,449 | level / +0.16% | 1.04 / 0.12% | |
+
+    The grid gain is the block-scale reads' own (1.3% alone on candidate 9). c16, c8 and c4
+    distinct streams, TTFT traces, startup and sink counters are level.
 
 ## Candidate 11 ([rc11/](rc11))
 
