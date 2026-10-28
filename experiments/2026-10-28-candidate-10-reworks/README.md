@@ -21,6 +21,13 @@ thread's arrival waits for its copies, so the stage's barrier publishes every ro
 same bits, same speed. Bundles: `moe-c10` (candidate 10's MoE tests, the control) on dgx1,
 `coded-arrive` (the same tests with the fix) on dgx2.
 
+Result (run `c10-coded-arrive`, 2026-10-28): same bits, same speed, as claimed. Both bundles
+passed (89 MoE tests each, dgx1 and dgx2). The determinism, greedy and seeded sampled digests
+equal candidate 10's; 64/64 greedy responses identical, teacher-forced KL 0. Lean bracket
+(candidate 10, coded-arrive, candidate 10 again): decode grid +0.19% (±0.16%, repeat 0.90%),
+c8 paired -0.38% (margin 0.55%), c1 paired -0.04% (margin 0.31%), prefill 32K +0.00%, 131K
++0.06%: all same. Kept in candidate 11 (0538).
+
 ## expert-codes-v2 (`expert-codes-v2.json`, against coded-arrive)
 
 The first expert-codes arm (one-at-a-time) was bit-exact but 2.7-2.8% slower at prefill. It
