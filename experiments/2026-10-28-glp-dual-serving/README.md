@@ -162,6 +162,7 @@ in those six tests (from `glp-2`).
 | --- | --- | --- |
 | [qualify-tp4.json](qualify-tp4.json) | build `spark-ds41f:19f2c20ed4d6-glp-3` on dgx2 and copy it to the ring; the release tests on dgx2; boot [rc-tp4.json](rc-tp4.json), the published file; the determinism gate, `dual_probe.py --speed`, 16 distinct streams, [advbench.py](advbench.py) | release tests pass or skip; determinism hashes equal 1025's (`3eab5112` / `db25fde3` with log probabilities, `c9cf9dbe` / `c6bb4f4e` as text): stock with steering configured is 1025; every `dual_probe.py` check passes. AdvBench is recorded, not gated |
 | [release-tp4.json](release-tp4.json) | `release` and `single-stream` suites: the candidate, 1025, the candidate again | no metric worse than 1025 beyond the repeat's interval: the cost of steering configured and unused |
+| [overhead.json](overhead.json) | [bundles/steer-overhead](bundles/steer-overhead/steer_overhead.py) on dgx3 and dgx4: a captured step's cost for no steering, the launch, a PyTorch conditional node and a shared condition, at 2, 16 and 96 rows, unmarked and marked | the conditional arms leave the streams bit-identical to the launch |
 
 - **The synthetic arm (`glp-1` only).** Before the published file could be downloaded,
   `glp-1`'s runs booted `synthetic-tp4.json` and its `-dev` variant (removed with `glp-3`;
@@ -202,6 +203,33 @@ in those six tests (from `glp-2`).
 - Speed, as time per engine step: stock 28.97 ms and steered 29.09 ms at 1 stream; stock
   149.85 ms and steered 150.08 ms at 16 streams. In tokens per second: 66.8 and 67.1 at
   1 stream, 279.2 and 276.0 at 16. The 16 distinct streams gave 256.7 tokens/s.
+
+**`glp-1` release on the synthetic file (stock name only, against 1025).** Greedy output
+was identical for 256 of 256 prompts; teacher-forced distributions and draft acceptance were
+unchanged. The engine grid's decode geometric mean was 0.78% and 1.37% slower in the
+two candidate arms. The arms differed from each other by 0.58%, so the cost is about 1%.
+Every throughput measurement was unchanged within its interval: c16, c8, Poisson,
+prefill from 32K to 1M tokens, and single stream. This is the cost of steering
+configured and unused. The 39 steering launches run in every step, and an unmarked row's
+block only reads its mark. Steering a request adds 0.1–0.4% more (the `dual_probe.py`
+speeds above).
+
+**Where the unused cost goes, and what a conditional node saves.**
+[overhead.json](overhead.json) runs
+[bundles/steer-overhead](bundles/steer-overhead/steer_overhead.py) on dgx3 and dgx4. It
+times a captured stand-in step of 40 layers at 2, 16 and 96 rows, unmarked and marked,
+in four arms:
+
+- no steering;
+- the `glp-3` launch in each layer;
+- that launch in a PyTorch conditional node in each layer, which sets its own condition
+  with a launch of its own;
+- that launch in conditional nodes that share one condition, set once a step by a kernel
+  that reads the step's marks.
+
+The conditional arms must leave the streams bit-identical to the launch, or the run
+fails. If the shared condition costs much less than the launches, patch 0538 takes it
+for captured steps. A step that runs eagerly keeps the launch.
 
 `glp-1`'s release run (synthetic arms) was already running when the published file
 arrived, and it was left to finish. `glp-2`'s qualification was queued and then withdrawn
