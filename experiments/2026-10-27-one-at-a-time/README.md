@@ -78,4 +78,14 @@ greedy, teacher-forced KL 0, equal determinism, sampled and control digests). De
 1.3% faster (±0.17%, repeat drift 0.7%); c1 engine steps +1.9%; distinct streams +3.4% at
 c4, +1.4% at c8, +0.4% at c16; 262K prefill 0.4-0.7% slower. Kept.
 
-Leave-one-out arms: queued 2026-10-27, not finished.
+Leave-one-out arms (queued 2026-10-27; change is candidate 9 against the arm, repeat is
+candidate 9 against candidate 9 again):
+
+| fix | bits without it | verdict on its metric | decision |
+|---|---|---|---|
+| 0504 (MoE prefill block_M 64) | equal (determinism, greedy, sampled) | prefill +4.2% at 32K (±1.3%), +4.4% at 131K (±0.4%), repeat under 0.5%; decode, c8, c1 same | keep |
+| 0511 (SP prefill MoE combine writes the exchange slots) | equal | prefill +2.8% at 32K (±1.0%), +2.7% at 131K (±0.3%), repeat under 0.2%; decode grid 1.2% faster (±0.15%, repeat 0.2%); c8, c1 same | keep |
+| 0510 (mHC finalize writes the MXFP8 cast; against no-PDL) | equal | decode grid 1.4% faster (±0.16%, repeat 0.16%); prefill 131K +0.85% (±0.4%); 32K, c8, c1 same | keep |
+| 0513-0519 (sparse-MLA page tables over live pages; against no-PDL) | equal | nothing beyond the repeat: decode grid 0.4% faster against 0.6% repeat drift, every 64K/256K/1016K row same; prefill, c8, c1 same | unproven: drop, or show the workload it pays on |
+| 0502 (no per-allocation KV zeroing) | equal | nothing beyond the repeat: decode grid +0.7% against -0.8% repeat drift; c8, c1, prefill same; c8 TTFT p99 4.3% lower with it (no interval) | unproven: measure allocation-heavy TTFT, else drop |
+| 0505 (two unread budget-sized buffers dropped) | equal | speed same as claimed (decode, c8, c1, prefill all within the repeat); the memory claim was not measured: the run had no startup_lines.py probe | pending: a startup-memory run (candidate 9 / no-0505 with startup_lines.py) |
