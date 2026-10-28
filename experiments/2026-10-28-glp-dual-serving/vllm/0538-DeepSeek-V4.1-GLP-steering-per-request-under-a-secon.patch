@@ -1,4 +1,4 @@
-From 6bfd56bb1e749a27b2c98963afe995c9f2361ff3 Mon Sep 17 00:00:00 2001
+From be78005605d9f78f7413b6a4344f4ce2027fc822 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 03:04:30 +0100
 Subject: [PATCH] DeepSeek-V4.1: GLP steering per request, under a second
@@ -7,10 +7,12 @@ Subject: [PATCH] DeepSeek-V4.1: GLP steering per request, under a second
 GLP steering was a property of the engine: WEIGHTLESS_STEER_PATH steered
 every request, and each covered layer folded every row explicitly (decode
 grid +2.4%, prefill -1.9% in spark-ds41f's next-release qualification).
-It is now a property of rows. With WEIGHTLESS_STEER_MODEL set, only the
-requests made to that served model name are steered, so one engine serves
-the model and its steered variant side by side; unset, every request is,
-as before.
+It is now a property of rows: only the requests made to the served model
+name WEIGHTLESS_STEER_MODEL are steered, so one engine serves the model and
+its steered variant side by side. WEIGHTLESS_STEER_PATH and
+WEIGHTLESS_STEER_MODEL are set together or not at all; one alone stops the
+boot. The file is applied as published: WEIGHTLESS_STEER_ALPHA and
+WEIGHTLESS_STEER_LAYERS, which overrode its alpha and layers, are gone.
 
 Each covered layer runs one TileLang launch over the step's rows. A block
 whose row is not marked returns after loading its mark, so unmarked rows
@@ -45,12 +47,10 @@ tests/kernels/test_deepseek_v41_tilelang_glp.py (on SM12x: a marked row
 within one rounding of the FP64 projection of mHC's fold, folded back
 exactly at world sizes 1-4, unmarked rows bit for bit untouched, batch
 independence, and the row marks).
-
-Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
- .../kernels/test_deepseek_v41_tilelang_glp.py | 280 +++++++++++-------
+ .../kernels/test_deepseek_v41_tilelang_glp.py | 280 +++++++++++------
  tests/models/test_deepseek_v4_1_engram.py     |   2 +
- tests/models/test_deepseek_v4_1_glp.py        | 249 ++++++++--------
+ tests/models/test_deepseek_v4_1_glp.py        | 296 ++++++++----------
  tests/test_weightless.py                      | 130 ++++++++
  .../attention/test_b12x_v41_ced_metadata.py   |   4 +
  .../openai/chat_completion/batch_serving.py   |   3 +-
@@ -59,15 +59,15 @@ Co-authored-by: Cursor <cursoragent@cursor.com>
  vllm/entrypoints/openai/responses/serving.py  |   5 +-
  vllm/entrypoints/serve/engine/serving.py      |  37 ++-
  vllm/entrypoints/serve/tokenize/serving.py    |   3 +
- vllm/envs.py                                  |   8 +-
- vllm/models/deepseek_v4_1/glp.py              | 171 +++++++----
- vllm/models/deepseek_v4_1/nvidia/model.py     |  42 ++-
- .../deepseek_v4_1/nvidia/model_state.py       |  36 +++
- vllm/models/deepseek_v4_1/tilelang/glp.py     | 208 ++++++++-----
+ vllm/envs.py                                  |  13 +-
+ vllm/models/deepseek_v4_1/glp.py              | 196 +++++++-----
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  46 ++-
+ .../deepseek_v4_1/nvidia/model_state.py       |  35 +++
+ vllm/models/deepseek_v4_1/tilelang/glp.py     | 208 ++++++++----
  .../models/deepseek_v4_1/tilelang/glp_rows.py |  76 +++++
  vllm/v1/core/kv_cache_utils.py                |  14 +-
  vllm/weightless.py                            |  47 +++
- 19 files changed, 945 insertions(+), 380 deletions(-)
+ 19 files changed, 953 insertions(+), 452 deletions(-)
  create mode 100644 tests/test_weightless.py
  create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp_rows.py
  create mode 100644 vllm/weightless.py
@@ -428,126 +428,183 @@ index 1a39bf880..a6b9556b0 100644
      state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
      state.disk_engram_models = (target,)
 diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
-index f4cec3331..544d66cfc 100644
+index f4cec3331..a965db42e 100644
 --- a/tests/models/test_deepseek_v4_1_glp.py
 +++ b/tests/models/test_deepseek_v4_1_glp.py
-@@ -30,7 +30,9 @@ STEER_ENV = (
-     "WEIGHTLESS_STEER_PATH",
-     "WEIGHTLESS_STEER_ALPHA",
-     "WEIGHTLESS_STEER_LAYERS",
-+    "WEIGHTLESS_STEER_MODEL",
- )
+@@ -26,11 +26,9 @@ METADATA = {
+     "glp.alpha_default": 0.75,
+     "glp.layer_ids_zero_based": "1,2,5",
+ }
+-STEER_ENV = (
+-    "WEIGHTLESS_STEER_PATH",
+-    "WEIGHTLESS_STEER_ALPHA",
+-    "WEIGHTLESS_STEER_LAYERS",
+-)
++STEER_ENV = ("WEIGHTLESS_STEER_PATH", "WEIGHTLESS_STEER_MODEL")
++STEERED = "model-weightless"
 +MAX_TOKENS = 64
  
  
  def _string(text: str) -> bytes:
-@@ -190,12 +192,12 @@ def test_a_transferred_vector_is_read(tmp_path):
- def test_no_path_means_no_steering_module(monkeypatch):
-     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
-     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
+@@ -187,65 +185,57 @@ def test_a_transferred_vector_is_read(tmp_path):
+ # Steering on and off.
+ 
+ 
+-def test_no_path_means_no_steering_module(monkeypatch):
+-    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
+-    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
 -    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS) is None
++def steer(monkeypatch, path) -> None:
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", STEERED)
++
++
++def test_unset_means_no_steering_module():
 +    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS) is None
  
  
  def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
-     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
 -    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++    steer(monkeypatch, glp_file(tmp_path))
 +    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
      assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
      assert steering.directions.dtype == torch.float32
      for layer in range(NUM_LAYERS):
-@@ -211,7 +213,7 @@ def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
-     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
-     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
+         expected = unit(layer) if layer in LAYERS else np.zeros(HIDDEN)
+         np.testing.assert_allclose(steering.directions[layer], expected, atol=1e-7)
+     assert steering.alpha.item() == pytest.approx(0.75)
++    assert steering.layers == frozenset(LAYERS)
+     # Buffers, never weights: the checkpoint loader must not see them.
+     assert dict(steering.named_parameters()) == {}
+     assert steering.state_dict() == {}
+ 
+ 
+-def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
+-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+-    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
+-    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
 -    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
-+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
-     assert steering.alpha.item() == pytest.approx(0.5)
-     assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
-     assert steering.directions[1].abs().sum() == 0
-@@ -232,20 +234,20 @@ def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
-     for name, value in env.items():
-         monkeypatch.setenv(name, value)
-     with pytest.raises(ValueError, match=message):
--        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+-    assert steering.alpha.item() == pytest.approx(0.5)
+-    assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
+-    assert steering.directions[1].abs().sum() == 0
++@pytest.mark.parametrize("name", STEER_ENV)
++def test_one_variable_without_the_other_is_refused(tmp_path, monkeypatch, name):
++    steer(monkeypatch, glp_file(tmp_path))
++    monkeypatch.delenv(name)
++    with pytest.raises(ValueError, match="needs both"):
 +        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
  
  
+-@pytest.mark.parametrize(
+-    "env, message",
+-    [
+-        ({"WEIGHTLESS_STEER_ALPHA": "strong"}, "WEIGHTLESS_STEER_ALPHA"),
+-        ({"WEIGHTLESS_STEER_ALPHA": "inf"}, "WEIGHTLESS_STEER_ALPHA"),
+-        ({"WEIGHTLESS_STEER_LAYERS": "1,x"}, "comma list"),
+-        ({"WEIGHTLESS_STEER_LAYERS": "1,3"}, "without a direction"),
+-        ({"WEIGHTLESS_STEER_LAYERS": ","}, "without a direction"),
+-    ],
+-)
+-def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
+-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+-    for name, value in env.items():
+-        monkeypatch.setenv(name, value)
+-    with pytest.raises(ValueError, match=message):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
++@pytest.mark.parametrize("name", ["WEIGHTLESS_STEER_ALPHA", "WEIGHTLESS_STEER_LAYERS"])
++def test_the_file_is_applied_as_it_is(tmp_path, monkeypatch, name):
++    steer(monkeypatch, glp_file(tmp_path))
++    monkeypatch.setenv(name, "2")
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    assert steering.alpha.item() == pytest.approx(0.75)
++    assert steering.layers == frozenset(LAYERS)
+ 
+ 
  def test_a_missing_file_is_refused(tmp_path, monkeypatch):
-     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
+-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
++    steer(monkeypatch, str(tmp_path / "missing.gguf"))
      with pytest.raises(FileNotFoundError):
 -        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
 +        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
  
  
- def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
-     path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
-     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
+-def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
+-    path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
+-    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
++def test_a_file_without_alpha_is_refused(tmp_path, monkeypatch):
++    steer(monkeypatch, glp_file(tmp_path, metadata={"glp.alpha_default": None}))
      with pytest.raises(ValueError, match="no glp.alpha_default"):
 -        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
 +        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
  
  
  def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
-@@ -256,159 +258,140 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+@@ -256,159 +246,122 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
      assert envs.compile_factors() != unsteered
  
  
 -# The projection: one TileLang launch (tilelang/glp.py) on the model's BF16
 -# streams, at the serving width. Its precision against FP64 is
 -# tests/kernels/test_deepseek_v41_tilelang_glp.py's.
-+def test_the_steered_model_name_alone_is_refused(monkeypatch):
-+    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "model-weightless")
-+    with pytest.raises(ValueError, match="names no GLP file"):
-+        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
- 
--WIDE = 5120
--on_gpu = pytest.mark.skipif(
--    not torch.cuda.is_available()
--    or torch.cuda.get_device_capability()[0] != 12,
--    reason="the TileLang projection targets SM120/SM121",
--)
- 
-+def test_without_a_model_name_every_row_is_marked(tmp_path, monkeypatch):
-+    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++def test_rows_start_unmarked(tmp_path, monkeypatch):
++    steer(monkeypatch, glp_file(tmp_path))
 +    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
-+    assert not steering.per_request
 +    assert steering.rows.dtype == torch.int32
 +    assert steering.rows.shape == (MAX_TOKENS,)
-+    assert bool((steering.rows == 1).all())
-+    assert steering.layers == frozenset(LAYERS)
- 
--def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
--    directions = torch.zeros(NUM_LAYERS, WIDE)
--    for layer in layers:
--        directions[layer] = torch.from_numpy(unit(layer, WIDE))
--    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
- 
-+def test_with_a_model_name_rows_start_unmarked(tmp_path, monkeypatch):
-+    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
-+    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "model-weightless")
-+    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
-+    assert steering.per_request
 +    assert bool((steering.rows == 0).all())
- 
--def streams(tokens: int = 7) -> torch.Tensor:
--    generator = torch.Generator().manual_seed(0)
--    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
- 
++
++
 +def test_a_step_reads_a_view_of_the_marks(tmp_path, monkeypatch):
-+    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    steer(monkeypatch, glp_file(tmp_path))
 +    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
 +    rows = steering.step_rows(5)
 +    assert rows.shape == (5,)
 +    assert rows.data_ptr() == steering.rows.data_ptr()
 +    with pytest.raises(ValueError, match="at most 64 rows"):
 +        steering.step_rows(MAX_TOKENS + 1)
++
++
++# A layer's step: one TileLang launch (tilelang/glp.py) for a covered layer. The
++# kernel's results are tests/kernels/test_deepseek_v41_tilelang_glp.py's.
+ 
+ WIDE = 5120
+-on_gpu = pytest.mark.skipif(
+-    not torch.cuda.is_available()
+-    or torch.cuda.get_device_capability()[0] != 12,
+-    reason="the TileLang projection targets SM120/SM121",
+-)
+ 
+ 
+-def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
++def steering(layers=LAYERS) -> glp.GLPSteering:
+     directions = torch.zeros(NUM_LAYERS, WIDE)
+     for layer in layers:
+         directions[layer] = torch.from_numpy(unit(layer, WIDE))
+-    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
++    return glp.GLPSteering(directions, 0.75, STREAMS, list(layers), MAX_TOKENS)
+ 
+ 
+-def streams(tokens: int = 7) -> torch.Tensor:
+-    generator = torch.Generator().manual_seed(0)
+-    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
++def _layer_outputs(tokens: int = 3):
++    generator = torch.Generator().manual_seed(1)
++    x = torch.randn(tokens, WIDE, generator=generator).bfloat16()
++    residual = torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16()
++    post_mix = torch.rand(tokens, STREAMS, generator=generator)
++    res_mix = torch.rand(tokens, STREAMS, STREAMS, generator=generator)
++    return x, residual, post_mix, res_mix
+ 
  
 -def direction(layer: int) -> torch.Tensor:
 -    return torch.from_numpy(unit(layer, WIDE)).double().cuda()
++@pytest.fixture
++def launches(monkeypatch):
++    calls = []
++    monkeypatch.setattr(glp.tilelang_glp, "glp_steer", lambda *args: calls.append(args))
++    return calls
  
-+# A layer's step: one TileLang launch (tilelang/glp.py) for a covered layer. The
-+# kernel's results are tests/kernels/test_deepseek_v41_tilelang_glp.py's.
  
 -@on_gpu
 -@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
@@ -558,7 +615,11 @@ index f4cec3331..544d66cfc 100644
 -    # One BF16 rounding of each output element bounds the error.
 -    torch.testing.assert_close(
 -        out @ d, (1 - alpha) * (h.double() @ d), atol=0.05, rtol=0
--    )
++def test_a_layer_the_file_does_not_cover_launches_nothing(launches):
++    x, residual, post_mix, res_mix = _layer_outputs()
++    steering().steer(
++        3, x, residual, post_mix, res_mix, torch.ones(3, dtype=torch.int32)
+     )
 -    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
 -    torch.testing.assert_close(rest(out), rest(h.double()), atol=0.05, rtol=0.01)
 -
@@ -571,63 +632,6 @@ index f4cec3331..544d66cfc 100644
 -    torch.testing.assert_close(
 -        out @ d, torch.zeros(7, STREAMS, dtype=torch.float64, device="cuda"),
 -        atol=0.05, rtol=0,
--    )
--    mean = h.double().mean(dim=1)
--    torch.testing.assert_close(
--        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
-+WIDE = 5120
-+
-+
-+def steering(layers=LAYERS, per_request=True) -> glp.GLPSteering:
-+    directions = torch.zeros(NUM_LAYERS, WIDE)
-+    for layer in layers:
-+        directions[layer] = torch.from_numpy(unit(layer, WIDE))
-+    return glp.GLPSteering(
-+        directions, 0.75, STREAMS, list(layers), MAX_TOKENS, per_request
-     )
- 
- 
--@on_gpu
--@pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
--def test_projection_never_adds_to_a_stream(alpha):
--    h = streams()
--    out = steering(alpha)(h, 1)
--    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
-+def _layer_outputs(tokens: int = 3):
-+    generator = torch.Generator().manual_seed(1)
-+    x = torch.randn(tokens, WIDE, generator=generator).bfloat16()
-+    residual = torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16()
-+    post_mix = torch.rand(tokens, STREAMS, generator=generator)
-+    res_mix = torch.rand(tokens, STREAMS, STREAMS, generator=generator)
-+    return x, residual, post_mix, res_mix
- 
- 
--@on_gpu
--def test_an_unsteered_layer_is_unchanged():
--    h = streams()
--    out = steering(0.75)(h, 3)
--    assert out.dtype == torch.bfloat16
--    assert torch.equal(out, h)
-+@pytest.fixture
-+def launches(monkeypatch):
-+    calls = []
-+    monkeypatch.setattr(glp.tilelang_glp, "glp_steer", lambda *args: calls.append(args))
-+    return calls
- 
- 
--@on_gpu
--def test_alpha_is_read_when_the_projection_runs():
--    module = steering(1.0)
--    h = streams()
--    full = module(h, 1)
--    module.alpha.fill_(0.0)
--    assert torch.equal(module(h, 1), h)
--    assert not torch.equal(full, h)
-+def test_a_layer_the_file_does_not_cover_launches_nothing(launches):
-+    x, residual, post_mix, res_mix = _layer_outputs()
-+    steering().steer(
-+        3, x, residual, post_mix, res_mix, torch.ones(3, dtype=torch.int32)
-+    )
 +    assert launches == []
 +
 +
@@ -656,10 +660,40 @@ index f4cec3331..544d66cfc 100644
 +        post_mix,
 +        res_mix,
 +        torch.ones(3, dtype=torch.int32),
-+    )
+     )
+-    mean = h.double().mean(dim=1)
+-    torch.testing.assert_close(
+-        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
+-    )
+-
+-
+-@on_gpu
+-@pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
+-def test_projection_never_adds_to_a_stream(alpha):
+-    h = streams()
+-    out = steering(alpha)(h, 1)
+-    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
+-
+-
+-@on_gpu
+-def test_an_unsteered_layer_is_unchanged():
+-    h = streams()
+-    out = steering(0.75)(h, 3)
+-    assert out.dtype == torch.bfloat16
+-    assert torch.equal(out, h)
 +    assert launches[0][0] is packed
  
  
+-@on_gpu
+-def test_alpha_is_read_when_the_projection_runs():
+-    module = steering(1.0)
+-    h = streams()
+-    full = module(h, 1)
+-    module.alpha.fill_(0.0)
+-    assert torch.equal(module(h, 1), h)
+-    assert not torch.equal(full, h)
+-
+-
 -@on_gpu
 -def test_only_the_models_streams_are_projected():
 -    module = steering(1.0)
@@ -680,15 +714,15 @@ index f4cec3331..544d66cfc 100644
 -        module(streams()[:, :2], 1)
 +        steering().steer(1, *change(outputs))
 +    assert launches == []
++
  
- 
--def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
 +@pytest.mark.parametrize("unreduced, worlds", [(False, (1,)), (True, (1, 4))])
 +def test_the_steering_is_declared_for_the_writes_it_takes(
 +    monkeypatch, unreduced, worlds
 +):
 +    import vllm.distributed
-+
+ 
+-def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
      declared = []
      monkeypatch.setattr(
          glp.tilelang_glp, "declare", lambda *shape: declared.append(shape)
@@ -757,6 +791,18 @@ index f4cec3331..544d66cfc 100644
  
  
  # A real GLP file, when one is named (it is not redistributed with the tests).
+@@ -419,7 +372,10 @@ REAL_FILE = os.environ.get("GLP_TEST_FILE")
+ @pytest.mark.skipif(not REAL_FILE, reason="GLP_TEST_FILE names no file")
+ def test_a_published_ds41_file_holds_only_unit_directions():
+     metadata, tensors = glp.read_gguf(REAL_FILE)
+-    assert all(key.startswith(("general.", "glp.")) for key in metadata)
++    # controlvector.*: llama.cpp's control-vector header, which the reader ignores.
++    assert all(
++        key.startswith(("general.", "glp.", "controlvector.")) for key in metadata
++    )
+     assert all(name.startswith("direction.") for name in tensors)
+     directions, alpha = glp.read_glp(REAL_FILE, 40, 5120)
+     assert sorted(directions) == list(range(1, 40))
 diff --git a/tests/test_weightless.py b/tests/test_weightless.py
 new file mode 100644
 index 000000000..11a39a5bc
@@ -1127,58 +1173,68 @@ index c2232324c..53ae726b8 100644
          self,
          models: OpenAIServingModels | OpenAIModelRegistry,
 diff --git a/vllm/envs.py b/vllm/envs.py
-index b83105166..495458b2e 100755
+index b83105166..d6011d377 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -230,6 +230,7 @@ if TYPE_CHECKING:
+@@ -228,8 +228,7 @@ if TYPE_CHECKING:
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
      WEIGHTLESS_STEER_PATH: str | None = None
-     WEIGHTLESS_STEER_ALPHA: str | None = None
-     WEIGHTLESS_STEER_LAYERS: str | None = None
+-    WEIGHTLESS_STEER_ALPHA: str | None = None
+-    WEIGHTLESS_STEER_LAYERS: str | None = None
 +    WEIGHTLESS_STEER_MODEL: str | None = None
      VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
      VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
      VLLM_MIMO_L2_PREFETCH: bool = False
-@@ -1941,11 +1942,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1940,12 +1939,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
          int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
      ),
-     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
+-    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
 -    # and overrides of its alpha and steered layers. Part of the compile key, as
 -    # every variable here is: steering adds the fold and projection to the graph.
-+    # and overrides of its alpha and steered layers, and the served model name
-+    # whose requests alone are steered (vllm/weightless.py; unset, every request
-+    # is). Part of the compile key, as every variable here is: steering adds its
-+    # launch to every covered layer.
++    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
++    # the served model name whose requests alone it steers (vllm/weightless.py),
++    # set together or not at all. Part of the compile key, as every variable here
++    # is: steering adds its launch to every covered layer.
      "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
-     "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
-     "WEIGHTLESS_STEER_LAYERS": lambda: os.getenv("WEIGHTLESS_STEER_LAYERS") or None,
+-    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
+-    "WEIGHTLESS_STEER_LAYERS": lambda: os.getenv("WEIGHTLESS_STEER_LAYERS") or None,
 +    "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
      # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
      "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
          int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
 diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
-index e79d863ea..2c233c95b 100644
+index e79d863ea..8d47b9302 100644
 --- a/vllm/models/deepseek_v4_1/glp.py
 +++ b/vllm/models/deepseek_v4_1/glp.py
-@@ -17,9 +17,15 @@ site, and a file for it is refused.
- Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
- module and its forward is unchanged. The reader is fail-closed: a file this
- runtime cannot apply exactly stops the boot rather than serving unsteered or
+@@ -14,12 +14,19 @@ projected, so their mean, the reduction the directions are derived on, is
+ projected too. The layer's write alone (``ffn_out_pre_residual``) is a different
+ site, and a file for it is refused.
+ 
+-Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
+-module and its forward is unchanged. The reader is fail-closed: a file this
+-runtime cannot apply exactly stops the boot rather than serving unsteered or
 -steering at another site. On, the projection is one TileLang launch per layer
 -(``tilelang/glp.py``), declared for kernel preparation with the model's other
 -kernels.
-+steering at another site.
++Off unless WEIGHTLESS_STEER_PATH names a file and WEIGHTLESS_STEER_MODEL the
++served model name it steers; one without the other stops the boot. Off, the
++model has no steering module and its forward is unchanged. The reader is
++fail-closed: a file this runtime cannot apply exactly stops the boot rather than
++serving unsteered or steering at another site. The file's own layers and
++``glp.alpha_default`` are applied as they are.
 +
 +On, steering is a property of rows. Each covered layer runs one TileLang launch
 +(``tilelang/glp.py``) that folds and projects the rows ``GLPSteering.rows`` marks,
-+in place, and leaves every other row untouched. Without WEIGHTLESS_STEER_MODEL
-+every row is marked, so every request is steered. With it, only the rows of
-+requests made to that served model name are (``vllm.weightless``): one engine
-+serves the model and its steered variant side by side, and a request to the
-+other names gets the same bits as with steering off.
++in place, and leaves every other row untouched. Only the rows of requests made to
++the steered model name are marked (``vllm.weightless``): one engine serves the
++model and its steered variant side by side, and a request to the other names
++gets the same bits as with steering off.
  """
  
  import argparse
-@@ -34,7 +40,9 @@ from torch import nn
+@@ -34,7 +41,9 @@ from torch import nn
  
  import vllm.envs as envs
  from vllm.logger import init_logger
@@ -1188,7 +1244,7 @@ index e79d863ea..2c233c95b 100644
  
  logger = init_logger(__name__)
  
-@@ -248,79 +256,120 @@ def read_glp(
+@@ -248,108 +257,125 @@ def read_glp(
  
  
  class GLPSteering(nn.Module):
@@ -1204,16 +1260,12 @@ index e79d863ea..2c233c95b 100644
 +        hc_mult: int,
 +        layers: list[int],
 +        max_tokens: int,
-+        per_request: bool,
 +    ):
          super().__init__()
          self.hc_mult = hc_mult
 -        # One float32 row per model layer; unsteered layers are zero rows, so
 -        # the traced graph does not depend on which layers a file covers.
 +        self.layers = frozenset(layers)
-+        # Rows are marked by the model state for the requests made to the steered
-+        # model name; with one model name, every row is.
-+        self.per_request = per_request
 +        # One float32 row per model layer; unsteered layers are zero rows.
          self.register_buffer("directions", directions, persistent=False)
          # A tensor, not a Python float, which would be a graph constant.
@@ -1221,12 +1273,11 @@ index e79d863ea..2c233c95b 100644
 -            "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
 +            "alpha", torch.tensor([alpha], dtype=torch.float32), persistent=False
 +        )
-+        # The step's row marks (int32, 0 or 1), refilled in place before every
-+        # step, so a captured graph reads the replayed step's.
++        # The step's row marks (int32, 0 or 1): the model state marks the rows of
++        # requests made to the steered model name, in place before every step, so
++        # a captured graph reads the replayed step's.
 +        self.register_buffer(
-+            "rows",
-+            torch.full((max_tokens,), 0 if per_request else 1, dtype=torch.int32),
-+            persistent=False,
++            "rows", torch.zeros(max_tokens, dtype=torch.int32), persistent=False
          )
  
      def declare_kernels(self) -> None:
@@ -1345,43 +1396,61 @@ index e79d863ea..2c233c95b 100644
 -    num_layers: int, hidden_size: int, hc_mult: int
 +    num_layers: int, hidden_size: int, hc_mult: int, max_tokens: int
  ) -> GLPSteering | None:
-     """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
- 
-     WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
-     WEIGHTLESS_STEER_LAYERS restricts steering to a comma list of the file's
+-    """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
+-
+-    WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
+-    WEIGHTLESS_STEER_LAYERS restricts steering to a comma list of the file's
 -    layers. Both are refused when malformed.
-+    layers. Both are refused when malformed. WEIGHTLESS_STEER_MODEL limits
-+    steering to the requests made to that served model name.
-     """
-+    if envs.WEIGHTLESS_STEER_PATH is None and envs.WEIGHTLESS_STEER_MODEL is not None:
-+        raise ValueError(
-+            f"WEIGHTLESS_STEER_MODEL names {envs.WEIGHTLESS_STEER_MODEL!r} but "
-+            "WEIGHTLESS_STEER_PATH names no GLP file to steer it with"
-+        )
-     path = envs.WEIGHTLESS_STEER_PATH
-     if path is None:
+-    """
+-    path = envs.WEIGHTLESS_STEER_PATH
+-    if path is None:
++    """The steering WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL ask for, or
++    None when neither is set."""
++    path, model = envs.WEIGHTLESS_STEER_PATH, envs.WEIGHTLESS_STEER_MODEL
++    if path is None and model is None:
          return None
-@@ -348,8 +397,16 @@ def glp_steering(
++    if path is None or model is None:
++        raise ValueError(
++            "GLP steering needs both WEIGHTLESS_STEER_PATH (the GLP file) and "
++            "WEIGHTLESS_STEER_MODEL (the served model name it steers), not "
++            f"WEIGHTLESS_STEER_PATH={path!r} and WEIGHTLESS_STEER_MODEL={model!r}"
++        )
+     directions, alpha = read_glp(path, num_layers, hidden_size)
+-    if envs.WEIGHTLESS_STEER_ALPHA is not None:
+-        try:
+-            alpha = float(envs.WEIGHTLESS_STEER_ALPHA)
+-        except ValueError:
+-            alpha = math.nan
+-        if not math.isfinite(alpha):
+-            raise ValueError(
+-                f"WEIGHTLESS_STEER_ALPHA is {envs.WEIGHTLESS_STEER_ALPHA!r}"
+-            )
+     if alpha is None:
+-        raise ValueError(f"{path}: no glp.alpha_default and no WEIGHTLESS_STEER_ALPHA")
++        raise ValueError(f"{path}: no glp.alpha_default")
+     layers = sorted(directions)
+-    if envs.WEIGHTLESS_STEER_LAYERS is not None:
+-        layers = _layer_list(envs.WEIGHTLESS_STEER_LAYERS, "WEIGHTLESS_STEER_LAYERS")
+-        missing = sorted(set(layers) - set(directions))
+-        if not layers or missing:
+-            raise ValueError(
+-                f"WEIGHTLESS_STEER_LAYERS {envs.WEIGHTLESS_STEER_LAYERS!r} names "
+-                f"layers without a direction in {path}: {missing}"
+-            )
      stack = torch.zeros((num_layers, hidden_size), dtype=torch.float32)
      for layer in layers:
          stack[layer] = torch.from_numpy(directions[layer])
 -    logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
 -    return GLPSteering(stack, alpha, hc_mult)
-+    per_request = envs.WEIGHTLESS_STEER_MODEL is not None
 +    logger.info(
-+        "GLP steering on: alpha %s, layers %s, %s",
-+        alpha,
-+        layers,
-+        f"requests to {envs.WEIGHTLESS_STEER_MODEL!r}"
-+        if per_request
-+        else "every request",
++        "GLP steering on: alpha %s, layers %s, requests to %r", alpha, layers, model
 +    )
-+    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens, per_request)
++    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens)
  
  
  def main() -> None:
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 3b2dfd7a2..44d523e98 100644
+index 3b2dfd7a2..57f94a8df 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -67,7 +67,7 @@ from .. import kernels, l2_prefetch, sp_prefill
@@ -1393,9 +1462,14 @@ index 3b2dfd7a2..44d523e98 100644
  from .b12x_attention import DeepseekV41B12xAttention
  
  if typing.TYPE_CHECKING:
-@@ -549,7 +549,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
-         # which leaves the forward as it is.
+@@ -546,10 +546,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 self.hc_mult,
+                 dtype=torch.float32,
+             )
+-        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
+-        # which leaves the forward as it is.
++        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL
++        # are set; None otherwise, which leaves the forward as it is.
          self.glp = glp_steering(
 -            config.num_hidden_layers, config.hidden_size, config.hc_mult
 +            config.num_hidden_layers,
@@ -1471,7 +1545,7 @@ index 3b2dfd7a2..44d523e98 100644
                      hidden_states, residual, post_mix, res_mix
                  )
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
-index 03e042bfc..37df7dc09 100644
+index 03e042bfc..a6d21fc86 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
 @@ -7,6 +7,7 @@ import torch
@@ -1490,7 +1564,7 @@ index 03e042bfc..37df7dc09 100644
  from vllm.v1.worker.gpu.input_batch import InputBatch
  from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
  from vllm.v1.worker.gpu.model_states.default import DefaultModelState
-@@ -212,6 +214,24 @@ class DeepseekV41ModelState(DefaultModelState):
+@@ -212,6 +214,23 @@ class DeepseekV41ModelState(DefaultModelState):
          # the outputs it recomputes), for the host's hash of its prefill chunks.
          self._prefill_tokens: dict[str, np.ndarray] = {}
          self._host_engram_hash = None
@@ -1502,7 +1576,6 @@ index 03e042bfc..37df7dc09 100644
 +                for module in model.modules()
 +                if isinstance(module, DeepseekV4Model)
 +                and module.glp is not None
-+                and module.glp.per_request
 +            ),
 +            None,
 +        )
@@ -1515,7 +1588,7 @@ index 03e042bfc..37df7dc09 100644
  
      def prepare_streaming_update(self, req_id: str) -> None:
          """Keep decoder history when the runner refreshes a live request."""
-@@ -227,6 +247,8 @@ class DeepseekV41ModelState(DefaultModelState):
+@@ -227,6 +246,8 @@ class DeepseekV41ModelState(DefaultModelState):
                  new_req_data.prefill_token_ids, dtype=np.int32
              )
          sampling = new_req_data.sampling_params
@@ -1524,7 +1597,7 @@ index 03e042bfc..37df7dc09 100644
          if sampling is not None and sampling.prompt_logprobs is not None:
              self._ced_prompt_logprobs.add(new_req_data.req_id)
          else:
-@@ -384,6 +406,17 @@ class DeepseekV41ModelState(DefaultModelState):
+@@ -384,6 +405,17 @@ class DeepseekV41ModelState(DefaultModelState):
              if self._ced_batch is not input_batch:
                  self._stage_ced(input_batch)
              model_inputs["ced_indices"] = self.get_ced_indices()
@@ -1542,7 +1615,7 @@ index 03e042bfc..37df7dc09 100644
          window = self.lookback_token_ids
          if window is None:
              return model_inputs
-@@ -459,6 +492,9 @@ class DeepseekV41ModelState(DefaultModelState):
+@@ -459,6 +491,9 @@ class DeepseekV41ModelState(DefaultModelState):
              self.ced_state.replay_start.zero_()
              self._ced_batch = None
              model_inputs["ced_indices"] = None

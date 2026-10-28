@@ -356,10 +356,14 @@ def host_path(cluster: dict, template: str) -> str:
     return template.format(**fields)
 
 
-# GLP steering (vLLM's WEIGHTLESS_STEER_*): the steered model name and the file the engine
-# reads at startup, which every node needs in its own hub cache.
-STEER_MODEL, STEER_PATH = "WEIGHTLESS_STEER_MODEL", "WEIGHTLESS_STEER_PATH"
-HUB_FILE = re.compile(r"models--(?P<owner>[^/]+?)--(?P<name>[^/]+)/snapshots/(?P<revision>[0-9a-f]{40})/(?P<file>[^/]+)$")
+# GLP steering: the recipe's ``glp`` block (scripts/recipe.py renders it), the steered model
+# name and the GLP file vLLM reads at startup, which every node needs in its own hub cache.
+GLP_FIELDS = {
+    "repo": re.compile(r"[\w.-]+/[\w.-]+"),
+    "revision": re.compile(r"[0-9a-f]{40}"),
+    "file": re.compile(r"[\w.-]+\.gguf"),
+    "sha256": re.compile(r"[0-9a-f]{64}"),
+}
 
 
 def served_model_names(cluster: dict) -> list[str]:
@@ -374,61 +378,42 @@ def served_model_names(cluster: dict) -> list[str]:
     return names
 
 
-def steering_file(cluster: dict) -> str | None:
-    """The host path (``{home}``/``{checkout}`` unexpanded) of the GLP file the container
-    reads at WEIGHTLESS_STEER_PATH, through the mount that holds it."""
-    path = cluster.get("environment", {}).get(STEER_PATH)
-    if not path:
-        return None
-    for source, target, _ in cluster["container"].get("mounts", []):
-        if path == target:
-            return source
-        if path.startswith(target.rstrip("/") + "/"):
-            return source.rstrip("/") + path[len(target.rstrip("/")):]
-    return None
-
-
-def steering_download(source: str) -> str:
-    """How to put the file on a node: ``hf download`` of its pinned revision when it lives
-    in a Hugging Face hub cache, otherwise a copy."""
-    match = HUB_FILE.search(source)
-    if not match:
-        return f"copy it from another node ({source})"
-    return "run " + shlex.join(["hf", "download", f"{match['owner']}/{match['name']}", match["file"],
-                                "--revision", match["revision"]]) + " (docs/setup.md, section 5)"
-
-
-def steering_problems(cluster: dict) -> list[str]:
-    """The profile's GLP steering settings: the file inside a container mount, and the
-    steered name one of the served names, after the stock one."""
+def glp_problems(cluster: dict) -> list[str]:
+    """The profile's ``glp`` block: its fields well formed, and the steered name served
+    after the stock one. Steering set by hand, without the block, is refused."""
+    glp = cluster.get("glp")
     environment = cluster.get("environment", {})
-    path, model = environment.get(STEER_PATH), environment.get(STEER_MODEL)
-    problems = []
-    if model and not path:
-        problems.append(f"{STEER_MODEL} is set without {STEER_PATH}; vLLM refuses to start")
-    if path and steering_file(cluster) is None:
-        problems.append(f"{STEER_PATH} {path} is not inside a container mount")
-    if model:
-        names = served_model_names(cluster)
-        if model not in names[1:]:
-            problems.append(
-                f"{STEER_MODEL} {model} must be a served model name after the first "
-                f"(--served-model-name {' '.join(names)}): the first is the stock model "
-                "every tool and probe uses")
+    steer = (cluster_recipe.STEER_PATH, cluster_recipe.STEER_MODEL)
+    if not glp:
+        written = [key for key in steer if key in environment]
+        return [f"{', '.join(written)} set without a glp block, which configures GLP steering"] if written else []
+    problems = [f"glp.{key} is {glp.get(key)!r}, not a {key} (docs/setup.md, section 5)"
+                for key, pattern in GLP_FIELDS.items() if not pattern.fullmatch(str(glp.get(key, "")))]
+    name, names = glp.get("served_model_name"), served_model_names(cluster)
+    if not name or names.count(name) != 1 or names.index(name) == 0:
+        problems.append(
+            f"glp.served_model_name {name!r} must be served once, after the stock name "
+            f"(--served-model-name {' '.join(names)}): the first is the stock model every tool "
+            "and probe uses")
     return problems
 
 
-def node_steering_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
-    source = steering_file(cluster)
+def node_glp_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
+    """The ``glp`` file on one node: present at its pinned revision, with the block's sha256."""
+    source = cluster_recipe.glp_file(cluster)
     if source is None:
         return []
     path = host_path(cluster, source)
-    result = run_ssh(nodes, node, "test", "-r", path)
+    result = run_ssh(nodes, node, "sha256sum", path)
     if result.returncode == 255:
         return [f"{node['name']}: cannot check the GLP steering file: {result.stderr.strip()}"]
+    fix = f"run {cluster_recipe.glp_download(cluster)} (docs/setup.md, section 5)"
     if result.returncode:
-        return [f"{node['name']}: GLP steering file is missing or unreadable: {path}; "
-                f"{steering_download(source)}"]
+        return [f"{node['name']}: GLP steering file is missing or unreadable: {path}; {fix}"]
+    digest = result.stdout.split()[0] if result.stdout.split() else ""
+    if digest != cluster["glp"]["sha256"]:
+        return [f"{node['name']}: GLP steering file {path} has sha256 {digest}, not glp.sha256 "
+                f"{cluster['glp']['sha256']}; remove it and {fix}"]
     return []
 
 
@@ -641,7 +626,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             problems.append(f"missing deployment artifact {relative}")
         elif sha256(candidate) != wanted:
             problems.append(f"deployment artifact differs from manifest: {relative}")
-    problems.extend(steering_problems(cluster))
+    problems.extend(glp_problems(cluster))
     problems.extend(tracked_secret_problems())
     return problems
 
@@ -1251,7 +1236,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
         problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
-        problems.extend(node_steering_problems(cluster, nodes, node))
+        problems.extend(node_glp_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
             problems.append(f"{node['name']}: cannot inspect {name}: {result.stderr.strip()}")
@@ -1684,7 +1669,7 @@ def node_runtime_problems(
     for line in mounts.stdout.splitlines():
         mode, _, source = line.partition(" ")
         problems.append(f"{node['name']}: {mode} mount source is unavailable: {source}")
-    problems.extend(node_steering_problems(cluster, nodes, node))
+    problems.extend(node_glp_problems(cluster, nodes, node))
     image = run_ssh(
         nodes,
         node,

@@ -528,10 +528,14 @@ its config, tokenizer and tensor layout are the same, and every weight shard dif
 
 ### GLP steering file
 
-A profile that also serves the steered model, `deepseek-v4.1-flash-weightless` (the
-[GLP dual-serving candidate](../experiments/2026-10-28-glp-dual-serving/README.md)),
-reads one more file on every node: the GLP direction it steers with (785 KiB). The
-repository is gated. With the Hugging Face account whose token is on the node, accept
+A profile with a `glp` block also serves a steered variant of the model under a second
+name, `deepseek-v4.1-flash-weightless` (the
+[GLP dual-serving candidate](../experiments/2026-10-28-glp-dual-serving/README.md)).
+The block names the GLP file it steers with: a Hugging Face `repo`, its pinned
+`revision`, the `file` and its `sha256`. The recipe renders the second served name, vLLM's
+`WEIGHTLESS_STEER_PATH` and `WEIGHTLESS_STEER_MODEL`, and a read-only mount of the file
+from the node's hub cache; a profile does not set those itself. Every node needs the file
+(785 KiB). The repository is gated. With the Hugging Face account whose token is on the node, accept
 its agreement once on the
 [repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75),
 then download the pinned revision on every node:
@@ -543,10 +547,10 @@ hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.7
 ```
 
 The file is 803,392 bytes, sha256
-`9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. The profile mounts it read-only from the snapshot
-path, so a node without a token can take a copy of that path (with its
-`hub/blobs` target) from another node instead. `bin/spark doctor --live` and the
-launch preflight report a node that lacks it, with this command
+`9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
+token can take a copy from another node instead: the snapshot path and the
+`hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
+report a node whose file is missing or differs, with this command
 ([doctor](doctor.md#glp-steering-file)).
 
 ## 6. Image

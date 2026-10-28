@@ -642,3 +642,65 @@ class OverlayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GLPTest(unittest.TestCase):
+    """``glp`` renders the steered model name, vLLM's steering variables and the file's mount."""
+
+    CANDIDATE = "experiments/2026-10-28-glp-dual-serving/cluster.json"
+    STEERED = "deepseek-v4.1-flash-weightless"
+
+    def resolved(self, change=None) -> dict:
+        candidate = load(self.CANDIDATE)
+        if change:
+            change(candidate)
+        return recipe.resolve(candidate, "tp4-ring")
+
+    def test_the_block_renders_the_name_variables_and_mount(self):
+        cluster = self.resolved()
+        args = cluster["serve_args"]
+        at = args.index("--served-model-name")
+        self.assertEqual(args[at + 1 : at + 4], ["deepseek-v4.1-flash", self.STEERED, "--host"])
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_PATH"], "/glp/vector.gguf")
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_MODEL"], self.STEERED)
+        self.assertIn([recipe.glp_file(cluster), "/glp/vector.gguf", "ro"], cluster["container"]["mounts"])
+        self.assertEqual(
+            recipe.glp_file(cluster),
+            "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75"
+            "/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf")
+        self.assertEqual(
+            recipe.glp_download(cluster),
+            "hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75 "
+            "glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf --revision 2715ffd51f59899115853e1118db080536966c44")
+
+    def test_a_recipe_without_the_block_serves_one_name(self):
+        cluster = recipe.resolve(load("config/cluster.json"), "tp4-ring")
+        self.assertIsNone(recipe.glp_file(cluster))
+        self.assertNotIn("WEIGHTLESS_STEER_PATH", cluster["environment"])
+        self.assertNotIn("/glp/vector.gguf", [mount[1] for mount in cluster["container"]["mounts"]])
+
+    def test_steering_written_by_hand_beside_the_block_is_refused(self):
+        def by_hand(candidate):
+            candidate["environment"]["WEIGHTLESS_STEER_PATH"] = "/glp/vector.gguf"
+        with self.assertRaisesRegex(SystemExit, "does not set them itself"):
+            self.resolved(by_hand)
+
+    def test_an_incomplete_block_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "glp lacks sha256"):
+            self.resolved(lambda candidate: candidate["glp"].pop("sha256"))
+
+    def test_an_arm_renames_unsets_or_keeps_the_steering(self):
+        base = self.resolved()
+        renamed = recipe.overlay({"extends": {}, "set": {"glp": {"served_model_name": "other"}}}, base)
+        names = renamed["serve_args"][renamed["serve_args"].index("--served-model-name") + 1:][:2]
+        self.assertEqual(names, ["deepseek-v4.1-flash", "other"])
+        self.assertEqual(renamed["environment"]["WEIGHTLESS_STEER_MODEL"], "other")
+        self.assertEqual([m[1] for m in renamed["container"]["mounts"]].count("/glp/vector.gguf"), 1)
+        off = recipe.overlay({"extends": {}, "unset": ["glp"]}, base)
+        self.assertNotIn(self.STEERED, off["serve_args"])
+        self.assertNotIn("WEIGHTLESS_STEER_MODEL", off["environment"])
+        self.assertNotIn("WEIGHTLESS_STEER_PATH", off["environment"])
+        self.assertNotIn("/glp/vector.gguf", [mount[1] for mount in off["container"]["mounts"]])
+        mounts = recipe.overlay({"extends": {}, "set": {"container": {"mounts": [["/x", "/cache", "rw"]]}}}, base)
+        self.assertIn([recipe.glp_file(base), "/glp/vector.gguf", "ro"], mounts["container"]["mounts"])
+        self.assertEqual(recipe.overlay({"extends": {}}, base)["serve_args"], base["serve_args"])

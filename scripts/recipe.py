@@ -18,7 +18,11 @@ a configuration (the recipe at a shape, or another arm) and ``set``/``unset``
 hold only what the arm changes, so arms cannot drift from what they compare to. ``models``
 names each checkpoint the recipe serves (a snapshot and its blob store, or a hub cache and the
 snapshot within it) and ``model`` the one mounted and served; ``generation_defaults`` is the sampling a request that sets none
-gets (vLLM's ``--override-generation-config``). An arm may set either. The site names the shape it is cabled as in
+gets (vLLM's ``--override-generation-config``). An arm may set either. ``glp``, when present,
+serves a GLP-steered variant of the model beside it: its ``served_model_name`` and the
+``file`` of a Hugging Face ``repo`` at a pinned ``revision`` (with its ``sha256``), rendered
+as the second served name, vLLM's steering variables and a read-only mount of the file
+from the node's hub cache. The site names the shape it is cabled as in
 ``config/site.json``; a site that names none gets the recipe's ``default_shape``,
 and ``--shape`` overrides either for planning.
 
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 import string
 from pathlib import Path
 
@@ -41,6 +46,12 @@ SITE_FILE = "config/site.json"
 # /blobs, or a whole Hugging Face hub cache at /hub (a snapshot whose blobs link on into
 # a shared store resolves only inside the hub it was laid out in).
 MODEL_MOUNTS = ("/models", "/blobs", "/hub")
+# GLP steering (``glp``): where the file is mounted, the variables vLLM reads, and the hub
+# cache on each node that ``hf download`` fills.
+GLP_TARGET = "/glp/vector.gguf"
+STEER_PATH, STEER_MODEL = "WEIGHTLESS_STEER_PATH", "WEIGHTLESS_STEER_MODEL"
+GLP_HUB = "{home}/.cache/huggingface/hub"
+GLP_KEYS = ("served_model_name", "repo", "revision", "file", "sha256")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
@@ -170,6 +181,59 @@ def _with_model_mounts(cluster: dict) -> None:
     cluster["serve_args"] = [path, *cluster["serve_args"][1:]]
 
 
+def glp_file(cluster: dict) -> str | None:
+    """The host path (``{home}`` unexpanded) of the ``glp`` block's file: its pinned
+    revision in the node's Hugging Face hub cache, where ``hf download`` puts it."""
+    glp = cluster.get("glp")
+    if not glp:
+        return None
+    owner, name = glp["repo"].split("/", 1)
+    return f"{GLP_HUB}/models--{owner}--{name}/snapshots/{glp['revision']}/{glp['file']}"
+
+
+def glp_download(cluster: dict) -> str:
+    glp = cluster["glp"]
+    return shlex.join(["hf", "download", glp["repo"], glp["file"], "--revision", glp["revision"]])
+
+
+def _glp_rendering(glp: dict) -> tuple[dict[str, str], list[str]]:
+    environment = {STEER_PATH: GLP_TARGET, STEER_MODEL: glp["served_model_name"]}
+    return environment, [glp_file({"glp": glp}), GLP_TARGET, "ro"]
+
+
+def _with_glp(cluster: dict, previous: dict | None = None) -> None:
+    """Render ``glp`` (the steered model name and the GLP file it is steered with) as the
+    second ``--served-model-name``, vLLM's two ``WEIGHTLESS_STEER_*`` variables and a
+    read-only mount of the file, after removing what ``previous`` rendered."""
+    args, environment = cluster["serve_args"], cluster["environment"]
+    mounts = cluster["container"].setdefault("mounts", [])
+    if previous:
+        if previous["served_model_name"] in args:
+            args.remove(previous["served_model_name"])
+        for key in (STEER_PATH, STEER_MODEL):
+            environment.pop(key, None)
+        mounts[:] = [mount for mount in mounts if mount[1] != GLP_TARGET]
+    glp = cluster.get("glp")
+    if not glp:
+        return
+    missing = [key for key in GLP_KEYS if not glp.get(key)]
+    if missing:
+        raise SystemExit(f"glp lacks {', '.join(missing)}")
+    if STEER_PATH in environment or STEER_MODEL in environment or any(
+            mount[1] == GLP_TARGET for mount in mounts):
+        raise SystemExit(f"glp renders {STEER_PATH}, {STEER_MODEL} and the {GLP_TARGET} mount; "
+                         "a profile does not set them itself")
+    if "--served-model-name" not in args:
+        raise SystemExit("glp needs --served-model-name in serve_args: the stock name it serves beside")
+    at = args.index("--served-model-name") + 1
+    while at < len(args) and not args[at].startswith("--"):
+        at += 1
+    args.insert(at, glp["served_model_name"])
+    rendered, mount = _glp_rendering(glp)
+    environment.update(rendered)
+    mounts.append(mount)
+
+
 def _with_generation_defaults(cluster: dict) -> None:
     """Render ``generation_defaults`` (the sampling a request that sets none gets) as
     vLLM's ``--override-generation-config``, beside ``--generation-config``."""
@@ -229,6 +293,8 @@ def resolve(recipe: dict, name: str) -> dict:
         _with_model_mounts(cluster)
     if "generation_defaults" in recipe:
         _with_generation_defaults(cluster)
+    if "glp" in recipe:
+        _with_glp(cluster)
     return cluster
 
 
@@ -279,6 +345,10 @@ def overlay(arm: dict, base: dict) -> dict:
         if not isinstance(node, dict) or last not in node:
             raise SystemExit(f"the arm unsets {dotted}, which its base does not set")
         del node[last]
+    if base.get("glp") or cluster.get("glp"):
+        # Rendered again whatever the arm changed: a serve_args or mount list it sets
+        # replaces the base's, which held the rendering.
+        _with_glp(cluster, previous=base.get("glp"))
     return cluster
 
 
