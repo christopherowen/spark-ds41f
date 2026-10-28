@@ -204,6 +204,28 @@ in those six tests (from `glp-2`).
   149.85 ms and steered 150.08 ms at 16 streams. In tokens per second: 66.8 and 67.1 at
   1 stream, 279.2 and 276.0 at 16. The 16 distinct streams gave 256.7 tokens/s.
 
+**`glp-3` qualification on the published file (2026-10-28, 13:25–14:34 UTC).**
+
+- Release tests on dgx2: pass (1,496 s). The six stubbed-state failures of `glp-1` are
+  gone.
+- Determinism and greedy: identical in every scenario. The hashes equal 1025's
+  (`3eab5112` / `db25fde3`, `c9cf9dbe` / `c6bb4f4e`), so stock with the published file
+  configured is 1025.
+- `dual_probe.py`: every check passes. Steering changed all 8 prompts' replies, and the
+  steered replies to its ordinary prompts stay on task.
+- Speed, as time per engine step: stock 28.98 ms and steered 29.29 ms at 1 stream; stock
+  150.06 ms and steered 146.64 ms at 16 streams (66.8 and 66.8, then 278.2 and 277.8
+  tokens/s). The 16 distinct streams gave 254.4 tokens/s (±0.52%).
+- AdvBench, 520 prompts per name, no request errors:
+
+  | | stock | steered |
+  | --- | --- | --- |
+  | no refusal phrase | 2.5% | 51.2% |
+  | judge says harmful | 1.4% | 38.9% |
+  | both (attack success) | 1.2% | 24.6% |
+
+  The judge is the stock name, so these are indicative, not a calibrated classifier.
+
 **`glp-1` release on the synthetic file (stock name only, against 1025).** Greedy output
 was identical for 256 of 256 prompts; teacher-forced distributions and draft acceptance were
 unchanged. The engine grid's decode geometric mean was 0.78% and 1.37% slower in the
