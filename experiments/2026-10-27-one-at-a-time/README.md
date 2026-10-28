@@ -100,3 +100,22 @@ Additions:
 | block-scales (SFB[row // 32]) | kernel: block32-base and block32-scales digests equal over 182 cases (7 TP4 shapes x 26 row counts), branch GEMM tests pass; serving: determinism, greedy, sampled digests equal | decode grid 1.3% faster (±0.16%, repeat 0.3%); 131K prefill 1.1% faster (±0.5%, repeat 0.3%); c8, c1, 32K same | promote candidate |
 | expert-codes (2-bit scale codes for narrow experts) | kernel: 114 MoE tests pass, the mixed 2-bit/4-bit launch equals the uncoded GEMM bit for bit; serving: determinism, greedy, sampled digests equal | slower: prefill 2.7% at 32K (±1.4%), 2.8% at 131K (±0.1%), c8 1.6% (±1.2%), repeats under 0.3%; decode grid within its 1.8% repeat drift | fix or drop: the expand costs more than the bytes it saves |
 | x7-gemm (kernel only) | first run (2026-10-28): X7 pack round trip exact on real Q-B weights (8.7% fewer bytes than production), the X8 control kernel bit-exact; the X7 kernel did not compile (TVM's bounds solver negated the uint32 constant of `code == 7`). The test is now signed; rerun queued | - | pending |
+
+## Are the correctness fixes' costs real? (`make_cost_check.py`, `cost-check.json`)
+
+The costs charged to 0506, 0526 and 0528 above come from one boot per arm, and two things
+say they may be boot noise, not cost:
+
+- At 131K prefill every arm on candidate 9 beat its run's candidate 9 boots: 0502 +0.24%,
+  0505 +0.25%, 0528 +0.35%, 0506 +0.44%, 0526 +0.47%. Five unrelated fixes cannot all cost
+  the same. Candidate 9's 18 boots in these runs spread 0.22% (sd), 0.89% (range).
+- 0528's 1.2% was on the engine grid, whose dummy steps (`ModelRunner._dummy_run`) run the
+  target and the drafter but never the rejection sampler 0528 changes; and every lean
+  workload is temperature 0, where 0528 commits what it committed before.
+
+`cost-check.json` boots candidate 9 three times and null-overlay, no-0526, no-0506 and
+no-0528 twice each, interleaved (11 boots), on [cost-suite.json](cost-suite.json) (the lean
+suite's heat-soak, grid and prefill). null-overlay mounts candidate 9's own copies of the
+11 files those arms replace: it differs from candidate 9 only in being an overlay arm.
+`cost_check.py` compares each arm's boots with candidate 9's (Welch over boots). A cost is
+real only if the arm beats candidate 9 and null-overlay does not; only then is it reworked.
