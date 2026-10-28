@@ -3144,6 +3144,19 @@ def runtime_stage(inputs: dict) -> str | None:
     return "runtime-tilelang" if "tilelang" in inputs else None
 
 
+def final_stage(cluster: dict, stage: str | None) -> str | None:
+    """The stage the image ends with: an arm's "build": {"flashinfer_kernels": false} ends
+    on the TileLang runtime with sparknet, less FlashInfer's precompiled kernels."""
+    kernels = cluster.get("build", {}).get("flashinfer_kernels", True)
+    if kernels is True:
+        return stage
+    if kernels is not False:
+        raise SystemExit("build.flashinfer_kernels is true or false")
+    if stage != "runtime-tilelang-sparknet":
+        raise SystemExit("an image without FlashInfer's kernels builds on the TileLang runtime with sparknet")
+    return "runtime-no-flashinfer-kernels"
+
+
 def tilelang_base_stage(inputs: dict) -> str:
     """The Dockerfile stage the TileLang runtime builds on: B12X's while the lock lists it."""
     return "runtime" if "b12x" in inputs else "runtime-core"
@@ -4081,7 +4094,7 @@ def command_build_image(args: argparse.Namespace) -> int:
             })
             if "version" in record:
                 build_args[f"{prefix}_VERSION"] = record["version"]
-        stage = runtime_stage(inputs)
+        stage = final_stage(cluster, runtime_stage(inputs))
         if stage is not None:
             build_args.update(RUNTIME_STAGE=stage, TILELANG_COMPILE_JOBS=str(jobs),
                               TILELANG_BASE_STAGE=tilelang_base_stage(inputs))
