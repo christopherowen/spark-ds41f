@@ -3405,13 +3405,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             planned_confidences = None
             if self.copy_drafter is not None:
                 # A request whose context repeats its own earlier text takes the
-                # copy in place of DSpark's drafts.
-                assert self.adaptive_verification is not None
+                # copy in place of DSpark's drafts. Warmup runs without adaptive
+                # verification (fixed draft counts); its rows verify none.
                 verified = (
                     self.adaptive_verification.get_verified_draft_counts(
                         input_batch.num_reqs
                     )
-                    if input_batch.num_draft_tokens_per_req is not None
+                    if self.adaptive_verification is not None
+                    and input_batch.num_draft_tokens_per_req is not None
                     else None
                 )
                 draft_tokens, confidences, planned_confidences = (

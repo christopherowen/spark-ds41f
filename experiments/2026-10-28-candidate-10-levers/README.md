@@ -59,3 +59,11 @@ Read the probe's TTFT, and the c8, c1 and prefill rows for cost (claim: level).
 ## Results
 
 (Filled in as each spec lands.)
+
+- **copy, first run** (`c10-copy`, 2026-10-28): copy-control booted and passed its gates and
+  `copy_probe.py`; the copy arm never became ready. Every worker failed in warmup at
+  `assert self.adaptive_verification is not None` in `sample_tokens`: `warmup_kernels` clears
+  the manager so pre-capture steps use fixed draft counts, and the copy path required it. The
+  fix (vLLM 657f0df54) takes no verified drafts when the manager is absent, as `propose()`
+  already reads None; `make_levers.py` rewrote only that file in `overlay/copy` and the two
+  copy bundles. Requeued ahead of candidate 11.

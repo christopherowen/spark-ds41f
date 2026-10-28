@@ -17,7 +17,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "rc10/vllm/series"
 BASE = "58938a074"  # candidate 10's head (tree 24313745)
-HEAD = "04d945fe9"  # vLLM candidate-11
+HEAD = "977e18a37"  # vLLM candidate-11
 PATCHES = [
     ("03dfd6bc7", 538),  # [DS4.1] Grouped MoE GEMM: stage arrivals wait for the thread's copies, so the 
     ("68682ce55", 539),  # DeepSeek V4.1 tokenizer: the DeepSeek API's effort aliases
@@ -49,6 +49,9 @@ PATCHES = [
     ("33908324e", 565),  # DS4.1 IKET: sampled events in loops of zero or one iterations, which ptxas doe
     ("2e6733dd4", 566),  # DS4.1 IKET: each site's loop trips in the manifest, to scale sampled iteration
     ("04d945fe9", 567),  # DS4.1 IKET: a sampled range's name carries the factor to its whole loops (*N)
+    ("b4ae21b63", 568),  # [DS4.1] Grouped MoE GEMM: 2-bit scale codes for experts whose block scales span
+    ("69f1f158b", 569),  # [DS4.1] Expert scale-code tests follow v2: the pad lives in scale_pack, each th
+    ("977e18a37", 570),  # [V2] Copy drafts: warmup steps run without adaptive verification
 ]
 
 
