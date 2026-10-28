@@ -35,3 +35,11 @@ Ceiling: 4-bit codes were bounded at 1.3-1.9% of a decode step
 experts only, so under about 0.9%, likely 0.3-0.5%. Claim: same bits, prefill no slower than
 coded-arrive, decode no slower. Bundle: `expert-codes-v2` (the MoE and scale-code tests) on
 dgx3.
+
+## API prompt semantics (`api-semantics.json`, kernel lab only)
+
+The DeepSeek API work (effort aliases; response_format, tool_choice none and the assistant
+prefix in the V4.1 prompt) ported onto candidate 10's head: its oracle passed on the
+laptop, but its tokenizer tests need vLLM's dependencies, which only the image has.
+`make_api_bundles.py` runs them there: `api-c10` (candidate 10's own copies, the control)
+on dgx1, `api-semantics` (the branch's tests and sources) on dgx2.
