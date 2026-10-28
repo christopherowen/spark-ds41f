@@ -542,7 +542,8 @@ hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.7
   --revision 2715ffd51f59899115853e1118db080536966c44
 ```
 
-The file is 803,392 bytes. The profile mounts it read-only from the snapshot
+The file is 803,392 bytes, sha256
+`9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. The profile mounts it read-only from the snapshot
 path, so a node without a token can take a copy of that path (with its
 `hub/blobs` target) from another node instead. `bin/spark doctor --live` and the
 launch preflight report a node that lacks it, with this command

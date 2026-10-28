@@ -61,9 +61,10 @@ next-release qualification ([2026-10-23-next-release](../2026-10-23-next-release
 - A read-only mount of the GLP file from the hub cache at `/glp/vector.gguf`. The file is
   `msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`, revision
   `2715ffd51f59899115853e1118db080536966c44`, file
-  `glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf` (803,392 bytes, MIT). Because it
-  is a mount, `cluster start` reports a node without the file ("ro mount source is
-  unavailable") before anything boots. The repository's `main` has moved on (c275c3ad, which
+  `glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf` (803,392 bytes, MIT, sha256
+  `9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`). `bin/spark doctor
+  --live` and `cluster start` report a node without the file, with this download
+  command, before anything boots. The repository's `main` has moved on (c275c3ad, which
   adds an `a1.0-dealign-attn` file); the pin keeps the audited vector.
 
 The one setup step a site needs, beside the model's download (docs/setup.md section 5, at
@@ -76,9 +77,11 @@ hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.7
 ```
 
 The repository is gated: the downloading account must first accept the author's
-responsible-use agreement. **On 2026-10-28 the owner's account was not on its authorized
-list** (the API answered "you are not in the authorized list"), so no node has the file
-yet. Until it does, the qualification runs on the synthetic file below.
+responsible-use agreement; anonymous downloads are refused too. On 2026-10-28 the owner
+accepted it, and the file was downloaded on dgx1 at the pinned revision (its sha256 equals
+the Hub's LFS hash) and copied to dgx2, dgx3 and dgx4 at the same hub-cache path, where
+each copy's sha256 was checked. The qualification runs, queued earlier, use the synthetic
+file below.
 
 **What the steered name serves.** According to its card, the published vector removes
 safety refusals (1/32 to 23/32 compliance on the card's refusal suite at α 0.75) and puts
