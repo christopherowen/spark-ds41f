@@ -54,6 +54,7 @@ repository. Every one is an error unless marked **warn**.
 | Deployment | `repository`, `path`, `ready_url` or `ready_timeout_seconds` is empty; `launch_enabled` is not true or false |
 | Sources | a revision is not a full commit SHA; a tracking ref or upstream is missing; a patch series or patch file is missing; a patch set's fingerprint differs from the source manifest; TileLang is listed without TileKernels (or the reverse) |
 | Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet |
+| GLP steering | `WEIGHTLESS_STEER_MODEL` is set without `WEIGHTLESS_STEER_PATH`; `WEIGHTLESS_STEER_PATH` is not inside a `container.mounts` target; the steered name is not one of the `--served-model-name` values after the first (the first is the stock model every tool and probe uses) |
 | Secrets | a tracked file is named `.env`, `id_rsa`, `id_ed25519` or `credentials.json`, or ends in `.pem`, `.key`, `.local.env` or `.local.json` |
 | Watchlist | **warn**: `docs/inspiration.md` is missing, or a watched reference is absent from it |
 
@@ -129,6 +130,17 @@ NCCL then fails with an unhandled system error.
 | The image's source-tree labels equal the configuration's `expected_labels` | error |
 | While serving, the GPU clock is at least 1,000 MHz | error; a lower clock is the [GB10 clock latch](recovery.md#gb10-gpu-clock-latch), cleared only by removing AC power |
 
+### GLP steering file
+
+A profile that sets `WEIGHTLESS_STEER_PATH` needs the steering file on every node,
+at the host path the mount maps to it: vLLM reads it at startup and refuses to
+start without it. The check runs whether or not the service is up. A missing or
+unreadable file is an error. When the file is in a Hugging Face hub cache
+(`models--<owner>--<name>/snapshots/<revision>/<file>`), the error prints the
+`hf download` command for that pinned revision
+([setup](setup.md#glp-steering-file)); otherwise it says to copy the file from
+another node.
+
 ### CPU pinning
 
 When a profile pins serving to CPUs (`--cpuset-cpus=` in `container.docker_run_args`),
@@ -167,6 +179,8 @@ a start cannot survive, on every node, and refuses to launch on any failure:
   it the start could not tell a triangle from a ring;
 - `bin/spark doctor` passes on the node itself;
 - every mount source exists (writable for read-write mounts);
+- the GLP steering file, if the profile has one, is readable, with its download
+  command when it is not (above);
 - the image is present with the expected tree labels;
 - no container with the serving name exists unless you pass `--replace`;
 - passwordless `sudo` works (the memory guards need it).

@@ -991,3 +991,77 @@ class CpusetTest(unittest.TestCase):
         self.assertEqual(spark.cpuset_problems("n", "5-9,15-19", "15-19,5-9", self.CAPACITIES), [])
         self.assertIn("runs on CPUs all", spark.cpuset_problems("n", "5-9,15-19", "", self.CAPACITIES)[0])
         self.assertIn("not this node's fast cores", spark.cpuset_problems("n", "0-9", "0-9", self.CAPACITIES)[0])
+
+
+class SteeringTest(unittest.TestCase):
+    """GLP steering in a profile: the dual-serving candidate's recipe, and its file on a node."""
+
+    GLP = ("{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75"
+           "/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf")
+
+    def cluster(self) -> dict:
+        return spark.read_cluster("experiments/2026-10-28-glp-dual-serving/rc-tp4.json")
+
+    def test_the_candidate_recipe_passes(self) -> None:
+        cluster = self.cluster()
+        self.assertEqual(spark.served_model_names(cluster),
+                         ["deepseek-v4.1-flash", "deepseek-v4.1-flash-weightless"])
+        self.assertEqual(spark.steering_file(cluster), self.GLP)
+        self.assertEqual(spark.steering_problems(cluster), [])
+
+    def test_a_profile_without_steering_passes(self) -> None:
+        cluster = spark.read_cluster("config/cluster.json")
+        self.assertIsNone(spark.steering_file(cluster))
+        self.assertEqual(spark.steering_problems(cluster), [])
+
+    def test_a_file_under_a_mounted_directory_is_found(self) -> None:
+        cluster = self.cluster()
+        cluster["environment"][spark.STEER_PATH] = "/cache/glp/synthetic-0.gguf"
+        self.assertEqual(spark.steering_file(cluster), "{checkout}/cache/glp/synthetic-0.gguf")
+
+    def test_a_file_outside_every_mount_is_reported(self) -> None:
+        cluster = self.cluster()
+        cluster["environment"][spark.STEER_PATH] = "/elsewhere/vector.gguf"
+        self.assertIn("not inside a container mount", spark.steering_problems(cluster)[0])
+
+    def test_a_steered_name_without_a_file_is_reported(self) -> None:
+        cluster = self.cluster()
+        del cluster["environment"][spark.STEER_PATH]
+        self.assertIn("vLLM refuses to start", spark.steering_problems(cluster)[0])
+
+    def test_the_steered_name_must_follow_the_stock_name(self) -> None:
+        cluster = self.cluster()
+        for names in (["deepseek-v4.1-flash"], ["deepseek-v4.1-flash-weightless", "deepseek-v4.1-flash"]):
+            args = cluster["serve_args"]
+            at = args.index("--served-model-name") + 1
+            args[at:at + len(spark.served_model_names(cluster))] = names
+            self.assertIn("after the first", spark.steering_problems(cluster)[0])
+
+    def test_a_missing_file_names_its_download(self) -> None:
+        cluster = self.cluster()
+        node = {"name": "dgx2"}
+        results = {}
+        original = spark.run_ssh
+        spark.run_ssh = lambda nodes, node, *argv: results.setdefault(
+            "call", spark.subprocess.CompletedProcess(argv, 1, "", ""))
+        try:
+            problems = spark.node_steering_problems(cluster, {}, node)
+        finally:
+            spark.run_ssh = original
+        self.assertEqual(results["call"].args[:2], ("test", "-r"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("dgx2: GLP steering file is missing", problems[0])
+        self.assertIn("hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75 "
+                      "glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf "
+                      "--revision 2715ffd51f59899115853e1118db080536966c44", problems[0])
+
+    def test_a_present_file_passes(self) -> None:
+        original = spark.run_ssh
+        spark.run_ssh = lambda nodes, node, *argv: spark.subprocess.CompletedProcess(argv, 0, "", "")
+        try:
+            self.assertEqual(spark.node_steering_problems(self.cluster(), {}, {"name": "dgx1"}), [])
+        finally:
+            spark.run_ssh = original
+
+    def test_a_file_outside_a_hub_cache_is_copied(self) -> None:
+        self.assertIn("copy it from another node", spark.steering_download("{checkout}/cache/glp/synthetic-0.gguf"))
