@@ -43,3 +43,14 @@ prefix in the V4.1 prompt) ported onto candidate 10's head: its oracle passed on
 laptop, but its tokenizer tests need vLLM's dependencies, which only the image has.
 `make_api_bundles.py` runs them there: `api-c10` (candidate 10's own copies, the control)
 on dgx1, `api-semantics` (the branch's tests and sources) on dgx2.
+
+## Markov projection in persisting L2 (`markov-l2.json`, kernel lab only)
+
+Byte lever 7 of the decode-bytes study: the DSpark Markov projection (a TP4 rank's 16.5 MB
+BF16 shard) is read by each of a step's five draft positions, and serving's per-call times
+(40-68 us against 71 cold) say most re-reads miss L2. Bound: +0.5% of a single-stream step.
+Placement only, so the bits cannot change. `bundles/markov-l2` times one step's five calls
+(the production `bf16_gemm` at the 16-row tile, a base-logits read and an argmax between
+them) as a CUDA graph on cold L2, with and without a persisting access-policy window on the
+weight, checks both give the same bits, and reports the device's persisting-L2 limits. A
+vLLM change follows only if the window saves time here.
