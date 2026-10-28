@@ -561,9 +561,9 @@ The release candidate the owner asked for on 2026-10-28: candidate 10, GLP dual 
 bits exact; a correctness fix, or a measured gain). Anything that fails its check is held back
 for rework, or dropped, and the series is rewritten without it before the qualification runs.
 
-- **Series:** candidate 10's plus 0538-0569 (vLLM `candidate-11`, head 69f1f158b;
+- **Series:** candidate 10's plus 0538-0570 (vLLM `candidate-11`, head 977e18a37;
   [rc11/vllm/series](rc11/vllm/series), [rc11/make_series.py](rc11/make_series.py)): patch head
-  `8b89ebb0`, tree `e9ae4808` (reproduced locally with the build's `git am`; `git diff --check`
+  `ad7a3923`, tree `04de041e` (reproduced locally with the build's `git am`; `git diff --check`
   clean). Each part is its branch's commits, cherry-picked:
 
   | Patches | Part | Why it is in | Its check |
@@ -577,6 +577,7 @@ for rework, or dropped, and the series is rewritten without it before the qualif
   | 0546-0550 | copy drafts beside DSpark, **off** (`copy_drafts` unset) | built for the copy A/B; without it every size, kernel and graph is the release's | `c10-copy` (queued); enabled only if it gains |
   | 0551-0567 | IKET debug mode (`VLLM_DS41_IKET`), off | optional debugging: off, it registers four variables and imports nothing | its test: off adds neither IKET module |
   | 0568-0569 | expert codes v2: 2-bit scale codes for experts whose block scales span at most 4 values, each thread expanding its own row; the two v1 source tests brought up to v2 | performance: c8 paired decode +1.29%, c1 +0.43%, same bits | `c10-expert-codes-v2` |
+  | 0570 | copy drafts: warmup steps run without adaptive verification | correctness: with `copy_drafts` set, every boot failed in warmup (an assert on the manager warmup clears); off, the line is not reached | `c10-copy` (requeued) |
 
   Conflicts: GLP's imports in `nvidia/model.py` and `model_state.py` (candidate 10 had retired
   the B12X attention import GLP's context named); copy drafts beside prefill yield in
@@ -585,7 +586,7 @@ for rework, or dropped, and the series is rewritten without it before the qualif
 - **Arm** ([rc11/rc-tp4.json](rc11/rc-tp4.json)): candidate 10's with the `glp` block of
   `../2026-10-28-glp-dual-serving/cluster.json` (the second served name
   `deepseek-v4.1-flash-weightless`, the published file mounted) and prefill yield.
-- **Release tests:** `scripts/release_tests.py check` for 19f2c20ed..69f1f158b: 171 selected,
+- **Release tests:** `scripts/release_tests.py check` for 19f2c20ed..977e18a37: 171 selected,
   116 gate (eight new gate files in `config/release-tests.json`: block-scale words, front, IKET,
   weightless, copy drafts and its scheduler, prefill yield, expert scale codes), 55 excluded, 0
   problems.
