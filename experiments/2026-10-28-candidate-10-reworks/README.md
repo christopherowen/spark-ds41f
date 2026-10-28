@@ -43,6 +43,16 @@ experts only, so under about 0.9%, likely 0.3-0.5%. Claim: same bits, prefill no
 coded-arrive, decode no slower. Bundle: `expert-codes-v2` (the MoE and scale-code tests) on
 dgx3.
 
+Result (run `c10-expert-codes-v2`, 2026-10-28): same bits, faster decode. Determinism, greedy
+and seeded sampled digests equal coded-arrive's; 64/64 greedy responses identical, KL 0. Lean
+bracket (coded-arrive, expert-codes-v2, coded-arrive again): c8 paired decode +1.29% (margin
+0.73%; c8 output 198.7 against 196.5 and 196.1 tok/s), c1 paired +0.43% (margin 0.31%); decode
+grid, prefill 32K and 131K same (v1 had cost 2.8% of prefill). The bundle on dgx3 passed 112
+of 114 tests: the two that failed read v1's source (the 127 pad sought in `gemm.py`, which
+`scale_pack.py` writes; the 2-bit loop expected inside the narrow-expert test, where v2 puts
+the test inside each thread's loop). Both now check v2's form (vLLM 8712a69e1). Joins
+candidate 11 as 0568-0569; the qualification's release tests run the file.
+
 ## API prompt semantics (`api-semantics.json`, kernel lab only)
 
 The DeepSeek API work (effort aliases; response_format, tool_choice none and the assistant

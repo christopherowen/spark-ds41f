@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:19:26 +0100
+Subject: [PATCH 569/569] [DS4.1] Expert scale-code tests follow v2: the pad
+ lives in scale_pack, each thread expands its own row
+
+The 127 pad of an uncoded word is written by scale_pack.py, not gemm.py.
+v2 expands each thread's own row again, so the 2-bit store is a direct
+statement of the narrow-expert test inside the per-thread loop; the test
+checks that store, and that the 4-bit branch never reads the 2-bit codes.
+The file is formatted, and an unused tile count goes.
+---
+ .../test_deepseek_v41_expert_scale_codes.py   | 72 ++++++++++++-------
+ 1 file changed, 46 insertions(+), 26 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+index 6b19f4915..399502f3c 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
++++ b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+@@ -79,9 +79,7 @@ def test_narrow_expert_round_trips_and_wide_expert_keeps_4bit_codes(k):
+         pack_scale_codes_2bit(exponents[1])
+ 
+     narrow_words = expand_scale_codes_2bit(got.codes_2bit[0], got.base[0])
+-    assert torch.equal(
+-        narrow_words, expand_scale_codes(got.codes[0], got.base[0])
+-    )
++    assert torch.equal(narrow_words, expand_scale_codes(got.codes[0], got.base[0]))
+     raw = narrow_words.view(torch.uint8).reshape(exponents.shape[1], -1)
+     assert torch.equal(raw[:, :n_exp], exponents[0])
+     pad = raw[:, n_exp:]
+@@ -160,9 +158,11 @@ def test_kernel_row_index_selects_that_experts_codes():
+     assert words == 5
+     for expert, bx, ko in ((0, 0, 0), (0, 1, 4), (1, 0, 3)):
+         row = (expert * n_blocks + bx) * words + ko
+-        expect = packed.codes_2bit[expert, bx * _BLOCK_N:(bx + 1) * _BLOCK_N, ko]
++        expect = packed.codes_2bit[expert, bx * _BLOCK_N : (bx + 1) * _BLOCK_N, ko]
+         assert torch.equal(tiled[row], expect)
+-    assert torch.equal(tiled[n_blocks * words:], torch.zeros_like(tiled[n_blocks * words:]))
++    assert torch.equal(
++        tiled[n_blocks * words :], torch.zeros_like(tiled[n_blocks * words :])
++    )
+ 
+ 
+ def test_the_moe_fixture_range_keeps_one_narrow_and_one_wide_expert():
+@@ -272,9 +272,7 @@ def test_apply_passes_narrow_codes_in_the_kernel_argument_order():
+         if "self.w1_scale" in text and "narrow13" in text:
+             tuples.append(text)
+     assert tuples, "apply() does not pass the 2-bit codes"
+-    assert tuples[0] == (
+-        "(w1, tail13, self.w1_scale, byte13, narrow13, base13)"
+-    )
++    assert tuples[0] == ("(w1, tail13, self.w1_scale, byte13, narrow13, base13)")
+ 
+ 
+ def _words_each_thread_writes(codes, base, narrow, block_n, threads=128):
+@@ -299,7 +297,9 @@ def _words_each_thread_writes(codes, base, narrow, block_n, threads=128):
+                     row = origin + tx * 16 + i
+                     seen[row] += 1
+                     for ko in range(words):
+-                        out[row, ko] = scale_word(int(codes[row, ko]), int(base[row]), True)
++                        out[row, ko] = scale_word(
++                            int(codes[row, ko]), int(base[row]), True
++                        )
+         else:
+             for tx in range(threads):
+                 if tx >= block_n // 8:
+@@ -308,7 +308,9 @@ def _words_each_thread_writes(codes, base, narrow, block_n, threads=128):
+                     row = origin + tx * 8 + i
+                     seen[row] += 1
+                     for ko in range(words):
+-                        out[row, ko] = scale_word(int(codes[row, ko]), int(base[row]), False)
++                        out[row, ko] = scale_word(
++                            int(codes[row, ko]), int(base[row]), False
++                        )
+     assert torch.equal(seen, torch.ones(rows, dtype=torch.int32))
+     return out
+ 
+@@ -334,17 +336,23 @@ def test_each_thread_expands_its_own_rows_to_the_packer_words(block_n):
+     )
+     narrow_ref = expand_scale_codes_2bit(packed.codes_2bit[0], packed.base[0])
+     wide_ref = expand_scale_codes(packed.codes[1], packed.base[1])
+-    assert torch.equal(narrow_words & 0xFFFFFFFF, narrow_ref.view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
+-    assert torch.equal(wide_words & 0xFFFFFFFF, wide_ref.view(torch.int32).to(torch.int64) & 0xFFFFFFFF)
++    assert torch.equal(
++        narrow_words & 0xFFFFFFFF,
++        narrow_ref.view(torch.int32).to(torch.int64) & 0xFFFFFFFF,
++    )
++    assert torch.equal(
++        wide_words & 0xFFFFFFFF, wide_ref.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
++    )
+     # The tiled load the kernel issues is those same rows, in thread order.
+     tiled = tile_byte_codes(packed.codes_2bit[:1], block_n)
+     words = packed.codes_2bit.shape[-1]
+-    n_blocks = 256 // block_n
+     for bx, ko in ((0, 0), (1, words - 1)):
+         row = bx * words + ko
+         for tx in range(block_n // 16):
+             got = tiled[row, tx * 16 : tx * 16 + 16]
+-            expect = packed.codes_2bit[0, bx * block_n + tx * 16 : bx * block_n + tx * 16 + 16, ko]
++            expect = packed.codes_2bit[
++                0, bx * block_n + tx * 16 : bx * block_n + tx * 16 + 16, ko
++            ]
+             assert torch.equal(got, expect), (bx, ko, tx)
+ 
+ 
+@@ -377,7 +385,9 @@ def test_the_mixed_launch_shapes_match_the_narrow_kernel(n, k):
+     )
+     experts, block_n = 32, 128
+     gen = torch.Generator().manual_seed(41)
+-    exps = torch.randint(100, 104, (experts, n, k // 32), generator=gen, dtype=torch.uint8)
++    exps = torch.randint(
++        100, 104, (experts, n, k // 32), generator=gen, dtype=torch.uint8
++    )
+     exps[1, 0, 0] = 100
+     exps[1, 0, 1] = 106
+     packed = pack_expert_scale_codes(exps)
+@@ -403,16 +413,16 @@ def test_the_mixed_launch_shapes_match_the_narrow_kernel(n, k):
+ def test_the_tail_pad_byte_is_the_row_base_and_the_real_exponents_match():
+     """K=576's last word has two real exponents and two pad bytes.
+ 
+-    The uncoded GEMM pads those bytes with 127. The coded expand stores the
++    The uncoded scale pack pads those bytes with 127. The coded expand stores the
+     row base there (delta 0). The 18 real exponents match. A 64-wide tail
+     reads the two real exponents; the bit-match depends on the MMA not
+     reading the pad.
+     """
+-    gemm = (
++    scale_pack = (
+         Path(__file__).resolve().parents[3]
+-        / "vllm/models/deepseek_v4_1/tilelang/gemm.py"
++        / "vllm/models/deepseek_v4_1/tilelang/scale_pack.py"
+     ).read_text()
+-    assert "value=127" in gemm
++    assert "value=127" in scale_pack
+     gen = torch.Generator().manual_seed(3)
+     base = torch.randint(100, 120, (4, 32, 1), generator=gen)
+     exps = (base + torch.randint(0, 4, (4, 32, 18), generator=gen)).to(torch.uint8)
+@@ -431,7 +441,9 @@ def test_the_tail_pad_byte_is_the_row_base_and_the_real_exponents_match():
+     pad = -raw.shape[-1] % 4
+     ref = torch.nn.functional.pad(raw, (0, pad), value=127)
+     assert torch.equal(got[..., :18], ref[..., :18])
+-    assert torch.equal(got[..., 18:], packed.base.unsqueeze(-1).expand_as(got[..., 18:]))
++    assert torch.equal(
++        got[..., 18:], packed.base.unsqueeze(-1).expand_as(got[..., 18:])
++    )
+     assert not torch.equal(got[..., 18:], ref[..., 18:])
+     # FP8 x unpacked E2M1 is mxf8f6f4: one byte per K32 atom. A 64-wide tail
+     # at k_start 0 reads bytes 0 and 1 of the word. Bytes 2 and 3 are the pad.
+@@ -441,7 +453,10 @@ def test_the_tail_pad_byte_is_the_row_base_and_the_real_exponents_match():
+     )
+     if mma.is_file():
+         src = mma.read_text()
+-        assert "return (_k_start + self.micro_size_k * ki) // int(sf_granularity_k) % 4" in src
++        assert (
++            "return (_k_start + self.micro_size_k * ki) // int(sf_granularity_k) % 4"
++            in src
++        )
+         assert '("mxf8f6f4", 1, "ue8m0")' in src
+         assert "atom_k=32" in src
+     bytes_read = [(0 + 32 * ki) // 32 % 4 for ki in range(2)]
+@@ -479,10 +494,15 @@ def test_the_narrow_scale_store_is_inside_the_device_branch():
+         assert not mentions(node.orelse, "code8")
+         if not (mentions(node.body, "code8") and mentions(node.body, "SFB_shared")):
+             continue
+-        # The unroll is a direct statement of the expert test, so every thread
+-        # runs it. The per-thread test stays inside that loop.
+-        loops = [child for child in node.body if isinstance(child, ast.For)]
+-        assert loops, "the 2-bit expand loop is inside the per-thread test"
+-        assert any("tx * 16" in ast.unparse(loop) for loop in loops)
++        # Each thread expands its own row; the 2-bit store is a statement of the
++        # expert test itself.
++        stores = [
++            child
++            for child in node.body
++            if isinstance(child, ast.Assign)
++            and "SFB_shared" in ast.unparse(child.targets[0])
++        ]
++        assert stores, "the 2-bit store is a statement of the expert test"
++        assert all("code8" in ast.unparse(store.value) for store in stores)
+         found = True
+     assert found
