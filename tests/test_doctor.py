@@ -875,6 +875,9 @@ class ClusterReplaceTest(unittest.TestCase):
             mock.patch.object(spark, "run_ssh", side_effect=run_ssh),
             mock.patch.object(spark, "preserve_failed_start_logs", return_value=None),
             mock.patch.object(spark, "restore_containers"),
+            mock.patch.object(spark, "wait_for_memory_recovery",
+                              side_effect=lambda c, n, stopped: calls.append(
+                                  ("recovery", tuple(node["name"] for node in stopped)))),
         ]
         for patch in patches:
             patch.start()
@@ -897,12 +900,62 @@ class ClusterReplaceTest(unittest.TestCase):
         self.assertEqual(removed, ["dgx1", "dgx2", "dgx3"])
         restore.assert_not_called()
 
+    def test_memory_recovers_after_every_stop_and_before_any_launch(self) -> None:
+        _, calls, _ = self.run_start()
+        recovery = calls.index(("recovery", ("dgx1", "dgx2", "dgx3")))
+        stops = [i for i, (_, command) in enumerate(calls) if command == ("docker", "stop")]
+        launches = [i for i, (_, command) in enumerate(calls) if command == ("docker", "run")]
+        self.assertLess(max(stops), recovery)
+        self.assertLess(recovery, min(launches))
+
     def test_a_failed_rename_rolls_back_the_stopped_nodes(self) -> None:
         code, calls, restore = self.run_start(fail_rename_on="dgx2")
         self.assertEqual(code, 1)
         backups = restore.call_args.args[2]
         self.assertEqual(sorted(backups), ["dgx1", "dgx3"])
         self.assertNotIn(("dgx1", ("docker", "run")), calls)
+
+
+class MemoryRecoveryTest(unittest.TestCase):
+    """After --replace stops the old engine, the start waits for MemAvailable to stop rising."""
+
+    CLUSTER = {"host": {"startup_memguard_gib": 5}}
+    NODES = {"ssh_user": "u", "nodes": [{"name": "dgx1", "management_ip": "1"},
+                                        {"name": "dgx2", "management_ip": "2"}]}
+
+    def wait(self, readings: dict[str, list[float]]):
+        import subprocess
+        from unittest import mock
+
+        clock = [0.0]
+
+        def run_ssh(_nodes, node, *command):
+            kib = int(readings[node["name"]].pop(0) * 1048576)
+            return subprocess.CompletedProcess(command, 0, stdout=f"{kib}\n", stderr="")
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        out = io.StringIO()
+        with mock.patch.object(spark, "run_ssh", side_effect=run_ssh), contextlib.redirect_stdout(out):
+            spark.wait_for_memory_recovery(self.CLUSTER, self.NODES, self.NODES["nodes"],
+                                           sleep=sleep, clock=lambda: clock[0])
+        return clock[0], out.getvalue()
+
+    def test_waits_until_each_node_stops_rising(self) -> None:
+        waited, out = self.wait({"dgx1": [40.0, 90.0, 116.0, 116.2], "dgx2": [116.0, 116.1]})
+        self.assertEqual(waited, 3 * spark.MEMORY_SETTLE_INTERVAL_SECONDS)
+        self.assertIn("dgx1: MemAvailable 116.2 GiB", out)
+        self.assertIn("dgx2: MemAvailable 116.1 GiB", out)
+
+    def test_memory_settled_at_the_guard_is_refused(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "dgx1: MemAvailable settled at 4.03 GiB"):
+            self.wait({"dgx1": [4.0, 4.03], "dgx2": [116.0, 116.0]})
+
+    def test_memory_still_rising_at_the_deadline_is_refused(self) -> None:
+        rising = [10.0 + i for i in range(100)]
+        with self.assertRaisesRegex(RuntimeError, "still rising 180s .*dgx1"):
+            self.wait({"dgx1": rising, "dgx2": [116.0] * 100})
 
 
 class KernelPolicyPathTest(unittest.TestCase):

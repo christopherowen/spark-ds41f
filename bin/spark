@@ -1786,6 +1786,65 @@ def memguard_is_active(cluster: dict, nodes: dict, node: dict) -> bool:
     return result.returncode == 0
 
 
+MEMORY_SETTLE_INTERVAL_SECONDS = 5
+MEMORY_SETTLE_GIB = 0.5
+MEMORY_RECOVERY_TIMEOUT_SECONDS = 180
+
+
+def available_gib(nodes: dict, node: dict) -> float:
+    result = run_ssh(nodes, node, "awk", "/^MemAvailable:/{print $2}", "/proc/meminfo")
+    try:
+        return int(result.stdout.strip()) / 1048576
+    except ValueError:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(f"{node['name']}: cannot read MemAvailable: {detail}") from None
+
+
+def wait_for_memory_recovery(
+    cluster: dict,
+    nodes: dict,
+    stopped: list[dict],
+    *,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> None:
+    """Wait until each node's MemAvailable stops rising after its old engine stopped.
+
+    A stopped engine returns its memory over seconds, not at `docker stop`'s exit: a rank
+    launched before then meets a startup memguard armed against memory still being
+    returned, and the guard kills a healthy boot (2026-10-25, a TP3 triangle at 1M, twice).
+    """
+    line = cluster["host"]["startup_memguard_gib"]
+    previous: dict[str, float] = {}
+    pending = list(stopped)
+    deadline = clock() + MEMORY_RECOVERY_TIMEOUT_SECONDS
+    while pending:
+        waiting = []
+        for node in pending:
+            now = available_gib(nodes, node)
+            before = previous.get(node["name"])
+            if before is None or now - before >= MEMORY_SETTLE_GIB:
+                previous[node["name"]] = now
+                waiting.append(node)
+                continue
+            if now <= line:
+                raise RuntimeError(
+                    f"{node['name']}: MemAvailable settled at {now:.2f} GiB after the old engine "
+                    f"stopped, at or below the {line} GiB startup memguard; a launch would be killed"
+                )
+            print(f"{node['name']}: MemAvailable {now:.1f} GiB after the old engine stopped", flush=True)
+        pending = waiting
+        if not pending:
+            return
+        if clock() >= deadline:
+            still = ", ".join(f"{node['name']} {previous[node['name']]:.1f} GiB" for node in pending)
+            raise RuntimeError(
+                f"MemAvailable still rising {MEMORY_RECOVERY_TIMEOUT_SECONDS}s after the old engine "
+                f"stopped ({still}); refusing to arm the startup memguard"
+            )
+        sleep(MEMORY_SETTLE_INTERVAL_SECONDS)
+
+
 def wait_for_api(cluster: dict, nodes: dict) -> None:
     head = next(node for node in nodes["nodes"] if node["head"])
     name = cluster["container"]["name"]
@@ -2175,6 +2234,9 @@ def command_cluster_start(args: argparse.Namespace) -> int:
                     errors.append(error)
             if errors:
                 raise RuntimeError("; ".join(errors))
+            wait_for_memory_recovery(
+                cluster, nodes, [node for node in nodes["nodes"] if node["name"] in backups]
+            )
         for node in order:
             start_memguard(cluster, nodes, node, "startup", prelaunch=True)
             if not memguard_is_active(cluster, nodes, node):
