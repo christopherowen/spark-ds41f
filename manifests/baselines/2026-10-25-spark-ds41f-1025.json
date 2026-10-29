@@ -166,6 +166,39 @@
     "copies": "dgx2 to dgx1 and dgx3, dgx1 to dgx4 over the fabric"
   },
   "benchmark_reference": "manifests/suites/2026-10-25-spark-ds41f-1025-tp4",
+  "recipe": "releases/spark-ds41f-1025/cluster.json",
+  "qualified_arms": {
+    "tp4-ring": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json",
+    "tp3-triangle": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp3.json"
+  },
+  "changed_after_release": [
+    {
+      "shapes": [
+        "tp4-ring",
+        "tp3-triangle"
+      ],
+      "overlay": {
+        "set": {
+          "environment": {
+            "VLLM_MAX_IMAGE_PIXELS": "16777216"
+          }
+        }
+      },
+      "why": "16 MP an image from 2026-10-26 (experiments/2026-10-26-site-landmines)"
+    },
+    {
+      "shapes": [
+        "tp3-triangle"
+      ],
+      "overlay": {
+        "serve_options": {
+          "--max-num-batched-tokens": "6144",
+          "--long-prefill-token-threshold": "6096"
+        }
+      },
+      "why": "the triangle's prefill budget 6,144 from 2026-10-27, for a median step beside a long prompt 21% shorter (owner); not qualified on 1025's image"
+    }
+  ],
   "previous_baseline": "2026-10-22-spark-ds41f-1022",
   "hosts": {
     "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",

@@ -24,6 +24,10 @@ def load(relative: str) -> dict:
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
 # Fabric settings sparknet renders from the node map; a recipe leaves them out.
 RENDERED = ("NCCL_IB_HCA", "SPARKNET_ROCE_GID_INDEX")
+# A recipe frozen for the tests of how recipes resolve, so a release does not move them;
+# what production serves is tests/test_releases.py's.
+FIXTURE = "tests/fixtures/cluster.json"
+RELEASE_1025 = "releases/spark-ds41f-1025/cluster.json"
 # Flags that change only what a response reports, added after the archived records.
 REPORTING_ARGS = ("--enable-prompt-tokens-details",)
 # The JIT monitor installs hooks and reports compiles; it computes nothing. spark-ds41f-1025
@@ -148,7 +152,7 @@ class RecipeTest(unittest.TestCase):
         "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS")
 
     def test_each_shape_is_its_1022_arm_renamed(self):
-        """Each shape resolves to spark-ds41f-1022's arm at that shape under the names of the
+        """spark-ds41f-1025's recipe resolves at each shape to spark-ds41f-1022's arm there under the names of the
         release after it (the owner's decision of 2026-10-19), on spark-ds41f-1025's image, and
         nothing else: the container, label prefix, variables and cache paths are renamed,
         PYTHONPATH is left to the image (which sets it to the same trees) and the boot-profile
@@ -161,9 +165,10 @@ class RecipeTest(unittest.TestCase):
         sparknet renders from the node map (the HCA list and the GID index) are left to it."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual(len(self.UNUSED_KERNEL_SETTINGS), 21)
+        release = load(RELEASE_1025)
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
-            resolved = recipe.resolve(self.recipe, shape)
+            resolved = recipe.resolve(release, shape)
             released = renamed(load_spark().read_cluster(arm))
             released["environment"] = {**{k: v for k, v in released["environment"].items()
                                           if k not in self.UNUSED_KERNEL_SETTINGS + RENDERED},
@@ -186,27 +191,14 @@ class RecipeTest(unittest.TestCase):
             resolved, released = host_mounts(resolved), host_mounts(released)
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
-        self.assertEqual(self.recipe["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-6")
-
-    def test_the_ring_is_candidate_6s_arm(self):
-        """Promotion runs what the release measured: tp4-ring resolves to candidate 6's arm,
-        apart from the baseline, lock and reference that name it, and the per-image pixel limit
-        added after the release (16 MP, experiments/2026-10-26-site-landmines), and the fabric
-        settings sparknet renders from the node map."""
-        resolved = host_mounts(recipe.resolve(self.recipe, "tp4-ring"))
-        released = host_mounts(load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"))
-        released["environment"] = {**{k: v for k, v in released["environment"].items() if k not in RENDERED},
-                                   "VLLM_MAX_IMAGE_PIXELS": "16777216"}
-        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
-        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
-                         {k: v for k, v in released.items() if k not in naming})
+        self.assertEqual(release["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-6")
 
     def test_the_image_cap_arm_changes_only_the_cap(self):
         """experiments/2026-10-26-site-landmines measures 4-32 images a request on one boot: the
-        recipe at tp3-triangle with 32 images a prompt and nothing else changed. Regenerate the arm
-        (make_arms.py) when the recipe's triangle changes."""
+        recipe (spark-ds41f-1025's) at tp3-triangle with 32 images a prompt and nothing else
+        changed."""
         arm = load_spark().read_cluster("experiments/2026-10-26-site-landmines/image-cap-32-tp3.json")
-        base = recipe.resolve(self.recipe, "tp3-triangle")
+        base = recipe.resolve(load(RELEASE_1025), "tp3-triangle")
         args = list(base["serve_args"])
         self.assertEqual(args[args.index("--limit-mm-per-prompt") + 1], '{"image":4}')
         args[args.index("--limit-mm-per-prompt") + 1] = '{"image":32}'
@@ -320,17 +312,18 @@ class RecipeTest(unittest.TestCase):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
         the hub's shared store, the snapshot served from inside it); an arm that sets
         another model serves it, whatever mounts it lists."""
-        self.assertEqual(self.recipe["model"], "v41-flash-1017")
-        profile = self.recipe["models"]["v41-flash-1017"]
+        fixture = load(FIXTURE)
+        self.assertEqual(fixture["model"], "v41-flash-1017")
+        profile = fixture["models"]["v41-flash-1017"]
         for shape in ("tp3-triangle", "tp4-ring"):
-            resolved = recipe.resolve(self.recipe, shape)
+            resolved = recipe.resolve(fixture, shape)
             self.assertEqual(resolved["container"]["mounts"][0], [profile["hub"], "/hub", "ro"])
             self.assertEqual(resolved["serve_args"][0], f"/hub/{profile['snapshot']}")
-        base = recipe.resolve(self.recipe, "tp3-triangle")
+        base = recipe.resolve(fixture, "tp3-triangle")
         self.assertEqual(recipe.model_snapshot(base), f"{profile['hub']}/{profile['snapshot']}")
         # The original checkpoint: snapshot and blobs mounted, served from /models.
         arm = recipe.overlay({"extends": {}, "set": {"model": "v41-flash"}}, base)
-        original = self.recipe["models"]["v41-flash"]
+        original = fixture["models"]["v41-flash"]
         mounts = arm["container"]["mounts"]
         self.assertEqual(mounts[:2], [[original["snapshot"], "/models", "ro"],
                                       [original["blobs"], "/blobs", "ro"]])
@@ -338,7 +331,7 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(arm["serve_args"][0], "/models")
         self.assertEqual(arm["serve_args"][1:], base["serve_args"][1:])
         # And back: an arm over it that sets 1017 serves from the hub again.
-        back = recipe.overlay({"extends": {}, "set": {"model": self.recipe["model"]}}, arm)
+        back = recipe.overlay({"extends": {}, "set": {"model": fixture["model"]}}, arm)
         self.assertEqual(back["container"]["mounts"], base["container"]["mounts"])
         self.assertEqual(back["serve_args"], base["serve_args"])
         with self.assertRaises(SystemExit):
@@ -370,8 +363,10 @@ class RecipeTest(unittest.TestCase):
         self.assertIn('{"temperature":0.6,"top_p":1.0}', again["serve_args"])
 
     def test_tp3_keeps_its_cabling_and_sizing(self):
-        """TP3 keeps what the triangle and its memory need, and nothing else of r6h."""
-        resolved = recipe.resolve(self.recipe, "tp3-triangle")
+        """TP3 keeps what the triangle and its memory need, and nothing else of r6h (through
+        spark-ds41f-1025)."""
+        release = load(RELEASE_1025)
+        resolved = recipe.resolve(release, "tp3-triangle")
         old = load("experiments/2026-10-14-one-recipe/tp3-r6h-production.json")
         # Since r6x the triangle serves 1M with a 4.90625 GiB pool (the expert scale codes freed
         # the memory); everything else of r6h's sizing, drafts and capture ladder stays.
@@ -396,7 +391,7 @@ class RecipeTest(unittest.TestCase):
                 continue
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
                 self.assertEqual(resolved["environment"].get(key.replace("SPARK3_", "SPARK_DS41F_", 1)), value, key)
-        tp4 = recipe.resolve(self.recipe, "tp4-ring")
+        tp4 = recipe.resolve(release, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
@@ -404,7 +399,7 @@ class RecipeTest(unittest.TestCase):
         # spark-ds41f-1025 was released on the ring, then qualified on the triangle (2026-10-25).
         self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-25-spark-ds41f-1025-tp3")
         self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-25-spark-ds41f-1025-tp4")
-        self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
+        self.assertNotIn("benchmark_reference", recipe.resolve(release, "tp3-triangle-4k"))  # not benched
 
     def test_every_shape_reports_prompt_cache_hits(self):
         """Prefix caching reuses cached blocks; --enable-prompt-tokens-details reports the reuse
@@ -542,14 +537,15 @@ class RecipeTest(unittest.TestCase):
                              budget, name)
 
     def test_a_variant_is_qualified_on_its_own(self):
-        resolved = recipe.resolve(self.recipe, "tp3-triangle-4k")
+        fixture = load(FIXTURE)
+        resolved = recipe.resolve(fixture, "tp3-triangle-4k")
         old = load("experiments/2026-10-14-one-recipe/tp3-4k-r6h.json")
         self.assertEqual(resolved["host"]["kernel"], old["host"]["kernel"])
         self.assertEqual(serving_arguments(resolved), serving_arguments(old))
         self.assertNotIn("benchmark_reference", resolved)
-        qualified = dict(self.recipe)
-        qualified["shapes"] = dict(self.recipe["shapes"])
-        qualified["shapes"]["tp3-triangle"] = dict(self.recipe["shapes"]["tp3-triangle"], benchmark_reference="x.json")
+        qualified = dict(fixture)
+        qualified["shapes"] = dict(fixture["shapes"])
+        qualified["shapes"]["tp3-triangle"] = dict(fixture["shapes"]["tp3-triangle"], benchmark_reference="x.json")
         self.assertNotIn("benchmark_reference", recipe.resolve(qualified, "tp3-triangle-4k"))
 
     def test_a_site_that_names_no_shape_gets_the_recipes_default(self):
@@ -614,8 +610,8 @@ class OverlayTest(unittest.TestCase):
             recipe.overlay({"extends": {}, "container": {}}, base)
 
     def test_serve_options_change_one_value_and_follow_every_other_argument(self):
-        base = recipe.resolve(load("config/cluster.json"), "tp3-triangle")
-        arm = {"extends": {"config": "config/cluster.json", "shape": "tp3-triangle"},
+        base = recipe.resolve(load(FIXTURE), "tp3-triangle")
+        arm = {"extends": {"config": FIXTURE, "shape": "tp3-triangle"},
                "serve_options": {"--load-format": "direct"}}
         args = recipe.overlay(arm, base)["serve_args"]
         at = base["serve_args"].index("--load-format") + 1
@@ -681,7 +677,7 @@ class GLPTest(unittest.TestCase):
             "glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf --revision 2715ffd51f59899115853e1118db080536966c44")
 
     def test_a_recipe_without_the_block_serves_one_name(self):
-        cluster = recipe.resolve(load("config/cluster.json"), "tp4-ring")
+        cluster = recipe.resolve(load(FIXTURE), "tp4-ring")
         self.assertIsNone(recipe.glp_file(cluster))
         self.assertNotIn("WEIGHTLESS_STEER_PATH", cluster["environment"])
         self.assertNotIn("/glp/vector.gguf", [mount[1] for mount in cluster["container"]["mounts"]])

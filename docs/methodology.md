@@ -91,8 +91,12 @@ new hardware work.
 
 A promotion commit must:
 
-1. update `config/`;
-2. add a new immutable baseline manifest;
+1. update `config/` and freeze the release: `releases/<name>/cluster.json` and
+   `upstreams.lock.json`, copies of `config/cluster.json` (naming its lock) and
+   `upstreams.lock.json`, never edited afterwards;
+2. add a new immutable baseline manifest naming the frozen `recipe`, the arm each shape
+   qualified on (`qualified_arms`), and `build.built_as` when the image was built under
+   another tag;
 3. link the accepted experiment and all native receipts;
 4. update upstream pins or patch series when source changed;
 5. prove all configured ranks use the same content-addressed image;
@@ -105,7 +109,18 @@ A promotion commit must:
    `manifests/benchmarks/<baseline>[-<shape>].json` instead;
 8. pass the release tests on the promoted image ([testing](testing.md)):
    `scripts/release_tests.py check` reports no unclassified, ambiguous or missing file
-   for the release's patch series, and the gate bundle exits 0.
+   for the release's patch series, and the gate bundle exits 0;
+9. repoint at the previous release's frozen recipe any arm of a finished experiment that
+   extends `config/cluster.json` and whose test regenerates it.
+
+`tests/test_releases.py` checks every manifest with a `recipe`: at each qualified shape the
+frozen recipe resolves to its arm (apart from names, the fabric settings sparknet renders,
+and the release tag of the same image), and `config/cluster.json` is the newest release's
+copy. A recipe change therefore waits in a candidate's arm until it is released. A change
+made to production between releases anyway is recorded in that release's manifest under
+`changed_after_release` (the shapes, the overlay that makes the arm match, and why), as
+spark-ds41f-1025's 16 MP image limit and triangle budget are. Tests of how recipes resolve
+use `tests/fixtures/cluster.json`, not the production recipe, so a promotion leaves them alone.
 
 Rollback is a new coordinated deployment of the previous promoted commit. It is
 not an ad hoc reconstruction from shell history.

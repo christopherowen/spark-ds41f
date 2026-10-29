@@ -5,6 +5,9 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
+**Released (2026-10-30):** candidate 14 is spark-ds41f-1030 on the ring
+([below](#candidate-14-rc14), [release notes](release-notes.md)); the triangle is not qualified on it.
+
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
 (6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
 MoE output fix; its image is built and its release tests show two order-dependent test failures,
@@ -770,3 +773,18 @@ candidate (owner, 2026-10-29: fold the fix in before promoting).
   Candidate 14 works if the load runs clean on both of its boots, every digest equals
   candidate 13's, and model loading stays at 71.67 GiB. Candidate 12's release comparison
   against 1025 then stands for candidate 14 on the ring.
+- **Result (run `candidate-14-fix-tp4`, 2026-10-29): works.** The image
+  (`sha256:7918fd6145b5`) built on dgx4 at 22:19 UTC from deployment commit `d7feb2d9` and was
+  copied dgx4 to dgx3, dgx2 and dgx1; the same ID on every node.
+  - The load ran clean on candidate 13 too (150 requests, 0 failed): the trigger is not
+    reproduced on the ring, and the fix stands on the scheduler's padding path, which reaches the
+    check whenever a prompt with one token left is padded with placeholder drafts (#677, asked of
+    its reporter).
+  - Candidate 14: 150 requests on each boot, 0 failed, prompts up to 311K tokens; every digest
+    equals candidate 13's; model loading 71.67 GiB a rank on both boots; 277 TileLang calls
+    prepared, init 28-37 s.
+- **Promoted as spark-ds41f-1030** on the ring (owner, 2026-10-29: "Ship 1030 from candidate
+  14"): image `spark-ds41f:1030` (this build, retagged), recipe and lock frozen in
+  [releases/spark-ds41f-1030](../../releases/spark-ds41f-1030/), baseline
+  [2026-10-30-spark-ds41f-1030](../../manifests/baselines/2026-10-30-spark-ds41f-1030.json),
+  [release notes](release-notes.md).

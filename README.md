@@ -3,11 +3,29 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
-Production is **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the three-node TP3 1M
-profile on the triangle the site is cabled as, and qualified on the four-node TP4 1M profile on
-the ring as well ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
-[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). The release name is
-the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1022 with
+Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is
+the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1025
+with TileLang as the only kernel family and direct checkpoint loading, prefill yield (a short
+request's first token beside a 131K prefill in 3.3-3.6 s instead of 12.4-12.8 s), a second served
+name, `deepseek-v4.1-flash-weightless`, steered per request with msuiche's published GLP vector
+(the stock name bit-identical beside it), the DeepSeek API's effort aliases and prompt semantics,
+PDL along the decode chain and the attention front in one launch, 2-bit expert scale codes, the
+startup KV line's corrected count (11.02 full 1M contexts, #586), and a fix for an engine stop
+under mixed agent and chat traffic (#677). Temperature-0 text outputs are identical to
+spark-ds41f-1025's except for multi-chunk prompts whose final chunk has 1-128 rows (CED now
+replays a prompt's last 128 rows wherever its chunks end). Against spark-ds41f-1025 in one
+session: decode 1.9-3.6% faster at every concurrency (78.3 tok/s at one stream, 198.4 output
+tok/s at eight), decode grid steps 4.6% shorter, prefill 8.4-12.2% faster from 32K to 1M; greedy
+256/256 identical. The triangle is not qualified on this image. The recipe and lock are frozen in
+[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, the rollback, in
+[releases/spark-ds41f-1025](releases/spark-ds41f-1025/).
+
+Before spark-ds41f-1030, production was **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the
+four-node TP4 1M profile on the ring (since 2026-10-26; on the three-node TP3 1M profile on the
+triangle from 2026-10-25 22:18 until 2026-10-26 08:10) ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). It is spark-ds41f-1022 with
 every serving kernel in TileLang (except NCCL and a few rare-path ATen copies), the CED row
 selection's nonfinal row skip with the ring's long-prefill budget at 16,384, fresh random draws in
 each block-verification round (a backport of vllm-project/vllm#61161), fixes for a `prompt_logprobs`
@@ -166,9 +184,9 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The baseline is
-[manifests/baselines/2026-10-25-spark-ds41f-1025.json](manifests/baselines/2026-10-25-spark-ds41f-1025.json)
-([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md)), on the ring at 1M context;
-the same release is qualified on the triangle at 1M context
+[manifests/baselines/2026-10-30-spark-ds41f-1030.json](manifests/baselines/2026-10-30-spark-ds41f-1030.json)
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md)), on the ring at 1M context;
+the triangle's last qualified release is spark-ds41f-1025
 ([manifests/suites/2026-10-25-spark-ds41f-1025-tp3](manifests/suites/2026-10-25-spark-ds41f-1025-tp3/)). See
 [docs/current-state.md](docs/current-state.md). The three-node deployment (the four-node ring
 differs only in cabling, transport and memory sizing):
