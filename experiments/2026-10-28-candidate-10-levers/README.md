@@ -77,6 +77,13 @@ qualification and is reworked.
 
 (Filled in as each spec lands.)
 
+- **front** (`c10-front`, 2026-10-28): same text (greedy 64/64 identical, teacher-forced KL 0)
+  and faster. Against the run's own repeat: decode grid geometric mean 0.44% faster (margin
+  0.39%), c1 paired decode 0.88% faster (margin 0.32%); c8 (-0.46% ±0.60%) and prefill at
+  32K and 131K level. The grid's gain is at small batches (1-4 requests, 1-2% faster); 12-16
+  requests at depth 6 read about 1% slower against both candidate-10 boots. Stays in
+  candidate 11.
+
 - **copy, first run** (`c10-copy`, 2026-10-28): copy-control booted and passed its gates and
   `copy_probe.py`; the copy arm never became ready. Every worker failed in warmup at
   `assert self.adaptive_verification is not None` in `sample_tokens`: `warmup_kernels` clears
