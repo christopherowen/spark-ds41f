@@ -673,9 +673,45 @@ branch (#619) until they start and pass their A/B.
     prefill's 0.8% has nothing to yield to; it is in 0541-0544 or the IKET patches, not yet
     bisected. c16, c8 and c4 distinct streams, the TTFT trace, startup and sink counters are
     level.
+  - Memory, found after the result above: model loading took 72.72 GiB a rank on candidate 12
+    against 71.67 GiB on candidate 10 (+1.05 GiB; idle free memory 0.6-0.7 GiB lower a
+    node), and at TP3 (#668, 983K context) the host's low point fell from 5.24-5.35 GiB to
+    3.45-3.92 GiB. 0563 gave the 2-bit scale codes their own buffer, half the 4-bit codes'
+    size, for every expert, and kept the 4-bit codes for every expert too. Candidate 13 fixes
+    it; candidate 12 is not promoted.
 - **Release comparison** ([rc12/release-tp4.json](rc12/release-tp4.json), run
   `candidate-12-release-tp4`, about 3.5 h; [rc12/release-tp3.json](rc12/release-tp3.json) after
   the triangle is re-cabled): suites `release`, `single-stream` and `sampled`, arms candidate 12,
   spark-ds41f-1025, candidate 12 again, `startup_memory` on every boot. With the TP3
   qualification ([rc12/candidate-tp3.json](rc12/candidate-tp3.json)) these are what promotion
   needs.
+
+## Candidate 13 ([rc13/](rc13))
+
+Candidate 12 with the 2-bit expert scale codes in the 4-bit codes' buffer, for candidate 10's
+memory with candidate 12's decode.
+
+- **Series:** candidate 12's plus 0566 (vLLM `scale-codes-one-form`, head 13793229f;
+  [rc13/vllm/series](rc13/vllm/series), [rc13/make_series.py](rc13/make_series.py)): patch
+  head `c1965d8e`, tree `e1a74af7` (the build's `git am` reproduces it).
+
+  | Patch | Change | Why |
+  | --- | --- | --- |
+  | 0566 | A narrow expert's 2-bit codes go in the first `block_N` bytes of each of its rows of the 4-bit codes' buffer (zeros after); the grouped GEMM reads them through a uint8 view of that storage, `[rows, 2 * block_N]`. A wide expert keeps its 4-bit rows | 0563 kept a second buffer, half the 4-bit codes' size, for every expert: about 1 GiB a rank at TP4 |
+
+  Each narrow load is still one contiguous `block_N`-byte row, so the bytes read and the
+  expanded scale words are unchanged; the CPU tests check that both views share one storage of
+  the 4-bit codes' size and that each expert's rows hold one form.
+- **Arm** ([rc13/rc-tp4.json](rc13/rc-tp4.json)): candidate 12's on candidate 13's image
+  (`spark-ds41f:19f2c20ed4d6-next-13`); [rc13/source.json](rc13/source.json) adds the
+  `tilelang-expert-scale-codes-one-buffer` capability.
+- **Release tests:** `release_tests.py check` for 19f2c20ed..13793229f: 169 selected, 114 gate,
+  55 excluded, 0 problems ([rc13/release-tests-gate-manifest.json](rc13/release-tests-gate-manifest.json),
+  [rc13/bundles/release-tests](rc13/bundles/release-tests)); the GPU bit-match of mixed narrow
+  and wide experts against the uncoded GEMM (`test_deepseek_v41_tilelang_moe.py`) is a gate
+  file.
+- **Qualification** ([rc13/candidate-tp4.json](rc13/candidate-tp4.json)): candidate 12's, for
+  candidate 13 against candidate 12: the image, the release tests, the checks and the memory
+  snapshot on candidate 12 and candidate 13, GLP's probes, and the lean suite on candidate 12,
+  candidate 13, candidate 12 again. It passes with every digest equal to candidate 12's, speed
+  level, and model loading about 1 GiB a rank below candidate 12's (candidate 10's 71.67 GiB).

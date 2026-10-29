@@ -1,0 +1,255 @@
+From 13793229fa29de29e06651e9a73c2b05aba109ff Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 21:07:51 +0100
+Subject: [PATCH] [DS4.1] Expert scale codes: a narrow expert's 2-bit codes
+ replace its 4-bit codes in one buffer
+
+The 2-bit codes had their own buffer, half the 4-bit codes' size, for every
+expert, beside 4-bit codes that were also kept for every expert: about
+1 GiB more weights a rank at TP4 than candidate 10. A narrow expert's rows
+of the 4-bit buffer now hold its 2-bit bytes (the first block_N bytes of
+each row, zeros after), and the GEMM reads them through a uint8 view of
+the same storage, [rows, 2 * block_N]. A wide expert keeps its 4-bit rows.
+Each narrow load is still one contiguous block_N-byte row, so the bytes
+read and the expanded scale words, and so every output bit, are unchanged.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 10 ++-
+ .../test_deepseek_v41_expert_scale_codes.py   | 61 +++++++++++++++++++
+ .../layers/fused_moe/tilelang.py              |  5 +-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 29 +++++----
+ .../deepseek_v4_1/tilelang/scale_codes.py     | 30 +++++++++
+ 5 files changed, 120 insertions(+), 15 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 1116cfd1b..56f8ef92a 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -41,6 +41,7 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+     workspace_bytes,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.scale_codes import (  # noqa: E402
++    overlay_byte_codes,
+     pack_expert_scale_codes,
+     tile_byte_codes,
+ )
+@@ -751,13 +752,18 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     out_plain = torch.zeros((order.shape[0], n), dtype=torch.bfloat16, device=DEVICE)
+     out_mixed = torch.zeros_like(out_plain)
+     plain(xq, x_words, tiles, *extra, pack_scale_words(exps), order, tile_expert, out_plain)
++    codes, byte_codes = overlay_byte_codes(
++        tile_codes(coded.codes, block_N),
++        tile_byte_codes(coded.codes_2bit, block_N),
++        coded.narrow,
++    )
+     mixed(
+         xq,
+         x_words,
+         tiles,
+         *extra,
+-        tile_codes(coded.codes, block_N),
+-        tile_byte_codes(coded.codes_2bit, block_N),
++        codes,
++        byte_codes,
+         coded.narrow,
+         coded.base,
+         order,
+diff --git a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+index 399502f3c..0fcc1b5e4 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
++++ b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+@@ -36,6 +36,7 @@ pack_scale_codes_2bit = _codes.pack_scale_codes_2bit
+ expand_scale_codes_2bit = _codes.expand_scale_codes_2bit
+ pack_expert_scale_codes = _codes.pack_expert_scale_codes
+ tile_byte_codes = _codes.tile_byte_codes
++overlay_byte_codes = _codes.overlay_byte_codes
+ scale_word = _codes.scale_word
+ 
+ _BLOCK_N = 128
+@@ -407,9 +408,69 @@ def test_the_mixed_launch_shapes_match_the_narrow_kernel(n, k):
+         assert tails.shape == (experts * n_blocks, block_n, tail // 2)
+     assert wide_codes.shape == (rows, block_n) and wide_codes.dtype == torch.uint16
+     assert byte_codes.shape == (rows, block_n) and byte_codes.dtype == torch.uint8
++    codes, byte_codes = overlay_byte_codes(wide_codes, byte_codes, packed.narrow)
++    assert codes.shape == (rows, block_n) and codes.dtype == torch.uint16
++    assert byte_codes.shape == (rows, 2 * block_n) and byte_codes.dtype == torch.uint8
+     assert packed.narrow.shape == (experts,) and packed.base.shape == (experts, n)
+ 
+ 
++def test_one_buffer_holds_each_experts_one_form():
++    """The 2-bit codes take no bytes beyond the 4-bit codes.
++
++    ``overlay_byte_codes`` returns two views of one storage the size of the 4-bit
++    tile codes. A wide expert's rows are its 4-bit codes. A narrow expert's row
++    at ``bytes[row, :block_N]`` is its ``tile_byte_codes`` row and the rest is
++    zero. K=576 has the padded fifth word.
++    """
++    (tile_codes,) = _moe_functions("tile_codes")
++    gen = torch.Generator().manual_seed(5)
++    exps = torch.randint(90, 94, (3, 256, 18), generator=gen, dtype=torch.uint8)
++    exps[1, 0, 0] = 90
++    exps[1, 0, 1] = 95
++    packed = pack_expert_scale_codes(exps)
++    assert packed.narrow.tolist() == [1, 0, 1]
++    wide = tile_codes(packed.codes, _BLOCK_N)
++    narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
++    codes, byte_codes = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
++    assert codes.dtype == torch.uint16 and codes.shape == wide.shape
++    assert byte_codes.dtype == torch.uint8
++    assert byte_codes.shape == (wide.shape[0], 2 * _BLOCK_N)
++    assert byte_codes.data_ptr() == codes.data_ptr()
++    assert codes.untyped_storage().nbytes() == wide.nbytes
++    per = wide.shape[0] // 3
++    for expert in range(3):
++        rows = slice(expert * per, (expert + 1) * per)
++        if packed.narrow[expert]:
++            assert torch.equal(byte_codes[rows, :_BLOCK_N], narrow[rows])
++            assert not byte_codes[rows, _BLOCK_N:].any()
++        else:
++            assert torch.equal(codes[rows], wide[rows])
++
++
++def test_an_all_wide_tensor_keeps_its_4bit_codes():
++    """With no narrow expert the overlay writes nothing."""
++    (tile_codes,) = _moe_functions("tile_codes")
++    exps = torch.full((2, 128, 16), 100, dtype=torch.uint8)
++    exps[:, 0, 0] = 108
++    packed = pack_expert_scale_codes(exps)
++    assert packed.narrow.tolist() == [0, 0]
++    wide = tile_codes(packed.codes, _BLOCK_N)
++    narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
++    codes, _ = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
++    assert torch.equal(codes, wide)
++
++
++def test_the_narrow_kernel_reads_2bit_codes_as_double_width_rows():
++    """The GEMM's 2-bit spec is the 4-bit codes' bytes: ``[rows, 2 * block_N]``."""
++    src = (
++        Path(__file__).resolve().parents[3]
++        / "vllm/models/deepseek_v4_1/tilelang/moe.py"
++    ).read_text()
++    spec = "T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)"
++    assert f"sfb8_spec = {spec}" in src
++    assert "overlay_byte_codes(" in src
++
++
+ def test_the_tail_pad_byte_is_the_row_base_and_the_real_exponents_match():
+     """K=576's last word has two real exponents and two pad bytes.
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 54df9e5b7..343b0b424 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -211,8 +211,9 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         # weights and scale codes are contiguous. A K that ends 64 past a multiple
+         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
+         # ``codes`` is the 4-bit tile layout a wide expert loads. ``byte`` is the
+-        # narrow experts' 2-bit codes (contiguous uint8); ``narrow`` is 1 for
+-        # those experts. The GEMM loads ``byte`` when the flag is 1.
++        # same buffer as uint8, holding the narrow experts' 2-bit codes in their
++        # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
++        # the flag is 1.
+         (
+             (t13, tail13, codes13, byte13, narrow13, base13),
+             (t2, tail2, codes2, byte2, narrow2, base2),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 9739ef658..7f5fab1a3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -55,7 +55,7 @@ from .gemm import (
+     scale_words,
+ )
+ from .linear import MXFP8Rows, _calls, _launch
+-from .scale_codes import pack_expert_scale_codes, tile_byte_codes
++from .scale_codes import overlay_byte_codes, pack_expert_scale_codes, tile_byte_codes
+ 
+ # Routes handled by one CTA of the dispatch kernels.
+ _CHUNK = 512
+@@ -925,7 +925,9 @@ def grouped_fp8_fp4_gemm(
+         else T.Tensor((num_experts, N, sf_words), T.uint32)
+     )
+     base_spec = T.Tensor((num_experts, N), T.uint8)
+-    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint8)
++    # SFB's bytes (``overlay_byte_codes``): a narrow expert's row holds its 2-bit
++    # codes in the first block_N of its 2 * block_N bytes.
++    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)
+     narrow_spec = T.Tensor((num_experts,), T.uint8)
+ 
+     if tail and coded_scales and narrow_codes:
+@@ -1432,22 +1434,27 @@ class MoeExpertsV41Plan:
+ 
+         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
+         down projection of TP4's 576-wide expert rows). ``codes`` is
+-        ``pack_scale_codes`` in ``tile_codes`` layout, the bytes the coded GEMM
+-        loads today, for every expert. An expert whose every row has delta <= 3
+-        also has ``codes_2bit`` in that tile order as contiguous uint8 (four
+-        2-bit deltas a byte, low bits first); ``narrow`` is uint8 1 for that
+-        expert and 0 otherwise, and a wide expert's ``codes_2bit`` slice is
+-        zero. A narrow expert's GEMM loads ``codes_2bit``; a wide expert loads
+-        ``codes``. The 4-bit expand is the wide expert's path.
++        ``pack_scale_codes`` in ``tile_codes`` layout for a wide expert. An
++        expert whose every row has delta <= 3 is narrow (``narrow`` uint8 1, else
++        0) and its rows of the same buffer hold 2-bit codes instead (four deltas a
++        byte, low bits first, in each row's first ``block_N`` bytes);
++        ``codes_2bit`` is that buffer as uint8 (``overlay_byte_codes``). A narrow
++        expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
++        expert holds both forms, so the codes take the 4-bit codes' bytes.
+         """
+         prepared = []
+         for w, scale in ((w13, w13_scale), (w2, w2_scale)):
+             packed = pack_expert_scale_codes(scale)
++            codes, codes_2bit = overlay_byte_codes(
++                tile_codes(packed.codes, self.block_N),
++                tile_byte_codes(packed.codes_2bit, self.block_N),
++                packed.narrow,
++            )
+             prepared.append(
+                 (
+                     *tile_expert_weights(w.view(torch.int8), self.block_N),
+-                    tile_codes(packed.codes, self.block_N),
+-                    tile_byte_codes(packed.codes_2bit, self.block_N),
++                    codes,
++                    codes_2bit,
+                     packed.narrow,
+                     packed.base,
+                 )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+index 93df23589..ece87f56a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+@@ -190,3 +190,33 @@ def tile_byte_codes(codes: torch.Tensor, block_N: int) -> torch.Tensor:
+         .contiguous()
+         .view(torch.uint8)
+     )
++
++
++def overlay_byte_codes(
++    codes: torch.Tensor, byte_codes: torch.Tensor, narrow: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """One buffer for both code widths: ``(codes, bytes)`` over the same storage.
++
++    ``codes`` is ``tile_codes``' uint16 ``[rows, block_N]``, ``byte_codes`` is
++    ``tile_byte_codes``' uint8 ``[rows, block_N]`` and ``narrow`` the per-expert
++    flags; each expert's rows are contiguous in both. A narrow expert's rows of
++    ``codes`` are rewritten in place: its 2-bit bytes in the first ``block_N``
++    bytes of each row, zeros after. ``bytes`` is that storage as uint8
++    ``[rows, 2 * block_N]``, so a narrow row's 2-bit codes are ``bytes[row,
++    :block_N]``, still contiguous. A wide expert's rows keep their 4-bit codes,
++    so no expert holds both forms.
++    """
++    if codes.dtype != torch.uint16 or byte_codes.dtype != torch.uint8:
++        raise TypeError("expected uint16 4-bit codes and uint8 2-bit codes")
++    if codes.shape != byte_codes.shape or not codes.is_contiguous():
++        raise ValueError("the two code layouts must be the same contiguous rows")
++    rows, block_N = codes.shape
++    experts = narrow.numel()
++    if rows % experts:
++        raise ValueError(f"{rows} code rows do not split into {experts} experts")
++    raw = codes.view(torch.uint8).view(experts, rows // experts, 2 * block_N)
++    mask = narrow.bool()
++    if mask.any().item():
++        raw[mask, :, :block_N] = byte_codes.view(experts, -1, block_N)[mask]
++        raw[mask, :, block_N:] = 0
++    return codes, codes.view(torch.uint8)
+-- 
+2.54.0 (Apple Git-157)
+
