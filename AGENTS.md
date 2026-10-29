@@ -46,6 +46,9 @@ Preserve required third-party license notices.
 Create `experiments/YYYY-MM-DD-short-name/` for performance work. Record the base
 commit, one intended variable, exact commands, workload identity, all runs, errors,
 memory observations, and a conclusion. Do not discard an unfavorable run.
+Compare against recorded runs: a released build's numbers never change, so do not
+measure it again (owner, 2026-10-29). Measure the candidate at least twice (a boot and
+a repeat boot), so every comparison keeps a confidence interval.
 
 Change one causal variable at a time unless the experiment explicitly tests an
 interaction. A candidate is promoted only when the owner accepts it and the same

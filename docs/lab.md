@@ -314,6 +314,14 @@ the whole release benchmark (release tests, determinism gate, this comparison) a
   again last to bound the session's drift. Read the verdicts against the previous
   release: `scripts/release_table.py RUN <previous> <candidate> <candidate>-again`
   (the table compares each listed arm with the first listed, in argv order).
+- **Recorded references (owner, 2026-10-29).** A released build's numbers never change, so
+  it is not measured again: compare against its recorded runs (its `benchmark_reference`
+  under `manifests/suites`, with the repeat recorded beside it) and its recorded digests and
+  memory. The same holds for an earlier candidate already measured on the same image. Every
+  arm that is measured runs at least twice, a boot and a repeat boot, so each verdict keeps
+  a confidence interval; a digest is exact and needs one boot. The arms below then drop the
+  previous release; `scripts/servebench_suite_table.py` reads arms from one run's directory,
+  so copy the recorded reference's files into the run under its label before the table step.
 - **The `release` profile (`scripts/lab.py`):**
   - quality;
   - decode on prose and code at 1, 2, 4, 8 and 16 streams, 5-10 samples until each
