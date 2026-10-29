@@ -438,7 +438,7 @@ Two files describe your site and stay out of git:
   `deployment.path` if every node keeps this checkout somewhere other than
   `{home}/projects/spark-ds41f`, `deployment.repository` if you use a fork (the launch checks every node's
   `origin` against it), and the interface names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`,
-  `TP_SOCKET_IFNAME` and `NCCL_IB_HCA`. Keep `distributed.master_port` below
+  `TP_SOCKET_IFNAME` (sparknet renders `NCCL_IB_HCA` from the node map). Keep `distributed.master_port` below
   the head's ephemeral port range (`sysctl net.ipv4.ip_local_port_range`);
   inside it, an outgoing connection can take the port and the head fails to
   start.

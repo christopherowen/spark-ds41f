@@ -39,7 +39,8 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(topology.problems(self.base, self.three), [])
         for node in self.three["nodes"]:
             expected = {k: str(v) for k, v in self.base["environment"].items()}
-            expected.update(VLLM_HOST_IP=node["management_ip"],
+            hcas = sorted({hca for route in node["roce_peer_hcas"].values() for hca in route})
+            expected.update(VLLM_HOST_IP=node["management_ip"], NCCL_IB_HCA="=" + ",".join(hcas),
                             SPARKNET_ROCE_PEER_HCAS=json.dumps(node["roce_peer_hcas"], separators=(",", ":")),
                             SPARKNET_ROCE_TOPOLOGY="direct")
             if "roce_gid_index" in node:
@@ -67,7 +68,8 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(command[command.index("--node-rank") + 1], "3")
         env = spark.expected_environment(self.ring, node)
         # The NCCL ring runs no one-shot collectives.
-        self.assertFalse([key for key in env if key.startswith("SPARKNET_ROCE_")])
+        for key in ("SPARKNET_ROCE_PEER_HCAS", "SPARKNET_ROCE_HCA", "SPARKNET_ROCE_TOPOLOGY"):
+            self.assertNotIn(key, env)
         self.assertTrue(env["NCCL_IB_HCA"].startswith("="))
 
     def test_cli_accepts_a_fourth_node_and_validates_against_selected_map(self):
@@ -87,7 +89,7 @@ class TopologyTest(unittest.TestCase):
 
     def test_four_nodes_cannot_use_direct_peer_transport(self):
         self.ring["fabric"]["transport"] = "oneshot-direct"
-        self.assertTrue(any("requires nccl-ring or oneshot-ring4" in p for p in topology.problems(self.ring, self.four)))
+        self.assertTrue(any("four nodes without a switch use nccl-ring, oneshot-ring4" in p for p in topology.problems(self.ring, self.four)))
 
     def test_retired_and_missing_transports_are_refused(self):
         # RoCEnante's transports are retired; a configuration recorded without a
@@ -102,7 +104,7 @@ class TopologyTest(unittest.TestCase):
         self.assertTrue(any("fabric.transport is required" in p for p in topology.problems(recorded, self.three)))
 
     def test_ring_policy_rejects_each_unsafe_override(self):
-        for key in topology.RING_ENV:
+        for key in {**topology.fabric(self.ring).render.RING_ENV, **topology.VLLM_RING_ENV}:
             with self.subTest(key=key):
                 candidate = copy.deepcopy(self.ring)
                 candidate["environment"][key] = "invalid"
@@ -160,7 +162,7 @@ class TopologyTest(unittest.TestCase):
         self.four["nodes"][3]["rank"] = 2
         self.assertTrue(any("contiguous" in p for p in topology.problems(self.ring, self.four)))
         self.three["nodes"][0]["head"] = False
-        self.assertTrue(any("API head" in p for p in topology.problems(self.base, self.three)))
+        self.assertTrue(any("exactly one head node" in p for p in topology.problems(self.base, self.three)))
 
     def test_live_gid_matches_declared_cable_and_per_node_index(self):
         node = self.four["nodes"][0]
@@ -172,9 +174,9 @@ class TopologyTest(unittest.TestCase):
             address = subnet.replace(".0/24", ".1")
             lines.append(f"{hca} 4 RoCEv2 ::ffff:{address} en0")
         output = "\n".join(lines)
-        self.assertEqual(topology.gid_subnet_problems(node, index, output), [])
-        self.assertTrue(topology.gid_subnet_problems(node, index, output.replace("10.40.0.1", "10.40.2.1")))
-        self.assertTrue(topology.gid_subnet_problems(node, 3, output))
+        self.assertEqual(topology.gid_subnet_problems(self.ring, node, index, output), [])
+        self.assertTrue(topology.gid_subnet_problems(self.ring, node, index, output.replace("10.40.0.1", "10.40.2.1")))
+        self.assertTrue(topology.gid_subnet_problems(self.ring, node, 3, output))
 
     def test_probe_is_bounded_and_does_not_share_serving_ipc(self):
         command = spark.collective_probe_command(self.ring, self.four, self.four["nodes"][3], 29999)
