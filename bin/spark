@@ -601,6 +601,9 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             problems.append(f"{name}: package version is not recorded in the lock")
     # sparknet's transports run only on an image built with sparknet's collectives.
     sparknet_image = SPARKNET_CAPABILITY in source_manifest.get("vllm", {}).get("capabilities", [])
+    if topology.transport(cluster) == 'nccl-switched' and sparknet_image:
+        problems.append('nccl-switched has no runtime support: this image replaces NCCL with '
+                        'sparknet, and a switch-aware NCCL build is separate work')
     if topology.is_sparknet(topology.transport(cluster)):
         if not sparknet_image or "sparknet" not in upstreams["sources"] or "sparknet" not in source_manifest:
             problems.append(f"{topology.transport(cluster)} requires an image with {SPARKNET_CAPABILITY} and the lock's sparknet source")
