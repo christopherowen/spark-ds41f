@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:30:23 +0100
+Subject: [PATCH 549/549] [DS4.1] IKET mode: range ends wait for a deferred
+ barrier (a shared load before the timer read)
+
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 11 +++++++++
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 23 ++++++++++++++++---
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index b17d47962..f2251ac46 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -101,6 +101,17 @@ def test_ranges_close_on_every_path():
+     )
+ 
+ 
++def test_range_ends_wait_for_barriers():
++    # A deferred-blocking barrier holds a warp only at its next memory access: each
++    # range end loads shared memory before it reads the timer.
++    out, sites = _ranges(KERNEL)
++    lines = [line.strip() for line in out.splitlines()]
++    ends = [i for i, line in enumerate(lines) if line == "TL_IKET_EVENT(31);"]
++    assert len(ends) == len(sites)
++    assert all(lines[i - 1] == "TL_IKET_SETTLE();" for i in ends)
++    assert out.startswith("#define TL_IKET_SETTLE() asm volatile(")
++
++
+ def test_pragma_stays_with_its_loop():
+     out, _ = _ranges(KERNEL)
+     lines = out.splitlines()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 7dea718ef..eafaeeb28 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -60,6 +60,16 @@ MAX_EVENTS = 30
+ MAX_NAME_BYTES = 32
+ RANGE_END = 31
+ _CUDA_POSTPROC = "tilelang_callback_cuda_postproc"
++# ptxas emits a block barrier as BAR.SYNC.DEFER_BLOCKING: the warp goes on issuing
++# until an instruction touches memory, so a range end's %globaltimer read would run
++# before the barrier releases the warp, and the wait would land after the range
++# (sparknet's flag wait, peers 20 us late: warps closed the barrier's range at 1 us
++# and stalled in the next event's store to 24 us). A volatile shared load (IKET's
++# own slot) first holds the timer read until the barrier is through.
++_SETTLE = (
++    '#define TL_IKET_SETTLE() asm volatile("{\\n\\t.reg .b32 s;\\n\\t'
++    'ld.volatile.shared.u32 s, [0x20];\\n\\t}" ::: "memory")\n'
++)
+ 
+ # (phase, kind, patterns): the first kind a statement matches names its phase.
+ _PATTERNS = [
+@@ -427,15 +437,22 @@ def annotate(
+                 f'{indent}{guard}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+             )
+         )
+-        inserts.append(
+-            (item.last.end, 0, f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n")
++        # Settled: a barrier inside the range (a block sync, TileLang's AllReduce)
++        # holds the range's end, not the next statement's.
++        end = (
++            f"{indent}{guard}TL_IKET_SETTLE();\n"
++            f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n"
+         )
++        inserts.append((item.last.end, 0, end))
+     out, last = [], 0
+     # At one offset a range's end goes before the next range's start.
+     for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
+         out += [code[last:offset], text]
+         last = offset
+-    return "".join(out) + code[last:], sites
++    annotated = "".join(out) + code[last:]
++    if "TL_IKET_SETTLE();" in annotated:
++        annotated = _SETTLE + annotated
++    return annotated, sites
+ 
+ 
+ _lock = threading.Lock()

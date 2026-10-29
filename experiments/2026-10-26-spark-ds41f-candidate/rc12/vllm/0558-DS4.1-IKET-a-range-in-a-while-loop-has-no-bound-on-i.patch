@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 05:06:50 +0100
+Subject: [PATCH 558/558] DS4.1 IKET: a range in a while loop has no bound on
+ its records
+
+---
+ .../kernels/test_deepseek_v41_tilelang_iket.py | 18 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/iket.py     |  8 +++++---
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index f980646e1..266686865 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -159,6 +159,24 @@ def test_sampled_iterations_guard_loop_ranges():
+     assert f"if (__tl_iket_cta && __tl_iket_lane0 && {stride}) TL_IKET_EVENT(1," in both
+ 
+ 
++def test_while_loop_ranges_have_no_bound():
++    # TVM's while loop has no variable to sample: a range in it records in every
++    # iteration, so the kernel's bound on a warp's events is None.
++    code = KERNEL.replace(
++        "  C[threadIdx.x] = acc[0];\n",
++        "  int t = 0;\n  while (1) {\n    if (!((t < e))) { break; }\n"
++        "    C[t] = acc[0];\n    t = (t + 1);\n  }\n  C[threadIdx.x] = acc[0];\n",
++    )
++    _, sites = iket.annotate(code, _token, iters=1)
++    assert [s["unsampled_loops"] for s in sites if "unsampled_loops" in s] == [
++        ["while (1)"]
++    ]
++    assert {s["events_per_warp_bound"] for s in sites} == {None}
++    # Without it, each range opens and closes once in the sampled iteration.
++    sites = iket.annotate(KERNEL, _token, iters=1)[1]
++    assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}
++
++
+ def test_module_without_kernels_is_unchanged():
+     code = (
+         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index ede4c910b..7b423385b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -302,7 +302,7 @@ class _Range:
+     kinds: set[str]
+     first: _Node
+     last: _Node
+-    loops: tuple[str, ...] = ()  # the headers of the for loops around the range
++    loops: tuple[str, ...] = ()  # the headers of the loops around the range
+     kernel: str = ""
+     base: str = ""
+     name: str = ""
+@@ -323,7 +323,8 @@ def _ranges(nodes: list[_Node], loops: tuple[str, ...] = ()) -> list[_Range]:
+         )
+         if node.jumps or node.phase == "mixed" or not node.alone or waits:
+             run = None
+-            inner = (*loops, node.text) if node.text.startswith("for") else loops
++            looped = node.text.startswith(("for", "while", "do"))
++            inner = (*loops, node.text) if looped else loops
+             for children in (node.body, node.orelse):
+                 if children and node.phase is not None:
+                     found.extend(_ranges(children, inner))
+@@ -393,7 +394,8 @@ def annotate(
+     spread, record their ranges (run-iket still records every warp's lifetime):
+     a kernel with many CTAs and loop-carried ranges otherwise writes millions of
+     records a launch. With ``iters`` > 0 a range inside a ``for`` loop records in
+-    at most that many of its iterations, evenly spread, and only lane 0 of a warp
++    at most that many of its iterations, evenly spread (a ``while`` loop has no
++    variable to sample: its site lists it, unsampled), and only lane 0 of a warp
+     records (where lanes diverge each group of them would record): run-iket
+     reserves the run's largest warp record for every warp of every instrumented
+     launch, so one long or divergent kernel sizes the whole run's buffer. A module with

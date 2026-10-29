@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:22:47 +0100
+Subject: [PATCH 548/548] [DS4.1] IKET mode: optional CTA sampling
+ (VLLM_DS41_IKET_CTAS); a source file per specialization
+
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 20 ++++++-
+ vllm/envs.py                                  |  4 ++
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 57 +++++++++++++------
+ vllm/v1/worker/gpu_worker.py                  |  2 +-
+ 4 files changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 2914ba847..b17d47962 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -111,6 +111,21 @@ def test_pragma_stays_with_its_loop():
+     assert lines[pragma + 1].startswith("  for (int s = 0;")
+ 
+ 
++def test_sampled_ctas_guard_every_event():
++    out, sites = iket.annotate(KERNEL, _token, ctas=8)
++    lines = out.splitlines()
++    body = next(
++        i for i, line in enumerate(lines) if line.endswith("{") and "k_kernel" in line
++    )
++    assert lines[body + 1].startswith("  const bool __tl_iket_cta = ")
++    assert "gridDim.x * gridDim.y * gridDim.z / 8u" in lines[body + 1]
++    events = [line.strip() for line in lines if "TL_IKET_EVENT(" in line]
++    assert len(events) == 2 * len(sites)
++    assert all(e.startswith("if (__tl_iket_cta) TL_IKET_EVENT(") for e in events)
++    # Unsampled, the kernel declares nothing.
++    assert "__tl_iket_cta" not in iket.annotate(KERNEL, _token)[0]
++
++
+ def test_module_without_kernels_is_unchanged():
+     code = (
+         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
+@@ -193,7 +208,8 @@ b = torch.ones(1024, device="cuda")
+ c = torch.empty_like(a)
+ kernel(a, b, c)
+ torch.cuda.synchronize()
+-import hashlib, tilelang.env, tvm_ffi
++import hashlib, tvm_ffi
++from tilelang.env import env as tilelang_env
+ callback = "tilelang_callback_cuda_postproc"
+ print(json.dumps({
+     "sum": c.double().sum().item(),
+@@ -201,7 +217,7 @@ print(json.dumps({
+     "source_instrumented": "__iket_meta_info" in kernel.get_kernel_source(),
+     "modules": sorted(m for m in sys.modules if m.endswith(".iket") or ".iket." in m),
+     "callback": tvm_ffi.get_global_func(callback, allow_missing=True) is not None,
+-    "cache_enabled": tilelang.env.env.is_cache_enabled(),
++    "cache_enabled": tilelang_env.is_cache_enabled(),
+     "cache_dir": os.environ.get("TILELANG_CACHE_DIR"),
+ }))
+ """
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d47ad8d34..4d3843626 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -226,6 +226,7 @@ if TYPE_CHECKING:
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     VLLM_DS41_IKET: str | None = None
++    VLLM_DS41_IKET_CTAS: int = 0
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+@@ -1922,6 +1923,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # TileLang's caches under this directory (models/deepseek_v4_1/tilelang/iket.py).
+     # Traces need the process to run under NVIDIA's run-iket profiler.
+     "VLLM_DS41_IKET": lambda: os.getenv("VLLM_DS41_IKET") or None,
++    # With VLLM_DS41_IKET: record ranges in about this many CTAs of each launch, evenly
++    # spread (0: all); run-iket still records every warp's lifetime.
++    "VLLM_DS41_IKET_CTAS": lambda: int(os.getenv("VLLM_DS41_IKET_CTAS", "0")),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+     # the served model name whose requests alone it steers (vllm/weightless.py),
+     # set together or not at all. Part of the compile key, as every variable here
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index da021e803..7dea718ef 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -349,20 +349,28 @@ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
+         yield name.group(0), pointers, j, parser.scan(j, None)
+ 
+ 
+-def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dict]]:
++def annotate(
++    code: str, token: Callable[[str, int], str], ctas: int = 0
++) -> tuple[str, list[dict]]:
+     """``code`` with each phase of each kernel in an IKET range, and its sites.
+ 
+     ``token(name, range_id)`` returns the IKET metadata token of a range named
+-    ``name``. A module with no ``__global__`` definition comes back unchanged; a
+-    kernel with a preprocessor conditional in its body is left as it is."""
++    ``name``. With ``ctas`` > 0 only about that many CTAs of a launch, evenly
++    spread, record their ranges (run-iket still records every warp's lifetime):
++    a kernel with many CTAs and loop-carried ranges otherwise writes millions of
++    records a launch. A module with no ``__global__`` definition comes back
++    unchanged; a kernel with a preprocessor conditional in its body is left as
++    it is."""
+     found: list[_Range] = []
+     sites: list[dict] = []
++    bodies: dict[str, int] = {}
+     for kernel, params, start, end in _kernels(code):
+         if _CONDITIONAL.search(code, start, end):
+             sites.append(
+                 {"kernel": kernel, "skipped": "a preprocessor conditional in its body"}
+             )
+             continue
++        bodies[kernel] = start
+         nodes, _ = _Parser(code).block(start)
+         for node in nodes:
+             _classify(node, params)
+@@ -384,6 +392,17 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
+             item.name = item.base
+     traced = list(dict.fromkeys(item.name for item in found))[:MAX_EVENTS]
+     inserts: list[tuple[int, int, str]] = []
++    guard = "if (__tl_iket_cta) " if ctas else ""
++    for kernel in dict.fromkeys(item.kernel for item in found if item.name in traced):
++        if not ctas:
++            break
++        # Uniform in a CTA, so a range opens and closes in every warp or in none.
++        sample = (
++            f"  const bool __tl_iket_cta = (((blockIdx.z * gridDim.y + blockIdx.y) * "
++            "gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z / "
++            f"{ctas}u)) == 0u;\n"
++        )
++        inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
+     for item in found:
+         sites.append(
+             {
+@@ -405,10 +424,12 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
+             (
+                 item.first.start,
+                 1,
+-                f'{indent}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
++                f'{indent}{guard}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+             )
+         )
+-        inserts.append((item.last.end, 0, f"{indent}TL_IKET_EVENT({RANGE_END});\n"))
++        inserts.append(
++            (item.last.end, 0, f"{indent}{guard}TL_IKET_EVENT({RANGE_END});\n")
++        )
+     out, last = [], 0
+     # At one offset a range's end goes before the next range's start.
+     for offset, _, text in sorted(inserts, key=lambda insert: insert[:2]):
+@@ -419,6 +440,7 @@ def annotate(code: str, token: Callable[[str, int], str]) -> tuple[str, list[dic
+ 
+ _lock = threading.Lock()
+ _directory: Path | None = None
++_ctas = 0
+ 
+ 
+ def directory() -> Path | None:
+@@ -426,16 +448,18 @@ def directory() -> Path | None:
+     return _directory
+ 
+ 
+-def enable(output: str | os.PathLike[str]) -> Path:
++def enable(output: str | os.PathLike[str], ctas: int = 0) -> Path:
+     """Turn the IKET mode on for this process, before it compiles any TileLang
+-    kernel. Idempotent for the same directory."""
+-    global _directory
++    kernel; ``ctas`` > 0 samples about that many CTAs a launch (``annotate``).
++    Idempotent for the same directory and sampling."""
++    global _directory, _ctas
+     root = Path(output).expanduser().resolve()
+     with _lock:
+         if _directory is not None:
+-            if root != _directory:
++            if (root, ctas) != (_directory, _ctas):
+                 raise RuntimeError(
+-                    f"IKET mode is already on with {_directory}, not {root}"
++                    f"IKET mode is already on with {_directory} and {_ctas} CTAs, "
++                    f"not {root} and {ctas}"
+                 )
+             return _directory
+         import tilelang.cache
+@@ -459,7 +483,7 @@ def enable(output: str | os.PathLike[str]) -> Path:
+         os.environ["TILELANG_CACHE_DIR"] = str(root / "tilelang-cache")
+         disable_cache()
+         tvm_ffi.register_global_func(_CUDA_POSTPROC, f=_postproc)
+-        _directory = root
++        _directory, _ctas = root, int(ctas)
+     return root
+ 
+ 
+@@ -475,12 +499,13 @@ def _postproc(code: str, target) -> str:
+     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
+ 
+     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
+-    annotated, sites = annotate(code, _token)
++    annotated, sites = annotate(code, _token, _ctas)
+     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
+     kernel = next((name for name, *_ in _kernels(code)), "module")
+-    stem = _directory / "sources" / f"{kernel}.{digest}"
+-    stem.with_suffix(".cu").write_text(instrumented)
+-    stem.with_suffix(".json").write_text(
+-        json.dumps({"kernel": kernel, "sites": sites}, indent=1) + "\n"
++    stem = f"{kernel}.{digest}"
++    (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
++    manifest = {"kernel": kernel, "ctas": _ctas, "sites": sites}
++    (_directory / "sources" / f"{stem}.json").write_text(
++        json.dumps(manifest, indent=1) + "\n"
+     )
+     return instrumented
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 43d9c7aeb..09f0f3ea1 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -431,7 +431,7 @@ class Worker(WorkerBase):
+             # compiles, so it must be on before the first one.
+             from vllm.models.deepseek_v4_1.tilelang import iket
+ 
+-            iket.enable(envs.VLLM_DS41_IKET)
++            iket.enable(envs.VLLM_DS41_IKET, envs.VLLM_DS41_IKET_CTAS)
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
+             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

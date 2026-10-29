@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:09:04 +0100
+Subject: [PATCH 547/547] [DS4.1] IKET mode: sparknet's release stores signal;
+ tests run their kernels from files
+
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 17 ++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 23 ++++++++++---------
+ 2 files changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 282b0eae9..2914ba847 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -207,10 +207,17 @@ print(json.dumps({
+ """
+ 
+ 
++def _script(tmp_path, source):
++    """A script file: TileLang reads a kernel's Python source, which ``-c`` lacks."""
++    path = tmp_path / f"script_{len(list(tmp_path.glob('script_*.py')))}.py"
++    path.write_text(source)
++    return str(path)
++
++
+ def _run(tmp_path, *args):
+     env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "deployment-cache"))
+     process = subprocess.run(
+-        [sys.executable, "-c", KERNEL_SCRIPT, *args],
++        [sys.executable, _script(tmp_path, KERNEL_SCRIPT), *args],
+         env=env,
+         capture_output=True,
+         text=True,
+@@ -223,7 +230,13 @@ def _run(tmp_path, *args):
+ @GPU
+ def test_on_matches_off_and_keeps_its_own_cache(tmp_path):
+     off = _run(tmp_path, "off")
++    cache = tmp_path / "deployment-cache"
++    before = sorted(str(p.relative_to(cache)) for p in cache.rglob("*"))
+     on = _run(tmp_path, "on", str(tmp_path / "iket"))
++    # The on run neither read nor wrote the deployment's cache.
++    assert (
++        before and sorted(str(p.relative_to(cache)) for p in cache.rglob("*")) == before
++    )
+     assert off["bits"] == on["bits"] and off["sum"] == on["sum"]
+     assert not off["source_instrumented"] and on["source_instrumented"]
+     # Off imports nothing of IKET and registers no callback.
+@@ -261,7 +274,7 @@ def test_enable_refuses_after_a_compile(tmp_path):
+     """)
+     env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "cache"))
+     process = subprocess.run(
+-        [sys.executable, "-c", script, str(tmp_path / "iket")],
++        [sys.executable, _script(tmp_path, script), str(tmp_path / "iket")],
+         env=env,
+         capture_output=True,
+         text=True,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 0e9b6a8c3..da021e803 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -32,16 +32,16 @@ or from the global buffers it reads or writes: ``load`` (TMA, cp.async, a global
+ read), ``wait`` (cp.async wait, mbarrier wait, block sync, PDL grid dependency,
+ sparknet's flag wait, fences, a spin on a global flag), ``compute`` (MMA and
+ ldmatrix, warp reductions), ``store`` (a global write, TMA store, atomics,
+-sparknet's staging) and ``signal`` (sparknet's doorbell and tail). A block's phase
+-is its statements' phase when they share one. Consecutive siblings of one phase
+-become one range, the phaseless statements between them included; a block whose
+-statements mix phases is entered instead. Every wait statement is a range of its
+-own. A range never contains ``return``, ``break``, ``continue`` or ``goto``, so it
+-closes on every warp path. Names are ``<phase>.<kind>`` (just ``<phase>`` over
+-several kinds), with ``#<n>`` for later sites of a name; at most 30 names a module,
+-as IKET keeps the event id in the five low bits of a 32 ns timestamp and id 31 ends
+-a range. A module with more names folds the ``#<n>`` sites into their first name,
+-and traces only its first 30.
++sparknet's staging) and ``signal`` (sparknet's doorbell, release stores and tail).
++A block's phase is its statements' phase when they share one. Consecutive siblings
++of one phase become one range, the phaseless statements between them included; a
++block whose statements mix phases is entered instead. Every wait statement is a
++range of its own. A range never contains ``return``, ``break``, ``continue`` or
++``goto``, so it closes on every warp path. Names are ``<phase>.<kind>`` (just
++``<phase>`` over several kinds), with ``#<n>`` for later sites of a name; at most 30
++names a module, as IKET keeps the event id in the five low bits of a 32 ns
++timestamp and id 31 ends a range. A module with more names folds the ``#<n>``
++sites into their first name, and traces only its first 30.
+ """
+ 
+ from __future__ import annotations
+@@ -82,7 +82,8 @@ _PATTERNS = [
+                            r"\b__shfl_\w+", r"\broce_reduce_\w+"]),
+     ("store", "tma", [r"\btl::tma_store\w*"]),
+     ("store", "stage", [r"\broce_copy_\w+\s*\("]),
+-    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\("]),
++    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\(",
++                         r"\broce_st_\w+\s*\("]),
+     ("store", "atomic", [r"\batomic\w+\s*\(", r"\btl::Atomic\w+\s*\("]),
+ ]  # fmt: skip
+ _COMPILED = [

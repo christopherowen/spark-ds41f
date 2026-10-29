@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:11:26 +0100
+Subject: [PATCH 540/540] DeepSeek V4.1 API prompt semantics: response_format,
+ tool_choice none and the assistant prefix
+
+---
+ tests/tokenizers_/test_deepseek_v41.py   | 282 +++++++++++++++++++++++
+ vllm/renderers/deepseek_v41.py           |  44 +++-
+ vllm/tokenizers/deepseek_v41.py          |  51 +++-
+ vllm/tokenizers/deepseek_v41_encoding.py | 157 ++++++++++++-
+ 4 files changed, 519 insertions(+), 15 deletions(-)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 5e463ee75..94edf6fbd 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -763,3 +763,285 @@ def test_deepseek_api_thinking_disabled_renders_chat_mode():
+     assert rendered(thinking={"type": "disabled"}, reasoning_effort="high") == chat
+     assert rendered(thinking={"type": "enabled"}) == rendered()
+     assert rendered() != chat
++
++
++def _rendered_request(request):
++    from vllm.renderers.deepseek_v41 import _with_api_semantics
++
++    original = request.build_chat_params(None, "auto")
++    before = copy.deepcopy(original.chat_template_kwargs)
++    params = _with_api_semantics(original)
++    return (
++        render(request.messages, **params.get_apply_chat_template_kwargs()),
++        params,
++        original,
++        before,
++    )
++
++
++def test_conversations_without_response_format_stay_identical():
++    """A request that does not use response_format is the prompt the encoder
++    already produced, and a shared kwargs dict is not rewritten."""
++    from types import SimpleNamespace
++
++    from vllm.renderers.deepseek_v41 import _with_api_semantics
++    from vllm.renderers.params import ChatParams
++
++    messages = [{"role": "user", "content": "What is 2+2?"}]
++    assert render(messages) == render(messages, response_format=None)
++    assert "## Response Format:" not in render(messages)
++
++    shared = {"reasoning_effort": "high"}
++    params = ChatParams(chat_template_kwargs=shared)
++    assert _with_api_semantics(params) is params
++    assert shared == {"reasoning_effort": "high"}
++
++    text = ChatCompletionRequest(
++        model="m",
++        messages=messages,
++        response_format={"type": "text"},
++    )
++    prompt, params, original, before = _rendered_request(text)
++    assert params is original
++    assert original.chat_template_kwargs == before
++    assert "## Response Format:" not in prompt
++    assert prompt == render(
++        messages, add_generation_prompt=True, continue_final_message=False
++    )
++
++    structural = ChatParams(
++        response_format=SimpleNamespace(type="structural_tag", format={})
++    )
++    assert _with_api_semantics(structural) is structural
++
++
++def test_response_format_schema_is_in_the_prompt_and_keeps_key_order():
++    schema = {
++        "additionalProperties": False,
++        "required": ["answer"],
++        "type": "object",
++        "properties": {
++            "answer": {
++                "type": "string",
++                "description": "答案，用中文",
++                "minimum": 0.00001,
++            }
++        },
++    }
++    request = ChatCompletionRequest(
++        model="m",
++        messages=[{"role": "user", "content": "Answer in JSON."}],
++        response_format={
++            "type": "json_schema",
++            "json_schema": {"name": "reply", "schema": schema},
++        },
++    )
++    prompt, params, original, before = _rendered_request(request)
++    assert original.chat_template_kwargs == before
++    assert "response_format" not in original.chat_template_kwargs
++    rendered_schema = params.chat_template_kwargs["response_format"]
++    assert list(rendered_schema) == [
++        "additionalProperties",
++        "required",
++        "type",
++        "properties",
++    ]
++    assert rendered_schema is not request.response_format.json_schema.json_schema
++    expected = json.dumps(rendered_schema, ensure_ascii=False)
++    assert '"minimum": 1e-05' in expected
++    assert '"additionalProperties": false' in expected
++    assert expected in prompt
++    assert "## Response Format:" in prompt
++    assert "答案，用中文" in prompt
++    bare, _, _, _ = _rendered_request(
++        ChatCompletionRequest(model="m", messages=request.messages)
++    )
++    assert "## Response Format:" not in bare
++    assert bare != prompt
++
++
++def test_json_object_response_format_renders_its_schema_object():
++    request = ChatCompletionRequest(
++        model="m",
++        messages=[{"role": "user", "content": "Reply with a json object."}],
++        response_format={"type": "json_object"},
++    )
++    prompt, params, _, _ = _rendered_request(request)
++    assert params.chat_template_kwargs["response_format"] == {"type": "json_object"}
++    assert '{"type": "json_object"}' in prompt
++
++
++def test_strict_schema_rejects_a_partial_required_list_and_keeps_a_valid_one():
++    partial = {
++        "type": "object",
++        "properties": {
++            "answer": {"type": "string"},
++            "tags": {"type": "array", "items": {"type": "string"}},
++        },
++        "required": ["answer"],
++        "additionalProperties": False,
++    }
++    rejected = ChatCompletionRequest(
++        model="m",
++        messages=[{"role": "user", "content": "Answer."}],
++        response_format={
++            "type": "json_schema",
++            "json_schema": {"name": "reply", "strict": True, "schema": partial},
++        },
++    )
++    with pytest.raises(
++        ValueError, match="Required properties must match all properties"
++    ):
++        _rendered_request(rejected)
++
++    valid = {
++        "type": "object",
++        "properties": {
++            "answer": {"type": "string"},
++            "confidence": {"type": "number"},
++        },
++        "required": ["answer", "confidence"],
++    }
++    request = ChatCompletionRequest(
++        model="m",
++        messages=[{"role": "user", "content": "Answer."}],
++        response_format={
++            "type": "json_schema",
++            "json_schema": {"name": "reply", "strict": True, "schema": valid},
++        },
++    )
++    prompt, params, _, _ = _rendered_request(request)
++    assert "additionalProperties" not in params.chat_template_kwargs["response_format"]
++    assert json.dumps(valid, ensure_ascii=False) in prompt
++
++
++def test_schema_and_tools_keep_control_spellings_and_do_not_mutate_inputs():
++    messages = [{"role": "user", "content": "Answer."}]
++    schema = {
++        "type": "object",
++        "properties": {"x": {"description": "not </think> or <｜User｜>"}},
++    }
++    tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "get_weather",
++                "description": "see </think>",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++    ]
++    before_messages = copy.deepcopy(messages)
++    before_schema = copy.deepcopy(schema)
++    before_tools = copy.deepcopy(tools)
++    prompt = render(messages, tools=tools, response_format=schema)
++    assert messages == before_messages
++    assert schema == before_schema
++    assert tools == before_tools
++    assert "not </think> or <｜User｜>" in prompt
++    assert "see </think>" in prompt
++    assert prompt.index("## Tools") < prompt.index("## Response Format:")
++
++
++def test_tool_choice_none_drops_the_tool_catalog_without_mutating_it():
++    from vllm.renderers.deepseek_v41 import _with_api_semantics
++    from vllm.renderers.params import ChatParams
++
++    tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "get_weather",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++    ]
++    shared = {
++        "tools": tools,
++        "add_generation_prompt": True,
++        "continue_final_message": False,
++    }
++    params = ChatParams(chat_template_kwargs=shared, tool_choice="none")
++    updated = _with_api_semantics(params)
++    assert shared["tools"] is tools
++    assert "tools" not in updated.chat_template_kwargs
++    messages = [{"role": "user", "content": "Weather in Paris?"}]
++    prompt = render(messages, **updated.get_apply_chat_template_kwargs())
++    assert "## Tools" not in prompt
++    assert "## Tools" in render(
++        messages,
++        tools=tools,
++        add_generation_prompt=True,
++        continue_final_message=False,
++    )
++    kept = ChatParams(chat_template_kwargs=shared, tool_choice="auto")
++    assert _with_api_semantics(kept) is kept
++
++
++def test_final_assistant_prefix_continues_that_message():
++    content = [
++        {"role": "user", "content": "Write a haiku."},
++        {"role": "assistant", "content": "Autumn", "prefix": True},
++    ]
++    prompt = render(content, add_generation_prompt=True)
++    assert prompt.endswith("<｜Assistant｜><think></think>Autumn")
++    assert not prompt.endswith("<｜end▁of▁sentence｜>")
++
++    chat = render(content, thinking=False, add_generation_prompt=True)
++    assert chat.endswith("<｜Assistant｜></think>Autumn")
++
++    reasoning = [
++        {"role": "user", "content": "What is 2+2?"},
++        {
++            "role": "assistant",
++            "content": "",
++            "reasoning_content": "Adding two and two",
++            "prefix": True,
++        },
++    ]
++    assert render(reasoning, add_generation_prompt=True).endswith(
++        "<｜Assistant｜><think>Adding two and two"
++    )
++
++    both = [
++        {"role": "user", "content": "What is 2+2?"},
++        {
++            "role": "assistant",
++            "content": "The answer",
++            "reasoning_content": "Easy.",
++            "prefix": True,
++        },
++    ]
++    assert render(both, add_generation_prompt=True).endswith(
++        "<｜Assistant｜><think>Easy.</think>The answer"
++    )
++
++    empty = [
++        {"role": "user", "content": "Hi"},
++        {"role": "assistant", "content": "", "prefix": True},
++    ]
++    assert render(empty, add_generation_prompt=True) == render(
++        [{"role": "user", "content": "Hi"}], add_generation_prompt=True
++    )
++
++    ordinary = [
++        {"role": "user", "content": "Write a haiku."},
++        {"role": "assistant", "content": "Autumn", "prefix": False},
++    ]
++    assert render(ordinary, thinking=False, add_generation_prompt=True) == render(
++        [
++            {"role": "user", "content": "Write a haiku."},
++            {"role": "assistant", "content": "Autumn"},
++        ],
++        thinking=False,
++        add_generation_prompt=True,
++    )
++
++    with pytest.raises(ValueError, match="prefix set true"):
++        render(
++            [
++                {"role": "user", "content": "q1"},
++                {"role": "assistant", "content": "a1", "prefix": True},
++                {"role": "user", "content": "q2"},
++            ]
++        )
+diff --git a/vllm/renderers/deepseek_v41.py b/vllm/renderers/deepseek_v41.py
+index a51adec6a..9ff00e717 100644
+--- a/vllm/renderers/deepseek_v41.py
++++ b/vllm/renderers/deepseek_v41.py
+@@ -1,17 +1,46 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from dataclasses import replace
++from typing import Any
++
+ from vllm.entrypoints.chat_utils import (
+     ChatCompletionMessageParam,
+     ConversationMessage,
+ )
+-from vllm.tokenizers.deepseek_v41_encoding import order_tool_results
++from vllm.tokenizers.deepseek_v41_encoding import (
++    chat_template_kwargs_for_api,
++    order_tool_results,
++    response_schema_for_prompt,
++)
+ 
+ from .deepseek_v4 import DeepseekV4Renderer
+ from .inputs import DictPrompt
+ from .params import ChatParams
+ 
+ 
++def _response_format_schema(response_format: Any) -> dict[str, Any] | None:
++    """The schema DeepSeek's API writes into the prompt for a response format."""
++    return response_schema_for_prompt(response_format)
++
++
++def _with_api_semantics(params: ChatParams) -> ChatParams:
++    """The request's API metadata the V4.1 prompt renders, as template kwargs.
++
++    The returned params share ``chat_template_kwargs`` with the input when the
++    request does not render a schema and does not drop tools. Otherwise the
++    kwargs dict is a copy, so a mapping reused across requests is not mutated.
++    """
++    kwargs = chat_template_kwargs_for_api(
++        params.chat_template_kwargs,
++        response_format=params.response_format,
++        tool_choice=params.tool_choice,
++    )
++    if kwargs is params.chat_template_kwargs:
++        return params
++    return replace(params, chat_template_kwargs=kwargs)
++
++
+ class DeepseekV41Renderer(DeepseekV4Renderer):
+     """The V4 renderer with tool messages in V4.1's prompt order first.
+ 
+@@ -23,6 +52,9 @@ class DeepseekV41Renderer(DeepseekV4Renderer):
+     downstream: the tokenizer encodes the template's control tokens as such and
+     control-token spellings in request text as plain text, which the string
+     form cannot carry (the online chat path asks for ``tokenize=False``).
++
++    A request's response format is rendered into the system prompt, as
++    DeepSeek's API does, so the model sees the schema it is constrained to.
+     """
+ 
+     def _apply_chat_template(self, *args, **kwargs):
+@@ -34,11 +66,17 @@ class DeepseekV41Renderer(DeepseekV4Renderer):
+         messages: list[ChatCompletionMessageParam],
+         params: ChatParams,
+     ) -> tuple[list[ConversationMessage], DictPrompt]:
+-        return super().render_messages(order_tool_results(messages), params)
++        return super().render_messages(
++            order_tool_results(messages),
++            params if params is None else _with_api_semantics(params),
++        )
+ 
+     async def render_messages_async(
+         self,
+         messages: list[ChatCompletionMessageParam],
+         params: ChatParams,
+     ) -> tuple[list[ConversationMessage], DictPrompt]:
+-        return await super().render_messages_async(order_tool_results(messages), params)
++        return await super().render_messages_async(
++            order_tool_results(messages),
++            params if params is None else _with_api_semantics(params),
++        )
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index c053de822..707513487 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -17,6 +17,7 @@ from .deepseek_v41_encoding import (
+     REASONING_EFFORT_MAPPINGS,
+     encode_messages,
+     eos_token,
++    insert_system_prompt_fields,
+     thinking_end_token,
+     thinking_start_token,
+ )
+@@ -210,6 +211,28 @@ def _normalize_messages(
+     return result
+ 
+ 
++_PREFIX_ERROR = (
++    "Invalid completion message: prefix set true with message which is not "
++    "final message or message role is not assistant"
++)
++
++
++def _prefix_continuation(conversation: list[dict[str, Any]]) -> bool:
++    """Whether the final assistant message is a prefix continuation.
++
++    DeepSeek's API rejects ``prefix: true`` on any other message. ``prefix:
++    false`` is an ordinary message.
++    """
++    last = len(conversation) - 1
++    for index, message in enumerate(conversation):
++        if not message.get("prefix"):
++            continue
++        if index != last or message.get("role") != "assistant":
++            raise ValueError(_PREFIX_ERROR)
++        return True
++    return False
++
++
+ def _apply_generation_controls(
+     prompt: str,
+     final: dict[str, Any] | None,
+@@ -306,23 +329,22 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             tools: list[dict[str, Any]] | None = None,
+             **kwargs,
+         ) -> str | list[int]:
++            # The schema of a response format, which the encoder writes after
++            # the tools in the first system message (the V4.1 renderer sets it
++            # from the request's response_format, as DeepSeek's API does).
++            response_format = kwargs.get("response_format")
+             # Control-token spellings in request text must not become control
+             # tokens (see _ControlSpellings); requests without any are unchanged.
+             controls = _ControlSpellings(text_spellings)
+-            messages, tools = controls.protect(messages, tools)
++            protected = controls.protect(messages, tools, response_format)
++            messages, tools, response_format = protected
+             # The generic renderer's conversation has already flattened text
+             # parts with '\n'. V4.1 encodes the original messages with '\n\n'.
+             conversation = _normalize_messages(messages)
+-            if tools:
+-                system = (
+-                    conversation[0]
+-                    if conversation and conversation[0]["role"] == "system"
+-                    else None
+-                )
+-                if system is None:
+-                    system = {"role": "system", "content": ""}
+-                    conversation.insert(0, system)
+-                system["tools"] = tools
++            # response_format is the schema dict, or None. An empty schema is
++            # still written; only None is left out. protect() returns one value
++            # per argument, so a schema that is itself a list is not unpacked.
++            insert_system_prompt_fields(conversation, tools, response_format)
+ 
+             thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
+             if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+@@ -345,6 +367,13 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+ 
+             add_generation_prompt = kwargs.get("add_generation_prompt")
+             continue_final_message = bool(kwargs.get("continue_final_message"))
++            # A final assistant message with prefix=true is that message
++            # continued, which is the encoder's continue_final_message. The
++            # chat API defaults add_generation_prompt to true; the prefix
++            # replaces that open turn instead of raising the both-controls error.
++            if _prefix_continuation(conversation):
++                add_generation_prompt = False
++                continue_final_message = True
+             if continue_final_message and add_generation_prompt:
+                 raise ValueError(
+                     "Cannot set both `add_generation_prompt` and "
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 182e1b241..b5ce25826 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -49,13 +49,168 @@ tool_output_template: str = "<tool_result>{content}</tool_result>"
+ 
+ 
+ def to_json(value: Any) -> str:
+-    """Serialize a value to JSON string."""
++    """Serialize a value to JSON string.
++
++    Key order is the value's own order. DeepSeek's encoder writes the schema
++    it was given, and ``json.dumps`` matches that spelling (spaces, ``false``,
++    and short floats such as ``1e-05``).
++    """
+     try:
+         return json.dumps(value, ensure_ascii=False)
+     except:
+         return json.dumps(value, ensure_ascii=True)
+ 
+ 
++def response_schema_for_prompt(response_format: Any) -> Optional[Dict[str, Any]]:
++    """The schema DeepSeek's API writes into the prompt for a response format.
++
++    A JSON schema renders its schema and JSON mode renders
++    ``{"type": "json_object"}``. Text and structural tags render nothing.
++    ``strict: true`` is checked the way the API checks it, and rejected
++    requests are not rendered. The returned schema is a copy: callers can put
++    it on a template-kwargs dict without aliasing the request body.
++    """
++    if response_format is None:
++        return None
++    if isinstance(response_format, dict):
++        kind = response_format.get("type")
++        wrapper = response_format.get("json_schema")
++    else:
++        kind = getattr(response_format, "type", None)
++        wrapper = getattr(response_format, "json_schema", None)
++    if kind == "json_object":
++        return {"type": "json_object"}
++    if kind != "json_schema" or wrapper is None:
++        return None
++    if isinstance(wrapper, dict):
++        schema = wrapper["schema"] if "schema" in wrapper else wrapper.get("json_schema")
++        strict = wrapper.get("strict")
++    else:
++        # ``schema`` is a BaseModel method; the field's attribute is json_schema.
++        schema = getattr(wrapper, "json_schema", None)
++        strict = getattr(wrapper, "strict", None)
++    if schema is None:
++        return None
++    if strict is True:
++        _reject_strict_response_schema(schema, top=True)
++    return copy.deepcopy(schema)
++
++
++def _reject_strict_response_schema(schema: Any, *, top: bool) -> None:
++    """Reject a ``strict: true`` response schema the DeepSeek API rejects."""
++    if top and (not isinstance(schema, dict) or schema.get("type") != "object"):
++        raise ValueError("The top level of the json schema must be an object.")
++    if not isinstance(schema, dict) or not any(
++        key in schema for key in ("type", "anyOf", "$ref")
++    ):
++        raise ValueError(
++            "Invalid json schema: one of `type`, `anyOf`, `$ref` field is required"
++        )
++    if "additionalProperties" in schema:
++        additional = schema["additionalProperties"]
++        if not isinstance(additional, bool):
++            raise ValueError(
++                "Invalid json schema: invalid type: map, expected a boolean"
++            )
++        if additional:
++            raise ValueError("additionalProperties should not be true")
++    if schema.get("type") == "object":
++        properties = schema.get("properties")
++        if not isinstance(properties, dict) or not properties:
++            raise ValueError("An object with no properties is not allowed.")
++        required = schema.get("required")
++        if required is not None:
++            if not isinstance(required, list):
++                raise ValueError(
++                    "Required properties must match all properties in the object"
++                )
++            seen: set[Any] = set()
++            for name in required:
++                if name not in properties:
++                    raise ValueError(f"Required property '{name}' not found in object")
++                if name in seen:
++                    raise ValueError(f"Duplicate required property '{name}'")
++                seen.add(name)
++            if seen != set(properties):
++                raise ValueError(
++                    "Required properties must match all properties in the object"
++                )
++        for child in properties.values():
++            _reject_strict_response_schema(child, top=False)
++    items = schema.get("items")
++    if isinstance(items, dict):
++        _reject_strict_response_schema(items, top=False)
++    elif isinstance(items, list):
++        raise ValueError(
++            "Invalid json schema: one of `type`, `anyOf`, `$ref` field is required"
++        )
++    for key in ("anyOf", "oneOf", "allOf"):
++        group = schema.get(key)
++        if isinstance(group, list):
++            for child in group:
++                _reject_strict_response_schema(child, top=False)
++    for key in ("$defs", "definitions"):
++        definitions = schema.get(key)
++        if isinstance(definitions, dict):
++            for child in definitions.values():
++                _reject_strict_response_schema(child, top=False)
++
++
++def chat_template_kwargs_for_api(
++    chat_template_kwargs: Optional[Dict[str, Any]],
++    *,
++    response_format: Any,
++    tool_choice: Any,
++) -> Dict[str, Any]:
++    """Template kwargs for one Chat Completions request.
++
++    Returns the same dict when the request uses none of the API prompt
++    features, so a shared kwargs mapping is not copied or mutated. A response
++    schema is added on a new dict. ``tool_choice`` ``none`` drops the tool
++    catalog from that copy; the caller's tools list stays put.
++    """
++    if chat_template_kwargs is None:
++        chat_template_kwargs = {}
++    schema = response_schema_for_prompt(response_format)
++    drop_tools = tool_choice == "none" and bool(chat_template_kwargs.get("tools"))
++    if schema is None and not drop_tools:
++        return chat_template_kwargs
++    updated = dict(chat_template_kwargs)
++    if drop_tools:
++        updated.pop("tools", None)
++    if schema is not None:
++        updated["response_format"] = schema
++    return updated
++
++
++def insert_system_prompt_fields(
++    conversation: List[Dict[str, Any]],
++    tools: Any,
++    response_format: Any,
++) -> List[Dict[str, Any]]:
++    """Attach tools and a response schema to the first system message.
++
++    ``response_format`` is the schema object ``to_json`` will write, or
++    ``None`` when the request does not render one. An empty schema still
++    renders; only ``None`` is absent.
++    """
++    if not tools and response_format is None:
++        return conversation
++    system = (
++        conversation[0]
++        if conversation and conversation[0].get("role") == "system"
++        else None
++    )
++    if system is None:
++        system = {"role": "system", "content": ""}
++        conversation.insert(0, system)
++    if tools:
++        system["tools"] = tools
++    if response_format is not None:
++        system["response_format"] = response_format
++    return conversation
++
++
+ def tools_from_openai_format(tools):
+     """Extract function definitions with namespace-qualified identities."""
+     return [normalize_tool_namespace(tool)["function"] for tool in tools]

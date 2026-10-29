@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 04:08:52 +0100
+Subject: [PATCH 554/554] [DS4.1] IKET mode: VLLM_DS41_IKET_SKIP leaves named
+ kernels uninstrumented
+
+---
+ vllm/envs.py                               |  4 ++++
+ vllm/models/deepseek_v4_1/tilelang/iket.py | 24 ++++++++++++++++------
+ vllm/v1/worker/gpu_worker.py               |  5 ++++-
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 35f9c8847..d651e1ce3 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -228,6 +228,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_IKET: str | None = None
+     VLLM_DS41_IKET_CTAS: int = 0
+     VLLM_DS41_IKET_ITERS: int = 0
++    VLLM_DS41_IKET_SKIP: str = ""
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+@@ -1930,6 +1931,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # With VLLM_DS41_IKET: ranges inside a loop record in at most this many of its
+     # iterations, evenly spread (0: all), so no warp's record sizes run-iket's buffer.
+     "VLLM_DS41_IKET_ITERS": lambda: int(os.getenv("VLLM_DS41_IKET_ITERS", "0")),
++    # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
++    # without ranges (run-iket still records their warps' lifetimes).
++    "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+     # the served model name whose requests alone it steers (vllm/weightless.py),
+     # set together or not at all. Part of the compile key, as every variable here
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 2225be311..0cbee5cd7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -20,6 +20,10 @@ When on:
+ - ``<directory>/sources`` holds each instrumented module's CUDA source and its
+   sites (``<kernel>.<hash>.cu`` and ``.json``: each range's name, phase, source
+   lines and first statement), which the trace's range names refer to.
++- ``VLLM_DS41_IKET_CTAS``, ``VLLM_DS41_IKET_ITERS`` and ``VLLM_DS41_IKET_SKIP``
++  (optional) sample CTAs and loop iterations and leave named kernels out, which an
++  engine-wide trace needs: run-iket's buffer is one allocation for the process, and
++  every instrumented launch reserves the run's largest warp record for each warp.
+ - Traces need NVIDIA's profiler: run the process under ``run-iket profile`` (CuTe
+   DSL's ``nvidia-cutlass-dsl-libs-base``), which patches the events into trace
+   stores. Outside it an event's placeholder store writes shared address 0x20, in
+@@ -505,7 +509,8 @@ def annotate(
+ 
+ _lock = threading.Lock()
+ _directory: Path | None = None
+-_sampling = (0, 0)  # (CTAs a launch, iterations a loop); 0: all
++# (CTAs a launch, iterations a loop, kernels left as they are); 0 and "": all, none
++_sampling: tuple[int, int, str] = (0, 0, "")
+ 
+ 
+ def directory() -> Path | None:
+@@ -513,13 +518,18 @@ def directory() -> Path | None:
+     return _directory
+ 
+ 
+-def enable(output: str | os.PathLike[str], ctas: int = 0, iters: int = 0) -> Path:
++def enable(
++    output: str | os.PathLike[str], ctas: int = 0, iters: int = 0, skip: str = ""
++) -> Path:
+     """Turn the IKET mode on for this process, before it compiles any TileLang
+     kernel; ``ctas`` and ``iters`` > 0 sample CTAs and loop iterations
+-    (``annotate``). Idempotent for the same directory and sampling."""
++    (``annotate``), and kernels whose name ``skip`` matches (a regex) compile
++    uninstrumented. Idempotent for the same directory and settings."""
+     global _directory, _sampling
+     root = Path(output).expanduser().resolve()
+-    sampling = (int(ctas), int(iters))
++    sampling = (int(ctas), int(iters), skip or "")
++    if skip:
++        re.compile(skip)
+     with _lock:
+         if _directory is not None:
+             if (root, sampling) != (_directory, _sampling):
+@@ -565,10 +575,12 @@ def _postproc(code: str, target) -> str:
+     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
+ 
+     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
+-    ctas, iters = _sampling
++    ctas, iters, skip = _sampling
++    kernel = next((name for name, *_ in _kernels(code)), "module")
++    if skip and re.search(skip, kernel):
++        return code  # run-iket still records its warps' lifetimes
+     annotated, sites = annotate(code, _token, ctas, iters)
+     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
+-    kernel = next((name for name, *_ in _kernels(code)), "module")
+     stem = f"{kernel}.{digest}"
+     (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
+     manifest = {"kernel": kernel, "ctas": ctas, "iters": iters, "sites": sites}
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index db5c9411a..1ae9fa14a 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -432,7 +432,10 @@ class Worker(WorkerBase):
+             from vllm.models.deepseek_v4_1.tilelang import iket
+ 
+             iket.enable(
+-                envs.VLLM_DS41_IKET, envs.VLLM_DS41_IKET_CTAS, envs.VLLM_DS41_IKET_ITERS
++                envs.VLLM_DS41_IKET,
++                envs.VLLM_DS41_IKET_CTAS,
++                envs.VLLM_DS41_IKET_ITERS,
++                envs.VLLM_DS41_IKET_SKIP,
+             )
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
