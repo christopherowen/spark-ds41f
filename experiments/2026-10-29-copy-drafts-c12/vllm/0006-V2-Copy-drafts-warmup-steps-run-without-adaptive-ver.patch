@@ -1,0 +1,40 @@
+From 99045263bfeec4e0f889695449c5c1a391e9ab22 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:40:34 +0100
+Subject: [PATCH 6/8] [V2] Copy drafts: warmup steps run without adaptive
+ verification
+
+warmup_kernels clears model_runner.adaptive_verification so pre-capture
+steps use fixed draft counts, and sample_tokens asserted it was set
+whenever the copy drafter is on: every boot with copy_drafts failed in
+warmup (c10-copy, 2026-10-28). Without the manager a step's copy state
+records no verified drafts, as propose() already takes None to mean.
+---
+ vllm/v1/worker/gpu/model_runner.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5a8afd1e4..c2ce93a6d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3405,13 +3405,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             planned_confidences = None
+             if self.copy_drafter is not None:
+                 # A request whose context repeats its own earlier text takes the
+-                # copy in place of DSpark's drafts.
+-                assert self.adaptive_verification is not None
++                # copy in place of DSpark's drafts. Warmup runs without adaptive
++                # verification (fixed draft counts); its rows verify none.
+                 verified = (
+                     self.adaptive_verification.get_verified_draft_counts(
+                         input_batch.num_reqs
+                     )
+-                    if input_batch.num_draft_tokens_per_req is not None
++                    if self.adaptive_verification is not None
++                    and input_batch.num_draft_tokens_per_req is not None
+                     else None
+                 )
+                 draft_tokens, confidences, planned_confidences = (
+-- 
+2.54.0 (Apple Git-157)
+
