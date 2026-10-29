@@ -265,7 +265,8 @@ def command_stall(args: argparse.Namespace) -> int:
     failed = sum(row["failed"] for row in rows)
     print(json.dumps({"summary": "servebench stall", "label": args.label,
                       "stall_s": {row["size"]: row["stall_s"].get("mean") for row in rows},
-                      "during_p50_s": {row["size"]: row["during_p50_s"].get("mean") for row in rows},
+                      "during_mean_s": {row["size"]: row["during_mean_s"].get("mean") for row in rows},
+                      "long_share": {row["size"]: row["long_share"].get("mean") for row in rows},
                       "before_p50_s": {row["size"]: row["before_p50_s"].get("mean") for row in rows},
                       "tps": {row["size"]: row["tps"].get("mean") for row in rows},
                       "skipped": skipped, "failed": failed, "output": args.output}), flush=True)

@@ -58,7 +58,7 @@ class FakeServer:
         self.seen: list[tuple[str, int]] = []  # (cache salt, prompt characters) per streamed request
         self.lock = threading.Lock()
         self.counters = {"generation": 0, "steps": 0, "step_tokens": 0, "drafts": 0, "accepted": 0,
-                         "pos0": 0, "pos1": 0, "finished": 0}
+                         "pos0": 0, "pos1": 0, "finished": 0, "chunk_steps": 0}
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,6 +76,9 @@ class FakeServer:
                         f'vllm:generation_tokens_total{{model_name="fake"}} {c["generation"]}\n'
                         f'vllm:iteration_tokens_total_count{{engine="0"}} {c["steps"]}\n'
                         f'vllm:iteration_tokens_total_sum{{engine="0"}} {c["step_tokens"]}\n'
+                        f'vllm:iteration_tokens_total_bucket{{engine="0",le="1024.0"}} {c["steps"]}\n'
+                        f'vllm:iteration_tokens_total_bucket{{engine="0",le="+Inf"}} '
+                        f'{c["steps"] + c["chunk_steps"]}\n'
                         f'vllm:spec_decode_num_drafts_total{{engine="0"}} {c["drafts"]}\n'
                         f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {c["accepted"]}\n'
                         f'vllm:spec_decode_num_draft_tokens_per_pos_total{{engine="0",position="0"}} {c["drafts"]}\n'
@@ -135,6 +138,7 @@ class FakeServer:
                     long_prompt = fake.prefill_stall_s and len(request["messages"][0]["content"]) > LONG_PROMPT
                     if long_prompt:
                         fake.stall_until = time.monotonic() + fake.prefill_stall_s
+                        fake.counters["chunk_steps"] += 1
                 per_chunk = request.get("stream_options", {}).get("continuous_usage_stats", False)
                 total = request["max_tokens"]
                 self.send_response(200)
@@ -529,6 +533,30 @@ class StallTest(unittest.TestCase):
         self.assertEqual(stall.split_gaps(events, 2.5, 5.5), ([1.0, 1.0], [3.0, 1.0]))
         self.assertEqual(stall.split_gaps(events[:1], 0.5, 1.0), ([], []))
 
+    def test_long_share_counts_the_steps_a_chunk_held(self):
+        self.assertEqual(stall.long_share([0.1, 2.2, 0.1, 2.3], 0.1), 0.5)
+        self.assertIsNone(stall.long_share([], 0.1))
+        self.assertIsNone(stall.long_share([2.0], None))
+
+    def test_engine_window_counts_steps_by_size(self):
+        def scrape(small, total):
+            return (f'vllm:iteration_tokens_total_bucket{{engine="0",le="64.0"}} {small}\n'
+                    f'vllm:iteration_tokens_total_bucket{{engine="0",le="1024.0"}} {small}\n'
+                    f'vllm:iteration_tokens_total_bucket{{engine="0",le="+Inf"}} {total}\n')
+        window = stall.engine_window(scrape(100, 110), scrape(116, 134))
+        self.assertEqual((window["steps"], window["chunk_steps"]), (24, 8))
+        self.assertEqual(window["buckets"], [["64.0", 16], ["1024.0", 16], ["+Inf", 24]])
+        self.assertIsNone(stall.engine_window(None, scrape(1, 1)))
+
+    def test_comparison_skips_metrics_an_older_record_lacks(self):
+        def row(**samples):
+            return {"size": 3000, "prompt_tokens": 3000, "samples": samples,
+                    **{key: stats.describe(values) for key, values in samples.items()}}
+        old = row(stall_s=[2.2, 2.3], during_p50_s=[0.8, 2.1])
+        new = row(stall_s=[2.2, 2.3], during_mean_s=[1.2, 1.2], long_share=[0.5, 0.5])
+        metrics = [row["metric"] for row in stall.compare([old], [new])["rows"]]
+        self.assertEqual(metrics, ["worst decode wait during 3,000 prefill (s)"])
+
     def test_streams_wait_for_a_long_prefill(self):
         fake = FakeServer(prefill_stall_s=0.3)
         try:
@@ -540,12 +568,22 @@ class StallTest(unittest.TestCase):
                 self.assertGreaterEqual(sample["ttft_s"], 0.29)
                 self.assertGreaterEqual(sample["stall_s"], 0.25)
                 self.assertLess(sample["before_s"]["p50"], 0.05)
+                self.assertGreater(sample["long_share"], 0)
+                self.assertEqual(len(sample["gaps"]), sample["during_s"]["n"])
+                stream, start, length = max(sample["gaps"], key=lambda gap: gap[2])
+                self.assertIn(stream, range(3))
+                self.assertLess(start, sample["ttft_s"])
+                self.assertEqual(length, round(sample["stall_s"], 4))
+                self.assertEqual(sample["engine"]["chunk_steps"], 1)
+                self.assertGreaterEqual(sample["engine"]["steps"], 1)
             rows = stall.summarize(samples)
             self.assertEqual(rows[0]["failed"], 0)
             self.assertEqual(rows[0]["stall_s"]["n"], 2)
             verdicts = {row["metric"]: row["verdict"] for row in stall.compare(rows, rows)["rows"]}
             self.assertEqual(set(verdicts.values()), {"same"})
             self.assertIn("worst decode wait during 3,000 prefill (s)", verdicts)
+            self.assertIn("decode step mean during 3,000 prefill (s)", verdicts)
+            self.assertNotIn("decode step p50 during 3,000 prefill (s)", verdicts)
             # The streams were stopped at the document's first token, not run to their budget.
             self.assertLess(fake.counters["generation"], 100000)
         finally:
@@ -622,7 +660,7 @@ class StallTest(unittest.TestCase):
                     self.assertEqual(cli.main(["suite", fake.url, "--suite", path, "--out", out]), 0)
                 result = suite.compare(cli.read_json, base, cand, lambda b, c: cli.compare_results(b, c, 3.0))
                 self.assertEqual(result["steps"]["stall"][0], stall.SCHEMA)
-                self.assertEqual(len(result["steps"]["stall"][1]["rows"]), 4)
+                self.assertEqual(len(result["steps"]["stall"][1]["rows"]), 6)
         finally:
             fake.close()
 
