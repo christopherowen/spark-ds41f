@@ -730,3 +730,43 @@ staying on the ring.
   every digest equals candidate 12's in `candidate-12-tp4` (the same checks on its own boot) and
   model loading is about 1 GiB a rank lower (candidate 12: 72.72 GiB). Candidate 12's release comparison
   against 1025 (`candidate-12-release-tp4`) then stands for candidate 13 on the ring.
+- **Fix check result (2026-10-29, 21:01-21:30 UTC, with the repeat boot
+  `candidate-13-fix-tp4-again`):** it works. The scale-code bundle passed on dgx4 (117 tests).
+  The logprob, greedy and 16K digests equal candidate 12's (`fe2461d8`, `c9cf9dbe`,
+  `fcd34fd2`). Model loading took 71.67 GiB on both boots (candidate 12: 72.72), with the KV
+  cache unchanged at 11,554,122 tokens, so the gigabyte is headroom (dgx1 had 21.3 GiB
+  available at ready). The startup lines are normal.
+
+## Candidate 14 ([rc14/](rc14))
+
+Candidate 13 with the Engram host hash fixed for a prefilling request that carries drafts, the
+engine stop of [#677](https://github.com/christopherowen/spark-ds41f/issues/677): the 1030
+candidate (owner, 2026-10-29: fold the fix in before promoting).
+
+- **Series:** candidate 13's plus 0567 (vLLM `engram-drafted-prefill`, head d5df88d83;
+  [rc14/vllm/series](rc14/vllm/series), [rc14/make_series.py](rc14/make_series.py)): patch
+  head `b6de07aa`, tree `ea1281f8` (the build's `git am` reproduces it).
+
+  | Patch | Change | Why |
+  | --- | --- | --- |
+  | 0567 | `_early_engram_ids` hashes on the host only the prefill rows of requests without drafts and leaves a drafted request's rows `UNKNOWN` for the GPU; drafts out of order leave the whole step to the GPU instead of raising | The scheduler pads a prompt with one token left (cached up to its last token) to the verification width with placeholder drafts, so a request can be prefilling and verifying at once; the old check raised on it and stopped every worker |
+
+  The worker sorts verifying requests first and adaptive verification keeps their total row
+  count, so a request after them starts at the host's row and its early IDs stay exact. The
+  host IDs are a prefetch of the GPU's hash, so the output does not change. CPU tests:
+  `tests/kernels/test_deepseek_v41_engram_host_placement.py` (5).
+- **Arms:** candidate 13's on candidate 14's image (`spark-ds41f:19f2c20ed4d6-next-14`) and
+  lock ([rc14/rc-tp4.json](rc14/rc-tp4.json), `-dev`); [rc14/source.json](rc14/source.json)
+  adds the `engram-host-hash-drafted-prefill` capability.
+- **Fix check:** [rc14/fix-tp4.json](rc14/fix-tp4.json), run `candidate-14-fix-tp4`, about an
+  hour. It builds the image, then runs [rc14/mixed_load.py](rc14/mixed_load.py) for 5 minutes
+  on each boot: 4 agents growing from 50K words by 20K a turn, and 8 chat streams that each
+  ask every question twice (the second cached up to its last token). The boots are:
+  - candidate 13, where the load should stop the engine;
+  - candidate 14, with the determinism gate, the 16K prompt, the memory snapshot and the
+    startup lines;
+  - candidate 14 again, with the memory snapshot and the startup lines.
+
+  Candidate 14 works if the load runs clean on both of its boots, every digest equals
+  candidate 13's, and model loading stays at 71.67 GiB. Candidate 12's release comparison
+  against 1025 then stands for candidate 14 on the ring.
