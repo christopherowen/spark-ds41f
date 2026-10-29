@@ -120,6 +120,12 @@ def node_environment(cluster: dict, node: dict) -> dict[str, str]:
         env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
         if is_sparknet(mode):
             env["SPARKNET_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
+    if "roce_traffic_class" in node:
+        # One DSCP/ECN byte for both backends. A switch classifies RoCE by it, and
+        # each backend defaults to 0, the best-effort class (docs/switched-fabric.md).
+        env["NCCL_IB_TC"] = str(node["roce_traffic_class"])
+        if is_sparknet(mode):
+            env["SPARKNET_ROCE_TRAFFIC_CLASS"] = str(node["roce_traffic_class"])
     return env
 
 
@@ -277,6 +283,18 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
         gid = node.get("roce_gid_index", 3)
         if type(gid) is not int or gid < 0:
             errors.append(f"{node['name']}: roce_gid_index must be a nonnegative integer")
+        traffic_class = node.get("roce_traffic_class")
+        if traffic_class is not None and (type(traffic_class) is not int or not 0 <= traffic_class <= 255):
+            errors.append(f"{node['name']}: roce_traffic_class must be an integer from 0 to 255")
+    # Ranks that mark differently put one direction of a collective in another switch
+    # class, and an environment value beside the map's would be silently overridden.
+    classes = {json.dumps(node.get("roce_traffic_class")) for node in entries}
+    if len(classes) > 1:
+        errors.append("roce_traffic_class must be the same on every node, or set on none")
+    if classes - {"null"}:
+        for key in ("NCCL_IB_TC", "SPARKNET_ROCE_TRAFFIC_CLASS"):
+            if key in settings:
+                errors.append(f"{key} comes from the node map's roce_traffic_class; remove it from the environment")
     if mode in ONE_SHOT:
         widths = {len(v) for n in entries if isinstance(n.get("roce_peer_hcas"), dict) for v in n["roce_peer_hcas"].values() if isinstance(v, list)}
         if len(widths) != 1:

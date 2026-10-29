@@ -63,6 +63,47 @@ class SwitchedTopologyTest(unittest.TestCase):
             self.assertEqual(env['SPARKNET_ROCE_TOPOLOGY'], 'direct')
             self.assertEqual(spark.roce_gid_setting(cluster, node), (3, sorted(pair)))
 
+    def test_traffic_class_marks_both_backends_alike(self):
+        cluster, nodes = fixture()
+        for node in nodes['nodes']:
+            node['roce_traffic_class'] = 106  # DSCP 26 << 2 | ECT(0)
+        self.assertEqual(topology.problems(cluster, nodes), [])
+        for node in nodes['nodes']:
+            env = spark.expected_environment(cluster, node)
+            self.assertEqual(env['NCCL_IB_TC'], '106')
+            self.assertEqual(env['SPARKNET_ROCE_TRAFFIC_CLASS'], '106')
+        cluster['fabric']['transport'] = 'nccl-switched'
+        env = spark.expected_environment(cluster, nodes['nodes'][0])
+        self.assertEqual(env['NCCL_IB_TC'], '106')
+        self.assertNotIn('SPARKNET_ROCE_TRAFFIC_CLASS', env)
+
+    def test_traffic_class_left_out_renders_nothing(self):
+        cluster, nodes = fixture()
+        self.assertEqual(topology.problems(cluster, nodes), [])
+        env = spark.expected_environment(cluster, nodes['nodes'][0])
+        self.assertNotIn('NCCL_IB_TC', env)
+        self.assertNotIn('SPARKNET_ROCE_TRAFFIC_CLASS', env)
+
+    def test_traffic_class_rejects_bad_mixed_or_duplicated_values(self):
+        def every(value):
+            return lambda c, n: [node.update(roce_traffic_class=value) for node in n['nodes']]
+        changes = [
+            every(256),
+            every(-1),
+            every('106'),
+            every(True),
+            every([106]),
+            lambda c, n: n['nodes'][1].update(roce_traffic_class=106),
+            lambda c, n: (every(106)(c, n), n['nodes'][2].update(roce_traffic_class=104)),
+            lambda c, n: (every(106)(c, n), c['environment'].update(NCCL_IB_TC='106')),
+            lambda c, n: (every(106)(c, n), c['environment'].update(SPARKNET_ROCE_TRAFFIC_CLASS='106')),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(index=index):
+                cluster, nodes = fixture()
+                change(cluster, nodes)
+                self.assertTrue(any('roce_traffic_class' in p for p in topology.problems(cluster, nodes)))
+
     def test_candidate_generation_preserves_explicit_switched_transport(self):
         cluster, nodes = fixture()
         result = topology.candidate(cluster, nodes, 'switched.json')
