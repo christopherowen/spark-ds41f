@@ -22,6 +22,8 @@ def load(relative: str) -> dict:
 
 
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
+# Fabric settings sparknet renders from the node map; a recipe leaves them out.
+RENDERED = ("NCCL_IB_HCA", "SPARKNET_ROCE_GID_INDEX")
 # Flags that change only what a response reports, added after the archived records.
 REPORTING_ARGS = ("--enable-prompt-tokens-details",)
 # The JIT monitor installs hooks and reports compiles; it computes nothing. spark-ds41f-1025
@@ -155,7 +157,8 @@ class RecipeTest(unittest.TestCase):
         experiments/2026-10-23-next-release, budget sweeps), glibc malloc keeps two arenas and a
         fixed 1 MiB mmap threshold (#439's growth; the memory window), every response reports its
         prompt-cache hits (#469), the JIT monitor is off, and the 21 settings for kernels serving
-        does not run are gone (experiments/2026-10-24-tilelang-completion)."""
+        does not run are gone (experiments/2026-10-24-tilelang-completion). The fabric settings
+        sparknet renders from the node map (the HCA list and the GID index) are left to it."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual(len(self.UNUSED_KERNEL_SETTINGS), 21)
         for shape in ("tp4-ring", "tp3-triangle"):
@@ -163,7 +166,7 @@ class RecipeTest(unittest.TestCase):
             resolved = recipe.resolve(self.recipe, shape)
             released = renamed(load_spark().read_cluster(arm))
             released["environment"] = {**{k: v for k, v in released["environment"].items()
-                                          if k not in self.UNUSED_KERNEL_SETTINGS},
+                                          if k not in self.UNUSED_KERNEL_SETTINGS + RENDERED},
                                        "MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "1048576",
                                        # 16 MP an image since 2026-10-25 (experiments/2026-10-26-site-landmines).
                                        "VLLM_MAX_IMAGE_PIXELS": "16777216"}
@@ -188,10 +191,12 @@ class RecipeTest(unittest.TestCase):
     def test_the_ring_is_candidate_6s_arm(self):
         """Promotion runs what the release measured: tp4-ring resolves to candidate 6's arm,
         apart from the baseline, lock and reference that name it, and the per-image pixel limit
-        added after the release (16 MP, experiments/2026-10-26-site-landmines)."""
+        added after the release (16 MP, experiments/2026-10-26-site-landmines), and the fabric
+        settings sparknet renders from the node map."""
         resolved = host_mounts(recipe.resolve(self.recipe, "tp4-ring"))
         released = host_mounts(load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"))
-        released["environment"] = {**released["environment"], "VLLM_MAX_IMAGE_PIXELS": "16777216"}
+        released["environment"] = {**{k: v for k, v in released["environment"].items() if k not in RENDERED},
+                                   "VLLM_MAX_IMAGE_PIXELS": "16777216"}
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
@@ -387,6 +392,8 @@ class RecipeTest(unittest.TestCase):
                          without_budget(without_context(serving_arguments(old))))
         self.assertEqual(resolved["fabric"], old["fabric"])
         for key, value in old["environment"].items():
+            if key in RENDERED:
+                continue
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
                 self.assertEqual(resolved["environment"].get(key.replace("SPARK3_", "SPARK_DS41F_", 1)), value, key)
         tp4 = recipe.resolve(self.recipe, "tp4-ring")

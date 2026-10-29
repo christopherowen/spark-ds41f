@@ -36,13 +36,15 @@ topology alone has no runtime.
 {"fabric": {"transport": "oneshot-switched", "topology": "switched"}}
 ```
 
-Each node then needs three fields the switchless maps do not use:
+The node map follows sparknet's switched schema (sparknet's `docs/topology.md`), which
+validates and renders it at the revision the upstream lock pins. Each node needs three
+fields the switchless maps do not use:
 
 | Field | Meaning |
 |---|---|
-| `socket_interface` | The one wired interface that carries rendezvous (GLOO, `TP_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`) |
-| `roce_peer_hcas` | Every peer rank, each mapped to the **same ordered pair** of HCAs |
-| `roce_subnets` | One IPv4 `/24` per HCA in that pair, matching the peer's entry for the same lane |
+| `management_interface` | The one wired interface that carries rendezvous (GLOO, `TP_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`) |
+| `roce_hcas` | The node's rails in order: both device paths of its switch port |
+| `roce_subnets` | One IPv4 `/24` per rail, the same rail subnet on every node |
 
 One optional field says how the hosts mark RoCE packets for the switch:
 
@@ -56,8 +58,9 @@ path is qualified at run time, not statically.
 
 ## What the renderer does
 
-- `NCCL_IB_HCA` becomes `=<pair>`. The leading `=` makes NCCL match device
-  names exactly rather than by prefix, so a node selects only its own pair.
+- `NCCL_IB_HCA` becomes `=<rails>`, and `SPARKNET_ROCE_HCA` the rails. The
+  leading `=` makes NCCL match device names exactly rather than by prefix, so a
+  node selects only its own devices.
 - Ring traffic controls are rejected, not ignored: `NCCL_ALGO`,
   `NCCL_MIN_NCHANNELS`, `NCCL_MIN_TRAFFIC_PER_CHANNEL`, `NCCL_THREAD_THRESHOLDS`
   and `NCCL_SWITCHLESS_BIDIRECTIONAL` cannot be set. A switchless setting left
@@ -65,18 +68,19 @@ path is qualified at run time, not statically.
 - `SPARK_DEPLOYMENT_TRANSPORT` names the deployment's transport. The collective
   probe reads it to keep a physical switched fabric distinct from sparknet's
   `direct` kernel mode, which is the same mode on both fabrics.
-- `roce_traffic_class` becomes `NCCL_IB_TC`, and `SPARKNET_ROCE_TRAFFIC_CLASS`
-  as well under `oneshot-switched`, so both backends mark their packets alike.
-  A value outside 0-255, nodes that disagree, or either variable also set in
-  the environment is an error.
+- The traffic class is sparknet's: at sparknet 0.5.0 the map's
+  `roce_traffic_class` becomes `NCCL_IB_TC` (and `SPARKNET_ROCE_TRAFFIC_CLASS`
+  under `oneshot-switched`); from the release after it, every switched fabric
+  marks DSCP 26 with ECN, byte 106 ([fabric conventions](fabric-conventions.md)),
+  and the field is retired.
 
 ## Validation
 
-`bin/spark doctor` rejects a switched map whose peers do not reuse one ordered
-HCA pair, whose lanes disagree with the peer's subnets, whose lanes share a
-subnet, or whose rendezvous interface is a loopback, container bridge, overlay
-or wireless device. Two peers on the same HCA are rejected: a switched node
-needs both paths of its pair.
+`bin/spark doctor` runs sparknet's map checks: rails named once, at most two,
+with one subnet a rail across every node, and the same rail counts everywhere.
+From the release after sparknet 0.5.0 it also rejects a rendezvous interface
+that is a loopback, container bridge, overlay or wireless device, and rails
+that share a subnet.
 
 `nccl-switched` names plain NCCL with per-node HCA selection. An image that
 replaces NCCL with sparknet cannot run it, and it requires
@@ -128,8 +132,9 @@ the switch therefore protects nothing until the hosts mark their packets with it
 DSCP. Unmarked, the collectives ride the default class, which drops under incast,
 and an all-reduce is incast by construction: every peer sends to one port at once.
 
-Set `roce_traffic_class` on every node to the byte that matches the switch. DSCP
-26 with ECN-capable transport, ECT(0), is `(26 << 2) | 2 = 106`. The host has to
+The hosts mark DSCP 26 with ECN-capable transport, ECT(0), `(26 << 2) | 2 = 106`
+([fabric conventions](fabric-conventions.md)); at sparknet 0.5.0, set
+`roce_traffic_class` to 106 on every node. The host has to
 agree as well: the NIC maps that DSCP to a priority with PFC on it, on both
 interfaces of the pair, for example
 
@@ -160,13 +165,13 @@ error. With `NCCL_IB_TC=106` the same runs had no retransmissions and held
 
 A host reaches its switch port through two HCA device nodes on the same physical
 port — for example `rocep1s0f1` and `roceP2p1s0f1`, which are two PCIe paths to
-one cable, not two rails. **Both must appear in the ordered pair**, and so in
+one cable, not two rails. **Both must appear in `roce_hcas`**, and so in
 `NCCL_IB_HCA`, or the node selects one and halves its fabric bandwidth. Measured
 on the reference deployment, all-pairs host-memory traffic reached about
 **196 Gb/s with both devices listed and about 112 Gb/s with one**.
 
 This is the trap the pair validation exists for: a map that lists one device, or
 two devices that belong to different ports, either runs at half rate with no
-error anywhere or fails the "same ordered pair" check. Confirm both paths
+error anywhere. Confirm both paths
 carried writes during the probe rather than inferring it from a healthy link —
 `--port-samples` reports per-HCA payload for exactly this reason.

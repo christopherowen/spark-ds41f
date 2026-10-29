@@ -1097,8 +1097,7 @@ def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
     env = expected_environment(cluster, node)
     key = "SPARKNET_ROCE_GID_INDEX" if topology.is_sparknet(topology.transport(cluster)) else "NCCL_IB_GID_INDEX"
     index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
-    hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
-    return index, hcas
+    return index, sorted(topology.hcas(cluster, node))
 
 
 def roce_gid_query(hcas: list[str]) -> str:
@@ -1238,7 +1237,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
-        problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
+        problems.extend(topology.gid_subnet_problems(cluster, node, gid_index, gids.stdout))
         problems.extend(node_glp_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
@@ -1655,7 +1654,7 @@ def node_runtime_problems(
     gid_index, hcas = roce_gid_setting(cluster, node)
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
     problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
-    problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
+    problems.extend(topology.gid_subnet_problems(cluster, node, gid_index, gids.stdout))
     problems.extend(unrecorded_subnet_problems(nodes, node, hcas))
     doctor = run_ssh(
         nodes,
