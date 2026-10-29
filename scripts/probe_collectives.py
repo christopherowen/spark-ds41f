@@ -5,11 +5,9 @@ Run one rank per node using commands rendered by `spark topology probe`.
 The surrounding container supplies a 600-second timeout and a 12 GiB limit (two NCCL groups plus compilation).
 This checks uniform TP collectives, not EP all-to-all or arbitrary send/recv.
 Inputs are contiguous [rows, width] with whole 16-byte rows, like the model's
-[tokens, hidden] activations. The old 1- and 17-element scalar-row fixtures are
-unsupported by the TileLang rank-order fallback: its world-size row padding
-must start and end on 16-byte packs. They are deliberately not claimed tested;
-one/17 packed rows and one/17 real 5120-wide rows replace them. No direct-adapter
-scalar test is used: it would bypass the TP-group path being qualified.
+[tokens, hidden] activations: the TileLang rank-order fallback pads rows to the
+world size and its padding must start and end on 16-byte packs, so scalar rows
+are not a shape it serves. The checks go through the TP group, not the adapter.
 """
 
 from __future__ import annotations
@@ -175,8 +173,8 @@ def main() -> None:
 
     checks = []
     before = adapter._runtime.stats()["ops_posted"] if adapter else 0
-    # Every HCA in the pair must carry payload at least once: a dead path is
-    # invisible in the summed counters but stalls a switched all-reduce.
+    # On a switched fabric every HCA in the pair must carry payload at least once:
+    # a dead path is invisible in the summed counters but stalls an all-reduce.
     carried_hcas = set()
     custom_cases = 0
     for dtype in (torch.bfloat16, torch.float32):
@@ -329,7 +327,7 @@ def main() -> None:
                     del graph, outputs
                 del local, scattered
 
-    if custom_cases and adapter is not None:
+    if deployment_transport == "oneshot-switched" and custom_cases and adapter is not None:
         idle = [h for h in adapter._runtime.stats()['hcas'] if h not in carried_hcas]
         if idle:
             raise RuntimeError(f'the oneshot proxy never posted payload on {idle}; '

@@ -649,3 +649,5 @@ section.
   more depth.
 - [switchless-topology.md](switchless-topology.md) covers three- and
   four-node fabrics and their transports.
+- [switched-fabric.md](switched-fabric.md) covers a fabric through a switch
+  (`fabric.topology=switched`) and what of it is qualified.

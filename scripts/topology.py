@@ -103,12 +103,12 @@ def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     env["VLLM_HOST_IP"] = node["management_ip"]
     mode = transport(cluster)
     if switched(mode):
-        pair = next(iter(node['roce_peer_hcas'].values()))
-        env['NCCL_IB_HCA'] = '=' + ','.join(pair)
-        env['SPARK_DEPLOYMENT_TRANSPORT'] = str(mode)
-        interface = node['socket_interface']
+        pair = next(iter(node["roce_peer_hcas"].values()))
+        env["NCCL_IB_HCA"] = "=" + ",".join(pair)
+        env["SPARK_DEPLOYMENT_TRANSPORT"] = str(mode)
+        interface = node["socket_interface"]
         env.update(GLOO_SOCKET_IFNAME=interface, TP_SOCKET_IFNAME=interface,
-                   NCCL_SOCKET_IFNAME='=' + interface)
+                   NCCL_SOCKET_IFNAME="=" + interface)
     if is_sparknet(mode):
         env["SPARKNET_ROCE_PEER_HCAS"] = json.dumps(node["roce_peer_hcas"], separators=(",", ":"))
         env["SPARKNET_ROCE_TOPOLOGY"] = one_shot_topology(mode)
@@ -220,9 +220,9 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     networks = {}
     for rank, node in by_rank.items():
         if switched(mode):
-            interface = node.get('socket_interface')
+            interface = node.get("socket_interface")
             if (not isinstance(interface, str)
-                    or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', interface)
+                    or not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", interface)
                     or interface.startswith(VIRTUAL_INTERFACES)):
                 errors.append(f"{node['name']}: socket_interface must name one explicit wired fabric "
                               f"interface, not a loopback, container, overlay or wireless device")
@@ -242,16 +242,16 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                     errors.append(f"{node['name']}: switched peer {peer} requires two distinct HCAs")
                 if hcas != next(iter(routes.values())):
                     errors.append(f"{node['name']}: switched peers must reuse the same ordered HCA pair")
-                if len({node.get('roce_subnets', {}).get(h) for h in hcas}) != len(hcas):
+                if len({node.get("roce_subnets", {}).get(h) for h in hcas}) != len(hcas):
                     errors.append(f"{node['name']}: each switched lane needs its own subnet")
                 for lane, hca in enumerate(hcas):
                     try:
-                        net = ipaddress.IPv4Network(node.get('roce_subnets', {}).get(hca), strict=True)
+                        net = ipaddress.IPv4Network(node.get("roce_subnets", {}).get(hca), strict=True)
                         remote = by_rank[int(peer)]
-                        remote_hcas = remote.get('roce_peer_hcas', {}).get(str(rank), [])
-                        remote_net = remote.get('roce_subnets', {}).get(remote_hcas[lane])
+                        remote_hcas = remote.get("roce_peer_hcas", {}).get(str(rank), [])
+                        remote_net = remote.get("roce_subnets", {}).get(remote_hcas[lane])
                         if net.prefixlen != 24 or str(net) != remote_net:
-                            raise ValueError('lane subnet mismatch')
+                            raise ValueError("lane subnet mismatch")
                     except (ValueError, TypeError, IndexError):
                         errors.append(f"{node['name']}: switched peer {peer} lane {lane} needs a "
                                       f"matching IPv4 /24 roce_subnets entry")
