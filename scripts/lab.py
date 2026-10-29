@@ -963,12 +963,64 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
             suffix = "" if name == suites[0] else f"-{name}"
             steps.append({"kind": "cli", "label": label, "argv": argv, "suite": name,
                           "telemetry_out": f"results/private/determinism/{run}/suite-{label}{suffix}"})
+    labels = [a["label"] for a in arms]
+    reference, unresolved = (recorded_reference(experiment, job["reference"], arms[0]["config"])
+                             if "reference" in job else (None, None))
     for name in suites:
-        steps.append({"kind": "table",
-                      "argv": ["scripts/servebench_suite_table.py", run_of(name), *[a["label"] for a in arms]],
-                      "out": f"results/private/lab/{run_of(name)}-table.txt",
-                      "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms]})
+        table = {"kind": "table", "argv": ["scripts/servebench_suite_table.py", run_of(name), *labels],
+                 "out": f"results/private/lab/{run_of(name)}-table.txt",
+                 "curves": [f"results/private/determinism/{run}/curves-{label}.json" for label in labels]}
+        if "reference" in job:
+            recorded = reference if name == suites[0] or reference is None else f"{reference}-{name}"
+            table["argv"][2:] = [labels[0], recorded or "?", *labels[1:]]
+            table.update(reference=recorded, suite=name, arms=len(arms), unresolved=unresolved)
+        steps.append(table)
     return steps
+
+
+def recorded_reference(experiment: str, reference: str, config: str) -> tuple[str | None, str | None]:
+    """A suite job's recorded reference: a suite run directory (repository-relative), or
+    "release", the benchmark_reference of the recipe shape the arm is built on (an arm
+    overlay carries none, so its extends chain is followed to the recipe). Returns the path,
+    or None and why it cannot be resolved; plan_problems reports the reason."""
+    if reference != "release":
+        return reference, None
+    config, shape = arm_config_path(experiment, config), None
+    try:
+        data = spark.read_json(config)
+        while spark.cluster_recipe.is_overlay(data):
+            config, shape = data["extends"]["config"], data["extends"].get("shape")
+            data = spark.read_json(config)
+        cluster = spark.read_cluster(config, shape)
+    except (OSError, ValueError, SystemExit) as error:
+        return None, f"cannot resolve the release the arm is built on: {error}"
+    if "benchmark_reference" not in cluster:
+        return None, f"{config} (shape {shape or 'of the site'}) names no benchmark_reference"
+    return cluster["benchmark_reference"], None
+
+
+def reference_problems(step: dict) -> list[str]:
+    """A table step's recorded reference: a run of the same suite definition, and a
+    candidate measured at least twice (a boot and a repeat boot) so the verdict keeps an
+    interval."""
+    if step["unresolved"]:
+        return [f"reference: {step['unresolved']}"]
+    problems = [] if step["arms"] >= 2 else [
+        "a recorded reference needs the candidate measured at least twice: a boot and a repeat boot"]
+    path = ROOT / step["reference"]
+    if not (path / "suite.json").is_file():
+        return problems + [f"reference {step['reference']} is not a suite run (no suite.json)"]
+    sys.path.insert(0, str(ROOT))
+    from servebench import suite
+    try:
+        digest = suite.digest(suite.load(step["suite"]))
+    except (ValueError, OSError):
+        return problems
+    recorded = json.loads((path / "suite.json").read_text(encoding="utf-8"))["suite_sha256"]
+    if recorded != digest:
+        problems.append(f"reference {step['reference']} is a run of suite {step['suite']} {recorded[:12]}, "
+                        f"which is now {digest[:12]}; a changed suite is a new suite: measure the reference again")
+    return problems
 
 
 def validate_steps(spec: dict, job: dict) -> list[dict]:
@@ -1102,6 +1154,8 @@ def plan_problems(steps: list[dict]) -> list[str]:
                 problems.extend(f"{step['config']}: {problem}" for problem in arm_problems(step["config"]))
         if step["kind"] == "cli" and step.get("suite"):
             problems.extend(suite_problems(step))
+        if step["kind"] == "table" and "reference" in step:
+            problems.extend(reference_problems(step))
         if step["kind"] not in ("script", "profile"):
             continue
         script, args = step["argv"][0], step["argv"][1:]

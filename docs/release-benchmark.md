@@ -118,10 +118,16 @@ look only; step 3 decides speed.
 
 ## 3. Release comparison
 
-Three arms in one lab session, back to back: the candidate, the previous release, the
-candidate again. The candidate goes first so heat soak never counts against it; its repeat
-bounds the session's drift, and a change counts only beyond its interval plus that drift.
-Never compare with a reference measured in another session.
+The candidate boots twice, back to back, and is compared with the previous release's
+recorded runs (owner, 2026-10-29): a released build's numbers never change, so it is not
+measured again. The record is the shape's `benchmark_reference` in the recipe
+(`manifests/suites/<release>-<shape>`, its companions beside it as `-single-stream` and
+`-sampled`). The candidate's repeat bounds its boot-to-boot spread, and a change counts only
+beyond its interval plus that spread. The previous release is measured again, as the middle
+of three arms, only when its record cannot serve: a suite changed since it was recorded (a
+changed suite is a new suite, and the lab refuses the record), or the record predates
+servebench's request tables (1025 and earlier), which leaves only the window verdict and not
+the paired decode verdict.
 
 ### Suites
 
@@ -142,11 +148,16 @@ same boot; r6x also ran `sampled` (added 2026-10-18), which the example below in
 ```json
 {"experiment": "<experiment>", "run": "<candidate>-release",
  "jobs": [{"kind": "sync"},
-          {"kind": "measure", "suite": ["release", "single-stream", "sampled"],
+          {"kind": "measure", "suite": ["release", "single-stream", "sampled"], "reference": "release",
            "arms": [{"config": "<candidate>-dev.json", "label": "<candidate>"},
-                    {"config": "<previous>-dev.json", "label": "<previous>"},
                     {"config": "<candidate>-dev.json", "label": "<candidate>-again"}]}]}
 ```
+
+`"reference": "release"` follows the first arm's `extends` chain to the recipe shape it is
+built on and reads that shape's `benchmark_reference`; `"reference"` may also name a recorded
+suite run directly. The plan refuses a record of another suite definition, a missing record,
+and a candidate measured only once. Without `"reference"`, list the previous release's arm
+between the candidate's two boots, as before.
 
 ```bash
 python3 scripts/lab.py queue add <experiment>/release-tp4-1017.json
@@ -158,8 +169,11 @@ suite: `results/private/lab/<run>-table.txt`, `<run>-single-stream-table.txt` an
 `<run>-sampled-table.txt`. To print a table again:
 
 ```bash
-python3 scripts/servebench_suite_table.py <run> <candidate> <previous> <candidate>-again
+python3 scripts/servebench_suite_table.py <run> <candidate> manifests/suites/<release>-<shape> <candidate>-again
 ```
+
+A label with a `/` is a recorded suite run (repository-relative); with a measured previous
+release, give its label instead.
 
 ### By hand
 
