@@ -1,0 +1,174 @@
+From d5df88d83b7c273d5e7c697c7946786c4df34f7d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:56:07 +0100
+Subject: [PATCH] [DS4.1] Engram host hash: a prefilling request with drafts is
+ left to the GPU
+
+The scheduler pads a prompt with one token left to the verification width
+with placeholder drafts, so a request can be prefilling and verifying at
+once. _early_engram_ids raised on it and stopped the engine (spark-ds41f
+#677). Adaptive verification places only the verifying requests' rows on
+the GPU; a request after them starts at the host's row. The host now
+hashes the prefill rows of requests without drafts and leaves a drafted
+request's rows UNKNOWN for the GPU; drafts out of order leave the whole
+step to the GPU instead of raising.
+---
+ ...test_deepseek_v41_engram_host_placement.py | 73 +++++++++++++++++++
+ .../deepseek_v4_1/engram_rows/host_hash.py    | 26 ++++++-
+ .../deepseek_v4_1/nvidia/model_state.py       | 18 ++---
+ 3 files changed, 104 insertions(+), 13 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_engram_host_placement.py
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_host_placement.py b/tests/kernels/test_deepseek_v41_engram_host_placement.py
+new file mode 100644
+index 000000000..94ad78943
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_engram_host_placement.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which prefill rows the host hashes early in a step with verifying requests (CPU)."""
++
++import numpy as np
++
++from vllm.models.deepseek_v4_1.engram_rows.host_hash import UNKNOWN, placed_by_host
++
++
++def _request(first, rows, prefill_positions):
++    tokens = np.arange(100, dtype=np.int64)
++    return (first, rows, tokens, np.asarray(prefill_positions, dtype=np.int64))
++
++
++def _kept(requests):
++    return [list(positions) for *_, positions in requests]
++
++
++def test_no_drafts_keeps_every_prefill_row():
++    requests = [_request(0, 1, []), _request(1, 4, [10, 11, 12, 13])]
++    assert placed_by_host(requests, None) is requests
++    assert _kept(placed_by_host(requests, np.array([0, 0]))) == [[], [10, 11, 12, 13]]
++
++
++def test_a_chunk_after_the_verifying_requests_keeps_its_rows():
++    requests = [
++        _request(0, 6, []),
++        _request(6, 6, []),
++        _request(12, 4, [20, 21, 22, 23]),
++    ]
++    assert _kept(placed_by_host(requests, np.array([5, 5, 0]))) == [
++        [],
++        [],
++        [20, 21, 22, 23],
++    ]
++
++
++def test_a_prefilling_request_with_drafts_is_left_to_the_gpu():
++    """#677: a prompt with one token left, padded to the verification width with
++    placeholder drafts, leads the batch; a later chunk still starts where the host
++    puts it."""
++    requests = [
++        _request(0, 6, [99]),
++        _request(6, 6, []),
++        _request(12, 4, [20, 21, 22, 23]),
++    ]
++    assert _kept(placed_by_host(requests, np.array([5, 5, 0]))) == [
++        [],
++        [],
++        [20, 21, 22, 23],
++    ]
++
++
++def test_a_verifying_request_after_one_without_drafts_leaves_the_step_to_the_gpu():
++    requests = [_request(0, 4, [20, 21, 22, 23]), _request(4, 6, [])]
++    assert _kept(placed_by_host(requests, np.array([0, 5]))) == [[], []]
++
++
++def test_dropped_rows_stay_unknown_in_the_step_ids():
++    from vllm.models.deepseek_v4_1.engram_rows import host_hash
++
++    host = host_hash.HostEngramHash.__new__(host_hash.HostEngramHash)
++    host.layers = 1
++    host.hash_positions = lambda tokens, positions: np.zeros(
++        (len(positions), 1, host_hash.HEADS), dtype=np.int64
++    )
++    requests = placed_by_host(
++        [_request(0, 6, [99]), _request(6, 2, [20, 21])], np.array([5, 0])
++    )
++    ids = host.step_ids(10, requests)
++    assert (ids[:6] == UNKNOWN).all()
++    assert (ids[6:8] == 0).all()
++    assert (ids[8:] == -1).all()
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+index e5bba8888..dd52a77fa 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+@@ -98,4 +98,28 @@ class HostEngramHash:
+         return out
+ 
+ 
+-__all__ = ["HEADS", "UNKNOWN", "HostEngramHash"]
++def placed_by_host(requests: list, drafts: np.ndarray | None) -> list:
++    """``requests`` (``(first_row, rows, tokens, positions)`` in batch order) with the
++    host's positions dropped from every request with drafts (``drafts``, per request).
++
++    Adaptive verification gives verifying requests row counts the GPU chooses, but
++    keeps them at the front of the batch with the host's total, so a request after
++    them starts at the same row on the host and the GPU, and one among them does
++    not. A request still prefilling can carry drafts (the scheduler pads a prompt
++    with one token left to the verification width with placeholder drafts), so its
++    rows stay ``UNKNOWN`` for the GPU to hash. Verifying requests after one without
++    drafts would leave no row placed by the host, so the GPU hashes the whole step."""
++    if drafts is None:
++        return requests
++    verifying = np.flatnonzero(drafts)
++    front = len(verifying)
++    if front and verifying[-1] >= front:
++        front = len(requests)
++    empty = np.empty(0, dtype=np.int64)
++    return [
++        (first, rows, tokens, empty if i < front else positions)
++        for i, (first, rows, tokens, positions) in enumerate(requests)
++    ]
++
++
++__all__ = ["HEADS", "UNKNOWN", "HostEngramHash", "placed_by_host"]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 337857ba7..9c94d8371 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -352,7 +352,10 @@ class DeepseekV41ModelState(DefaultModelState):
+         or None when the step has no prefill chunk to hash."""
+         if not input_batch.has_prefill:
+             return None
+-        from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
++        from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
++            HostEngramHash,
++            placed_by_host,
++        )
+ 
+         if self._host_engram_hash is None:
+             layout = model.engram_hash.layout
+@@ -375,18 +378,9 @@ class DeepseekV41ModelState(DefaultModelState):
+                     start, min(start + rows, len(tokens)), dtype=np.int64
+                 )
+             requests.append((first, rows, tokens, positions))
+-        hashed = [i for i, (*_, positions) in enumerate(requests) if len(positions)]
+-        if not hashed:
++        requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
++        if not any(len(positions) for *_, positions in requests):
+             return None
+-        # Adaptive verification gives verifying requests row counts the GPU chooses,
+-        # but keeps them at the front of the batch with the host's total, so every
+-        # later request starts at the same row on the host and the GPU.
+-        drafts = input_batch.num_draft_tokens_per_req
+-        if drafts is not None and drafts[hashed[0] :].any():
+-            raise RuntimeError(
+-                "Engram host hash: a verifying request follows a prefill chunk, so "
+-                "the chunk's rows are placed by the GPU"
+-            )
+         return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
+ 
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+-- 
+2.54.0 (Apple Git-157)
+
