@@ -83,6 +83,35 @@ qualification and is reworked.
   32K and 131K level. The grid's gain is at small batches (1-4 requests, 1-2% faster); 12-16
   requests at depth 6 read about 1% slower against both candidate-10 boots. Stays in
   candidate 11.
+- **yield** (`c10-yield`, 2026-10-29): same text (greedy 64/64 identical, teacher-forced KL 0);
+  grid, c8, c1 and prefill level. The stall probe (131K cold prefill beside 11 of 16 decoding
+  streams, five repeats), against both candidate-10 boots:
+
+  | | candidate 10 | yield |
+  |---|---|---|
+  | decode gap p50 during the prefill | 1.371 / 2.115 s | 0.334 s |
+  | decode gap p99, worst | 2.28-2.69 s, 3.13 s | 2.32 s, 2.81 s (level) |
+  | short request TTFT p50 / max | 11.03 / 17.03 s | 3.51 / 4.89 s |
+  | long prompt's prefill under decode | 6,900 tok/s | 6,307 tok/s (-8.6%) |
+
+  At this depth yield shortens the streams' waits as well as the probes': the steps it gives
+  to probes carry no long chunk. The long prompt pays about 9% of its prefill time, as
+  designed.
+- **yield, depth** (`c10-yield-depth`, 2026-10-29): 131K cold prefill, four repeats a depth;
+  candidate 10 as the mean of its two boots (they agree within their intervals):
+
+  | streams of 16 | decode gap p50: c10 / yield | worst wait: c10 / yield | probe TTFT p50: c10 / yield | long prefill under decode |
+  |---|---|---|---|---|
+  | 3 | 0.69-0.92 / 0.086 s | 2.21-2.22 / 2.29 s (+3%) | 10.5 / 3.1 s | -8.8% |
+  | 7 | 1.48-2.09 / 0.316 s | 3.30-3.32 / 2.92 s (level) | 10.7 / 3.3 s | -9.3% |
+  | 11 | 2.11-2.12 / 0.333 s | 2.80-2.81 / 2.45 s (level) | 10.9 / 3.5 s | -10.2% |
+  | 15 | 2.12-2.13 / 2.114 s | 2.28-2.78 / 2.77 s (level) | (no probes) | level |
+
+  On the ring yield costs no decode median or p99 at any depth: with free slots the streams'
+  median gap falls 5-10 times, and at 15 (every slot taken during the prefill) yield is inert,
+  as its admission gate predicts. The one cost is at 3 streams, where the worst wait (and p99,
+  the same gap there) is 3% longer (margin 1.1%). The triangle's doubling at 6 of 8 (#650) does
+  not reproduce here; release-tp3's new stall steps (3, 6 and 7 of 8) measure it on TP3.
 
 - **copy, first run** (`c10-copy`, 2026-10-28): copy-control booted and passed its gates and
   `copy_probe.py`; the copy arm never became ready. Every worker failed in warmup at
