@@ -44,6 +44,12 @@ Each node then needs three fields the switchless maps do not use:
 | `roce_peer_hcas` | Every peer rank, each mapped to the **same ordered pair** of HCAs |
 | `roce_subnets` | One IPv4 `/24` per HCA in that pair, matching the peer's entry for the same lane |
 
+One optional field says how the hosts mark RoCE packets for the switch:
+
+| Field | Meaning |
+|---|---|
+| `roce_traffic_class` | The IP traffic class byte of every RoCE packet, `(DSCP << 2) \| ECN`, the same on every node; left out, both backends send 0 ([marking the lossless class](#marking-the-lossless-class)) |
+
 `management_ip` may sit on any reachable network. It is not required to be on a
 fabric lane: an API head on a management network is normal, and the bootstrap
 path is qualified at run time, not statically.
@@ -59,6 +65,10 @@ path is qualified at run time, not statically.
 - `SPARK_DEPLOYMENT_TRANSPORT` names the deployment's transport. The collective
   probe reads it to keep a physical switched fabric distinct from sparknet's
   `direct` kernel mode, which is the same mode on both fabrics.
+- `roce_traffic_class` becomes `NCCL_IB_TC`, and `SPARKNET_ROCE_TRAFFIC_CLASS`
+  as well under `oneshot-switched`, so both backends mark their packets alike.
+  A value outside 0-255, nodes that disagree, or either variable also set in
+  the environment is an error.
 
 ## Validation
 
@@ -106,6 +116,45 @@ configured or whether the fabric worked on default drop-and-retry behaviour.
 Qualify your own switch by setting a lossless class (PFC) or ECN marking, then
 watching pause and discard counters while a collective runs. If you measure the
 defaults, record that — "worked without PFC at four nodes" is itself useful.
+
+### Marking the lossless class
+
+A switch sorts RoCE packets into its classes by the DSCP in their IP header, and
+the sender chooses that DSCP: every queue pair carries one traffic class byte,
+DSCP in the upper six bits and ECN in the lower two. NCCL takes it from
+`NCCL_IB_TC`, sparknet from `SPARKNET_ROCE_TRAFFIC_CLASS` (falling back to
+`NCCL_IB_TC`), and both default to 0, the best-effort class. A lossless class on
+the switch therefore protects nothing until the hosts mark their packets with its
+DSCP. Unmarked, the collectives ride the default class, which drops under incast,
+and an all-reduce is incast by construction: every peer sends to one port at once.
+
+Set `roce_traffic_class` on every node to the byte that matches the switch. DSCP
+26 with ECN-capable transport, ECT(0), is `(26 << 2) | 2 = 106`. The host has to
+agree as well: the NIC maps that DSCP to a priority with PFC on it, on both
+interfaces of the pair, for example
+
+```sh
+sudo dcb app add dev enp1s0f1np1 dscp-prio 26:3
+sudo dcb pfc set dev enp1s0f1np1 prio-pfc 3:on
+```
+
+and the switch maps the same DSCP to its lossless queue. `dcb` state does not
+survive a reboot by itself; apply it from a boot-time unit.
+
+Losses in the wrong class need not show on the switch, so check the hosts. While
+the collective probe runs, `roce_adp_retrans` and `out_of_sequence` under
+`/sys/class/infiniband/<hca>/ports/1/hw_counters/` should stay put, and the
+marked priority's counters (`ethtool -S <interface> | grep prio3` for priority
+3) should carry the traffic.
+
+**Externally reported, not qualified here:** a switched GB10 site (MikroTik
+CRS804-4DDQ, PFC on DSCP 26 to priority 3, MTU 9000) measured `all_reduce_perf`
+over one PCIe path at the default traffic class with about 1,000
+`out_of_sequence` packets per run and bus bandwidth falling from 95 Gb/s at
+64 MB to 78 Gb/s at 512 MB, while the switch showed no drop, overflow or FCS
+error. With `NCCL_IB_TC=106` the same runs had no retransmissions and held
+88-92 Gb/s; both PCIe paths of the port, marked, reached 174-182 Gb/s
+(2026-10-17).
 
 ### One switch port, two device paths
 
