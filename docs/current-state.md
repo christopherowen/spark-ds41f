@@ -1,7 +1,41 @@
 # Current state
 
-Production is **spark-ds41f-1025** ([config/cluster.json](../config/cluster.json)), serving
-DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. Since 2026-10-26 21:46 CET it runs the
+Production is **spark-ds41f-1030** ([config/cluster.json](../config/cluster.json), frozen in
+[releases/spark-ds41f-1030](../releases/spark-ds41f-1030/)), serving DeepSeek-V4.1-Flash-1017 at
+1,048,576 tokens on the `tp4-ring` shape (dgx1-dgx4). It was promoted 2026-10-30 as
+[`2026-10-30-spark-ds41f-1030`](../manifests/baselines/2026-10-30-spark-ds41f-1030.json)
+([release record](../experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
+`spark-ds41f:1030` (built as `spark-ds41f:19f2c20ed4d6-next-14`, `sha256:7918fd6145b5`),
+candidate 14, spark-ds41f-1025's sources with vLLM 0491-0567 (patch head `b6de07aa`, tree
+`ea1281f8`). 0491 counts the startup KV figure as the pool holds it (11,554,122 tokens, 11.02
+full 1M contexts at the ring's 16,384 budget); 0493-0496 make TileLang the only kernel family
+and 0499 loads the checkpoint directly (`--load-format direct`, `VLLM_PLUGINS` empty); 0502-0503
+drop per-allocation KV zeroing; 0520-0525 and 0543-0544 run the decode chain under PDL with the
+attention front in one launch; 0526-0527 replay a prompt's last 128 CED rows wherever its chunks
+end; 0537-0538 load the MXFP8 block-scale grid by row block and make the grouped MoE GEMM's stage
+arrivals wait for every copy; 0539-0540 follow the DeepSeek API's effort aliases and prompt
+semantics; 0541-0542 serve GLP steering per request under `deepseek-v4.1-flash-weightless`; 0545
+is prefill yield (`--prefill-yield short`, 10 s); 0546-0562 and 0565 are IKET's debug mode, off;
+0563-0564 and 0566 store 2-bit expert scale codes in the 4-bit codes' buffer; 0567 has the GPU
+hash the Engram rows of a prefilling request that carries drafts (#677). Temperature-0 text is
+identical to spark-ds41f-1025's except multi-chunk prompts whose final chunk has 1-128 rows
+(0526). Against spark-ds41f-1025 in candidate 12's release comparison (one session, verdicts
+against the repeat; candidates 13 and 14 keep its digests and kernels): decode grid -4.62%; c16
++2.05%, c8 +2.02%, one stream +3.61% (paired decode); prefill +8.4% / +8.8% / +9.9% / +11.4% /
++12.2% at 32K / 131K / 262K / 524K / 1M; 131K prefill beside 15 streams +8.2%, beside 3 and 11
+the same; a short request's first token beside a 131K prefill 3.6-3.7x sooner; Poisson the same;
+sampled c16 +1.87%, c8 +2.77%, c1 +2.68%; greedy 256/256 identical, teacher-forced KL 4.2e-8.
+`tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-30-spark-ds41f-1030-tp4](../manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)
+(candidate 12's first release arm). `tp3-triangle` is not qualified on this image (its reference
+stays spark-ds41f-1025's); candidate 13's TP3 arms move to this image once the triangle is
+cabled (#668). spark-ds41f-1025's recipe and lock, the rollback, are frozen in
+[releases/spark-ds41f-1025](../releases/spark-ds41f-1025/) (image
+`spark-ds41f:19f2c20ed4d6-next-6`, still on every node).
+
+Before spark-ds41f-1030 production was **spark-ds41f-1025**, serving
+DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. From 2026-10-26 21:46 CET it ran the
 `tp4-ring` shape on dgx1-dgx4 again, after re-cabling. It was qualified on that shape first and
 served there from 2026-10-25 18:31, then on the `tp3-triangle` shape (dgx1-dgx3) from 22:18
 until 2026-10-26 08:10. It was promoted

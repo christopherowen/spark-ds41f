@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "promoted_baseline": "2026-10-25-spark-ds41f-1025",
+  "promoted_baseline": "2026-10-30-spark-ds41f-1030",
   "model": "v41-flash-1017",
   "models": {
     "v41-flash": {
@@ -18,11 +18,19 @@
     "temperature": 1.0,
     "top_p": 1.0
   },
+  "glp": {
+    "served_model_name": "deepseek-v4.1-flash-weightless",
+    "repo": "msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75",
+    "revision": "2715ffd51f59899115853e1118db080536966c44",
+    "file": "glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+    "sha256": "9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf",
+    "notes": "The published GLP vector for v41-flash-1017 (39 layers, alpha 0.75, MIT; a gated repository whose agreement the downloading account accepts). Requests to the served name are steered; the stock name beside it is unchanged."
+  },
   "container": {
     "name": "spark-ds41f",
-    "image": "spark-ds41f:19f2c20ed4d6-next-6",
+    "image": "spark-ds41f:1030",
     "expected_labels": {
-      "local.spark-ds41f.vllm.tree": "6f8e062f0cfb5b5fe016df9ef965499ed5ea8519",
+      "local.spark-ds41f.vllm.tree": "ea1281f880e7535e3d87725be0156a8e38fc2fb2",
       "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark-ds41f.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
@@ -81,11 +89,13 @@
     "OMP_NUM_THREADS": "8",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
     "SAFETENSORS_FAST_GPU": "1",
+    "SPARKNET_ROCE_ALLREDUCE_CAPACITY_BYTES": "2097152",
+    "SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152",
+    "SPARKNET_ROCE_PROXY_CPU": "big",
+    "SPARKNET_ROCE_TIMEOUT_MS": "10000",
     "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2",
     "SPARK_DS41F_DSPARK_MAIN_PROJ_TP": "1",
     "SPARK_DS41F_DSPARK_VOCAB_PARALLEL": "1",
-    "SPARKNET_ROCE_ALLREDUCE_CAPACITY_BYTES": "2097152",
-    "SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152",
     "TILELANG_CACHE_DIR": "/cache/spark-ds41f/jit/tilelang",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
     "TP_SOCKET_IFNAME": "enP7s7",
@@ -96,21 +106,18 @@
     "VLLM_CACHE_ROOT": "/cache/spark-ds41f/jit/vllm",
     "VLLM_DISABLE_PYNCCL": "0",
     "VLLM_DS41_HEAD_DTYPE": "float32",
-    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
     "VLLM_DS41_PACKED_BF16_LM_HEAD": "1",
     "VLLM_ENABLE_PCIE_ALLREDUCE": "0",
     "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "900",
     "VLLM_L2_PREFETCH_GRID": "2",
+    "VLLM_L2_PREFETCH_KERNELS": "tilelang",
     "VLLM_LATE_ADMISSION_LAYER": "30",
     "VLLM_MAX_IMAGE_PIXELS": "16777216",
-    "VLLM_PLUGINS": "b12x_loader",
+    "VLLM_PLUGINS": "",
     "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
-    "XDG_CACHE_HOME": "/cache/spark-ds41f/jit",
-    "SPARKNET_ROCE_PROXY_CPU": "big",
-    "VLLM_L2_PREFETCH_KERNELS": "tilelang",
-    "SPARKNET_ROCE_TIMEOUT_MS": "10000"
+    "XDG_CACHE_HOME": "/cache/spark-ds41f/jit"
   },
   "drafts": 5,
   "serve_args": [
@@ -128,7 +135,7 @@
     "--tensor-parallel-size",
     "${tensor_parallel_size}",
     "--load-format",
-    "b12x",
+    "direct",
     "--block-size",
     "256",
     "--enable-prefix-caching",
@@ -183,7 +190,11 @@
     "--limit-mm-per-prompt",
     "{\"image\":4}",
     "--mm-processor-cache-gb",
-    "0"
+    "0",
+    "--prefill-yield",
+    "short",
+    "--prefill-yield-limit-s",
+    "10"
   ],
   "distributed": {
     "master_addr": "10.0.1.71",
@@ -201,7 +212,7 @@
   "default_shape": "tp4-ring",
   "shapes": {
     "tp4-ring": {
-      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12). Its long-prefill budget is 16,384 from the release after spark-ds41f-1022: with the CED skip, +5.4-6.3% prefill over 8,192 for decode steps beside a long prompt about twice as long (experiments/2026-10-23-next-release).",
+      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12). Its long-prefill budget is 16,384 from the release after spark-ds41f-1022: with the CED skip, +5.4-6.3% prefill over 8,192 for decode steps beside a long prompt about twice as long (experiments/2026-10-23-next-release). spark-ds41f-1030 (candidate 14: candidate 12 with vLLM 0566 and 0567) serves the GLP-steered name beside the stock one and yields a long prompt's chunk to short requests (--prefill-yield short, 10 s); against spark-ds41f-1025 decode is 4.6% faster on the engine grid, prefill 8.4-12.2% faster from 32K to 1M, and the startup line reads 11,554,122 tokens (experiments/2026-10-26-spark-ds41f-candidate).",
       "nodes": 4,
       "nodes_config": "config/nodes-ring4.local.json",
       "fabric": {
@@ -252,10 +263,10 @@
         "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "0",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152"
       },
-      "benchmark_reference": "manifests/suites/2026-10-25-spark-ds41f-1025-tp4"
+      "benchmark_reference": "manifests/suites/2026-10-30-spark-ds41f-1030-tp4"
     },
     "tp3-triangle": {
-      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate). From the release after spark-ds41f-1025 it is 6,144 (owner, 2026-10-27), the prepared fallback (rc6/rc-tp3-6144.json): against 8,192 it gives up about 3% of prefill (1M 3,797 against 3,907 tok/s) for a median step beside a long prompt 21% shorter (1.143 s against 1.444 s; experiments/2026-10-19-prefill-budget-tp3). A site triangle measured the same trade on candidate 8 (#503: about 2% prefill at 131K for 24% longer stalls), with decode unchanged at every budget. The startup line at 6,144 reads 4,354,971 tokens; the pool still holds 5 full 1M contexts.",
+      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate). From the release after spark-ds41f-1025 it is 6,144 (owner, 2026-10-27), the prepared fallback (rc6/rc-tp3-6144.json): against 8,192 it gives up about 3% of prefill (1M 3,797 against 3,907 tok/s) for a median step beside a long prompt 21% shorter (1.143 s against 1.444 s; experiments/2026-10-19-prefill-budget-tp3). A site triangle measured the same trade on candidate 8 (#503: about 2% prefill at 131K for 24% longer stalls), with decode unchanged at every budget. The startup line at 6,144 reads 4,354,971 tokens; the pool still holds 5 full 1M contexts. spark-ds41f-1030 (candidate 14) is qualified on the ring only; its full qualification on the triangle runs once the triangle is cabled (candidate 13's TP3 arms and specs in experiments/2026-10-26-spark-ds41f-candidate/rc13, moved to candidate 14's image). Candidate 12's expert scale codes cost about 1.4 GiB a rank at TP3 (#668); 0566 returns it.",
       "nodes": 3,
       "nodes_config": "config/nodes.json",
       "fabric": {

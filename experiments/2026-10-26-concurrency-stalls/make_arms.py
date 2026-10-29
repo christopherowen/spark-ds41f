@@ -1,4 +1,4 @@
-"""Write the validation arms from the recipe (config/cluster.json).
+"""Write the validation arms from spark-ds41f-1025's recipe (releases/spark-ds41f-1025).
 
 - production-{tp4,tp3}.json: the recipe at the shape, unchanged.
 - prefill-yield-{tp4,tp3}.json: production with `--prefill-yield short --prefill-yield-limit-s 10`,
@@ -28,14 +28,15 @@ EXPERIMENT = "experiments/2026-10-26-concurrency-stalls"
 IMAGE_VLLM = "/opt/spark-ds41f/candidate/vllm"
 OVERLAY = ("vllm/v1/core/sched/scheduler.py", "vllm/config/scheduler.py", "vllm/engine/arg_utils.py")
 SHAPES = {"tp4": "tp4-ring", "tp3": "tp3-triangle"}
+RECIPE = "releases/spark-ds41f-1025/cluster.json"
 
 
 def base(shape: str) -> dict:
-    return {"extends": {"config": "config/cluster.json", "shape": shape}}
+    return {"extends": {"config": RECIPE, "shape": shape}}
 
 
 def resolved(shape: str) -> dict:
-    cluster = json.loads((ROOT / "config/cluster.json").read_text())
+    cluster = json.loads((ROOT / RECIPE).read_text())
     return recipe.resolve(cluster, shape)
 
 
@@ -53,7 +54,7 @@ def prefill_yield(shape: str) -> dict:
 
 
 def slots(shape: str, seqs: int) -> dict:
-    cluster = json.loads((ROOT / "config/cluster.json").read_text())
+    cluster = json.loads((ROOT / RECIPE).read_text())
     entry = cluster["shapes"][shape]
     sizing = entry["sizing"]
     drafts = int(cluster["drafts"])

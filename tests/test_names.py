@@ -16,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+# A recipe frozen for these tests, so a release does not move them.
+FIXTURE = "tests/fixtures/cluster.json"
 loader = importlib.machinery.SourceFileLoader("spark_names_test", str(ROOT / "bin" / "spark"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 spark = importlib.util.module_from_spec(spec)
@@ -152,7 +154,7 @@ class RenamedRecipeTest(unittest.TestCase):
     doctor --live) refuse such an image instead of serving it under the wrong names."""
 
     def test_the_renamed_recipe_refuses_an_image_built_before_the_rename(self) -> None:
-        recipe = spark.read_cluster("config/cluster.json", "tp4-ring")
+        recipe = spark.read_cluster(FIXTURE, "tp4-ring")
         self.assertTrue(all(key.startswith(source_labels.PREFIX) for key in recipe["container"]["expected_labels"]))
         old_image = {key.replace(source_labels.PREFIX, source_labels.LEGACY_PREFIX, 1): value
                      for key, value in recipe["container"]["expected_labels"].items()}

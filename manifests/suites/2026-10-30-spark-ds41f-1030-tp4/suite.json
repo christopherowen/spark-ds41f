@@ -1,0 +1,464 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "release",
+  "version": 3,
+  "description": "Release measurement, about 60 minutes a build: the screen with all 256 prompts, eight streams as well, Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput under a 2 s time to first token and 100 ms per output token, decode stalls while a cold 131K prompt prefills at three depths of the sixteen slots (3 and 11 streams, with short probes sent 2-14 s into it, whose time to first token is what a new conversation waits; 15 streams, which fills every slot during the prefill), and real-text prefill from 32K to 1M. Its grid needs the dev-mode collective RPC.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "concurrency": 16,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1
+    }
+   },
+   {
+    "id": "c16",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 16,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c8",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 8,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "poisson",
+    "command": "run",
+    "args": {
+     "mode": "poisson",
+     "rate": 0.7,
+     "warmup": 60,
+     "duration": 300,
+     "slo_ttft": 2,
+     "slo_tpot": 100,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "stall-3",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 3,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-11",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 11,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-15",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 15,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072,
+      262144,
+      524288,
+      1000000
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "2c1698722fafa68c534a2197673c418fa9b465c0dbaa70f53d9105a4271c4d87",
+ "label": "candidate-12",
+ "corpus": null,
+ "started_utc": "2026-10-29T17:16:12+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 295.9
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 105.3
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "output": "c16.json",
+   "exit": 0,
+   "seconds": 370.0
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "output": "c8.json",
+   "exit": 0,
+   "seconds": 365.4
+  },
+  {
+   "id": "poisson",
+   "command": "run",
+   "output": "poisson.json",
+   "exit": 0,
+   "seconds": 366.1
+  },
+  {
+   "id": "stall-3",
+   "command": "stall",
+   "output": "stall-3.json",
+   "exit": 0,
+   "seconds": 128.4
+  },
+  {
+   "id": "stall-11",
+   "command": "stall",
+   "output": "stall-11.json",
+   "exit": 0,
+   "seconds": 130.5
+  },
+  {
+   "id": "stall-15",
+   "command": "stall",
+   "output": "stall-15.json",
+   "exit": 0,
+   "seconds": 124.0
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 975.7
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-10-26-spark-ds41f-candidate/rc12/rc-tp4-dev.json",
+   "cluster_config_sha256": "d68531f9317a4f10111f46f789a07040bb27e356758c367031e653e34df9b663",
+   "nodes_config": "config/nodes-ring4.local.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "swank",
+    "nodes": [
+     {
+      "name": "dgx1",
+      "rank": 0,
+      "head": true,
+      "management_ip": "10.0.1.71",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "1": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "3": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.12.1.0/24",
+       "roceP2p1s0f0": "10.12.2.0/24",
+       "rocep1s0f1": "10.14.1.0/24",
+       "roceP2p1s0f1": "10.14.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:7e:80:91",
+        "address": "10.12.1.1/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:7e:80:95",
+        "address": "10.12.2.1/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:7e:80:92",
+        "address": "10.14.1.1/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:7e:80:96",
+        "address": "10.14.2.1/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024
+     },
+     {
+      "name": "dgx2",
+      "rank": 1,
+      "head": false,
+      "management_ip": "10.0.1.72",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "2": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "0": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.23.1.0/24",
+       "roceP2p1s0f0": "10.23.2.0/24",
+       "rocep1s0f1": "10.12.1.0/24",
+       "roceP2p1s0f1": "10.12.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:2e:bc:c3",
+        "address": "10.23.1.2/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:2e:bc:c7",
+        "address": "10.23.2.2/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:2e:bc:c4",
+        "address": "10.12.1.2/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:2e:bc:c8",
+        "address": "10.12.2.2/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024,
+      "transfer_host": "dgx2-internal"
+     },
+     {
+      "name": "dgx3",
+      "rank": 2,
+      "head": false,
+      "management_ip": "10.0.1.73",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "3": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "1": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.34.1.0/24",
+       "roceP2p1s0f0": "10.34.2.0/24",
+       "rocep1s0f1": "10.23.1.0/24",
+       "roceP2p1s0f1": "10.23.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:e9:7f:2b",
+        "address": "10.34.1.3/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:e9:7f:2f",
+        "address": "10.34.2.3/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:e9:7f:2c",
+        "address": "10.23.1.3/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:e9:7f:30",
+        "address": "10.23.2.3/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024
+     },
+     {
+      "name": "dgx4",
+      "rank": 3,
+      "head": false,
+      "management_ip": "10.0.1.74",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "2": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.14.1.0/24",
+       "roceP2p1s0f0": "10.14.2.0/24",
+       "rocep1s0f1": "10.34.1.0/24",
+       "roceP2p1s0f1": "10.34.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:eb:1e:0d",
+        "address": "10.14.1.4/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:eb:1e:11",
+        "address": "10.14.2.4/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:eb:1e:0e",
+        "address": "10.34.1.4/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:eb:1e:12",
+        "address": "10.34.2.4/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024,
+      "transfer_host": "dgx4-internal"
+     }
+    ]
+   },
+   "transport": "oneshot-ring4",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-25-spark-ds41f-1025",
+   "image": "spark-ds41f:19f2c20ed4d6-next-12",
+   "client_commit": "6fa33a36da3d9bacdc1e62c552a8a6ec4c568728",
+   "client_dirty": false,
+   "client_host": "dgx1",
+   "nodes": {
+    "dgx1": {
+     "image_id": "sha256:2d9c2cc6afd6417affae62e98f7fca84ecd6f207455338fdbd0e01f229e05bd2",
+     "container_started_at": "2026-10-29T17:14:31.665700661Z",
+     "checkout": "6fa33a36da3d9bacdc1e62c552a8a6ec4c568728"
+    },
+    "dgx2": {
+     "image_id": "sha256:2d9c2cc6afd6417affae62e98f7fca84ecd6f207455338fdbd0e01f229e05bd2",
+     "container_started_at": "2026-10-29T17:14:30.494796075Z",
+     "checkout": "6fa33a36da3d9bacdc1e62c552a8a6ec4c568728"
+    },
+    "dgx3": {
+     "image_id": "sha256:2d9c2cc6afd6417affae62e98f7fca84ecd6f207455338fdbd0e01f229e05bd2",
+     "container_started_at": "2026-10-29T17:14:30.883745925Z",
+     "checkout": "6fa33a36da3d9bacdc1e62c552a8a6ec4c568728"
+    },
+    "dgx4": {
+     "image_id": "sha256:2d9c2cc6afd6417affae62e98f7fca84ecd6f207455338fdbd0e01f229e05bd2",
+     "container_started_at": "2026-10-29T17:14:31.280676562Z",
+     "checkout": "6fa33a36da3d9bacdc1e62c552a8a6ec4c568728"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": []
+  }
+ },
+ "finished_utc": "2026-10-29T18:03:53+00:00"
+}

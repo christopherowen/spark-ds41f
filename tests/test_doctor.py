@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# A recipe frozen for these tests, so a release does not move them.
+FIXTURE = "tests/fixtures/cluster.json"
 loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
 spec = importlib.util.spec_from_loader("spark", loader)
 spark = importlib.util.module_from_spec(spec)
@@ -535,7 +537,7 @@ SPARKNET_BIND = "/home/swank/sparknet-port/sparknet:/usr/local/lib/python3.12/di
 
 class LiveMountsTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster = spark.read_cluster("config/cluster.json", "tp4-ring")
+        self.cluster = spark.read_cluster(FIXTURE, "tp4-ring")
         self.wanted = spark.expected_binds(self.cluster)
 
     def test_docker_run_is_given_the_compared_binds(self) -> None:
@@ -589,12 +591,12 @@ class CheckoutPlaceholderTest(unittest.TestCase):
     unavailable rw source."""
 
     def site(self, path: str) -> dict:
-        base = spark.read_cluster("config/cluster.json", "tp3-triangle")
+        base = spark.read_cluster(FIXTURE, "tp3-triangle")
         return spark.cluster_recipe.overlay({"extends": {}, "set": {"deployment": {"path": path}}}, base)
 
     def test_our_recipe_resolves_to_the_production_binds_at_every_shape(self) -> None:
         for shape in ("tp4-ring", "tp3-triangle", "tp3-triangle-4k"):
-            cluster = spark.read_cluster("config/cluster.json", shape)
+            cluster = spark.read_cluster(FIXTURE, shape)
             self.assertIn(["{checkout}/cache", "/cache", "rw"], cluster["container"]["mounts"])
             self.assertEqual(spark.expected_binds(cluster), PRODUCTION_BINDS)
             self.assertEqual(spark.repository_path(cluster), "/home/swank/projects/spark-ds41f")
@@ -639,7 +641,7 @@ def container_env(wanted: dict[str, str]) -> list[str]:
 
 class LiveEnvironmentTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster = spark.read_cluster("config/cluster.json", "tp4-ring")
+        self.cluster = spark.read_cluster(FIXTURE, "tp4-ring")
         site = spark.json.loads((ROOT / "config" / "examples" / "nodes-ring4.json").read_text())
         self.node = site["nodes"][0]
         self.wanted = spark.expected_environment(self.cluster, self.node)
@@ -1037,10 +1039,10 @@ class GLPTest(unittest.TestCase):
         self.assertEqual(spark.glp_problems(cluster), [])
 
     def test_a_profile_without_steering_passes(self) -> None:
-        self.assertEqual(spark.glp_problems(spark.read_cluster("config/cluster.json")), [])
+        self.assertEqual(spark.glp_problems(spark.read_cluster(FIXTURE)), [])
 
     def test_steering_by_hand_is_reported(self) -> None:
-        cluster = spark.read_cluster("config/cluster.json")
+        cluster = spark.read_cluster(FIXTURE)
         cluster["environment"]["WEIGHTLESS_STEER_PATH"] = "/glp/vector.gguf"
         self.assertIn("without a glp block", spark.glp_problems(cluster)[0])
 
