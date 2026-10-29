@@ -533,6 +533,12 @@ class StallTest(unittest.TestCase):
         self.assertEqual(stall.split_gaps(events, 2.5, 5.5), ([1.0, 1.0], [3.0, 1.0]))
         self.assertEqual(stall.split_gaps(events[:1], 0.5, 1.0), ([], []))
 
+    def test_admission_is_the_gaps_before_the_first_chunk_step(self):
+        gaps = [(0.0, 0.08), (0.08, 0.07), (0.15, 2.2), (2.35, 0.08), (2.43, 2.1)]
+        self.assertEqual(stall.admission(gaps, 0.08), 2)
+        self.assertEqual(stall.admission(gaps[:2], 0.08), 0)
+        self.assertEqual(stall.admission(gaps, None), 0)
+
     def test_long_share_counts_the_steps_a_chunk_held(self):
         self.assertEqual(stall.long_share([0.1, 2.2, 0.1, 2.3], 0.1), 0.5)
         self.assertIsNone(stall.long_share([], 0.1))
@@ -544,7 +550,7 @@ class StallTest(unittest.TestCase):
                     f'vllm:iteration_tokens_total_bucket{{engine="0",le="1024.0"}} {small}\n'
                     f'vllm:iteration_tokens_total_bucket{{engine="0",le="+Inf"}} {total}\n')
         window = stall.engine_window(scrape(100, 110), scrape(116, 134))
-        self.assertEqual((window["steps"], window["chunk_steps"]), (24, 8))
+        self.assertEqual(window["steps"], 24)
         self.assertEqual(window["buckets"], [["64.0", 16], ["1024.0", 16], ["+Inf", 24]])
         self.assertIsNone(stall.engine_window(None, scrape(1, 1)))
 
@@ -569,12 +575,12 @@ class StallTest(unittest.TestCase):
                 self.assertGreaterEqual(sample["stall_s"], 0.25)
                 self.assertLess(sample["before_s"]["p50"], 0.05)
                 self.assertGreater(sample["long_share"], 0)
-                self.assertEqual(len(sample["gaps"]), sample["during_s"]["n"])
-                stream, start, length = max(sample["gaps"], key=lambda gap: gap[2])
+                self.assertEqual(sum(not gap[3] for gap in sample["gaps"]), sample["during_s"]["n"])
+                stream, start, length, admitted = max(sample["gaps"], key=lambda gap: gap[2])
+                self.assertFalse(admitted)
                 self.assertIn(stream, range(3))
                 self.assertLess(start, sample["ttft_s"])
                 self.assertEqual(length, round(sample["stall_s"], 4))
-                self.assertEqual(sample["engine"]["chunk_steps"], 1)
                 self.assertGreaterEqual(sample["engine"]["steps"], 1)
             rows = stall.summarize(samples)
             self.assertEqual(rows[0]["failed"], 0)
@@ -660,7 +666,7 @@ class StallTest(unittest.TestCase):
                     self.assertEqual(cli.main(["suite", fake.url, "--suite", path, "--out", out]), 0)
                 result = suite.compare(cli.read_json, base, cand, lambda b, c: cli.compare_results(b, c, 3.0))
                 self.assertEqual(result["steps"]["stall"][0], stall.SCHEMA)
-                self.assertEqual(len(result["steps"]["stall"][1]["rows"]), 6)
+                self.assertEqual(len(result["steps"]["stall"][1]["rows"]), 7)
         finally:
             fake.close()
 

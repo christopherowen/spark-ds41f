@@ -6,18 +6,20 @@ sets how much longer. ``streams`` requests decode (fixed length, fresh cache sal
 default prompt set); after a warm-up, the prefill step's cold real-text document of
 ``size`` tokens is sent for one output token. A stream's gaps between output chunks are
 its step times: those that ended before the document was sent are the decode baseline,
-and those that overlap the document's prefill (sent to first token) are the stall. The
-longest overlapping gap is the worst wait any stream saw. Their mean, p90 and p99 show how
-slowly decoding ran meanwhile, and the long share is the fraction of them longer than
-twice the baseline step: the steps a prefill chunk held up. The median is not compared:
-each chunk step makes one long gap and the steps between chunks short ones, about as many,
-so the median lands on either side from one repeat to the next while the mean and p90 do
-not move. Each repeat keeps its raw overlapping gaps (stream, start after the document was
-sent, length) for a histogram, and with vLLM the engine steps run while the document
-prefilled, from the step-tokens histogram scraped as it was sent and at its first token:
-if each stream saw a gap a step, the short gaps are steps that only decoded; if it saw
-two a step, they are one step's output sent as two chunks. The streams stop ``tail_s`` after the document's first
-token, so each records the chunk that ends its wait. A repeat fails unless every stream
+and those that overlap the document's prefill are the stall. The prefill starts after the
+server has tokenized and admitted the document, and until then the streams decode at their
+baseline: a stream's overlapping gaps before its first one longer than ``LONG_GAP_FACTOR``
+baseline steps are the admission (``admission_s``, sent to that gap's start, the streams'
+median), and the stall's gaps are those from it to the first token. The longest is the worst
+wait any stream saw; their mean, p90 and p99 show how slowly decoding ran meanwhile, and the
+long share is the fraction of them a prefill chunk held up. The median is not compared: with
+the admission's gaps counted, about as many short gaps as chunk steps put it on either side
+from one repeat to the next. Each repeat keeps every overlapping gap (stream, start after
+the document was sent, length, whether it was the admission's) and, with vLLM, the engine
+steps between the document's send and its first token, from the step-tokens histogram (vLLM
+counts a prompt's tokens at its first token, so the histogram does not tell chunk steps from
+decode steps; the count does: about one a stream's gap). The streams stop ``tail_s`` after
+the document's first token, so each records the chunk that ends its wait. A repeat fails unless every stream
 decoded across the whole prefill.
 
 ``probes`` sends short cold requests (``probe_tokens`` of real text, fresh cache salts)
@@ -36,8 +38,6 @@ SCHEMA = "servebench-stall/1"
 # A gap this many times the baseline step's median is a step a prefill chunk held up.
 LONG_GAP_FACTOR = 2.0
 STEP_HISTOGRAM = "vllm:iteration_tokens_total"
-# A step over this many tokens carried a prefill chunk: decode alone stays far below.
-CHUNK_STEP_TOKENS = 1024
 
 
 def split_gaps(events: list, sent: float, first: float) -> tuple[list[float], list[float]]:
@@ -61,9 +61,19 @@ def overlapping(events: list, sent: float, first: float, before: list | None = N
     return gaps
 
 
+def admission(gaps: list[tuple[float, float]], baseline: float | None) -> int:
+    """How many of a stream's overlapping gaps came before the prefill's first chunk step:
+    those before the first longer than ``LONG_GAP_FACTOR`` baseline steps (none if no gap is)."""
+    if not baseline:
+        return 0
+    for index, (_, length) in enumerate(gaps):
+        if length > LONG_GAP_FACTOR * baseline:
+            return index
+    return 0
+
+
 def engine_window(start: str | None, end: str | None) -> dict | None:
-    """The engine steps between two /metrics scrapes, by tokens per step: ``chunk_steps``
-    carried more than ``CHUNK_STEP_TOKENS`` (a prefill chunk), the rest only decoded."""
+    """The engine steps between two /metrics scrapes, and their step-tokens histogram."""
     if start is None or end is None:
         return None
     before = prom.by_label(start, STEP_HISTOGRAM + "_bucket", "le")
@@ -71,9 +81,7 @@ def engine_window(start: str | None, end: str | None) -> dict | None:
     buckets = {bound: after[bound] - before.get(bound, 0.0) for bound in sorted(after, key=float)}
     if not buckets:
         return None
-    steps = buckets[max(buckets, key=float)]
-    decode = next((count for bound, count in buckets.items() if float(bound) == CHUNK_STEP_TOKENS), None)
-    return {"steps": steps, "chunk_steps": None if decode is None else steps - decode,
+    return {"steps": buckets[max(buckets, key=float)],
             "buckets": [[bound, count] for bound, count in buckets.items()]}
 
 
@@ -82,9 +90,8 @@ def engine_note(sample: dict) -> str:
     engine = sample.get("engine")
     if not engine or not sample["covering"]:
         return ""
-    chunks = "?" if engine["chunk_steps"] is None else f"{engine['chunk_steps']:.0f}"
-    return (f", engine steps {engine['steps']:.0f} ({chunks} with a chunk), "
-            f"gaps a stream {sample['during_s']['n'] / sample['covering']:.1f}")
+    return (f", engine steps {engine['steps']:.0f}, "
+            f"overlapping gaps a stream {len(sample['gaps']) / sample['covering']:.1f}")
 
 
 def long_share(during: list[float], baseline: float | None) -> float | None:
@@ -151,15 +158,23 @@ def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *
     for thread in probers:
         thread.join()
     sent, first = record["sent"], record["first"]
-    before, during, gaps, covering = [], [], [], 0
+    before, by_stream, covering = [], {}, 0
     for index, stream in enumerate(records):
         events = (stream or {}).get("events") or []
         if first is None or not events or events[0][0] >= sent or events[-1][0] < first:
             continue
         covering += 1
-        for start, length in overlapping(events, sent, first, before):
-            during.append(length)
-            gaps.append([index, round(start - sent, 4), round(length, 4)])
+        by_stream[index] = overlapping(events, sent, first, before)
+    before_s = stats.percentiles(before)
+    during, gaps, admitted = [], [], []
+    for index, stream_gaps in by_stream.items():
+        waited = admission(stream_gaps, before_s.get("p50"))
+        if stream_gaps:
+            admitted.append(stream_gaps[waited][0] - sent if waited else 0.0)
+        for k, (start, length) in enumerate(stream_gaps):
+            gaps.append([index, round(start - sent, 4), round(length, 4), k < waited])
+            if k >= waited:
+                during.append(length)
     tokens = record["prompt_tokens"] or counted
     ttft = first - sent if first is not None else None
     error = record["error"]
@@ -176,11 +191,11 @@ def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *
     if error is None and any(row["error"] or row["ttft_s"] is None for row in probe_rows):
         error = "a probe failed"
     probe_ttfts = [row["ttft_s"] for row in probe_rows if row["during"] and row["ttft_s"] is not None]
-    before_s = stats.percentiles(before)
     return {"size": size, "prompt_tokens": tokens, "ttft_s": ttft,
             "tps": tokens / ttft if tokens and ttft else None, "streams": len(texts), "covering": covering,
             "before_s": before_s, "during_s": stats.percentiles(during),
             "long_share": long_share(during, before_s.get("p50")), "gaps": gaps, "engine": engine,
+            "admission_s": stats.percentiles(admitted).get("p50"),
             "stall_s": max(during) if during else None, "probes": probe_rows,
             "probe_ttft_s": stats.percentiles(probe_ttfts),
             "probe_ttft_max_s": max(probe_ttfts) if probe_ttfts else None, "error": error}
@@ -205,7 +220,8 @@ def run(base_url: str, model: str, sizes: list[int], *, streams: int = 8, max_to
             log(f"servebench: stall {size} repeat {repeat + 1}/{repeats}: "
                 + (f"worst {sample['stall_s']:.2f} s, decode mean {sample['during_s']['mean']:.3f} s, "
                    f"p90 {sample['during_s']['p90']:.3f} s, p99 {sample['during_s']['p99']:.3f} s, "
-                   f"long {100 * (sample['long_share'] or 0):.0f}% "
+                   f"long {100 * (sample['long_share'] or 0):.0f}%, "
+                   f"admission {sample['admission_s'] or 0:.2f} s "
                    f"(baseline {sample['before_s'].get('p50', float('nan')):.3f} s)"
                    + engine_note(sample)
                    + (f", probe TTFT p50 {sample['probe_ttft_s']['p50']:.2f} s" if sample["probe_ttft_s"]["n"] else "")
@@ -219,6 +235,7 @@ def summarize(samples: list[dict]) -> list[dict]:
         ok = [s for s in samples if s["size"] == size and s["error"] is None]
         series = {"stall_s": [s["stall_s"] for s in ok],
                   "during_mean_s": [s["during_s"]["mean"] for s in ok],
+                  "admission_s": [s["admission_s"] for s in ok if s.get("admission_s") is not None],
                   "during_p90_s": [s["during_s"]["p90"] for s in ok],
                   "during_p99_s": [s["during_s"]["p99"] for s in ok],
                   "long_share": [s["long_share"] for s in ok if s.get("long_share") is not None],
@@ -236,6 +253,7 @@ def summarize(samples: list[dict]) -> list[dict]:
 METRICS = (("stall_s", "worst decode wait during {size:,} prefill (s)", False),
            ("during_p99_s", "decode step p99 during {size:,} prefill (s)", False),
            ("during_mean_s", "decode step mean during {size:,} prefill (s)", False),
+           ("admission_s", "decode before {size:,} prefill's first chunk (s)", False),
            ("during_p90_s", "decode step p90 during {size:,} prefill (s)", False),
            ("long_share", "share of decode steps a chunk held during {size:,} prefill", False),
            ("tps", "prefill {size:,} tok/s under decode", True),
