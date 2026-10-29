@@ -56,6 +56,23 @@ before the prefill step (500-token probes 2-14 s into a cold 131K prefill beside
 streams, five repeats). Bundle `yield` (dgx4): the yield and aligned-chunk scheduler tests.
 Read the probe's TTFT, and the c8, c1 and prefill rows for cost (claim: level).
 
+### Depth (`yield-depth.json`, against candidate 10)
+
+A site triangle (TP3, `max_num_seqs` 8, our recipe) measured on #650 that yield cuts a
+probe's TTFT behind a 132K prefill 4.52 s to 1.68 s, but at 6 decoding streams takes the
+median decode gap during the prefill from 9.7 to about 18 times the baseline, candidate 8's
+level. Candidate 10 alone was 9.2 times at 7 streams and 1.2 times at 8. At 8 the long
+prompt waits for a slot rather than prefilling beside the streams, so that row is queueing,
+not interleaving. Yield acts only while the scheduler can admit (`len(running) <
+max_num_seqs`), so its effect depends on depth; `yield.json` measures one depth, 11 of 16.
+By design it never removes decode rows from a step, so the doubling is unexplained.
+
+`yield-depth-suite.json` runs only the stall step, 131K, four repeats, at 3, 7 and 11
+streams with the probes and at 15 without (15 and the long prompt fill the sixteen slots).
+Read the decode p50/p99 and the probe TTFT at each depth. Yield stays in candidate 11 only
+if no depth shows a decode cost; otherwise it leaves the series before candidate 11's
+qualification and is reworked.
+
 ## Results
 
 (Filled in as each spec lands.)

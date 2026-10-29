@@ -99,13 +99,17 @@ Built in:
 - `screen`, about 18 minutes a build: model behaviour on 128 prompts (first, so it also
   heat-soaks the GPU), the engine grid, sixteen streams in a closed loop, and prefill at
   32K and 256K.
-- `release` (version 2), about 51 minutes: all 256 prompts, eight streams as well,
+- `release` (version 3), about 60 minutes: all 256 prompts, eight streams as well,
   Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput
-  under a 2 s time to first token and 100 ms per output token, and prefill from 32K to
-  1M. Version 1 had no Poisson step.
+  under a 2 s time to first token and 100 ms per output token, stalls during a 131K
+  prefill at three depths, and prefill from 32K to 1M. The stall steps run 3 and 11
+  streams with short probes, and 15, which with the long prompt fills every slot: the
+  scheduler admits nothing during the prefill, and a scheduler change can help one depth
+  and cost another. Version 1 had no Poisson step, version 2 no stall steps.
 - `screen-tp3` and `release-tp3`: the same for a server of eight streams and 512K of
   context. They run eight (and four) streams, the grid up to eight requests
-  (`--max-requests`), Poisson at 0.42 requests/s and prefill to 500K.
+  (`--max-requests`), Poisson at 0.42 requests/s, stalls at 3, 6 and 7 streams, and
+  prefill to 500K. `release-tp3` version 1 had no stall steps.
 
 Every built-in suite times the engine grid, so it needs a development server (below).
 
@@ -131,6 +135,13 @@ stall. It reports the worst overlapping gap (the longest step that carried a pre
 chunk, which the long-prefill budget sets), the overlapping gaps' median and p99, the
 baseline median and the prefill rate under decode. A repeat fails unless every stream
 decoded across the whole prefill (`--max-tokens` must outlast warm-up and prefill).
+
+Measure more than one depth. With free slots the scheduler can admit work during the
+prefill, and policies that reorder admitted work act only then; at `--max-num-seqs` − 1
+streams the long prompt takes the last slot and nothing else is admitted until it ends.
+At `--max-num-seqs` streams the long prompt waits for a slot instead of stalling anyone:
+low decode gaps there are queueing, not interleaving, and the step fails because the
+streams stop before it prefills.
 
 `--probes 2,5,8` also sends short cold requests that many seconds after the document
 (`--probe-tokens` of real text, default 500; `--probe-max-tokens`, default 64) and reports
