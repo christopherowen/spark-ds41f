@@ -447,6 +447,27 @@ floor.
   Maximizing expected tokens minus a running-rate-weighted cost may be closer
   to the long-run optimum. Neither the marginal rule (0006) nor the cost-aware
   dead-row count (0011) beat the current configuration.
+- **Verify rows across requests by expected tokens per modelled millisecond**
+  ([sparkflash](https://github.com/allenh1/sparkflash/blob/main/docs/performance.md),
+  2026-10-29). Each step it gives up to 64 verify rows to the likeliest drafts
+  across all decoding sequences, ranked by expected accepted tokens per
+  millisecond of a cost model of the step. It reports 5.3-5.7 tokens a step on
+  code and about 3 on prose at one stream, the same as SGLang. Our draft budget
+  admits the globally best slots by survival (`assign_draft_budget`), and the
+  verify length is chosen per step against the profiled cost. Compare the two
+  rules at 4-16 streams on a replayed draft trace. A rule that ranks slots by
+  marginal tokens per marginal millisecond prices the batch's step, not one
+  request's.
+- **Speculation that holds at high concurrency** (sparkflash, same source). It
+  speculates for up to 32 sequences in one step, drafted in passes of sixteen,
+  and keeps 4.2 tokens a step at sixteen code streams and 2.3 on prose (from
+  5.7 and 3.2 at one stream). Record our tokens a step at 8 and 16 streams from
+  the release and sampled suites' accounting rows. If they fall faster than
+  that, find which limit binds first (draft budget, verify-row cap, dead-row
+  cut, capture sizes) and raise it. Its step grows from about 43 ms at one code
+  stream to about 125 ms at eight, because its decode GEMVs run on CUDA cores
+  for batch invariance. Our batch-invariant kernels cost less per extra row, so
+  the same policy may pay more here.
 - **Cost-profile noise.** The startup cost profile takes the median of five
   replays and varies between boots. One pinned table across a fresh boot and
   two restarts gave 51.8, 51.2 and 51.8 tok/s on single-stream prose
