@@ -721,3 +721,12 @@ staying on the ring.
   candidate 13, candidate 12 again). It passes with every digest equal to candidate 12's, speed
   level, and model loading about 1 GiB a rank below candidate 12's at TP4 (candidate 10's
   71.67 GiB) and about 1.4 GiB at TP3.
+- **On the ring: a fix check, not a requalification** (owner, 2026-10-29: ship 0566 at TP4 if it
+  works, the full qualification at TP3). [rc13/fix-tp4.json](rc13/fix-tp4.json), run
+  `candidate-13-fix-tp4`, about 45 min: the image; the two scale-code test files on dgx4
+  ([rc13/bundles/scale-codes](rc13/bundles/scale-codes), the GPU bit-match of mixed narrow and wide
+  experts against the uncoded GEMM); one candidate 13 boot with the determinism gate (with and
+  without logprobs), the 16K SP prompt, the memory snapshot and the startup lines. It works if
+  every digest equals candidate 12's in `candidate-12-tp4` (the same checks on its own boot) and
+  model loading is about 1 GiB a rank lower (candidate 12: 72.72 GiB). Candidate 12's release comparison
+  against 1025 (`candidate-12-release-tp4`) then stands for candidate 13 on the ring.
