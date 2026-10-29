@@ -266,12 +266,13 @@ differs only in cabling, transport and memory sizing):
   argument as torch does;
 - 1,048,576-token per-request limit, eight admitted sequences, and a 4.90625
   GiB-per-rank cache that holds five full 1M contexts at once, or all eight
-  sequences at up to 666,880 tokens (spark-ds41f-1025's startup line: 4,009,281
-  tokens, 3.82x; [KV capacity](docs/memory-profiles.md#kv-capacity));
-- one concurrent prefill, 8,192 batched tokens, and fail-closed 5 GiB startup
-  and 3 GiB steady memory guards;
-- FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): only the
-  sampler uses FlashInfer, and the pass saved no configs.
+  sequences at up to 682,240 tokens (the startup line at 6,144 batched tokens:
+  4,354,971 tokens, 4.15x; [KV capacity](docs/memory-profiles.md#kv-capacity));
+- one concurrent prefill, 6,144 batched tokens (8,192 in spark-ds41f-1025), and
+  fail-closed 5 GiB startup and 3 GiB steady memory guards;
+- FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): serving runs
+  no FlashInfer kernel (top-k/top-p filtering is TileLang since spark-ds41f-1025,
+  vLLM 0436), and the pass saved no configs.
 
 One content-addressed image runs on all three nodes and passes the LRU
 coherence gate 5/5; see [Performance](#performance).
