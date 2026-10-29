@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vedcsolution <vedcsolution@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:20:00 +0100
+Subject: [PATCH 540/540] [DS4.1] SP row exchange tests at five and six ranks
+
+The sequence-parallel row exchange and PyNCCL's all_to_all_rows only relay
+at four ranks (the switchless ring); every other rank count sends each peer
+its block directly. Their tests covered three and four ranks; they now also
+run five and six, the switch's TP5 and TP6, with the last blocks short or
+empty as before. No code changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../models/test_deepseek_v41_sp_project_reduce_scatter.py  | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 1a2c9c4..c9851fe 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -278,7 +278,7 @@ def test_moe_combine_writes_the_exchange_slots(
+ 
+ 
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+-@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("world", [3, 4, 5, 6])
+ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
+     monkeypatch, tokens, world
+ ):
+@@ -355,13 +355,14 @@ class _Fabric:
+         self.barrier.wait()
+ 
+ 
+-@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("world", [3, 4, 5, 6])
+ @pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
+ def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+     """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
+     rank's block of its real rows bit for bit and later rows stay unwritten, with the
+     last blocks short or empty; at four ranks (the switchless ring) only neighbours
+-    exchange, since ranks two apart share no cable."""
++    exchange, since ranks two apart share no cable; other rank counts (three on a
++    triangle, five and six on a switch) exchange with every peer directly."""
+     total = max(1, world * rows - short)
+     fabric = _Fabric(world)
+     inputs = [torch.randn(total, 6) for _ in range(world)]
