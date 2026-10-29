@@ -1,0 +1,87 @@
+From 267929f3e44ab22efbc6831be4523fcbe8a234a4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:49:32 +0100
+Subject: [PATCH 7/8] [DS4.1] Copy drafts: the decode arena holds every request
+ at the reorder threshold
+
+A request of up to 1 + num_verification_tokens query rows is a decode row, short
+prefills included, so a step can hold max_num_seqs such rows: 272 at 16 requests
+with 16 copy drafts. The arena held the drafter's rows plus one copying request
+(187), and the warmup's 214-token tail step (16 requests of 13-14 tokens) cut its
+SWA indices to 187 rows, which the sparse-MLA kernel refused. Unchanged without
+copy drafts (num_verification_tokens is the drafter's block).
+---
+ tests/models/test_deepseek_v4_1_attention.py | 24 ++++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       | 16 ++++++-------
+ 2 files changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 373bcc2e0..f69b9eed9 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -79,6 +79,30 @@ def test_tilelang_binding_prepares_the_attention_staging(
+     assert module._active.tolist() == [16 * 64]
+ 
+ 
++@pytest.mark.parametrize(
++    "num_verification_tokens,decode_capacity",
++    [
++        (5, 4 * 11),  # parallel drafting's two spans
++        (16, 4 * 17),  # copy drafts: every request at the reorder threshold
++    ],
++)
++def test_decode_arena_holds_every_request_at_the_reorder_threshold(
++    num_verification_tokens, decode_capacity
++):
++    # A step of short requests (16 of 13-14 tokens under copy drafts' threshold
++    # of 17) is all decode rows; its metadata must not be cut to fewer rows.
++    module = _tilelang_layer(layer_id=3)
++    module.config.speculative_config = SimpleNamespace(
++        num_speculative_tokens=5,
++        parallel_drafting=True,
++        num_verification_tokens=num_verification_tokens,
++    )
++    module._attention_geometry()
++    assert module._decode_capacity == decode_capacity
++    swa_spec = module._attention_workspace_specs["decode"][0]
++    assert swa_spec == ((decode_capacity, module.swa_width), torch.int32)
++
++
+ def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
+     from vllm.models.deepseek_v4_1.tilelang import cache_writer, rope
+ 
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d3952249f..028b7fc1b 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -481,19 +481,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # SWA block); re-reading it here would plan half-size main pages
+         # whenever the worker shares the engine's config (the uniproc executor).
+         spec = self.config.speculative_config
+-        # Parallel drafting can admit two draft spans during verifier profiling.
++        # Every request at or below the backend's reorder threshold is a decode
++        # row, short prefills included, so the decode arena holds max_num_seqs of
++        # the widest: two draft spans (parallel drafting's verifier profiling) or
++        # a copying request's verification (copy drafts).
+         query_width = (
+-            1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens
++            max(
++                1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens,
++                1 + spec.num_verification_tokens,
++            )
+             if spec is not None
+             else 1
+         )
+         decode_rows = self.config.scheduler_config.max_num_seqs * query_width
+-        # A copying request verifies past the drafter's block (copy drafts),
+-        # within the scheduler's decode-row envelope.
+-        decode_rows += self.config.max_decode_rows - (
+-            self.config.scheduler_config.max_num_seqs
+-            * self.config.uniform_decode_query_len
+-        )
+         # Graph buffers include padding beyond the live decode-token bound.
+         decode_rows = max(
+             decode_rows,
+-- 
+2.54.0 (Apple Git-157)
+
