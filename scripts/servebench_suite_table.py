@@ -5,7 +5,9 @@ usage: scripts/servebench_suite_table.py RUN LABEL [LABEL...]
 
 Arms run candidate first (heat soak), then the reference, then the candidate again. With
 two or more arms, the second arm is the reference: it is compared against every other arm,
-and the first against the last as the run's own repeat.
+and the first against the last as the run's own repeat. A LABEL with a "/" is a recorded
+suite run, repository-relative (a release's manifests/suites/<name>): a released build's
+numbers never change, so the reference is read from its record instead of measured again.
 
 The verdict block judges the paired decode row (servebench's per-request pairs) against
 AA_FLOOR_PCT, over both candidate boots; the window rows keep the run's own repeat. Rows a
@@ -37,8 +39,19 @@ def pairs(labels: list[str]) -> list[tuple[str, str]]:
     return out
 
 
+def is_recorded(label: str) -> bool:
+    return "/" in label
+
+
 def directory(run: str, label: str) -> str:
+    if is_recorded(label):
+        return str(ROOT / label)
     return str(ROOT / "results/private/suites" / run / label)
+
+
+def name(label: str) -> str:
+    """A recorded run by its record's name (the release and shape), an arm by its label."""
+    return f"{Path(label).name} (recorded)" if is_recorded(label) else label
 
 
 if __name__ == "__main__":
@@ -51,10 +64,10 @@ if __name__ == "__main__":
         reference_to_repeat = suite.compare(read_json, directory(run, labels[1]), directory(run, labels[-1]), judge)
         print(suite.format_floor(suite.with_floor(reference_to_candidate, repeat, floors=AA_FLOOR_PCT,
                                                   reference_to_repeat=reference_to_repeat),
-                                 labels[1], labels[0], labels[-1]))
+                                 name(labels[1]), labels[0], labels[-1]))
     if labels:
-        print("\n" + suite.format_accounting({label: suite.step_accounting(read_json, directory(run, label))
+        print("\n" + suite.format_accounting({name(label): suite.step_accounting(read_json, directory(run, label))
                                               for label in labels}))
     for base, candidate in pairs(labels):
-        print(f"\n######## {base} -> {candidate}", flush=True)
+        print(f"\n######## {name(base)} -> {name(candidate)}", flush=True)
         main(["compare", directory(run, base), directory(run, candidate)])

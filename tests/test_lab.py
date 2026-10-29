@@ -645,6 +645,47 @@ class PlanProblemsTest(unittest.TestCase):
         self.assertEqual([t["out"] for t in tables],
                          ["results/private/lab/s-table.txt", "results/private/lab/s-single-stream-table.txt"])
 
+    def test_suite_job_with_a_recorded_reference(self) -> None:
+        """"reference": a recorded run stands in the table as the second arm, never booted;
+        a companion suite reads <reference>-<suite>; the candidate must run twice."""
+        recorded = "manifests/suites/2026-10-25-spark-ds41f-1025-tp4"
+        arm = "experiments/2026-10-14-servebench/engine-r6k.json"
+        spec = {"experiment": "experiments/2026-10-14-servebench", "run": "s", "jobs": [
+            {"kind": "measure", "suite": ["release", "single-stream"], "reference": recorded,
+             "arms": [{"config": arm, "label": "cand"}, {"config": arm, "label": "cand-again"}]}]}
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            steps = lab.plan(spec)
+        self.assertEqual([s["kind"] for s in steps].count("boot"), 2)
+        tables = [s for s in steps if s["kind"] == "table"]
+        self.assertEqual([t["argv"][2:] for t in tables],
+                         [["cand", recorded, "cand-again"], ["cand", f"{recorded}-single-stream", "cand-again"]])
+        # The release suite changed after 1025 was recorded: its record is no reference.
+        self.assertEqual([len(lab.reference_problems(t)) for t in tables], [1, 0])
+        self.assertIn("a changed suite is a new suite", lab.reference_problems(tables[0])[0])
+        spec["jobs"][0]["arms"].pop()
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            once = [s for s in lab.plan(spec) if s["kind"] == "table"]
+        self.assertIn("at least twice", lab.reference_problems(once[1])[0])
+        spec["jobs"][0]["reference"] = "manifests/suites/no-such-run"
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            missing = [s for s in lab.plan(spec) if s["kind"] == "table"]
+        self.assertTrue(any("is not a suite run" in p for p in lab.reference_problems(missing[0])))
+
+    def test_release_reference_follows_the_arm_to_its_recipe_shape(self) -> None:
+        """An arm overlay carries no benchmark_reference; "release" is the one of the recipe
+        shape its extends chain ends at."""
+        experiment = "experiments/2026-10-26-spark-ds41f-candidate/rc13"
+        config, data = f"{experiment}/rc-tp4.json", None
+        while data is None or "extends" in data:
+            data = lab.spark.read_json(config)
+            if "extends" in data:
+                config, shape = data["extends"]["config"], data["extends"].get("shape")
+        expected = lab.spark.read_cluster(config, shape)["benchmark_reference"]
+        self.assertEqual(lab.recorded_reference(experiment, "release", "rc-tp4.json"), (expected, None))
+        path, why = lab.recorded_reference(experiment, "release", "no-such-arm.json")
+        self.assertIsNone(path)
+        self.assertIn("cannot resolve", why)
+
     def test_bad_arguments_missing_files_and_configs(self) -> None:
         spec = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"],
                              ["no_such_script.py", [], "x"]])

@@ -176,7 +176,9 @@ before the first boot. `run --dry-run` prints the problems.
   the first score the first arm's text in model steps. The table
   (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
   every other arm, and the first arm with the last as the run's own repeat. Order arms
-  candidate, reference, candidate again. Its verdict block judges the closed loops' paired
+  candidate, reference, candidate again; with `"reference"` (a recorded suite run, or
+  `"release"`, see Recorded references) the arms are the candidate's two boots and the
+  record stands in the table as the second arm. Its verdict block judges the closed loops' paired
   decode row (requests paired by prompt) over both candidate boots against the recorded
   A/A floor, so a lean A/B resolves about 0.3% at one stream
   ([experiments/2026-10-26-paired-verdict](../experiments/2026-10-26-paired-verdict/README.md)).
@@ -320,8 +322,12 @@ the whole release benchmark (release tests, determinism gate, this comparison) a
   memory. The same holds for an earlier candidate already measured on the same image. Every
   arm that is measured runs at least twice, a boot and a repeat boot, so each verdict keeps
   a confidence interval; a digest is exact and needs one boot. The arms below then drop the
-  previous release; `scripts/servebench_suite_table.py` reads arms from one run's directory,
-  so copy the recorded reference's files into the run under its label before the table step.
+  previous release: a suite job's `"reference": "release"` reads the recorded runs of the
+  release the first arm is built on (the `benchmark_reference` of the recipe shape its
+  `extends` chain ends at, companions at `<reference>-<suite>`), and
+  `scripts/servebench_suite_table.py` takes a recorded run's path in place of a label. A
+  promotion keeps the release's suite runs whole, request tables included (only the model
+  step's text may be left out), so the next candidate's paired verdict can read them.
 - **The `release` profile (`scripts/lab.py`):**
   - quality;
   - decode on prose and code at 1, 2, 4, 8 and 16 streams, 5-10 samples until each

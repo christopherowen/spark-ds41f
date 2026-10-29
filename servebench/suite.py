@@ -151,8 +151,9 @@ def step_accounting(read_json, run_dir: str) -> dict:
 def format_accounting(by_label: dict) -> str:
     """One line per run step and arm: tokens and verified rows a step, row yield, wasted rows,
     and per draft position survival / coverage."""
+    width = max([24, *map(len, by_label)])
     lines = ["rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)",
-             f"{'step':8s} {'arm':24s} {'tokens':>7s} {'requests':>8s} {'rows':>6s} {'yield':>6s} {'wasted':>7s}"
+             f"{'step':8s} {'arm':{width}s} {'tokens':>7s} {'requests':>8s} {'rows':>6s} {'yield':>6s} {'wasted':>7s}"
              "  by position (survival/coverage)"]
     steps = []
     for cards in by_label.values():
@@ -163,11 +164,11 @@ def format_accounting(by_label: dict) -> str:
             if card is None:
                 continue
             if "verified_rows_per_step" not in card:
-                lines.append(f"{step:8s} {label[:24]:24s} {'-':>7s}  (no speculative counters)")
+                lines.append(f"{step:8s} {label:{width}s} {'-':>7s}  (no speculative counters)")
                 continue
             positions = " ".join(f"{p['position']}:{p['survival']:.3f}/{p['coverage']:.3f}" for p in card["positions"]
                                  if p["survival"] is not None and p["coverage"] is not None)
-            lines.append(f"{step:8s} {label[:24]:24s} {card['tokens_per_step']:7.3f} "
+            lines.append(f"{step:8s} {label:{width}s} {card['tokens_per_step']:7.3f} "
                          f"{card['decoding_requests_per_step']:8.2f} {card['verified_rows_per_step']:6.2f} "
                          f"{card['row_yield']:6.3f} {card['wasted_rows_per_step']:7.2f}  {positions or '-'}")
     return "\n".join(lines)
