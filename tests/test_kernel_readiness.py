@@ -46,7 +46,7 @@ def ready(uuid="node-a"):
             "cpu_tools": True, "governors": ["performance"],
             "modules": {m: {"vermagic": NEW + " SMP", "version": POLICY["driver"]} for m in
                         ("nvidia", "nvidia_uvm", "nvidia_drm", "mlx5_core", "mlx5_ib", "dgx_ec_fan_control")},
-            "fan_dkms": f"dgx-spark-fan-control/0.1.3, {NEW}, aarch64: installed",
+            "fan_dkms": f"dgx-spark-fan-control/0.1.4, {NEW}, aarch64: installed",
             "grub": kernel.grub_inventory(menu(uuid), "")}
 
 

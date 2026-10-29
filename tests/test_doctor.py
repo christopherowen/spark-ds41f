@@ -88,7 +88,7 @@ FAN_WORKING = (
     "grub_splash=0\n"
     "idle_services=\n"
     "kernel=7.0.0-1019-nvidia\n"
-    "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
+    "fan_dkms=dgx-spark-fan-control/0.1.4, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
     "fan_cooling_device=1\n"
     "fan_service=installed\n"
@@ -351,6 +351,14 @@ class FanControlTest(unittest.TestCase):
             problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia; run "
                 "sudo dkms autoinstall -k 7.0.0-1019-nvidia"]
         )
+
+    def test_other_dkms_version_is_reported(self) -> None:
+        problems = spark.fan_control_problems(
+            "dgx3", facts(fan_dkms="dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed")
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is 0.1.3 for 7.0.0-1019-nvidia, and this recipe uses 0.1.4", problems[0])
+        self.assertIn("blob/v0.1.4/docs/maintenance.md", problems[0])
 
     def test_unloaded_module_is_reported(self) -> None:
         problems = spark.fan_control_problems("dgx3", facts(fan_module="0"))

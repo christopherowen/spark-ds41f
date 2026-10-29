@@ -1049,6 +1049,11 @@ def nvme_coalescing_warnings(node_name: str, facts: dict[str, str]) -> list[str]
     return warnings
 
 
+FAN_CONTROL_VERSION = "0.1.4"
+FAN_CONTROL_UPGRADE = ("https://github.com/christopherowen/dgx-spark-fan-control/blob/"
+                       f"v{FAN_CONTROL_VERSION}/docs/maintenance.md")
+
+
 def fan_control_problems(node_name: str, facts: dict[str, str],
                          fan_control: bool = True) -> list[str]:
     """The first missing layer of the DGX Spark additive fan-floor control.
@@ -1069,6 +1074,13 @@ def fan_control_problems(node_name: str, facts: dict[str, str],
         return [
             f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}; run "
             f"sudo dkms autoinstall -k {facts.get('kernel') or '$(uname -r)'}"
+        ]
+    installed = facts["fan_dkms"].split(",", 1)[0].rpartition("/")[2]
+    if installed != FAN_CONTROL_VERSION:
+        return [
+            f"{node_name}: DKMS dgx-spark-fan-control is {installed} for {kernel}, and this recipe "
+            f"uses {FAN_CONTROL_VERSION}; upgrade from a checkout at v{FAN_CONTROL_VERSION} "
+            f"({FAN_CONTROL_UPGRADE})"
         ]
     if facts.get("fan_module") != "1":
         return [
