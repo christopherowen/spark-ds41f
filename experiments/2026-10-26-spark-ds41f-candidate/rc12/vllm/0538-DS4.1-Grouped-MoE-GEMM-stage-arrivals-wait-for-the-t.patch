@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:51:01 +0100
+Subject: [PATCH 538/538] [DS4.1] Grouped MoE GEMM: stage arrivals wait for the
+ thread's copies, so the code expand reads landed rows
+
+The coded-scale expand reads codes other threads copied with cp.async
+between ptx_wait_group, which covers only the thread's own copies, and
+the next sync_threads. A plain mbarrier arrival orders nothing about
+cp.async writes; cp.async.mbarrier.arrive.noinc arrives once the
+thread's copies land, so the wait on the stage's barrier publishes
+every row before the expand.
+---
+ vllm/models/deepseek_v4_1/tilelang/moe.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 4ac0a6734..7578e84c4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -46,6 +46,7 @@ import math
+ import tilelang
+ import tilelang.language as T
+ import torch
++from tilelang.language.builtin import cp_async_barrier_noinc
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+@@ -735,7 +736,10 @@ def grouped_fp8_fp4_gemm(
+                         1,
+                     )
+         T.ptx_commit_group()
+-        T.barrier_arrive(loaded[s])
++        # The arrival waits for this thread's copies to land, so the wait on
++        # loaded[s] publishes every thread's codes to the expand, which reads
++        # rows other threads copied (ptx_wait_group covers only its own).
++        cp_async_barrier_noinc(loaded[s])
+ 
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C):

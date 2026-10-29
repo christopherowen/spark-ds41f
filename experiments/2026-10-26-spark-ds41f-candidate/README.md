@@ -601,3 +601,40 @@ for rework, or dropped, and the series is rewritten without it before the qualif
   yield moves no chunk boundary); `dual_probe.py --speed` and AdvBench on candidate 11; the lean
   suite with the 131K stall probe (`../2026-10-28-candidate-10-levers/yield-suite.json`) on
   candidate 10, candidate 11, candidate 10 again. It runs after the queued A/Bs.
+- **Result** (`candidate-11-tp4`, 2026-10-29): the release tests failed, 42 of 6,887 (dgx4).
+  Forty were the copy patches': fakes without the attributes copy drafts added to the batch,
+  the spec config and the rejection sampler (`num_draft_tokens_per_req` in the rejection
+  sampler, `num_verification_tokens`, `num_draft_steps`, `max_decode_rows`). Two were IKET's:
+  its scripts, run as files, imported the image's installed vLLM, which has no DS4.1 package.
+  Every serving check passed: digests equal candidate 10's (greedy 64/64, teacher-forced KL 0),
+  decode grid 1.91% faster, c8 paired decode 1.17%, c1 0.95%, prefill level, the 131K prefill
+  under decode 9% slower (yield's trade). Copy drafts, enabled (`c10-copy-2`), still failed to
+  start: the sparse-MLA kernel's packed-index check (`SwaIndices` 187 rows, 214 expected) in
+  warmup. Not released; candidate 12 replaces it.
+
+## Candidate 12 ([rc12/](rc12))
+
+Candidate 11 without copy drafts, which fail to start when enabled; a release ships no feature
+that does not work, and none switched off but IKET's debug mode. Copy drafts stay on their
+branch (#619) until they start and pass their A/B.
+
+- **Series:** candidate 10's plus 0538-0565 (vLLM `candidate-12`, head d984b2e66;
+  [rc12/vllm/series](rc12/vllm/series), [rc12/make_series.py](rc12/make_series.py)): patch head
+  `491ba2b7`, tree `4976b446` (the build's `git am` reproduces it). Candidate 11's patches in
+  order, cherry-picked without a conflict, less 0546-0550 and 0570 (copy drafts), plus:
+
+  | Patch | Change | Why |
+  | --- | --- | --- |
+  | 0565 | IKET mode tests: the subprocesses import the vLLM under test (the tested source root first on `PYTHONPATH`) | the release gate's two IKET failures |
+
+- **Arm** ([rc12/rc-tp4.json](rc12/rc-tp4.json)): candidate 11's on candidate 12's image
+  (`spark-ds41f:19f2c20ed4d6-next-12`); [rc12/source.json](rc12/source.json) drops the
+  `copy-drafts` capability.
+- **Release tests:** `config/release-tests.json` drops the two copy test files;
+  `release_tests.py check` for 19f2c20ed..d984b2e66: 169 selected, 114 gate, 55 excluded, 0
+  problems ([rc12/release-tests-gate-manifest.json](rc12/release-tests-gate-manifest.json),
+  [rc12/bundles/release-tests](rc12/bundles/release-tests)).
+- **Qualification** ([rc12/candidate-tp4.json](rc12/candidate-tp4.json)): candidate 11's, for
+  candidate 12: the image, the release tests, candidate 10's checks on candidate 10 and
+  candidate 12, GLP's probes, and the lean suite with the stall probe on candidate 10,
+  candidate 12, candidate 10 again.

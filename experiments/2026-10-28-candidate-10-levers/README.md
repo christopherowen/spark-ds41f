@@ -120,3 +120,7 @@ qualification and is reworked.
   fix (vLLM 657f0df54) takes no verified drafts when the manager is absent, as `propose()`
   already reads None; `make_levers.py` rewrote only that file in `overlay/copy` and the two
   copy bundles. Requeued ahead of candidate 11.
+- **copy, second run** (`c10-copy-2`, 2026-10-29): copy-control again booted and passed its
+  gates and `copy_probe.py`; the copy arm passed warmup's adaptive-verification step but failed in
+  the sparse-MLA kernel's packed-index check, every worker alike: `SwaIndices` shape[0] 187,
+  214 expected. Copy drafts leave the release (candidate 12) and are reworked on #619.

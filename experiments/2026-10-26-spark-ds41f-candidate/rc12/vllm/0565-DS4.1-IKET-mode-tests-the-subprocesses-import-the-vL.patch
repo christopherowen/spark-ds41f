@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:16:53 +0100
+Subject: [PATCH 565/565] [DS4.1] IKET mode tests: the subprocesses import the
+ vLLM under test
+
+A script run as a file starts its path with its own directory, so the release
+gate's subprocesses imported the image's installed vLLM, which has no DS4.1
+package. The scripts now get the tested source root first on PYTHONPATH.
+---
+ tests/kernels/test_deepseek_v41_tilelang_iket.py | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index b76f929e5..41901baf6 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -15,6 +15,7 @@ import textwrap
+ 
+ import pytest
+ 
++import vllm
+ from vllm.models.deepseek_v4_1.tilelang import iket
+ 
+ 
+@@ -293,8 +294,16 @@ def _script(tmp_path, source):
+     return str(path)
+ 
+ 
++def _env(cache_dir):
++    """The subprocess imports the vLLM under test: a script's own directory, not the
++    working directory, starts its path, and an installed vLLM may lack DS4.1."""
++    source_root = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
++    path = os.pathsep.join(p for p in (source_root, os.environ.get("PYTHONPATH")) if p)
++    return dict(os.environ, PYTHONPATH=path, TILELANG_CACHE_DIR=str(cache_dir))
++
++
+ def _run(tmp_path, *args):
+-    env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "deployment-cache"))
++    env = _env(tmp_path / "deployment-cache")
+     process = subprocess.run(
+         [sys.executable, _script(tmp_path, KERNEL_SCRIPT), *args],
+         env=env,
+@@ -351,7 +360,7 @@ def test_enable_refuses_after_a_compile(tmp_path):
+         except RuntimeError as error:
+             print("refused:", error)
+     """)
+-    env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "cache"))
++    env = _env(tmp_path / "cache")
+     process = subprocess.run(
+         [sys.executable, _script(tmp_path, script), str(tmp_path / "iket")],
+         env=env,

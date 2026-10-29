@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 22:40:21 +0100
+Subject: [PATCH 539/539] DeepSeek V4.1 tokenizer: the DeepSeek API's effort
+ aliases
+
+The DeepSeek API accepts reasoning_effort minimal, medium and ultra as aliases
+of low (50), high (75) and max (100). The chat protocol already accepts
+minimal and medium, but the V4.1 tokenizer knew only low, high, xhigh and max,
+so an OpenAI-style client sending reasoning_effort "medium" passed validation
+and then got a 400 from the template; "ultra" was refused by the protocol.
+
+- The V4.1 effort table gains the three aliases at their API budgets.
+- The chat protocol accepts "ultra" (like "max", DeepSeek-specific). Other
+  renderers look named efforts up with a default, so an unknown name stays
+  theirs to handle.
+
+Requests with any previously accepted effort render the same prompt.
+
+Tests: the aliases render 50/75/100 through the tokenizer, the encoder's
+effort prefix and a chat request; "ultra" and "minimal" turn thinking on; the
+invalid-effort cases keep only spellings the API does not accept.
+
+Base: next-candidate e2b2b0b59 (spark-ds41f candidate 9).
+
+Quality: frontend only; prompts of requests without these aliases are
+token-identical.
+
+Upstream status: local; not proposed.
+---
+ .../openai/test_reasoning_enable_thinking.py  |  4 ++-
+ tests/tokenizers_/test_deepseek_v41.py        | 26 ++++++++++++++++++-
+ tests/tokenizers_/test_deepseek_v41_effort.py | 11 +++++++-
+ .../openai/chat_completion/protocol.py        |  9 ++++---
+ vllm/tokenizers/deepseek_v41.py               |  5 ++--
+ vllm/tokenizers/deepseek_v41_encoding.py      |  4 +++
+ 6 files changed, 50 insertions(+), 9 deletions(-)
+
+diff --git a/tests/entrypoints/openai/test_reasoning_enable_thinking.py b/tests/entrypoints/openai/test_reasoning_enable_thinking.py
+index c6eaae1fd..869392903 100644
+--- a/tests/entrypoints/openai/test_reasoning_enable_thinking.py
++++ b/tests/entrypoints/openai/test_reasoning_enable_thinking.py
+@@ -38,7 +38,9 @@ def _build_responses_request(**kwargs) -> ResponsesRequest:
+ class TestChatCompletionReasoningEffort:
+     """Chat Completions: reasoning_effort -> enable_thinking."""
+ 
+-    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
++    @pytest.mark.parametrize(
++        "effort", ["minimal", "low", "medium", "high", "max", "ultra"]
++    )
+     def test_non_none_effort_injects_enable_thinking_true(self, effort):
+         request = _build_chat_request(reasoning_effort=effort)
+         params = request.build_chat_params(None, "auto")
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index dab658b0b..5e463ee75 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -46,6 +46,9 @@ def test_reference_encoder_fixtures(case_id):
+         ("high", 75),
+         ("xhigh", 75),
+         ("max", 100),
++        ("minimal", 50),
++        ("medium", 75),
++        ("ultra", 100),
+         (1, 1),
+         (42, 42),
+         (100, 100),
+@@ -62,12 +65,33 @@ def test_numeric_reasoning_effort(effort, budget):
+     )
+ 
+ 
+-@pytest.mark.parametrize("effort", ["medium", "minimal", -1, 0, 101, True, 1.5, []])
++@pytest.mark.parametrize("effort", ["auto", "Medium", -1, 0, 101, True, 1.5, []])
+ def test_invalid_effort_is_a_request_error(effort):
+     with pytest.raises(ValueError, match="reasoning_effort"):
+         render([{"role": "user", "content": "question"}], reasoning_effort=effort)
+ 
+ 
++@pytest.mark.parametrize(
++    ("effort", "budget"), [("minimal", 50), ("medium", 75), ("ultra", 100)]
++)
++def test_api_effort_aliases_render_the_api_budgets(effort, budget):
++    """The DeepSeek API's aliases, as an OpenAI-style client sends them, render
++    the budget of the name they alias (minimal as low, medium as high, ultra as
++    max) and turn thinking on."""
++    request = ChatCompletionRequest(
++        model="deepseek-ai/DeepSeek-V4.1-Flash",
++        messages=[{"role": "user", "content": "question"}],
++        reasoning_effort=effort,
++    )
++    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
++    assert render(request.messages, **kwargs) == (
++        "<｜begin▁of▁sentence｜><｜System｜>"
++        f"Reasoning Effort: {budget} (range 1-100, the higher the value, "
++        "the more thorough the reasoning)\n\n"
++        "<｜User｜>question<｜Assistant｜><think>"
++    )
++
++
+ @pytest.mark.parametrize(
+     "controls",
+     [
+diff --git a/tests/tokenizers_/test_deepseek_v41_effort.py b/tests/tokenizers_/test_deepseek_v41_effort.py
+index b9aba4bd9..c3310627c 100644
+--- a/tests/tokenizers_/test_deepseek_v41_effort.py
++++ b/tests/tokenizers_/test_deepseek_v41_effort.py
+@@ -9,7 +9,16 @@ from vllm.tokenizers.deepseek_v41_encoding import render_reasoning_effort
+ 
+ @pytest.mark.parametrize(
+     ("effort", "budget"),
+-    [("low", 50), ("high", 75), ("max", 100), ("xhigh", 75), (None, 75)],
++    [
++        ("low", 50),
++        ("high", 75),
++        ("max", 100),
++        ("xhigh", 75),
++        ("minimal", 50),
++        ("medium", 75),
++        ("ultra", 100),
++        (None, 75),
++    ],
+ )
+ def test_named_and_default_effort_render_configured_numeric_budget(effort, budget):
+     assert render_reasoning_effort(0, "thinking", effort).startswith(
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index c821539e6..d6c828489 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -261,16 +261,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         | None
+     ) = "none"
+     reasoning_effort: (
+-        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
++        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
++        | None
+     ) = Field(
+         default=None,
+         description=(
+             "Constrains effort on reasoning for reasoning models. "
+             "Currently supported values are none, minimal, low, medium, "
+-            "high, xhigh, and max. Reducing reasoning effort can result in "
++            "high, xhigh, max, and ultra. Reducing reasoning effort can result in "
+             "faster responses and fewer tokens used on reasoning in a response. "
+-            "Note that 'max' is specific to the DeepSeek V4 series and is not "
+-            "part of the standard OpenAI API specification."
++            "Note that 'max' and 'ultra' are specific to the DeepSeek V4 series "
++            "and are not part of the standard OpenAI API specification."
+         ),
+     )
+     thinking: ChatCompletionThinkingParam | None = Field(
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 1f430ba5f..c053de822 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -338,8 +338,9 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
+             ):
+                 raise ValueError(
+-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
+-                    "or an integer within [1, 100] in chat_template_kwargs"
++                    "DeepSeek V4.1 reasoning_effort must be minimal, low, medium, "
++                    "high, xhigh, max, ultra, or an integer within [1, 100] in "
++                    "chat_template_kwargs"
+                 )
+ 
+             add_generation_prompt = kwargs.get("add_generation_prompt")
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index b9af8a75e..182e1b241 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -242,6 +242,10 @@ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+     # are low, high and max.
+     "xhigh": 75,
+     "max": 100,
++    # The DeepSeek API's aliases: minimal as low, medium as high, ultra as max.
++    "minimal": 50,
++    "medium": 75,
++    "ultra": 100,
+ }
+ 
+ DEFAULT_REASONING_EFFORT = "high"
