@@ -638,3 +638,44 @@ branch (#619) until they start and pass their A/B.
   candidate 12: the image, the release tests, candidate 10's checks on candidate 10 and
   candidate 12, GLP's probes, and the lean suite with the stall probe on candidate 10,
   candidate 12, candidate 10 again.
+- **Result (run `candidate-12-tp4`, 2026-10-29): qualified on the ring.**
+  - Release tests (dgx4, image `sha256:2d9c2cc6`): 6,686 passed, 163 skipped, 0 failed.
+  - Bits: every digest equals candidate 10's (determinism with and without logprobs, 16K,
+    greedy, seeded sampled, prompt logprobs, images, CED cross-shape, control spellings and
+    controls); model behaviour 64/64 greedy responses identical, teacher-forced KL 0 over
+    16,384 positions, acceptance 2.263 on both. One controls digest differs again,
+    `penalties-sampled/c8`: candidate 12 gave `fb36e3be` (candidate 10's in its own
+    qualification) and candidate 10 gave `44f3b309` on this boot; the scenario does not repeat
+    across boots, so it is not a bit change. Seeded sampling at c8 is batch-variant on both
+    builds, as before.
+  - GLP: the dual-serving probe passes every check (both names served, steering moves all 8
+    prompts, mixed batches and the prefix cache keep each name's text, completions and
+    tokenize; beam search refused with 400). AdvBench (520 prompts, 256 tokens): replies with
+    no refusal phrase 2.5% stock, 51.2% steered; judged compliant 1.4% / 38.9%.
+  - Speed against candidate 10 (paired verdict; repeat candidate 10 to candidate 10 again):
+
+    | Metric | Candidate 12 | Change | ±95% | Repeat |
+    | --- | ---: | ---: | ---: | ---: |
+    | engine grid, decode geometric mean (20 shapes) | | 0.25-1.14% faster | 0.15% | -0.88% |
+    | c1 decode tok/s, paired | 79.14 | +0.69-0.91% | 0.08% | +0.21% |
+    | c8 decode tok/s, paired | 24.87 | +0.80-0.86% | 0.50% | +0.03% |
+    | c1 TTFT, paired | 0.124 s | level | 0.45% | |
+    | prefill 32K tok/s | 7,317 | level | 1.24% | |
+    | prefill 131K tok/s, alone | 7,383 | -0.8% | 0.48% | |
+    | 131K prefill beside 11 decoding streams and five 500-token requests | 6,270 tok/s | -9.0% | 0.54% | +0.09% |
+    | those short requests' TTFT p50 / max | 3.55 / 4.97 s | 3.1x / 3.4x sooner | 2.4% | |
+
+    Ranges are against each candidate 10 boot; the second candidate 10 boot ran its grid
+    0.88% faster than the first. The 131K prefill beside short requests is yield (0545) doing
+    what it is for: each short request takes one step for its prefill and one for its held
+    first token, about 10 steps of the long prompt's 19 s, and with nothing short waiting it
+    schedules as before (level at 15 of 16 streams in `c10-yield-depth`). The lone 131K
+    prefill's 0.8% has nothing to yield to; it is in 0541-0544 or the IKET patches, not yet
+    bisected. c16, c8 and c4 distinct streams, the TTFT trace, startup and sink counters are
+    level.
+- **Release comparison** ([rc12/release-tp4.json](rc12/release-tp4.json), run
+  `candidate-12-release-tp4`, about 3.5 h; [rc12/release-tp3.json](rc12/release-tp3.json) after
+  the triangle is re-cabled): suites `release`, `single-stream` and `sampled`, arms candidate 12,
+  spark-ds41f-1025, candidate 12 again, `startup_memory` on every boot. With the TP3
+  qualification ([rc12/candidate-tp3.json](rc12/candidate-tp3.json)) these are what promotion
+  needs.

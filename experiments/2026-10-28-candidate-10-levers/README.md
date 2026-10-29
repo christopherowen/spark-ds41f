@@ -113,6 +113,16 @@ qualification and is reworked.
   the same gap there) is 3% longer (margin 1.1%). The triangle's doubling at 6 of 8 (#650) does
   not reproduce here; release-tp3's new stall steps (3, 6 and 7 of 8) measure it on TP3.
 
+  **Correction (2026-10-29, #650, #673): read the mean, not the median.** The gaps overlapping
+  the prefill take two values, one chunk step (about 2.25 s here) and a short gap, at about half
+  each, so their median lands on either one from repeat to repeat: candidate 10's 0.69-2.12 s
+  medians above are that flip, within a boot as well as between boots. Over the same repeats
+  the mean (1.15-1.36 s) and p90 (2.24-2.27 s) hold. By the mean, yield shortens the streams'
+  gaps during the prefill by about 27% (1.2 to 0.88 s at 11 streams), not 5-10 times; the
+  steps it gives to short requests carry no chunk. The probes' TTFT and the long prompt's
+  cost are unaffected by the correction. servebench's stall step now compares the mean, p90,
+  p99 and the share of long gaps instead of the median.
+
 - **copy, first run** (`c10-copy`, 2026-10-28): copy-control booted and passed its gates and
   `copy_probe.py`; the copy arm never became ready. Every worker failed in warmup at
   `assert self.adaptive_verification is not None` in `sample_tokens`: `warmup_kernels` clears
