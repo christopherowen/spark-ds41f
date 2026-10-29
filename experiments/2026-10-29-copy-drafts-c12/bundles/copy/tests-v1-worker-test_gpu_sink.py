@@ -918,6 +918,7 @@ class MiniRunner:
             logits_indices=torch.arange(int(cu_np[-1]), device=DEVICE),
             cu_num_logits=cu,
             cu_num_logits_np=cu_np,
+            num_draft_tokens_per_req=np.array(counts, dtype=np.int32) - 1,
             query_start_loc=cu,
             idx_mapping=idx,
             idx_mapping_np=idx_np,

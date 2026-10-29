@@ -52,4 +52,34 @@ AgentX (#574) before the release claims it.
 
 ## Results
 
-Pending.
+**`c12-copy`, 2026-10-29: exact and level, with the gate's six test stand-ins to fix.**
+
+- **Bits:** determinism and greedy (logprobs on and off) identical in every scenario, with the
+  same digests as copy-control; the seeded sampled digest is copy-control's as well. 64/64
+  greedy responses identical, teacher-forced KL 0. Acceptance length moves (2.277 to 2.268),
+  as it must: copy drafts are other drafts; the control's repeat matches itself exactly.
+- **Copy probe** (DSpark tokens a step, 12 prompts a category; the same output tokens):
+
+  | category | copy-control | copy | change |
+  |---|---|---|---|
+  | prose | 2.235 | 2.235 | +0.0% |
+  | copy | 4.960 | 16.015 | +222.9% |
+  | edit | 5.098 | 14.216 | +178.9% |
+  | tool | 5.411 | 6.780 | +25.3% |
+
+  The probe writes one record a category and no `summary` line, so the run's log reads "(no
+  summary)" for it; the records are in `results/private/determinism/c12-copy/`.
+- **Speed** (lean suite, copy against copy-control, against the control's repeat): grid, c8
+  and c1 decode, and prefill at 32K, level; prefill at 131K 0.32% slower (margin 0.20%).
+- **Bundles:** `copy` (70 passed) and `copy-wide` (690 passed) passed. `release-tests-copy`
+  failed 6 of 6,726, all in the tests' stand-ins, not in serving code:
+  - five in `tests/v1/worker/test_gpu_sink.py` (`MiniRunner`): the rejection sampler now
+    reads `num_draft_tokens_per_req` from the batch, which the runner's `InputBatch` always
+    carries and the test's batch did not;
+  - `test_sink_alternates_carry_logprobs_for_logprob_token_ids`: its stand-in `_verify` took
+    the sink chunk as its last argument, which `kernel_steps` now is, so the chunk never got
+    its alternates. The stand-in now takes the runner's arguments by name.
+
+  Fixed in vLLM copy-drafts-c12 509a95995; `make_copy.py` regenerated the bundles.
+
+**`c12-copy-gate` (`gate.json`):** the three bundles again at 509a95995. Pending.
