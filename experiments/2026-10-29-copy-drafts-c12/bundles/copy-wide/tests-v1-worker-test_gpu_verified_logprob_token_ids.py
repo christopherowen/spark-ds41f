@@ -262,10 +262,20 @@ def _rejection_sampler(
     rs.enable_adaptive_verification = adaptive
 
     def verify(
-        self, logits, _draft_logits, _drafts, _pos, cu_num_logits, idx_mapping, *rest
+        self,
+        logits,
+        _draft_logits,
+        _drafts,
+        _pos,
+        cu_num_logits,
+        idx_mapping,
+        _idx_mapping_np,
+        _expanded_idx_mapping,
+        _expanded_local_pos,
+        _dead_row_cut=None,
+        chunk=None,
+        _kernel_steps=None,
     ):
-        # rest: the index mappings, the token cap and the sink chunk (last).
-        chunk = rest[-1]
         processed = logits.float() * 2
         num_reqs = idx_mapping.shape[0]
         sampled = torch.zeros(
