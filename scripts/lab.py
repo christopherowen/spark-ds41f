@@ -353,8 +353,9 @@ def boot(config: str, dry: bool = False) -> bool:
 
 
 def buddy_free(text: str, page_bytes: int) -> dict:
-    """/proc/buddyinfo as free GiB per block size (summed over zones) and the GiB free in
-    blocks of 2 MiB or more, the size a GPU large page needs."""
+    """/proc/buddyinfo as free GiB per block size (summed over zones), the GiB free in
+    blocks of 2 MiB or more (a GPU large page), and the GiB and block count free in blocks
+    of 512 MiB or more (Order 13 on 64 KiB pages)."""
     free: dict[int, int] = {}
     for line in text.splitlines():
         counts = line.split()[4:]
@@ -363,7 +364,10 @@ def buddy_free(text: str, page_bytes: int) -> dict:
     by_block = {f"{page_bytes * 2 ** order // 1024} KiB": round(count * page_bytes * 2 ** order / 2 ** 30, 3)
                 for order, count in sorted(free.items())}
     large = sum(count * page_bytes * 2 ** order for order, count in free.items() if page_bytes * 2 ** order >= 2 ** 21)
+    blocks_512m = sum(count for order, count in free.items() if page_bytes * 2 ** order >= 2 ** 29)
+    bytes_512m = sum(count * page_bytes * 2 ** order for order, count in free.items() if page_bytes * 2 ** order >= 2 ** 29)
     return {"free_gib_by_block": by_block, "free_gib_2mib_blocks": round(large / 2 ** 30, 3),
+            "free_gib_512mib_blocks": round(bytes_512m / 2 ** 30, 3), "order13_512mib_blocks": blocks_512m,
             "free_gib": round(sum(c * page_bytes * 2 ** o for o, c in free.items()) / 2 ** 30, 3)}
 
 
@@ -381,8 +385,15 @@ def memory_before_boot(compact: bool) -> dict:
             record["compact"] = {"exit": result.returncode, "seconds": round(time.time() - began, 1),
                                  **buddy_free(spark.run_ssh(nodes, node, "cat", "/proc/buddyinfo").stdout, page)}
         out[node["name"]] = record
-        log(f"{node['name']}: {record['stopped']['free_gib_2mib_blocks']} GiB free in blocks of 2 MiB or more"
-            + (f", {record['compact']['free_gib_2mib_blocks']} GiB after compaction" if compact else ""))
+        after = record["compact"] if compact else record["stopped"]
+        warn = (f" (WARNING: < 70 GiB in 512 MiB Order-13 blocks: {after['free_gib_512mib_blocks']} GiB)"
+                if page == 65536 and after["free_gib_512mib_blocks"] < 70.0 else "")
+        log(f"{node['name']}: {record['stopped']['free_gib_2mib_blocks']} GiB free in blocks of 2 MiB or more "
+            f"({record['stopped']['free_gib_512mib_blocks']} GiB in 512 MiB blocks)"
+            + (f", {record['compact']['free_gib_2mib_blocks']} GiB "
+               f"({record['compact']['free_gib_512mib_blocks']} GiB in 512 MiB blocks) after compaction"
+               if compact else "")
+            + warn)
     return out
 
 

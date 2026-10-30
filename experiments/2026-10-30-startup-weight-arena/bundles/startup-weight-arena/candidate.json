@@ -1,0 +1,73 @@
+{
+ "description": "Candidate 12 with the startup weight arena, Order-13 buddy sponge, static MoE output buffer, and post-capture/post-warmup allocator cache flushes.",
+ "image": "spark-ds41f:19f2c20ed4d6-next-12",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+  "DIRECT_IO_TEST_DIR": "/c/direct-io-test"
+ },
+ "source_root": "/opt/spark-ds41f/candidate",
+ "workdir": "vllm",
+ "io_uring": true,
+ "argv": [
+  "-m",
+  "pytest",
+  "-q",
+  "-p",
+  "no:cacheprovider",
+  "--noconftest",
+  "-p",
+  "prepare_fixtures",
+  "-rfEs",
+  "--basetemp",
+  "/c/pytest-startup-weight-arena",
+  "tests/model_executor/model_loader/test_direct_loader.py",
+  "tests/model_executor/model_loader/test_direct_loader_cuda.py",
+  "tests/v1/worker/test_gpu_model_runner_v2.py::test_capture_model_locks_workspace_after_capture",
+  "tests/v1/worker/test_gpu_model_runner_v2.py::test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch",
+  "tests/v1/worker/test_gpu_worker.py::test_v2_kernel_warmup_flushes_allocator_cache"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "overlay/vllm/model_executor/model_loader/direct_loader.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/model_loader/direct_loader.py"
+  ],
+  [
+   "overlay/vllm/model_executor/layers/fused_moe/modular_kernel.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/modular_kernel.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/workspace.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/workspace.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/gpu/model_runner.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/gpu_worker.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu_worker.py"
+  ],
+  [
+   "tests-model_executor-model_loader-test_direct_loader.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/model_executor/model_loader/test_direct_loader.py"
+  ],
+  [
+   "tests-model_executor-model_loader-test_direct_loader_cuda.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/model_executor/model_loader/test_direct_loader_cuda.py"
+  ],
+  [
+   "tests-v1-worker-test_gpu_model_runner_v2.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_model_runner_v2.py"
+  ],
+  [
+   "tests-v1-worker-test_gpu_worker.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_worker.py"
+  ]
+ ]
+}

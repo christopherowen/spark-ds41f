@@ -1,0 +1,245 @@
+From 28927fd51f203b33403bbd7f0a127e7f649ac1a2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:22:55 +0100
+Subject: [PATCH 570/570] [Worker] Flush allocator cache after CUDA graph
+ capture and V2 kernel warmup
+
+---
+ tests/v1/worker/test_gpu_model_runner_v2.py | 91 ++++++++++++++++++++-
+ tests/v1/worker/test_gpu_worker.py          | 73 +++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py          |  1 +
+ vllm/v1/worker/gpu_worker.py                |  4 +
+ 4 files changed, 167 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index f4ef5d2b4..2f394a3e3 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -333,9 +333,14 @@ def test_capture_model_locks_workspace_after_capture(monkeypatch):
+     monkeypatch.setattr(
+         model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+     )
+-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
++    events: list[str] = []
+     monkeypatch.setattr(
+-        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
++        torch.accelerator, "empty_cache", lambda: events.append("empty_cache")
++    )
++    monkeypatch.setattr(
++        torch.accelerator,
++        "get_memory_info",
++        lambda: (events.append("mem_info") or (1 << 30), 1 << 30),
+     )
+     lock_calls = []
+     monkeypatch.setattr(
+@@ -345,6 +350,7 @@ def test_capture_model_locks_workspace_after_capture(monkeypatch):
+     runner.capture_model()
+ 
+     assert lock_calls == ["lock"]
++    assert events == ["empty_cache", "mem_info", "empty_cache", "mem_info"]
+ 
+ 
+ def test_capture_model_skips_lock_when_nothing_captured(monkeypatch):
+@@ -793,3 +799,84 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+     else:
+         pp.broadcast_drafts.assert_not_called()
+         runner.draft_tokens_handler.set_draft_tokens.assert_not_called()
++
++
++def test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch(
++    monkeypatch, workspace_init
++):
++    import vllm.config as vllm_config_module
++    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++    from vllm.v1.worker.workspace import current_workspace_manager
++
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
++    monkeypatch.setattr(
++        vllm_config_module,
++        "get_current_vllm_config_or_none",
++        lambda: SimpleNamespace(
++            scheduler_config=SimpleNamespace(max_num_batched_tokens=64)
++        ),
++    )
++    manager = current_workspace_manager()
++    view_small = manager.get_moe_output_buffer((8, 16), torch.bfloat16)
++    view_large = manager.get_moe_output_buffer((32, 16), torch.bfloat16)
++    assert view_small.shape == (8, 16)
++    assert view_large.shape == (32, 16)
++    assert view_small.data_ptr() == view_large.data_ptr()
++
++    (scratch,) = manager.get_simultaneous(((32, 16), torch.bfloat16))
++    view_large.fill_(3.0)
++    scratch.fill_(-5.0)
++    assert torch.all(view_large == 3.0)
++
++    aliases: list[int] = []
++
++    class _DummyPrepareFinalize:
++        def supports_async(self) -> bool:
++            return False
++
++        def prepare(self, hidden_states, topk_weights, topk_ids, *args, **kwargs):
++            return hidden_states, None, None, topk_ids, topk_weights
++
++        def finalize(self, output, fused_out, *args, **kwargs):
++            output.copy_(fused_out)
++
++    class _DummyExperts:
++        output_dtype = torch.bfloat16
++        quant_config = None
++        expects_unquantized_inputs = True
++        a2_scale = None
++
++        def moe_problem_size(self, a1q, w1, w2, topk_ids):
++            return 1, a1q.shape[0], w1.shape[1], a1q.shape[1], topk_ids.shape[1]
++
++        def workspace_dtype(self, in_dtype):
++            return in_dtype
++
++        def workspace_shapes(self, M, N, K, *args):
++            return (M, N), (M, K), (M, K)
++
++        def finalize_weight_and_reduce_impl(self):
++            return None
++
++        def apply(self, *, output, hidden_states, **kwargs):
++            aliases.append(output.data_ptr())
++            output.copy_(hidden_states)
++
++    impl = mk.FusedMoEKernelModularImpl.__new__(mk.FusedMoEKernelModularImpl)
++    impl.prepare_finalize = _DummyPrepareFinalize()
++    impl.fused_experts = _DummyExperts()
++    monkeypatch.setattr(
++        mk, "current_platform", SimpleNamespace(is_cpu=lambda: False, is_rocm=lambda: False)
++    )
++    monkeypatch.setattr(mk, "is_forward_context_available", lambda: True)
++    device = manager._device
++    hidden = torch.ones((12, 16), dtype=torch.bfloat16, device=device)
++    w1 = torch.ones((2, 8, 16), dtype=torch.bfloat16, device=device)
++    w2 = torch.ones((2, 16, 8), dtype=torch.bfloat16, device=device)
++    topk_ids = torch.zeros((12, 2), dtype=torch.int32, device=device)
++    topk_weights = torch.ones((12, 2), dtype=torch.float32, device=device)
++
++    out1 = impl.apply(hidden, w1, w2, topk_ids, topk_weights)
++    out2 = impl.apply(hidden, w1, w2, topk_ids, topk_weights)
++    assert out1.data_ptr() == out2.data_ptr() == view_small.data_ptr()
++    assert aliases == [view_small.data_ptr(), view_small.data_ptr()]
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 8a9002a4b..0dd1926f0 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -782,3 +782,76 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+     assert events[0] == "set_torch_threads_for_runtime"
+     assert events.count("set_torch_threads_for_runtime") == 1
+     assert "kernel_warmup" in events and "capture_model" in events
++
++
++def test_v2_kernel_warmup_flushes_allocator_cache(monkeypatch):
++    events: list[str] = []
++    compilation = SimpleNamespace(
++        mode=gpu_worker.CompilationMode.NONE,
++        cudagraph_mode=gpu_worker.CUDAGraphMode.FULL_AND_PIECEWISE,
++        compilation_time=0.0,
++        encoder_compilation_time=0.0,
++    )
++    worker = SimpleNamespace(
++        vllm_config=SimpleNamespace(compilation_config=compilation),
++        compilation_config=compilation,
++        model_runner=SimpleNamespace(
++            lora_config=None,
++            maybe_remove_all_loras=lambda config: None,
++            capture_model=lambda: events.append("capture_model") or 0,
++        ),
++        execute_model=None,
++        sample_tokens=None,
++        model_config=SimpleNamespace(enforce_eager=False, seed=0),
++        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
++        use_v2_model_runner=True,
++        observability_config=SimpleNamespace(
++            jit_monitor_mode="off", jit_monitor_verbose=False
++        ),
++        _startup_rendezvous=lambda stage: events.append(f"rendezvous:{stage}"),
++        _startup_heartbeat=None,
++        _b12x_session=None,
++        _get_cudagraph_capture_context=nullcontext,
++    )
++    monkeypatch.setattr(
++        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
++    )
++    for name in (
++        "set_random_seed",
++        "freeze_gc_heap",
++        "maybe_attach_gc_debug_callback",
++        "enable_gpu_sync_check",
++        "set_torch_threads_for_runtime",
++    ):
++        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
++    monkeypatch.setattr(
++        gpu_worker, "kernel_warmup", lambda *args: events.append("kernel_warmup")
++    )
++    monkeypatch.setattr(
++        gpu_worker, "warmup_kernels", lambda *args: events.append("warmup_kernels")
++    )
++    monkeypatch.setattr(
++        gpu_worker.torch.accelerator,
++        "synchronize",
++        lambda: events.append("synchronize"),
++    )
++    monkeypatch.setattr(
++        gpu_worker.torch.accelerator,
++        "empty_cache",
++        lambda: events.append("empty_cache"),
++    )
++    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
++
++    gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
++
++    assert events == [
++        "kernel_warmup",
++        "rendezvous:warm-up",
++        "warmup_kernels",
++        "synchronize",
++        "empty_cache",
++        "capture_model",
++        "warmup_kernels",
++        "synchronize",
++        "empty_cache",
++    ]
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 85e0a2093..bdd34b482 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1436,6 +1436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.adaptive_verification.load_draft_budget_kernels()
+                     self.kv_connector.reset_capture_state()
+ 
++            torch.accelerator.empty_cache()
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+         if not profile_only:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1ae9fa14a..bbdb4e877 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1046,6 +1046,8 @@ class Worker(WorkerBase):
+         if self.use_v2_model_runner:
+             # A workspace resize after capture frees what the graphs point at.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
++            torch.accelerator.synchronize()
++            torch.accelerator.empty_cache()
+ 
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+@@ -1143,6 +1145,8 @@ class Worker(WorkerBase):
+                 warmup_kernels(
+                     self.model_runner, self.execute_model, self.sample_tokens
+                 )
++                torch.accelerator.synchronize()
++                torch.accelerator.empty_cache()
+         elif get_pp_group().is_last_rank:
+             # V1: Warm up sampler and preallocate memory buffer for logits and other
+             # sampling related tensors of max possible shape to avoid memory
+-- 
+2.54.0 (Apple Git-157)
+

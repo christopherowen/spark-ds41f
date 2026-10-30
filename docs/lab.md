@@ -208,9 +208,14 @@ before the first boot. `run --dry-run` prints the problems.
   serving-container log tail (4,000 lines) is saved beside its output as
   `<output>.engine-<node>.log`, before a later boot replaces the container.
 - **Arm options `memory_snapshot` and `compact_memory`:** before that arm's boot, serving
-  stops and every node's free memory by block size (`/proc/buddyinfo`) is saved to
-  `memory-<label>.json`. `compact_memory` then runs
-  `sudo -n sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'` and records the result.
+  stops and every node's free memory by block size (`/proc/buddyinfo`, including
+  `free_gib_2mib_blocks`, `free_gib_512mib_blocks` and `order13_512mib_blocks`) is saved to
+  `memory-<label>.json`, warning when a 64 KiB-page node has under 70 GiB in 512 MiB
+  (Order 13) blocks. `compact_memory` then runs
+  `sudo -n sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'` and records the result. Do
+  not enable `compact_memory` on warm 64 KiB-page GB10 nodes before benchmarks: `Unmovable`
+  slab pageblocks cause the kernel compactor to split 512 MiB (Order 13) blocks into smaller
+  orders instead of coalescing them.
 - **Arm option `startup_memory`:** every node's `MemAvailable`, `MemFree` and page cache
   (`Cached`) are sampled every 0.25 s from the arm's start command until it is ready, to
   `startup-memory-<label>-<node>.txt`, and summarized in `startup-memory-<label>.json`: the

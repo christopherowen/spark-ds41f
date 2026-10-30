@@ -778,11 +778,14 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual(summary["l3_clusters"], [[0, 1, 5, 6], [10, 11, 15, 16]])
 
     def test_buddy_free(self) -> None:
-        text = ("Node 0, zone      DMA      2      0      0      0      0      1\n"
-                "Node 0, zone   Normal      4      0      0      0      0      3\n")
+        text = ("Node 0, zone      DMA      2      0      0      0      0      1      0      0      0      0      0      0      0      3\n"
+                "Node 0, zone   Normal      4      0      0      0      0      3      0      0      0      0      0      0      0    191\n")
         free = lab.buddy_free(text, 65536)
-        self.assertEqual(free["free_gib_2mib_blocks"], round(4 * 2 ** 21 / 2 ** 30, 3))
+        self.assertEqual(free["free_gib_2mib_blocks"], round((4 * 2 ** 21 + 194 * 2 ** 29) / 2 ** 30, 3))
+        self.assertEqual(free["free_gib_512mib_blocks"], round(194 * 2 ** 29 / 2 ** 30, 3))
+        self.assertEqual(free["order13_512mib_blocks"], 194)
         self.assertEqual(free["free_gib_by_block"]["64 KiB"], round(6 * 65536 / 2 ** 30, 3))
+        self.assertEqual(free["free_gib_by_block"]["524288 KiB"], round(194 * 2 ** 29 / 2 ** 30, 3))
 
     def test_boot_step_memory_options(self) -> None:
         self.assertNotIn("memory_out", lab.boot_step("r", {"label": "a"}, "c.json"))
