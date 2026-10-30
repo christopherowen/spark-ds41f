@@ -1,0 +1,66 @@
+{
+ "description": "spark-ds41f-1030 with per-type L2 weight prefetch windows (70d18e1a1): L2 schedule, WO, L2 prefetch, attention, SP prefill, CED model, and kernel preparation tests.",
+ "image": "spark-ds41f:1030",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "VLLM_L2_PREFETCH_KERNELS": "tilelang",
+  "VLLM_L2_PREFETCH_GRID": "2",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+  "TILELANG_CACHE_DIR": "/c/tilelang-l2-prefetch-pertype"
+ },
+ "source_root": "/opt/spark-ds41f/candidate",
+ "workdir": "vllm",
+ "argv": [
+  "-m",
+  "pytest",
+  "-q",
+  "-p",
+  "no:cacheprovider",
+  "--noconftest",
+  "-p",
+  "prepare_fixtures",
+  "-rfEs",
+  "--basetemp",
+  "/c/pytest-l2-prefetch-pertype",
+  "tests/models/test_deepseek_v4_1_l2_schedule.py",
+  "tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py",
+  "tests/model_executor/layers/test_l2_prefetch.py",
+  "tests/models/test_glm5next_tilelang_l2_prefetch.py",
+  "tests/models/test_deepseek_v4_1_attention.py",
+  "tests/models/test_deepseek_v4_1_sp_prefill.py",
+  "tests/models/test_deepseek_v4_1_ced_model.py",
+  "tests/v1/worker/test_prepare_kernels.py"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/attention.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/common/engram.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/l2_prefetch.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py"
+  ],
+  [
+   "tests-models-test_deepseek_v4_1_l2_schedule.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_l2_schedule.py"
+  ],
+  [
+   "tests-models-test_deepseek_v4_1_sp_prefill.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_sp_prefill.py"
+  ]
+ ]
+}
