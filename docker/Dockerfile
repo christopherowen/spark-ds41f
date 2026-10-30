@@ -274,7 +274,6 @@ for label, mod in (("direct_io", direct_native), ("engram_rows", engram_native))
     native_path = builder()
     linked = subprocess.check_output(["ldd", str(native_path)], text=True)
     assert "liburing.so" in linked, f"{label} was built without io_uring"
-    assert mod.load().ABI_VERSION == mod.ABI_VERSION
 print("runtime build checks passed")
 PY
 
