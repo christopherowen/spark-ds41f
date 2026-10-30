@@ -1,0 +1,17 @@
+# Eliminate 1-Step Async Staleness in DSpark Adaptive Budget Selection
+
+## Problem
+
+In `AdaptiveVerificationManager.get_num_tokens`, the host selects step $t$'s outer CUDA graph size and `draft_budget` by reading `self._stale_confidences[self._stale_idx]`—which holds step $t-1$'s draft confidences because step $t$ is scheduled on the CPU before step $t-1$'s `propose()` finishes on the GPU. Meanwhile, on the GPU stream, `record_confidences` has already scattered and TP-broadcast step $t$'s current confidences into `self._confidence_probs`.
+
+When a request transitions from an easy token (high confidence in step $t-1$) to a hard branching token in step $t$, three staleness leaks occur under `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU`:
+
+1. **Sub-`tau` slots budgeted on the host (`AdaptiveVerificationManager.get_num_tokens`)**: `valid = steps[None, :] < scheduled_drafts[:, None]` did not filter out draft slots with `survival_probability < self.dead_rows_tau` when `self.dead_rows_tau > 0`, causing the host to price and allocate outer CUDA graph rows for slots that device dead-row cutting unconditionally discards.
+2. **Unclamped device capacities (`AdaptiveVerificationManager.get_verified_draft_counts`)**: At `c1` (`draft_budget == scheduled_drafts.sum()`), `reallocate_drafts` skips `assign_draft_budget` and leaves `self._batch_draft_capacity[0] = 5`. Even when `combine_sampled_and_draft_tokens` cuts live drafts on device via `self._dead_row_cut` (computed from current-step `self._confidence_probs`), `get_verified_draft_counts` returned `self._batch_draft_capacity[:num_reqs]` unclamped by `self._dead_row_cut[:num_reqs]`, inflating `AsyncOutput.num_verified_draft_tokens`, `CopyDrafter`, `scheduler.make_spec_decoding_stats`, and `acceptance_length_controller` with dead tail rows.
+3. **False-rejection poisoning of online calibration (`GPUModelRunner.sample_tokens`)**: Because `get_num_sampled_and_rejected` computes `num_rejected = capacity + 1 - num_sampled` relative to the stale capacity (required by `post_update` so `query_len - num_rejected == num_sampled`), whenever all `dead_row_cut[r]` live drafts are accepted (`num_sampled = dead_row_cut[r] + 1`), `num_rejected = capacity - dead_row_cut[r] > 0` caused `OnlineAcceptanceEstimator.observe_verification` to grade `step = dead_row_cut[r]` (a dead row that skipped routed MoE and was never verified) as a deterministic false rejection (`label = 0.0`).
+
+## Fix
+
+1. **`AdaptiveVerificationManager.get_num_tokens`**: When `self.dead_rows_tau > 0`, filter `valid &= survival_probability >= self.dead_rows_tau` so the host budget never allocates outer CUDA graph rows for slots below `dead_rows_tau`.
+2. **`AdaptiveVerificationManager.get_verified_draft_counts` & `dead_row_args`**: Track active dead-row steps and clamp `self._batch_draft_capacity[:num_reqs]` in-place on device with `torch.minimum(capacities, cut[:num_reqs], out=capacities)` so `AsyncOutput.num_verified_draft_tokens`, `CopyDrafter`, and scheduler metrics reflect only current-step live verified drafts.
+3. **`GPUModelRunner.sample_tokens`**: Clamp `observed_rejected` passed to `self.speculator.observe_verification` by `live_rejected = (self._dead_row_cut[:input_batch.num_reqs] - (num_sampled - 1).clamp_min(0)).clamp_min(0)` (and compose with `SinkOutcome.REJECTED` masking) so dead tail rows from 1-step stale CPU budgets are never graded as false rejections by `OnlineAcceptanceEstimator`.
