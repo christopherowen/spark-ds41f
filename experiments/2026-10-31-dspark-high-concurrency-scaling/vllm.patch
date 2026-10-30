@@ -1,0 +1,220 @@
+From ce0a8b3f26d74489ebdf7518b1afca584df2d7f4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 00:42:56 +0100
+Subject: [PATCH] perf(spec_decode): align host draft budget with dead-row cut
+ and 16-row MMA knee
+
+---
+ .../spec_decode/test_adaptive_verification.py | 60 +++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 27 ++++++---
+ .../gpu/spec_decode/adaptive_verification.py  | 39 ++++++++++--
+ 3 files changed, 112 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 110a956ff..e511b3d03 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -551,3 +551,63 @@ def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
+     runs = []
+     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
++
++
++def test_dead_rows_tau_excludes_sub_tau_slots_from_host_budget():
++    # Conditional confidences [0.68, 0.50, 0.44, 0.48, 0.53] give cumulative
++    # survival [0.68, 0.34, 0.1496, 0.0718, 0.0381]. At row_cost=0.035 without
++    # dead_rows_tau, slots 0..3 pay (4 drafts -> 5 total rows). With
++    # dead_rows_tau=0.20, slots 2..4 (< 0.20) would be marked dead on device, so
++    # host budgeting excludes them upfront (2 drafts -> 3 total rows).
++    confs = np.array([[0.68, 0.50, 0.44, 0.48, 0.53]], dtype=np.float32)
++    manager = make_manager(confs, row_cost=0.035)
++    manager.dead_rows_tau = 0.0
++    assert manager.get_num_tokens({"low": 6}, {"low": [1, 2, 3, 4, 5]}) == 5
++    assert manager._batch_budget[2] == 4
++
++    manager.dead_rows_tau = 0.20
++    assert manager.get_num_tokens({"low": 6}, {"low": [1, 2, 3, 4, 5]}) == 3
++    assert manager._batch_budget[2] == 2
++
++
++def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
++    # 8 concurrent requests with cumulative survival [0.70, 0.294, 0.129] and
++    # dead_rows_tau=0.20: 16 live candidates (8 first-drafts at 0.70, 8 second-
++    # drafts at 0.294) above 8 non-draft rows (total rows 8..24).
++    # At 16 rows (8 bonus + 8 first-drafts), expected tokens = 13.6 and cost = 1.56:
++    # - Uniform linear pricing (scale=1.0) requires marginal survival >= 0.305,
++    #   rejecting all 8 second-drafts (8 drafts -> 16 rows).
++    # - Post-16-row MMA knee pricing (knee=16, scale=0.55) requires marginal
++    #   survival >= 0.168, admitting all 8 second-drafts (16 drafts -> 24 rows).
++    confs = np.tile(np.array([[0.70, 0.42, 0.44]], dtype=np.float32), (8, 1))
++    manager = make_manager(confs, row_cost=0.035)
++    manager.req_states.req_id_to_index = {f"r{i}": i for i in range(8)}
++    manager.dead_rows_tau = 0.20
++    num_tokens_per_req = {f"r{i}": 4 for i in range(8)}
++    draft_tokens = {f"r{i}": [1, 2, 3] for i in range(8)}
++
++    manager.high_row_cost_knee = 16
++    manager.high_row_cost_scale = 1.0
++    tokens_uniform = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    budget_uniform = manager._batch_budget[2]
++
++    manager.high_row_cost_scale = 0.55
++    tokens_knee = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    budget_knee = manager._batch_budget[2]
++
++    assert budget_uniform == 8 and tokens_uniform == 16
++    assert budget_knee == 16 and tokens_knee == 24
++
++
++def test_get_verified_draft_counts_clamps_to_dead_row_cut():
++    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
++    manager._batch_draft_capacity = torch.tensor([4, 3, 0, 5], dtype=torch.int32)
++    dead_cut = torch.tensor([2, 4, 6, 1], dtype=torch.int32)
++    assert torch.equal(
++        manager.get_verified_draft_counts(3),
++        torch.tensor([4, 3, 0], dtype=torch.int32),
++    )
++    assert torch.equal(
++        manager.get_verified_draft_counts(3, dead_cut),
++        torch.tensor([2, 3, 0], dtype=torch.int32),
++    )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 85e0a2093..3f2a4f393 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3202,7 +3202,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cudagraph_stats=cudagraph_stats,
+         )
+         num_verified_draft_tokens = (
+-            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
++            self.adaptive_verification.get_verified_draft_counts(
++                input_batch.num_reqs, getattr(self, "_dead_row_cut", None)
++            )
+             if self.adaptive_verification is not None
+             and input_batch.num_draft_tokens_per_req is not None
+             else None
+@@ -3309,14 +3311,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             assert self.sampler is not None
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 observed_rejected = num_rejected
+-                if (
+-                    sampler_output.sink is not None
+-                    and self.speculator.acceptance_estimator is not None
+-                ):
+-                    # A rejected draft zero left the drafts unjudged.
+-                    observed_rejected = num_rejected.masked_fill(
+-                        sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+-                    )
++                if self.speculator.acceptance_estimator is not None:
++                    dead_row_cut = getattr(self, "_dead_row_cut", None)
++                    if dead_row_cut is not None:
++                        live_rejected = (
++                            dead_row_cut[: input_batch.num_reqs]
++                            - (num_sampled - 1).clamp_min(0)
++                        ).clamp_min(0)
++                        observed_rejected = torch.minimum(
++                            observed_rejected, live_rejected
++                        )
++                    if sampler_output.sink is not None:
++                        # A rejected draft zero left the drafts unjudged.
++                        observed_rejected = observed_rejected.masked_fill(
++                            sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
++                        )
+                 self.speculator.observe_verification(
+                     input_batch.idx_mapping, num_sampled, observed_rejected
+                 )
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index a5a5d7333..664640158 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -31,6 +31,14 @@ logger = init_logger(__name__)
+ # token past its last live row. Decided on device, inside the draft combine,
+ # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
+ _DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_DEAD_ROWS_TAU", "0"))
++# Above the 16-row Tensor Core MMA tile boundary (c8/c16 batches), dense weight
++# reads amortize across full M=16 tiles and routed MoE tokens coalesce into
++# shared expert tiles, reducing the marginal step cost per verification row to
++# ~0.55x of the sub-16-row slope.
++_HIGH_ROW_COST_KNEE = int(os.environ.get("SPARK_DS41F_DSPARK_HIGH_ROW_KNEE", "16"))
++_HIGH_ROW_COST_SCALE = float(
++    os.environ.get("SPARK_DS41F_DSPARK_HIGH_ROW_COST_SCALE", "0.55")
++)
+ 
+ 
+ def dead_rows_enabled() -> bool:
+@@ -131,6 +139,8 @@ class AdaptiveVerificationManager:
+         # cost: a recipe constant, so the budget is a rule of the inputs, the same
+         # on every build and boot, with nothing timed.
+         self.row_cost = row_cost
++        self.high_row_cost_knee = _HIGH_ROW_COST_KNEE
++        self.high_row_cost_scale = _HIGH_ROW_COST_SCALE
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+@@ -253,6 +263,17 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def _step_cost(self, rows: np.ndarray) -> np.ndarray:
++        """Relative step cost at each candidate verification row count."""
++        knee = getattr(self, "high_row_cost_knee", _HIGH_ROW_COST_KNEE)
++        scale = getattr(self, "high_row_cost_scale", _HIGH_ROW_COST_SCALE)
++        if knee > 0 and scale != 1.0:
++            effective_rows = np.minimum(rows, knee) + scale * np.maximum(
++                rows - knee, 0
++            )
++            return 1.0 + self.row_cost * effective_rows
++        return 1.0 + self.row_cost * rows
++
+     def get_num_tokens(
+         self,
+         num_tokens_per_req: dict[str, int],
+@@ -262,7 +283,7 @@ class AdaptiveVerificationManager:
+ 
+         The budget maximises expected tokens per unit of step cost: the step's
+         sampling requests plus the survival probabilities of the admitted draft
+-        slots (best first), over ``1 + row_cost * rows``, where ``rows`` counts
++        slots (best first), over ``_step_cost(rows)``, where ``rows`` counts
+         the step's non-draft rows and admitted draft rows; within the one-chunk
+         logits limit. Stashes it in ``_batch_budget`` for the compaction and
+         reallocation that follow in the same step.
+@@ -287,6 +308,9 @@ class AdaptiveVerificationManager:
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(self.num_speculative_steps)
+         valid = steps[None, :] < scheduled_drafts[:, None]
++        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
++        if dead_rows_tau > 0.0:
++            valid &= survival_probability >= dead_rows_tau
+         scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+             int(scheduled_drafts.sum()),
+@@ -309,7 +333,7 @@ class AdaptiveVerificationManager:
+             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+         )
+         rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / (1.0 + self.row_cost * rows)
++        utilities = expected_tokens / self._step_cost(rows)
+         draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+@@ -394,9 +418,14 @@ class AdaptiveVerificationManager:
+             float(np.log(self.dead_rows_tau)),
+         )
+ 
+-    def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+-        """Return the device-selected draft count for each request."""
+-        return self._batch_draft_capacity[:num_reqs]
++    def get_verified_draft_counts(
++        self, num_reqs: int, dead_row_cut: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        """Return the device-selected live draft count for each request."""
++        capacities = self._batch_draft_capacity[:num_reqs]
++        if dead_row_cut is not None:
++            return torch.minimum(capacities, dead_row_cut[:num_reqs])
++        return capacities
+ 
+     def reallocate_drafts(
+         self, req_ids: list[str], idx_mapping: torch.Tensor
+-- 
+2.54.0 (Apple Git-157)
+
