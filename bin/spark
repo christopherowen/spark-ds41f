@@ -1908,8 +1908,9 @@ def wait_for_memory_recovery(
     deadline = clock() + MEMORY_RECOVERY_TIMEOUT_SECONDS
     while pending:
         waiting = []
-        for node in pending:
-            now = available_gib(nodes, node)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as pool:
+            readings = list(pool.map(lambda node: available_gib(nodes, node), pending))
+        for node, now in zip(pending, readings):
             before = previous.get(node["name"])
             if before is None or now - before >= MEMORY_SETTLE_GIB:
                 previous[node["name"]] = now
@@ -2047,8 +2048,13 @@ def start_memguard(
 
 
 def start_memguards(cluster: dict, nodes: dict, phase: str) -> None:
-    for node in nodes["nodes"]:
-        start_memguard(cluster, nodes, node, phase)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        futures = [
+            pool.submit(start_memguard, cluster, nodes, node, phase)
+            for node in nodes["nodes"]
+        ]
+        for future in futures:
+            future.result()
 
 
 def preserve_failed_start_logs(
@@ -2288,12 +2294,18 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         return f"+{time.monotonic() - launch_began:.1f}s"
 
     try:
-        for node in nodes["nodes"]:
+        def stop_stale_memguard(node: dict) -> str | None:
             stop_memguard(cluster, nodes, node)
             if memguard_is_active(cluster, nodes, node):
-                raise RuntimeError(
-                    f"{node['name']}: stale memguard is still active; refusing startup"
-                )
+                return f"{node['name']}: stale memguard is still active; refusing startup"
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            stale_errors = [
+                err for err in pool.map(stop_stale_memguard, nodes["nodes"]) if err
+            ]
+        if stale_errors:
+            raise RuntimeError("; ".join(stale_errors))
         if args.replace:
             def replace(node: dict) -> tuple[str | None, str | None]:
                 """Stop and keep one node's old container; return (backup, error)."""
@@ -2325,19 +2337,40 @@ def command_cluster_start(args: argparse.Namespace) -> int:
             wait_for_memory_recovery(
                 cluster, nodes, [node for node in nodes["nodes"] if node["name"] in backups]
             )
-        for node in order:
+        def launch_node(node: dict) -> tuple[dict | None, str | None, str | None]:
             start_memguard(cluster, nodes, node, "startup", prelaunch=True)
             if not memguard_is_active(cluster, nodes, node):
-                raise RuntimeError(
+                return (
+                    None,
+                    None,
                     f"{node['name']}: pre-armed startup memguard is not active; "
-                    "refusing launch"
+                    "refusing launch",
                 )
             result = run_ssh(nodes, node, *launch_command(cluster, node, config_relative))
             if result.returncode:
                 detail = result.stderr.strip() or result.stdout.strip()
-                raise RuntimeError(f"{node['name']}: launch failed: {detail}")
-            started.append(node)
-            print(f"{node['name']}: launched {result.stdout.strip()} ({elapsed()})", flush=True)
+                return None, None, f"{node['name']}: launch failed: {detail}"
+            return (
+                node,
+                f"{node['name']}: launched {result.stdout.strip()} ({elapsed()})",
+                None,
+            )
+
+        for batch in (order[:-1], order[-1:]):
+            if not batch:
+                continue
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                launch_outcomes = list(pool.map(launch_node, batch))
+            launch_errors = []
+            for launched_node, message, error in launch_outcomes:
+                if launched_node is not None:
+                    started.append(launched_node)
+                if message is not None:
+                    print(message, flush=True)
+                if error is not None:
+                    launch_errors.append(error)
+            if launch_errors:
+                raise RuntimeError("; ".join(launch_errors))
         wait_for_api(cluster, nodes)
         print(f"API ready at {elapsed()}", flush=True)
         start_memguards(cluster, nodes, "steady")

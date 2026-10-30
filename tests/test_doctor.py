@@ -846,7 +846,7 @@ class MountTestScriptTest(unittest.TestCase):
 class ClusterReplaceTest(unittest.TestCase):
     """start --replace stops every node's old container (concurrently) and rolls back on failure."""
 
-    def run_start(self, fail_rename_on=None):
+    def run_start(self, fail_rename_on=None, fail_launch_on=None):
         import argparse
         from unittest import mock
 
@@ -862,6 +862,8 @@ class ClusterReplaceTest(unittest.TestCase):
             calls.append((node["name"], command[:2]))
             code = 0
             if command[:2] == ("docker", "rename") and node["name"] == fail_rename_on:
+                code = 1
+            if command[:2] == ("docker", "run") and node["name"] == fail_launch_on:
                 code = 1
             return subprocess.CompletedProcess(command, code, stdout="id\n", stderr="")
 
@@ -923,6 +925,19 @@ class ClusterReplaceTest(unittest.TestCase):
         self.assertEqual(code, 1)
         backups = restore.call_args.args[2]
         self.assertEqual(sorted(backups), ["dgx1", "dgx3"])
+        self.assertNotIn(("dgx1", ("docker", "run")), calls)
+
+    def test_followers_launch_before_head_and_roll_back_on_partial_failure(self) -> None:
+        code, calls, _ = self.run_start()
+        self.assertEqual(code, 0)
+        launched = [node for node, command in calls if command == ("docker", "run")]
+        self.assertEqual(sorted(launched[:2]), ["dgx2", "dgx3"])
+        self.assertEqual(launched[2], "dgx1")
+
+        code, calls, restore = self.run_start(fail_launch_on="dgx2")
+        self.assertEqual(code, 1)
+        started_nodes = [node["name"] for node in restore.call_args.args[3]]
+        self.assertEqual(started_nodes, ["dgx3"])
         self.assertNotIn(("dgx1", ("docker", "run")), calls)
 
 
