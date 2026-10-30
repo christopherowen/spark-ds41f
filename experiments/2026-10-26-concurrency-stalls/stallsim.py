@@ -161,6 +161,7 @@ class Policy:
     sink_hold: bool = True
     overhead_cut_s: float = 0.0        # host or collective time removed from every step
     lookup_window: int = 32            # waiting requests a non-FCFS order looks at each step
+    interleave_decode_steps: int = 0   # pure graphed decode steps interleaved between long chunks
 
 
 # ---------------------------------------------------------------------------------------------
@@ -452,6 +453,7 @@ class Engine:
         self.livelock_s = 300.0
         self.no_progress_since = None
         self.livelocked = False
+        self.interleave_remaining = 0
 
     # -- events ---------------------------------------------------------------------------
 
@@ -822,8 +824,39 @@ class Engine:
             cap = policy.long_wait_cap_s
             return cap is not None and request.deferred_since is not None and now - request.deferred_since >= cap
 
+        inflight_prefills = running_prefills()
+        if not inflight_prefills:
+            self.interleave_remaining = 0
+        interleave_first_due = policy.sink_hold and any(
+            not r.prefilling and r.first is None and (r.out > 0 or r.rid in in_flight)
+            for r in self.running
+        )
+        interleave_step = (
+            policy.interleave_decode_steps > 0
+            and stats["n_dec"] > 0
+            and bool(inflight_prefills)
+            and (self.interleave_remaining > 0 or interleave_first_due)
+        )
+        if interleave_step and self.interleave_remaining > 0:
+            self.interleave_remaining -= 1
+
         order = policy.order
-        if order == "fcfs":
+        if interleave_step:
+            # Defer running multi-chunk prefills via defer_prefills so active decodes run
+            # as a fast graphed decode step, while still admitting any waiting short prefill.
+            waiting = list(self.waiting)[: policy.lookup_window] if not preempted else []
+            cut = policy.bypass_tokens or threshold
+            slots = self.max_seqs - len(self.running)
+            for request in waiting:
+                if budget <= 0 or slots <= 0:
+                    break
+                self.lookup(request)
+                if self.remaining(request) <= cut:
+                    used = admit(request, budget)
+                    if used > 0:
+                        budget -= used
+                        slots -= 1
+        elif order == "fcfs":
             for request in running_prefills():
                 if budget <= 0:
                     break
@@ -922,6 +955,13 @@ class Engine:
                     serve(request, False)
         else:
             raise ValueError(order)
+
+        if (
+            policy.interleave_decode_steps > 0
+            and not interleave_step
+            and any(r.prefilling and r.rid in scheduled for r in self.running)
+        ):
+            self.interleave_remaining = policy.interleave_decode_steps
 
         if len(self.running) >= self.max_seqs:
             self.wait_reason = "slots"
