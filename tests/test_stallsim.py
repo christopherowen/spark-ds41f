@@ -246,6 +246,24 @@ class PolicyTest(unittest.TestCase):
         engine.run(100.0)
         self.assertEqual({c for _, c in chunk_steps(engine, long)}, {256})
 
+    def test_context_aware_step_target_grid(self):
+        import json
+
+        cal = json.loads((ROOT / "experiments/2026-10-26-concurrency-stalls/calibration.json").read_text())
+        tp4 = Shape(**cal["tp4-ring"])
+        policy = Policy(step_target_s=1.0, grid=2048)
+        engine = Engine(tp4, policy, seed=13)
+        # Solo prefill (n_dec == 0): full 16,288 threshold at any context.
+        self.assertEqual(engine.context_chunk_threshold(0, 0), 16288)
+        self.assertEqual(engine.context_chunk_threshold(900_000, 0), 16288)
+        # Low context (c < 64K) with active decodes: T(c) = 8,192.
+        self.assertEqual(engine.context_chunk_threshold(0, 4), 8192)
+        self.assertEqual(engine.context_chunk_threshold(32_768, 8), 8192)
+        # Deep context (c > 500K) with active decodes: T(c) = 4,096.
+        self.assertEqual(engine.context_chunk_threshold(600_000, 4), 4096)
+        self.assertEqual(engine.context_chunk_threshold(900_000, 8), 4096)
+
+
     def test_summary(self):
         engine = Engine(toy(), seed=10)
         stallsim_rng = random.Random(1)

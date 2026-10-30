@@ -142,6 +142,7 @@ class Policy:
     # Otherwise [(decoding requests at least, threshold)]; chunks end on multiples of `grid`.
     chunk_tiers: list | None = None
     grid: int = 0
+    step_target_s: float | None = None  # context-aware step-time ceiling tau_max on the 2,048 grid
     budget_alone: int | None = None    # the step budget when no decode is runnable (memory)
     # Prefill order: "fcfs" (production), "bypass" (prefills that finish within one chunk go
     # first), "spf" (shortest remaining prefill first), "rr2" (vLLM's two round-robin lanes).
@@ -161,6 +162,7 @@ class Policy:
     sink_hold: bool = True
     overhead_cut_s: float = 0.0        # host or collective time removed from every step
     lookup_window: int = 32            # waiting requests a non-FCFS order looks at each step
+    interleave_decode_steps: int = 0   # pure graphed decode steps interleaved between long chunks
 
 
 # ---------------------------------------------------------------------------------------------
@@ -452,6 +454,7 @@ class Engine:
         self.livelock_s = 300.0
         self.no_progress_since = None
         self.livelocked = False
+        self.interleave_remaining = 0
 
     # -- events ---------------------------------------------------------------------------
 
@@ -659,9 +662,38 @@ class Engine:
                 chosen = threshold
         return chosen
 
+    def context_chunk_threshold(self, computed: int, n_dec: int) -> int:
+        """Context-aware step-time threshold T(c) on the 2,048-token grid when decodes are active."""
+        target_s = self.policy.step_target_s
+        if target_s is None or target_s <= 0:
+            return self.chunk_threshold(n_dec)
+        if n_dec <= 0:
+            return self.threshold
+        grid = self.policy.grid if self.policy.grid > 0 else 2048
+        avail = max(target_s - self.shape.F - self.shape.alpha * self.shape.t_dec(n_dec), 0.0)
+        denom = self.shape.m0 + self.shape.m1 * max(computed, 0)
+        q_raw = avail / denom if denom > 0 else float(self.threshold)
+        grid_units = max(1, int((q_raw + 0.75 * grid) // grid))
+        if grid_units <= 1:
+            tier = grid
+        elif grid_units == 2:
+            tier = 2 * grid
+        elif grid_units <= 4:
+            tier = 4 * grid
+            if tier > self.threshold >= 2 * grid:
+                tier = 2 * grid
+        else:
+            tier = self.threshold
+        return min(tier, self.threshold)
+
     def aligned_chunk(self, computed: int, remaining: int, threshold: int) -> int:
         """vLLM's `_aligned_prefill_chunk`, or the policy's grid."""
-        grid = self.policy.grid if self.policy.chunk_tiers else threshold
+        if self.policy.step_target_s is not None and self.policy.step_target_s > 0:
+            if threshold >= self.threshold:
+                return min(remaining, self.threshold - computed % self.threshold)
+            grid = self.policy.grid if self.policy.grid > 0 else 2048
+        else:
+            grid = self.policy.grid if self.policy.chunk_tiers else threshold
         end = (computed + threshold) // grid * grid
         if end <= computed:
             end = (computed // grid + 1) * grid
@@ -692,13 +724,14 @@ class Engine:
                     request.waits[self.wait_reason] = request.waits.get(self.wait_reason, 0.0) + span
         self.last_decision = now
         runnable = sum(1 for r in self.running if not r.prefilling)
-        threshold = self.chunk_threshold(runnable)
+        threshold = self.context_chunk_threshold(0, runnable)
         budget = self.budget
         if policy.budget_alone and runnable == 0:
             budget = max(budget, policy.budget_alone)
         entries: list = []
         chunks: list = []
         stats = {"n_dec": 0, "new": 0, "prefill": 0, "recompute": 0, "engram": False}
+        step_prefill_cap = [self.budget]
         scheduled: set = set()
         preempted = False
         in_flight = {e[0].rid for e in self.in_flight[1]["entries"]} if self.in_flight else set()
@@ -721,12 +754,17 @@ class Engine:
             if admit:
                 self.lookup(request)
             remaining = request.target - request.computed
-            chunk = self.aligned_chunk(request.computed, remaining, threshold)
-            if chunk <= 0 or chunk > budget_left:
+            req_threshold = self.context_chunk_threshold(request.computed, runnable)
+            eff_budget = budget_left
+            if policy.step_target_s is not None and policy.step_target_s > 0 and runnable > 0:
+                cap = min(step_prefill_cap[0], req_threshold)
+                eff_budget = min(eff_budget, max(cap - stats["prefill"], 0))
+            chunk = self.aligned_chunk(request.computed, remaining, req_threshold)
+            if chunk <= 0 or chunk > eff_budget:
                 return 0
             x0 = request.computed
             continues = x0 + chunk < request.target
-            fill = round(shape.fill_blocks * min(chunk, threshold) / self.threshold) if continues else 0
+            fill = round(shape.fill_blocks * min(chunk, req_threshold) / self.threshold) if continues else 0
             if admit:
                 self.grow(request, x0 - x0 % BLOCK)  # pin the hit's blocks before making room
                 if request.lookup_key is not None:
@@ -779,6 +817,8 @@ class Engine:
             request.recompute += recompute
             stats["recompute"] += recompute
             stats["prefill"] += chunk
+            if policy.step_target_s is not None and policy.step_target_s > 0 and runnable > 0:
+                step_prefill_cap[0] = min(step_prefill_cap[0], req_threshold)
             request.deferred_since = None
             return chunk
 
@@ -822,8 +862,39 @@ class Engine:
             cap = policy.long_wait_cap_s
             return cap is not None and request.deferred_since is not None and now - request.deferred_since >= cap
 
+        inflight_prefills = running_prefills()
+        if not inflight_prefills:
+            self.interleave_remaining = 0
+        interleave_first_due = policy.sink_hold and any(
+            not r.prefilling and r.first is None and (r.out > 0 or r.rid in in_flight)
+            for r in self.running
+        )
+        interleave_step = (
+            policy.interleave_decode_steps > 0
+            and stats["n_dec"] > 0
+            and bool(inflight_prefills)
+            and (self.interleave_remaining > 0 or interleave_first_due)
+        )
+        if interleave_step and self.interleave_remaining > 0:
+            self.interleave_remaining -= 1
+
         order = policy.order
-        if order == "fcfs":
+        if interleave_step:
+            # Defer running multi-chunk prefills via defer_prefills so active decodes run
+            # as a fast graphed decode step, while still admitting any waiting short prefill.
+            waiting = list(self.waiting)[: policy.lookup_window] if not preempted else []
+            cut = policy.bypass_tokens or threshold
+            slots = self.max_seqs - len(self.running)
+            for request in waiting:
+                if budget <= 0 or slots <= 0:
+                    break
+                self.lookup(request)
+                if self.remaining(request) <= cut:
+                    used = admit(request, budget)
+                    if used > 0:
+                        budget -= used
+                        slots -= 1
+        elif order == "fcfs":
             for request in running_prefills():
                 if budget <= 0:
                     break
@@ -922,6 +993,13 @@ class Engine:
                     serve(request, False)
         else:
             raise ValueError(order)
+
+        if (
+            policy.interleave_decode_steps > 0
+            and not interleave_step
+            and any(r.prefilling and r.rid in scheduled for r in self.running)
+        ):
+            self.interleave_remaining = policy.interleave_decode_steps
 
         if len(self.running) >= self.max_seqs:
             self.wait_reason = "slots"
