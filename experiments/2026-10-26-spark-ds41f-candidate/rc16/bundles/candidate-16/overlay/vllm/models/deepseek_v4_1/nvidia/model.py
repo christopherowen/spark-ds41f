@@ -1,0 +1,1267 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+import typing
+from collections.abc import Callable, Iterable
+from itertools import islice
+
+import regex as re
+import torch
+import torch.nn as nn
+
+import vllm.envs as envs
+from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    fused_moe_make_expert_params_mapping,
+)
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+)
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
+    make_layers,
+)
+from vllm.model_executor.weight_transfer import copy_weight
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+from vllm.models.deepseek_v41.nvidia.model import (
+    DeepseekV4MixtureOfExperts as DeepseekV4MixtureOfExperts,
+)
+from vllm.models.deepseek_v41.nvidia.model import (
+    DeepseekV41LLMForCausalLM as UpstreamDeepseekV41LLMForCausalLM,
+)
+from vllm.models.deepseek_v41.nvidia.model import (
+    _make_deepseek_v4_weights_mapper as _make_deepseek_v4_weights_mapper,
+)
+from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.sample.sink import SinkConfig
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+from .. import kernels, l2_prefetch, sp_prefill
+from ..attention import DeepseekV4Attention
+from ..ced import ced_decoder_start, gather_rows, scatter_rows
+from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..glp import glp_steering
+
+if typing.TYPE_CHECKING:
+    pass
+
+logger = init_logger(__name__)
+
+
+def _select_dsv4_attn_cls(vllm_config):
+    if vllm_config.attention_config.backend not in (
+        None,
+        AttentionBackendEnum.TILELANG,
+    ):
+        raise ValueError("DeepSeek V4.1 requires the TILELANG attention backend")
+    from ..tilelang.attention import DeepseekV41TileLangAttention
+
+    return DeepseekV41TileLangAttention
+
+
+class DeepseekV4DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        vllm_config,
+        prefix,
+        topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list[torch.cuda.Stream] | None = None,
+        engram_layout: EngramLayout | None = None,
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        self.hidden_size = config.hidden_size
+
+        self.engram: Engram | None = None
+        if engram_layout is not None:
+            layer_id = extract_layer_index(prefix)
+            if layer_id in engram_layout.layer_ids:
+                self.engram = Engram(
+                    config,
+                    vllm_config.quant_config,
+                    engram_layout,
+                    engram_layout.layer_ids.index(layer_id),
+                    prefix=f"{prefix}.engram",
+                )
+
+        self.rms_norm_eps = config.rms_norm_eps
+        self.attn = _select_dsv4_attn_cls(vllm_config)(
+            vllm_config,
+            prefix=f"{prefix}.attn",
+            topk_indices_buffer=topk_indices_buffer,
+            aux_stream_list=aux_stream_list,
+        )
+        if config.scoring_func != "sqrtsoftplus" or not config.norm_topk_prob:
+            raise ValueError("V4.1 requires normalized sqrtsoftplus routing")
+        if getattr(config, "gate_temp", 1.0) != 1.0:
+            raise ValueError("V4.1 requires gate_temp=1")
+        is_draft = extract_layer_index(prefix) >= config.num_hidden_layers
+        moe_config = vllm_config
+        if is_draft:
+            # Only the expert counts differ; use the same DSV4 TP implementation.
+            moe_config = copy.copy(vllm_config)
+            moe_config.model_config = copy.copy(vllm_config.model_config)
+            moe_config.model_config.hf_config = copy.copy(config)
+            moe_config.model_config.hf_config.n_routed_experts = (
+                config.dspark_n_routed_experts
+            )
+            moe_config.model_config.hf_config.num_experts_per_tok = (
+                config.dspark_num_experts_per_tok
+            )
+        gate = ReplicatedLinear(
+            config.hidden_size,
+            moe_config.model_config.hf_config.n_routed_experts,
+            bias=False,
+            prefix=f"{prefix}.ffn.gate",
+        )
+        gate.quant_method = kernels.linear_method()
+        gate.out_dtype = torch.float32
+        self.ffn = DeepseekV4MoE(
+            moe_config,
+            prefix=f"{prefix}.ffn",
+            use_sequence_parallel=False,
+            gate=gate,
+            image_sentinel_lo=0 if is_draft else 129264,
+            image_sentinel_count=1,
+            router_cls=kernels.moe_router_class(),
+        )
+
+        shared = getattr(self.ffn, "shared_experts", None)
+        if shared is not None:
+            shared.act_fn = kernels.shared_expert_activation(
+                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
+            )
+        # The mHC entries write these projections' MXFP8 input (the routed
+        # experts' too): ``forward`` hands it over and they cast nothing.
+        self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
+        if shared is not None:
+            shared.gate_up_proj.tilelang_mxfp8_input = True
+
+        # A CED decoder layer routes the compact decoder rows, whose padding
+        # mask differs from the step's. Tag its router by layer, never by the
+        # row count, which an encoder forward can share.
+        router = getattr(self.ffn.experts, "router", None)
+        if router is not None:
+            router._ds41_is_ced_decoder = self.attn.is_ced_decoder
+
+        self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+        self.ffn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.hc_post_alpha = 2.0
+        self.mhc = kernels.mhc(config)
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * self.hidden_size
+        self.hc_attn_fn = nn.Parameter(
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.hc_attn_fn_broadcast: torch.Tensor | None = None
+        self.hc_ffn_fn = nn.Parameter(
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.hc_attn_base = nn.Parameter(
+            torch.empty(
+                mix_hc,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.hc_ffn_base = nn.Parameter(
+            torch.empty(
+                mix_hc,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.hc_attn_scale = nn.Parameter(
+            torch.empty(
+                3,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.hc_ffn_scale = nn.Parameter(
+            torch.empty(
+                3,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    def declare_kernels(self) -> None:
+        """Declare the MoE router's kernels (a router is not a module) and the MXFP8
+        cast of the rows a forward regroups after the mHC entry that cast them
+        (CED's compact rows, prefill SP's gathered rows)."""
+        from ..tilelang import prepare
+        from ..tilelang.linear import _warm_casts
+
+        router = getattr(self.ffn.experts, "router", None)
+        declare = getattr(router, "declare_kernels", None)
+        if declare is not None:
+            declare()
+        prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+
+    def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+        """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+        attn, device = self.attn, self.hc_attn_fn.device
+        # The WO projection names the bytes it reads.
+        wo = attn._wo_projection_weights.l2_segments()
+        attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
+        ffn = l2_prefetch.param_segments(
+            "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
+        )
+        ffn += l2_prefetch.param_segments("ffn_norm", self.ffn_norm, ("weight",))
+        ffn += l2_prefetch.linear_segments("gate", self.ffn.gate)
+        shared = getattr(self.ffn, "shared_experts", None)
+        for name in ("gate_up_proj", "down_proj"):
+            ffn += l2_prefetch.linear_segments(name, getattr(shared, name, None))
+        attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
+        if attn.compressor is not None:
+            # COMP: the compressor's projection, the first weight an owner layer
+            # reads after Q-B.
+            comp = l2_prefetch.linear_segments(
+                "compressor", attn.compressor.fused_wkv_wgate
+            )
+            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
+        plan_next = None
+        if nxt is not None:
+            segments = l2_prefetch.param_segments(
+                "mhc",
+                nxt,
+                ("hc_attn_fn_broadcast", "hc_attn_fn", "hc_attn_scale", "hc_attn_base"),
+            )
+            segments += l2_prefetch.param_segments(
+                "attn_norm", nxt.attn_norm, ("weight",)
+            )
+            segments += l2_prefetch.linear_segments("wqa_wkv", nxt.attn.fused_wqa_wkv)
+            segments += l2_prefetch.linear_segments("wq_b", nxt.attn.wq_b)
+            indexer = getattr(nxt.attn, "indexer", None)
+            for name in ("wq_b", "weights_proj"):
+                segments += l2_prefetch.linear_segments(
+                    f"indexer.{name}", getattr(indexer, name, None)
+                )
+            plan_next = l2_prefetch.make_plan(segments, l2_prefetch.BUDGET_NEXT, device)
+        plan_engram = None
+        engram = getattr(nxt, "engram", None)
+        if plan_next is not None and engram is not None:
+            # The next layer runs its Engram projection before anything NEXT holds,
+            # and NEXT's lines would not survive it: that layer issues NEXT between
+            # the projection and its all-gather, and this window prefetches the
+            # projection's first bytes over the latency-bound work before it.
+            plan_engram = l2_prefetch.make_plan(
+                l2_prefetch.linear_segments("engram.wkv", engram.wkv),
+                l2_prefetch.BUDGET_NEXT,
+                device,
+            )
+            engram.l2_prefetch_after_projection = (
+                lambda n, p=plan_next: l2_prefetch.issue(p, n)
+            )
+        hooked = plan_engram if plan_engram is not None else plan_next
+        if hooked is not None:
+            object.__setattr__(
+                self.ffn.experts,
+                "_l2_prefetch_pre_reduce_hook",
+                lambda n, p=hooked: l2_prefetch.issue(p, n),
+            )
+        return " | ".join(
+            f"{label} {plan.describe() if plan else '-'}"
+            for label, plan in (
+                ("WO", attn._l2pf_wo),
+                ("COMP", attn._l2pf_comp),
+                ("FFN", attn._l2pf_ffn),
+                ("NEXT", plan_next),
+                ("ENGRAM", plan_engram),
+            )
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None = None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
+        engram_mask: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
+        sp_rows: sp_prefill.SPRows | None = None,
+        *,
+        ced_positions: torch.Tensor | None = None,
+        ced_input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        previous_output = x if residual is not None else None
+        apply_engram = self.engram is not None and engram_hashes is not None
+        if residual is None:
+            residual = x
+        elif apply_engram:
+            # Engram mutates the reconstructed residual; do not fuse across it.
+            residual = self.mhc.post(x, residual, post_mix, res_mix)
+            previous_output = None
+        if apply_engram:
+            if residual.ndim == 2:
+                residual = (
+                    residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
+                )
+            residual = self.engram(
+                residual,
+                engram_hashes[:, self.engram.layer_hash_index],
+                engram_mask,
+                sp_rows=sp_rows,
+            )
+        fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
+        # x_q: x's MXFP8 cast for the sublayer's projections.
+        residual, post_mix, res_mix, x, attn_pre, x_q = self.mhc.pre(
+            residual,
+            fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.attn_norm.weight,
+            pre_mix,
+            previous_output=previous_output,
+            previous_post=post_mix if previous_output is not None else None,
+            previous_comb=res_mix if previous_output is not None else None,
+        )
+        global_kv_ready = None
+        if ced_indices is not None:
+            # Decoder global KV needs every encoder row, but decoder queries,
+            # residual updates and experts only need the selected replay rows.
+            global_kv_ready = self.attn.prepare_global_kv(positions, x)
+            x = gather_rows(x, ced_indices)
+            x_q = self.mhc.cast_rows(x)
+            residual = gather_rows(residual, ced_indices)
+            post_mix = gather_rows(post_mix, ced_indices)
+            res_mix = gather_rows(res_mix, ced_indices)
+            attn_pre = gather_rows(attn_pre, ced_indices)
+            positions = (
+                gather_rows(positions, ced_indices)
+                if ced_positions is None
+                else ced_positions
+            )
+            if input_ids is not None:
+                input_ids = (
+                    gather_rows(input_ids, ced_indices)
+                    if ced_input_ids is None
+                    else ced_input_ids
+                )
+        if sp_rows is None:
+            with kernels.mxfp8_inputs(x_q):
+                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+        else:
+            # SP: attention gathers every row and reduce-scatters its output.
+            with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
+                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+            if sp_rows.unreduced:
+                x = sp_prefill.unreduced_parts(x)
+        residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.ffn_norm.weight,
+            attn_pre,
+        )
+        if sp_rows is None:
+            with kernels.mxfp8_inputs(x_q):
+                x = self.ffn(x, input_ids)
+        else:
+            # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
+            with (
+                sp_prefill.activate(sp_rows),
+                kernels.sp_moe_inputs(
+                    sp_rows, x, x_q, self.ffn, input_ids, self.mhc
+                ) as rows,
+            ):
+                x = self.ffn(
+                    rows,
+                    input_ids,
+                    reduce_scatter_rows=sp_rows.padded_rows,
+                )
+            if sp_rows.unreduced:
+                x = sp_prefill.unreduced_parts(x)
+        return x, residual, post_mix, res_mix, ffn_pre
+
+
+def build_l2_prefetch_plans(layers: list, first_layer: int = 0) -> bool:
+    """Install L2 prefetch windows on consecutive decoder layers.
+
+    Plans own device tables, so they are built on an eager pass before any
+    graph capture, once the WO weights have been packed. Returns whether the
+    layers need no further attempt.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    if any(layer.attn._wo_projection_weights is None for layer in layers):
+        return False
+    if not l2_prefetch.warmup():
+        return True
+    for index, layer in enumerate(layers):
+        nxt = layers[index + 1] if index + 1 < len(layers) else None
+        summary = layer.build_l2_prefetch(nxt)
+        if index in (0, len(layers) - 1):
+            logger.info("[l2_prefetch] layer %d %s", first_layer + index, summary)
+    return True
+
+
+class DeepseekV4Model(nn.Module, EagleModelMixin):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.ced_decoder_start = ced_decoder_start(config)
+        self.quant_config = quant_config
+        self.parallel_config = vllm_config.parallel_config
+        # Per-forward prefill sequence parallelism (0 = off); see sp_prefill.
+        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(vllm_config)
+        if vllm_config.parallel_config.use_ubatching:
+            raise ValueError(
+                "V4.1 fixed native layer buffers require ubatching/DBO disabled"
+            )
+        if vllm_config.lora_config is not None:
+            raise ValueError("V4.1 native kernels do not support LoRA adapters")
+        if quant_config is None or quant_config.get_name() not in (
+            "deepseek_v41_fp8",
+            "mxfp4_csf",
+        ):
+            raise ValueError("V4.1 requires its native block32 quantization config")
+        self.vocab_size = config.vocab_size
+        self.hc_eps = config.hc_eps
+        self.hc_mult = config.hc_mult
+        self.hc_dim = self.hc_mult * config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
+
+        aux_stream_list = None
+
+        # Reserved topk indices buffer for all Indexer layers to reuse.
+        self.topk_indices_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            config.index_topk,
+            dtype=torch.int32,
+        )
+
+        # Two-level candidate filtering needs no buffer here: the attention of
+        # candidate_source_layer_id keeps the candidates it publishes for the
+        # later ratio-1 indexers (24/28/32/36) in its own staging (_candidates).
+
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.engram_layout = EngramLayout.from_config(config)
+
+        self._l2pf_ready = False
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: DeepseekV4DecoderLayer(
+                vllm_config,
+                prefix=prefix,
+                topk_indices_buffer=self.topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
+                engram_layout=self.engram_layout,
+            ),
+            prefix=f"{prefix}.layers",
+        )
+        # SP results stay unreduced for mHC to add (see sp_prefill).
+        self.prefill_sp_unreduced = (
+            bool(self.prefill_sp_min_rows) and sp_prefill.unreduced_enabled()
+        )
+        if self.prefill_sp_unreduced:
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                object.__setattr__(
+                    layer.ffn.experts,
+                    "_sp_project_reduce_scatter_hook",
+                    sp_prefill.project_reduce_scatter_current,
+                )
+        # Under SP prefill an Engram layer gates this rank's rows (its blocked gate).
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if getattr(layer, "engram", None) is not None:
+                layer.engram.prefill_sp_min_rows = self.prefill_sp_min_rows
+
+        # Hashing reads the runner's accepted-only lookback, never KV slot state.
+        self.engram_hash: NgramHashState | None = None
+        self.engram_swa_prefix: str | None = None
+        if self.engram_layout is not None:
+            local_engram = any(
+                isinstance(layer, DeepseekV4DecoderLayer) and layer.engram is not None
+                for layer in islice(self.layers, self.start_layer, self.end_layer)
+            )
+            if local_engram:
+                first_layer = next(
+                    iter(islice(self.layers, self.start_layer, self.end_layer))
+                )
+                swa_cache_module = first_layer.attn.swa_cache_layer
+                self.engram_hash = NgramHashState(
+                    vllm_config, self.engram_layout, swa_cache_module
+                )
+                self.engram_swa_prefix = swa_cache_module.prefix
+        self.disk_engram = (
+            self.engram_layout is not None and self.engram_layout.table_memory == "disk"
+        )
+        self.file_backed_engram = (
+            self.engram_layout is not None
+            and self.engram_layout.table_memory in ("ram", "disk")
+        )
+        if self.disk_engram:
+            self.register_engram_hashes()
+
+        if get_pp_group().is_last_rank:
+            self.norm = kernels.rms_norm(config.hidden_size, self.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+
+        # The attention-sink detector (vllm.v1.sample.sink) watches one column
+        # of the pre-norm residual: each forward keeps that column of every
+        # residual stream, [tokens, hc_mult] (float32), for every token.
+        sink_config = SinkConfig.for_model(vllm_config)
+        self._sink_column = sink_config.column if sink_config is not None else -1
+        self._sink_columns: torch.Tensor | None = None
+        if get_pp_group().is_last_rank and sink_config is not None:
+            self._sink_columns = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.hc_mult,
+                dtype=torch.float32,
+            )
+        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL
+        # are set; None otherwise, which leaves the forward as it is.
+        self.glp = glp_steering(
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.hc_mult,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
+        # A captured forward's outputs, written in place: the hidden states and one
+        # row block per auxiliary layer (set with them), for the CUDA graph sizes.
+        # The graph manager adopts them rather than copying every replay's outputs.
+        graph_rows = (
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            if get_pp_group().is_last_rank
+            else 0
+        )
+        self._graph_outputs: tuple[torch.Tensor, list[torch.Tensor]] | None = (
+            (
+                torch.empty(
+                    graph_rows,
+                    config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                [],
+            )
+            if graph_rows
+            else None
+        )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        if self._graph_outputs is not None:
+            hidden = self._graph_outputs[0]
+            self._graph_outputs = (
+                hidden,
+                [torch.empty_like(hidden) for _ in self.aux_hidden_state_layers],
+            )
+
+    def _graph_out(self, index: int | None, rows: int) -> torch.Tensor | None:
+        """Rows of a captured forward's output buffer (``index`` None: the hidden
+        states, else that auxiliary layer's), or None outside capture."""
+        if self._graph_outputs is None or not torch.cuda.is_current_stream_capturing():
+            return None
+        hidden, aux = self._graph_outputs
+        buffer = hidden if index is None else aux[index]
+        return buffer[:rows] if rows <= buffer.shape[0] else None
+
+    def register_engram_hashes(self) -> None:
+        """The step's disk Engram row IDs, ``prepared_engram_hashes`` [max_tokens,
+        layers, 24]: a view of a layer-major buffer whose planes are the local disk
+        Engram layers' own IDs, the hash writing them (and the live token count) in
+        place for every layer's reader and gather."""
+        caps = self.engram_layout.caps[0]
+        planes = torch.full(
+            (len(self.engram_layout.layer_ids), caps.max_tokens, 24),
+            -1,
+            dtype=torch.int64,
+            device=caps.device,
+        )
+        self.register_buffer(
+            "prepared_engram_hashes", planes.permute(1, 0, 2), persistent=False
+        )
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.share_hashes(
+                    planes[engram.layer_hash_index], self.engram_hash.num_tokens
+                )
+
+    def prepare_disk_engram(
+        self, input_ids, query_start_loc, lookback_token_ids, early=None
+    ):
+        """Hash this step's tokens and queue each disk Engram table's rows; each
+        Engram layer's forward gathers them. ``early`` ([tokens, layers, 24] int64 on
+        the host, or None) holds the row IDs the host hashed for the tokens it knows,
+        ``host_hash.UNKNOWN`` elsewhere: the reader reads those rows before the GPU
+        reaches the step."""
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Disk Engram preparation must run outside compile/capture"
+            )
+        engrams = tuple(
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if getattr(layer, "engram", None) is not None
+        )
+        if self.engram_hash is None:
+            raise RuntimeError("Disk Engram requires initialized hash state")
+        tokens = input_ids.shape[0]
+        # Each layer's IDs land in its own plane; the hash finds the image sentinel
+        # in the ids itself.
+        self.engram_hash.run_native(
+            input_ids,
+            query_start_loc,
+            lookback_token_ids,
+            self.prepared_engram_hashes[:tokens],
+        )
+        stream = torch.cuda.current_stream()
+        for engram in engrams:
+            engram.stage_rows(
+                tokens,
+                stream,
+                None if early is None else early[:, engram.layer_hash_index],
+            )
+
+    def prepare_dummy_engram(self, num_tokens):
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Disk Engram preparation must run outside compile/capture"
+            )
+        self.prepared_engram_hashes.fill_(-1)
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if getattr(layer, "engram", None) is not None:
+                layer.engram.prepare_dummy_output(num_tokens)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # PP intermediate tensors carry the multi-stream hidden_states
+        # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
+        # token embedding to hc_mult streams before the first decoder
+        # layer and keeps that shape until the final hc collapse — plus the
+        # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
+        # for its attention collapse.
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.hc_mult, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+                "pre_mix": torch.zeros(
+                    (batch_size, self.hc_mult),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+        )
+
+    def declare_kernels(self) -> None:
+        """Declare the TileLang kernels the forward reaches outside its modules: the
+        rank-order sum and the NCCL all-gathers' concatenation of the TP group's
+        collectives, prefill SP's pad-row zeros, the L2 prefetch and the last
+        collapse's sink-column variant."""
+        from ..tilelang import collectives, columns, prepare
+        from ..tilelang.mhc import TileKernelsMHC
+
+        # The last collapse with the sink detector's column (forward).
+        collapse = (
+            TileKernelsMHC.collapse_column_calls(
+                self.config.hidden_size, self._sink_column
+            )
+            if self._sink_columns is not None
+            else []
+        )
+        prepare.declare(
+            lambda: [
+                *collectives.rank_order_sum_calls(),
+                *collectives.rank_rows_calls(),
+                # Prefill SP's and the rank-order all-reduce's pad rows.
+                prepare.call(columns.zero_packs_kernel),
+                *l2_prefetch.kernel_calls(),
+                *collapse,
+            ]
+        )
+
+    def _build_l2_prefetch(self) -> None:
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        self._l2pf_ready = build_l2_prefetch_plans(layers, self.start_layer)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        sp = None
+        # With CED the encoder layers (before ced_decoder_start) still run on
+        # every row; SP covers them and hands full rows to the boundary layer.
+        sp_layers_available = ced_indices is None or (
+            self.ced_decoder_start is not None
+            and self.start_layer < self.ced_decoder_start
+        )
+        if self.prefill_sp_min_rows and sp_layers_available:
+            sp = sp_prefill.plan_rows(
+                positions.shape[0],
+                self.prefill_sp_min_rows,
+                get_tensor_model_parallel_world_size(),
+                get_tensor_model_parallel_rank(),
+                unreduced=self.prefill_sp_unreduced,
+            )
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = (
+                    inputs_embeds if sp is None else sp.local_slice(inputs_embeds)
+                )
+            elif sp is not None:
+                # One vocabulary shard owns each token: the reduce-scatter is
+                # exact and leaves this rank's rows.
+                hidden_states = self.embed_tokens.forward_reduce_scatter(
+                    input_ids, sp.padded_rows
+                )
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+
+        engram_hashes: torch.Tensor | None = None
+        engram_mask: torch.Tensor | None = None
+        if self.disk_engram and input_ids is not None:
+            engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+            # The gate takes the ids: the image sentinel's rows pass.
+            engram_mask = input_ids
+        elif self.engram_hash is not None and input_ids is not None:
+            attn_metadata = (
+                get_forward_context().attn_metadata
+                if is_forward_context_available()
+                else None
+            )
+            if isinstance(attn_metadata, list):
+                attn_metadata = attn_metadata[dbo_current_ubatch_id()]
+            if isinstance(attn_metadata, dict):
+                swa_metadata = attn_metadata[self.engram_swa_prefix]
+                query_start_loc = swa_metadata.query_start_loc
+                if lookback_token_ids is None:
+                    raise ValueError(
+                        "V4.1 Engram requires accepted-only lookback_token_ids"
+                    )
+            else:
+                # Profiling must exercise the same native hash/lookup/projection
+                # and gate kernels, not silently omit the Engram layers.
+                query_start_loc = torch.zeros(
+                    2, dtype=torch.int32, device=input_ids.device
+                )
+                query_start_loc[1] = input_ids.shape[0]
+                lookback_token_ids = input_ids.new_full((1, 3), -1)
+            engram_mask = input_ids
+            engram_hashes = self.engram_hash(
+                input_ids,
+                positions,
+                query_start_loc,
+                lookback_token_ids,
+            )
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
+
+        full_num_tokens = positions.shape[0]
+        # GLP steering's row marks for the rows the layers hold: this rank's under
+        # sequence parallelism, the decoder's once CED compacts the step.
+        steer_rows: torch.Tensor | None = None
+        if self.glp is not None:
+            steer_rows = self.glp.step_rows(full_num_tokens)
+            if sp is not None:
+                steer_rows = sp.local_slice(steer_rows)
+
+        residual, post_mix, res_mix = None, None, None
+        pre_mix: torch.Tensor | None = None
+        if not get_pp_group().is_first_rank:
+            assert intermediate_tensors is not None
+            pre_mix = intermediate_tensors["pre_mix"]
+        decoder_compacted = False
+        if (
+            ced_indices is not None
+            and self.ced_decoder_start is not None
+            and self.start_layer > self.ced_decoder_start
+        ):
+            # Pipeline transport keeps its original full-row ABI. A decoder
+            # stage gathers only the rows materialized by the preceding stage.
+            hidden_states = gather_rows(hidden_states, ced_indices)
+            pre_mix = gather_rows(pre_mix, ced_indices)
+            positions = gather_rows(positions, ced_indices)
+            if input_ids is not None:
+                input_ids = gather_rows(input_ids, ced_indices)
+            if steer_rows is not None:
+                steer_rows = gather_rows(
+                    self.glp.step_rows(full_num_tokens), ced_indices
+                )
+            decoder_compacted = True
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        if l2_prefetch.ENABLED and not self._l2pf_ready:
+            self._build_l2_prefetch()
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            boundary_indices = ced_indices if idx == self.ced_decoder_start else None
+            if sp is not None and boundary_indices is not None:
+                # The CED boundary layer builds the decoder's global KV from every
+                # encoder row, then compacts; gather the carried rows first.
+                hidden_states, residual, post_mix, res_mix, pre_mix = (
+                    None if t is None else sp.gather(t)
+                    for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+                )
+                sp = None
+            ced_positions = (
+                gather_rows(positions, boundary_indices)
+                if boundary_indices is not None
+                else None
+            )
+            ced_input_ids = (
+                gather_rows(input_ids, boundary_indices)
+                if boundary_indices is not None and input_ids is not None
+                else None
+            )
+            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                engram_hashes,
+                engram_mask,
+                ced_indices=boundary_indices,
+                sp_rows=sp,
+                ced_positions=ced_positions,
+                ced_input_ids=ced_input_ids,
+            )
+            if boundary_indices is not None:
+                assert ced_positions is not None
+                positions = ced_positions
+                input_ids = ced_input_ids
+                if steer_rows is not None:
+                    steer_rows = gather_rows(
+                        self.glp.step_rows(full_num_tokens), ced_indices
+                    )
+                decoder_compacted = True
+            if self.glp is not None:
+                self.glp.steer(
+                    idx, hidden_states, residual, post_mix, res_mix, steer_rows
+                )
+            if idx + 1 in self.aux_hidden_state_layers:
+                # Reconstruct the aux hidden state for draft models
+                aux_out = (
+                    self._graph_out(len(aux_hidden_states), full_num_tokens)
+                    if sp is None and not decoder_compacted
+                    else None
+                )
+                if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
+                    aux_hidden_state = layer.mhc.post_collapse(
+                        hidden_states, residual, post_mix, res_mix, out=aux_out
+                    )
+                else:
+                    aux_recon = layer.mhc.post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = (
+                        layer.mhc.collapse(aux_recon)
+                        if aux_out is None
+                        else layer.mhc.collapse(aux_recon, out=aux_out)
+                    )
+                    final_aux_recon = aux_recon
+                if sp is not None:
+                    aux_hidden_state = sp.gather(aux_hidden_state)
+                if decoder_compacted:
+                    aux_hidden_state = scatter_rows(
+                        aux_hidden_state, ced_indices, full_num_tokens
+                    )
+                aux_hidden_states.append(aux_hidden_state)
+        l2_prefetch.join()
+        last_rank = get_pp_group().is_last_rank
+        fused_final_collapse = (
+            layer is not None
+            and last_rank
+            and self.end_layer not in self.aux_hidden_state_layers
+            and self._sink_columns is None
+            and hasattr(layer.mhc, "post_collapse")
+        )
+        if fused_final_collapse:
+            hidden_states = layer.mhc.post_collapse(
+                hidden_states, residual, post_mix, res_mix, pre_mix
+            )
+        elif layer is not None:
+            # Reuse if the last layer was captured as an aux hidden state
+            if self.end_layer in self.aux_hidden_state_layers:
+                hidden_states = final_aux_recon
+            else:
+                hidden_states = layer.mhc.post(
+                    hidden_states, residual, post_mix, res_mix
+                )
+
+        if not last_rank:
+            if decoder_compacted:
+                hidden_states = scatter_rows(
+                    hidden_states, ced_indices, full_num_tokens
+                )
+                pre_mix = scatter_rows(pre_mix, ced_indices, full_num_tokens)
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            )
+
+        # The sink detector's column of every residual stream comes from the last
+        # collapse, which reads the streams anyway: straight into its buffer when
+        # every row is here, else gathered after.
+        columns: torch.Tensor | None = None
+        rows_here = sp is None and not decoder_compacted
+        if self._sink_columns is not None:
+            columns = (
+                self._sink_columns[:full_num_tokens]
+                if rows_here
+                else torch.empty(
+                    (hidden_states.shape[0], self.hc_mult),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            )
+        # Collapse the hc copies with the pre-mix from the last layer's FFN
+        # mixes — the mix the reference applies via
+        # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+        if not fused_final_collapse:
+            hidden_states = (
+                layer.mhc.collapse(hidden_states, pre_mix)
+                if columns is None
+                else layer.mhc.collapse(
+                    hidden_states, pre_mix, columns=columns, column=self._sink_column
+                )
+            )
+        if columns is not None and not rows_here:
+            # A gather of hc_mult values per token under sequence parallelism.
+            if sp is not None:
+                columns = sp.gather(columns)
+            if decoder_compacted:
+                columns = scatter_rows(columns, ced_indices, full_num_tokens)
+            self._sink_columns[:full_num_tokens].copy_(columns)
+        out = self._graph_out(None, full_num_tokens) if rows_here else None
+        hidden_states = (
+            self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
+        )
+        if sp is not None:
+            hidden_states = sp.gather(hidden_states)
+        if decoder_compacted:
+            hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+            ("attn.fused_wqa_wkv", "attn.wkv", 1),
+            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        # TP for attention
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        n_head = self.config.num_attention_heads
+        n_local_head = n_head // tp_size
+        head_rank_start = n_local_head * tp_rank
+        head_rank_end = n_local_head * (tp_rank + 1)
+
+        # Pre-compute expert mapping ONCE.
+        expert_mapping = self.get_expert_mapping()
+
+        for name, loaded_weight in weights:
+            if name.startswith(("vision.", "aligner.", "image_")):
+                # Vision weights are loaded by the outer multimodal wrapper.
+                logger.warning_once("Skipping non-text weight: %s", name)
+                continue
+            if ".engram.embed_tokens." in name:
+                if is_pp_missing_parameter(name, self):
+                    continue
+                module_name, _, leaf = name.rpartition(".")
+                embedding = self.get_submodule(module_name)
+                loaded_params.update(
+                    f"{module_name}.{loaded}"
+                    for loaded in embedding.load_weights(((leaf, loaded_weight),))
+                )
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if ".experts." in name:
+                    continue
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                if is_pp_missing_parameter(name, self):
+                    break
+                if name not in params_dict:
+                    head, _, leaf = name.rpartition(".")
+                    suffixed = f"{head}.base_layer.{leaf}"
+                    if suffixed in params_dict:
+                        name = suffixed
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                if ".experts." in name:
+                    # E8M0 scales are stored as float8_e8m0fnu in
+                    # checkpoints but the MoE param is uint8. copy_()
+                    # would do a numeric conversion (e.g. 2^-7 → 0),
+                    # destroying the raw exponent bytes.
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(torch.uint8)
+                    for mapping in expert_mapping:
+                        param_name, weight_name, expert_id, expert_shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name_mapped = name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(name_mapped, self):
+                            continue
+                        param = params_dict[name_mapped]
+                        # We should ask the weight loader to return success or not
+                        # here since otherwise we may skip experts with other
+                        # available replicas.
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=expert_shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            name = name_mapped
+                            break
+                    loaded_params.add(name_mapped)
+                    continue
+                elif "attn_sink" in name:
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                    n = narrow_weight.shape[0]
+                    copy_weight(params_dict[name][:n], narrow_weight)
+                    loaded_params.add(name)
+                    continue
+                else:
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    # Non-LoRA params on a LoRA-wrapped module live at
+                    # ``<head>.base_layer.<leaf>``; the checkpoint is plain.
+                    if name not in params_dict:
+                        head, _, leaf = name.rpartition(".")
+                        suffixed = f"{head}.base_layer.{leaf}"
+                        if suffixed in params_dict:
+                            name = suffixed
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                    continue
+
+        return loaded_params
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.n_routed_experts,
+        )
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
+            return
+        layer = self.layers[self.start_layer]
+        if isinstance(layer, DeepseekV4DecoderLayer):
+            broadcast = (
+                layer.hc_attn_fn.detach()
+                .view(-1, layer.hc_mult, layer.hidden_size)
+                .sum(dim=1)
+            )
+            if layer.hc_attn_fn_broadcast is None:
+                layer.hc_attn_fn_broadcast = broadcast
+            else:
+                layer.hc_attn_fn_broadcast.copy_(broadcast)
+
+
+def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
+    """Native block32 linears retain the checkpoint-compatible scale name."""
+    return "weight_scale_inv"
+
+
+class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
+    model_cls = DeepseekV4Model
+
+    # Default mapper assumes the original FP4-expert checkpoint layout.
+    # Overridden per-instance in __init__ when expert_dtype != "fp4".
+    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
+
+    packed_modules_mapping = {
+        "gate_up_proj": ["w1", "w3"],
+        "fused_wqa_wkv": ["wq_a", "wkv"],
+        "fused_wkv_wgate": ["wkv", "wgate"],
+    }
+
+    # The MTP draft head is not LoRA-adapted.
+    lora_skip_prefixes = ["mtp."]
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
+            getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
+        )
+
+    def set_moe_parameters(self) -> None:
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        self.num_moe_layers = self.config.num_hidden_layers
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers: list[DeepseekV4MoE] = []
+        example_moe: DeepseekV4MoE | None = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if not isinstance(layer, DeepseekV4DecoderLayer):
+                continue
+            if isinstance(layer.ffn, DeepseekV4MoE):
+                example_moe = layer.ffn
+                self.moe_mlp_layers.append(layer.ffn)
+                self.moe_layers.append(layer.ffn.experts)
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(example_moe)
+
+    def checkpoint_file_weight_filter(self, name: str) -> bool:
+        return (
+            self.model.file_backed_engram
+            and re.fullmatch(r"layers\.\d+\.engram\.embed\.(?:weight|scale)", name)
+            is not None
+        )
+
+    @staticmethod
+    def get_model_state_cls():
+        from .model_state import DeepseekV41ModelState
+
+        return DeepseekV41ModelState
+
+    requires_accepted_token_lookback = True
+
+    def get_sink_residual_columns(self) -> torch.Tensor | None:
+        """The attention-sink detector's column of each pre-norm residual
+        stream, (max_num_batched_tokens, hc_mult) float32, for every token of
+        the last forward; None without the detector (vllm.v1.sample.sink)."""
+        return self.model._sink_columns
+
+    def get_graph_output_buffers(
+        self,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        """The buffers a captured forward writes its hidden states and auxiliary
+        hidden states into (rows: the largest CUDA graph); None without graphs."""
+        return self.model._graph_outputs
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids=lookback_token_ids,
+            ced_indices=ced_indices,
+        )
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        # AutoWeightsLoader may revisit this child for another contiguous
+        # prefix group. Finalize only in the root model's post-load hook.
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.model.finalize_mhc_broadcast_weights()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4Attention):
+                module.setup_wo_projection()
+            if isinstance(module, Engram):
+                module.process_weights_after_loading()

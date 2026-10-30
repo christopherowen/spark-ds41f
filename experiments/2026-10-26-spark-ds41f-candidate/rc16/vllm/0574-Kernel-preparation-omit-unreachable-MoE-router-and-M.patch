@@ -1,0 +1,558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:13:47 +0100
+Subject: [PATCH 574/574] Kernel preparation: omit unreachable MoE, router, and
+ Markov head variants
+
+---
+ tests/models/test_deepseek_v4_1_prepare.py    |  18 +++
+ tests/v1/worker/test_prepare_kernels.py       |  95 +++++++++++++++
+ .../layers/fused_moe/tilelang.py              |   6 +
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |   4 +
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  11 +-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  19 ++-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 113 +++++++++++++-----
+ vllm/models/deepseek_v4_1/tilelang/prepare.py |  24 +++-
+ vllm/models/deepseek_v4_1/tilelang/router.py  |   3 +
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  14 ++-
+ 10 files changed, 266 insertions(+), 41 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_prepare.py b/tests/models/test_deepseek_v4_1_prepare.py
+index 6919a376f..704c16e78 100644
+--- a/tests/models/test_deepseek_v4_1_prepare.py
++++ b/tests/models/test_deepseek_v4_1_prepare.py
+@@ -61,3 +61,21 @@ def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
+     bound = []
+     prepare.declare(lambda: [prepare.call(_rope, 2, 64)], bind=lambda: bound.append(1))
+     assert prepared == [(_rope, (2, 64), {})] and bound == [1]
++
++
++def test_registry_warmup_skips_calls_already_prepared_by_prepare_declared(monkeypatch):
++    batches = []
++    monkeypatch.setattr(
++        tilelang, "prepare", lambda calls, **kw: batches.append(list(calls))
++    )
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        prepare.declare(lambda: [prepare.call(_gemm, 1024, 512, block_M=16)])
++    assert prepare.prepare_declared(registry) == 1
++    with registry.activate():
++        prepare.declare(lambda: [prepare.call(_rope, 8, 512)])
++    registry.warmup()
++    assert batches == [
++        [(_gemm, (1024, 512), {"block_M": 16})],
++        [(_rope, (8, 512), {})],
++    ]
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index f7d24a3cc..d0ff72e6f 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -279,3 +279,98 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+         runner_module.GPUModelRunner.declare_step_kernels(runner)
+         assert declared.pop()["dead_rows"] is enabled
+     assert not declared
++
++
++def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels():
++    """Target and drafter MoE plans, router gates, and Markov heads declare only the
++    tile heights, dispatch parts, and index dtypes their row bounds can reach."""
++    import torch
++
++    from vllm.models.deepseek_v4_1.tilelang import gemm, linear, moe, vocab
++
++    assert gemm.BF16_SPLIT_ROWS[(128, 5120)] == 256
++
++    drafter = moe.MoeExpertsV41Plan(
++        128,
++        3,
++        5120,
++        576,
++        swiglu_limit=10.0,
++        out_dtype=torch.float32,
++        idx_dtypes=(torch.int64,),
++        max_rows=80,
++    )
++    assert not drafter._has_prefill_tiles()
++    assert set(drafter.kernels()) == {
++        "gate_up",
++        "down",
++        "swiglu",
++        "late_gate_up",
++        "late_down",
++    }
++    drafter_dispatches = drafter._dispatches()
++    assert len(drafter_dispatches) == 1
++    drafter_dispatch_kernels = drafter_dispatches[0].kernels()
++    assert set(drafter_dispatch_kernels) == {
++        "fused",
++        "combine_kernels",
++        "fold_kernels",
++    }
++    assert set(drafter_dispatch_kernels["combine_kernels"]) == {
++        (False, False),
++        (True, False),
++    }
++    assert set(drafter_dispatch_kernels["fold_kernels"]) == {False}
++
++    target = moe.MoeExpertsV41Plan(
++        384,
++        6,
++        5120,
++        576,
++        swiglu_limit=10.0,
++        out_dtype=torch.float32,
++        idx_dtypes=(torch.int64,),
++        max_rows=4096,
++    )
++    assert target._has_prefill_tiles()
++    target_dispatches = target._dispatches()
++    assert len(target_dispatches) == 2
++    assert set(target_dispatches[0].kernels()) == {
++        "fused",
++        "count",
++        "layout",
++        "scatter",
++        "combine_kernels",
++        "fold_kernels",
++    }
++    assert set(target_dispatches[1].kernels()) == {
++        "count",
++        "layout",
++        "scatter",
++        "combine_kernels",
++        "fold_kernels",
++    }
++
++    drafter_gate = SimpleNamespace(
++        weight=torch.empty((128, 5120), dtype=torch.bfloat16),
++        out_dtype=torch.float32,
++        tilelang_router=SimpleNamespace(
++            max_rows=80, _gates_every_row=lambda: False
++        ),
++    )
++    assert set(linear._bf16_kernels(drafter_gate)) == {"partials"}
++
++    target_gate = SimpleNamespace(
++        weight=torch.empty((384, 5120), dtype=torch.bfloat16),
++        out_dtype=torch.float32,
++        tilelang_router=SimpleNamespace(
++            max_rows=4096, _gates_every_row=lambda: True
++        ),
++    )
++    assert set(linear._bf16_kernels(target_gate)) == {"gemm", "partials"}
++
++    markov_head = SimpleNamespace(
++        weight=torch.empty((32320, 256), dtype=torch.bfloat16),
++        tilelang_max_rows=16,
++    )
++    assert set(vocab._bf16_head_kernels(markov_head, torch.bfloat16)) == {16}
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 343b0b424..04445cd51 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -197,6 +197,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         moe = _kernels()
+         w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
+         limit = self.quant_config.gemm1_clamp_limit
++        router = getattr(layer, "router", None)
++        idx_dtype = getattr(router, "indices_dtype", None)
+         # The plan's geometry; its kernels are declared when the worker prepares
+         # kernels (``declare_kernels``).
+         self._plan = moe.MoeExpertsV41Plan(
+@@ -206,6 +208,10 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             w2.shape[2] * 2,
+             swiglu_limit=self.moe_config.swiglu_limit if limit is None else limit,
+             out_dtype=self.output_dtype,
++            idx_dtypes=(idx_dtype,)
++            if idx_dtype is not None
++            else (torch.int32, torch.int64),
++            max_rows=getattr(router, "max_rows", None),
+         )
+         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
+         # weights and scale codes are contiguous. A K that ends 64 past a multiple
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9c645e313..b4348e0b7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -315,6 +315,10 @@ class DSparkDeepseekV4Model(nn.Module):
+             lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
+             vocab_parallel=_vocab_parallel_greedy(),
+         )
++        # Each sequential Markov step projects one row per request.
++        self.markov_head.markov_w2.tilelang_max_rows = (
++            vllm_config.scheduler_config.max_num_seqs
++        )
+         self.confidence_head: DSparkConfidenceHead | None = None
+         if getattr(config, "enable_confidence_head", True):
+             self.confidence_head = kernels.dspark_confidence_head(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 4a0c886fa..f577991f4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1272,9 +1272,14 @@ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+ # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
+ # (N, K): the most rows it serves. The partials plus their reduce add the same
+ # shards in the same order as the shard GEMM, so the bits do not change. The
+-# router (8 shards) splits faster up to 256 rows, the indexer's head weights (40
+-# shards) up to 1024 (decode-rows bundle, 2026-10-10).
+-BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {(384, 5120): 256, (32, 5120): 1024}
++# routers (8 shards at 384 experts, 20 at the drafter's 128) split faster up to
++# 256 rows, the indexer's head weights (40 shards) up to 1024 (decode-rows
++# bundle, 2026-10-10).
++BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {
++    (384, 5120): 256,
++    (128, 5120): 256,
++    (32, 5120): 1024,
++}
+ 
+ 
+ def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 071f67d7a..efd9b3acc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -561,15 +561,24 @@ def _bf16_kernels(layer: nn.Module) -> dict:
+     n, k = layer.weight.shape
+     out_dtype = _out_dtype(layer)
+     shards = bf16_shards(n, k)
+-    kernels = {
+-        "gemm": prepare.call(bf16_gemm, n, k, out_dtype=out_dtype, shards=shards)
+-    }
++    router = getattr(layer, "tilelang_router", None)
++    bounded_router = router is not None and router.max_rows is not None
++    kernels = {}
++    if shards == 1 or not bounded_router or router._gates_every_row():
++        kernels["gemm"] = prepare.call(
++            bf16_gemm, n, k, out_dtype=out_dtype, shards=shards
++        )
+     if shards > 1:
++        max_rows = router.max_rows if bounded_router else None
+         kernels["partials"] = {
+             block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
+-            for block_M in PARTIAL_ROW_TILES
++            for i, block_M in enumerate(PARTIAL_ROW_TILES)
++            if i == 0 or max_rows is None or max_rows > PARTIAL_ROW_TILES[i - 1]
+         }
+-        kernels["reduce"] = prepare.call(splitk_reduce, n, shards, out_dtype=out_dtype)
++        if not bounded_router:
++            kernels["reduce"] = prepare.call(
++                splitk_reduce, n, shards, out_dtype=out_dtype
++            )
+     return kernels
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 7f5fab1a3..bf1527579 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -444,6 +444,10 @@ class MoeDispatchV41Plan:
+         hidden,
+         idx_dtype=torch.int64,
+         out_dtype=torch.bfloat16,
++        *,
++        min_routes: int = 1,
++        max_routes: int | None = None,
++        weighted: bool = False,
+     ):
+         self.num_experts, self.topk, self.block_M, self.hidden = (
+             num_experts,
+@@ -453,6 +457,9 @@ class MoeDispatchV41Plan:
+         )
+         self.idx_dtype = idx_dtype
+         self.out_dtype = out_dtype
++        self.min_routes = min_routes
++        self.max_routes = max_routes
++        self.weighted = weighted
+ 
+     def kernels(self) -> dict:
+         """Every kernel of the plan, as the calls ``bind`` makes."""
+@@ -464,16 +471,25 @@ class MoeDispatchV41Plan:
+         )
+         tl_idx = {torch.int64: T.int64, torch.int32: T.int32}[self.idx_dtype]
+         tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[self.out_dtype]
++        parts = (
++            *(("fused",) if self.min_routes <= _CHUNK else ()),
++            *(
++                ("count", "layout", "scatter")
++                if self.max_routes is None or self.max_routes > _CHUNK
++                else ()
++            ),
++        )
+         kernels = {
+             part: prepare.call(
+                 moe_dispatch_v41, num_experts, topk, block_M, part, tl_idx
+             )
+-            for part in ("fused", "count", "layout", "scatter")
++            for part in parts
+         }
++        weights = (False, True) if self.weighted else (False,)
+         kernels["combine_kernels"] = {
+             (s, w): prepare.call(moe_combine_v41, hidden, topk, s, w, out_dtype=tl_out)
+             for s in (False, True)
+-            for w in (False, True)
++            for w in weights
+         }
+         # A wider output (the FP32 partial) can instead take the shared expert's
+         # output, add it in FP32 and round once to BF16 (``combine(shared=...)``).
+@@ -484,7 +500,7 @@ class MoeDispatchV41Plan:
+                 w: prepare.call(
+                     moe_combine_v41, hidden, topk, True, w, out_dtype=T.bfloat16
+                 )
+-                for w in (False, True)
++                for w in weights
+             }
+         )
+         return kernels
+@@ -1306,6 +1322,8 @@ class MoeExpertsV41Plan:
+         block_N=128,
+         num_stages=3,
+         out_dtype=torch.bfloat16,
++        idx_dtypes=(torch.int32, torch.int64),
++        max_rows: int | None = None,
+     ):
+         self.num_experts, self.topk, self.hidden, self.intermediate = (
+             num_experts,
+@@ -1322,23 +1340,65 @@ class MoeExpertsV41Plan:
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+-        self.dispatch, self.prefill_dispatch = (
+-            {
+-                dtype: MoeDispatchV41Plan(
+-                    num_experts, topk, height, hidden, dtype, out_dtype
+-                )
+-                for dtype in (torch.int32, torch.int64)
+-            }
+-            for height in (block_M, prefill_block_M)
++        self.idx_dtypes = tuple(idx_dtypes)
++        self.max_rows = max_rows
++        prefill_min_routes = block_M * num_experts
++        decode_max_routes = (
++            prefill_min_routes - 1 if prefill_block_M != block_M else None
+         )
++        if max_rows is not None:
++            max_routes = max_rows * topk
++            decode_max_routes = (
++                max_routes
++                if decode_max_routes is None
++                else min(decode_max_routes, max_routes)
++            )
++        else:
++            max_routes = None
++        self.dispatch = {
++            dtype: MoeDispatchV41Plan(
++                num_experts,
++                topk,
++                block_M,
++                hidden,
++                dtype,
++                out_dtype,
++                max_routes=decode_max_routes,
++            )
++            for dtype in self.idx_dtypes
++        }
++        self.prefill_dispatch = {
++            dtype: MoeDispatchV41Plan(
++                num_experts,
++                topk,
++                prefill_block_M,
++                hidden,
++                dtype,
++                out_dtype,
++                min_routes=prefill_min_routes,
++                max_routes=max_routes,
++            )
++            for dtype in self.idx_dtypes
++        }
+         self.tk = _tile_kernels(block_M)
+ 
++    def _has_prefill_tiles(self) -> bool:
++        return (
++            self.max_rows is None
++            or self.tile_height(self.max_rows) != self.block_M
++        )
++
++    def _dispatches(self) -> tuple[MoeDispatchV41Plan, ...]:
++        if self._has_prefill_tiles():
++            return (*self.dispatch.values(), *self.prefill_dispatch.values())
++        return tuple(self.dispatch.values())
++
+     def kernels(self) -> dict:
+-        """The grouped GEMMs and the fused SwiGLU at both tile heights, as the calls
+-        ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``; at the same
+-        height ``late_gate_up`` and ``late_down``, which trigger after their K loop
+-        (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a ``prefill_`` prefix
+-        at ``prefill_block_M``, whose GEMMs trigger late too."""
++        """The grouped GEMMs and the fused SwiGLU at each reachable tile height, as
++        the calls ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``;
++        at the same height ``late_gate_up`` and ``late_down``, which trigger after
++        their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a
++        ``prefill_`` prefix at ``prefill_block_M``, whose GEMMs trigger late too."""
+         config = dict(
+             block_N=self.block_N,
+             num_stages=self.num_stages,
+@@ -1351,12 +1411,13 @@ class MoeExpertsV41Plan:
+             self.hidden,
+             self.intermediate,
+         )
++        tiers = [("", self.block_M, False)]
++        if self.max_rows is None or self.max_rows >= LATE_TRIGGER_ROWS:
++            tiers.append(("late_", self.block_M, True))
++        if self._has_prefill_tiles():
++            tiers.append(("prefill_", self.prefill_block_M, True))
+         kernels = {}
+-        for prefix, block_M, late in (
+-            ("", self.block_M, False),
+-            ("late_", self.block_M, True),
+-            ("prefill_", self.prefill_block_M, True),
+-        ):
++        for prefix, block_M, late in tiers:
+             kernels[f"{prefix}gate_up"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+@@ -1410,21 +1471,19 @@ class MoeExpertsV41Plan:
+         return self.gate_up, self.swiglu, self.down
+ 
+     def declare_kernels(self) -> None:
+-        """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
+-        kernels, stored on the plans once prepared."""
+-
+-        dispatches = (*self.dispatch.values(), *self.prefill_dispatch.values())
++        """Declare the grouped GEMMs, the fused SwiGLU and each reachable dispatch
++        plan's kernels, stored on the plans once prepared."""
+ 
+         def calls() -> list[prepare.TileLangCall]:
+             out = _calls(self.kernels())
+-            for dispatch in dispatches:
++            for dispatch in self._dispatches():
+                 out.extend(_calls(dispatch.kernels()))
+             return out
+ 
+         def bind() -> None:
+             for name, kernel in _launch(self.kernels()).items():
+                 setattr(self, name, kernel)
+-            for dispatch in dispatches:
++            for dispatch in self._dispatches():
+                 dispatch.bind()
+ 
+         prepare.declare(calls, bind=bind)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 29869d116..9204be48e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -70,10 +70,14 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
+     the owner's kernels once the cache is frozen.
+     """
+ 
++    def __init__(self) -> None:
++        super().__init__()
++        self._prepared_calls: set[int] = set()
++
+     def get_warmup_keys(
+         self, calls: Calls | None, bind=None, warm=None
+     ) -> list[_CallKey]:
+-        if calls is None:
++        if calls is None or id(calls) in self._prepared_calls:
+             return []
+         return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
+ 
+@@ -83,8 +87,11 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
+     def compile_many(self, compile_keys: Iterable[_CallKey]) -> None:
+         import tilelang
+ 
++        pending = [(key.function, key.args, key.kwargs) for key in compile_keys]
++        if not pending:
++            return
+         tilelang.prepare(
+-            [(key.function, key.args, key.kwargs) for key in compile_keys],
++            pending,
+             num_workers=compile_workers(),
+             progress=PROGRESS.report,
+         )
+@@ -182,8 +189,12 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
+     for kernel, registrations in registry.registrations():
+         if kernel is not TILELANG:
+             continue
+-        for args, kwargs in registrations:
+-            for key in kernel.get_warmup_keys(*args, **kwargs):
++        for args, _ in registrations:
++            fn = args[0] if args else None
++            if fn is None:
++                continue
++            for function, call_args, call_kwargs in fn():
++                key = _CallKey(function, call_args, call_kwargs)
+                 calls.setdefault(key, (key.function, key.args, key.kwargs))
+     return list(calls.values())
+ 
+@@ -205,6 +216,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+     calls = declared_calls(registry)
+     PROGRESS.start(len(calls))
+     tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
++    for kernel, registrations in registry.registrations():
++        if kernel is TILELANG:
++            for args, _ in registrations:
++                if args and args[0] is not None:
++                    TILELANG._prepared_calls.add(id(args[0]))
+     return len(calls)
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index e71b3c289..3acf4412e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -313,6 +313,8 @@ def _warm_topk_gate(num_topk: int, num_experts: int, image: bool, mask: bool) ->
+ class TileKernelsRouter(FusedTopKBiasRouter):
+     """V4.1 routing through TileKernels' TileLang top-k gate."""
+ 
++    indices_dtype = torch.int64
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         if self._hash_indices_table is not None:
+@@ -584,6 +586,7 @@ class TileLangGateRouter(TileKernelsRouter):
+             if vllm_config is None
+             else vllm_config.scheduler_config.max_num_batched_tokens
+         )
++        gate.tilelang_router = self
+         self._mask_variants = _routing_mask_variants(vllm_config)
+ 
+     def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 4ef095614..b6d2cca1c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -207,6 +207,16 @@ def packed_vocab_projection(
+ _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
+ 
+ 
++def _head_row_tiles(layer: nn.Module) -> tuple[int, ...]:
++    """The token tiles a head can launch: up to ``tilelang_max_rows`` when set."""
++    max_rows = getattr(layer, "tilelang_max_rows", None)
++    return tuple(
++        block_M
++        for i, block_M in enumerate(ROW_TILES)
++        if i == 0 or max_rows is None or max_rows > ROW_TILES[i - 1]
++    )
++
++
+ def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     """A packed head's projection for every token tile, as calls (its exponent base
+     comes from the packed weights)."""
+@@ -221,7 +231,7 @@ def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+             out_dtype=_OUT[out_dtype],
+             **tile_config(block_M, k),
+         )
+-        for block_M in ROW_TILES
++        for block_M in _head_row_tiles(layer)
+     }
+ 
+ 
+@@ -229,7 +239,7 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     """A BF16 head's projection for every token tile, as calls."""
+     n, k = map(int, layer.weight.shape)
+     kernels = {}
+-    for block_M in ROW_TILES:
++    for block_M in _head_row_tiles(layer):
+         config = dict(BF16_HEAD_CONFIGS[block_M])
+         if k % config["block_K"]:
+             config["block_K"] = 64

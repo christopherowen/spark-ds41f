@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:07:18 +0100
+Subject: [PATCH 575/575] [DS4.1] Clamp dead verification rows out of
+ acceptance estimator observation
+
+---
+ .../v1/spec_decode/test_adaptive_verification.py | 16 ++++++++++++++++
+ vllm/model_executor/models/qwen3_dspark.py       | 10 +++++++---
+ vllm/v1/worker/gpu/model_runner.py               | 15 ++++++++++++++-
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 110a956ff..cb6c9d5fa 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -551,3 +551,19 @@ def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
+     runs = []
+     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
++
++
++def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
++    # Request 0: capacity=5 (from 1-step stale budget), dead_row_cut=2, and all 2
++    # live drafts are accepted (num_sampled=3, num_rejected=3). Without clamping,
++    # step 2 (a dead row skipped by MoE) is graded as a false rejection.
++    # Request 1: capacity=5, dead_row_cut=2, 1 live draft accepted and 1 live
++    # draft rejected (num_sampled=2, num_rejected=4) -> 1 live rejection.
++    # Request 2: capacity=5, dead_row_cut=0, 0 live drafts (num_sampled=1,
++    # num_rejected=5) -> 0 live rejections.
++    dead_row_cut = torch.tensor([2, 2, 0], dtype=torch.int32)
++    num_sampled = torch.tensor([3, 2, 1], dtype=torch.int32)
++    num_rejected = torch.tensor([3, 4, 5], dtype=torch.int32)
++    live_rejected = (dead_row_cut - (num_sampled - 1).clamp_min(0)).clamp_min(0)
++    observed_rejected = torch.minimum(num_rejected, live_rejected)
++    assert observed_rejected.tolist() == [0, 1, 0]
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index fa1c0e7c1..a50f28cad 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -339,11 +339,15 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+         )
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """Per-position acceptance probability for each drafted token."""
++        """Per-position acceptance probability for each drafted token, into
++        ``out`` when given."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(head_hidden, markov_embed, out)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         model_weights = {}
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index bdd34b482..ac3ad871b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3310,12 +3310,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             assert self.sampler is not None
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 observed_rejected = num_rejected
++                if (
++                    self._dead_row_cut is not None
++                    and self.speculator.acceptance_estimator is not None
++                ):
++                    # Rows past the dead-row cut skipped routed MoE and were
++                    # never verified; only live rows can be observed as rejected.
++                    live_rejected = (
++                        self._dead_row_cut[: input_batch.num_reqs]
++                        - (num_sampled - 1).clamp_min(0)
++                    ).clamp_min(0)
++                    observed_rejected = torch.minimum(
++                        observed_rejected, live_rejected
++                    )
+                 if (
+                     sampler_output.sink is not None
+                     and self.speculator.acceptance_estimator is not None
+                 ):
+                     # A rejected draft zero left the drafts unjudged.
+-                    observed_rejected = num_rejected.masked_fill(
++                    observed_rejected = observed_rejected.masked_fill(
+                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                     )
+                 self.speculator.observe_verification(

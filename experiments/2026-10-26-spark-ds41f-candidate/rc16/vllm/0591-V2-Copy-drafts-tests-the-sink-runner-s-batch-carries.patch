@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:18:47 +0100
+Subject: [PATCH 591/591] [V2] Copy drafts tests: the sink runner's batch
+ carries its drafts a request, and the logprob test's verification takes the
+ runner's arguments by name (the sink chunk is no longer last)
+
+---
+ tests/v1/worker/test_gpu_sink.py                 |  1 +
+ .../test_gpu_verified_logprob_token_ids.py       | 16 +++++++++++++---
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index 08fe920c6..a3dc151c5 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -918,6 +918,7 @@ class MiniRunner:
+             logits_indices=torch.arange(int(cu_np[-1]), device=DEVICE),
+             cu_num_logits=cu,
+             cu_num_logits_np=cu_np,
++            num_draft_tokens_per_req=np.array(counts, dtype=np.int32) - 1,
+             query_start_loc=cu,
+             idx_mapping=idx,
+             idx_mapping_np=idx_np,
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+index 0d797c083..6db4e1852 100644
+--- a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -262,10 +262,20 @@ def _rejection_sampler(
+     rs.enable_adaptive_verification = adaptive
+ 
+     def verify(
+-        self, logits, _draft_logits, _drafts, _pos, cu_num_logits, idx_mapping, *rest
++        self,
++        logits,
++        _draft_logits,
++        _drafts,
++        _pos,
++        cu_num_logits,
++        idx_mapping,
++        _idx_mapping_np,
++        _expanded_idx_mapping,
++        _expanded_local_pos,
++        _dead_row_cut=None,
++        chunk=None,
++        _kernel_steps=None,
+     ):
+-        # rest: the index mappings, the token cap and the sink chunk (last).
+-        chunk = rest[-1]
+         processed = logits.float() * 2
+         num_reqs = idx_mapping.shape[0]
+         sampled = torch.zeros(

@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:10:15 +0100
+Subject: [PATCH 573/573] Route local SP rows and gather MXFP8 with MoE routes
+
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  |  87 +++++++
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 232 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/kernels.py          |  45 ++++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  21 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  80 +++++-
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 123 ++++++++--
+ 6 files changed, 555 insertions(+), 33 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 79edba141..5f5636863 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -485,3 +485,90 @@ def test_gate_router_declares_its_masks(
+     router._compute_routing(None, x, None, input_ids=input_ids)
+     assert launches == [("int64", True) if vision else (None, True)]
+     assert set(launches) <= declared
++
++
++def test_provide_routes_scopes_handed_over_routes():
++    rows = torch.empty((8, 5120), dtype=torch.bfloat16, device="cuda")
++    other = torch.empty((8, 5120), dtype=torch.bfloat16, device="cuda")
++    weights = torch.ones((8, 6), dtype=torch.float32, device="cuda")
++    ids = torch.zeros((8, 6), dtype=torch.int64, device="cuda")
++    assert tilelang_router.provided_routes(rows) is None
++    with tilelang_router.provide_routes(rows, weights, ids):
++        assert tilelang_router.provided_routes(rows) == (weights, ids)
++        assert tilelang_router.provided_routes(other) is None
++    assert tilelang_router.provided_routes(rows) is None
++
++
++@pytest.mark.parametrize("num_tokens", [150, 205])
++@pytest.mark.parametrize("vision", [False, True])
++def test_gate_router_route_local_matches_full_rows(
++    plain_scratch, padded_step, num_tokens, vision
++):
++    """Sequence-parallel local routing across ranks matches full-batch routing
++    bit-for-bit across both the split-K partials path (local_rows <= 64) and the
++    full-gate path (local_rows > 64), including vision tokens and padding masks."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    world_size = 3
++    padded_step(num_tokens, 4)
++    gate = _Gate(384, seed=num_tokens)
++    generator = torch.Generator(device="cuda").manual_seed(num_tokens + int(vision))
++    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
++        torch.bfloat16
++    )
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    kwargs = dict(
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    input_ids = None
++    if vision:
++        kwargs.update(
++            bias_vl=torch.nn.Parameter(
++                torch.randn(384, device="cuda", generator=generator) * 0.1,
++                requires_grad=False,
++            ),
++            image_sentinel_lo=LO,
++            image_sentinel_count=1,
++        )
++        input_ids = torch.randint(
++            0, 1000, (num_tokens,), device="cuda", generator=generator
++        )
++        input_ids[2::5] = LO
++    router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    router.declare_kernels()
++    expected_weights, expected_ids = router._compute_routing(
++        None, x, None, input_ids=input_ids
++    )
++
++    rank_weights = []
++    rank_ids = []
++    for rank in range(world_size):
++        layout = sp_prefill.SPRows(num_tokens, world_size, rank)
++        local_x = layout.local_slice(x)
++        w, idx = router.route_local(local_x, layout, input_ids=input_ids)
++        assert w.shape == (layout.local_rows, 6)
++        assert idx.shape == (layout.local_rows, 6)
++        assert torch.isfinite(w).all()
++        rank_weights.append(w)
++        rank_ids.append(idx)
++
++    gathered_weights = torch.cat(rank_weights, dim=0)[:num_tokens]
++    gathered_ids = torch.cat(rank_ids, dim=0)[:num_tokens]
++    assert torch.equal(gathered_ids, expected_ids)
++    assert torch.equal(
++        gathered_weights.view(torch.int32), expected_weights.view(torch.int32)
++    )
++
++    # When handed over via provide_routes, _compute_routing returns the gathered
++    # routes directly without touching the gate or reading the BF16 handle.
++    handle = torch.empty_like(x)
++    with tilelang_router.provide_routes(handle, gathered_weights, gathered_ids):
++        handed_w, handed_ids = router._compute_routing(
++            None, handle, None, input_ids=input_ids
++        )
++    assert handed_w is gathered_weights and handed_ids is gathered_ids
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 9762e62b5..6bb623452 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -255,6 +255,238 @@ def test_activate_scopes_the_rows():
+     assert sp_prefill.current() is None
+ 
+ 
++def test_gather_many_groups_pynccl_or_falls_back(monkeypatch):
++    layout = sp_prefill.SPRows(10, 3, 2)  # padded=12, local=4, real=2
++    assert layout.gather_many() == ()
++
++    a = torch.arange(8, dtype=torch.float32).reshape(4, 2)
++    b = torch.arange(12, dtype=torch.int64).reshape(4, 3)
++
++    # Fallback path when pynccl is disabled or absent.
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(pynccl_comm=None)
++        ),
++    )
++    monkeypatch.setattr(
++        sp_prefill,
++        "tensor_model_parallel_all_gather",
++        lambda x, dim: x.repeat(3, 1),
++    )
++    out_a, out_b = layout.gather_many(a, b, padded_rows=(64,))
++    assert out_a.shape == (64, 2)
++    torch.testing.assert_close(out_a[:10], a.repeat(3, 1)[:10], rtol=0, atol=0)
++    assert out_b.shape == (10, 3)
++    torch.testing.assert_close(out_b, b.repeat(3, 1)[:10], rtol=0, atol=0)
++
++    # Grouped PyNCCL path.
++    events = []
++
++    class _Comm:
++        disabled = False
++
++        def group_start(self):
++            events.append("group_start")
++
++        def all_gather(self, full, local):
++            events.append(("all_gather", tuple(full.shape), tuple(local.shape)))
++            full.copy_(local.repeat(3, *([1] * (local.ndim - 1))))
++
++        def group_end(self):
++            events.append("group_end")
++
++    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(pynccl_comm=_Comm())
++        ),
++    )
++    out_a2, out_b2 = layout.gather_many(a, b, padded_rows=(64,))
++    assert events == [
++        "group_start",
++        ("all_gather", (12, 2), (4, 2)),
++        ("all_gather", (12, 3), (4, 3)),
++        "group_end",
++    ]
++    assert out_a2.shape == (64, 2)
++    torch.testing.assert_close(out_a2[:10], out_a[:10], rtol=0, atol=0)
++    torch.testing.assert_close(out_b2, out_b, rtol=0, atol=0)
++    with pytest.raises(ValueError):
++        layout.gather_many(torch.zeros(3, 2))
++
++
++@pytest.mark.parametrize(
++    "num_tokens,expected_q_rows", [(10, 64), (70, 128), (131, 131)]
++)
++def test_gather_mxfp8_gathers_cast_and_extra_tensors(
++    monkeypatch, num_tokens, expected_q_rows
++):
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    world = 3
++    layouts = [sp_prefill.SPRows(num_tokens, world, rank) for rank in range(world)]
++    local = layouts[0].local_rows
++    local_q = max(local, 128)
++    full_vals = torch.arange(layouts[0].padded_rows * 64, dtype=torch.uint8).reshape(
++        layouts[0].padded_rows, 64
++    )
++    full_scales = torch.arange(layouts[0].padded_rows * 2, dtype=torch.uint8).reshape(
++        layouts[0].padded_rows, 2
++    )
++    full_weights = torch.arange(
++        layouts[0].padded_rows * 6, dtype=torch.float32
++    ).reshape(layouts[0].padded_rows, 6)
++    full_ids = torch.arange(layouts[0].padded_rows * 6, dtype=torch.int64).reshape(
++        layouts[0].padded_rows, 6
++    )
++
++    rank_0 = layouts[0]
++    vals_0 = torch.zeros((local_q, 64), dtype=torch.uint8)
++    scales_0 = torch.zeros((local_q, 2), dtype=torch.uint8)
++    vals_0[:local] = full_vals[:local]
++    scales_0[:local] = full_scales[:local]
++    x_q = MXFP8Rows(
++        rows=torch.empty((local, 64), dtype=torch.bfloat16),
++        values=vals_0,
++        scales=scales_0,
++    )
++
++    calls = []
++
++    def fake_gather_many(self, *tensors, padded_rows=()):
++        calls.append((len(tensors), padded_rows))
++        sources = (full_vals, full_scales, full_weights, full_ids)[: len(tensors)]
++        outs = []
++        for idx, (t, src) in enumerate(zip(tensors, sources)):
++            assert t.shape[0] == local
++            rows = padded_rows[idx] if idx < len(padded_rows) else self.num_tokens
++            if rows > self.num_tokens:
++                buf = src.new_zeros((rows, *src.shape[1:]))
++                buf[: self.num_tokens] = src[: self.num_tokens]
++                outs.append(buf)
++            else:
++                outs.append(src[: self.num_tokens])
++        return tuple(outs)
++
++    monkeypatch.setattr(sp_prefill.SPRows, "gather_many", fake_gather_many)
++    gathered_q, weights, ids = rank_0.gather_mxfp8(
++        x_q, full_weights[:local], full_ids[:local]
++    )
++    assert calls == [(4, (expected_q_rows, expected_q_rows))]
++    assert gathered_q.rows.shape == (num_tokens, 64)
++    assert gathered_q.rows.dtype == torch.bfloat16
++    assert gathered_q.values.shape == (expected_q_rows, 64)
++    assert gathered_q.scales.shape == (expected_q_rows, 2)
++    torch.testing.assert_close(
++        gathered_q.values[:num_tokens], full_vals[:num_tokens], rtol=0, atol=0
++    )
++    torch.testing.assert_close(
++        gathered_q.scales[:num_tokens], full_scales[:num_tokens], rtol=0, atol=0
++    )
++    if expected_q_rows > num_tokens:
++        assert not gathered_q.values[num_tokens:].any()
++        assert not gathered_q.scales[num_tokens:].any()
++    torch.testing.assert_close(weights, full_weights[:num_tokens], rtol=0, atol=0)
++    torch.testing.assert_close(ids, full_ids[:num_tokens], rtol=0, atol=0)
++    with pytest.raises(ValueError):
++        rank_0.gather_mxfp8(
++            MXFP8Rows(
++                rows=torch.empty((local + 1, 64), dtype=torch.bfloat16),
++                values=vals_0,
++                scales=scales_0,
++            )
++        )
++
++
++def test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast():
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
++    from vllm.models.deepseek_v4_1.tilelang.router import provided_routes
++
++    layout = sp_prefill.SPRows(10, 3, 0)  # local_rows = 4
++    x = torch.randn(4, 64, dtype=torch.bfloat16)
++    x_q = MXFP8Rows(
++        rows=x,
++        values=torch.ones((128, 64), dtype=torch.uint8),
++        scales=torch.ones((128, 2), dtype=torch.uint8),
++    )
++    input_ids = torch.arange(10, dtype=torch.int64)
++    local_w = torch.ones((4, 6), dtype=torch.float32)
++    local_ids = torch.zeros((4, 6), dtype=torch.int64)
++    full_q = MXFP8Rows(
++        rows=torch.empty((10, 64), dtype=torch.bfloat16),
++        values=torch.ones((128, 64), dtype=torch.uint8),
++        scales=torch.ones((128, 2), dtype=torch.uint8),
++    )
++    full_w = torch.ones((10, 6), dtype=torch.float32)
++    full_ids = torch.zeros((10, 6), dtype=torch.int64)
++    seen = []
++
++    class _FakeSPRows:
++        def gather(self, _):
++            raise AssertionError("BF16 gather should not run when x_q is present")
++
++        def gather_mxfp8(self, q, *extra):
++            seen.append(("gather_mxfp8", q is x_q, len(extra)))
++            return (full_q, full_w, full_ids) if extra else (full_q,)
++
++    fake_sp_rows = _FakeSPRows()
++
++    def route_local(local_x, sp_rows, *, input_ids=None):
++        seen.append(("route_local", local_x is x, sp_rows is fake_sp_rows, input_ids))
++        return local_w, local_ids
++
++    mhc = SimpleNamespace(
++        cast_rows=lambda _: (_ for _ in ()).throw(
++            AssertionError("mhc.cast_rows should not run when x_q is present")
++        )
++    )
++    ffn = SimpleNamespace(
++        experts=SimpleNamespace(router=SimpleNamespace(route_local=route_local))
++    )
++    with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn, input_ids, mhc) as rows:
++        assert rows is full_q.rows
++        assert provided_mxfp8(rows) is full_q
++        assert provided_routes(rows) == (full_w, full_ids)
++    with pytest.raises(RuntimeError):
++        provided_mxfp8(full_q.rows)
++    assert provided_routes(full_q.rows) is None
++    assert seen == [
++        ("route_local", True, True, input_ids),
++        ("gather_mxfp8", True, 2),
++    ]
++
++    # Without route_local, gathers MXFP8 only.
++    seen.clear()
++    ffn_no_router = SimpleNamespace(experts=SimpleNamespace(router=object()))
++    with kernels.sp_moe_inputs(
++        _FakeSPRows(), x, x_q, ffn_no_router, input_ids, mhc
++    ) as rows:
++        assert rows is full_q.rows
++        assert provided_mxfp8(rows) is full_q
++        assert provided_routes(rows) is None
++    with pytest.raises(RuntimeError):
++        provided_mxfp8(full_q.rows)
++    assert seen == [("gather_mxfp8", True, 0)]
++
++    # When x_q is None (CPU stand-in tests), falls back to BF16 gather + cast_rows.
++    fallback_rows = torch.randn(10, 64, dtype=torch.bfloat16)
++    cast_called = []
++    sp_fallback = SimpleNamespace(gather=lambda local_x: fallback_rows)
++    mhc_fallback = SimpleNamespace(
++        cast_rows=lambda r: (cast_called.append(r is fallback_rows), None)[1]
++    )
++    with kernels.sp_moe_inputs(
++        sp_fallback, x, None, ffn, input_ids, mhc_fallback
++    ) as rows:
++        assert rows is fallback_rows
++    assert cast_called == [True]
++
++
+ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatch):
+     from vllm.model_executor.layers.fused_moe.runner import moe_runner
+ 
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 9ccc93676..eb977e952 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -86,6 +86,51 @@ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+     return provide_mxfp8(rows)
+ 
+ 
++@contextlib.contextmanager
++def sp_moe_inputs(
++    sp_rows,
++    x: torch.Tensor,
++    x_q,
++    ffn: nn.Module,
++    input_ids: torch.Tensor | None,
++    mhc: nn.Module | None = None,
++):
++    """Gather the MoE sublayer's inputs across sequence-parallel ranks.
++
++    When ``mhc.post_pre`` already cast the rank's local rows into ``x_q``
++    (``MXFP8Rows``), each rank routes its ``sp_rows.local_rows`` BF16 rows and
++    all-gathers ``(x_q.values, x_q.scales, topk_weights, topk_ids)`` in one
++    grouped collective, handing both the gathered MXFP8 cast and the gathered
++    routes to ``ffn`` without all-gathering BF16 ``x`` or re-running
++    ``mhc.cast_rows``. When ``x_q`` is None (mHC stand-ins in model tests),
++    gathers BF16 ``x`` and falls back to ``mhc.cast_rows(rows)``.
++    """
++    if x_q is None:
++        rows = sp_rows.gather(x)
++        cast = None if mhc is None else mhc.cast_rows(rows)
++        with mxfp8_inputs(cast):
++            yield rows
++        return
++    from .tilelang.linear import provide_mxfp8
++    from .tilelang.router import provide_routes
++
++    router = getattr(getattr(ffn, "experts", None), "router", None)
++    route_local = getattr(router, "route_local", None)
++    if callable(route_local):
++        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
++        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
++        with (
++            provide_mxfp8(gathered_q),
++            provide_routes(gathered_q.rows, weights, ids),
++        ):
++            yield gathered_q.rows
++        return
++    (gathered_q,) = sp_rows.gather_mxfp8(x_q)
++    with provide_mxfp8(gathered_q):
++        yield gathered_q.rows
++
++
++
+ def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
+     from .tilelang.norm import TileLangRMSNorm
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 95c0ecd7a..b5b2185a0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -397,15 +397,18 @@ class DeepseekV4DecoderLayer(nn.Module):
+             with kernels.mxfp8_inputs(x_q):
+                 x = self.ffn(x, input_ids)
+         else:
+-            # SP: route every row; the TP partial sum is reduce-scattered.
+-            with sp_prefill.activate(sp_rows):
+-                rows = sp_rows.gather(x)
+-                with kernels.mxfp8_inputs(self.mhc.cast_rows(rows)):
+-                    x = self.ffn(
+-                        rows,
+-                        input_ids,
+-                        reduce_scatter_rows=sp_rows.padded_rows,
+-                    )
++            # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
++            with (
++                sp_prefill.activate(sp_rows),
++                kernels.sp_moe_inputs(
++                    sp_rows, x, x_q, self.ffn, input_ids, self.mhc
++                ) as rows,
++            ):
++                x = self.ffn(
++                    rows,
++                    input_ids,
++                    reduce_scatter_rows=sp_rows.padded_rows,
++                )
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+         return x, residual, post_mix, res_mix, ffn_pre
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index e24cc2912..1e733e17c 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -47,15 +47,20 @@ row and then compacts.
+ ## Where each op runs
+ 
+ - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
+-  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
++  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``), the MoE gate and
++  top-k routing, and the final norm.
+ - Gathered rows (T): the Engram lookup reduction and ``wkv`` (each rank keeps
+   only its own rows of ``wkv``'s product, exchanged all-to-all; the TileLang
+   gate reads the exchanged column blocks in place), attention
+   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+-  MoE gate, top-k, routed and shared experts.
++  MoE routed and shared experts.
+ - In attention layers without a compressor, the row-wise front
+   (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
+   rows and its narrower product is gathered instead of the hidden state.
++- In MoE layers, ``mhc.post_pre`` already writes the local rows' MXFP8 cast and
++  the router routes the local BF16 rows; one grouped all-gather exchanges the
++  MXFP8 values, scales and local top-k routes instead of gathering the BF16
++  hidden state and casting every row again on every rank.
+ 
+ Per decoder layer: all-gather before attention (inside
+ ``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
+@@ -198,6 +203,77 @@ class SPRows:
+             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
+         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
+ 
++    def gather_many(
++        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
++    ) -> tuple[torch.Tensor, ...]:
++        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
++        when given for a tensor) in one grouped PyNCCL collective when available."""
++        inputs = []
++        for x in tensors:
++            x = materialize(x)
++            if x.shape[0] != self.local_rows:
++                raise ValueError(
++                    f"SP gather expects {self.local_rows} rows, got {x.shape}"
++                )
++            inputs.append(x)
++        limits = padded_rows + (self.num_tokens,) * (len(inputs) - len(padded_rows))
++        comm = (
++            getattr(get_tp_group().device_communicator, "pynccl_comm", None)
++            if model_parallel_is_initialized()
++            else None
++        )
++        if comm is None or comm.disabled:
++            outs = []
++            for x, rows in zip(inputs, limits):
++                gathered = tensor_model_parallel_all_gather(x, dim=0)
++                if rows > gathered.shape[0]:
++                    padded = x.new_empty((rows, *x.shape[1:]))
++                    padded[: gathered.shape[0]].copy_(gathered)
++                    outs.append(padded)
++                else:
++                    outs.append(gathered[:rows])
++            return tuple(outs)
++        outs = []
++        pairs = []
++        for x, rows in zip(inputs, limits):
++            inp = x.contiguous()
++            alloc_rows = max(self.padded_rows, rows)
++            out = torch.empty(
++                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
++            )
++            outs.append(out[:rows])
++            pairs.append((out[: self.padded_rows], inp))
++        comm.group_start()
++        for dst, src in pairs:
++            comm.all_gather(dst, src)
++        comm.group_end()
++        return tuple(outs)
++
++    def gather_mxfp8(self, x_q, *extra: torch.Tensor):
++        """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
++        tensors, such as local top-k routes) in one grouped collective, returning
++        ``(MXFP8Rows, *extra_gathered)``."""
++        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
++
++        local = self.local_rows
++        if x_q.rows.shape[0] != local:
++            raise ValueError(
++                f"SP MXFP8 gather expects {local} rows, got {x_q.rows.shape}"
++            )
++        rows_q = mxfp8_rows(self.num_tokens)
++        values, scales, *rest = self.gather_many(
++            x_q.values[:local],
++            x_q.scales[:local],
++            *extra,
++            padded_rows=(rows_q, rows_q),
++        )
++        rows = torch.empty(
++            (self.num_tokens, *x_q.rows.shape[1:]),
++            dtype=x_q.rows.dtype,
++            device=x_q.rows.device,
++        )
++        return (MXFP8Rows(rows, values, scales), *rest)
++
+     def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
+         """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
+         if padded.shape[0] != self.padded_rows:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index aadf8a3ab..e71b3c289 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -27,7 +27,9 @@ memory and each MoE layer runs one launch fewer. At prefill the gate runs its
+ own GEMM and TileKernels routes the logits.
+ """
+ 
++import contextlib
+ import functools
++from typing import NamedTuple
+ 
+ import tilelang
+ import tilelang.language as T
+@@ -160,8 +162,17 @@ def _ced_routing_mask(context, rows: int, ced_decoder: bool) -> torch.Tensor | N
+     return None
+ 
+ 
++def _local_mask(mask: torch.Tensor | None, rows: int, sp_rows) -> torch.Tensor | None:
++    """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
++    if mask is None:
++        return None
++    if sp_rows is not None and mask.shape[0] != rows:
++        return sp_rows.local_slice(mask[: sp_rows.num_tokens])
++    return mask if mask.shape[0] == rows else mask[:rows]
++
++
+ def _known_routing_mask(
+-    rows: int, ced_decoder: bool
++    rows: int, ced_decoder: bool, sp_rows=None
+ ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+     """``(mask, None)`` when this step's rows to route are known (a CED decoder's,
+     or the step's already computed), ``(None, is_padding)`` when the step's padding
+@@ -177,7 +188,7 @@ def _known_routing_mask(
+         return None, None
+     cached = getattr(context, "_ds41_routing_mask", None)
+     if cached is not None and cached[0] is is_padding:
+-        return cached[1][:rows], None
++        return _local_mask(cached[1], rows, sp_rows), None
+     return None, is_padding
+ 
+ 
+@@ -199,30 +210,30 @@ def _routing_masks(
+     count: int,
+     *,
+     ced_decoder: bool = False,
++    sp_rows=None,
+ ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+     """``(_image_token_mask(input_ids, lo, count), _routing_mask(rows))``, the
+     image mask None without ``input_ids``: what a forward's first routing layer
+     computes of them, in one launch, and later layers find cached."""
+     context = get_forward_context() if is_forward_context_available() else None
+     image = None if input_ids is None else _cached_image_mask(context, input_ids)
+-    route, is_padding = _known_routing_mask(rows, ced_decoder)
++    route, is_padding = _known_routing_mask(rows, ced_decoder, sp_rows=sp_rows)
+     ids = input_ids if image is None else None
+-    if ids is None and is_padding is None:
+-        return image, route
+-    new_image, routed = _masks(ids, lo, count, is_padding)
+-    if ids is not None:
+-        image = new_image
+-        if context is not None:
+-            context._ds41_image_token_mask = (ids, image)
+-    if is_padding is not None:
+-        assert context is not None and routed is not None
+-        context._ds41_routing_mask = (is_padding, routed)
+-        route = routed[:rows]
+-    return image, route
++    if ids is not None or is_padding is not None:
++        new_image, routed = _masks(ids, lo, count, is_padding)
++        if ids is not None:
++            image = new_image
++            if context is not None:
++                context._ds41_image_token_mask = (ids, image)
++        if is_padding is not None:
++            assert context is not None and routed is not None
++            context._ds41_routing_mask = (is_padding, routed)
++            route = _local_mask(routed, rows, sp_rows)
++    return _local_mask(image, rows, sp_rows), route
+ 
+ 
+ def _partials_mask(
+-    rows: int, *, ced_decoder: bool = False
++    rows: int, *, ced_decoder: bool = False, sp_rows=None
+ ) -> tuple[torch.Tensor | None, bool]:
+     """``route_partials``' mask of this step's rows and whether it is the padding
+     mask itself (a set row is skipped; nothing negates it) or a CED decoder's
+@@ -234,7 +245,9 @@ def _partials_mask(
+     if ced is not None:
+         return ced, False
+     is_padding = context.is_padding
+-    return (None, False) if is_padding is None else (is_padding[:rows], True)
++    if is_padding is None:
++        return None, False
++    return _local_mask(is_padding, rows, sp_rows), True
+ 
+ 
+ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
+@@ -320,6 +333,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+         indices_type: torch.dtype | None,
+         *,
+         input_ids: torch.Tensor | None = None,
++        sp_rows=None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         image_bias = None
+         vision = self.bias_vl is not None and self.image_sentinel_lo > 0
+@@ -333,6 +347,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+             self.image_sentinel_lo,
+             self.image_sentinel_count,
+             ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
++            sp_rows=sp_rows,
+         )
+         topk_ids, topk_weights = _topk_gate(
+             router_logits,
+@@ -511,6 +526,41 @@ def route_partials(
+     return router_partials
+ 
+ 
++class RoutedRows(NamedTuple):
++    """Top-k routing weights and expert ids computed on local SP rows and
++    gathered beside ``rows``' MXFP8 cast."""
++
++    rows: torch.Tensor
++    weights: torch.Tensor
++    ids: torch.Tensor
++
++
++_PROVIDED_ROUTES: list[RoutedRows] = []
++
++
++@contextlib.contextmanager
++def provide_routes(
++    rows: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
++):
++    """Hand ``rows``' gathered top-k routing to ``TileLangGateRouter`` for the
++    MoE call inside."""
++    _PROVIDED_ROUTES.append(RoutedRows(rows, weights, ids))
++    try:
++        yield
++    finally:
++        _PROVIDED_ROUTES.pop()
++
++
++def provided_routes(
++    x: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor] | None:
++    """The handed-over ``(weights, ids)`` routing of ``x``, or None."""
++    for routes in reversed(_PROVIDED_ROUTES):
++        if routes.rows.data_ptr() == x.data_ptr() and routes.rows.shape == x.shape:
++            return routes.weights, routes.ids
++    return None
++
++
+ class TileLangGateRouter(TileKernelsRouter):
+     """TileKernelsRouter that also runs the gate, fusing its decode reduction.
+ 
+@@ -623,6 +673,22 @@ class TileLangGateRouter(TileKernelsRouter):
+             warm=self._warm,
+         )
+ 
++    def route_local(
++        self,
++        x: torch.Tensor,
++        sp_rows,
++        *,
++        input_ids: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Route this rank's ``sp_rows.local_rows`` rows before the SP MoE gather."""
++        if x.shape[0] != sp_rows.local_rows:
++            raise ValueError(
++                f"SP local routing expects {sp_rows.local_rows} rows, got {x.shape}"
++            )
++        return self._compute_routing(
++            x, x, torch.int64, input_ids=input_ids, sp_rows=sp_rows
++        )
++
+     def _compute_routing(
+         self,
+         hidden_states: torch.Tensor,
+@@ -630,16 +696,28 @@ class TileLangGateRouter(TileKernelsRouter):
+         indices_type: torch.dtype | None,
+         *,
+         input_ids: torch.Tensor | None = None,
++        sp_rows=None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         from .linear import _partial_specs, _scratch, partials_kernel
+ 
+         gate = self.gate
+         x = router_logits.reshape(-1, gate.weight.shape[1])
++        provided = provided_routes(x)
++        if provided is not None:
++            if indices_type not in (None, torch.int64):
++                raise ValueError(
++                    f"TileLang routing writes int64 expert ids, not {indices_type}"
++                )
++            return provided
+         specs = _partial_specs(gate, x.shape[0])
+         if not specs:
+             logits, _ = gate(x)
+             return super()._compute_routing(
+-                hidden_states, logits, indices_type, input_ids=input_ids
++                hidden_states,
++                logits,
++                indices_type,
++                input_ids=input_ids,
++                sp_rows=sp_rows,
+             )
+         if indices_type not in (None, torch.int64):
+             raise ValueError(
+@@ -650,9 +728,11 @@ class TileLangGateRouter(TileKernelsRouter):
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
++        ced_decoder = getattr(self, "_ds41_is_ced_decoder", False)
+         route_mask, padding = _partials_mask(
+             x.shape[0],
+-            ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
++            ced_decoder=ced_decoder,
++            sp_rows=sp_rows,
+         )
+         key = (
+             {torch.int32: "int32", torch.int64: "int64"}[input_ids.dtype]
+@@ -679,9 +759,8 @@ class TileLangGateRouter(TileKernelsRouter):
+             )
+         # A vision layer's kernel compares the ids with the sentinels itself; a
+         # text layer's, and an absent routing mask, read nothing of these rows.
+-        image_bias, mask = (
+-            (self.bias_vl.data, input_ids) if image else (bias, self._no_image[:rows])
+-        )
++        ids = _local_mask(input_ids, rows, sp_rows) if image else self._no_image[:rows]
++        image_bias, mask = (self.bias_vl.data, ids) if image else (bias, ids)
+         self._kernels[key](
+             partials,
+             bias,

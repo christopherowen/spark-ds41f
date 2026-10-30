@@ -1,0 +1,1185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 22:16:44 +0100
+Subject: [PATCH 592/592] [Spec] Rework copy drafts: async alloc before
+ drafter, block-width non-copy kernels, slot draft limits, and warp-coalesced
+ match/select
+
+---
+ tests/v1/core/test_copy_drafts_scheduler.py   |  42 ++++
+ .../spec_decode/test_adaptive_verification.py |  25 +++
+ tests/v1/spec_decode/test_copy_drafts.py      |  77 +++++++
+ vllm/v1/core/sched/scheduler.py               |   2 +-
+ vllm/v1/worker/gpu/async_utils.py             |   5 +-
+ vllm/v1/worker/gpu/input_batch.py             |   2 +
+ vllm/v1/worker/gpu/model_runner.py            | 209 ++++++++++++++----
+ .../gpu/spec_decode/adaptive_verification.py  |  81 +++++--
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py |  74 ++++++-
+ .../gpu/spec_decode/greedy_verification.py    |   4 +-
+ .../gpu/spec_decode/rejection_sampler.py      |   4 +-
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 149 ++++++++++---
+ vllm/v1/worker/gpu/tilelang_inputs.py         |  30 +--
+ 13 files changed, 599 insertions(+), 105 deletions(-)
+
+diff --git a/tests/v1/core/test_copy_drafts_scheduler.py b/tests/v1/core/test_copy_drafts_scheduler.py
+index 77c9fda7e..39299cabb 100644
+--- a/tests/v1/core/test_copy_drafts_scheduler.py
++++ b/tests/v1/core/test_copy_drafts_scheduler.py
+@@ -265,3 +265,45 @@ def test_waiting_requests_keep_their_slots_rows(monkeypatch, tmp_path):
+         len(scheduled.scheduled_spec_decode_tokens[r.request_id]) for r in requests[:2]
+     )
+     assert widths == [BLOCK, LOOKAHEAD]
++
++
++def test_active_prefill_chunk_keeps_decode_requests_at_the_block(monkeypatch, tmp_path):
++    """While a multi-chunk prefill is in progress, decode requests stay at the
++    drafter's block so copy lookahead does not inflate prefill-chunk steps."""
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, copy_drafts=True, max_num_seqs=4
++    )
++    decode_req = utils.create_requests(num_requests=1, num_tokens=20, max_tokens=500)[0]
++    long_req = utils.create_requests(num_requests=2, num_tokens=1500, max_tokens=500)[1]
++    alloc = {decode_req.request_id: LOOKAHEAD}
++    scheduler.add_request(decode_req)
++    queue: deque[SchedulerOutput] = deque()
++    for step in range(8):
++        if step == 5:
++            scheduler.add_request(long_req)
++        scheduled = scheduler.schedule()
++        if step == 4:
++            assert (
++                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
++                == LOOKAHEAD
++            )
++        if step == 5:
++            assert long_req.is_prefill_chunk
++        if step == 6:
++            # Step 6 runs while long_req is an active prefill chunk in running:
++            # decode_req must stay at BLOCK instead of widening to LOOKAHEAD.
++            assert (
++                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
++                == BLOCK
++            )
++        if step == 7:
++            # Once long_req finishes its prefill in step 6, decode_req widens again.
++            assert not long_req.is_prefill_chunk
++            assert (
++                len(scheduled.scheduled_spec_decode_tokens[decode_req.request_id])
++                == LOOKAHEAD
++            )
++        queue.append(scheduled)
++        if len(queue) == 2:
++            done = queue.popleft()
++            scheduler.update_from_output(done, _output(done, alloc))
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index aa97a10b0..98d8fb4bc 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -638,3 +638,28 @@ def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
+     live_rejected = (dead_row_cut - (num_sampled - 1).clamp_min(0)).clamp_min(0)
+     observed_rejected = torch.minimum(num_rejected, live_rejected)
+     assert observed_rejected.tolist() == [0, 1, 0]
++
++
++def test_slot_draft_limits_cap_stale_wide_scheduled_drafts():
++    # Step t reported alloc=16 and planned_confidences[0:16]=0.95, so the
++    # scheduler laid out 16 draft placeholders for Step t+2. When Step t+1
++    # rejects the copy and falls back to DSpark (5 valid drafts, columns 5:16
++    # zero-padded), slot_draft_limits[slot]=5 caps Step t+2's eligible drafts to
++    # 5 so zero-padded slots are never budgeted or verified.
++    manager = make_manager(
++        np.full((2, 16), 0.95, dtype=np.float32),
++        row_cost=0.02,
++    )
++    manager.num_draft_steps = 5
++    limits = np.array([5, 16], dtype=np.int32)
++    manager._slot_draft_limits = lambda: limits
++
++    tokens = manager.get_num_tokens(
++        {"low": 17},
++        {"low": [-1] * 16},
++    )
++    valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
++    assert valid_drafts == {"low": 5}
++    assert num_non_draft_tokens == {"low": 1}
++    assert draft_budget == 5
++    assert tokens == 6
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index 6465fb70d..1b83136f6 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -635,6 +635,46 @@ def test_a_slot_starts_afresh_with_each_request():
+     assert int(drafter.alloc[0]) == 2 * INITIAL
+ 
+ 
++def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
++    """prepare_alloc computes the same alloc as propose before DSpark runs and
++    writes each slot's valid draft count to slot_draft_limits."""
++    rng = np.random.default_rng(7)
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    S, start = copy_stream(rng, VOCAB, doc=400, edits=0)
++    P, pstart = prose_stream(rng, VOCAB, length=300)
++    slot_copy = _set_history(states, "copy", S[: start + 30])
++    slot_prose = _set_history(states, "prose", P[:pstart])
++    drafter.add_request(slot_copy)
++    drafter.add_request(slot_prose)
++    drafter.apply_staged_writes()
++
++    idx = torch.tensor([slot_copy, slot_prose], dtype=torch.int64, device=DEVICE)
++    one = torch.ones(2, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++    dspark = (
++        torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE),
++        torch.full((2, BLOCK), 0.6, device=DEVICE),
++    )
++    drafter.prepare_alloc(idx, one, zero, None)
++    early_alloc = drafter.alloc[:2].clone()
++    assert int(drafter.slot_draft_limits.gpu[slot_copy]) == INITIAL
++    assert int(drafter.slot_draft_limits.gpu[slot_prose]) == BLOCK
++
++    drafts, confidences, planned = drafter.propose(
++        idx, *dspark, one, zero, None, matched=True
++    )
++    assert torch.equal(early_alloc, drafter.alloc[:2])
++    assert int(early_alloc[0]) == 2 * INITIAL
++    assert int(early_alloc[1]) == BLOCK
++    assert (drafts[0, INITIAL:] == 0).all()
++    assert (drafts[1, BLOCK:] == 0).all()
++    assert (confidences[0, INITIAL:] == 0).all()
++    assert (confidences[1, BLOCK:] == 0).all()
++    assert (planned[0, : 2 * INITIAL] > 0).all()
++
++
++
+ # --- Temperature 0: the committed text does not depend on the drafts ------------
+ 
+ 
+@@ -778,3 +818,40 @@ def test_temperature_zero_text_does_not_depend_on_copy_drafts():
+     with_copies = _decode(targets, prompts, count, copy=True)
+     assert alone == expected
+     assert with_copies == expected
++
++
++def test_prepare_alloc_skips_incomplete_prefill_requests():
++    """Requests still mid-prefill after a step pass -1 in match_idx_mapping so
++    their uncomputed prompt tail is neither scanned nor offered as a copy."""
++    rng = np.random.default_rng(11)
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    repeated = np.tile(rng.integers(0, VOCAB, 32), 4).tolist()
++    s0 = _set_history(states, "decode_req", repeated[:96])
++    s1 = _set_history(states, "mid_prefill_req", repeated[:96])
++    drafter.add_request(s0)
++    drafter.add_request(s1)
++    drafter.apply_staged_writes()
++    idx = torch.tensor([s0, s1], dtype=torch.int64, device=DEVICE)
++    match_idx = torch.tensor([s0, -1], dtype=torch.int64, device=DEVICE)
++    dspark_drafts = torch.arange(1, 1 + 2 * BLOCK, dtype=torch.int64, device=DEVICE).view(
++        2, BLOCK
++    )
++    dspark_conf = torch.full((2, BLOCK), 0.6, device=DEVICE)
++    num_sampled = torch.tensor([1, 0], dtype=torch.int32, device=DEVICE)
++    verified = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++    drafter.prepare_alloc(
++        idx, num_sampled, verified, None, match_idx_mapping=match_idx
++    )
++    drafts, confs, _ = drafter.propose(
++        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
++    )
++    # Decoding slot s0 matched and proposes INITIAL copy drafts; mid-prefill slot s1
++    # was masked in copy_match and keeps DSpark's block with pending=0.
++    assert int(drafter.int_state[s0, 1]) == INITIAL
++    assert int(drafter.int_state[s1, 1]) == 0
++    assert int(drafter.alloc[1]) == BLOCK
++    assert int(drafter.slot_draft_limits.gpu[s1]) == BLOCK
++    assert drafts[1, :BLOCK].tolist() == dspark_drafts[1].tolist()
++    assert drafts[1, BLOCK:].tolist() == [0] * (LOOKAHEAD - BLOCK)
++    torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ce3f7f2b6..1e4891830 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1192,7 +1192,7 @@ class Scheduler(SchedulerInterface):
+         # take a free slot this step, may hold the uniform width, so the step's
+         # decode rows stay within max_decode_rows.
+         copy_rows_left = 0
+-        if self.copy_drafts:
++        if self.copy_drafts and not any(r.is_prefill_chunk for r in self.running):
+             slots = min(
+                 self.max_num_running_reqs,
+                 len(self.running) + len(self.waiting) + len(self.skipped_waiting),
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 5cc5aec58..074d9cc24 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -3,7 +3,7 @@
+ import contextlib
+ from collections.abc import Iterator
+ from dataclasses import dataclass, field
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
+ 
+ import numpy as np
+ import torch
+@@ -216,6 +216,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         copy_draft_alloc: torch.Tensor,
+         copy_stream: torch.cuda.Stream,
+         main_stream: torch.cuda.Stream,
++        slot_draft_limits: Any = None,
+     ) -> None:
+         """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
+         written by this step's proposal after the outputs' copy began, to the host
+@@ -226,6 +227,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         with stream(copy_stream, main_stream):
+             copy_stream.wait_stream(main_stream)
+             self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
++            if slot_draft_limits is not None:
++                slot_draft_limits.copy_to_cpu()
+             self.copy_draft_alloc_event.record(copy_stream)
+ 
+     def get_output(self) -> ModelRunnerOutput:
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index bbb9a76b0..309f14d3d 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -914,6 +914,7 @@ def declare_input_batch_kernels(
+     dead_rows: bool,
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
++    draft_widths: Sequence[int] = (),
+ ) -> None:
+     """Declare the TileLang kernels that prepare a step's inputs from the request
+     states and commit its sampled tokens: prefill inputs (``num_lookahead`` tokens
+@@ -935,5 +936,6 @@ def declare_input_batch_kernels(
+             dead_rows=dead_rows,
+             sampled_widths=sampled_widths,
+             commits=commits,
++            draft_widths=draft_widths,
+         )
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5ff7462dc..d5e84a352 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -822,6 +822,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+             planned_confidences=self.copy_drafter is not None,
++            slot_draft_limits=(
++                self.copy_drafter.sync_slot_draft_limits
++                if self.copy_drafter is not None
++                else None
++            ),
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+@@ -1231,12 +1236,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 shard.org_vocab_start_index,
+                 get_tensor_model_parallel_world_size(),
+             )
+-            greedy_rejection_sample(
+-                pairs,
+-                self.input_buffers.input_ids[:num_reqs],
+-                dummy_input_batch.cu_num_logits,
+-                self.rejection_sampler.num_speculative_steps,
+-            )
++            for steps in dict.fromkeys(
++                (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
++                if self.num_draft_steps > 0
++                else (self.rejection_sampler.num_speculative_steps,)
++            ):
++                greedy_rejection_sample(
++                    pairs,
++                    self.input_buffers.input_ids[:num_reqs],
++                    dummy_input_batch.cu_num_logits,
++                    steps,
++                )
+ 
+     @torch.inference_mode()
+     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
+@@ -1850,6 +1860,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # Some input token ids are directly read from the last sampled tokens
+         # and draft tokens. Also, get the logits indices to sample tokens from.
++        if adaptive_verification is not None:
++            max_step_drafts = adaptive_verification.step_steps
++        elif num_draft_tokens_per_req is not None:
++            max_step_drafts = int(num_draft_tokens_per_req.max(initial=0))
++        else:
++            max_step_drafts = 0
++        step_draft_steps = (
++            self.num_draft_steps
++            if 0 < self.num_draft_steps < self.req_states.draft_tokens.shape[-1]
++            and max_step_drafts <= self.num_draft_steps
++            else self.req_states.draft_tokens.shape[-1]
++        )
++        self._step_draft_steps = step_draft_steps
+         logits_indices = combine_sampled_and_draft_tokens(
+             self.input_buffers.input_ids,
+             idx_mapping,
+@@ -1857,7 +1880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             query_start_loc,
+             seq_lens,
+             self.req_states.prefill_len.gpu,
+-            self.req_states.draft_tokens,
++            self.req_states.draft_tokens[:, :step_draft_steps],
+             cu_num_logits,
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
+@@ -2153,14 +2176,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             commits = ((True, True, True), (True, False, False), (True, True, False))
+         else:
+             commits = ((True, True, False),)
++        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
+         declare_input_batch_kernels(
+             num_lookahead=self.req_states.next_prefill_tokens.shape[0],
+             num_speculative_steps=self.req_states.draft_tokens.shape[-1],
+             num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
+             dead_rows=dead_rows,
++            draft_widths=(
++                (num_draft_steps, self.req_states.draft_tokens.shape[-1])
++                if 0 < num_draft_steps < self.req_states.draft_tokens.shape[-1]
++                else ()
++            ),
+             # The sampler's one column, and verification's num_speculative_steps + 1.
+-            sampled_widths=(1,)
+-            + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
++            sampled_widths=tuple(
++                dict.fromkeys(
++                    (1,)
++                    + (
++                        (num_draft_steps + 1,)
++                        if num_draft_steps
++                        and num_draft_steps != self.num_speculative_steps
++                        else ()
++                    )
++                    + (
++                        (self.num_speculative_steps + 1,)
++                        if self.num_speculative_steps
++                        else ()
++                    )
++                )
++            ),
+             commits=commits,
+         )
+         if self.speculator is not None and self.num_speculative_steps:
+@@ -2176,6 +2219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         torch.int64, draft_dtype, gather=False
+                     )
+                     if self.vllm_config.use_request_boundary_checkpoints
++                    or not self.draft_tokens_handler.track_consumed_drafts
+                     else []
+                 )
+             )
+@@ -2189,11 +2233,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # The target's padding rows (prepare_inputs).
+             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
+         if adaptive:
+-            steps = self.num_speculative_steps
+-            width = steps + self.model_state.num_new_sampled_tokens_per_step
++            step_widths = tuple(
++                dict.fromkeys(
++                    (num_draft_steps, self.num_speculative_steps)
++                    if num_draft_steps > 0
++                    else (self.num_speculative_steps,)
++                )
++            )
+             tilelang_inputs.declare(
+-                lambda: tilelang_inputs.adaptive_offsets_calls(width)
+-                + tilelang_inputs.assign_draft_budget_calls(steps)
++                lambda: [
++                    call
++                    for steps in step_widths
++                    for call in (
++                        tilelang_inputs.adaptive_offsets_calls(
++                            steps + self.model_state.num_new_sampled_tokens_per_step
++                        )
++                        + tilelang_inputs.assign_draft_budget_calls(steps)
++                    )
++                ]
+                 + tilelang_inputs.scatter_rows_calls(
+                     torch.int64, torch.float32, gather=False
+                 )
+@@ -2263,11 +2320,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.sink.register_warmups(
+                     logits=logits,
+                     processed_logits_strides=processed_strides,
+-                    sampled_widths=(1,)
+-                    + (
+-                        (self.num_speculative_steps + 1,)
+-                        if self.num_speculative_steps > 0
+-                        else ()
++                    sampled_widths=tuple(
++                        dict.fromkeys(
++                            (1,)
++                            + (
++                                (num_draft_steps + 1,)
++                                if num_draft_steps > 0
++                                and num_draft_steps != self.num_speculative_steps
++                                else ()
++                            )
++                            + (
++                                (self.num_speculative_steps + 1,)
++                                if self.num_speculative_steps > 0
++                                else ()
++                            )
++                        )
+                     ),
+                     bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
+                         0
+@@ -2286,6 +2353,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 vocab_start=shard.org_vocab_start_index,
+                 tp_size=get_tensor_model_parallel_world_size(),
+                 num_speculative_steps=self.rejection_sampler.num_speculative_steps,
++                step_widths=tuple(
++                    dict.fromkeys(
++                        (
++                            num_draft_steps,
++                            self.rejection_sampler.num_speculative_steps,
++                        )
++                        if num_draft_steps > 0
++                        else (self.rejection_sampler.num_speculative_steps,)
++                    )
++                ),
+             )
+         if isinstance(self.speculator, DFlashSpeculator):
+             self.speculator.register_warmups(
+@@ -2431,11 +2508,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             shard.org_vocab_start_index,
+             tp_size,
+         )
++        greedy_steps = min(
++            getattr(
++                self,
++                "_step_draft_steps",
++                self.rejection_sampler.num_speculative_steps,
++            ),
++            self.rejection_sampler.num_speculative_steps,
++        )
+         sampled, num_sampled = greedy_rejection_sample(
+             pairs,
+             drafts,
+             input_batch.cu_num_logits,
+-            self.rejection_sampler.num_speculative_steps,
++            greedy_steps,
+         )
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+             num_sampled,
+@@ -2642,6 +2727,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             output_bin_counts = self.sampler.penalties_state.output_bin_counts
+         else:
+             output_bin_counts = None
++        if (
++            sampled_tokens.dim() == 2
++            and sampled_tokens.shape[1] > self.num_draft_steps + 1 >= 2
++            and getattr(self, "_step_draft_steps", self.num_speculative_steps)
++            <= self.num_draft_steps
++        ):
++            sampled_tokens = sampled_tokens[:, : self.num_draft_steps + 1]
+         post_update(
+             idx_mapping,
+             self.req_states.num_computed_tokens.gpu,
+@@ -3385,6 +3477,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                 )
++            verified = None
++            if self.copy_drafter is not None:
++                # Match the updated histories and publish next-step alloc and
++                # slot draft limits before the drafter runs, so the async output
++                # copy completes on output_copy_stream while DSpark executes.
++                # Requests still mid-prefill after this step have not reached the
++                # end of their prompt yet and must not be matched.
++                match_idx_mapping = None
++                if input_batch.has_prefill:
++                    incomplete_prefill_np = (
++                        input_batch.num_computed_prefill_tokens_np
++                        + input_batch.num_scheduled_tokens
++                        < input_batch.prefill_len_np
++                    )
++                    if incomplete_prefill_np.any():
++                        match_idx_mapping = async_tensor_h2d(
++                            np.where(
++                                incomplete_prefill_np, -1, input_batch.idx_mapping_np
++                            ),
++                            dtype=input_batch.idx_mapping.dtype,
++                            device=self.device,
++                        )
++                verified = (
++                    self.adaptive_verification.get_verified_draft_counts(
++                        input_batch.num_reqs
++                    )
++                    if self.adaptive_verification is not None
++                    and input_batch.num_draft_tokens_per_req is not None
++                    else None
++                )
++                self.copy_drafter.prepare_alloc(
++                    input_batch.idx_mapping,
++                    num_sampled,
++                    verified,
++                    self._dead_row_cut if verified is not None else None,
++                    match_idx_mapping=match_idx_mapping,
++                )
++                async_output.attach_copy_draft_alloc(
++                    self.copy_drafter.alloc[: input_batch.num_reqs],
++                    self.output_copy_stream,
++                    self.main_stream,
++                    slot_draft_limits=self.copy_drafter.slot_draft_limits,
++                )
++                self.copy_drafter._limits_event = async_output.copy_draft_alloc_event
+             with use_workspace_lane(self._draft_workspace_lane):
+                 if boundary_state is not None:
+                     self.speculator.boundary_checkpoint_capture = (
+@@ -3421,14 +3557,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # A request whose context repeats its own earlier text takes the
+                 # copy in place of DSpark's drafts. Warmup runs without adaptive
+                 # verification (fixed draft counts); its rows verify none.
+-                verified = (
+-                    self.adaptive_verification.get_verified_draft_counts(
+-                        input_batch.num_reqs
+-                    )
+-                    if self.adaptive_verification is not None
+-                    and input_batch.num_draft_tokens_per_req is not None
+-                    else None
+-                )
+                 draft_tokens, confidences, planned_confidences = (
+                     self.copy_drafter.propose(
+                         input_batch.idx_mapping,
+@@ -3437,22 +3565,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         num_sampled,
+                         verified,
+                         self._dead_row_cut if verified is not None else None,
++                        matched=True,
+                     )
+                 )
+-                async_output.attach_copy_draft_alloc(
+-                    self.copy_drafter.alloc[: input_batch.num_reqs],
+-                    self.output_copy_stream,
+-                    self.main_stream,
+-                )
+             num_draft_tokens = draft_tokens.shape[1]
+             if num_draft_tokens > 0:
+                 # Into the request states, and read back for the next step.
+-                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+-                    input_batch.idx_mapping,
+-                    draft_tokens,
+-                    self.req_states.draft_tokens,
+-                    gather=True,
+-                )
++                if self.draft_tokens_handler.track_consumed_drafts:
++                    tilelang_inputs.scatter_rows(
++                        input_batch.idx_mapping,
++                        draft_tokens,
++                        self.req_states.draft_tokens,
++                        gather=False,
++                    )
++                    draft_tokens_for_next_step = draft_tokens
++                else:
++                    draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
++                        input_batch.idx_mapping,
++                        draft_tokens,
++                        self.req_states.draft_tokens,
++                        gather=True,
++                    )
+             else:
+                 draft_tokens_for_next_step = draft_tokens
+             if self.adaptive_verification is not None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index f98789329..cf60206cf 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -117,9 +117,14 @@ class AdaptiveVerificationManager:
+         max_total_logits: int,
+         row_cost: float,
+         planned_confidences: bool = False,
++        num_draft_steps: int | None = None,
++        slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
++        self.num_draft_steps = num_draft_steps or self.num_speculative_steps
++        self.step_steps = self.num_speculative_steps
++        self._slot_draft_limits = slot_draft_limits
+         device = req_states.device
+         self._copy_stream = torch.cuda.Stream(device)
+ 
+@@ -209,22 +214,24 @@ class AdaptiveVerificationManager:
+         so its kernels are loaded at startup rather than on the first step that
+         trims a budget."""
+         device = self._confidence_probs.device
+-        steps = self.num_speculative_steps
++        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
+         probs = torch.ones_like(self._confidence_probs)
+         max_reqs = probs.shape[0]
+-        for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
+-            if not 0 < draft_budget < num_reqs * steps:
+-                continue
+-            capacities = torch.full(
+-                (num_reqs,),
+-                steps,
+-                dtype=self._batch_draft_capacity.dtype,
+-                device=device,
+-            )
+-            idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+-            tilelang_inputs.assign_draft_budget(
+-                probs, idx_mapping, capacities, draft_budget, steps
+-            )
++        for steps in dict.fromkeys((num_draft_steps, self.num_speculative_steps)):
++            step_probs = probs[:, :steps]
++            for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
++                if not 0 < draft_budget < num_reqs * steps:
++                    continue
++                capacities = torch.full(
++                    (num_reqs,),
++                    steps,
++                    dtype=self._batch_draft_capacity.dtype,
++                    device=device,
++                )
++                idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
++                tilelang_inputs.assign_draft_budget(
++                    step_probs, idx_mapping, capacities, draft_budget, steps
++                )
+         torch.cuda.synchronize(device)
+ 
+     def record_confidences(
+@@ -299,19 +306,34 @@ class AdaptiveVerificationManager:
+             dtype=np.int32,
+             count=len(req_ids),
+         )
+-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
++        slot_limits = getattr(self, "_slot_draft_limits", None)
++        if callable(slot_limits):
++            slot_limits = slot_limits()
++        if slot_limits is not None:
++            eligible_drafts = np.minimum(scheduled_drafts, slot_limits[slots])
++        else:
++            eligible_drafts = scheduled_drafts
++        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
++        step_steps = (
++            num_draft_steps
++            if int(eligible_drafts.max(initial=0)) <= num_draft_steps
++            else self.num_speculative_steps
++        )
++        stale_confidences = self._stale_confidences[self._stale_idx].np[
++            slots, :step_steps
++        ]
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+-        steps = np.arange(self.num_speculative_steps)
+-        valid = steps[None, :] < scheduled_drafts[:, None]
++        steps = np.arange(step_steps)
++        valid = steps[None, :] < eligible_drafts[:, None]
+         scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+-            int(scheduled_drafts.sum()),
++            int(eligible_drafts.sum()),
+             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+         )
+         scores = scores[:max_draft_budget]
+         num_drafts_per_req = {
+             req_id: int(num_drafts)
+-            for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
++            for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
+         }
+         num_non_draft_tokens_per_req = {
+             req_id: int(num_tokens)
+@@ -439,16 +461,23 @@ class AdaptiveVerificationManager:
+         # Rank draft slots by survival probability and admit the best prefix.
+         # capacities enters holding each request's valid draft count (the kernel
+         # uses it to bound eligible slots) and leaves holding the admitted count.
++        num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
++        step_steps = (
++            num_draft_steps
++            if int(scheduled_drafts.max(initial=0)) <= num_draft_steps
++            else self.num_speculative_steps
++        )
++        self.step_steps = step_steps
+         capacities = self._batch_draft_capacity[:num_reqs]
+         if draft_budget:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
+                 tilelang_inputs.assign_draft_budget(
+-                    self._confidence_probs,
++                    self._confidence_probs[:, :step_steps],
+                     idx_mapping,
+                     capacities,
+                     draft_budget,
+-                    self.num_speculative_steps,
++                    step_steps,
+                 )
+ 
+         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+@@ -462,7 +491,7 @@ class AdaptiveVerificationManager:
+             self.query_start_loc,
+             idx_mapping,
+             num_reqs * self.num_bonus_tokens + draft_budget,
+-            self.num_speculative_steps + self.num_bonus_tokens,
++            step_steps + self.num_bonus_tokens,
+             self.num_bonus_tokens,
+             num_tokens,
+             drafted=draft_budget > 0,
+@@ -490,6 +519,7 @@ def maybe_create_adaptive_verification_manager(
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+     planned_confidences: bool = False,
++    slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -558,4 +588,11 @@ def maybe_create_adaptive_verification_manager(
+         max_total_logits=max_total_logits,
+         row_cost=adaptive_verification_row_cost,
+         planned_confidences=planned_confidences,
++        num_draft_steps=getattr(
++            getattr(vllm_config, "speculative_config", None),
++            "num_speculative_tokens",
++            None,
++        )
++        or None,
++        slot_draft_limits=slot_draft_limits,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index b71e8316f..6b5fb860e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -23,10 +23,13 @@ which the scheduler gives the request's step after next (within its decode-row
+ envelope), and the planned confidences the budget reads at that step.
+ """
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.config.speculative import CopyDraftsConfig
++from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.torch_utils import async_tensor_h2d
++from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.spec_decode import tilelang_copy
+ from vllm.v1.worker.gpu.states import RequestState
+@@ -74,10 +77,25 @@ class CopyDrafter:
+         )
+         self.planned = torch.zeros_like(self.confidences)
+         self.alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
++        # Actual valid draft count per slot from the latest proposal, mirrored to
++        # host so the next step's adaptive budget never admits zero-padded slots.
++        self.slot_draft_limits = CpuGpuBuffer(
++            max_reqs, dtype=torch.int32, device=device
++        )
++        self.slot_draft_limits.np.fill(self.lookahead)
++        self.slot_draft_limits.gpu.fill_(self.lookahead)
++        self._limits_event: torch.cuda.Event | None = None
+         # A step that verified no drafts: nothing to judge.
+         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         self._new_rows: list[int] = []
+ 
++    def sync_slot_draft_limits(self) -> np.ndarray:
++        if self._limits_event is not None:
++            with gpu_sync_allowed():
++                self._limits_event.synchronize()
++            self._limits_event = None
++        return self.slot_draft_limits.np
++
+     def register_warmups(self) -> None:
+         """Declare the copy kernels and the copy state's reset."""
+         tilelang_inputs.declare(
+@@ -91,6 +109,7 @@ class CopyDrafter:
+         )
+ 
+     def add_request(self, req_idx: int) -> None:
++        self.sync_slot_draft_limits()[req_idx] = self.lookahead
+         self._new_rows.append(req_idx)
+ 
+     def apply_staged_writes(self) -> None:
+@@ -102,8 +121,52 @@ class CopyDrafter:
+             )
+             tilelang_inputs.fill_rows(rows, self.int_state, 0)
+             tilelang_inputs.fill_rows(rows, self.float_state, 0.0)
++            tilelang_inputs.fill_rows(
++                rows, self.slot_draft_limits.gpu[:, None], self.lookahead
++            )
+             self._new_rows.clear()
+ 
++    def prepare_alloc(
++        self,
++        idx_mapping: torch.Tensor,
++        num_sampled: torch.Tensor,
++        verified: torch.Tensor | None,
++        dead_row_cut: torch.Tensor | None,
++        *,
++        match_idx_mapping: torch.Tensor | None = None,
++    ) -> None:
++        """Match the batch's updated histories and write ``alloc[:num_reqs]`` and
++        ``slot_draft_limits.gpu`` before the drafter runs, so the async output
++        copy does not wait behind the drafter."""
++        num_reqs = idx_mapping.shape[0]
++        if verified is None:
++            verified = self._no_drafts[:num_reqs]
++        history = self.req_states.all_token_ids.gpu
++        total_len = self.req_states.total_len.gpu
++        sources = self.sources[:num_reqs]
++        tilelang_copy.copy_match(
++            idx_mapping if match_idx_mapping is None else match_idx_mapping,
++            history,
++            total_len,
++            sources,
++            self.min_match,
++        )
++        tilelang_copy.copy_alloc(
++            idx_mapping,
++            total_len,
++            sources,
++            num_sampled,
++            verified,
++            verified if dead_row_cut is None else dead_row_cut,
++            self.int_state,
++            self.alloc[:num_reqs],
++            self.slot_draft_limits.gpu,
++            self.min_match,
++            self.lookahead,
++            self.num_draft_steps,
++            self.initial,
++        )
++
+     def propose(
+         self,
+         idx_mapping: torch.Tensor,
+@@ -112,6 +175,8 @@ class CopyDrafter:
+         num_sampled: torch.Tensor,
+         verified: torch.Tensor | None,
+         dead_row_cut: torch.Tensor | None,
++        *,
++        matched: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         """The batch's drafts, confidences and planned confidences
+         (``[num_reqs, lookahead]``), and ``alloc[:num_reqs]``.
+@@ -124,6 +189,8 @@ class CopyDrafter:
+             verified: The drafts this step verified per request (adaptive
+                 verification's admitted counts), None if it verified none.
+             dead_row_cut: The live drafts per request, None without dead rows.
++            matched: Whether ``prepare_alloc`` already matched this step's
++                histories into ``sources[:num_reqs]``.
+         """
+         num_reqs = idx_mapping.shape[0]
+         if verified is None:
+@@ -131,9 +198,10 @@ class CopyDrafter:
+         history = self.req_states.all_token_ids.gpu
+         total_len = self.req_states.total_len.gpu
+         sources = self.sources[:num_reqs]
+-        tilelang_copy.copy_match(
+-            idx_mapping, history, total_len, sources, self.min_match
+-        )
++        if not matched:
++            tilelang_copy.copy_match(
++                idx_mapping, history, total_len, sources, self.min_match
++            )
+         drafts = self.drafts[:num_reqs]
+         confidences = self.confidences[:num_reqs]
+         planned = self.planned[:num_reqs]
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index 8b2d99ac7..1aa1be380 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -95,6 +95,7 @@ def register_greedy_verification_warmups(
+     vocab_start: int,
+     tp_size: int,
+     num_speculative_steps: int,
++    step_widths: tuple[int, ...] = (),
+ ) -> None:
+     """Declare the kernels ``vocab_parallel_pairs`` and ``greedy_rejection_sample``
+     launch: this rank's shard of ``compute_logits_local`` (``logits_dtype``, rows
+@@ -109,9 +110,10 @@ def register_greedy_verification_warmups(
+     )
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
++    widths = dict.fromkeys(step_widths or (num_speculative_steps,))
+     tilelang_sampling.declare(
+         lambda: tilelang_sampling.greedy_calls(
+-            rejection=[(num_speculative_steps + 1, tp_size, PAIR_WIDTH)]
++            rejection=[(steps + 1, tp_size, PAIR_WIDTH) for steps in widths]
+         )
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index a57fcb799..42b1a0380 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -388,7 +388,9 @@ class RejectionSampler:
+         kernel_steps = None
+         drafts = input_batch.num_draft_tokens_per_req
+         if self.num_draft_steps < self.num_speculative_steps and (
+-            drafts is None or int(drafts.max(initial=0)) <= self.num_draft_steps
++            drafts is None
++            or min(int(drafts.max(initial=0)), input_batch.num_draft_tokens)
++            <= self.num_draft_steps
+         ):
+             kernel_steps = self.num_draft_steps
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index a4c144182..4a657a02b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -69,6 +69,7 @@ MAX_DOUBLINGS = 16
+ STATE_COLUMNS = 2
+ 
+ assert MAX_LEVEL == _MATCH_THREADS, "a thread loads one key token"
++assert CHUNKS == _SELECT_THREADS, "a lane reads one chunk's source"
+ 
+ 
+ def num_levels(min_match: int) -> int:
+@@ -112,27 +113,29 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
+             for i in tuple(range(count)):
+                 best[i] = -1
+             T.sync_threads()
++            k0 = T.alloc_var(T.int32, init=key[0])
+             ends = T.max(length - min_match, 0)  # window ends min_match .. length - 1
+             for k in T.serial(T.ceildiv(ends, span)):
+                 e = min_match + k * span + c * _MATCH_THREADS + tx
+                 if e < length:
+-                    run = T.alloc_var(T.int32, init=0)
+-                    # The shortest level first: most ends fail on its first token.
+-                    # A token is loaded only while the run reaches it.
+-                    for j in T.unroll(min_match):
+-                        if run == j:  # noqa: SIM102
+-                            if history[slot, e - 1 - j] == key[j]:
+-                                run = j + 1
+-                    # A longer level only past a full match of the one before.
+-                    for i in tuple(range(1, count)):
+-                        if run == levels[i - 1]:
+-                            for j in T.serial(levels[i - 1], levels[i]):
+-                                if run == j and j < e:  # noqa: SIM102
+-                                    if history[slot, e - 1 - j] == key[j]:
+-                                        run = j + 1
+-                    for i in tuple(range(count)):
+-                        if run >= levels[i]:
+-                            best[i] = e
++                    if history[slot, e - 1] == k0:
++                        run = T.alloc_var(T.int32, init=1)
++                        # The shortest level first: most ends fail on its first token.
++                        # A token is loaded only while the run reaches it.
++                        for j in T.unroll(1, min_match):
++                            if run == j:  # noqa: SIM102
++                                if history[slot, e - 1 - j] == key[j]:
++                                    run = j + 1
++                        # A longer level only past a full match of the one before.
++                        for i in tuple(range(1, count)):
++                            if run == levels[i - 1]:
++                                for j in T.serial(levels[i - 1], levels[i]):
++                                    if run == j and j < e:  # noqa: SIM102
++                                        if history[slot, e - 1 - j] == key[j]:
++                                            run = j + 1
++                        for i in tuple(range(count)):
++                            if run >= levels[i]:
++                                best[i] = e
+             for i in tuple(range(count)):
+                 for distance in (16, 8, 4, 2, 1):
+                     best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
+@@ -196,6 +199,14 @@ def copy_select_kernel(
+             chosen = T.alloc_shared((3,), T.int32)
+             estimate = T.alloc_shared((1,), T.float32)
+             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
++            # The longest level with a source wins; its latest source across chunks.
++            source = T.alloc_var(T.int32, init=-1)
++            for i in tuple(range(count)):
++                latest = T.alloc_var(T.int32, init=sources[r, tx, i])
++                for step in (16, 8, 4, 2, 1):
++                    latest = T.max(latest, T.shfl_xor(latest, step))
++                if latest >= 0:
++                    source = latest
+             if tx == 0:
+                 doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+                 pending = int_state[slot, 1]
+@@ -213,14 +224,6 @@ def copy_select_kernel(
+                             T.min(accepted + 1, live), T.float32
+                         )
+                 cap = T.min(T.int32(initial) << doublings, lookahead)
+-                # The longest level with a source wins; its latest source.
+-                source = T.alloc_var(T.int32, init=-1)
+-                for i in tuple(range(count)):
+-                    latest = T.alloc_var(T.int32, init=-1)
+-                    for ch in T.serial(CHUNKS):
+-                        latest = T.max(latest, sources[r, ch, i])
+-                    if latest >= 0:
+-                        source = latest
+                 distance = total_len[slot] - source
+                 offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+                 after = T.if_then_else(
+@@ -273,6 +276,64 @@ def copy_select_kernel(
+     return copy_select
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def copy_alloc_kernel(
++    min_match: int,
++    lookahead: int,
++    block: int,
++    initial: int,
++    idx_dtype: str,
++):
++    """The copy allocation and per-slot valid draft count before the drafter runs."""
++    count = num_levels(min_match)
++    num_reqs = T.dynamic("num_reqs")
++    total_rows = T.dynamic("total_rows")
++    state_rows = T.dynamic("state_rows")
++
++    @T.prim_func
++    def copy_alloc(
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        total_len: T.Tensor((total_rows,), T.int32),
++        sources: T.Tensor((num_reqs, CHUNKS, count), T.int32),
++        num_sampled: T.Tensor((num_reqs,), T.int32),
++        verified: T.Tensor((num_reqs,), T.int32),
++        cut: T.Tensor((num_reqs,), T.int32),
++        int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
++        alloc: T.Tensor((num_reqs,), T.int32),
++        slot_limits: T.Tensor((state_rows,), T.int32),
++    ):
++        with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
++            tx = T.get_thread_binding()
++            slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
++            source = T.alloc_var(T.int32, init=-1)
++            for i in tuple(range(count)):
++                latest = T.alloc_var(T.int32, init=sources[r, tx, i])
++                for step in (16, 8, 4, 2, 1):
++                    latest = T.max(latest, T.shfl_xor(latest, step))
++                if latest >= 0:
++                    source = latest
++            if tx == 0:
++                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
++                pending = int_state[slot, 1]
++                if pending > 0 and num_sampled[r] > 0:
++                    live = T.min(verified[r], cut[r])
++                    if live > 0:
++                        accepted = num_sampled[r] - 1
++                        doublings = T.if_then_else(
++                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
++                        )
++                cap = T.min(T.int32(initial) << doublings, lookahead)
++                distance = total_len[slot] - source
++                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
++                after = T.if_then_else(
++                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
++                )
++                alloc[r] = T.max(after, block)
++                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
++
++    return copy_alloc
++
++
+ def copy_match_key(min_match: int, idx_dtype: torch.dtype) -> tuple:
+     return (min_match, _DTYPES[idx_dtype])
+ 
+@@ -283,6 +344,40 @@ def copy_select_key(
+     return (min_match, lookahead, block, initial, _DTYPES[idx_dtype])
+ 
+ 
++def copy_alloc(
++    idx_mapping: torch.Tensor,
++    total_len: torch.Tensor,
++    sources: torch.Tensor,
++    num_sampled: torch.Tensor,
++    verified: torch.Tensor,
++    cut: torch.Tensor,
++    int_state: torch.Tensor,
++    alloc: torch.Tensor,
++    slot_limits: torch.Tensor,
++    min_match: int,
++    lookahead: int,
++    block: int,
++    initial: int,
++) -> None:
++    """``alloc[:num_reqs]`` and ``slot_limits[idx_mapping]`` from ``sources`` and
++    the current copy state (read-only), before the drafter proposes."""
++    num_reqs = idx_mapping.shape[0]
++    if not num_reqs:
++        return
++    key = copy_select_key(min_match, lookahead, block, initial, idx_mapping.dtype)
++    _kernel(copy_alloc_kernel, *key)(
++        idx_mapping,
++        total_len,
++        sources,
++        num_sampled,
++        verified,
++        cut,
++        int_state,
++        alloc,
++        slot_limits,
++    )
++
++
+ def copy_match(
+     idx_mapping: torch.Tensor,
+     history: torch.Tensor,
+@@ -351,6 +446,10 @@ def copy_calls(min_match: int, lookahead: int, block: int, initial: int) -> list
+     assert _DTYPES[idx] == RUNNER_IDX_DTYPE
+     return [
+         _call(copy_match_kernel, *copy_match_key(min_match, idx)),
++        _call(
++            copy_alloc_kernel,
++            *copy_select_key(min_match, lookahead, block, initial, idx),
++        ),
+         _call(
+             copy_select_kernel,
+             *copy_select_key(min_match, lookahead, block, initial, idx),
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index dcd5d13cc..8eeb5251e 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -1030,7 +1030,7 @@ def assign_draft_budget_kernel(steps: int, idx_dtype: str):
+     past its scheduled drafts; the ``draft_budget`` best slots as ``torch.topk``
+     picks them (radix keys, NaN highest, ties to the lower slot); and each
+     request's admitted count into ``capacities``."""
+-    num_reqs, prob_rows = T.dynamic("num_reqs, prob_rows")
++    num_reqs, prob_rows, prob_stride = T.dynamic("num_reqs, prob_rows, prob_stride")
+     scan_threads = 16  # torch's num_threads_x for these rows (at least 2**4)
+     while 2 * scan_threads < steps:
+         scan_threads *= 2
+@@ -1038,7 +1038,9 @@ def assign_draft_budget_kernel(steps: int, idx_dtype: str):
+ 
+     @T.prim_func
+     def assign_draft_budget(
+-        confidence_probs: T.Tensor((prob_rows, steps), T.float32),
++        confidence_probs: T.StridedTensor(
++            (prob_rows, steps), (prob_stride, 1), T.float32
++        ),
+         idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+         capacities: T.Tensor((num_reqs,), T.int32),
+         draft_budget: T.int32,
+@@ -2562,6 +2564,7 @@ def input_batch_calls(
+     dead_rows: bool,
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
++    draft_widths: Sequence[int] = (),
+ ) -> list:
+     """The step-input kernels for the runner's buffers: prefill inputs, positions
+     and sequence lengths, the draft combine (with its dead-row variant when
+@@ -2575,18 +2578,19 @@ def input_batch_calls(
+         ),
+         _call(prepare_pos_seq_lens_kernel, *prepare_pos_seq_lens_key(RUNNER_IDX_DTYPE)),
+     ]
+-    for dead in (False, True) if dead_rows else (False,):
+-        calls.append(
+-            _call(
+-                combine_sampled_and_draft_tokens_kernel,
+-                *combine_key(
+-                    num_speculative_steps,
+-                    num_new_sampled_tokens,
+-                    dead,
+-                    RUNNER_IDX_DTYPE,
+-                ),
++    for steps in dict.fromkeys(draft_widths or (num_speculative_steps,)):
++        for dead in (False, True) if dead_rows else (False,):
++            calls.append(
++                _call(
++                    combine_sampled_and_draft_tokens_kernel,
++                    *combine_key(
++                        steps,
++                        num_new_sampled_tokens,
++                        dead,
++                        RUNNER_IDX_DTYPE,
++                    ),
++                )
+             )
+-        )
+     if num_speculative_steps > 0:
+         calls.append(
+             _call(
