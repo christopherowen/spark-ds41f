@@ -673,3 +673,22 @@ def test_the_helper_refuses_to_build_without_liburing(tmp_path, monkeypatch):
     monkeypatch.setenv("CC", str(tmp_path / "no-such-compiler"))
     with pytest.raises(RuntimeError, match="needs a C99 compiler"):
         _native._build()
+
+
+def test_prebuilt_native_helpers_resolve_without_compiler(tmp_path, monkeypatch):
+    import sysconfig
+    from vllm.model_executor.model_loader.direct_io import _native as direct_native
+    from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
+
+    prebuilt_root = tmp_path / "native"
+    monkeypatch.setenv("VLLM_NATIVE_CACHE_DIR", str(prebuilt_root))
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    # Simulate a runtime container with no compiler or pkg-config on PATH.
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    ext = sysconfig.get_config_var("EXT_SUFFIX")
+    for kind, mod in (("direct_io", direct_native), ("engram_rows", engram_native)):
+        expected = prebuilt_root / kind / mod._source_digest() / (mod._NAME + ext)
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.write_bytes(b"\x7fELFprebuilt")
+        assert mod._build() == expected

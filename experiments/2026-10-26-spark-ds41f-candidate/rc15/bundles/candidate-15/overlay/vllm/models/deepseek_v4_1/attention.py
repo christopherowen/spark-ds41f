@@ -170,6 +170,8 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.wq_b",
         )
         _native_linear(self.wq_b)
+        # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
+        self.wq_b.tilelang_mxfp8_input = True
         self.weights_proj = ReplicatedLinear(
             hf.hidden_size,
             hf.index_n_heads,
@@ -198,6 +200,8 @@ class DeepseekV4Indexer(nn.Module):
             )
             self.wk.quant_method = kernels.linear_method()
             self.k_norm = kernels.rms_norm(128, hf.rms_norm_eps)
+            # _write_index_keys fuses k_norm with RoPE and MXFP4 quantization.
+            self.k_norm.declare_kernels = lambda: None
         self.ratio = ratio
 
 
@@ -585,7 +589,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         in its call site's call form."""
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
-        from vllm.models.deepseek_v4_1.tilelang.front import front_call
+        from vllm.models.deepseek_v4_1.tilelang.front import (
+            context_kv_front_call,
+            front_call,
+        )
         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
 
         calls = []
@@ -642,17 +649,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             (self.n_local_heads, self.head_dim, 1, False),  # q
             (1, 512, 1, False),  # kv
         ]
-        if self.indexer is not None:
-            roles.append((self.indexer.heads, 128, 1, False))  # index query
-        if self.compressor is not None:
-            roles.append((1, 128, self.compress_ratio, False))  # index key
-            roles.append((1, 512, self.compress_ratio, False))  # latent
         calls.extend(
             rope_call(heads, dim, table_width, ratio, inverse)
             for heads, dim, ratio, inverse in roles
         )
         # _write_v41_cache: SWA records of every layer, indexed records of the
-        # compressor's latents, at the builders' (and compressor's) slot dtype.
+        # compressor's latents (rotated in registers), at the builders' (and
+        # compressor's) slot dtype.
         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
         # _front: the decode front's one kernel.
         calls.append(
@@ -662,8 +665,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 SLOT_DTYPE,
             )
         )
+        if self.is_draft:
+            calls.append(
+                context_kv_front_call(
+                    self.kv_norm.variance_epsilon,
+                    self.swa_cache_layer.block_size,
+                    SLOT_DTYPE,
+                )
+            )
         if self.compressor is not None:
-            calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
+            calls.append(
+                writer_call(
+                    "indexed",
+                    self._main_page,
+                    SLOT_DTYPE,
+                    rope_dim=table_width,
+                    ratio=self.compress_ratio,
+                )
+            )
         else:
             # _gather_front: prefill SP's BF16 front, the index head weights beside
             # the normalized halves.
@@ -701,11 +720,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
         return x
 
-    def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
+    def _write_v41_cache(
+        self, x, cache, slots, *, page_size, cache_kind, positions=None
+    ):
         """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
         from .tilelang.cache_writer import write_cache
 
-        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+        if positions is None:
+            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+            return
+        write_cache(
+            x,
+            cache,
+            slots,
+            page_size=page_size,
+            cache_kind=cache_kind,
+            positions=positions,
+            cos_sin=self.rotary_emb.cos_sin_cache,
+            ratio=self.compress_ratio if cache_kind == "indexed" else 1,
+        )
 
     def insert_context_kv(self, kv, positions, slot_mapping):
         if not self._ready:
@@ -717,6 +750,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             slot_mapping,
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
+        )
+
+    def insert_raw_context_kv(self, kv_raw, positions, slot_mapping):
+        if not self._ready:
+            raise RuntimeError("V4.1 attention metadata is not prepared")
+        from vllm.models.deepseek_v4_1.tilelang.front import context_kv_front
+
+        context_kv_front(
+            kv_raw,
+            self.kv_norm.weight,
+            self.kv_norm.variance_epsilon,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.swa_cache_layer.kv_cache,
+            slot_mapping,
+            self.swa_cache_layer.block_size,
         )
 
     def _query_metadata(self, metadata):
@@ -758,18 +807,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         latent, slots = self.compressor(hidden_states, main, state)
         self._issue_wo_prefetch(rows, after="compressor")
-        # Index K consumes the ordinary-normalized PRE-RoPE latent.
-        key = indexer.k_norm(indexer.wk(latent))
-        key = self._rope(key, positions, "index_key")
+        # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+        # and the paged MXFP4 write run in one kernel.
+        key = indexer.wk(latent)
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
-        self._write_index_keys(key, index_meta.slot_mapping[:rows])
-        latent = self._rope(latent, positions, "latent")
+        self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
         self._write_v41_cache(
             latent,
             self.kv_cache,
             slots,
             page_size=self._main_page,
             cache_kind="indexed",
+            positions=positions,
         )
 
     def forward(
@@ -904,12 +953,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 first = split.start if split is not None else 0
                 last = first + split.real_rows if split is not None else rows
                 query = self._index_query(
-                    qr, positions, hidden_states, index_weights, first, last, swa
+                    qr,
+                    positions,
+                    hidden_states,
+                    index_weights,
+                    first,
+                    last,
+                    swa,
+                    q_cast,
                 )
                 reference = None
                 if split is not None and _INDEX_SPLIT_CHECK:
                     reference = self._index_query(
-                        qr, positions, hidden_states, index_weights, 0, rows, swa
+                        qr,
+                        positions,
+                        hidden_states,
+                        index_weights,
+                        0,
+                        rows,
+                        swa,
+                        q_cast,
                     )
                 index_query = (*query, split, reference)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
@@ -927,17 +990,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             l2_prefetch.issue(self._l2pf_comp, rows)
 
     def _index_query(
-        self, qr, positions, hidden_states, index_weights, first, last, swa
+        self,
+        qr,
+        positions,
+        hidden_states,
+        index_weights,
+        first,
+        last,
+        swa,
+        q_cast=None,
     ):
         """MXFP4 index queries and scaled head weights for rows [first, last)."""
         rows = last - first
         h = self.indexer.heads
-        iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
-        iq = self._rope(iq, positions[first:last], "index_query")
+        qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
+        cast_rows = (
+            kernels.cast_mxfp8(qr_rows)
+            if q_cast is None
+            else kernels.slice_mxfp8(q_cast, first, last)
+        )
+        with kernels.mxfp8_inputs(cast_rows):
+            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
         self._quantize_index_query(
-            "decode" if swa.is_decode else "prefill", iq, iq_data, iq_scale
+            "decode" if swa.is_decode else "prefill",
+            iq,
+            iq_data,
+            iq_scale,
+            positions=positions[first:last],
         )
         # The BF16 head-weight projection runs on every row: its GEMV rounds
         # differently at another row count, which would move top-k selections.

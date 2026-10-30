@@ -662,8 +662,8 @@ class Engram(nn.Module):
         quant_config,
         layout,
         layer_hash_index,
-        use_sequence_parallel,
-        prefix,
+        use_sequence_parallel=False,
+        prefix="",
     ):
         super().__init__()
         if use_sequence_parallel:

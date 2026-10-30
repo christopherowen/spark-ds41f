@@ -1,0 +1,48 @@
+name: pages
+
+# Builds and deploys the manifest-driven status & benchmark observatory to GitHub Pages.
+# Also works out of the box with branch-based GitHub Pages pointed at main:/docs
+# since docs/index.html and docs/.nojekyll are kept in sync and verified by CI.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'config/cluster.json'
+      - 'upstreams.lock.json'
+      - 'manifests/**'
+      - 'scripts/render_docs.py'
+      - 'scripts/recipe.py'
+      - 'scripts/kv_capacity.py'
+      - 'docs/index.html'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Render and verify manifest-driven GitHub Page
+        run: |
+          python3 scripts/render_docs.py --check
+          python3 scripts/render_docs.py --site-dir _site
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

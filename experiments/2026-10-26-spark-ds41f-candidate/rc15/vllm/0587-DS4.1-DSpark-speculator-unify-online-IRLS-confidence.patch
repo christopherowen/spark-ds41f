@@ -7,7 +7,7 @@ Subject: [PATCH 587/587] [DS4.1] DSpark speculator: unify online IRLS
 
 ---
  .../test_deepseek_v41_tilelang_confidence.py  |  31 ++
- .../spec_decode/test_acceptance_estimator.py  | 132 +++++-
+ .../spec_decode/test_acceptance_estimator.py  | 132 ++++-
  tests/v1/worker/test_dspark_greedy_markov.py  | 213 ++++++++-
  tests/v1/worker/test_gpu_tilelang_sampling.py |  67 +++
  vllm/model_executor/models/qwen3_dspark.py    |  36 +-
@@ -16,9 +16,9 @@ Subject: [PATCH 587/587] [DS4.1] DSpark speculator: unify online IRLS
  .../v1/worker/gpu/sample/tilelang_sampling.py | 258 +++++++++-
  .../gpu/spec_decode/acceptance_estimator.py   | 255 +++++++++-
  .../worker/gpu/spec_decode/dspark/greedy.py   |  50 +-
- .../gpu/spec_decode/dspark/speculator.py      | 442 ++++++++++++++++--
+ .../gpu/spec_decode/dspark/speculator.py      | 452 ++++++++++++++++--
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  19 +-
- 12 files changed, 1606 insertions(+), 101 deletions(-)
+ 12 files changed, 1616 insertions(+), 101 deletions(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
 index 6d1dd230f..c1199c211 100644
@@ -1787,7 +1787,7 @@ index fbcf7e526..e6c65b6bf 100644
  
  def markov_anchor_embed(
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-index af71df562..a12323fe0 100644
+index af71df562..aca39b7f0 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -23,7 +23,8 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
@@ -1977,18 +1977,28 @@ index af71df562..a12323fe0 100644
  
      @property
      def attn_vllm_config(self) -> VllmConfig:
-@@ -179,12 +343,30 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -179,12 +343,40 @@ class DSparkSpeculator(DFlashSpeculator):
              self.enable_adaptive_verification
              and getattr(model.model, "confidence_head", None) is not None
          )
-+        # Keep OnlineAcceptanceEstimator active when use_confidence_head is True:
-+        # logit(p_head) is fed into the online IRLS solver (_accumulate_kernel +
-+        # _refit_kernel) so a shared slope and per-position intercepts calibrate
-+        # the static head online against observed target acceptance.
++        # Keep OnlineAcceptanceEstimator active when explicitly enabled so
++        # logit(p_head) is calibrated online against observed target acceptance;
++        # otherwise use the TileLang confidence head directly.
          if self.use_confidence_head:
 -            # The acceptance estimator is not needed when a trained confidence head
 -            # is available.
 -            self.use_acceptance_estimator = False
++            online_cal = os.environ.get(
++                "SPARK_DS41F_DSPARK_ONLINE_CALIBRATION", "0"
++            ) == "1" or bool(
++                getattr(
++                    self.draft_model_config.hf_config,
++                    "dspark_online_calibration",
++                    False,
++                )
++            )
++            if not online_cal:
++                self.use_acceptance_estimator = False
 +            if (
 +                getattr(self, "_confidence_margin_weight", 0.0) != 0.0
 +                or getattr(self, "_confidence_step_biases", None) is not None
@@ -2011,7 +2021,7 @@ index af71df562..a12323fe0 100644
      def _sample_logits(
          self,
          logits: torch.Tensor,
-@@ -192,7 +374,8 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -192,7 +384,8 @@ class DSparkSpeculator(DFlashSpeculator):
          sample_pos: torch.Tensor,
          step: int,
      ) -> torch.Tensor:
@@ -2021,7 +2031,7 @@ index af71df562..a12323fe0 100644
          if self.draft_logits is None:
              draft_ids = logits.argmax(dim=-1)
              return self.model.map_draft_to_target(draft_ids)
-@@ -236,7 +419,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -236,7 +429,7 @@ class DSparkSpeculator(DFlashSpeculator):
              and getattr(self.model, "vocab_parallel_greedy", False)
              and self.draft_logits is None
              and self.model.draft_id_to_target_id is None
@@ -2030,7 +2040,7 @@ index af71df562..a12323fe0 100644
          )
  
      def register_warmups(
-@@ -247,7 +430,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -247,7 +440,7 @@ class DSparkSpeculator(DFlashSpeculator):
          shards, written in the draft head's dtype (draft position ``i`` is column
          ``i`` of both the base logits' ``[requests, positions, shard]`` view and
          the draft tokens); or the full-vocabulary one, when no logits cache,
@@ -2039,7 +2049,7 @@ index af71df562..a12323fe0 100644
          super().register_warmups(block_table_layouts)
          local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
          if self._draft_topk is not None:
-@@ -259,7 +442,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -259,7 +452,7 @@ class DSparkSpeculator(DFlashSpeculator):
                  and processor is not None
                  and self.draft_logits is None
                  and self.model.draft_id_to_target_id is None
@@ -2048,7 +2058,7 @@ index af71df562..a12323fe0 100644
              ):
                  register_sample_greedy_markov_warmup(
                      dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
-@@ -267,23 +450,34 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -267,23 +460,34 @@ class DSparkSpeculator(DFlashSpeculator):
              return
          vocab_start, shard_vocab = self.model.draft_vocab_shard
          dtype, head_width, markov_width = self.model.draft_logits_local_layout
@@ -2100,7 +2110,7 @@ index af71df562..a12323fe0 100644
          tilelang_inputs.declare(
              lambda: tilelang_inputs.gather_hidden_rows_calls(
                  self.hidden_states.dtype, self.hidden_states.shape[1]
-@@ -301,6 +495,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -301,6 +505,7 @@ class DSparkSpeculator(DFlashSpeculator):
                      self.draft_tokens.dtype,
                      get_tensor_model_parallel_world_size(),
                      table.shape[1],
@@ -2108,7 +2118,7 @@ index af71df562..a12323fe0 100644
                  )
              )
  
-@@ -323,11 +518,26 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -323,11 +528,26 @@ class DSparkSpeculator(DFlashSpeculator):
  
          # Sequential Markov sampling over the backbone's output hidden states.
          n_spec = self.num_speculative_steps
@@ -2138,7 +2148,7 @@ index af71df562..a12323fe0 100644
          # Draft-vocab logits; sampled ids are remapped to target vocab below.
          local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
          vocab_parallel = self._vocab_parallel_greedy(local_head)
-@@ -339,11 +549,19 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -339,11 +559,19 @@ class DSparkSpeculator(DFlashSpeculator):
          else:
              base_logits = self.model.compute_draft_logits(sample_hidden)
          vocab_size = base_logits.shape[-1]
@@ -2159,7 +2169,7 @@ index af71df562..a12323fe0 100644
  
          # Anchor (bonus) token per request = the input id at query offset 0,
          # read via the precomputed persistent index (fixed buffer for capture).
-@@ -363,7 +581,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -363,7 +591,7 @@ class DSparkSpeculator(DFlashSpeculator):
          else:
              prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
  
@@ -2168,7 +2178,7 @@ index af71df562..a12323fe0 100644
              # Sequential stage: Markov bias from the previously sampled token.
              if table is not None:
                  markov_embed = step_embed
-@@ -373,7 +591,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -373,7 +601,7 @@ class DSparkSpeculator(DFlashSpeculator):
                      confidence_markov_embeds.append(markov_embed)
              if local_head:
                  bias = self.model.compute_local_markov_bias(markov_embed)
@@ -2177,7 +2187,7 @@ index af71df562..a12323fe0 100644
                      draft_sampled_i = self.model.sample_local_draft_logits(
                          base_logits[:, i], bias
                      )
-@@ -397,6 +615,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -397,6 +625,7 @@ class DSparkSpeculator(DFlashSpeculator):
                      pairs,
                      self._greedy_partial_values,
                      self._greedy_partial_indices,
@@ -2185,7 +2195,7 @@ index af71df562..a12323fe0 100644
                  )
                  draft_sampled_i = self.draft_tokens[:num_reqs, i]
                  select_first_argmax(
-@@ -405,9 +624,10 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -405,9 +634,10 @@ class DSparkSpeculator(DFlashSpeculator):
                      pair_width=4,
                      embed=(
                          (table, step_embed, confidence_embeds[:, i + 1])
@@ -2197,7 +2207,7 @@ index af71df562..a12323fe0 100644
                  )
                  prev = draft_sampled_i
                  continue
-@@ -416,7 +636,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -416,7 +646,7 @@ class DSparkSpeculator(DFlashSpeculator):
                  self.draft_logits is None
                  and self.model.draft_id_to_target_id is None
                  and base_logits.dtype == bias.dtype
@@ -2206,7 +2216,7 @@ index af71df562..a12323fe0 100644
              ):
                  draft_sampled_i = self.draft_tokens[:num_reqs, i]
                  sample_greedy_markov(
-@@ -434,21 +654,109 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -434,21 +664,109 @@ class DSparkSpeculator(DFlashSpeculator):
                  self.draft_tokens[:num_reqs, i] = draft_sampled_i
              prev = draft_sampled_i
  
@@ -2327,7 +2337,7 @@ index af71df562..a12323fe0 100644
  
      def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
          """Apply the sequential Markov head only to top-k base-logit candidates.
-@@ -460,12 +768,27 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -460,12 +778,27 @@ class DSparkSpeculator(DFlashSpeculator):
          """
          assert self._draft_topk is not None
          n_spec = self.num_speculative_steps
@@ -2359,7 +2369,7 @@ index af71df562..a12323fe0 100644
          base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
          # Reuse the dense backbone output as the normal sampler's input. Fill
          # once for all positions, then scatter only the corrected candidates
-@@ -476,7 +799,7 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -476,7 +809,7 @@ class DSparkSpeculator(DFlashSpeculator):
          confidence_markov_embeds = []
          prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
  
@@ -2368,7 +2378,7 @@ index af71df562..a12323fe0 100644
              markov_embed = self.model.markov_embed(prev)
              if self.use_confidence_head:
                  confidence_markov_embeds.append(markov_embed)
-@@ -492,14 +815,31 @@ class DSparkSpeculator(DFlashSpeculator):
+@@ -492,14 +825,31 @@ class DSparkSpeculator(DFlashSpeculator):
              self.draft_tokens[:num_reqs, i] = draft_sampled_i
              prev = draft_sampled_i
  

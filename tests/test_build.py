@@ -147,6 +147,9 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertTrue(stages["runtime"].startswith("runtime-core AS runtime"))
         self.assertTrue(stages["runtime-tilelang"].startswith("${TILELANG_BASE_STAGE} AS runtime-tilelang"))
         self.assertNotIn("b12x", stages["runtime-core"].lower())
+        self.assertIn("VLLM_NATIVE_CACHE_DIR=/opt/spark-ds41f/native", stages["runtime-core"])
+        self.assertIn("from vllm.model_executor.model_loader.direct_io import _native as direct_native", stages["runtime-core"])
+        self.assertIn("from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native", stages["runtime-core"])
 
 
 if __name__ == "__main__":

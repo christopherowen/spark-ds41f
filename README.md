@@ -118,15 +118,17 @@ The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
 with DeepSeek's TileKernels and the one-shot RoCE collectives of
 [sparknet](https://github.com/christopherowen/dgx-spark-networking), in place
 of B12X's attention, linear, MoE, mHC, vocabulary and collective kernels
-(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). B12X stays in
-the image as the alternative backend; a configuration without
-`kernel_backend` means B12X. The [r6 promotion record](experiments/2026-10-05-tilelang-r6/README.md)
+(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). Since
+spark-ds41f-1030 (`vLLM 0493-0496`), TileLang is the only kernel family in the
+image and checkpoints load directly (`--load-format direct`, `VLLM_PLUGINS`
+empty). The [r6 promotion record](experiments/2026-10-05-tilelang-r6/README.md)
 has both recipes and their benchmarks, and the
 [decode-kernel experiment](experiments/2026-10-05-tilelang-decode-kernels/README.md)
 compares the two families kernel by kernel.
 [docs/fundamentals.md](docs/fundamentals.md) explains the model itself: GEMM
 shapes, number formats, one decoder layer, attention, mHC, Engram, DSpark, and
-how TP3 and TP4 split the layers.
+how TP3 and TP4 split the layers. Interactive manifest-driven status and
+benchmark charts are in [docs/index.html](docs/index.html).
 
 The deployment tools also generate and validate a
 [four-node switchless ring](docs/switchless-topology.md). One recipe,
@@ -189,113 +191,113 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 
 The baseline is
 [manifests/baselines/2026-10-30-spark-ds41f-1030.json](manifests/baselines/2026-10-30-spark-ds41f-1030.json)
-([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md)), on the ring and the
-triangle at 1M context. See
-[docs/current-state.md](docs/current-state.md). The three-node deployment (the four-node ring
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)), on the ring
+(`tp4-ring`) and the triangle (`tp3-triangle`) at 1M context.
+See [docs/current-state.md](docs/current-state.md) and the manifest-driven dashboard in
+[docs/index.html](docs/index.html) (regenerated and verified by `scripts/render_docs.py`).
+
+<!-- BEGIN GENERATED: current-baseline-summary -->
+| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Full contexts held (startup line) | Qualified reference |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) |
+| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) |
+| `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | 8 (8.80x; startup `1,348,708` / `5.14x`) | unqualified (`--unqualified-shape`) |
+<!-- END GENERATED: current-baseline-summary -->
+
+The promoted deployment (`tp4-ring` on four nodes by default; `tp3-triangle` on three nodes
 differs only in cabling, transport and memory sizing):
 
-- three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
-  kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
-  0.4.1 with UVM leaf-table packing enabled, no desktop, and
-  `vm.watermark_boost_factor=0`;
-- direct dual ConnectX-7 paths between every pair of nodes;
-- Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
-  projection sharding, asynchronous Engram rows, and two tool-call and
-  image-cache fixes) with the TileLang kernel family:
-  - TileLang 0.1.15 with three patches that enable SM120/SM121 block-scaled
-    MMAs (MXFP8, FP8 × FP4, MXFP4);
-  - DS4.1 TileLang kernels for sparse MLA, the MXFP4 indexer, the block-32 FP8
-    and BF16 projections, the FP8 × FP4 routed experts and the vocabulary
-    heads; decode rows run on 16-, 32- or 64-row tiles with TileLang's
-    unspecialized pipeline (its warp-specialized scale staging races on SM121
-    at decode tiles), and prefill rasterizes weights larger than L2 in panels;
-  - DeepSeek's TileKernels 2.0.0 for the MoE top-k gate, the SwiGLU and
-    quantization casts and mHC, with the mHC projection a TileLang kernel;
-  - the routed experts' SwiGLU and MXFP8 cast run over the dispatch layout's
-    live tiles only, and the routed experts' weight scales are kept as a row
-    base exponent and 4-bit codes (exact, half the scale bytes; about 2.7 GiB a
-    rank freed at TP3, which pays for the 1M context);
-  - TileLang kernels for RoPE, the CSA compressor and its projection, the KV
-    cache writers, the Engram gate, hash and row gather, the index-head weight
-    scale, the sparse-MLA metadata (the first port off Triton), the WO
-    projection and the drafter's context-KV projection;
-  - sparknet 0.5.0's one-shot RoCE all-reduce and all-gather, explicit and
-    fail-stop, for every TP collective including DSpark's per-step broadcast
-    (serving never uses the PyTorch NCCL process group); its data phase reads
-    one 16-byte pack a thread with a single poller;
-  - L2 weight prefetch during decode (the next layer's weights and scale
-    words stream into L2 while latency-bound kernels run);
-  - B12X's vision tower kernels, which the family does not replace yet, and
-    its checkpoint loader;
-- B12X, with all its fixes, as the alternative backend in the same image: its
-  FP4 KV writer rounds like DeepSeek's reference quantizer, its indexer top-k
-  breaks score ties by position, its dense GEMM and prefill kernels fence
-  shared-memory stage reads before the TMA refill, and W4A8 tiny decode stays
-  off; its four-node RoCEnante relay and mesh transports are present too;
-- NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
-  (NVIDIA/nccl#2393), which prevents a proxy-thread hang, and the four-node
-  switchless ring patches (bidirectional rings, balanced channels);
-- DeepSeek V4.1 Flash native FP8/FP4/BF16 weights, every served weight bit as
-  the checkpoint stores it, with the vision tower loaded (up to four images
-  per request, history included: the recipe's chosen limit, not the
-  model's; see [images per request](docs/current-state.md#images-per-request));
-  the output head is stored in an exact 12-bit packed form of
-  its BF16 weights, and the embedding and output head live in the GB10
-  display carve-out, loaded there directly from the checkpoint while the
-  text console keeps its framebuffer;
+- four DGX Spark nodes in a switchless ring using tensor parallelism 4 (`tp4-ring`, pinned to the
+  GB10's ten fast cores `--cpuset-cpus=5-9,15-19`), or three in a triangle using tensor
+  parallelism 3 (`tp3-triangle`), on DGX Spark 26.09.2 with kernel `7.0.0-1019-nvidia-64k`
+  (`kho=off`), signed memory-saver DKMS 0.4.1 with UVM leaf-table packing enabled, no desktop,
+  `vm.watermark_boost_factor=0`, and glibc malloc pinned (`MALLOC_ARENA_MAX=2`,
+  `MALLOC_MMAP_THRESHOLD_=1048576`);
+- dual ConnectX-7 200 GbE RoCE paths between every adjacent pair of nodes (`oneshot-ring4` on four
+  nodes, `oneshot-direct` on three);
+- Local Inference Lab's `integration/karmic-kraken-beta` vLLM (`19f2c20e`) with the
+  spark-ds41f-1030 series (`0001-0567`, tree `ea1281f8`) and TileLang as the only kernel family
+  (`vLLM 0493-0496`):
+  - TileLang 0.1.15 with four patches (`0001-0004`, tree `222b895d`) that enable SM120/SM121
+    block-scaled MMAs (MXFP8, FP8 × FP4, MXFP4) and prepare and freeze every declared TileLang
+    call before memory profiling (277 calls at TP4);
+  - DS4.1 TileLang kernels for sparse MLA (with the attention front in one launch, `0543-0544`),
+    the MXFP4 indexer, the block-32 FP8 and BF16 projections, the FP8 × FP4 routed experts (64-row
+    prefill tiles, coded stage arrivals `0538`, block-scale grid `0537`), the vocabulary heads,
+    programmatic dependent launch (PDL) along the decode chain (`0520-0525`), and the TileLang
+    vision tower (`0300-0488`);
+  - DeepSeek's TileKernels 2.0.0 (`cb2fa41c`) for the MoE top-k gate and mHC, with the mHC stream
+    projection and finalize MXFP8 cast in TileLang and the routed experts' SwiGLU and MXFP8 cast
+    (`moe_swiglu_cast`, `0181`) over the dispatch layout's live tiles only;
+  - the routed experts' UE8M0 weight scales kept as a per-row base exponent and 4-bit deltas
+    (`0182-0183`), with 2-bit deltas for narrow experts stored in the 4-bit codes' buffer
+    (`0563-0564`, `0566`: model loading 71.67 GiB a rank at TP4);
+  - TileLang kernels for RoPE, the CSA compressor and its projection, the CED row selection and
+    its non-final row skip with last-128-row replay (`0229-0255`, `0526-0527`), the KV cache
+    writers without per-allocation zeroing (`0502-0503`), the Engram gate, host/GPU hash and row
+    gather (`0145-0154`, `0567`), the WO projection (`0177`, `0179`), the drafter's context-KV
+    projection (`0131`), sampling, block verification, logprobs and generation controls;
+  - sparknet 0.5.0's (`f997a594`) one-shot RoCE all-reduce (up to 2 MiB) and all-gather, explicit
+    and fail-stop (`SPARKNET_ROCE_TIMEOUT_MS=10000`), for every TP collective including DSpark's
+    per-step broadcast (`0185`, so serving never touches the PyTorch NCCL process group);
+  - L2 weight prefetch during decode (`VLLM_L2_PREFETCH_KERNELS=tilelang`, `0044`, `0119`);
+  - direct O_DIRECT checkpoint loading through anonymous memory (`--load-format direct`, `0147`,
+    `0499`, `VLLM_PLUGINS` empty);
+- NCCL 2.30.7 rebuilt (`6af10aa7`) with the AArch64 InfiniBand send-path fence
+  (NVIDIA/nccl#2393) and the four-node switchless ring patches (bidirectional rings, balanced
+  channels);
+- DeepSeek-V4.1-Flash-1017 (`1bae0e10`) native FP8/FP4/BF16 weights, with the TileLang vision
+  tower loaded (up to four images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
+  see [images per request](docs/current-state.md#images-per-request)), served under both
+  `deepseek-v4.1-flash` and the per-request GLP-steered `deepseek-v4.1-flash-weightless`
+  (`0541-0542`, msuiche's 39-layer vector for 1017); the output head is stored in an exact 12-bit
+  packed form of its BF16 weights (in regular memory on `tp4-ring` for L2 reuse, and in the GB10
+  display carve-out on `tp3-triangle`);
 - arithmetic at DeepSeek's reference precision (`inference/model.py`): FP32
   logits from the packed head, the mHC stream projection in FP32 (each FP32
   weight split into three exact TF32 parts), the shared expert's SwiGLU in
-  FP32 with one rounding, and MoE partials rounded once per rank with the
+  FP32 with one rounding, MoE partials rounded once per rank with the
   shared expert added in the combine, and WO-A on BF16 activations with its
   input quantized as the reference's 2026-10-12 revision does (`act_quant`,
   block 32, UE8M0);
-- every row's result is independent of its batch: each kernel adds its
+- every row's result is independent of its batch at temperature 0: each kernel adds its
   reduction in a fixed order, the collectives add every rank's partial in rank
   order with one FP32 rounding, prefill chunks leave room for every stream's
-  decode and draft rows, and a step that mixes decode and prefill runs sparse
-  MLA per request, so decode rows keep the decode plan;
+  decode and draft rows (`--long-prefill-token-threshold` 16,288 on `tp4-ring`, 6,096 on
+  `tp3-triangle`), and a step that mixes decode and prefill runs sparse MLA per request;
 - the ratio-2 compressor carries its open pair across decode steps, so
   compressed entries for generated tokens match the ones prefill builds;
 - DSpark speculative decoding with five draft tokens (the drafter's trained
-  block) and block rejection, full CUDA graphs for decode batches up to 48
-  tokens, and a draft budget that is a rule of the inputs (a fixed linear step
-  cost, row cost 0.035), so nothing is timed at boot; verification rows
-  whose drafts are unlikely to survive skip the routed experts, the drafter
-  marks its padding rows for the MoE routers, and greedy drafts stay sharded
-  by vocabulary over the checkpoint's BF16 drafter head and Markov projection;
-- late admission: the asynchronous engine decides each step when the step in
-  flight reaches decoder layer 30, so a request that arrives meanwhile joins
-  the next step; a step that continues a prompt chunk decides its successor at
-  once, which keeps chunked prefill's pace;
+  block) and block rejection with fresh random draws per verification round (`0228`),
+  `FULL_AND_PIECEWISE` CUDA graphs for decode batches up to 96 rows on `tp4-ring` (16 streams × 6
+  rows; 48 rows on `tp3-triangle`), and a draft budget that is a rule of the inputs (row cost
+  0.035, `0184`), so nothing is timed at boot; verification rows below survival 0.2 skip the
+  routed experts (`0504`), the drafter marks its padding rows for the MoE routers, and greedy
+  verification reduces per-rank vocabulary shards when no request reads logits (`0112-0114`);
+- late admission (`VLLM_LATE_ADMISSION_LAYER=30`, `0222`, `0226`) and prefill yield
+  (`--prefill-yield short --prefill-yield-limit-s 10`, `0545`), so a waiting short request takes
+  the next step from a long prompt's prefill (first token in 3.3–3.6 s instead of 12.4–12.8 s
+  beside a 131K prefill);
 - sink detection and draft-zero rejection for DeepSeek V4.1, on by default
-  (`VLLM_SINK_REJECTION=0` turns it off): a sampled token that becomes the
-  model's attention sink (residual column 2455) is drawn again, so short
-  prompts such as `Say hi.` no longer collapse; a request's first token waits
-  one decode step for it. `vllm:sink_*` counts the flags in the outputs the
-  scheduler commits; each rank's `Sink detector, rank N` log line counts every
-  flagged row its GPU executed, including steps whose output is discarded (the
-  step in flight when a request finishes or is aborted, stale output after a
-  preemption), so the log reads at least the metric (#489);
-- control-token spellings written in request text stay plain text, as
-  DeepSeek's encoder treats them;
-- the fabricated context of startup profiling gives each KV cache group its
-  own blocks;
-- sequence-parallel prefill once a prompt chunk's reduce-scatter outgrows
-  the one-shot RoCE all-reduce (205 tokens);
-- mutating custom ops read their argument schema once per call, not once per
-  argument as torch does;
-- 1,048,576-token per-request limit, eight admitted sequences, and a 4.90625
-  GiB-per-rank cache that holds five full 1M contexts at once, or all eight
-  sequences at up to 666,880 tokens (spark-ds41f-1025's startup line: 4,009,281
-  tokens, 3.82x; [KV capacity](docs/memory-profiles.md#kv-capacity));
-- one concurrent prefill, 8,192 batched tokens, and fail-closed 5 GiB startup
-  and 3 GiB steady memory guards;
-- FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): only the
-  sampler uses FlashInfer, and the pass saved no configs.
+  (`VLLM_SINK_REJECTION=0` turns it off, `0221`, `0223`, `0264`, `0266`);
+- DeepSeek API effort aliases, `thinking` switch, `response_format`, `tool_choice: none`,
+  assistant prefix (`0256-0257`, `0539-0540`), prompt-cache hit reporting
+  (`--enable-prompt-tokens-details`), and control-token spellings kept as plain text (`0227`);
+- 1,048,576-token per-request limit on both 64 KiB shapes:
+  - `tp4-ring`: 16 admitted sequences, 16,384 batched tokens, and a 10.5 GiB-per-rank KV pool
+    that holds 11 full 1M contexts at once (`11,554,122` tokens / `11.02x` on vLLM's startup line,
+    or all 16 sequences at up to 718,848 tokens each);
+  - `tp3-triangle`: 8 admitted sequences, 6,144 batched tokens in the recipe (8,192 in
+    spark-ds41f-1025's qualified run), and a 4.90625 GiB-per-rank KV pool that holds 5 full 1M
+    contexts at once (`5,488,353` tokens / `5.23x` with vLLM 0491, or all 8 sequences at up to
+    682,240 tokens each; see [KV capacity](docs/memory-profiles.md#kv-capacity));
+- one concurrent prefill, fail-closed 5 GiB startup and 3 GiB steady memory guards, and
+  FlashInfer autotune and JIT monitor disabled (`--no-enable-flashinfer-autotune`,
+  `--jit-monitor-mode off`).
 
-One content-addressed image runs on all three nodes and passes the LRU
-coherence gate 5/5; see [Performance](#performance).
+One content-addressed image runs on every node in the shape and passes the release
+test suite (6,686 passed, 0 failed); see [Performance](#performance).
 
 The machine-readable desired configuration is the recipe
 [config/cluster.json](config/cluster.json): everything the shapes share once,
@@ -309,6 +311,79 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+<!-- BEGIN GENERATED: performance-summary -->
+Current qualified reference runs by shape (from `config/cluster.json` and `manifests/suites/`):
+
+| Metric | `tp4-ring` ([`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)) | `tp3-triangle` ([`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/)) |
+| --- | ---: | ---: |
+| Decode step geometric mean (20 TP4 / 15 TP3 shapes) | 24.58 ms | 25.13 ms |
+| Decode, 16 streams (`c16` output tok/s) | 257.8 | — |
+| Decode, 8 streams (`c8` output tok/s) | 198.4 | 158.6 |
+| Decode, 4 streams (`c4` output tok/s) | — | 121.2 |
+| One conversation at a time (`single-stream` `c1` output tok/s) | 78.0 | 62.6 |
+| Sampled decode (`temp=1.0, top_p=1.0`), c16 / c8 / c1 (tok/s) | 252.2 / 194.9 / 75.6 | 154.9 / 153.8 / 61.4 |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.4 | 119.0 |
+| Source-text prefill, 32K (tok/s) | 7,313 | 5,888 |
+| Prefill, 131K (tok/s) | 7,396 | 5,862 |
+| Prefill, 262K (tok/s) | 7,120 | 5,613 |
+| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,155 |
+| Prefill, 1M (tok/s) | 5,550 | 3,952 (cold 1M) |
+| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 3.30 s / 3.59 s | 2.03 s / 9.59 s |
+<!-- END GENERATED: performance-summary -->
+
+spark-ds41f-1030 against spark-ds41f-1025 on four nodes, both serving
+DeepSeek-V4.1-Flash-1017 (2026-10-29), measured with the `release`, `single-stream` and
+`sampled` suites in one session (candidate 12, spark-ds41f-1025, candidate 12 again;
+candidates 13 and 14 keep its digests, kernels and bytes read;
+[results](experiments/2026-10-26-spark-ds41f-candidate/README.md);
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md);
+[suite run](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)). Bold changes exceed their
+95% interval and the run's own repeat.
+
+| Workload | TP4 spark-ds41f-1025 | TP4 spark-ds41f-1030 |
+| --- | ---: | ---: |
+| Decode step time, geometric mean of 20 shapes | | **-4.62%** ±0.15 |
+| Decode, 16 streams output / paired decode (tok/s) | 251.7 | 257.7 (**+2.40%** ±0.68; paired **+2.05%** ±0.41) |
+| Decode, 8 streams output / paired decode (tok/s) | 194.6 | 198.4 (**+1.96%** ±0.87; paired **+2.02%** ±0.51) |
+| One conversation at a time, paired decode / output (tok/s) | 75.4 / 75.4 | 78.3 (**+3.61%** ±0.16) / 78.0 (+3.41% ±3.35) |
+| Sampled decode (temp 1.0), c16 / c8 / c1 paired change | | **+1.87%** / **+2.77%** / **+2.68%** |
+| Poisson arrivals at 0.7 req/s, output (tok/s) | 180.4 | 180.4 (-0.01% ±18.0) |
+| Source-text prefill, 32K (tok/s) | 6,744 | 7,313 (**+8.44%** ±1.83) |
+| Prefill, 131K | 6,798 | 7,396 (**+8.79%** ±0.24) |
+| Prefill, 262K | 6,477 | 7,120 (**+9.93%** ±0.23) |
+| Prefill, 524K | 5,870 | 6,538 (**+11.38%** ±0.14) |
+| Prefill, 1M | 4,948 | 5,549 (**+12.16%** ±0.30) |
+| 131K prefill under 15 decoding streams (tok/s) | 6,447 | 6,978 (**+8.23%** ±0.78) |
+| Short request TTFT p50 during 131K prefill, 3 / 11 streams (s) | 12.36 / 12.79 | **3.30** (**-73.3%**) / **3.59** (**-71.9%**) |
+
+All 256 greedy responses are identical to spark-ds41f-1025's (teacher-forced KL 4.2e-8 nats
+over 65,536 positions; 0 between the candidate boots).
+
+spark-ds41f-1025 against spark-ds41f-1022 on four nodes (`tp4-ring` at 16,384 batched tokens)
+and three nodes (`tp3-triangle` at 8,192 batched tokens), both serving
+DeepSeek-V4.1-Flash-1017 (2026-10-25;
+[results](experiments/2026-10-25-spark-ds41f-candidate/README.md);
+[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md); suite runs for
+[TP4](manifests/suites/2026-10-25-spark-ds41f-1025-tp4/) and
+[TP3](manifests/suites/2026-10-25-spark-ds41f-1025-tp3/)).
+
+| Workload | TP4 1022 | TP4 1025 | TP3 1022 | TP3 1025 |
+| --- | ---: | ---: | ---: | ---: |
+| Decode step time, geometric mean (20 TP4 / 15 TP3 shapes) | | **-2.38%** ±0.15 | | **-1.65%** ±0.16 |
+| Decode, 16 streams (tok/s) | 251.1 | 251.4 (+0.12% ±0.81) | | |
+| Decode, 8 streams (tok/s) | 193.2 | 194.9 (+0.88% ±0.79) | 154.4 | 154.7 (+0.22% ±1.34) |
+| Decode, 4 streams (tok/s) | | | 117.5 | 118.2 (+0.59% ±1.99) |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.4 | 180.4 (+0.01% ±17.7) | 118.8 | 118.8 (-0.03% ±22.3) |
+| One conversation at a time (`single-stream`, tok/s) | 73.8 | 75.3 (+2.11% ±3.82) | 59.4 | 60.5 (+1.85% ±7.06) |
+| Source-text prefill, 32K (tok/s) | 5,994 | 6,762 (**+12.80%** ±0.95) | 4,469 | 5,637 (**+26.14%** ±0.74) |
+| Prefill, 131K | 5,969 | 6,796 (**+13.85%** ±0.87) | 4,389 | 5,628 (**+28.22%** ±0.67) |
+| Prefill, 262K | 5,700 | 6,482 (**+13.73%** ±0.79) | 4,194 | 5,320 (**+26.84%** ±0.49) |
+| Prefill, 524K (TP4) / 500K (TP3) | 5,194 | 5,863 (**+12.89%** ±0.34) | 3,837 | 4,815 (**+25.50%** ±0.34) |
+| Prefill, 1M | 4,420 | 4,942 (**+11.81%** ±0.49) | 3,226 | 3,952 (**+22.5%**) |
+
+All 256 greedy responses are identical to spark-ds41f-1022's on both topologies, with
+teacher-forced KL 0.
 
 spark-ds41f-1022 against r6x on four nodes, both serving DeepSeek-V4.1-Flash-1017
 (2026-10-23), measured with the trimmed promotion suite in one session (spark-ds41f-1022,

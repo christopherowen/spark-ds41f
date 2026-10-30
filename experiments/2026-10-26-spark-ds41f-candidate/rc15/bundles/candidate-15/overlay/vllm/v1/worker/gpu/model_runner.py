@@ -1567,7 +1567,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
-                self.adaptive_verification.add_request(req_index, sampling_params)
+                self.adaptive_verification.add_request(
+                    req_index,
+                    sampling_params
+                    if os.environ.get("SPARK_DS41F_DSPARK_PIN_SEEDED_BUDGET", "0")
+                    == "1"
+                    else None,
+                )
             if self.copy_drafter is not None:
                 # A slot's copy state starts afresh with each request it holds.
                 self.copy_drafter.add_request(req_index)

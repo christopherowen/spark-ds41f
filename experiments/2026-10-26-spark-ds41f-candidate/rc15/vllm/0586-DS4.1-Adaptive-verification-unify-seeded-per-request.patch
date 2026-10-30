@@ -6,14 +6,14 @@ Subject: [PATCH 586/586] [DS4.1] Adaptive verification: unify seeded
  continuation-value cutoff
 
 ---
- .../spec_decode/test_adaptive_verification.py | 510 +++++++++++++++++-
+ .../spec_decode/test_adaptive_verification.py | 510 +++++++++++++++-
  tests/v1/worker/test_dead_rows.py             |  20 +
  tests/v1/worker/test_gpu_tilelang_inputs.py   |  51 ++
  vllm/v1/worker/gpu/input_batch.py             |   2 +
- vllm/v1/worker/gpu/model_runner.py            |  23 +-
- .../gpu/spec_decode/adaptive_verification.py  | 493 +++++++++++++++--
- vllm/v1/worker/gpu/tilelang_inputs.py         | 351 +++++++++---
- 7 files changed, 1307 insertions(+), 143 deletions(-)
+ vllm/v1/worker/gpu/model_runner.py            |  29 +-
+ .../gpu/spec_decode/adaptive_verification.py  | 550 ++++++++++++++++--
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 351 ++++++++---
+ 7 files changed, 1370 insertions(+), 143 deletions(-)
 
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
 index b54928687..baa319c3c 100644
@@ -664,19 +664,25 @@ index bbb9a76b0..a8901d844 100644
  
  def combine_sampled_and_draft_tokens(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 2fb39371a..4c9194cff 100644
+index 2fb39371a..3555d81bc 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1567,7 +1567,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1567,7 +1567,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
              req_index = self.req_states.req_id_to_index[req_id]
              if self.adaptive_verification is not None:
 -                self.adaptive_verification.add_request(req_index)
-+                self.adaptive_verification.add_request(req_index, sampling_params)
++                self.adaptive_verification.add_request(
++                    req_index,
++                    sampling_params
++                    if os.environ.get("SPARK_DS41F_DSPARK_PIN_SEEDED_BUDGET", "0")
++                    == "1"
++                    else None,
++                )
              if self.copy_drafter is not None:
                  # A slot's copy state starts afresh with each request it holds.
                  self.copy_drafter.add_request(req_index)
-@@ -3246,7 +3246,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3246,7 +3252,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cudagraph_stats=cudagraph_stats,
          )
          num_verified_draft_tokens = (
@@ -687,7 +693,7 @@ index 2fb39371a..4c9194cff 100644
              if self.adaptive_verification is not None
              and input_batch.num_draft_tokens_per_req is not None
              else None
-@@ -3353,12 +3355,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3353,12 +3361,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              assert self.sampler is not None
              if isinstance(self.speculator, DraftModelSpeculator):
                  observed_rejected = num_rejected
@@ -714,7 +720,7 @@ index 2fb39371a..4c9194cff 100644
                          sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
                      )
                  self.speculator.observe_verification(
-@@ -3410,7 +3425,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3410,7 +3431,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  # verification (fixed draft counts); its rows verify none.
                  verified = (
                      self.adaptive_verification.get_verified_draft_counts(
@@ -724,7 +730,7 @@ index 2fb39371a..4c9194cff 100644
                      if self.adaptive_verification is not None
                      and input_batch.num_draft_tokens_per_req is not None
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index f98789329..82ae2c483 100644
+index f98789329..3d3a4505c 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 @@ -31,6 +31,16 @@ logger = init_logger(__name__)
@@ -824,7 +830,7 @@ index f98789329..82ae2c483 100644
      survival = survival.masked_fill(out_of_range, -float("inf"))
      flat = survival.flatten()
      winners = flat.topk(draft_budget).indices
-@@ -117,6 +173,10 @@ class AdaptiveVerificationManager:
+@@ -117,6 +173,13 @@ class AdaptiveVerificationManager:
          max_total_logits: int,
          row_cost: float,
          planned_confidences: bool = False,
@@ -832,15 +838,21 @@ index f98789329..82ae2c483 100644
 +        tile_cost: float = 0.0,
 +        moe_row_cost: float = 0.0,
 +        continuation_alpha: float | None = None,
++        use_capture_step_cost: bool = True,
++        filter_dead_rows_on_host: bool = True,
++        clamp_verified_to_dead_cut: bool = True,
      ):
          self.req_states = req_states
          self.num_speculative_steps = req_states.num_speculative_steps
-@@ -132,28 +192,47 @@ class AdaptiveVerificationManager:
+@@ -132,28 +195,50 @@ class AdaptiveVerificationManager:
          # cost: a recipe constant, so the budget is a rule of the inputs, the same
          # on every build and boot, with nothing timed.
          self.row_cost = row_cost
 +        self.tile_cost = tile_cost
 +        self.moe_row_cost = moe_row_cost
++        self.use_capture_step_cost = use_capture_step_cost
++        self.filter_dead_rows_on_host = filter_dead_rows_on_host
++        self.clamp_verified_to_dead_cut = clamp_verified_to_dead_cut
 +        self._capture_sizes: tuple[int, ...] = tuple(
 +            sorted(int(s) for s in capture_sizes if int(s) > 0)
 +        )
@@ -887,7 +899,7 @@ index f98789329..82ae2c483 100644
          self._batch_draft_capacity = torch.empty(
              max_num_reqs, dtype=torch.int32, device=device
          )
-@@ -174,14 +253,45 @@ class AdaptiveVerificationManager:
+@@ -174,14 +259,45 @@ class AdaptiveVerificationManager:
          self._pending_resets: list[int] = []
          # The new requests' confidence rows, set to 1 together (apply_staged_writes).
          self._new_rows: list[int] = []
@@ -935,11 +947,15 @@ index f98789329..82ae2c483 100644
  
      def apply_staged_writes(self) -> None:
          """Set the new requests' confidences to 1 in one launch."""
-@@ -200,10 +310,101 @@ class AdaptiveVerificationManager:
+@@ -200,10 +316,117 @@ class AdaptiveVerificationManager:
      ) -> None:
          """Run each eager token count past the capture limit once, untimed, so its
          kernels compile before the first long prefill does."""
-+        if capture_sizes and not getattr(self, "_capture_sizes", ()):
++        if (
++            capture_sizes
++            and not getattr(self, "_capture_sizes", ())
++            and getattr(self, "use_capture_step_cost", True)
++        ):
 +            self._capture_sizes = tuple(
 +                sorted(int(s) for s in capture_sizes if int(s) > 0)
 +            )
@@ -980,8 +996,16 @@ index f98789329..82ae2c483 100644
 +        When neither is active, reduces to ``1.0 + row_cost * rows``.
 +        """
 +        rows = np.asarray(rows, dtype=np.int64)
-+        capture_sizes = getattr(self, "_capture_sizes", ()) if use_capture_sizes else ()
-+        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
++        capture_sizes = (
++            getattr(self, "_capture_sizes", ())
++            if use_capture_sizes and getattr(self, "use_capture_step_cost", True)
++            else ()
++        )
++        dead_rows_tau = (
++            getattr(self, "dead_rows_tau", 0.0)
++            if getattr(self, "filter_dead_rows_on_host", True)
++            else 0.0
++        )
 +        if not capture_sizes and dead_rows_tau <= 0.0:
 +            return 1.0 + self.row_cost * rows
 +
@@ -1020,7 +1044,11 @@ index f98789329..82ae2c483 100644
 +        *,
 +        use_capture_sizes: bool = True,
 +    ) -> int:
-+        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
++        dead_rows_tau = (
++            getattr(self, "dead_rows_tau", 0.0)
++            if getattr(self, "filter_dead_rows_on_host", True)
++            else 0.0
++        )
 +        if dead_rows_tau > 0.0 and len(scores) > 0:
 +            live_scores = np.where(scores >= dead_rows_tau, scores, 0.0)
 +        else:
@@ -1037,51 +1065,61 @@ index f98789329..82ae2c483 100644
      def load_draft_budget_kernels(self) -> None:
          """Run the draft-budget selection once at its smallest and largest shapes,
          so its kernels are loaded at startup rather than on the first step that
-@@ -239,9 +440,42 @@ class AdaptiveVerificationManager:
+@@ -239,7 +462,52 @@ class AdaptiveVerificationManager:
          ready_idx = self._stale_idx ^ 1
          with gpu_sync_allowed():
              self._copy_events[ready_idx].synchronize()
+-        if self._pending_resets:
++        has_seeded = bool(
++            getattr(self, "_seeded_sampled", None) is not None
++            and np.any(self._seeded_sampled)
++        )
 +        mid_prefill_slots: list[int] = []
-+        if (
-+            hasattr(input_batch, "idx_mapping_np")
-+            and hasattr(input_batch, "num_computed_tokens_np")
-+            and hasattr(input_batch, "num_scheduled_tokens")
-+            and hasattr(input_batch, "prefill_len_np")
-+        ):
-+            completed_mask = (
-+                input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
-+                >= input_batch.prefill_len_np
-+            )
-+            completed_slots = set(input_batch.idx_mapping_np[completed_mask].tolist())
-+            mid_prefill_slots = input_batch.idx_mapping_np[~completed_mask].tolist()
-+        else:
-+            completed_slots = set(input_batch.idx_mapping.tolist())
-         if self._pending_resets:
++        if has_seeded:
++            if (
++                hasattr(input_batch, "idx_mapping_np")
++                and hasattr(input_batch, "num_computed_tokens_np")
++                and hasattr(input_batch, "num_scheduled_tokens")
++                and hasattr(input_batch, "prefill_len_np")
++            ):
++                completed_mask = (
++                    input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
++                    >= input_batch.prefill_len_np
++                )
++                completed_slots = set(
++                    input_batch.idx_mapping_np[completed_mask].tolist()
++                )
++                mid_prefill_slots = input_batch.idx_mapping_np[
++                    ~completed_mask
++                ].tolist()
++            else:
++                completed_slots = set(input_batch.idx_mapping.tolist())
++            if self._pending_resets:
++                self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
++                self._pending_resets = [
++                    r for r in self._pending_resets if r not in completed_slots
++                ]
++            for slot in mid_prefill_slots:
++                if slot not in self._pending_resets:
++                    self._pending_resets.append(slot)
++            req_stale = getattr(self, "_req_stale_confidences", None)
++            if req_stale is not None:
++                self._has_recorded_confidences = True
++                for slot in self._in_flight_slots:
++                    self._next_stale_confidences[slot] = self._stale_confidences[
++                        ready_idx
++                    ].np[slot]
++                    self._has_next_confidences[slot] = True
++                for slot in completed_slots:
++                    if self._has_next_confidences[slot]:
++                        req_stale[slot] = self._next_stale_confidences[slot]
++                        self._has_next_confidences[slot] = False
++                self._in_flight_slots = sorted(completed_slots)
++        elif self._pending_resets:
              self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
--            self._pending_resets.clear()
-+            self._pending_resets = [
-+                r for r in self._pending_resets if r not in completed_slots
-+            ]
-+        for slot in mid_prefill_slots:
-+            if slot not in self._pending_resets:
-+                self._pending_resets.append(slot)
-+        req_stale = getattr(self, "_req_stale_confidences", None)
-+        if req_stale is not None:
-+            self._has_recorded_confidences = True
-+            for slot in self._in_flight_slots:
-+                self._next_stale_confidences[slot] = self._stale_confidences[
-+                    ready_idx
-+                ].np[slot]
-+                self._has_next_confidences[slot] = True
-+            for slot in completed_slots:
-+                if self._has_next_confidences[slot]:
-+                    req_stale[slot] = self._next_stale_confidences[slot]
-+                    self._has_next_confidences[slot] = False
-+            self._in_flight_slots = sorted(completed_slots)
+             self._pending_resets.clear()
          # Last step's copy has landed: budgets read it, this step overwrites the
-         # slot they were reading before.
-         self._stale_idx, write_idx = ready_idx, self._stale_idx
-@@ -254,6 +488,15 @@ class AdaptiveVerificationManager:
+@@ -254,6 +522,15 @@ class AdaptiveVerificationManager:
              tilelang_inputs.scatter_rows(
                  input_batch.idx_mapping, planned, self._planned_probs
              )
@@ -1097,7 +1135,7 @@ index f98789329..82ae2c483 100644
          # Replicated projections may differ through unordered floating-point
          # reductions. Both CPU graph selection and GPU request compaction must
          # consume one TP-wide confidence snapshot to issue matching collectives.
-@@ -278,10 +521,13 @@ class AdaptiveVerificationManager:
+@@ -278,10 +555,13 @@ class AdaptiveVerificationManager:
  
          The budget maximises expected tokens per unit of step cost: the step's
          sampling requests plus the survival probabilities of the admitted draft
@@ -1115,15 +1153,19 @@ index f98789329..82ae2c483 100644
          """
          req_ids = list(num_tokens_per_req)
          num_reqs = len(req_ids)
-@@ -299,47 +545,124 @@ class AdaptiveVerificationManager:
+@@ -299,47 +579,131 @@ class AdaptiveVerificationManager:
              dtype=np.int32,
              count=len(req_ids),
          )
 -        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
++        seeded_sampled = getattr(self, "_seeded_sampled", None)
++        has_seeded = bool(seeded_sampled is not None and np.any(seeded_sampled))
 +        req_stale = getattr(self, "_req_stale_confidences", None)
 +        stale_confidences = (
 +            req_stale[slots]
-+            if req_stale is not None and getattr(self, "_has_recorded_confidences", True)
++            if has_seeded
++            and req_stale is not None
++            and getattr(self, "_has_recorded_confidences", True)
 +            else self._stale_confidences[self._stale_idx].np[slots]
 +        )
          survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
@@ -1140,13 +1182,16 @@ index f98789329..82ae2c483 100644
 +            >= self.req_states.prefill_len.np[slots]
 +        )
 +        effective_drafts = scheduled_drafts.copy()
-+        seeded_sampled = getattr(self, "_seeded_sampled", None)
 +        seeded_mask = (
 +            seeded_sampled[slots]
 +            if seeded_sampled is not None
 +            else np.zeros(num_reqs, dtype=bool)
 +        )
-+        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
++        dead_rows_tau = (
++            getattr(self, "dead_rows_tau", 0.0)
++            if getattr(self, "filter_dead_rows_on_host", True)
++            else 0.0
++        )
 +        continuation_alpha = getattr(self, "continuation_alpha", 0.0)
 +        pinned_budget = 0
 +        if np.any(seeded_mask):
@@ -1268,7 +1313,7 @@ index f98789329..82ae2c483 100644
          logger.debug(
              "DSpark adaptive verification selected %d/%d draft rows for %d "
              "requests at row cost %.3g",
-@@ -402,7 +725,18 @@ class AdaptiveVerificationManager:
+@@ -402,7 +766,18 @@ class AdaptiveVerificationManager:
          every rank marks the same rows.
          """
          if self.dead_rows_tau <= 0:
@@ -1287,7 +1332,7 @@ index f98789329..82ae2c483 100644
          return DeadRows(
              self._confidence_probs,
              is_padding,
-@@ -410,9 +744,25 @@ class AdaptiveVerificationManager:
+@@ -410,9 +785,29 @@ class AdaptiveVerificationManager:
              float(np.log(self.dead_rows_tau)),
          )
  
@@ -1306,7 +1351,11 @@ index f98789329..82ae2c483 100644
 +        draft count is ``min(admitted, dead_row_cut)``.
 +        """
 +        admitted = self._batch_draft_capacity[:num_reqs]
-+        if self.dead_rows_tau <= 0 or getattr(self, "_active_dead_row_reqs", 0) != num_reqs:
++        if (
++            not getattr(self, "clamp_verified_to_dead_cut", True)
++            or self.dead_rows_tau <= 0
++            or getattr(self, "_active_dead_row_reqs", 0) != num_reqs
++        ):
 +            return admitted
 +        cut = self._dead_row_cut if dead_row_cut is None else dead_row_cut
 +        if cut is None:
@@ -1316,7 +1365,7 @@ index f98789329..82ae2c483 100644
  
      def reallocate_drafts(
          self, req_ids: list[str], idx_mapping: torch.Tensor
-@@ -420,6 +770,7 @@ class AdaptiveVerificationManager:
+@@ -420,6 +815,7 @@ class AdaptiveVerificationManager:
          """The step's logits offsets, query starts and draft budget, and its
          expanded state indices and positions (``expand_idx_mapping``'s), all
          from the admitted drafts."""
@@ -1324,7 +1373,7 @@ index f98789329..82ae2c483 100644
          batch_budget, self._batch_budget = self._batch_budget, None
          assert batch_budget is not None
          num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
-@@ -443,13 +794,49 @@ class AdaptiveVerificationManager:
+@@ -443,13 +839,49 @@ class AdaptiveVerificationManager:
          if draft_budget:
              async_tensor_h2d(scheduled_drafts, out=capacities)
              if draft_budget < int(scheduled_drafts.sum()):
@@ -1381,6 +1430,23 @@ index f98789329..82ae2c483 100644
  
          num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
          async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
+@@ -558,4 +990,16 @@ def maybe_create_adaptive_verification_manager(
+         max_total_logits=max_total_logits,
+         row_cost=adaptive_verification_row_cost,
+         planned_confidences=planned_confidences,
++        use_capture_step_cost=os.environ.get(
++            "SPARK_DS41F_DSPARK_PIECEWISE_STEP_COST", "0"
++        )
++        == "1",
++        filter_dead_rows_on_host=os.environ.get(
++            "SPARK_DS41F_DSPARK_HOST_DEAD_ROWS", "0"
++        )
++        == "1",
++        clamp_verified_to_dead_cut=os.environ.get(
++            "SPARK_DS41F_DSPARK_CLAMP_DEAD_CAPACITY", "0"
++        )
++        == "1",
+     )
 diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
 index dcd5d13cc..15f72fad2 100644
 --- a/vllm/v1/worker/gpu/tilelang_inputs.py

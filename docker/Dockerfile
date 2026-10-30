@@ -187,8 +187,8 @@ RUN set -eux; \
     install -m 0755 /opt/spark-ds41f/nccl/libnccl.so.2 "$target"; \
     rm /opt/spark-ds41f/nccl/libnccl.so.2
 
-# vLLM's direct loader and Engram disk row reader (and B12X's readers, where it is
-# installed) build their io_uring helpers at first use; they need the header.
+# vLLM's direct loader and Engram disk row reader build their io_uring C helpers
+# into VLLM_NATIVE_CACHE_DIR below so no compiler runs on first boot.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       liburing-dev liburing2 pkg-config \
@@ -243,15 +243,19 @@ for consumer in ("vllm", "quack-kernels", "flashinfer-python", "nvidia-cudnn-fro
 PY
 
 ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm
+ENV VLLM_NATIVE_CACHE_DIR=/opt/spark-ds41f/native
 
-RUN python3 - <<'PY'
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import ctypes
 import hashlib
 import importlib.metadata as metadata
+import subprocess
 
 assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
 import cutlass.base_dsl.enums  # noqa: F401  (quack-kernels, the DS4.1 L2 prefetch)
 import quack.compile_utils  # noqa: F401
+from vllm.model_executor.model_loader.direct_io import _native as direct_native
+from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
 
 # torch.cuda.nccl.version() reports the NCCL torch was compiled against, so
 # ask the installed library itself (NCCL_VERSION_CODE 2.30.7 = 23007).
@@ -265,6 +269,12 @@ with open(nccl, "rb") as handle:
 for name in ("_C_stable_libtorch", "_moe_C_stable_libtorch"):
     with open(f"/opt/spark-ds41f/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
         assert handle.read(4) == b"\x7fELF"
+for label, mod in (("direct_io", direct_native), ("engram_rows", engram_native)):
+    builder = getattr(mod, "prebuild", mod._build)
+    native_path = builder()
+    linked = subprocess.check_output(["ldd", str(native_path)], text=True)
+    assert "liburing.so" in linked, f"{label} was built without io_uring"
+    assert mod.load().ABI_VERSION == mod.ABI_VERSION
 print("runtime build checks passed")
 PY
 

@@ -1,0 +1,739 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:42:06 +0100
+Subject: [PATCH 589/589] [DS4.1] Fuse global KV post-projection kernels in
+ _prepare_global_kv (#707)
+
+---
+ .../attention/test_deepseek_v41_tilelang.py   |  33 +++
+ ...test_deepseek_v41_tilelang_cache_writer.py |  44 ++++
+ tests/models/test_deepseek_v4_1_attention.py  |  54 +++++
+ vllm/models/deepseek_v4_1/attention.py        |  46 +++-
+ .../deepseek_v4_1/tilelang/attention.py       |  28 ++-
+ .../deepseek_v4_1/tilelang/cache_writer.py    | 105 ++++++++-
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 207 ++++++++++++++++++
+ 7 files changed, 491 insertions(+), 26 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 60d5bc900..17ed2f1f4 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -45,6 +45,7 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
+     INDEX_TOPK,
+     IndexerTopK,
+     IndexerV41Plan,
++    norm_rope_write_index_keys,
+     page_bytes,
+     quantize_mxfp4,
+     write_index_keys,
+@@ -271,6 +272,38 @@ def test_write_index_keys(page_size=64, pages=5):
+     assert bool((pool._base[:, [0, 2]] == 0xAB).all())
+ 
+ 
++@pytest.mark.parametrize("ratio", [1, 2])
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++def test_norm_rope_write_index_keys(ratio, slot_dtype, page_size=64, pages=5):
++    from vllm.models.deepseek_v4_1.tilelang import pdl
++    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
++
++    n = pages * page_size // 2
++    x = _mxfp4_inputs(n, 14)
++    gen = _gen(15)
++    weight = torch.randn((INDEX_DIM,), generator=gen, device=DEVICE).bfloat16()
++    eps = 1e-6
++    positions = torch.randint(
++        0, 512, (n,), generator=gen, device=DEVICE, dtype=torch.int64
++    )
++    table = rope_table(512)
++    slots = torch.randperm(pages * page_size, generator=gen, device=DEVICE)[:n].to(
++        slot_dtype
++    )
++    slots[:3] = -1
++    pool = _page_buffer(pages, page_bytes(page_size))
++    expected = pool.clone()
++    norm_rope_write_index_keys(
++        x, weight, eps, positions, table, pool, slots, page_size, ratio
++    )
++    ref = torch.empty_like(x)
++    pdl.norm_forward(x, weight, eps, out=ref)
++    rope_(ref, positions, table, ratio, False)
++    write_index_keys(ref, expected, slots, page_size)
++    assert torch.equal(pool, expected)
++    assert bool((pool._base[:, [0, 2]] == 0xAB).all())
++
++
+ def _ref_scores(inp, page_size, extent, positions_of):
+     """Staged BF16 score: BF16 dot, ReLU, BF16 weighted product, ordered head sum."""
+     rows = inp["q_values"].shape[0]
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py b/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
+index 0e1bae963..ae70fef09 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
+@@ -98,3 +98,47 @@ def test_strided_rows():
+     write_cache(kv, cache, slots, page_size=page_size, cache_kind=kind)
+     got = cache.view(-1, RECORD_BYTES[kind])[:70].cpu()
+     assert torch.equal(got, _records(kv.cpu(), kind))
++
++
++@pytest.mark.parametrize("kind", ["swa", "indexed"])
++@pytest.mark.parametrize("ratio", [1, 2])
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++def test_fused_rope_records_match_separate(kind, ratio, slot_dtype):
++    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
++
++    page_size, pages, tokens = 64, 4, 150
++    record = RECORD_BYTES[kind]
++    kv = _kv(tokens, 7).to(DEVICE)
++    gen = torch.Generator().manual_seed(8)
++    slots = torch.randperm(pages * page_size, generator=gen)[:tokens].to(
++        dtype=slot_dtype, device=DEVICE
++    )
++    slots[4] = -1
++    positions = torch.randint(0, 512, (tokens,), generator=gen).to(
++        dtype=torch.int64, device=DEVICE
++    )
++    cos_sin = torch.randn(512, 64, generator=gen).to(dtype=torch.float32, device=DEVICE)
++    cache_fused = torch.full(
++        (pages, page_size * record + 32), 0x5A, dtype=torch.uint8, device=DEVICE
++    )
++    cache_ref = cache_fused.clone()
++    write_cache(
++        kv,
++        cache_fused[:, : page_size * record],
++        slots,
++        page_size=page_size,
++        cache_kind=kind,
++        positions=positions,
++        cos_sin=cos_sin,
++        ratio=ratio,
++    )
++    kv_rot = kv.clone()
++    rope_(kv_rot, positions, cos_sin, ratio, False)
++    write_cache(
++        kv_rot,
++        cache_ref[:, : page_size * record],
++        slots,
++        page_size=page_size,
++        cache_kind=kind,
++    )
++    assert torch.equal(cache_fused, cache_ref)
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index f3bf81160..1404cdb27 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -251,3 +251,57 @@ def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
+     module._index_query(qr, positions, hidden, None, 4, 9, swa, q_cast)
+     assert seen_provided == [(5, 1280)]
+     assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
++
++
++def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
++    from vllm.models.deepseek_v4_1.tilelang import cache_writer
++
++    module = _tilelang_layer(layer_id=0)
++    module._ready = True
++    module._owner = lambda: module
++    module.kv_cache = torch.empty(2, 8, dtype=torch.uint8)
++    latent = torch.zeros(4, 512, dtype=torch.bfloat16)
++    slots = torch.arange(4, dtype=torch.int64)
++    module.compressor = lambda hidden, main, state: (latent, slots)
++    module.compressor.state_cache = None
++    raw_key = torch.zeros(4, 128, dtype=torch.bfloat16)
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wk=lambda x: raw_key,
++        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
++        k_cache=SimpleNamespace(
++            prefix="k_cache", kv_cache=torch.empty(2, 8, dtype=torch.uint8)
++        ),
++    )
++    idx_slots = torch.arange(10, 14, dtype=torch.int64)
++    metadata = {
++        module.prefix: SimpleNamespace(),
++        "k_cache": SimpleNamespace(slot_mapping=idx_slots),
++    }
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    key_writes, cache_writes = [], []
++    monkeypatch.setattr(
++        tl_attention,
++        "norm_rope_write_index_keys",
++        lambda *args: key_writes.append(args),
++    )
++    monkeypatch.setattr(
++        cache_writer,
++        "write_cache",
++        lambda *args, **kwargs: cache_writes.append((args, kwargs)),
++    )
++    positions = torch.arange(4, dtype=torch.int64)
++    module._prepare_global_kv(positions, torch.zeros(4, 5120, dtype=torch.bfloat16))
++    assert len(key_writes) == 1
++    assert key_writes[0][0] is raw_key and key_writes[0][3] is positions
++    assert key_writes[0][6].tolist() == [10, 11, 12, 13]
++    assert len(cache_writes) == 1
++    assert cache_writes[0][0][0] is latent
++    assert cache_writes[0][1]["positions"] is positions
++    assert cache_writes[0][1]["cache_kind"] == "indexed"
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 953af5755..035cc609a 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -200,6 +200,8 @@ class DeepseekV4Indexer(nn.Module):
+             )
+             self.wk.quant_method = kernels.linear_method()
+             self.k_norm = kernels.rms_norm(128, hf.rms_norm_eps)
++            # _write_index_keys fuses k_norm with RoPE and MXFP4 quantization.
++            self.k_norm.declare_kernels = lambda: None
+         self.ratio = ratio
+ 
+ 
+@@ -644,15 +646,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             (self.n_local_heads, self.head_dim, 1, False),  # q
+             (1, 512, 1, False),  # kv
+         ]
+-        if self.compressor is not None:
+-            roles.append((1, 128, self.compress_ratio, False))  # index key
+-            roles.append((1, 512, self.compress_ratio, False))  # latent
+         calls.extend(
+             rope_call(heads, dim, table_width, ratio, inverse)
+             for heads, dim, ratio, inverse in roles
+         )
+         # _write_v41_cache: SWA records of every layer, indexed records of the
+-        # compressor's latents, at the builders' (and compressor's) slot dtype.
++        # compressor's latents (rotated in registers), at the builders' (and
++        # compressor's) slot dtype.
+         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
+         # _front: the decode front's one kernel.
+         calls.append(
+@@ -663,7 +663,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             )
+         )
+         if self.compressor is not None:
+-            calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
++            calls.append(
++                writer_call(
++                    "indexed",
++                    self._main_page,
++                    SLOT_DTYPE,
++                    rope_dim=table_width,
++                    ratio=self.compress_ratio,
++                )
++            )
+         else:
+             # _gather_front: prefill SP's BF16 front, the index head weights beside
+             # the normalized halves.
+@@ -701,11 +709,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
+         return x
+ 
+-    def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
++    def _write_v41_cache(
++        self, x, cache, slots, *, page_size, cache_kind, positions=None
++    ):
+         """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+         from .tilelang.cache_writer import write_cache
+ 
+-        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
++        if positions is None:
++            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
++            return
++        write_cache(
++            x,
++            cache,
++            slots,
++            page_size=page_size,
++            cache_kind=cache_kind,
++            positions=positions,
++            cos_sin=self.rotary_emb.cos_sin_cache,
++            ratio=self.compress_ratio if cache_kind == "indexed" else 1,
++        )
+ 
+     def insert_context_kv(self, kv, positions, slot_mapping):
+         if not self._ready:
+@@ -758,18 +780,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         )
+         latent, slots = self.compressor(hidden_states, main, state)
+         self._issue_wo_prefetch(rows, after="compressor")
+-        # Index K consumes the ordinary-normalized PRE-RoPE latent.
+-        key = indexer.k_norm(indexer.wk(latent))
+-        key = self._rope(key, positions, "index_key")
++        # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
++        # and the paged MXFP4 write run in one kernel.
++        key = indexer.wk(latent)
+         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
+-        self._write_index_keys(key, index_meta.slot_mapping[:rows])
+-        latent = self._rope(latent, positions, "latent")
++        self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
+         self._write_v41_cache(
+             latent,
+             self.kv_cache,
+             slots,
+             page_size=self._main_page,
+             cache_kind="indexed",
++            positions=positions,
+         )
+ 
+     def forward(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 11011a915..9dcc083ab 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -18,7 +18,7 @@ from types import SimpleNamespace
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     retain_cuda_graph_capture_resource,
+@@ -29,6 +29,8 @@ from .indexer import (
+     CANDIDATE_BLOCK,
+     CANDIDATE_BLOCKS,
+     IndexerV41Plan,
++    norm_quantize_call,
++    norm_rope_write_index_keys,
+     page_bytes,
+     quantize_call,
+     quantize_mxfp4,
+@@ -146,7 +148,14 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 )
+             )  # _quantize_index_query
+         if self.compressor is not None:
+-            calls.append(quantize_call(self._index_page))  # _write_index_keys
++            calls.append(
++                norm_quantize_call(
++                    self.indexer.k_norm.variance_epsilon,
++                    self._index_page,
++                    self.compress_ratio,
++                    SLOT_DTYPE,
++                )
++            )  # _write_index_keys
+         return calls
+ 
+     def _bind_plans(self) -> None:
+@@ -244,7 +253,20 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+             cos_sin=self.rotary_emb.cos_sin_cache if positions is not None else None,
+         )
+ 
+-    def _write_index_keys(self, key, slot_mapping) -> None:
++    def _write_index_keys(self, key, slot_mapping, positions=None) -> None:
++        if positions is not None:
++            norm_rope_write_index_keys(
++                key,
++                self.indexer.k_norm.weight,
++                self.indexer.k_norm.variance_epsilon,
++                positions,
++                self.rotary_emb.cos_sin_cache,
++                self.indexer.k_cache.kv_cache,
++                slot_mapping,
++                self._index_page,
++                self.compress_ratio,
++            )
++            return
+         write_index_keys(
+             key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
+         )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+index 3ad50cbd2..c70671851 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -72,12 +72,19 @@ __device__ __forceinline__ unsigned short dsv41_e2m1x4(float v0, float v1,
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int64"):
++def cache_writer_kernel(
++    cache_kind: str,
++    page_size: int,
++    slot_dtype: str = "int64",
++    rope_dim: int = 0,
++    ratio: int = 1,
++):
+     """One record per token, 128 threads, four values per thread, payload stored in
+     whole words through a word view of the pages (scales through the byte view),
+     the group's amax shuffled across its lanes. ``swa``: eight lanes per 32-value
+     group, one 32-bit word of E4M3 each. ``indexed``: four lanes per 16-value
+-    group, one 16-bit word of packed E2M1 each."""
++    group, one 16-bit word of packed E2M1 each. With ``rope_dim > 0``, rotates the
++    trailing ``rope_dim`` columns in registers at ``positions`` before quantizing."""
+     threads = 128
+     group_size = _GROUP[cache_kind]
+     groups = DIM // group_size
+@@ -89,16 +96,14 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+     record = RECORD_BYTES[cache_kind]
+     payload = DIM if cache_kind == "swa" else DIM // 2  # scale bytes follow
+     tokens, kv_stride = T.dynamic("tokens, kv_stride")
++    positions_max = T.dynamic("positions_max")
+     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
+     page_words, word_stride = T.dynamic("page_words, word_stride")
++    rope_start = DIM - rope_dim
++    rope_half = rope_dim // 2
+ 
+-    @T.prim_func
+-    def cache_writer(
+-        kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
+-        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
+-        words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
+-        slots: T.Tensor((tokens,), slot_dtype),
+-    ):
++    @T.macro
++    def body(kv, positions, cos_sin, cache, words, slots):
+         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
+             T.import_source(_CVT_HEADER)
+             pdl.chain()
+@@ -114,6 +119,34 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+             if token < tokens:
+                 for i in T.unroll(per_thread):
+                     values[i] = T.cast(kv[token, col + i], T.float32)
++                if rope_dim > 0:
++                    if col >= rope_start:
++                        pos = (
++                            positions[token] // ratio * ratio
++                            if ratio > 1
++                            else positions[token]
++                        )
++                        pair_base = (col - rope_start) // 2
++                        for p in T.unroll(per_thread // 2):
++                            first = values[2 * p]
++                            second = values[2 * p + 1]
++                            cosine = cos_sin[pos, pair_base + p]
++                            sine = cos_sin[pos, rope_half + pair_base + p]
++                            values[2 * p] = T.cast(
++                                T.cast(
++                                    T.ieee_fmaf(first, cosine, -(second * sine)),
++                                    T.bfloat16,
++                                ),
++                                T.float32,
++                            )
++                            values[2 * p + 1] = T.cast(
++                                T.cast(
++                                    T.ieee_fmaf(first, sine, second * cosine),
++                                    T.bfloat16,
++                                ),
++                                T.float32,
++                            )
++                for i in T.unroll(per_thread):
+                     amax = T.max(amax, T.abs(values[i]))
+             amax = T.max(amax, T.shfl_xor(amax, 1))
+             amax = T.max(amax, T.shfl_xor(amax, 2))
+@@ -170,6 +203,30 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+                                 scale_code, T.uint8
+                             )
+ 
++    if rope_dim > 0:
++
++        @T.prim_func
++        def cache_writer(
++            kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
++            positions: T.Tensor((tokens,), T.int64),
++            cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
++            cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++            words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
++            slots: T.Tensor((tokens,), slot_dtype),
++        ):
++            body(kv, positions, cos_sin, cache, words, slots)
++
++        return cache_writer
++
++    @T.prim_func
++    def cache_writer(
++        kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
++        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
++        slots: T.Tensor((tokens,), slot_dtype),
++    ):
++        body(kv, None, None, cache, words, slots)
++
+     return cache_writer
+ 
+ 
+@@ -180,10 +237,14 @@ def write_cache(
+     *,
+     page_size: int,
+     cache_kind: str,
++    positions: torch.Tensor | None = None,
++    cos_sin: torch.Tensor | None = None,
++    ratio: int = 1,
+ ) -> None:
+     """Write ``kv`` ([T, 512] BF16, unit column stride) into ``cache`` (``[pages,
+     page bytes]`` or ``[pages, records, record bytes]`` bytes, any page stride) at
+-    ``slot_mapping`` ([T] int32 or int64)."""
++    ``slot_mapping`` ([T] int32 or int64). With ``positions`` and ``cos_sin``,
++    rotates the trailing ``cos_sin.shape[1]`` columns in registers first."""
+     if kv.shape[0] == 0:
+         return
+     if kv.dtype != torch.bfloat16 or kv.shape[1] != DIM or kv.stride(1) != 1:
+@@ -198,19 +259,41 @@ def write_cache(
+     word_bytes, _, word_torch = _WORD[cache_kind]
+     if pages.stride(0) % word_bytes or pages.shape[1] % word_bytes:
+         raise ValueError(f"cache pages are not whole {word_bytes}-byte words")
++    if positions is not None and cos_sin is not None:
++        function, args, kwargs = writer_call(
++            cache_kind,
++            page_size,
++            slot_mapping.dtype,
++            rope_dim=cos_sin.shape[1],
++            ratio=ratio,
++        )
++        kernel = function(*args, **kwargs)
++        kernel(kv, positions, cos_sin, pages, pages.view(word_torch), slot_mapping)
++        return
+     function, args, kwargs = writer_call(cache_kind, page_size, slot_mapping.dtype)
+     kernel = function(*args, **kwargs)
+     kernel(kv, pages, pages.view(word_torch), slot_mapping)
+ 
+ 
+-def writer_call(cache_kind: str, page_size: int, slot_dtype: torch.dtype):
++def writer_call(
++    cache_kind: str,
++    page_size: int,
++    slot_dtype: torch.dtype,
++    *,
++    rope_dim: int = 0,
++    ratio: int = 1,
++):
+     """The kernel ``write_cache`` launches for ``slot_dtype`` slots, as a
+     ``prepare.call``."""
++    kwargs = {}
++    if rope_dim > 0:
++        kwargs = dict(rope_dim=rope_dim, ratio=ratio)
+     return prepare.call(
+         cache_writer_kernel,
+         cache_kind,
+         page_size,
+         str(slot_dtype).removeprefix("torch."),
++        **kwargs,
+     )
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 56c31fc7a..abd8927cd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -90,6 +90,20 @@ def quantize_call(
+     return prepare.call(mxfp4_quantize_v41, True, page_size, **kwargs)
+ 
+ 
++def norm_quantize_call(
++    eps: float, page_size: int, ratio: int = 1, slot_dtype: torch.dtype = torch.int64
++):
++    """The fused ``k_norm + rope + write_index_keys`` kernel ``norm_rope_write_index_keys``
++    launches, as a ``prepare.call``."""
++    return prepare.call(
++        mxfp4_norm_rope_quantize_v41,
++        eps,
++        page_size,
++        ratio,
++        str(slot_dtype).removeprefix("torch."),
++    )
++
++
+ def _row_extent(Lengths, Active, row, width):
+     """Positions a row selects from: ``min(Lengths, Active, width)``, at least zero.
+ 
+@@ -589,6 +603,199 @@ def write_index_keys(keys, pool, slots, page_size):
+     kernel(keys, slots.to(torch.int64), pool[:, : page_bytes(page_size)])
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def mxfp4_norm_rope_quantize_v41(
++    eps: float,
++    page_size: int = 64,
++    ratio: int = 1,
++    slot_dtype: str = "int64",
++):
++    """Fused 128-column RMSNorm (TileKernels' ``norm_forward`` reduction), trailing
++    64-column GPT-J RoPE (``rope_kernel``) and paged MXFP4 key write
++    (``mxfp4_quantize_v41(paged=True)``) in one launch, bit for bit."""
++    from .front import ROPE_DIM, _THREADS, _VEC, _row_split
++
++    k = _row_split(INDEX_DIM)
++    assert (
++        k["num_row_warps"] == 1
++        and k["row_threads"] == 8
++        and k["num_thread_vec"] == 2
++        and ROPE_DIM == 64
++    )
++    kb, kt = k["block_m"], k["row_threads"]
++    half = ROPE_DIM // 2
++    pairs = _VEC // 2
++    out_scale = 1.0
++    rows, positions_max = T.dynamic("rows, positions_max")
++    pool_pages, pool_stride = T.dynamic("pool_pages, pool_stride")
++
++    @T.prim_func
++    def indexer_mxfp4_quantize(
++        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
++        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
++        Positions: T.Tensor([rows], T.int64),
++        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
++        Slots: T.Tensor([rows], slot_dtype),
++        Pool: T.StridedTensor(
++            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
++        ),
++    ):
++        with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
++            pdl.chain()
++            tid = T.get_thread_binding()
++            k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
++            k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
++            k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
++            k_sum_shared = T.alloc_shared((kb, 1), T.float32)
++            k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
++            k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
++            k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
++            T.annotate_layout(
++                {
++                    k_sum_partial: k["row_layout"],
++                    k_warp_fragment: k["warp_layout"],
++                    k_row_partial: k["row_reduce_layout"],
++                    k_sum_fragment: k["row_layout"],
++                }
++            )
++            k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            y_fp32_local = T.alloc_local((_VEC,), T.float32)
++            sum_local = T.alloc_local((2,), T.float32)
++            weight_local = T.alloc_local((_VEC,), T.bfloat16)
++            cs = T.alloc_local((_VEC,), T.float32)
++
++            row_id = tid // kt
++            lane = tid % kt
++            token_id = bx * kb + row_id
++            T.clear(sum_local)
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                if token_id < rows:
++                    for j in T.vectorized(_VEC):
++                        k_x[vi, j] = X[token_id, token_offset + j]
++                else:
++                    T.clear(k_x[vi, :])
++                for j in T.vectorized(_VEC):
++                    sum_local[j % 2] += T.float32(k_x[vi, j]) * T.float32(k_x[vi, j])
++            k_sum_partial[row_id, lane] = sum_local[0] + sum_local[1]
++            T.reducer_init(k_warp_reducer)
++            for i, w, j in T.Parallel(
++                kb, 1, kt, loop_layout=k["warp_reduce_layout"]
++            ):
++                T.reducer_update(k_warp_reducer[i, w], k_sum_partial[i, w * kt + j])
++            T.finalize_reducer(k_warp_reducer, k_warp_fragment)
++            if lane == 0:
++                k_sum_shared[row_id, 0] = k_warp_fragment[row_id, 0]
++            T.sync_threads()
++            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++                k_row_partial[i, j, w] = k_sum_shared[i, w]
++            T.reducer_init(k_sum_reducer)
++            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++                T.reducer_update(k_sum_reducer[i, j], k_row_partial[i, j, w])
++            T.finalize_reducer(k_sum_reducer, k_sum_fragment)
++
++            rstd_value = T.alloc_var(
++                T.float32,
++                init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
++            )
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                for j in T.vectorized(_VEC):
++                    weight_local[j] = Weight[token_offset + j]
++                for j in T.vectorized(_VEC):
++                    y_fp32_local[j] = (
++                        T.float32(k_x[vi, j])
++                        * rstd_value
++                        * (T.float32(weight_local[j]) * out_scale)
++                    )
++                for j in T.vectorized(_VEC):
++                    k_y[vi, j] = y_fp32_local[j]
++
++            if token_id < rows:
++                pos = (
++                    Positions[token_id] // ratio * ratio
++                    if ratio > 1
++                    else Positions[token_id]
++                )
++                for i in T.vectorized(pairs):
++                    cs[i] = CosSin[pos, lane * pairs + i]
++                for i in T.vectorized(pairs):
++                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
++                for j in T.unroll(pairs):
++                    first = T.cast(k_y[1, 2 * j], T.float32)
++                    second = T.cast(k_y[1, 2 * j + 1], T.float32)
++                    cosine = cs[j]
++                    sine = cs[pairs + j]
++                    k_y[1, 2 * j] = T.cast(
++                        T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
++                    )
++                    k_y[1, 2 * j + 1] = T.cast(
++                        T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
++                    )
++
++            for vi in T.unroll(k["num_thread_vec"]):
++                group = vi * 2 + (lane // 4)
++                group_lane = lane % 4
++                amax = T.alloc_var(T.float32, init=6.0 * 2.0**-126)
++                for j in T.unroll(_VEC):
++                    amax = T.max(amax, T.abs(T.cast(k_y[vi, j], T.float32)))
++                amax = T.max(amax, T.shfl_xor(amax, 1))
++                amax = T.max(amax, T.shfl_xor(amax, 2))
++                if token_id < rows:
++                    slot = T.cast(Slots[token_id], T.int64)
++                    page = slot // page_size
++                    tok = slot % page_size
++                    if (slot >= 0) & (page < pool_pages):
++                        bits = T.reinterpret(
++                            T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32
++                        )
++                        sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
++                            (bits & 0x7FFFFF) != 0, T.int32
++                        )
++                        scale = T.reinterpret(
++                            T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
++                        )
++                        for i in T.unroll(pairs):
++                            lo = _e2m1_code(
++                                T.fmul(T.cast(k_y[vi, 2 * i], T.float32), scale)
++                            )
++                            hi = _e2m1_code(
++                                T.fmul(T.cast(k_y[vi, 2 * i + 1], T.float32), scale)
++                            )
++                            Pool[
++                                page,
++                                tok * (INDEX_DIM // 2)
++                                + group * 16
++                                + group_lane * pairs
++                                + i,
++                            ] = T.cast(lo | (hi << 4), T.uint8)
++                        if group_lane == 0:
++                            Pool[
++                                page,
++                                page_size * (INDEX_DIM // 2) + tok * 4 + group,
++                            ] = T.cast(sf, T.uint8)
++
++    return indexer_mxfp4_quantize
++
++
++def norm_rope_write_index_keys(
++    raw_keys, weight, eps: float, positions, cos_sin, pool, slots, page_size: int, ratio: int = 1
++):
++    """Fused RMSNorm + RoPE + paged MXFP4 quantize/write of ``[rows, 128]`` keys."""
++    if raw_keys.shape[0] == 0:
++        return
++    kernel = _make(norm_quantize_call(eps, page_size, ratio, slots.dtype))
++    kernel(
++        raw_keys,
++        weight,
++        positions,
++        cos_sin,
++        slots,
++        pool[:, : page_bytes(page_size)],
++    )
++
++
+ def _key16(x):
+     """Order-preserving uint16 key of a BF16 value, as int32."""
+     bits = T.cast(T.reinterpret(x, T.uint16), T.int32)

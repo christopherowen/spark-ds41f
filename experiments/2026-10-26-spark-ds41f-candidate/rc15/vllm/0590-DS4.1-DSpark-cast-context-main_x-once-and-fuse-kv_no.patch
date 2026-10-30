@@ -1,0 +1,586 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:43:17 +0100
+Subject: [PATCH 590/590] [DS4.1] DSpark: cast context main_x once and fuse
+ kv_norm + rope + cache_writer (#708)
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  25 +-
+ ...st_deepseek_v41_tilelang_dspark_context.py |  51 +++++
+ .../test_deepseek_v41_tilelang_front.py       |  35 +++
+ vllm/models/deepseek_v4_1/attention.py        |  29 ++-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  46 +++-
+ vllm/models/deepseek_v4_1/tilelang/front.py   | 216 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  40 +++-
+ 7 files changed, 420 insertions(+), 22 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 1c5390b1d..7f87a3aca 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -371,19 +371,34 @@ def test_slice_mxfp8_reuses_or_pads_rows(default_vllm_config, n=4096, k=1280):
+                 assert torch.equal(fed(sub), expected), f"slice=({first}, {last})"
+ 
+ 
+-def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
+-    """A split-K projection's decode scratch is its own: marking it is refused."""
++def test_block32_split_reads_its_producers_cast(default_vllm_config):
++    """A split-K projection whose decode tiles divide ``DECODE_ROWS`` (DSpark's
++    512 x 5120 context KV slice) reads a producer's ``MXFP8Rows`` cast bit for bit."""
+     from torch import nn
+ 
+-    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangBlock32Rows,
++        cast_mxfp8,
++        provide_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
+ 
+     weight, exps, _ = _block32_weight(1792, 5120, 6)
+     layer = nn.Module()
+     layer.weight, layer.weight_scale_inv = weight, exps
++    casting = TileLangBlock32Rows(layer, 1280)
++    casting.declare_kernels()
+     narrow = TileLangBlock32Rows(layer, 1280)  # 512 x 5120: splits K
+     narrow.tilelang_mxfp8_input = True
+-    with pytest.raises(ValueError):
+-        narrow.declare_kernels()
++    narrow.declare_kernels()
++    x = torch.randn((300, 5120), generator=_gen(10), device=DEVICE).bfloat16()
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for count in (1, 7, 16, 17, 32, 33, 64, 65, 96, 128, 129, 300):
++            rows = x[:count]
++            expected = casting(rows)
++            with provide_mxfp8(cast_mxfp8(rows)):
++                assert torch.equal(narrow(rows), expected), f"rows={count}"
+ 
+ 
+ # The router splits K eight ways; (100, 200) cannot split.
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 59e83276e..12410ddfa 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -154,3 +154,54 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+     assert torch.equal(
+         hidden_states[capacity:].view(torch.int16), before[capacity:].view(torch.int16)
+     )
++
++
++def test_precompute_and_store_context_kv_casts_once_and_fuses_front(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
++
++    casts = []
++    orig_cast = kernels.cast_mxfp8
++
++    def record_cast(x):
++        out = orig_cast(x)
++        casts.append(out)
++        return out
++
++    monkeypatch.setattr(kernels, "cast_mxfp8", record_cast)
++    inserts = []
++
++    class Proj:
++        tilelang_mxfp8_input = True
++
++        def __init__(self, idx):
++            self.idx = idx
++
++        def __call__(self, x):
++            return x[:, :512] + self.idx
++
++    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
++    torch.nn.Module.__init__(model)
++    model._context_kv_projections = [Proj(i) for i in range(3)]
++    model.layers = [
++        SimpleNamespace(
++            attn=SimpleNamespace(
++                insert_raw_context_kv=lambda kv_raw, pos, slots, i=i: inserts.append(
++                    (i, kv_raw, pos, slots)
++                )
++            )
++        )
++        for i in range(3)
++    ]
++    main_x = torch.randn(6, WIDTH, dtype=torch.bfloat16, device=DEVICE)
++    positions = torch.arange(6, dtype=torch.int64, device=DEVICE)
++    slots = [torch.arange(6, dtype=torch.int64, device=DEVICE) + i * 10 for i in range(3)]
++    model.precompute_and_store_context_kv(main_x, positions, slots)
++    assert len(casts) == 1
++    assert len(inserts) == 3
++    for i, (layer_idx, kv_raw, pos, slot) in enumerate(inserts):
++        assert layer_idx == i
++        assert torch.equal(kv_raw, main_x[:, :512] + i)
++        assert pos is positions and slot is slots[i]
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_front.py b/tests/kernels/test_deepseek_v41_tilelang_front.py
+index 22c2f464f..2be8e0c0c 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_front.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_front.py
+@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4_1.tilelang.front import (  # noqa: E402
+     Q_LATENT,
+     ROPE_DIM,
+     attention_front,
++    context_kv_front,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.pdl import (  # noqa: E402
+@@ -126,3 +127,37 @@ def test_front_gives_the_five_kernels_bits(rows, slot_dtype):
+     _assert_bytes_equal(scales, scales_ref, "q scales")
+     _assert_bytes_equal(kv, kv_ref, "rotated kv latent")
+     _assert_bytes_equal(pages, pages_ref, "cache pages")
++
++
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("rows", [1, 6, 16, 24, 64, 96, 256])
++def test_context_kv_front_gives_the_three_kernels_bits(rows, slot_dtype):
++    """``context_kv_front`` matches ``norm_forward`` + ``rope_`` + ``write_cache``
++    on ``[rows, 512]`` BF16 context KV rows bit for bit."""
++    gen = torch.Generator(device=DEVICE).manual_seed(rows + 100)
++    kv_raw = (
++        torch.randn((rows, KV_LATENT), generator=gen, device=DEVICE) * 3
++    ).bfloat16()
++    kv_raw[0, :64] = 0.0
++    kv_weight = (
++        torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.3 + 1
++    ).bfloat16()
++    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    slots = torch.randperm(PAGES * PAGE_SIZE, generator=gen, device=DEVICE)[:rows]
++    slots[rows // 2] = -1
++    slots = slots.to(slot_dtype)
++    table = _table()
++    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
++    pages = torch.empty((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
++    pages.random_(generator=gen)
++    pages_ref = pages.clone()
++
++    kv_ref = torch.empty((rows, KV_LATENT), dtype=torch.bfloat16, device=DEVICE)
++    norm_forward(kv_raw, kv_weight, EPS, out=kv_ref)
++    rope_(kv_ref, positions, table, 1, False)
++    write_cache(kv_ref, pages_ref, slots, page_size=PAGE_SIZE, cache_kind="swa")
++
++    context_kv_front(
++        kv_raw, kv_weight, EPS, positions, table, pages, slots, PAGE_SIZE
++    )
++    _assert_bytes_equal(pages, pages_ref, "context kv cache pages")
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 035cc609a..35547359e 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -589,7 +589,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         in its call site's call form."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
+-        from vllm.models.deepseek_v4_1.tilelang.front import front_call
++        from vllm.models.deepseek_v4_1.tilelang.front import (
++            context_kv_front_call,
++            front_call,
++        )
+         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+ 
+         calls = []
+@@ -662,6 +665,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 SLOT_DTYPE,
+             )
+         )
++        if self.is_draft:
++            calls.append(
++                context_kv_front_call(
++                    self.kv_norm.variance_epsilon,
++                    self.swa_cache_layer.block_size,
++                    SLOT_DTYPE,
++                )
++            )
+         if self.compressor is not None:
+             calls.append(
+                 writer_call(
+@@ -741,6 +752,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             cache_kind="swa",
+         )
+ 
++    def insert_raw_context_kv(self, kv_raw, positions, slot_mapping):
++        if not self._ready:
++            raise RuntimeError("V4.1 attention metadata is not prepared")
++        from vllm.models.deepseek_v4_1.tilelang.front import context_kv_front
++
++        context_kv_front(
++            kv_raw,
++            self.kv_norm.weight,
++            self.kv_norm.variance_epsilon,
++            positions,
++            self.rotary_emb.cos_sin_cache,
++            self.swa_cache_layer.kv_cache,
++            slot_mapping,
++            self.swa_cache_layer.block_size,
++        )
++
+     def _query_metadata(self, metadata):
+         if self.is_ced_decoder and metadata.decoder is not None:
+             return metadata.decoder
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9cbf64cb9..aca49d4b9 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -79,7 +79,9 @@ def _context_kv_projection(attn: nn.Module):
+     """The KV rows of ``attn``'s fused Q-A/KV weight as one projection."""
+     from ..tilelang.linear import TileLangBlock32Rows
+ 
+-    return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
++    projection = TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
++    projection.tilelang_mxfp8_input = True
++    return projection
+ 
+ 
+ class DSparkContextCudaGraphs:
+@@ -333,8 +335,12 @@ class DSparkDeepseekV4Model(nn.Module):
+         The draft layers' modules declare their own kernels, WO included, and the
+         Markov head's are declared by the logits processor it is registered with.
+         """
++        from ..tilelang.linear import _warm_casts
++
+         for projection in self._context_kv_projections:
+             projection.declare_kernels()
++        if self._context_kv_projections:
++            prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         assert self.embed_tokens is not None
+@@ -381,18 +387,34 @@ class DSparkDeepseekV4Model(nn.Module):
+         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
+         but writes nothing (profiling).
+         """
+-        for i, layer in enumerate(self.layers):
+-            slot_mapping = (
+-                context_slot_mappings
+-                if context_slot_mappings is None
+-                or isinstance(context_slot_mappings, torch.Tensor)
+-                else context_slot_mappings[i]
++        main_cast = (
++            kernels.cast_mxfp8(main_x)
++            if any(
++                getattr(proj, "tilelang_mxfp8_input", False)
++                for proj in self._context_kv_projections
+             )
+-            attn = layer.attn
+-            kv = attn.kv_norm(self._context_kv_projections[i](main_x))
+-            if slot_mapping is None:
+-                continue
+-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
++            else None
++        )
++        with kernels.mxfp8_inputs(main_cast):
++            for i, layer in enumerate(self.layers):
++                slot_mapping = (
++                    context_slot_mappings
++                    if context_slot_mappings is None
++                    or isinstance(context_slot_mappings, torch.Tensor)
++                    else context_slot_mappings[i]
++                )
++                attn = layer.attn
++                kv_raw = self._context_kv_projections[i](main_x)
++                if slot_mapping is None:
++                    continue
++                if hasattr(attn, "insert_raw_context_kv"):
++                    attn.insert_raw_context_kv(
++                        kv_raw, context_positions, slot_mapping
++                    )
++                else:
++                    _insert_context_kv(
++                        attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
++                    )
+ 
+     def forward(
+         self,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index 15463960f..58bac0e86 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -478,4 +478,218 @@ def attention_front(
+     )
+ 
+ 
+-__all__ = ["attention_front", "attention_front_kernel", "front_call"]
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def context_kv_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
++    """The KV CTA body of ``attention_front_kernel`` on standalone ``[M, 512]`` BF16
++    ``kv_raw`` rows (DSpark's context KV projections): TileKernels' ``norm_forward``,
++    trailing 64-column ``rope_kernel`` rotation in registers, and ``cache_writer``'s
++    528-byte SWA record write in one launch, without writing the rotated BF16 row."""
++    group_lanes = 32 // _VEC
++    out_scale = 1.0
++    k = _row_split(KV_LATENT)
++    assert (
++        k["num_row_warps"] == 1 and k["row_threads"] == 16 and k["num_thread_vec"] == 4
++    )
++    half = ROPE_DIM // 2
++    rope_vec = KV_LATENT // _VEC - ROPE_DIM // _VEC
++    last = k["num_thread_vec"] - 1
++    record = RECORD_BYTES["swa"]
++    kb, kt = k["block_m"], k["row_threads"]
++    M = T.dynamic("M")
++    positions_max = T.dynamic("positions_max")
++    pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
++    page_words, word_stride = T.dynamic("page_words, word_stride")
++
++    @T.prim_func
++    def attention_front(
++        kv_raw: T.Tensor((M, KV_LATENT), T.bfloat16),
++        kv_weight: T.Tensor((KV_LATENT,), T.bfloat16),
++        positions: T.Tensor((M,), T.int64),
++        cos_sin: T.Tensor((positions_max, ROPE_DIM), T.float32),
++        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        words: T.StridedTensor((pages, page_words), (word_stride, 1), T.uint32),
++        slots: T.Tensor((M,), slot_dtype),
++    ):
++        with T.Kernel(T.ceildiv(M, kb), threads=_THREADS) as pid:
++            T.import_source(_CVT_HEADER)
++            pdl.chain()
++            tid = T.get_thread_binding()
++            k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
++            k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
++            k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
++            k_sum_shared = T.alloc_shared((kb, 1), T.float32)
++            k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
++            k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
++            k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
++            T.annotate_layout(
++                {
++                    k_sum_partial: k["row_layout"],
++                    k_warp_fragment: k["warp_layout"],
++                    k_row_partial: k["row_reduce_layout"],
++                    k_sum_fragment: k["row_layout"],
++                }
++            )
++            k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            y_fp32_local = T.alloc_local((_VEC,), T.float32)
++            sum_local = T.alloc_local((2,), T.float32)
++            weight_local = T.alloc_local((_VEC,), T.bfloat16)
++            cs = T.alloc_local((_VEC,), T.float32)
++            values = T.alloc_local((_VEC,), T.float32)
++
++            row_id = tid // kt
++            lane = tid % kt
++            token_id = pid * kb + row_id
++            T.clear(sum_local)
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                if token_id < M:
++                    for j in T.vectorized(_VEC):
++                        k_x[vi, j] = kv_raw[token_id, token_offset + j]
++                else:
++                    T.clear(k_x[vi, :])
++                for j in T.vectorized(_VEC):
++                    sum_local[j % 2] += T.float32(k_x[vi, j]) * T.float32(k_x[vi, j])
++            k_sum_partial[row_id, lane] = sum_local[0] + sum_local[1]
++            T.reducer_init(k_warp_reducer)
++            for i, w, j in T.Parallel(
++                kb, 1, kt, loop_layout=k["warp_reduce_layout"]
++            ):
++                T.reducer_update(k_warp_reducer[i, w], k_sum_partial[i, w * kt + j])
++            T.finalize_reducer(k_warp_reducer, k_warp_fragment)
++            if lane == 0:
++                k_sum_shared[row_id, 0] = k_warp_fragment[row_id, 0]
++            T.sync_threads()
++            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++                k_row_partial[i, j, w] = k_sum_shared[i, w]
++            T.reducer_init(k_sum_reducer)
++            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++                T.reducer_update(k_sum_reducer[i, j], k_row_partial[i, j, w])
++            T.finalize_reducer(k_sum_reducer, k_sum_fragment)
++
++            rstd_value = T.alloc_var(
++                T.float32,
++                init=T.rsqrt(k_sum_fragment[row_id, lane] / KV_LATENT + eps),
++            )
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                for j in T.vectorized(_VEC):
++                    weight_local[j] = kv_weight[token_offset + j]
++                for j in T.vectorized(_VEC):
++                    y_fp32_local[j] = (
++                        T.float32(k_x[vi, j])
++                        * rstd_value
++                        * (T.float32(weight_local[j]) * out_scale)
++                    )
++                for j in T.vectorized(_VEC):
++                    k_y[vi, j] = y_fp32_local[j]
++            if (last * kt + lane >= rope_vec) & (token_id < M):
++                rope_lane = last * kt + lane - rope_vec
++                position = positions[token_id]
++                for i in T.vectorized(_VEC // 2):
++                    cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
++                for i in T.vectorized(_VEC // 2):
++                    cs[_VEC // 2 + i] = cos_sin[
++                        position, half + rope_lane * (_VEC // 2) + i
++                    ]
++                for j in T.unroll(_VEC // 2):
++                    first = T.cast(k_y[last, 2 * j], T.float32)
++                    second = T.cast(k_y[last, 2 * j + 1], T.float32)
++                    cosine = cs[j]
++                    sine = cs[_VEC // 2 + j]
++                    k_y[last, 2 * j] = T.cast(
++                        T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
++                    )
++                    k_y[last, 2 * j + 1] = T.cast(
++                        T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
++                    )
++            for vi in T.unroll(k["num_thread_vec"]):
++                col = (vi * kt + lane) * _VEC
++                amax = T.alloc_var(T.float32, init=0.0)
++                for j in T.unroll(_VEC):
++                    values[j] = T.cast(k_y[vi, j], T.float32)
++                    amax = T.max(amax, T.abs(values[j]))
++                amax = T.max(amax, T.shfl_xor(amax, 1))
++                amax = T.max(amax, T.shfl_xor(amax, 2))
++                if token_id < M:
++                    slot = T.cast(slots[token_id], T.int64)
++                    page = slot // page_size
++                    if (slot >= 0) & (page < pages):
++                        base = (slot % page_size) * record
++                        bits = T.reinterpret(
++                            T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
++                            T.uint32,
++                        )
++                        bumped = T.if_then_else(
++                            (bits & 0x7FFFFF) != 0,
++                            (bits + 0x800000) & 0x7F800000,
++                            bits,
++                        )
++                        exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
++                        inverse = T.reinterpret(
++                            T.cast(T.shift_left(254 - exponent, 23), T.uint32),
++                            T.float32,
++                        )
++                        for h in T.unroll(2):
++                            words[page, (base + col + 4 * h) // 4] = T.call_extern(
++                                "uint32",
++                                "dsv41_e4m3x4",
++                                T.fmul(values[4 * h], inverse),
++                                T.fmul(values[4 * h + 1], inverse),
++                                T.fmul(values[4 * h + 2], inverse),
++                                T.fmul(values[4 * h + 3], inverse),
++                            )
++                        if lane % group_lanes == 0:
++                            cache[page, base + KV_LATENT + col // 32] = T.cast(
++                                exponent, T.uint8
++                            )
++
++    return attention_front
++
++
++def context_kv_front_call(eps: float, page_size: int, slot_dtype: torch.dtype):
++    """The kernel ``context_kv_front`` launches, as a ``prepare.call``."""
++    return prepare.call(
++        context_kv_front_kernel,
++        eps,
++        page_size,
++        str(slot_dtype).removeprefix("torch."),
++    )
++
++
++def context_kv_front(
++    kv_raw: torch.Tensor,
++    kv_weight: torch.Tensor,
++    eps: float,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    page_size: int,
++) -> None:
++    """Fused ``kv_norm`` + ``rope`` + SWA ``cache_writer`` for ``kv_raw`` ([T, 512])."""
++    if kv_raw.shape[0] == 0:
++        return
++    pages = cache.view(torch.uint8)
++    if pages.dim() > 2:
++        pages = pages.flatten(1)
++    function, args, kwargs = context_kv_front_call(eps, page_size, slot_mapping.dtype)
++    function(*args, **kwargs)(
++        kv_raw,
++        kv_weight,
++        positions,
++        cos_sin_cache,
++        pages,
++        pages.view(torch.uint32),
++        slot_mapping,
++    )
++
++
++__all__ = [
++    "attention_front",
++    "attention_front_kernel",
++    "context_kv_front",
++    "context_kv_front_call",
++    "context_kv_front_kernel",
++    "front_call",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 9598102ad..5a6418a9c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -260,7 +260,14 @@ def _block32_linear(
+     rows = x.shape[0]
+     if layer.tilelang_mxfp8_input:
+         provided = provided_mxfp8(x)
+-        _block32_gemm(layer, provided.values, provided.scales, out.view(rows, n), rows)
++        if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
++            _block32_split_mxfp8(
++                layer, provided.values, provided.scales, out.view(rows, n), scratch
++            )
++        else:
++            _block32_gemm(
++                layer, provided.values, provided.scales, out.view(rows, n), rows
++            )
+         return
+     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+         _block32_split(layer, x, out.view(rows, n), scratch)
+@@ -325,6 +332,25 @@ def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
+     layer.tilelang_reduce(partials, out)
+ 
+ 
++def _block32_split_mxfp8(
++    layer, xq: torch.Tensor, sf: torch.Tensor, out: torch.Tensor, scratch
++) -> None:
++    rows, n = out.shape
++    tile = split_row_tile(rows)
++    padded = -(-rows // tile) * tile
++    (partials,) = _scratch(
++        (((layer.tilelang_shards, rows, n), torch.float32),), scratch
++    )
++    layer.tilelang_partials[split_bucket(rows)](
++        xq[:padded],
++        layer.weight,
++        sf[:padded].view(torch.uint32),
++        layer.tilelang_weight_sf,
++        partials,
++    )
++    layer.tilelang_reduce(partials, out)
++
++
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_bf16_linear", mutates_args=("out", "scratch")
+ )
+@@ -474,8 +500,16 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+         layer.tilelang_split_rows = split["rows"]
+     layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+     if layer.tilelang_mxfp8_input:
+-        heights = {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
+-        if split or groups != 1 or any(DECODE_ROWS % height for height in heights):
++        heights = (
++            {min(bucket, 64) for bucket in split["decode"]}
++            if split
++            else {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
++        )
++        if (
++            groups != 1
++            or (split and split["rows"] > MXFP8_DECODE_ROWS)
++            or any(DECODE_ROWS % height for height in heights)
++        ):
+             # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
+             raise ValueError(
+                 f"the ({n}, {k}) projection cannot read a producer's MXFP8 rows"

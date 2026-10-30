@@ -946,8 +946,6 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
         target = SimpleNamespace(
             embed_input_ids=lambda input_ids: table[input_ids],
             embed_tokens=_Embedding(table, world),
-            use_mega_moe=False,
-            use_sequence_parallel=False,
             prefill_sp_min_rows=min_rows,
             prefill_sp_unreduced=False,
             disk_engram=False,
@@ -987,3 +985,16 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
         assert len(aux) == len(expected_aux) == 2
         for actual, value in zip(aux, expected_aux):
             torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
+
+
+def test_dspark_tp_defaults_enabled_for_multi_rank(monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+
+    monkeypatch.delenv("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", raising=False)
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    assert not dspark._vocab_parallel_greedy()
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
+    assert dspark._vocab_parallel_greedy()
+    monkeypatch.setenv("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", "0")
+    assert not dspark._vocab_parallel_greedy()
+    assert not hasattr(dspark, "_use_sequence_parallel")

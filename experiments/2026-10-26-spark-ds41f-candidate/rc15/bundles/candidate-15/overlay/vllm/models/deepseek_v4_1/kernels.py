@@ -75,6 +75,15 @@ def cast_mxfp8(rows: torch.Tensor):
     return cast_mxfp8(rows)
 
 
+def slice_mxfp8(rows, first: int, last: int):
+    """Rows ``[first, last)`` of ``rows`` (``linear.MXFP8Rows``) for a split consumer."""
+    if rows is None:
+        return None
+    from .tilelang.linear import slice_mxfp8
+
+    return slice_mxfp8(rows, first, last)
+
+
 def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
     """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
     from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None

@@ -33,10 +33,10 @@ class TestCandidate15(unittest.TestCase):
         series_path = RC15 / "vllm/series"
         self.assertTrue(series_path.is_file())
         patches = spark.read_series(series_path)
-        # 452 patches in rc14 + 20 new patches (0568..0587) = 472 patches total
-        self.assertEqual(len(patches), 472)
-        tail_numbers = [Path(p).name[:4] for p in patches[-20:]]
-        self.assertEqual(tail_numbers, [f"{n:04d}" for n in range(568, 588)])
+        # 452 patches in rc14 + 27 new patches (0568..0594) = 479 patches total
+        self.assertEqual(len(patches), 479)
+        tail_numbers = [Path(p).name[:4] for p in patches[-27:]]
+        self.assertEqual(tail_numbers, [f"{n:04d}" for n in range(568, 595)])
         for rel_patch in patches:
             self.assertTrue(
                 (series_path.parent / rel_patch).is_file(),
@@ -64,11 +64,11 @@ class TestCandidate15(unittest.TestCase):
             inputs = spark.build_inputs(upstreams)
             self.assertEqual(
                 inputs["vllm"]["patch_head"],
-                "5e6a5da1f13c9ac0a34f366b50c056fc7762b718",
+                "02099795a447d164325551bf8e20c3d7b6863a22",
             )
             self.assertEqual(
                 inputs["vllm"]["expected_tree"],
-                "8e3d0de6867fe4aac8392018f0f29ae2bc49bd40",
+                "096391fe4e2928af228c96321a959d1ae560e9e8",
             )
 
     def test_unified_overlays_preserve_all_14_prs(self) -> None:
@@ -139,6 +139,36 @@ class TestCandidate15(unittest.TestCase):
         ).read_text(encoding="utf-8")
         # #703: local SP row routing + gather_mxfp8
         self.assertIn("def gather_mxfp8(", sp_src)
+
+        # #706 & #707: indexer q_cast reuse + RoPE-fused MXFP4 quantize + wk(latent)
+        attn_src = (
+            BUNDLE / "overlay/vllm/models/deepseek_v4_1/attention.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("indexer.wk(latent)", attn_src)
+
+        # #708: DSpark context main_x cast + kv_norm + rope + cache_writer fusion
+        front_src = (
+            BUNDLE / "overlay/vllm/models/deepseek_v4_1/tilelang/front.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("attention_front", front_src)
+
+        # #710: Fuse mHC post+collapse
+        mhc_src = (
+            BUNDLE / "overlay/vllm/models/deepseek_v4_1/tilelang/mhc.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("mhc_post_collapse", mhc_src)
+
+        # Pre-built native io_uring helpers cache
+        dio_src = (
+            BUNDLE / "overlay/vllm/model_executor/model_loader/direct_io/_native.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("VLLM_NATIVE_CACHE_DIR", dio_src)
+
+        # Vision encoder TP sharding (opt-in via SPARK_DS41F_VISION_TP)
+        vl_src = (
+            BUNDLE / "overlay/vllm/models/deepseek_v4_1/nvidia/vl_model.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("SPARK_DS41F_VISION_TP", vl_src)
 
     def test_verdict_and_results_match(self) -> None:
         verdict = json.loads((RC15 / "verdict.json").read_text(encoding="utf-8"))

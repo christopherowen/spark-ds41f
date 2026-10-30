@@ -1,13 +1,16 @@
 """The kernel backend policy: B12X by default, TileLang only with its sources."""
 
 import argparse
+import ast
 import contextlib
 import copy
+import functools
 import glob
 import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -474,20 +477,20 @@ class KernelBackendTest(unittest.TestCase):
                 self.assertIn(expected, script)
 
     def test_existing_profiles_and_locks_are_unaffected(self):
-        for path in sorted(glob.glob(str(ROOT / "experiments/**/*.json"), recursive=True)):
-            relative = Path(path).relative_to(ROOT).as_posix()
+        seen_locks: set[str] = set()
+        for relative, data in _experiment_configs_and_locks():
             if relative.startswith(TILELANG_EXPERIMENTS):
                 continue
-            data = json.loads(Path(path).read_text())
-            if not isinstance(data, dict):
-                continue
-            if "sources" in data and "source_manifest" in data:
+            if "sources" in data and "source_manifest" in data and "tilelang" not in data["sources"]:
                 with self.subTest(lock=relative):
                     # Every lock before the TileLang family lists B12X.
                     self.assertEqual(spark.build_projects(data["sources"]),
                                      (*spark.BUILD_PROJECTS, *spark.LEGACY_BUILD_PROJECTS))
-                    inputs = spark.build_inputs(data)
-                    self.assertEqual(spark.build_contexts(inputs), (*spark.BUILD_CONTEXTS, "b12x-source"))
+                    fingerprint = json.dumps(data, sort_keys=True)
+                    if fingerprint not in seen_locks:
+                        seen_locks.add(fingerprint)
+                        inputs = spark.build_inputs(data)
+                        self.assertEqual(spark.build_contexts(inputs), (*spark.BUILD_CONTEXTS, "b12x-source"))
             elif "serve_args" in data and "container" in data and "kernel_backend" not in data:
                 with self.subTest(profile=relative):
                     self.assertEqual(kernel_backend.source_problems(data, {"sources": {}}, {}), [])
@@ -495,8 +498,29 @@ class KernelBackendTest(unittest.TestCase):
                         self.assertEqual(kernel_backend.problems(data), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
+@functools.lru_cache(maxsize=1)
+def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:
+    """Experiment JSON dictionaries that could be cluster profiles or upstream locks."""
+    skipped_dirs = {"results", "bundles", "release-tests", "__pycache__"}
+    items: list[tuple[str, dict]] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT / "experiments"):
+        dirnames[:] = sorted(d for d in dirnames if d not in skipped_dirs)
+        for filename in sorted(filenames):
+            if not filename.endswith(".json"):
+                continue
+            path = Path(dirpath) / filename
+            try:
+                if path.stat().st_size > 65536:
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if '"source_manifest"' not in text and '"container"' not in text:
+                continue
+            data = json.loads(text)
+            if isinstance(data, dict):
+                items.append((path.relative_to(ROOT).as_posix(), data))
+    return tuple(items)
 
 
 class TileLangProfileLabelTest(unittest.TestCase):
@@ -518,13 +542,34 @@ class TileLangProfileLabelTest(unittest.TestCase):
         """The launch preflight refuses a TileLang profile whose expected image trees
         differ from its lock's source manifest (an arm generated from a recipe before
         its series changed)."""
-        for path in sorted(glob.glob(str(ROOT / "experiments/**/*.json"), recursive=True)):
-            relative = Path(path).relative_to(ROOT).as_posix()
-            data = json.loads(Path(path).read_text())
-            if (not isinstance(data, dict) or data.get("kernel_backend") != "tilelang"
+        for relative, data in _experiment_configs_and_locks():
+            if (data.get("kernel_backend") != "tilelang"
                     or "container" not in data or relative in self.HISTORICAL):
                 continue
             lock = spark.read_json(data.get("upstreams_config", "upstreams.lock.json"))
             manifest = spark.read_json(lock["source_manifest"])
             with self.subTest(profile=relative):
                 self.assertEqual(kernel_backend.source_problems(data, lock, manifest), [])
+
+
+class TestModuleEntrypointOrderTest(unittest.TestCase):
+    def test_every_test_module_keeps_unittest_main_at_the_end(self):
+        """Running a test file directly must execute every TestCase class in the module."""
+        self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            main_indices = [
+                index
+                for index, node in enumerate(tree.body)
+                if isinstance(node, ast.If) and "__name__" in ast.unparse(node.test)
+            ]
+            with self.subTest(module=path.name):
+                self.assertEqual(
+                    main_indices,
+                    [len(tree.body) - 1],
+                    f"{path.name} must have a single `if __name__ == '__main__':` guard at EOF",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

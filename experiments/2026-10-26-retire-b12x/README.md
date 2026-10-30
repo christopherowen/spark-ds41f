@@ -63,14 +63,13 @@ Left alone (generic code, importable without B12X):
 Which vLLM modules fail to import without B12X is measured by the import sweeps below
 (next-candidate and this branch, each with B12X installed and then uninstalled).
 
-## vLLM branch `retire-b12x`
+## vLLM branch `retire-b12x` / `runtime-vision-b12x-cleanup`
 
-Local branch on next-candidate 1bc005688 (worktree `~/projects/vllm-retire-b12x`, shared
-object store), head **4672ecc3d**; patches in [vllm/](vllm/series), numbered 0520-0526
-provisionally. (The bundles ran at ea60f8afe, which differs from 4672ecc3d only in 0526's
-test file; the targeted rerun covers it.)
+Rebased onto `d5df88d83` (`engram-drafted-prefill`, candidate 14) as `runtime-vision-b12x-cleanup`,
+head **190d0d46d** (originally `4672ecc3d` on `1bc005688`); patches in [vllm/](vllm/series),
+numbered 0520-0528 provisionally:
 
-1. **0520 6c05a5b01** The packed BF16 head packs with TileLang in vLLM; B12X's packed
+1. **0520 f0ca194c6** The packed BF16 head packs with TileLang in vLLM; B12X's packed
    projection goes. `vocab_pack.py`: `PackedBf16Weight`, `pack`, `unpack`, `is_supported`
    (B12X's contract). TileLang passes for B12X's three Triton ones: the exponent histogram
    (shared-memory counts), per-row exception counts (a warp a row), and the row pack (a
@@ -79,20 +78,32 @@ test file; the targeted rerun covers it.)
    (window choice, offsets, the in-place 1,024-row staging, the round-trip refusal) is
    unchanged. Tests: B12X's packer tests ported, B12X's packed-head integration test
    ported to TileLang; the vocabulary tests no longer `importorskip` B12X.
-2. **0521 7370718b2** Engram's token map, geometry and caps in vLLM; resident tables
+2. **0521 f4c005e17** Engram's token map, geometry and caps in vLLM; resident tables
    gather with TileLang (`engram_table_gather`, B12X's lookup arithmetic and zeros).
-3. **0522 0b0ddfed3** MXFP4-CSF leaves the DS4.1 package.
-4. **0523 54643f76c** The `b12x` load format and its in-tree adapter go.
-5. **0524 b748cec19** Names: `DeepseekV41Metadata`, `DeepseekV41MetadataBuilder`,
+3. **0522 86775e0cc** MXFP4-CSF leaves the DS4.1 package.
+4. **0523 c002e7639** The `b12x` load format and its in-tree adapter go.
+5. **0524 6b6d35a9f** Names: `DeepseekV41Metadata`, `DeepseekV41MetadataBuilder`,
    `DeepseekV41Backend` (`"DSV41"`), `"DSV41_COMPRESSOR"`, `cache_dtype_str="dsv41"`,
    `vllm::dsv41_attention`, `vllm::dsv41_prepare_global_kv`.
-6. **0525 9ff3d4adb** The DSpark drafter's NVFP4 head switches go.
-7. **0526 4672ecc3d** Tests: eighteen tests of B12X's own preparation objects (fifteen
-   directly, three through the coordinator tests' `_tuning_progress` helper, found by the
-   B12X-absent gate) skip without B12X, as vLLM's other B12X tests do; the coordinator's
+6. **0525 aaf510365** The DSpark drafter's NVFP4 head switches go.
+7. **0526 e51cff338** Tests: B12X's own preparation tests (including `test_b12x_output.py`'s
+   subprocess replay) skip without B12X, as vLLM's other B12X tests do; the coordinator's
    other tests run.
-
-41 files, +1183 / -1766. ruff (0.16.6) is clean on every line changed.
+8. **0527 308b87a6d** Pre-build `direct_io` (`_storage.c`) and `engram_rows` (`_reader.c`)
+   `io_uring` C99 helpers into `VLLM_NATIVE_CACHE_DIR` (`/opt/spark-ds41f/native/{direct_io,engram_rows}/<source_digest>`)
+   during `docker build` so first boot loads the pre-compiled `.so` directly without invoking
+   `cc` into `$XDG_CACHE_HOME`. Custom `CC` / `CUDA_HOME` overrides fall back to the runtime
+   cache build path.
+9. **0528 190d0d46d** Tensor-parallelize the TileLang vision tower (`DeepseekV4ViT`) and
+   aligner (`DeepseekV4Aligner`) across TP ranks unless `is_vit_use_data_parallel()` is set:
+   - Column-parallel `wqkv`, `mlp.w1`, and `aligner.w1` with zero-padded tail columns when
+     `tp_size` does not evenly divide `16` heads (`6` heads/rank at TP3, `4` at TP4),
+     `2,816` MLP width (`960`/rank at TP3, `704` at TP4), or `5,120` aligner width
+     (`1,728`/rank at TP3, `1,280` at TP4) so every TileLang GEMM/GEMV dimension stays a
+     multiple of 64.
+   - Row-parallel `wo`, `mlp.w2`, and `aligner.w2` followed by `tensor_model_parallel_all_reduce`
+     (with bias added after all-reduce so it is applied once), recovering ~0.61 GiB/rank at TP3
+     and ~0.69 GiB/rank at TP4.
 
 ## spark-ds41f: image, lock and tooling
 
@@ -228,6 +239,11 @@ skipped, 4 failed.**
 `Successfully uninstalled b12x-1.3.0`, `find_spec("b12x")` `None`, no `b12x` distribution and
 no B12X tree on `sys.path`. The B12X-absent packer (`checkpoint-absent`, synthetic cases)
 gave the same packed hashes as the run with B12X.
+
+**Rebased series + prebuilt `io_uring` helpers + TP vision tower (dgx4, 2026-10-30, pass, B12X uninstalled).**
+- Image: `spark-ds41f:19f2c20ed4d6-next-14` (`sha256:7918fd6145b5`) with `0520..0528` (`190d0d46d`) mounted over `d5df88d83` and `b12x-1.3.0` uninstalled by `without_b12x.py`.
+- Both `direct_io._native.prebuild()` and `engram_rows._native.prebuild()` built into `VLLM_NATIVE_CACHE_DIR`, verified `liburing.so` linkage via `ldd`, and resolved via `load()` with an empty `XDG_CACHE_HOME` (`xdg_compiled_so: []`).
+- 8 gate test files (`test_b12x_startup.py`, `test_b12x_output.py`, `test_deepseek_v4_1_engram.py`, `test_deepseek_v41_engram_rows.py`, `test_deepseek_v41_tilelang_engram.py`, `test_direct_loader.py`, `test_deepseek_v41_tilelang_vision.py`, `test_deepseek_v41_tilelang_vocab.py`): **276 passed, 25 skipped, 0 failed, 0 errors** in 154.8 s (`exit: 0`).
 
 **Interrupted (recorded, no result).** dgx4 08:03: `pack-dev` stopped by the planned
 power-off. dgx4 13:50 `compare-ea60f8afe` and dgx2 14:29 `checkpoint-absent-ea60f8afe`: my

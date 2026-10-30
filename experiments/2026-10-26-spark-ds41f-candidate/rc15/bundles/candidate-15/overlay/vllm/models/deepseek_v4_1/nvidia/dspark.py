@@ -40,11 +40,6 @@ from vllm.model_executor.models.qwen3_dspark import (
 )
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.weight_transfer import copy_weight
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
 from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
@@ -54,7 +49,6 @@ from ..tilelang import columns, dspark_context, prepare
 from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
-    _use_sequence_parallel,
     build_l2_prefetch_plans,
 )
 
@@ -62,10 +56,10 @@ logger = init_logger(__name__)
 
 
 def _vocab_parallel_greedy() -> bool:
-    """SPARK_DS41F_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
-    vocabulary and reduce greedy drafts across ranks (see
-    DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
-    if os.environ.get("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", "0") != "1":
+    """Shard the Markov projection by vocabulary and reduce greedy drafts across
+    ranks when TP > 1 (default on; set SPARK_DS41F_DSPARK_VOCAB_PARALLEL=0 to
+    disable)."""
+    if os.environ.get("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", "1") != "1":
         return False
     return get_tensor_model_parallel_world_size() > 1
 
@@ -79,7 +73,9 @@ def _context_kv_projection(attn: nn.Module):
     """The KV rows of ``attn``'s fused Q-A/KV weight as one projection."""
     from ..tilelang.linear import TileLangBlock32Rows
 
-    return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+    projection = TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+    projection.tilelang_mxfp8_input = True
+    return projection
 
 
 class DSparkContextCudaGraphs:
@@ -234,7 +230,6 @@ class DSparkDeepseekV4Model(nn.Module):
                 prepare.call(columns.split_columns_kernel, *join_key),
             ]
         )
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self._context_kv_projections: list = []
 
         self.num_dspark_layers = (
@@ -247,11 +242,11 @@ class DSparkDeepseekV4Model(nn.Module):
         # unused vocabulary allocation while loading the draft checkpoint.
         self.embed_tokens: nn.Module | None = None
 
-        # SPARK_DS41F_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
-        # target's auxiliary hidden states (replicated otherwise, so every rank
-        # streams the whole weight) and gathers the output: same arithmetic.
+        # Column-shard the projection of the target's auxiliary hidden states when
+        # TP > 1 (default on; set SPARK_DS41F_DSPARK_MAIN_PROJ_TP=0 to replicate)
+        # and gather the output: same arithmetic.
         main_proj_tp = (
-            os.environ.get("SPARK_DS41F_DSPARK_MAIN_PROJ_TP", "0") == "1"
+            os.environ.get("SPARK_DS41F_DSPARK_MAIN_PROJ_TP", "1") == "1"
             and get_tensor_model_parallel_world_size() > 1
         )
         main_proj_cls = (
@@ -333,8 +328,12 @@ class DSparkDeepseekV4Model(nn.Module):
         The draft layers' modules declare their own kernels, WO included, and the
         Markov head's are declared by the logits processor it is registered with.
         """
+        from ..tilelang.linear import _warm_casts
+
         for projection in self._context_kv_projections:
             projection.declare_kernels()
+        if self._context_kv_projections:
+            prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -381,18 +380,34 @@ class DSparkDeepseekV4Model(nn.Module):
         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
         but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
-            slot_mapping = (
-                context_slot_mappings
-                if context_slot_mappings is None
-                or isinstance(context_slot_mappings, torch.Tensor)
-                else context_slot_mappings[i]
+        main_cast = (
+            kernels.cast_mxfp8(main_x)
+            if any(
+                getattr(proj, "tilelang_mxfp8_input", False)
+                for proj in self._context_kv_projections
             )
-            attn = layer.attn
-            kv = attn.kv_norm(self._context_kv_projections[i](main_x))
-            if slot_mapping is None:
-                continue
-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            else None
+        )
+        with kernels.mxfp8_inputs(main_cast):
+            for i, layer in enumerate(self.layers):
+                slot_mapping = (
+                    context_slot_mappings
+                    if context_slot_mappings is None
+                    or isinstance(context_slot_mappings, torch.Tensor)
+                    else context_slot_mappings[i]
+                )
+                attn = layer.attn
+                kv_raw = self._context_kv_projections[i](main_x)
+                if slot_mapping is None:
+                    continue
+                if hasattr(attn, "insert_raw_context_kv"):
+                    attn.insert_raw_context_kv(
+                        kv_raw, context_positions, slot_mapping
+                    )
+                else:
+                    _insert_context_kv(
+                        attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
+                    )
 
     def forward(
         self,
@@ -402,15 +417,6 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        full_num_tokens = positions.shape[0]
-        if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, inputs_embeds
-                )
-            inputs_embeds = sp_shard(inputs_embeds)
-            input_ids = sp_shard(input_ids)
         # The first layer's post-load broadcast weights consume [T, H] directly.
         hidden_states = inputs_embeds
 
@@ -430,15 +436,16 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         l2_prefetch.join()
+        assert pre_mix is not None
+        if hasattr(layer.mhc, "post_collapse"):
+            return layer.mhc.post_collapse(
+                hidden_states, residual, post_mix, res_mix, pre_mix
+            )
         hidden_states = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-            pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference forward_head applies (hc_pre with the
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
-        assert pre_mix is not None
         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
         return hidden_states
 

@@ -643,10 +643,6 @@ class OverlayTest(unittest.TestCase):
             spark.read_cluster("arm.json")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GLPTest(unittest.TestCase):
     """``glp`` renders the steered model name, vLLM's steering variables and the file's mount."""
 
@@ -707,3 +703,7 @@ class GLPTest(unittest.TestCase):
         mounts = recipe.overlay({"extends": {}, "set": {"container": {"mounts": [["/x", "/cache", "rw"]]}}}, base)
         self.assertIn([recipe.glp_file(base), "/glp/vector.gguf", "ro"], mounts["container"]["mounts"])
         self.assertEqual(recipe.overlay({"extends": {}}, base)["serve_args"], base["serve_args"])
+
+
+if __name__ == "__main__":
+    unittest.main()

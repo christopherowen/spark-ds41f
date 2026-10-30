@@ -177,6 +177,9 @@ class AdaptiveVerificationManager:
         tile_cost: float = 0.0,
         moe_row_cost: float = 0.0,
         continuation_alpha: float | None = None,
+        use_capture_step_cost: bool = True,
+        filter_dead_rows_on_host: bool = True,
+        clamp_verified_to_dead_cut: bool = True,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -194,6 +197,9 @@ class AdaptiveVerificationManager:
         self.row_cost = row_cost
         self.tile_cost = tile_cost
         self.moe_row_cost = moe_row_cost
+        self.use_capture_step_cost = use_capture_step_cost
+        self.filter_dead_rows_on_host = filter_dead_rows_on_host
+        self.clamp_verified_to_dead_cut = clamp_verified_to_dead_cut
         self._capture_sizes: tuple[int, ...] = tuple(
             sorted(int(s) for s in capture_sizes if int(s) > 0)
         )
@@ -310,7 +316,11 @@ class AdaptiveVerificationManager:
     ) -> None:
         """Run each eager token count past the capture limit once, untimed, so its
         kernels compile before the first long prefill does."""
-        if capture_sizes and not getattr(self, "_capture_sizes", ()):
+        if (
+            capture_sizes
+            and not getattr(self, "_capture_sizes", ())
+            and getattr(self, "use_capture_step_cost", True)
+        ):
             self._capture_sizes = tuple(
                 sorted(int(s) for s in capture_sizes if int(s) > 0)
             )
@@ -351,8 +361,16 @@ class AdaptiveVerificationManager:
         When neither is active, reduces to ``1.0 + row_cost * rows``.
         """
         rows = np.asarray(rows, dtype=np.int64)
-        capture_sizes = getattr(self, "_capture_sizes", ()) if use_capture_sizes else ()
-        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
+        capture_sizes = (
+            getattr(self, "_capture_sizes", ())
+            if use_capture_sizes and getattr(self, "use_capture_step_cost", True)
+            else ()
+        )
+        dead_rows_tau = (
+            getattr(self, "dead_rows_tau", 0.0)
+            if getattr(self, "filter_dead_rows_on_host", True)
+            else 0.0
+        )
         if not capture_sizes and dead_rows_tau <= 0.0:
             return 1.0 + self.row_cost * rows
 
@@ -391,7 +409,11 @@ class AdaptiveVerificationManager:
         *,
         use_capture_sizes: bool = True,
     ) -> int:
-        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
+        dead_rows_tau = (
+            getattr(self, "dead_rows_tau", 0.0)
+            if getattr(self, "filter_dead_rows_on_host", True)
+            else 0.0
+        )
         if dead_rows_tau > 0.0 and len(scores) > 0:
             live_scores = np.where(scores >= dead_rows_tau, scores, 0.0)
         else:
@@ -440,42 +462,54 @@ class AdaptiveVerificationManager:
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
+        has_seeded = bool(
+            getattr(self, "_seeded_sampled", None) is not None
+            and np.any(self._seeded_sampled)
+        )
         mid_prefill_slots: list[int] = []
-        if (
-            hasattr(input_batch, "idx_mapping_np")
-            and hasattr(input_batch, "num_computed_tokens_np")
-            and hasattr(input_batch, "num_scheduled_tokens")
-            and hasattr(input_batch, "prefill_len_np")
-        ):
-            completed_mask = (
-                input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
-                >= input_batch.prefill_len_np
-            )
-            completed_slots = set(input_batch.idx_mapping_np[completed_mask].tolist())
-            mid_prefill_slots = input_batch.idx_mapping_np[~completed_mask].tolist()
-        else:
-            completed_slots = set(input_batch.idx_mapping.tolist())
-        if self._pending_resets:
+        if has_seeded:
+            if (
+                hasattr(input_batch, "idx_mapping_np")
+                and hasattr(input_batch, "num_computed_tokens_np")
+                and hasattr(input_batch, "num_scheduled_tokens")
+                and hasattr(input_batch, "prefill_len_np")
+            ):
+                completed_mask = (
+                    input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
+                    >= input_batch.prefill_len_np
+                )
+                completed_slots = set(
+                    input_batch.idx_mapping_np[completed_mask].tolist()
+                )
+                mid_prefill_slots = input_batch.idx_mapping_np[
+                    ~completed_mask
+                ].tolist()
+            else:
+                completed_slots = set(input_batch.idx_mapping.tolist())
+            if self._pending_resets:
+                self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
+                self._pending_resets = [
+                    r for r in self._pending_resets if r not in completed_slots
+                ]
+            for slot in mid_prefill_slots:
+                if slot not in self._pending_resets:
+                    self._pending_resets.append(slot)
+            req_stale = getattr(self, "_req_stale_confidences", None)
+            if req_stale is not None:
+                self._has_recorded_confidences = True
+                for slot in self._in_flight_slots:
+                    self._next_stale_confidences[slot] = self._stale_confidences[
+                        ready_idx
+                    ].np[slot]
+                    self._has_next_confidences[slot] = True
+                for slot in completed_slots:
+                    if self._has_next_confidences[slot]:
+                        req_stale[slot] = self._next_stale_confidences[slot]
+                        self._has_next_confidences[slot] = False
+                self._in_flight_slots = sorted(completed_slots)
+        elif self._pending_resets:
             self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
-            self._pending_resets = [
-                r for r in self._pending_resets if r not in completed_slots
-            ]
-        for slot in mid_prefill_slots:
-            if slot not in self._pending_resets:
-                self._pending_resets.append(slot)
-        req_stale = getattr(self, "_req_stale_confidences", None)
-        if req_stale is not None:
-            self._has_recorded_confidences = True
-            for slot in self._in_flight_slots:
-                self._next_stale_confidences[slot] = self._stale_confidences[
-                    ready_idx
-                ].np[slot]
-                self._has_next_confidences[slot] = True
-            for slot in completed_slots:
-                if self._has_next_confidences[slot]:
-                    req_stale[slot] = self._next_stale_confidences[slot]
-                    self._has_next_confidences[slot] = False
-            self._in_flight_slots = sorted(completed_slots)
+            self._pending_resets.clear()
         # Last step's copy has landed: budgets read it, this step overwrites the
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
@@ -545,10 +579,14 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
+        seeded_sampled = getattr(self, "_seeded_sampled", None)
+        has_seeded = bool(seeded_sampled is not None and np.any(seeded_sampled))
         req_stale = getattr(self, "_req_stale_confidences", None)
         stale_confidences = (
             req_stale[slots]
-            if req_stale is not None and getattr(self, "_has_recorded_confidences", True)
+            if has_seeded
+            and req_stale is not None
+            and getattr(self, "_has_recorded_confidences", True)
             else self._stale_confidences[self._stale_idx].np[slots]
         )
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
@@ -562,13 +600,16 @@ class AdaptiveVerificationManager:
             >= self.req_states.prefill_len.np[slots]
         )
         effective_drafts = scheduled_drafts.copy()
-        seeded_sampled = getattr(self, "_seeded_sampled", None)
         seeded_mask = (
             seeded_sampled[slots]
             if seeded_sampled is not None
             else np.zeros(num_reqs, dtype=bool)
         )
-        dead_rows_tau = getattr(self, "dead_rows_tau", 0.0)
+        dead_rows_tau = (
+            getattr(self, "dead_rows_tau", 0.0)
+            if getattr(self, "filter_dead_rows_on_host", True)
+            else 0.0
+        )
         continuation_alpha = getattr(self, "continuation_alpha", 0.0)
         pinned_budget = 0
         if np.any(seeded_mask):
@@ -756,7 +797,11 @@ class AdaptiveVerificationManager:
         draft count is ``min(admitted, dead_row_cut)``.
         """
         admitted = self._batch_draft_capacity[:num_reqs]
-        if self.dead_rows_tau <= 0 or getattr(self, "_active_dead_row_reqs", 0) != num_reqs:
+        if (
+            not getattr(self, "clamp_verified_to_dead_cut", True)
+            or self.dead_rows_tau <= 0
+            or getattr(self, "_active_dead_row_reqs", 0) != num_reqs
+        ):
             return admitted
         cut = self._dead_row_cut if dead_row_cut is None else dead_row_cut
         if cut is None:
@@ -945,4 +990,16 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         row_cost=adaptive_verification_row_cost,
         planned_confidences=planned_confidences,
+        use_capture_step_cost=os.environ.get(
+            "SPARK_DS41F_DSPARK_PIECEWISE_STEP_COST", "0"
+        )
+        == "1",
+        filter_dead_rows_on_host=os.environ.get(
+            "SPARK_DS41F_DSPARK_HOST_DEAD_ROWS", "0"
+        )
+        == "1",
+        clamp_verified_to_dead_cut=os.environ.get(
+            "SPARK_DS41F_DSPARK_CLAMP_DEAD_CAPACITY", "0"
+        )
+        == "1",
     )

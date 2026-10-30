@@ -16,7 +16,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "rc14/vllm/series"
 BASE = "d5df88d83"  # vLLM engram-drafted-prefill, candidate 14 (spark-ds41f:1030)
-HEAD = "2954ce4d3"  # vLLM candidate-15
+HEAD = "2945b1eb2"  # vLLM candidate-15
 PATCHES = [
     ('e01a47375', 568),  # [Spec] Copy drafts: a verification lookahead apart from DSpark's block
     ('cdc125259', 569),  # [DS4.1] Decode rows for the verification lookahead
@@ -36,8 +36,15 @@ PATCHES = [
     ('016a89326', 583),  # [Scheduler] Prefill-decode interleave: run K graphed decode steps between full prefill chunks
     ('b62468342', 584),  # [Scheduler] Context-aware prefill step-time budgeting on an absolute 2,048-token grid
     ('2c2afabfe', 585),  # Kernel preparation: omit unreachable MoE, router, and Markov head variants
-    ('9809c3a1b', 586),  # [DS4.1] Adaptive verification: unify seeded per-request budgeting, piecewise step cost, device dead-row clamp, and continuation-value cutoff
-    ('2954ce4d3', 587),  # [DS4.1] DSpark speculator: unify online IRLS confidence calibration, greedy shard runner-up margin, and concurrency-bounded draft depth
+    ('b1ecb91ab', 586),  # [DS4.1] Adaptive verification: unify seeded per-request budgeting, piecewise step cost, device dead-row clamp, and continuation-value cutoff
+    ('ecea426f8', 587),  # [DS4.1] DSpark speculator: unify online IRLS confidence calibration, greedy shard runner-up margin, and concurrency-bounded draft depth
+    ('4b192a3f8', 588),  # [DS4.1] Reuse q_cast in indexer wq_b and fuse RoPE into index query MXFP4 quantize (#706)
+    ('b2ae69a75', 589),  # [DS4.1] Fuse global KV post-projection kernels in _prepare_global_kv (#707)
+    ('139394805', 590),  # [DS4.1] DSpark: cast context main_x once and fuse kv_norm + rope + cache_writer (#708)
+    ('6133b90ad', 591),  # [DS4.1] Fuse mHC post+collapse and deduplicate CED boundary position/ID gathers (#710)
+    ('6e49b2128', 592),  # [DS4.1] Remove dead static SP/mega_moe branches and default multi-rank DSpark TP flags on (#711)
+    ('c843dd18d', 593),  # Pre-build direct_io and engram_rows io_uring helpers into VLLM_NATIVE_CACHE_DIR
+    ('2945b1eb2', 594),  # Tensor-parallelize the TileLang vision tower and aligner across TP ranks
 ]
 
 

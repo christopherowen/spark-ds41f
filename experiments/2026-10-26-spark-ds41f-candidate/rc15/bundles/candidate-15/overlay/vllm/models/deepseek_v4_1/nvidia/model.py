@@ -37,11 +37,6 @@ from vllm.model_executor.models.utils import (
     make_layers,
 )
 from vllm.model_executor.weight_transfer import copy_weight
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.models.deepseek_v41.nvidia.model import (
     DeepseekV4MixtureOfExperts as DeepseekV4MixtureOfExperts,
@@ -80,10 +75,6 @@ def _select_dsv4_attn_cls(vllm_config):
     return DeepseekV41TileLangAttention
 
 
-def _use_sequence_parallel(vllm_config):
-    return False
-
-
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -97,7 +88,6 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.engram: Engram | None = None
         if engram_layout is not None:
@@ -108,7 +98,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     vllm_config.quant_config,
                     engram_layout,
                     engram_layout.layer_ids.index(layer_id),
-                    use_sequence_parallel=self.use_sequence_parallel,
                     prefix=f"{prefix}.engram",
                 )
 
@@ -119,8 +108,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        if self.use_sequence_parallel:
-            self.attn.wo_b.reduce_results = False
         if config.scoring_func != "sqrtsoftplus" or not config.norm_topk_prob:
             raise ValueError("V4.1 requires normalized sqrtsoftplus routing")
         if getattr(config, "gate_temp", 1.0) != 1.0:
@@ -149,7 +136,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn = DeepseekV4MoE(
             moe_config,
             prefix=f"{prefix}.ffn",
-            use_sequence_parallel=self.use_sequence_parallel,
+            use_sequence_parallel=False,
             gate=gate,
             image_sentinel_lo=0 if is_draft else 129264,
             image_sentinel_count=1,
@@ -326,6 +313,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_mask: torch.Tensor | None = None,
         ced_indices: torch.Tensor | None = None,
         sp_rows: sp_prefill.SPRows | None = None,
+        *,
+        ced_positions: torch.Tensor | None = None,
+        ced_input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         previous_output = x if residual is not None else None
         apply_engram = self.engram is not None and engram_hashes is not None
@@ -370,9 +360,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             post_mix = gather_rows(post_mix, ced_indices)
             res_mix = gather_rows(res_mix, ced_indices)
             attn_pre = gather_rows(attn_pre, ced_indices)
-            positions = gather_rows(positions, ced_indices)
+            positions = (
+                gather_rows(positions, ced_indices)
+                if ced_positions is None
+                else ced_positions
+            )
             if input_ids is not None:
-                input_ids = gather_rows(input_ids, ced_indices)
+                input_ids = (
+                    gather_rows(input_ids, ced_indices)
+                    if ced_input_ids is None
+                    else ced_input_ids
+                )
         if sp_rows is None:
             with kernels.mxfp8_inputs(x_q):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
@@ -445,12 +443,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.ced_decoder_start = ced_decoder_start(config)
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
-        self.use_mega_moe = False
-        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         # Per-forward prefill sequence parallelism (0 = off); see sp_prefill.
-        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(
-            vllm_config, static_sequence_parallel=self.use_sequence_parallel
-        )
+        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(vllm_config)
         if vllm_config.parallel_config.use_ubatching:
             raise ValueError(
                 "V4.1 fixed native layer buffers require ubatching/DBO disabled"
@@ -782,9 +776,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
-            input_ids = input_ids.to(torch.int64)
-
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
@@ -827,22 +818,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
 
         full_num_tokens = positions.shape[0]
-        if self.use_sequence_parallel:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
-                )
-            hidden_states = sp_shard(hidden_states)
-            input_ids = sp_shard(input_ids)
         # GLP steering's row marks for the rows the layers hold: this rank's under
         # sequence parallelism, the decoder's once CED compacts the step.
         steer_rows: torch.Tensor | None = None
         if self.glp is not None:
             steer_rows = self.glp.step_rows(full_num_tokens)
-            if self.use_sequence_parallel:
-                steer_rows = sp_shard(steer_rows)
-            elif sp is not None:
+            if sp is not None:
                 steer_rows = sp.local_slice(steer_rows)
 
         residual, post_mix, res_mix = None, None, None
@@ -885,6 +866,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
                 )
                 sp = None
+            ced_positions = (
+                gather_rows(positions, boundary_indices)
+                if boundary_indices is not None
+                else None
+            )
+            ced_input_ids = (
+                gather_rows(input_ids, boundary_indices)
+                if boundary_indices is not None and input_ids is not None
+                else None
+            )
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -897,11 +888,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_mask,
                 ced_indices=boundary_indices,
                 sp_rows=sp,
+                ced_positions=ced_positions,
+                ced_input_ids=ced_input_ids,
             )
             if boundary_indices is not None:
-                positions = gather_rows(positions, ced_indices)
-                if input_ids is not None:
-                    input_ids = gather_rows(input_ids, ced_indices)
+                assert ced_positions is not None
+                positions = ced_positions
+                input_ids = ced_input_ids
                 if steer_rows is not None:
                     steer_rows = gather_rows(
                         self.glp.step_rows(full_num_tokens), ced_indices
@@ -913,31 +906,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
                 aux_out = (
                     self._graph_out(len(aux_hidden_states), full_num_tokens)
-                    if sp is None
-                    and not decoder_compacted
-                    and not self.use_sequence_parallel
+                    if sp is None and not decoder_compacted
                     else None
                 )
-                aux_hidden_state = (
-                    layer.mhc.collapse(aux_recon)
-                    if aux_out is None
-                    else layer.mhc.collapse(aux_recon, out=aux_out)
-                )
-                if self.use_sequence_parallel:
-                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
-                elif sp is not None:
+                if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
+                    aux_hidden_state = layer.mhc.post_collapse(
+                        hidden_states, residual, post_mix, res_mix, out=aux_out
+                    )
+                else:
+                    aux_recon = layer.mhc.post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = (
+                        layer.mhc.collapse(aux_recon)
+                        if aux_out is None
+                        else layer.mhc.collapse(aux_recon, out=aux_out)
+                    )
+                    final_aux_recon = aux_recon
+                if sp is not None:
                     aux_hidden_state = sp.gather(aux_hidden_state)
                 if decoder_compacted:
                     aux_hidden_state = scatter_rows(
                         aux_hidden_state, ced_indices, full_num_tokens
                     )
                 aux_hidden_states.append(aux_hidden_state)
-                final_aux_recon = aux_recon
         l2_prefetch.join()
-        if layer is not None:
+        last_rank = get_pp_group().is_last_rank
+        fused_final_collapse = (
+            layer is not None
+            and last_rank
+            and self.end_layer not in self.aux_hidden_state_layers
+            and self._sink_columns is None
+            and hasattr(layer.mhc, "post_collapse")
+        )
+        if fused_final_collapse:
+            hidden_states = layer.mhc.post_collapse(
+                hidden_states, residual, post_mix, res_mix, pre_mix
+            )
+        elif layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
@@ -946,7 +954,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, residual, post_mix, res_mix
                 )
 
-        if not get_pp_group().is_last_rank:
+        if not last_rank:
             if decoder_compacted:
                 hidden_states = scatter_rows(
                     hidden_states, ced_indices, full_num_tokens
@@ -964,7 +972,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self._sink_columns is not None:
             columns = (
                 self._sink_columns[:full_num_tokens]
-                if rows_here and not self.use_sequence_parallel
+                if rows_here
                 else torch.empty(
                     (hidden_states.shape[0], self.hc_mult),
                     dtype=torch.float32,
@@ -974,33 +982,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        hidden_states = (
-            layer.mhc.collapse(hidden_states, pre_mix)
-            if columns is None
-            else layer.mhc.collapse(
-                hidden_states, pre_mix, columns=columns, column=self._sink_column
+        if not fused_final_collapse:
+            hidden_states = (
+                layer.mhc.collapse(hidden_states, pre_mix)
+                if columns is None
+                else layer.mhc.collapse(
+                    hidden_states, pre_mix, columns=columns, column=self._sink_column
+                )
             )
-        )
-        if columns is not None and not (rows_here and not self.use_sequence_parallel):
+        if columns is not None and not rows_here:
             # A gather of hc_mult values per token under sequence parallelism.
-            if self.use_sequence_parallel:
-                columns = sp_all_gather(columns)[:full_num_tokens]
-            elif sp is not None:
+            if sp is not None:
                 columns = sp.gather(columns)
             if decoder_compacted:
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
-        out = (
-            self._graph_out(None, full_num_tokens)
-            if rows_here and not self.use_sequence_parallel
-            else None
-        )
+        out = self._graph_out(None, full_num_tokens) if rows_here else None
         hidden_states = (
             self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
         )
-        if self.use_sequence_parallel:
-            # Gather only the collapsed and normalized hidden states.
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         if sp is not None:
             hidden_states = sp.gather(hidden_states)
         if decoder_compacted:

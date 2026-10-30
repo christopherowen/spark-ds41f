@@ -343,11 +343,21 @@ class DSparkSpeculator(DFlashSpeculator):
             self.enable_adaptive_verification
             and getattr(model.model, "confidence_head", None) is not None
         )
-        # Keep OnlineAcceptanceEstimator active when use_confidence_head is True:
-        # logit(p_head) is fed into the online IRLS solver (_accumulate_kernel +
-        # _refit_kernel) so a shared slope and per-position intercepts calibrate
-        # the static head online against observed target acceptance.
+        # Keep OnlineAcceptanceEstimator active when explicitly enabled so
+        # logit(p_head) is calibrated online against observed target acceptance;
+        # otherwise use the TileLang confidence head directly.
         if self.use_confidence_head:
+            online_cal = os.environ.get(
+                "SPARK_DS41F_DSPARK_ONLINE_CALIBRATION", "0"
+            ) == "1" or bool(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_online_calibration",
+                    False,
+                )
+            )
+            if not online_cal:
+                self.use_acceptance_estimator = False
             if (
                 getattr(self, "_confidence_margin_weight", 0.0) != 0.0
                 or getattr(self, "_confidence_step_biases", None) is not None
