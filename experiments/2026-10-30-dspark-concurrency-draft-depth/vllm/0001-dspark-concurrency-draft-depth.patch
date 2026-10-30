@@ -1,0 +1,496 @@
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 8d6e9c358..5ab83fba6 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -150,3 +150,132 @@ def test_greedy_markov_exact_replay(dtype, vocab, rows):
+         torch.testing.assert_close(output, (base + bias).argmax(-1), rtol=0, atol=0)
+         assert torch.all(result[:, :3] == -77)
+         assert torch.all(result[:, 4:] == -77)
++
++
++def test_parse_max_steps_by_batch_normalizes_and_clamps():
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
++        parse_max_steps_by_batch,
++    )
++
++    assert parse_max_steps_by_batch("", 5) == ()
++    assert parse_max_steps_by_batch("8:4, 16:3", 5) == ((8, 4), (16, 3))
++    # Enforces monotonic non-increasing depth as concurrency grows.
++    assert parse_max_steps_by_batch({4: 3, 8: 4, 16: 2}, 5) == ((4, 3), (16, 2))
++    assert parse_max_steps_by_batch([(2, 9), (8, 0)], 5) == ((8, 1),)
++
++
++def test_concurrency_bounded_sequential_draft_depth(monkeypatch):
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
++        DSparkSpeculator,
++        parse_max_steps_by_batch,
++    )
++
++    gathered_rows = []
++
++    def fake_gather(source, indices):
++        gathered_rows.append(indices.tolist())
++        return source[indices]
++
++    monkeypatch.setattr(tilelang_inputs, "gather_hidden_rows", fake_gather)
++
++    seen_markov = []
++
++    def embed(ids):
++        seen_markov.append(ids.clone())
++        return ids[:, None].float()
++
++    model = SimpleNamespace(
++        supports_local_draft_argmax=lambda: True,
++        compute_local_draft_logits=Mock(
++            side_effect=lambda h: torch.tensor([[1.0, 5.0]]).expand(h.shape[0], 2)
++        ),
++        markov_embed=embed,
++        compute_local_markov_bias=lambda x: torch.zeros(x.shape[0], 2),
++        sample_local_draft_logits=Mock(
++            side_effect=lambda b, m: (b + m).argmax(-1)
++        ),
++        compute_confidence=Mock(
++            side_effect=lambda h, m: torch.full((h.shape[0],), 0.75)
++        ),
++    )
++    n_spec = 4
++    max_reqs = 4
++    spec = SimpleNamespace(
++        _draft_topk=None,
++        num_speculative_steps=n_spec,
++        _max_steps_by_batch=parse_max_steps_by_batch("2:3,4:2", n_spec),
++        _active_sample_indices=torch.empty(max_reqs * n_spec, dtype=torch.int64),
++        model=model,
++        sample_indices=torch.arange(max_reqs * n_spec, dtype=torch.int64),
++        sample_idx_mapping=torch.arange(max_reqs * n_spec, dtype=torch.int32) // n_spec,
++        sample_pos=torch.arange(max_reqs * n_spec, dtype=torch.int64),
++        use_confidence_head=True,
++        input_buffers=SimpleNamespace(input_ids=torch.tensor([3, 4, 5, 6])),
++        _anchor_idx=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
++        draft_tokens=torch.full((max_reqs, n_spec), 9, dtype=torch.int64),
++        draft_token_confidence_probs=torch.ones((max_reqs, n_spec), dtype=torch.float32),
++        draft_logits=None,
++        acceptance_estimator=None,
++    )
++    spec._vocab_parallel_greedy = MethodType(
++        DSparkSpeculator._vocab_parallel_greedy, spec
++    )
++    spec.active_speculative_steps = MethodType(
++        DSparkSpeculator.active_speculative_steps, spec
++    )
++
++    assert spec.active_speculative_steps(1) == 4
++    assert spec.active_speculative_steps(2) == 3
++    assert spec.active_speculative_steps(4) == 2
++
++    DSparkSpeculator._sample_sequential(
++        spec, 4, torch.zeros(max_reqs * n_spec, 8)
++    )
++    # Only the first 2 steps per request (8 rows instead of 16) are gathered and
++    # projected, and only 2 sequential Markov steps execute.
++    assert gathered_rows[-1] == [0, 1, 4, 5, 8, 9, 12, 13]
++    assert len(seen_markov) == 2
++    assert spec.draft_tokens.tolist() == [
++        [1, 1, 0, 0],
++        [1, 1, 0, 0],
++        [1, 1, 0, 0],
++        [1, 1, 0, 0],
++    ]
++    assert spec.draft_token_confidence_probs.tolist() == [
++        [0.75, 0.75, 0.0, 0.0],
++        [0.75, 0.75, 0.0, 0.0],
++        [0.75, 0.75, 0.0, 0.0],
++        [0.75, 0.75, 0.0, 0.0],
++    ]
++
++    # Also verify _sample_sequential_topk honors active_speculative_steps.
++    topk_model = SimpleNamespace(
++        compute_draft_logits=Mock(
++            side_effect=lambda h: torch.tensor([[1.0, 2.0, 6.0]]).expand(h.shape[0], 3)
++        ),
++        markov_embed=lambda ids: ids[:, None].float(),
++        apply_markov_bias_gathered=Mock(
++            side_effect=lambda emb, base_i, val_i, idx_i: base_i.scatter(
++                1, idx_i, val_i
++            )
++        ),
++        compute_confidence=Mock(
++            side_effect=lambda h, m: torch.full((h.shape[0],), 0.875)
++        ),
++    )
++    spec._draft_topk = 2
++    spec.model = topk_model
++    spec._sample_logits = Mock(side_effect=lambda logits_i, *args: logits_i.argmax(-1))
++    spec._sample_sequential_topk = DSparkSpeculator._sample_sequential_topk.__get__(spec)
++    spec.draft_tokens.fill_(9)
++    spec.draft_token_confidence_probs.fill_(1.0)
++    DSparkSpeculator._sample_sequential(
++        spec, 2, torch.zeros(max_reqs * n_spec, 8)
++    )
++    assert topk_model.apply_markov_bias_gathered.call_count == 3
++    assert spec.draft_tokens[:2].tolist() == [[2, 2, 2, 0], [2, 2, 2, 0]]
++    assert spec.draft_token_confidence_probs[:2].tolist() == [
++        [0.875, 0.875, 0.875, 0.0],
++        [0.875, 0.875, 0.875, 0.0],
++    ]
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index af71df562..59ce993ef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -23,7 +23,8 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
+ backbone forward AND the sequential Markov sampling.
+ """
+ 
+-from collections.abc import Sequence
++from collections.abc import Mapping, Sequence
++import os
+ from typing import Any
+ 
+ import torch
+@@ -55,6 +56,57 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ logger = init_logger(__name__)
+ 
++_MAX_STEPS_BY_BATCH_ENV = os.environ.get("SPARK_DS41F_DSPARK_MAX_STEPS_BY_BATCH", "")
++
++
++def parse_max_steps_by_batch(
++    spec: str | Mapping[int, int] | Sequence[tuple[int, int]] | None,
++    num_speculative_steps: int,
++) -> tuple[tuple[int, int], ...]:
++    """Parse concurrency-bounded speculative step schedule ``(min_reqs, max_steps)``.
++
++    Entries are sorted by ``min_reqs`` ascending, clamped to
++    ``[1, num_speculative_steps]``, and made monotonically non-increasing in
++    ``max_steps`` as ``min_reqs`` increases.
++    """
++    if not spec or num_speculative_steps <= 0:
++        return ()
++    raw_pairs: list[tuple[int, int]] = []
++    if isinstance(spec, str):
++        for token in spec.split(","):
++            token = token.strip()
++            if not token:
++                continue
++            if ":" not in token:
++                raise ValueError(
++                    f"Invalid max_steps_by_batch entry {token!r}; expected 'batch:steps'"
++                )
++            batch_s, steps_s = token.split(":", 1)
++            raw_pairs.append((int(batch_s.strip()), int(steps_s.strip())))
++    elif isinstance(spec, Mapping):
++        for batch_k, steps_v in spec.items():
++            raw_pairs.append((int(batch_k), int(steps_v)))
++    else:
++        for batch_k, steps_v in spec:
++            raw_pairs.append((int(batch_k), int(steps_v)))
++
++    by_batch: dict[int, int] = {}
++    for min_reqs, max_steps in sorted(raw_pairs, key=lambda item: item[0]):
++        if min_reqs < 1:
++            raise ValueError(f"min_reqs must be >= 1, got {min_reqs}")
++        clamped = max(1, min(int(max_steps), int(num_speculative_steps)))
++        by_batch[min_reqs] = min(by_batch.get(min_reqs, clamped), clamped)
++
++    normalized: list[tuple[int, int]] = []
++    running_cap = int(num_speculative_steps)
++    for min_reqs in sorted(by_batch):
++        running_cap = min(running_cap, by_batch[min_reqs])
++        if running_cap < num_speculative_steps and (
++            not normalized or normalized[-1][1] != running_cap
++        ):
++            normalized.append((min_reqs, running_cap))
++    return tuple(normalized)
++
+ 
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
+@@ -130,6 +182,54 @@ class DSparkSpeculator(DFlashSpeculator):
+             dtype=torch.bfloat16,
+             device=device,
+         )
++        schedule_spec = _MAX_STEPS_BY_BATCH_ENV or getattr(
++            self.draft_model_config.hf_config, "dspark_max_steps_by_batch", None
++        )
++        self._max_steps_by_batch = parse_max_steps_by_batch(
++            schedule_spec, self.num_speculative_steps
++        )
++        self._active_sample_indices = torch.empty(
++            self.max_num_reqs * self.num_speculative_steps,
++            dtype=torch.int64,
++            device=device,
++        )
++        self._active_confidence_out = torch.empty(
++            self.max_num_reqs * self.num_speculative_steps,
++            dtype=torch.float32,
++            device=device,
++        )
++        if self._max_steps_by_batch:
++            logger.info(
++                "DSpark concurrency-bounded draft depth schedule: %s (max=%d)",
++                self._max_steps_by_batch,
++                self.num_speculative_steps,
++            )
++
++    def active_speculative_steps(self, num_reqs: int) -> int:
++        """Return active sequential Markov draft steps for batch size ``num_reqs``."""
++        n_spec = self.num_speculative_steps
++        schedule = getattr(self, "_max_steps_by_batch", ())
++        if not schedule or num_reqs <= 0:
++            return n_spec
++        steps = n_spec
++        for min_reqs, max_steps in schedule:
++            if num_reqs >= min_reqs:
++                steps = min(steps, max_steps)
++            else:
++                break
++        return max(1, min(steps, n_spec))
++
++    def _configured_step_counts(self) -> tuple[int, ...]:
++        """All distinct active speculative step counts across batch sizes."""
++        n_spec = self.num_speculative_steps
++        schedule = getattr(self, "_max_steps_by_batch", ())
++        if not schedule:
++            return (n_spec,)
++        counts = [n_spec]
++        for _, steps in schedule:
++            if 1 <= steps <= n_spec and steps not in counts:
++                counts.append(steps)
++        return tuple(counts)
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -267,23 +367,28 @@ class DSparkSpeculator(DFlashSpeculator):
+             return
+         vocab_start, shard_vocab = self.model.draft_vocab_shard
+         dtype, head_width, markov_width = self.model.draft_logits_local_layout
+-        n_spec = self.num_speculative_steps
+-        for i in range(n_spec):
+-            register_greedy_markov_shard_pair_warmup(
+-                base_dtype=dtype,
+-                base_stride=n_spec * head_width,
+-                base_aligned=i * head_width * dtype.itemsize % 16 == 0,
+-                bias_dtype=dtype,
+-                bias_stride=markov_width,
+-                vocab=shard_vocab,
+-                vocab_start=vocab_start,
+-            )
+-            register_select_first_argmax_warmup(
+-                ranks=get_tensor_model_parallel_world_size(),
+-                output_dtype=self.draft_tokens.dtype,
+-                output_stride=self.draft_tokens.stride(0),
+-                output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
+-            )
++        configured_steps = (
++            self._configured_step_counts()
++            if hasattr(self, "_configured_step_counts")
++            else (self.num_speculative_steps,)
++        )
++        for steps in configured_steps:
++            for i in range(steps):
++                register_greedy_markov_shard_pair_warmup(
++                    base_dtype=dtype,
++                    base_stride=steps * head_width,
++                    base_aligned=i * head_width * dtype.itemsize % 16 == 0,
++                    bias_dtype=dtype,
++                    bias_stride=markov_width,
++                    vocab=shard_vocab,
++                    vocab_start=vocab_start,
++                )
++                register_select_first_argmax_warmup(
++                    ranks=get_tensor_model_parallel_world_size(),
++                    output_dtype=self.draft_tokens.dtype,
++                    output_stride=self.draft_tokens.stride(0),
++                    output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
++                )
+         tilelang_inputs.declare(
+             lambda: tilelang_inputs.gather_hidden_rows_calls(
+                 self.hidden_states.dtype, self.hidden_states.shape[1]
+@@ -323,11 +428,26 @@ class DSparkSpeculator(DFlashSpeculator):
+ 
+         # Sequential Markov sampling over the backbone's output hidden states.
+         n_spec = self.num_speculative_steps
++        active_steps_fn = getattr(self, "active_speculative_steps", None)
++        active_steps = (
++            active_steps_fn(num_reqs) if callable(active_steps_fn) else n_spec
++        )
+         num_sample = num_reqs * n_spec
++        active_sample = num_reqs * active_steps
++        if active_steps < n_spec:
++            indices_2d = self.sample_indices[:num_sample].view(num_reqs, n_spec)[
++                :, :active_steps
++            ]
++            active_buf = getattr(self, "_active_sample_indices", None)
++            if active_buf is not None:
++                sample_indices = active_buf[:active_sample]
++                sample_indices.view(num_reqs, active_steps).copy_(indices_2d)
++            else:
++                sample_indices = indices_2d.contiguous().view(-1)
++        else:
++            sample_indices = self.sample_indices[:num_sample]
+         # Per-(req, position) head hidden, ordered (req, step).
+-        sample_hidden = tilelang_inputs.gather_hidden_rows(
+-            head_hidden, self.sample_indices[:num_sample]
+-        )
++        sample_hidden = tilelang_inputs.gather_hidden_rows(head_hidden, sample_indices)
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         vocab_parallel = self._vocab_parallel_greedy(local_head)
+@@ -339,7 +459,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         else:
+             base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++        base_logits = base_logits.view(num_reqs, active_steps, vocab_size)
+ 
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+@@ -363,7 +483,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         else:
+             prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+ 
+-        for i in range(n_spec):
++        for i in range(active_steps):
+             # Sequential stage: Markov bias from the previously sampled token.
+             if table is not None:
+                 markov_embed = step_embed
+@@ -405,7 +525,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                     pair_width=4,
+                     embed=(
+                         (table, step_embed, confidence_embeds[:, i + 1])
+-                        if table is not None and i + 1 < n_spec
++                        if table is not None and i + 1 < active_steps
+                         else None
+                     ),
+                 )
+@@ -434,21 +554,52 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
++        if active_steps < n_spec:
++            self.draft_tokens[:num_reqs, active_steps:].zero_()
++
+         if self.use_confidence_head and table is not None:
+-            # Straight into the probabilities' rows (contiguous: [:num_reqs]).
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                confidence_embeds.flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
++            if active_steps == n_spec:
++                # Straight into the probabilities' rows (contiguous: [:num_reqs]).
++                self.model.compute_confidence(
++                    sample_hidden,
++                    confidence_embeds.flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                )
++            else:
++                conf_buf = getattr(self, "_active_confidence_out", None)
++                conf_out = (
++                    conf_buf[:active_sample]
++                    if conf_buf is not None
++                    else torch.empty(
++                        active_sample,
++                        dtype=self.draft_token_confidence_probs.dtype,
++                        device=sample_hidden.device,
++                    )
++                )
++                self.model.compute_confidence(
++                    sample_hidden,
++                    confidence_embeds[:, :active_steps].reshape(active_sample, -1),
++                    out=conf_out,
++                )
++                self.draft_token_confidence_probs[:num_reqs, :active_steps] = (
++                    conf_out.view(num_reqs, active_steps)
++                )
++                self.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
+         elif self.use_confidence_head:
+             confidence = self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+             )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+-                num_reqs, n_spec
++            self.draft_token_confidence_probs[:num_reqs, :active_steps] = (
++                confidence.view(num_reqs, active_steps)
+             )
++            if active_steps < n_spec:
++                self.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
++        elif (
++            active_steps < n_spec
++            and getattr(self, "draft_token_confidence_probs", None) is not None
++        ):
++            self.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+@@ -460,12 +611,27 @@ class DSparkSpeculator(DFlashSpeculator):
+         """
+         assert self._draft_topk is not None
+         n_spec = self.num_speculative_steps
+-        num_sample = num_reqs * n_spec
+-        sample_hidden = tilelang_inputs.gather_hidden_rows(
+-            head_hidden, self.sample_indices[:num_sample]
++        active_steps_fn = getattr(self, "active_speculative_steps", None)
++        active_steps = (
++            active_steps_fn(num_reqs) if callable(active_steps_fn) else n_spec
+         )
++        num_sample = num_reqs * n_spec
++        active_sample = num_reqs * active_steps
++        if active_steps < n_spec:
++            indices_2d = self.sample_indices[:num_sample].view(num_reqs, n_spec)[
++                :, :active_steps
++            ]
++            active_buf = getattr(self, "_active_sample_indices", None)
++            if active_buf is not None:
++                sample_indices = active_buf[:active_sample]
++                sample_indices.view(num_reqs, active_steps).copy_(indices_2d)
++            else:
++                sample_indices = indices_2d.contiguous().view(-1)
++        else:
++            sample_indices = self.sample_indices[:num_sample]
++        sample_hidden = tilelang_inputs.gather_hidden_rows(head_hidden, sample_indices)
+         base_logits = self.model.compute_draft_logits(sample_hidden)
+-        base_logits = base_logits.view(num_reqs, n_spec, -1)
++        base_logits = base_logits.view(num_reqs, active_steps, -1)
+         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
+         # Reuse the dense backbone output as the normal sampler's input. Fill
+         # once for all positions, then scatter only the corrected candidates
+@@ -476,7 +642,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         confidence_markov_embeds = []
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+ 
+-        for i in range(n_spec):
++        for i in range(active_steps):
+             markov_embed = self.model.markov_embed(prev)
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+@@ -492,14 +658,24 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
++        if active_steps < n_spec:
++            self.draft_tokens[:num_reqs, active_steps:].zero_()
++
+         if self.use_confidence_head:
+             confidence = self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+             )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+-                num_reqs, n_spec
++            self.draft_token_confidence_probs[:num_reqs, :active_steps] = (
++                confidence.view(num_reqs, active_steps)
+             )
++            if active_steps < n_spec:
++                self.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
++        elif (
++            active_steps < n_spec
++            and getattr(self, "draft_token_confidence_probs", None) is not None
++        ):
++            self.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
+ 
+     def _generate_draft(
+         self,
