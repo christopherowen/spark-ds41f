@@ -445,7 +445,13 @@ def repository_dirty() -> str:
     return result.stdout.strip()
 
 
+_TRACKED_SECRET_CACHE: dict[Path, list[str]] = sys.__dict__.setdefault("_spark_tracked_secret_cache", {})
+
+
 def tracked_secret_problems() -> list[str]:
+    cacheable = getattr(subprocess.run, "__module__", None) == "subprocess"
+    if cacheable and ROOT in _TRACKED_SECRET_CACHE:
+        return list(_TRACKED_SECRET_CACHE[ROOT])
     result = subprocess.run(
         ["git", "ls-files", "-z"],
         cwd=ROOT,
@@ -462,6 +468,7 @@ def tracked_secret_problems() -> list[str]:
         b"-----BEGIN " + b"PRIVATE KEY-----",
         b"-----BEGIN OPENSSH " + b"PRIVATE KEY-----",
     )
+    token_hints = (b"github_pat_", b"ghp_", b"hf_", b"tskey-")
     token_patterns = (
         re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
         re.compile(rb"\bghp_[A-Za-z0-9]{20,}\b"),
@@ -477,11 +484,14 @@ def tracked_secret_problems() -> list[str]:
         if not candidate.is_file() or candidate.stat().st_size > 2 * 1024 * 1024:
             continue
         contents = candidate.read_bytes()
-        if any(signature in contents for signature in signatures) or any(
-            pattern.search(contents) for pattern in token_patterns
+        if any(signature in contents for signature in signatures) or (
+            any(hint in contents for hint in token_hints)
+            and any(pattern.search(contents) for pattern in token_patterns)
         ):
             problems.append(f"tracked file contains a secret-like signature: {relative}")
-    return problems
+    if cacheable:
+        _TRACKED_SECRET_CACHE[ROOT] = problems
+    return list(problems)
 
 
 class Warn(str):
@@ -2544,14 +2554,25 @@ def expected_wheel_hashes() -> dict[str, str]:
     return expected
 
 
+_PATCHSET_SHA256_CACHE: dict[tuple[Path, str | None, int | None, tuple[str, ...]], str] = sys.__dict__.setdefault(
+    "_spark_patchset_sha256_cache", {}
+)
+
+
 def patchset_sha256(source: dict) -> str:
-    digest = hashlib.sha256()
-    for commit in source.get("applied_upstream_commits", []):
-        digest.update(commit["revision"].encode())
-        digest.update(b"\0")
+    commits = tuple(commit["revision"] for commit in source.get("applied_upstream_commits", []))
     series = source.get("patch_series")
-    if series:
-        series_path = ROOT / series
+    series_path = ROOT / series if series else None
+    cacheable = getattr(read_series, "__module__", None) == __name__
+    mtime_ns = series_path.stat().st_mtime_ns if cacheable and series_path and series_path.is_file() else None
+    key = (ROOT, series, mtime_ns, commits)
+    if cacheable and key in _PATCHSET_SHA256_CACHE:
+        return _PATCHSET_SHA256_CACHE[key]
+    digest = hashlib.sha256()
+    for revision in commits:
+        digest.update(revision.encode())
+        digest.update(b"\0")
+    if series_path is not None:
         digest.update(series_path.read_bytes())
         for patch_name in read_series(series_path):
             if patch_name.startswith("TODO-"):
@@ -2559,7 +2580,10 @@ def patchset_sha256(source: dict) -> str:
             digest.update(patch_name.encode())
             digest.update(b"\0")
             digest.update((series_path.parent / patch_name).read_bytes())
-    return digest.hexdigest()
+    result = digest.hexdigest()
+    if cacheable:
+        _PATCHSET_SHA256_CACHE[key] = result
+    return result
 
 
 BUILD_ROOT = ROOT / ".work/build"

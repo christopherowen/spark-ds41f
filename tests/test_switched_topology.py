@@ -5,8 +5,13 @@ the rails, rendezvous interfaces and traffic class); these tests cover what serv
 adds on a switch and that the render is sparknet's at the lock's revision.
 """
 import copy
+from pathlib import Path
+import sys
 import unittest
-from test_topology import spark, topology
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_topology import spark, topology  # noqa: E402
 
 
 def fixture(count=4, shape='tp4-ring'):

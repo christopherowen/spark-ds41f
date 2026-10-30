@@ -26,6 +26,30 @@ lab = importlib.util.module_from_spec(spec)
 loader.exec_module(lab)
 # Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
 lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
+_real_configuration = lab.spark.configuration
+
+
+def _host_independent_configuration(args=None):
+    try:
+        return _real_configuration(args)
+    except FileNotFoundError:
+        ring = lab.spark.read_json("config/examples/nodes-ring4.json")
+        head_ip = lab.spark.read_json("config/cluster.json")["distributed"]["master_addr"]
+        next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
+        ring_text = json.dumps(ring)
+        real_read_text = Path.read_text
+        with mock.patch.object(
+            Path,
+            "read_text",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: (
+                ring_text if self == ROOT / "config/nodes-ring4.local.json" else real_read_text(self, *a, **kw)
+            ),
+        ):
+            return _real_configuration(args)
+
+
+lab.spark.configuration = _host_independent_configuration
 # Never read or write the real hold and request files, even when the suite runs on dgx1.
 _STATE = tempfile.TemporaryDirectory()
 lab.HOLD = Path(_STATE.name) / "spark-hold.json"
@@ -1195,10 +1219,6 @@ class AnalysisTest(unittest.TestCase):
             self.assertFalse(lab.summarize_analysis(Path(directory))["passed"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TransferRouteTest(unittest.TestCase):
     def test_bulk_copies_prefer_the_transfer_host(self) -> None:
         nodes = {"ssh_user": "swank"}
@@ -1680,3 +1700,7 @@ class SourceRootTest(unittest.TestCase):
                 module.bundle(str(manifest), "img:tag", str(Path(directory) / "b"), "x")
             candidate = json.loads((Path(directory) / "b" / "candidate.json").read_text())
         self.assertEqual(candidate["workdir"], "vllm")
+
+
+if __name__ == "__main__":
+    unittest.main()
