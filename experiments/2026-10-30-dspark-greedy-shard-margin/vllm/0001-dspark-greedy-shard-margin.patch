@@ -1,0 +1,1267 @@
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+index 6d1dd230f..c1199c211 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_confidence.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+@@ -206,3 +206,34 @@ def test_declared_as_the_head_calls_it():
+         confidence.declare(HIDDEN, RANK)
+     calls = list(prepare.declared_calls(registry))
+     assert calls == [(confidence.dspark_confidence_kernel, (HIDDEN, RANK), {})]
++
++
++@pytest.mark.parametrize("reqs,n_spec", [(1, 5), (3, 5), (4, 3)])
++def test_calibrated_head_matches_exact_sum_with_margin_and_step_biases(reqs, n_spec):
++    rows = reqs * n_spec
++    hidden, markov, weight = _exact_inputs(rows, seed=rows + 17)
++    margins = (torch.arange(rows, device="cuda", dtype=torch.float32) - 2.0) * 0.25
++    step_biases = torch.arange(n_spec, device="cuda", dtype=torch.float32) * -0.125
++    margin_weight = 0.5
++    out = torch.empty(rows, dtype=torch.float32, device="cuda")
++    confidence.dspark_confidence_calibrated(
++        hidden, markov, weight, margins, step_biases, margin_weight, out
++    )
++    x = torch.cat([hidden, markov], dim=-1).float()
++    base_logit = F.linear(x, weight.view(1, -1)).squeeze(-1)
++    bias_per_row = step_biases.unsqueeze(0).expand(reqs, n_spec).reshape(-1)
++    want = torch.sigmoid(base_logit + margin_weight * margins + bias_per_row)
++    assert torch.equal(out, want)
++
++    head = confidence.TileLangConfidenceHead.__new__(confidence.TileLangConfidenceHead)
++    torch.nn.Module.__init__(head)
++    head.proj = SimpleNamespace(weight=weight.view(1, -1))
++    head.hidden_size, head.markov_rank = HIDDEN, RANK
++    via_head = head.probability(
++        hidden,
++        markov,
++        margins=margins,
++        margin_weight=margin_weight,
++        step_biases=step_biases,
++    )
++    assert torch.equal(via_head, want)
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index e7bb2942f..55ace95f6 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -1011,3 +1011,70 @@ def test_greedy_rejection(steps, drafts_dtype, ranks, pair_width, strided):
+     for r in range(len(counts)):
+         n = int(theirs[1][r])
+         _assert_same(ours[0][r, :n], theirs[0][r, :n], f"request {r}'s tokens")
++
++
++@pytest.mark.parametrize("ranks", [1, 3, 4])
++def test_greedy_shard_runner_up_and_margin_selection(ranks):
++    """With ``track_runner_up=True``, column 2 of the 16-byte shard pair row
++    holds the best non-winning partial maximum of the shard, and
++    ``select_first_argmax(..., margin_out=...)`` writes the non-negative logit
++    margin ``max(best - runner_up, 0)`` alongside the selected index and Markov
++    embeddings without altering columns 0..1 or the selected token."""
++    rows, vocab, width, steps = 9, 8192, 256, 5
++    g = torch.Generator(device=DEVICE).manual_seed(ranks + 99)
++    base = torch.randn(rows, ranks * vocab, generator=g, device=DEVICE).bfloat16()
++    bias = torch.randn(rows, ranks * vocab, generator=g, device=DEVICE).bfloat16()
++    # Row 1: exact tie between top-1 and top-2 across shards -> margin 0.
++    base[1, 10] = 25.0
++    bias[1, 10] = 0.0
++    if ranks > 1:
++        base[1, vocab + 20] = 25.0
++        bias[1, vocab + 20] = 0.0
++    else:
++        # Tie in another 2048-token block of the same shard.
++        base[1, 2048 + 20] = 25.0
++        bias[1, 2048 + 20] = 0.0
++
++    wide_plain, wide_margin = [], []
++    for rank in range(ranks):
++        s_base = base[:, rank * vocab : (rank + 1) * vocab]
++        s_bias = bias[:, rank * vocab : (rank + 1) * vocab]
++        p_plain = torch.full((rows, 4), -3.0, device=DEVICE)
++        p_margin = torch.full((rows, 4), -3.0, device=DEVICE)
++        v1, i1 = _scratch(rows, vocab)
++        v2, i2 = _scratch(rows, vocab)
++        tls.greedy_markov_shard_pair(
++            s_base, s_bias, rank * vocab, p_plain, v1, i1, track_runner_up=False
++        )
++        tls.greedy_markov_shard_pair(
++            s_base, s_bias, rank * vocab, p_margin, v2, i2, track_runner_up=True
++        )
++        _assert_same(p_margin[:, :2], p_plain[:, :2], "winner pair")
++        assert (p_plain[:, 2:] == -3.0).all()
++        assert (p_margin[:, 3] == -3.0).all()
++        assert (p_margin[:, 2] <= p_margin[:, 0]).all()
++        wide_plain.append(p_plain)
++        wide_margin.append(p_margin)
++
++    gathered = torch.cat(wide_margin, dim=-1)
++    plain_out = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
++    tls.select_first_argmax(torch.cat(wide_plain, dim=-1), plain_out, pair_width=4)
++
++    margin_out = torch.full((rows, steps), -9.0, device=DEVICE)
++    out = torch.full((rows, steps), -2, dtype=torch.int64, device=DEVICE)
++    table = torch.randn(ranks * vocab, width, generator=g, device=DEVICE).bfloat16()
++    step = torch.zeros(rows, width, dtype=torch.bfloat16, device=DEVICE)
++    confidence = torch.zeros(rows, steps, width, dtype=torch.bfloat16, device=DEVICE)
++    tls.select_first_argmax(
++        gathered,
++        out[:, 1],
++        pair_width=4,
++        embed=(table, step, confidence[:, 2]),
++        margin_out=margin_out[:, 1],
++    )
++    _assert_same(out[:, 1], plain_out, "selected index with margin")
++    assert (margin_out[:, 1] >= 0.0).all()
++    assert margin_out[1, 1].item() == 0.0
++    expected_embed = torch.nn.functional.embedding(plain_out, table)
++    _assert_same(step, expected_embed, "step embed with margin")
++    _assert_same(confidence[:, 2], expected_embed, "confidence embed with margin")
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index fa1c0e7c1..5001968fe 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -221,10 +221,22 @@ class DSparkConfidenceHead(nn.Module):
+         hidden: torch.Tensor,
+         markov_embed: torch.Tensor,
+         out: torch.Tensor | None = None,
++        *,
++        margins: torch.Tensor | None = None,
++        margin_weight: float = 0.0,
++        step_biases: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """The acceptance probability, ``sigmoid`` of the head's logit (into
+         ``out`` when given)."""
+-        return torch.sigmoid(self(hidden, markov_embed), out=out)
++        logit = self(hidden, markov_embed)
++        if margins is not None and margin_weight != 0.0:
++            logit = logit + float(margin_weight) * margins.reshape_as(logit)
++        if step_biases is not None:
++            n_spec = step_biases.numel()
++            logit = logit + step_biases.reshape(1, n_spec).expand(
++                logit.numel() // n_spec, n_spec
++            ).reshape_as(logit)
++        return torch.sigmoid(logit, out=out)
+ 
+ 
+ class Qwen3DSparkModel(DFlashQwen3Model):
+@@ -339,11 +351,29 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+         )
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
++        *,
++        margins: torch.Tensor | None = None,
++        margin_weight: float = 0.0,
++        step_biases: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        if margins is None and step_biases is None and margin_weight == 0.0:
++            return self.model.confidence_head.probability(
++                head_hidden, markov_embed, out
++            )
++        return self.model.confidence_head.probability(
++            head_hidden,
++            markov_embed,
++            out,
++            margins=margins,
++            margin_weight=margin_weight,
++            step_biases=step_biases,
++        )
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         model_weights = {}
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9c645e313..5f8222e6f 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -648,11 +648,26 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         head_hidden: torch.Tensor,
+         markov_embed: torch.Tensor,
+         out: torch.Tensor | None = None,
++        *,
++        margins: torch.Tensor | None = None,
++        margin_weight: float = 0.0,
++        step_biases: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token, into
+         ``out`` when given."""
+         assert self.model.confidence_head is not None
+-        return self.model.confidence_head.probability(head_hidden, markov_embed, out)
++        if margins is None and step_biases is None and margin_weight == 0.0:
++            return self.model.confidence_head.probability(
++                head_hidden, markov_embed, out
++            )
++        return self.model.confidence_head.probability(
++            head_hidden,
++            markov_embed,
++            out,
++            margins=margins,
++            margin_weight=margin_weight,
++            step_biases=step_biases,
++        )
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+index bb2197dbb..6a4f30cc7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -128,6 +128,97 @@ def _kernel(hidden: int, rank: int):
+     return dspark_confidence_kernel(hidden, rank)
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def dspark_confidence_calibrated_kernel(hidden: int, rank: int, threads: int = 128):
++    """``p[m] = sigmoid(w . [h[m] | e[m]] + margin_weight * margins[m] + step_biases[m % n_spec])``."""
++    assert hidden % _VEC == 0 and rank % _VEC == 0 and threads % 32 == 0
++    warps = threads // 32
++    hidden_pieces = hidden // _VEC
++    rank_pieces = rank // _VEC
++    hidden_chunks = -(-hidden_pieces // threads)
++    rank_chunks = -(-rank_pieces // threads)
++    chunks = hidden_chunks + rank_chunks
++    rows, n_spec = T.dynamic("rows, n_spec")
++
++    @T.prim_func
++    def dspark_confidence_calibrated(
++        h: T.Tensor((rows, hidden), T.bfloat16),
++        e: T.Tensor((rows, rank), T.bfloat16),
++        weight: T.Tensor((hidden + rank,), T.float32),
++        margins: T.Tensor((rows,), T.float32),
++        step_biases: T.Tensor((n_spec,), T.float32),
++        margin_weight: T.float32,
++        out: T.Tensor((rows,), T.float32),
++    ):
++        with T.Kernel(rows, threads=threads) as m:
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * _VEC,), T.bfloat16)
++            ws = T.alloc_local((chunks * _VEC,), T.float32)
++            acc = T.alloc_local((_VEC,), T.float32)
++            total = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            for c in T.unroll(hidden_chunks):
++                piece = c * threads + tx
++                if piece < hidden_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = h[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + i] = weight[piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + 4 + i] = weight[piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[c * _VEC + i] = T.float32(0)
++            for c in T.unroll(rank_chunks):
++                piece = c * threads + tx
++                k = hidden_chunks + c
++                if piece < rank_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = e[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + i] = weight[hidden + piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + 4 + i] = weight[hidden + piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[k * _VEC + i] = T.float32(0)
++            for i in T.unroll(_VEC):
++                acc[i] = T.float32(0)
++            for c in T.unroll(chunks):
++                for i in T.unroll(_VEC):
++                    acc[i] += T.cast(xs[c * _VEC + i], T.float32) * ws[c * _VEC + i]
++            for i in T.unroll(4):
++                acc[i] = acc[i] + acc[i + 4]
++            for i in T.unroll(2):
++                acc[i] = acc[i] + acc[i + 2]
++            acc[0] = acc[0] + acc[1]
++            acc[0] = T.warp_reduce_sum(acc[0])
++            if tx % 32 == 0:
++                partial[tx // 32] = acc[0]
++            T.sync_threads()
++            if tx == 0:
++                total[0] = T.float32(0)
++                for warp in T.serial(warps):
++                    total[0] += partial[warp]
++                total[0] = (
++                    total[0]
++                    + margin_weight * margins[m]
++                    + step_biases[m % n_spec]
++                )
++                out[m] = T.float32(1) / (T.float32(1) + T.exp(-total[0]))
++
++    return dspark_confidence_calibrated
++
++
++@cache
++def _calibrated_kernel(hidden: int, rank: int):
++    return dspark_confidence_calibrated_kernel(hidden, rank)
++
++
+ def declare(hidden: int, rank: int) -> None:
+     """Declare the head over ``hidden``-wide hidden states and ``rank``-wide Markov
+     embeddings, and keep it."""
+@@ -137,6 +228,14 @@ def declare(hidden: int, rank: int) -> None:
+     )
+ 
+ 
++def declare_calibrated(hidden: int, rank: int) -> None:
++    """Declare the margin- and step-bias-calibrated confidence head."""
++    prepare.declare(
++        lambda: [prepare.call(dspark_confidence_calibrated_kernel, hidden, rank)],
++        bind=lambda: _calibrated_kernel(hidden, rank),
++    )
++
++
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_dspark_confidence", mutates_args=("out",)
+ )
+@@ -180,6 +279,64 @@ def _dspark_confidence_fake(hidden, markov_embed, weight, out):
+     return None
+ 
+ 
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_dspark_confidence_calibrated", mutates_args=("out",)
++)
++def dspark_confidence_calibrated(
++    hidden: torch.Tensor,
++    markov_embed: torch.Tensor,
++    weight: torch.Tensor,
++    margins: torch.Tensor,
++    step_biases: torch.Tensor,
++    margin_weight: float,
++    out: torch.Tensor,
++) -> None:
++    """``out[m] = sigmoid(weight . [hidden[m] | markov_embed[m]] + margin_weight *
++    margins[m] + step_biases[m % K])``."""
++    rows, width = hidden.shape
++    rank = markov_embed.shape[-1]
++    n_spec = step_biases.numel()
++    if (
++        hidden.dtype != torch.bfloat16
++        or markov_embed.dtype != torch.bfloat16
++        or weight.dtype != torch.float32
++        or margins.dtype != torch.float32
++        or step_biases.dtype != torch.float32
++        or out.dtype != torch.float32
++        or markov_embed.shape != (rows, rank)
++        or weight.shape != (width + rank,)
++        or margins.shape != (rows,)
++        or step_biases.ndim != 1
++        or n_spec <= 0
++        or (rows % n_spec != 0)
++        or out.shape != (rows,)
++        or not (hidden.is_contiguous() and markov_embed.is_contiguous())
++        or not (
++            weight.is_contiguous()
++            and margins.is_contiguous()
++            and step_biases.is_contiguous()
++            and out.is_contiguous()
++        )
++    ):
++        raise ValueError(
++            "The calibrated TileLang DSpark confidence head needs contiguous BF16 "
++            "[M, H] hidden and [M, R] Markov rows, FP32 [H + R] weight, FP32 [M] "
++            "margins, FP32 [K] step_biases (M % K == 0), and FP32 [M] output"
++        )
++    if rows == 0:
++        return
++    _calibrated_kernel(width, rank)(
++        hidden, markov_embed, weight, margins, step_biases, float(margin_weight), out
++    )
++
++
++@dspark_confidence_calibrated.register_fake
++def _dspark_confidence_calibrated_fake(
++    hidden, markov_embed, weight, margins, step_biases, margin_weight, out
++):
++    return None
++
++
+ class TileLangConfidenceHead(DSparkConfidenceHead):
+     """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
+     probability is the one-launch kernel."""
+@@ -189,8 +346,10 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+         self.hidden_size = hidden_size
+         self.markov_rank = markov_rank
+ 
+-    def declare_kernels(self) -> None:
++    def declare_kernels(self, calibrated: bool = False) -> None:
+         declare(self.hidden_size, self.markov_rank)
++        if calibrated:
++            declare_calibrated(self.hidden_size, self.markov_rank)
+ 
+     def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
+         raise NotImplementedError(
+@@ -202,6 +361,10 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+         hidden: torch.Tensor,
+         markov_embed: torch.Tensor,
+         out: torch.Tensor | None = None,
++        *,
++        margins: torch.Tensor | None = None,
++        margin_weight: float = 0.0,
++        step_biases: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Each row's acceptance probability, into ``out`` (FP32 [rows],
+         contiguous) when given."""
+@@ -209,13 +372,33 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+             out = torch.empty(
+                 hidden.shape[0], dtype=torch.float32, device=hidden.device
+             )
+-        dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
++        if margins is None and step_biases is None and margin_weight == 0.0:
++            dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
++            return out
++        if margins is None:
++            margins = torch.zeros(
++                hidden.shape[0], dtype=torch.float32, device=hidden.device
++            )
++        if step_biases is None:
++            step_biases = torch.zeros(1, dtype=torch.float32, device=hidden.device)
++        dspark_confidence_calibrated(
++            hidden,
++            markov_embed,
++            self.proj.weight.view(-1),
++            margins,
++            step_biases,
++            float(margin_weight),
++            out,
++        )
+         return out
+ 
+ 
+ __all__ = [
+     "TileLangConfidenceHead",
+     "declare",
++    "declare_calibrated",
+     "dspark_confidence",
++    "dspark_confidence_calibrated",
++    "dspark_confidence_calibrated_kernel",
+     "dspark_confidence_kernel",
+ ]
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 7189634a0..46e1ecfce 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -2041,7 +2041,9 @@ _FINISH_LANES = (1, 2)
+ def finish_argmax_kernel(output: str, per_lane: int = 1):
+     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
+     maximum and its global index ``+ vocab_start`` as FP32 into ``out[row *
+-    out_stride]`` and the element after it) and ``_finish_argmax`` ("int32" /
++    out_stride]`` and the element after it; "pair_margin": also the shard's
++    runner-up block maximum into ``out[row * out_stride + 2]``) and
++    ``_finish_argmax`` ("int32" /
+     "int64": the index into ``out[row * out_stride]``), from the parts' scratch, a
+     warp a row. As Triton's, every part
+     is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
+@@ -2050,7 +2052,8 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+     rows, values_len, indices_len, out_len = T.dynamic(
+         "rows, values_len, indices_len, out_len"
+     )
+-    pair = output == "pair"
++    with_margin = output == "pair_margin"
++    pair = output == "pair" or with_margin
+     out_dtype = "float32" if pair else output
+ 
+     @T.prim_func
+@@ -2084,12 +2087,27 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+             for k in T.unroll(1, per_lane):
+                 _first_keep_or_take(best, best_index, v[k], ix[k])
+             _warp_first_argmax(best, best_index, other, other_index)
++            if with_margin:
++                runner = T.alloc_local((1,), T.float32)
++                runner[0] = -T.infinity(T.float32)
++                for k in T.unroll(per_lane):
++                    part = tx + k * 32
++                    cand = T.if_then_else(
++                        (part < parts) & (ix[k] != best_index[0]) & (v[k] == v[k]),
++                        v[k],
++                        -T.infinity(T.float32),
++                    )
++                    runner[0] = T.max(runner[0], cand)
++                for d in (16, 8, 4, 2, 1):
++                    runner[0] = T.max(runner[0], T.shfl_xor(runner[0], d))
+             if tx == 0:
+                 if pair:
+                     out[T.cast(row, T.int64) * out_stride] = best[0]
+                     out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
+                         best_index[0] + vocab_start, T.float32
+                     )
++                    if with_margin:
++                        out[T.cast(row, T.int64) * out_stride + 2] = runner[0]
+                 else:
+                     out[T.cast(row, T.int64) * out_stride] = T.cast(
+                         best_index[0], out_dtype
+@@ -2121,6 +2139,38 @@ def _select_pairs(
+         _first_exchange(best, best_index, other, other_index, 1)
+ 
+ 
++@T.macro
++def _select_runner_up(
++    pairs, best, best_index, runner, row, tx, ranks, span, pair_width
++):
++    """Every lane below ``span`` reduces the global runner-up value across
++    the non-winning ranks' maxima and the winning rank's shard runner-up."""
++    lane = T.min(tx, ranks - 1)
++    value = pairs[row, pair_width * lane]
++    index = T.cast(pairs[row, pair_width * lane + 1], T.int32)
++    shard_runner = pairs[row, pair_width * lane + 2]
++    cand = T.if_then_else(
++        tx < ranks,
++        T.if_then_else(
++            index == best_index[0],
++            shard_runner,
++            T.if_then_else(value == value, value, -T.infinity(T.float32)),
++        ),
++        -T.infinity(T.float32),
++    )
++    runner[0] = T.if_then_else(cand == cand, cand, -T.infinity(T.float32))
++    if span >= 32:
++        runner[0] = T.max(runner[0], T.shfl_xor(runner[0], 16))
++    if span >= 16:
++        runner[0] = T.max(runner[0], T.shfl_xor(runner[0], 8))
++    if span >= 8:
++        runner[0] = T.max(runner[0], T.shfl_xor(runner[0], 4))
++    if span >= 4:
++        runner[0] = T.max(runner[0], T.shfl_xor(runner[0], 2))
++    if span >= 2:
++        runner[0] = T.max(runner[0], T.shfl_xor(runner[0], 1))
++
++
+ @T.macro
+ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_rows):
+     """Row ``token`` of the Markov embedding ``table`` into both outputs' ``row``,
+@@ -2134,7 +2184,11 @@ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def select_first_argmax_kernel(
+-    output_dtype: str, ranks: int, embed_width: int = 0, pair_width: int = 2
++    output_dtype: str,
++    ranks: int,
++    embed_width: int = 0,
++    pair_width: int = 2,
++    write_margin: bool = False,
+ ):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
+@@ -2147,14 +2201,18 @@ def select_first_argmax_kernel(
+ 
+     With ``embed_width``, the drafter's next step: the selected token's row of the
+     Markov embedding ``table`` ([vocab, embed_width] BF16) into ``step_out[row]``
+-    and ``confidence_out[row]``, which ``nn.Embedding`` and a stack wrote."""
++    and ``confidence_out[row]``, which ``nn.Embedding`` and a stack wrote.
++    With ``write_margin``, also writes ``max(best - runner_up, 0.0)`` into
++    ``margin_out[row * margin_stride]``."""
+     assert 1 <= ranks <= 32
+     assert embed_width % 32 == 0
++    if write_margin:
++        assert pair_width >= 3
+     rows, width, out_len = T.dynamic("rows, width, out_len")
+     pairs_stride = T.dynamic("pairs_stride", "int64")
+     span = 1 << max(ranks - 1, 0).bit_length()
+ 
+-    if not embed_width:
++    if not embed_width and not write_margin:
+ 
+         @T.prim_func
+         def select_first_argmax(
+@@ -2180,14 +2238,96 @@ def select_first_argmax_kernel(
+ 
+         return select_first_argmax
+ 
++    if not embed_width and write_margin:
++        margin_len = T.dynamic("margin_len")
++
++        @T.prim_func
++        def select_first_argmax_margin(
++            pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
++            out: T.Tensor((out_len,), output_dtype),
++            out_stride: T.int64,
++            margin_out: T.Tensor((margin_len,), T.float32),
++            margin_stride: T.int64,
++        ):
++            with T.Kernel(rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                runner = T.alloc_local((1,), T.float32)
++                _select_pairs(
++                    pairs, best, best_index, other, other_index, row, tx, ranks,
++                    span, pair_width,
++                )  # fmt: skip
++                _select_runner_up(
++                    pairs, best, best_index, runner, row, tx, ranks, span, pair_width
++                )
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
++                    margin_out[T.cast(row, T.int64) * margin_stride] = T.if_then_else(
++                        (best[0] == best[0])
++                        & (best[0] > -T.infinity(T.float32))
++                        & (runner[0] > -T.infinity(T.float32)),
++                        T.max(best[0] - runner[0], T.float32(0)),
++                        T.float32(0),
++                    )
++
++        return select_first_argmax_margin
++
+     table_rows = T.dynamic("table_rows")
+     step_stride, confidence_stride = T.dynamic(
+         "step_stride, confidence_stride", "int64"
+     )
+     per_lane = embed_width // 32
+ 
++    if not write_margin:
++
++        @T.prim_func
++        def select_first_argmax_embed(
++            pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
++            out: T.Tensor((out_len,), output_dtype),
++            out_stride: T.int64,
++            table: T.Tensor((table_rows, embed_width), T.bfloat16),
++            step_out: T.StridedTensor(
++                (rows, embed_width), (step_stride, 1), T.bfloat16
++            ),
++            confidence_out: T.StridedTensor(
++                (rows, embed_width), (confidence_stride, 1), T.bfloat16
++            ),
++        ):
++            with T.Kernel(rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                selected = T.alloc_shared((1,), T.int32)
++                _select_pairs(
++                    pairs, best, best_index, other, other_index, row, tx, ranks,
++                    span, pair_width,
++                )  # fmt: skip
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
++                    selected[0] = best_index[0]
++                T.sync_threads()
++                _embed_row(
++                    table, selected[0], step_out, confidence_out, row, tx, per_lane,
++                    table_rows,
++                )  # fmt: skip
++
++        return select_first_argmax_embed
++
++    margin_len = T.dynamic("margin_len")
++
+     @T.prim_func
+-    def select_first_argmax_embed(
++    def select_first_argmax_embed_margin(
+         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
+@@ -2196,6 +2336,8 @@ def select_first_argmax_kernel(
+         confidence_out: T.StridedTensor(
+             (rows, embed_width), (confidence_stride, 1), T.bfloat16
+         ),
++        margin_out: T.Tensor((margin_len,), T.float32),
++        margin_stride: T.int64,
+     ):
+         with T.Kernel(rows, threads=32) as row:
+             T.import_source(_HEADER)
+@@ -2204,15 +2346,26 @@ def select_first_argmax_kernel(
+             best_index = T.alloc_local((1,), T.int32)
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
++            runner = T.alloc_local((1,), T.float32)
+             selected = T.alloc_shared((1,), T.int32)
+             _select_pairs(
+                 pairs, best, best_index, other, other_index, row, tx, ranks,
+                 span, pair_width,
+             )  # fmt: skip
++            _select_runner_up(
++                pairs, best, best_index, runner, row, tx, ranks, span, pair_width
++            )
+             if tx == 0:
+                 out[T.cast(row, T.int64) * out_stride] = T.cast(
+                     best_index[0], output_dtype
+                 )
++                margin_out[T.cast(row, T.int64) * margin_stride] = T.if_then_else(
++                    (best[0] == best[0])
++                    & (best[0] > -T.infinity(T.float32))
++                    & (runner[0] > -T.infinity(T.float32)),
++                    T.max(best[0] - runner[0], T.float32(0)),
++                    T.float32(0),
++                )
+                 selected[0] = best_index[0]
+             T.sync_threads()
+             _embed_row(
+@@ -2220,7 +2373,7 @@ def select_first_argmax_kernel(
+                 table_rows,
+             )  # fmt: skip
+ 
+-    return select_first_argmax_embed
++    return select_first_argmax_embed_margin
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -2345,6 +2498,7 @@ def greedy_markov_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    track_runner_up: bool = False,
+ ) -> None:
+     """``dspark.greedy.greedy_markov_shard_pair``."""
+     if base_logits.shape != markov_bias.shape:
+@@ -2355,6 +2509,8 @@ def greedy_markov_shard_pair(
+     rows, vocab = base_logits.shape
+     if vocab_start + vocab > 1 << 24:
+         raise ValueError("vocabulary indices must stay exact in FP32")
++    if track_runner_up and pairs.stride(0) < 3:
++        raise ValueError("runner-up tracking requires at least 3 columns per pair row")
+     parts = -(-vocab // GREEDY_BLOCK)
+     if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+         raise ValueError("DSpark greedy scratch is smaller than the logits require")
+@@ -2367,7 +2523,7 @@ def greedy_markov_shard_pair(
+         parts,
+         pairs.stride(0),
+         vocab_start,
+-        "pair",
++        "pair_margin" if track_runner_up else "pair",
+     )
+ 
+ 
+@@ -2378,6 +2534,7 @@ def greedy_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    track_runner_up: bool = False,
+ ) -> None:
+     """``dspark.greedy.greedy_shard_pair``."""
+     rows = logits.shape[0]
+@@ -2385,6 +2542,8 @@ def greedy_shard_pair(
+         raise ValueError("the shard's real vocabulary exceeds its logits")
+     if vocab_start + vocab > 1 << 24:
+         raise ValueError("vocabulary indices must stay exact in FP32")
++    if track_runner_up and pairs.stride(0) < 3:
++        raise ValueError("runner-up tracking requires at least 3 columns per pair row")
+     parts = -(-vocab // GREEDY_BLOCK)
+     if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+         raise ValueError("greedy scratch is smaller than the logits require")
+@@ -2397,7 +2556,7 @@ def greedy_shard_pair(
+         parts,
+         pairs.stride(0),
+         vocab_start,
+-        "pair",
++        "pair_margin" if track_runner_up else "pair",
+     )
+ 
+ 
+@@ -2406,37 +2565,73 @@ def select_first_argmax(
+     output: torch.Tensor,
+     pair_width: int = 2,
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    margin_out: torch.Tensor | None = None,
+ ) -> None:
+     """``dspark.greedy.select_first_argmax``; with ``embed`` (table, step rows,
+-    confidence rows), also the selected tokens' Markov embeddings."""
++    confidence rows), also the selected tokens' Markov embeddings; with
++    ``margin_out``, also the non-negative logit margin ``max(best - runner_up, 0)``."""
+     rows = pairs.shape[0]
+     if rows == 0:
+         return
++    if margin_out is not None and pair_width < 4:
++        raise ValueError("margin_out requires pair_width >= 4")
+     ranks = pairs.shape[1] // pair_width
++    write_margin = margin_out is not None
+     if embed is None:
+         kernel = _kernel(
+             select_first_argmax_kernel,
+-            *select_first_argmax_key(output, ranks, 0, pair_width),
++            *select_first_argmax_key(output, ranks, 0, pair_width, write_margin),
+         )
+-        kernel(pairs, _flat(output), output.stride(0))
++        if not write_margin:
++            kernel(pairs, _flat(output), output.stride(0))
++        else:
++            assert margin_out is not None
++            kernel(
++                pairs,
++                _flat(output),
++                output.stride(0),
++                _flat(margin_out),
++                margin_out.stride(0),
++            )
+         return
+     table, step_out, confidence_out = embed
+     kernel = _kernel(
+         select_first_argmax_kernel,
+-        *select_first_argmax_key(output, ranks, table.shape[1], pair_width),
++        *select_first_argmax_key(
++            output, ranks, table.shape[1], pair_width, write_margin
++        ),
+     )
+-    kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
++    if not write_margin:
++        kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
++    else:
++        assert margin_out is not None
++        kernel(
++            pairs,
++            _flat(output),
++            output.stride(0),
++            table,
++            step_out,
++            confidence_out,
++            _flat(margin_out),
++            margin_out.stride(0),
++        )
+ 
+ 
+ def select_first_argmax_key(
+-    output: torch.Tensor | torch.dtype, ranks: int, embed_width: int, pair_width: int
++    output: torch.Tensor | torch.dtype,
++    ranks: int,
++    embed_width: int,
++    pair_width: int,
++    write_margin: bool = False,
+ ) -> tuple:
+     """``select_first_argmax_kernel``'s key: the width-2 pairs (Triton's layout)
+     keep the original kernel's key."""
+     dtype = _DTYPES[output if isinstance(output, torch.dtype) else output.dtype]
+-    if pair_width == 2:
+-        return (dtype, ranks, embed_width) if embed_width else (dtype, ranks)
+-    return (dtype, ranks, embed_width, pair_width)
++    if not write_margin:
++        if pair_width == 2:
++            return (dtype, ranks, embed_width) if embed_width else (dtype, ranks)
++        return (dtype, ranks, embed_width, pair_width)
++    return (dtype, ranks, embed_width, pair_width, True)
+ 
+ 
+ def markov_anchor_embed(
+@@ -2464,10 +2659,11 @@ def markov_embed_calls(
+     output_dtype: torch.dtype,
+     ranks: int,
+     embed_width: int,
++    write_margin: bool = False,
+ ) -> list:
+     """The drafter's Markov embeddings: the anchor's, and the selection that also
+     embeds the next step's token."""
+-    return [
++    calls = [
+         _call(
+             markov_anchor_embed_kernel,
+             _DTYPES[ids_dtype],
+@@ -2479,6 +2675,16 @@ def markov_embed_calls(
+             *select_first_argmax_key(output_dtype, ranks, embed_width, 4),
+         ),
+     ]
++    if write_margin:
++        calls.append(
++            _call(
++                select_first_argmax_kernel,
++                *select_first_argmax_key(
++                    output_dtype, ranks, embed_width, 4, write_margin=True
++                ),
++            )
++        )
++    return calls
+ 
+ 
+ def sample_greedy_markov(
+@@ -2892,8 +3098,10 @@ def greedy_calls(
+     markov: Sequence[tuple[torch.dtype, torch.dtype]] = (),
+     logits: Sequence[torch.dtype] = (),
+     select: Sequence[tuple[torch.dtype, int, int]] = (),
++    select_margin: Sequence[tuple[torch.dtype, int, int]] = (),
+     finish_outputs: Sequence[torch.dtype] = (),
+     rejection: Sequence[tuple[int, int, int]] = (),
++    track_runner_up: bool = False,
+ ) -> list:
+     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
+     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
+@@ -2916,6 +3124,11 @@ def greedy_calls(
+     ]
+     if markov or logits:
+         calls += [_call(finish_argmax_kernel, "pair", lanes) for lanes in _FINISH_LANES]
++        if track_runner_up:
++            calls += [
++                _call(finish_argmax_kernel, "pair_margin", lanes)
++                for lanes in _FINISH_LANES
++            ]
+     calls += [
+         _call(finish_argmax_kernel, _DTYPES[dtype], lanes)
+         for dtype in finish_outputs
+@@ -2927,6 +3140,13 @@ def greedy_calls(
+         )
+         for dtype, ranks, width in select
+     ]
++    calls += [
++        _call(
++            select_first_argmax_kernel,
++            *select_first_argmax_key(dtype, ranks, 0, width, write_margin=True),
++        )
++        for dtype, ranks, width in select_margin
++    ]
+     calls += [
+         _call(
+             greedy_rejection_kernel, *greedy_rejection_key(width, dtype, ranks, pairs)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index fbcf7e526..e6c65b6bf 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -137,6 +137,7 @@ def register_greedy_markov_shard_pair_warmup(
+     bias_stride: int,
+     vocab: int,
+     vocab_start: int,
++    track_runner_up: bool = False,
+ ) -> None:
+     """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
+     and a Markov bias of these dtypes (the TileLang kernels take any stride,
+@@ -144,19 +145,28 @@ def register_greedy_markov_shard_pair_warmup(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.declare(
+-        lambda: tilelang_sampling.greedy_calls(markov=[(base_dtype, bias_dtype)])
++        lambda: tilelang_sampling.greedy_calls(
++            markov=[(base_dtype, bias_dtype)], track_runner_up=track_runner_up
++        )
+     )
+ 
+ 
+ def register_greedy_shard_pair_warmup(
+-    *, logits_dtype: torch.dtype, logits_stride: int, vocab: int, vocab_start: int
++    *,
++    logits_dtype: torch.dtype,
++    logits_stride: int,
++    vocab: int,
++    vocab_start: int,
++    track_runner_up: bool = False,
+ ) -> None:
+     """Declare the kernels ``greedy_shard_pair`` launches for logits of
+     ``logits_dtype``."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.declare(
+-        lambda: tilelang_sampling.greedy_calls(logits=[logits_dtype])
++        lambda: tilelang_sampling.greedy_calls(
++            logits=[logits_dtype], track_runner_up=track_runner_up
++        )
+     )
+ 
+ 
+@@ -167,6 +177,7 @@ def register_select_first_argmax_warmup(
+     output_stride: int,
+     output_aligned: bool,
+     pair_width: int = 4,
++    write_margin: bool = False,
+ ) -> None:
+     """Declare ``select_first_argmax`` for an output column of ``output_dtype``
+     over pairs of ``pair_width`` columns (the runner's 16-byte rows)."""
+@@ -174,7 +185,8 @@ def register_select_first_argmax_warmup(
+ 
+     tilelang_sampling.declare(
+         lambda: tilelang_sampling.greedy_calls(
+-            select=[(output_dtype, ranks, pair_width)]
++            select=[(output_dtype, ranks, pair_width)],
++            select_margin=[(output_dtype, ranks, pair_width)] if write_margin else (),
+         )
+     )
+ 
+@@ -200,11 +212,16 @@ def greedy_markov_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    track_runner_up: bool = False,
+ ) -> None:
+     """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
+     over one vocabulary shard into the first two columns of FP32 ``pairs`` ([rows,
+     2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place).
+ 
++    With ``track_runner_up=True`` on a 4-column pair row, column 2 also receives
++    the best non-winning partial maximum of the shard at zero extra communication
++    bytes.
++
+     The value keeps the materialized sum's rounding, and the index is the
+     shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
+     2**24). All-gathering the pairs across shards and passing them to
+@@ -214,7 +231,13 @@ def greedy_markov_shard_pair(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.greedy_markov_shard_pair(
+-        base_logits, markov_bias, vocab_start, pairs, partial_values, partial_indices
++        base_logits,
++        markov_bias,
++        vocab_start,
++        pairs,
++        partial_values,
++        partial_indices,
++        track_runner_up=track_runner_up,
+     )
+ 
+ 
+@@ -225,6 +248,7 @@ def greedy_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    track_runner_up: bool = False,
+ ) -> None:
+     """``greedy_markov_shard_pair`` without a bias: each row's ``(max, global
+     index)`` over the first ``vocab`` columns of one vocabulary shard of
+@@ -233,7 +257,13 @@ def greedy_shard_pair(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.greedy_shard_pair(
+-        logits, vocab, vocab_start, pairs, partial_values, partial_indices
++        logits,
++        vocab,
++        vocab_start,
++        pairs,
++        partial_values,
++        partial_indices,
++        track_runner_up=track_runner_up,
+     )
+ 
+ 
+@@ -242,14 +272,18 @@ def select_first_argmax(
+     output: torch.Tensor,
+     pair_width: int = 2,
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    margin_out: torch.Tensor | None = None,
+ ) -> None:
+     """Reduce all-gathered shard pairs ([rows, pair_width * ranks], FP32, each
+     rank's pair first in its ``pair_width`` columns) to the first maximum's global
+     index, written to ``output`` (one per row). With ``embed`` (a BF16 Markov W1
+-    table and two row outputs), also the selected tokens' rows of the table."""
++    table and two row outputs), also the selected tokens' rows of the table; with
++    ``margin_out``, also the non-negative logit margin ``max(best - runner_up, 0)``."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+-    tilelang_sampling.select_first_argmax(pairs, output, pair_width, embed)
++    tilelang_sampling.select_first_argmax(
++        pairs, output, pair_width, embed, margin_out=margin_out
++    )
+ 
+ 
+ def markov_anchor_embed(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index af71df562..db53a4ab1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -24,6 +24,7 @@ backbone forward AND the sequential Markov sampling.
+ """
+ 
+ from collections.abc import Sequence
++import os
+ from typing import Any
+ 
+ import torch
+@@ -56,6 +57,46 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ logger = init_logger(__name__)
+ 
+ 
++def _parse_confidence_calibration(
++    hf_config: Any, n_spec: int, device: torch.device
++) -> tuple[float, torch.Tensor | None]:
++    """Read optional logit-margin weight and per-position step biases for
++    DSpark's acceptance-confidence head."""
++    env_weight = os.environ.get("SPARK_DS41F_DSPARK_MARGIN_WEIGHT")
++    if env_weight is not None and env_weight.strip() != "":
++        margin_weight = float(env_weight)
++    else:
++        margin_weight = float(getattr(hf_config, "dspark_margin_weight", 0.0) or 0.0)
++    if margin_weight < 0.0:
++        raise ValueError(
++            f"dspark_margin_weight must be non-negative, got {margin_weight}"
++        )
++
++    env_biases = os.environ.get("SPARK_DS41F_DSPARK_CONFIDENCE_STEP_BIASES")
++    raw_biases: Sequence[float] | None
++    if env_biases is not None and env_biases.strip() != "":
++        raw_biases = [float(x.strip()) for x in env_biases.split(",") if x.strip()]
++    else:
++        cfg_biases = getattr(hf_config, "dspark_confidence_step_biases", None)
++        if isinstance(cfg_biases, str):
++            raw_biases = [float(x.strip()) for x in cfg_biases.split(",") if x.strip()]
++        elif cfg_biases is not None:
++            raw_biases = [float(x) for x in cfg_biases]
++        else:
++            raw_biases = None
++
++    has_nonzero_bias = bool(raw_biases and any(b != 0.0 for b in raw_biases))
++    if margin_weight == 0.0 and not has_nonzero_bias:
++        return 0.0, None
++
++    values = [0.0] * n_spec
++    if raw_biases:
++        for i in range(n_spec):
++            values[i] = raw_biases[i] if i < len(raw_biases) else raw_biases[-1]
++    step_biases = torch.tensor(values, dtype=torch.float32, device=device)
++    return margin_weight, step_biases
++
++
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
+ 
+@@ -130,6 +171,17 @@ class DSparkSpeculator(DFlashSpeculator):
+             dtype=torch.bfloat16,
+             device=device,
+         )
++        self._draft_logit_margins = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps),
++            dtype=torch.float32,
++            device=device,
++        )
++        (
++            self._confidence_margin_weight,
++            self._confidence_step_biases,
++        ) = _parse_confidence_calibration(
++            self.draft_model_config.hf_config, self.num_speculative_steps, device
++        )
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -183,6 +235,18 @@ class DSparkSpeculator(DFlashSpeculator):
+             # The acceptance estimator is not needed when a trained confidence head
+             # is available.
+             self.use_acceptance_estimator = False
++            if (
++                self._confidence_margin_weight != 0.0
++                or self._confidence_step_biases is not None
++            ):
++                declare_fn = getattr(
++                    model.model.confidence_head, "declare_kernels", None
++                )
++                if callable(declare_fn):
++                    try:
++                        declare_fn(calibrated=True)
++                    except TypeError:
++                        declare_fn()
+         return model
+ 
+     def _sample_logits(
+@@ -268,6 +332,10 @@ class DSparkSpeculator(DFlashSpeculator):
+         vocab_start, shard_vocab = self.model.draft_vocab_shard
+         dtype, head_width, markov_width = self.model.draft_logits_local_layout
+         n_spec = self.num_speculative_steps
++        track_margin = bool(
++            self.use_confidence_head
++            and getattr(self, "_confidence_margin_weight", 0.0) != 0.0
++        )
+         for i in range(n_spec):
+             register_greedy_markov_shard_pair_warmup(
+                 base_dtype=dtype,
+@@ -277,12 +345,14 @@ class DSparkSpeculator(DFlashSpeculator):
+                 bias_stride=markov_width,
+                 vocab=shard_vocab,
+                 vocab_start=vocab_start,
++                track_runner_up=track_margin,
+             )
+             register_select_first_argmax_warmup(
+                 ranks=get_tensor_model_parallel_world_size(),
+                 output_dtype=self.draft_tokens.dtype,
+                 output_stride=self.draft_tokens.stride(0),
+                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
++                write_margin=track_margin,
+             )
+         tilelang_inputs.declare(
+             lambda: tilelang_inputs.gather_hidden_rows_calls(
+@@ -301,6 +371,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                     self.draft_tokens.dtype,
+                     get_tensor_model_parallel_world_size(),
+                     table.shape[1],
++                    write_margin=track_margin,
+                 )
+             )
+ 
+@@ -344,6 +415,14 @@ class DSparkSpeculator(DFlashSpeculator):
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         confidence_markov_embeds = []
++        margin_weight = float(getattr(self, "_confidence_margin_weight", 0.0) or 0.0)
++        step_biases = getattr(self, "_confidence_step_biases", None)
++        margins_buf = getattr(self, "_draft_logit_margins", None)
++        track_margin = bool(
++            self.use_confidence_head
++            and margin_weight != 0.0
++            and margins_buf is not None
++        )
+ 
+         # Anchor (bonus) token per request = the input id at query offset 0,
+         # read via the precomputed persistent index (fixed buffer for capture).
+@@ -397,6 +476,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                     pairs,
+                     self._greedy_partial_values,
+                     self._greedy_partial_indices,
++                    track_runner_up=track_margin,
+                 )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                 select_first_argmax(
+@@ -408,6 +488,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                         if table is not None and i + 1 < n_spec
+                         else None
+                     ),
++                    margin_out=margins_buf[:num_reqs, i] if track_margin else None,
+                 )
+                 prev = draft_sampled_i
+                 continue
+@@ -434,18 +515,41 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
++        calibrated = track_margin or step_biases is not None
++        margin_rows = (
++            margins_buf[:num_reqs].reshape(-1) if track_margin else None
++        )
+         if self.use_confidence_head and table is not None:
+             # Straight into the probabilities' rows (contiguous: [:num_reqs]).
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                confidence_embeds.flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
++            if not calibrated:
++                self.model.compute_confidence(
++                    sample_hidden,
++                    confidence_embeds.flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                )
++            else:
++                self.model.compute_confidence(
++                    sample_hidden,
++                    confidence_embeds.flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                    margins=margin_rows,
++                    margin_weight=margin_weight,
++                    step_biases=step_biases,
++                )
+         elif self.use_confidence_head:
+-            confidence = self.model.compute_confidence(
+-                sample_hidden,
+-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-            )
++            stacked_embeds = torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1)
++            if not calibrated:
++                confidence = self.model.compute_confidence(
++                    sample_hidden, stacked_embeds
++                )
++            else:
++                confidence = self.model.compute_confidence(
++                    sample_hidden,
++                    stacked_embeds,
++                    margins=margin_rows,
++                    margin_weight=margin_weight,
++                    step_biases=step_biases,
++                )
+             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                 num_reqs, n_spec
+             )

@@ -1,0 +1,42 @@
+{
+  "description": "Verify DSpark greedy shard runner-up margin extraction and fused margin + step-bias confidence calibration on dgx4.",
+  "image": "spark-ds41f:1030",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+    "TILELANG_CACHE_DIR": "/c/tilelang-dspark-greedy-shard-margin"
+  },
+  "workdir": "vllm",
+  "argv": [
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "-p",
+    "tblib_stub",
+    "--basetemp",
+    "/c/pytest-tmp-margin",
+    "tests/kernels/test_deepseek_v41_tilelang_confidence.py",
+    "tests/v1/worker/test_gpu_tilelang_sampling.py",
+    "tests/v1/spec_decode/test_dspark_vocab_parallel.py",
+    "tests/v1/worker/test_dspark_greedy_markov.py",
+    "-k",
+    "confidence or greedy or sequential or shard_pairs"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "tblib_stub.py",
+      "/b/tblib_stub.py"
+    ],
+    [
+      "tests/kernels/test_deepseek_v41_tilelang_confidence.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_confidence.py"
+    ],
+    [
+      "tests/v1/worker/test_gpu_tilelang_sampling.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_tilelang_sampling.py"
+    ]
+  ]
+}
