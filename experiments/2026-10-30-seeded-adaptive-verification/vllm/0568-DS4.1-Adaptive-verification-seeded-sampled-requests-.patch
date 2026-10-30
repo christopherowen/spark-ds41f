@@ -1,0 +1,682 @@
+From a2b579274d8d45588c17b6cccaaea19acfadba6f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:22:31 +0100
+Subject: [PATCH] [DS4.1] Adaptive verification: seeded sampled requests budget
+ per request
+
+---
+ .../spec_decode/test_adaptive_verification.py | 312 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |   2 +-
+ .../gpu/spec_decode/adaptive_verification.py  | 243 +++++++++++---
+ 3 files changed, 517 insertions(+), 40 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 110a956ff..2ce5a5493 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -551,3 +551,315 @@ def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
+     runs = []
+     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
++
++
++def test_seeded_sampled_budget_is_batch_invariant():
++    # At row_cost = 0.02, a single request with survival [0.5, 0.25, 0.05, 0.01, 0.002]
++    # admits 2 drafts alone (marginal utility of slot 2 is 0.05 < 0.02 * 1.75 / 1.06),
++    # whereas in an 8-request pooled batch with seven 0.99-confidence peers, pooling
++    # inflates expected_tokens ~ 36 so even slot 1 (0.25 < 0.02 * 36 / 1.8) is dropped.
++    # Seeded sampled requests budget per request so their verified block matches alone.
++    target_conf = np.array([0.5, 0.5, 0.2, 0.2, 0.2], dtype=np.float32)
++    peer_conf = np.array([0.99, 0.99, 0.99, 0.99, 0.99], dtype=np.float32)
++
++    alone = make_manager(target_conf[None, :], row_cost=0.02)
++    alone.req_states.req_id_to_index = {"target": 0}
++    alone._seeded_sampled = np.array([True])
++    alone.get_num_tokens({"target": 6}, {"target": [1, 2, 3, 4, 5]})
++    alone_drafts, _, alone_budget = alone._batch_budget
++    assert alone_budget == 3
++    assert alone_drafts == {"target": 3}
++
++    confs = np.vstack([target_conf[None, :], np.tile(peer_conf, (7, 1))])
++    req_ids = ["target", *(f"peer_{i}" for i in range(7))]
++    batch_mgr = make_manager(confs, row_cost=0.02)
++    batch_mgr.req_states.req_id_to_index = {
++        req_id: i for i, req_id in enumerate(req_ids)
++    }
++    # When unseeded/greedy, pooling across the 8 requests drops target's 3rd draft
++    # (and 2nd draft), giving a total batch budget of 36 instead of 3 + 35 = 38.
++    batch_mgr.get_num_tokens(
++        dict.fromkeys(req_ids, 6),
++        {req_id: [1, 2, 3, 4, 5] for req_id in req_ids},
++    )
++    _, _, pooled_budget = batch_mgr._batch_budget
++    assert pooled_budget == 36
++
++    # When seeded sampled, target gets the exact 3-draft budget it gets alone.
++    batch_mgr._seeded_sampled = np.ones(8, dtype=bool)
++    batch_mgr.get_num_tokens(
++        dict.fromkeys(req_ids, 6),
++        {req_id: [1, 2, 3, 4, 5] for req_id in req_ids},
++    )
++    seeded_drafts, _, seeded_budget = batch_mgr._batch_budget
++    assert seeded_drafts["target"] == alone_budget
++    assert seeded_budget == alone_budget + 7 * 5
++
++
++def test_seeded_sampled_reallocate_drafts_and_mid_prefill_reset(monkeypatch):
++    if not torch.accelerator.is_available():
++        pytest.skip("requires CUDA")
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(world_size=1),
++    )
++    device = torch.device("cuda", 0)
++    state = SimpleNamespace(
++        device=device,
++        max_num_reqs=4,
++        num_speculative_steps=5,
++        req_id_to_index={"seeded": 0, "greedy_hi": 1, "greedy_lo": 2, "prefill": 3},
++        num_computed_tokens_np=np.array([10, 10, 10, 0], dtype=np.int32),
++        prefill_len=SimpleNamespace(np=np.array([10, 10, 10, 100], dtype=np.int32)),
++    )
++    manager = AdaptiveVerificationManager(
++        state,
++        torch.zeros(5, dtype=torch.int32, device=device),
++        num_bonus_tokens=1,
++        max_total_logits=64,
++        row_cost=0.2,
++    )
++    manager.add_request(0, SimpleNamespace(seed=42, temperature=0.8))
++    manager.add_request(1, SimpleNamespace(seed=42, temperature=0.0))
++    manager.add_request(2, SimpleNamespace(seed=None, temperature=0.8))
++    manager.add_request(3, SimpleNamespace(seed=99, temperature=0.8))
++    manager.apply_staged_writes()
++
++    # Request 3 is mid-prefill (40 < 100): its reset stays pending and its
++    # confidences remain 1.0 even after two confidence records alongside decodes.
++    mid_batch = SimpleNamespace(
++        num_reqs=4,
++        idx_mapping=torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device),
++        idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int64),
++        num_computed_tokens_np=np.array([10, 10, 10, 0], dtype=np.int32),
++        num_scheduled_tokens=np.array([6, 6, 6, 40], dtype=np.int32),
++        prefill_len_np=np.array([10, 10, 10, 100], dtype=np.int32),
++    )
++    step_confs = torch.tensor(
++        [
++            [0.6, 0.6, 0.1, 0.1, 0.1],
++            [0.9, 0.9, 0.1, 0.1, 0.1],
++            [0.1, 0.1, 0.1, 0.1, 0.1],
++            [0.2, 0.2, 0.2, 0.2, 0.2],
++        ],
++        dtype=torch.float32,
++        device=device,
++    )
++    for _ in range(2):
++        manager.record_confidences(step_confs, mid_batch)
++    assert 3 in manager._pending_resets
++    np.testing.assert_array_equal(
++        manager._stale_confidences[manager._stale_idx].np[3],
++        np.ones(5, dtype=np.float32),
++    )
++
++    # Alone, "seeded" (survival [0.6, 0.36, ...], row_cost=0.2) admits 2 drafts.
++    alone_tokens = manager.get_num_tokens(
++        {"seeded": 6}, {"seeded": [1, 2, 3, 4, 5]}
++    )
++    assert alone_tokens == 3
++    manager.reallocate_drafts(
++        ["seeded"], torch.tensor([0], dtype=torch.int64, device=device)
++    )
++    torch.cuda.synchronize(device)
++    assert manager.get_verified_draft_counts(1).tolist() == [2]
++
++    # Mixed with two greedy/unseeded requests whose current GPU confidences make
++    # greedy_hi's all 5 slots (0.95^k) outrank seeded's 0.6^k: seeded still keeps
++    # its exact 2-draft capacity while the two unpinned requests share their 2-draft
++    # budget by survival.
++    manager._confidence_probs[:3].copy_(
++        torch.tensor(
++            [
++                [0.25, 0.25, 0.1, 0.1, 0.1],
++                [0.95, 0.95, 0.95, 0.95, 0.95],
++                [0.1, 0.1, 0.1, 0.1, 0.1],
++            ],
++            dtype=torch.float32,
++            device=device,
++        )
++    )
++    mixed_tokens = manager.get_num_tokens(
++        {"seeded": 6, "greedy_hi": 6, "greedy_lo": 6},
++        {
++            "seeded": [1, 2, 3, 4, 5],
++            "greedy_hi": [1, 2, 3, 4, 5],
++            "greedy_lo": [1, 2, 3, 4, 5],
++        },
++    )
++    assert mixed_tokens == 3 + 4
++    manager.reallocate_drafts(
++        ["seeded", "greedy_hi", "greedy_lo"],
++        torch.tensor([0, 1, 2], dtype=torch.int64, device=device),
++    )
++    torch.cuda.synchronize(device)
++    assert manager.get_verified_draft_counts(3).tolist() == [2, 2, 0]
++
++
++def test_seeded_sampled_multi_step_schedule_and_batch_invariance(monkeypatch):
++    if not torch.accelerator.is_available():
++        pytest.skip("requires CUDA")
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(world_size=1),
++    )
++    device = torch.device("cuda", 0)
++    num_reqs = 8
++    num_steps = 5
++    decode_steps = 5
++    rng = np.random.default_rng(12345)
++    # Deterministic per-request, per-decode-step confidence trajectories.
++    req_trajectories = rng.uniform(
++        0.15, 0.98, size=(num_reqs, decode_steps, num_steps)
++    ).astype(np.float32)
++
++    def run_alone(req_idx: int) -> list[int]:
++        state = SimpleNamespace(
++            device=device,
++            max_num_reqs=1,
++            num_speculative_steps=num_steps,
++            req_id_to_index={"r": 0},
++            num_computed_tokens_np=np.array([0], dtype=np.int32),
++            prefill_len=SimpleNamespace(np=np.array([20], dtype=np.int32)),
++        )
++        mgr = AdaptiveVerificationManager(
++            state,
++            torch.zeros(2, dtype=torch.int32, device=device),
++            num_bonus_tokens=1,
++            max_total_logits=64,
++            row_cost=0.04,
++        )
++        mgr.add_request(0, SimpleNamespace(seed=100 + req_idx, temperature=0.8))
++        mgr.apply_staged_writes()
++
++        # Prefill completion step (step 0): proposes drafts for decode step 0.
++        mgr.get_num_tokens({"r": 20}, {})
++        mgr.reallocate_drafts(["r"], torch.tensor([0], dtype=torch.int64, device=device))
++        prefill_batch = SimpleNamespace(
++            num_reqs=1,
++            idx_mapping=torch.tensor([0], dtype=torch.int64, device=device),
++            idx_mapping_np=np.array([0], dtype=np.int64),
++            num_computed_tokens_np=np.array([0], dtype=np.int32),
++            num_scheduled_tokens=np.array([20], dtype=np.int32),
++            prefill_len_np=np.array([20], dtype=np.int32),
++        )
++        mgr.record_confidences(
++            torch.tensor(req_trajectories[req_idx, 0][None, :], device=device),
++            prefill_batch,
++        )
++        state.num_computed_tokens_np[0] = 20
++
++        capacities = []
++        for k in range(1, decode_steps):
++            mgr.get_num_tokens({"r": 1 + num_steps}, {"r": [1, 2, 3, 4, 5]})
++            mgr.reallocate_drafts(
++                ["r"], torch.tensor([0], dtype=torch.int64, device=device)
++            )
++            torch.cuda.synchronize(device)
++            capacities.append(int(mgr.get_verified_draft_counts(1)[0].item()))
++            decode_batch = SimpleNamespace(
++                num_reqs=1,
++                idx_mapping=torch.tensor([0], dtype=torch.int64, device=device),
++                idx_mapping_np=np.array([0], dtype=np.int64),
++                num_computed_tokens_np=np.array([20 + k], dtype=np.int32),
++                num_scheduled_tokens=np.array([1 + num_steps], dtype=np.int32),
++                prefill_len_np=np.array([20], dtype=np.int32),
++            )
++            mgr.record_confidences(
++                torch.tensor(req_trajectories[req_idx, k][None, :], device=device),
++                decode_batch,
++            )
++        return capacities
++
++    alone_capacities = [run_alone(i) for i in range(num_reqs)]
++
++    # Run all 8 requests under a staggered schedule with chunked prefill and a pause:
++    # - r0..r3 finish prefill at engine step 0; r4..r7 run a mid-prefill chunk (10/20)
++    #   at engine step 0 and finish prefill at engine step 1.
++    # - r0..r1 pause at engine step 2 while r2..r7 decode.
++    req_ids = [f"r{i}" for i in range(num_reqs)]
++    state = SimpleNamespace(
++        device=device,
++        max_num_reqs=num_reqs,
++        num_speculative_steps=num_steps,
++        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++        num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
++        prefill_len=SimpleNamespace(np=np.full(num_reqs, 20, dtype=np.int32)),
++    )
++    mgr = AdaptiveVerificationManager(
++        state,
++        torch.zeros(num_reqs + 1, dtype=torch.int32, device=device),
++        num_bonus_tokens=1,
++        max_total_logits=64,
++        row_cost=0.04,
++    )
++    for i in range(num_reqs):
++        mgr.add_request(i, SimpleNamespace(seed=100 + i, temperature=0.8))
++    mgr.apply_staged_writes()
++
++    req_step = np.zeros(num_reqs, dtype=np.int32)
++    staggered_capacities: list[list[int]] = [[] for _ in range(num_reqs)]
++    engine_step = 0
++    while np.any(req_step < decode_steps):
++        active = [
++            i
++            for i in range(num_reqs)
++            if req_step[i] < decode_steps and not (engine_step == 2 and i in (0, 1))
++        ]
++        num_tokens_per_req = {}
++        draft_tokens = {}
++        sched_tokens_list = []
++        comp_tokens_list = []
++        for i in active:
++            rid = req_ids[i]
++            comp = int(state.num_computed_tokens_np[i])
++            comp_tokens_list.append(comp)
++            if comp < 20:
++                tokens = 10 if (engine_step == 0 and i >= 4) else (20 - comp)
++                num_tokens_per_req[rid] = tokens
++                sched_tokens_list.append(tokens)
++            else:
++                num_tokens_per_req[rid] = 1 + num_steps
++                draft_tokens[rid] = [1, 2, 3, 4, 5]
++                sched_tokens_list.append(1 + num_steps)
++
++        mgr.get_num_tokens(num_tokens_per_req, draft_tokens)
++        idx_map = torch.tensor(active, dtype=torch.int64, device=device)
++        mgr.reallocate_drafts([req_ids[i] for i in active], idx_map)
++        torch.cuda.synchronize(device)
++        verified = mgr.get_verified_draft_counts(len(active)).tolist()
++
++        confs = []
++        for pos, i in enumerate(active):
++            comp = comp_tokens_list[pos]
++            sched = sched_tokens_list[pos]
++            if comp >= 20:
++                staggered_capacities[i].append(int(verified[pos]))
++            if comp + sched >= 20:
++                k = int(req_step[i])
++                confs.append(req_trajectories[i, k])
++                req_step[i] += 1
++            else:
++                # Mid-prefill garbage confidences must be ignored and reset to 1.0.
++                confs.append(np.full(num_steps, 0.12, dtype=np.float32))
++            state.num_computed_tokens_np[i] = comp + sched
++
++        batch = SimpleNamespace(
++            num_reqs=len(active),
++            idx_mapping=idx_map,
++            idx_mapping_np=np.array(active, dtype=np.int64),
++            num_computed_tokens_np=np.array(comp_tokens_list, dtype=np.int32),
++            num_scheduled_tokens=np.array(sched_tokens_list, dtype=np.int32),
++            prefill_len_np=np.full(len(active), 20, dtype=np.int32),
++        )
++        mgr.record_confidences(
++            torch.tensor(np.stack(confs), dtype=torch.float32, device=device),
++            batch,
++        )
++        engine_step += 1
++
++    assert staggered_capacities == alone_capacities
++
++
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 85e0a2093..9f2c0438f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1530,7 +1530,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+-                self.adaptive_verification.add_request(req_index)
++                self.adaptive_verification.add_request(req_index, sampling_params)
+ 
+             if self.pooling_runner is not None:
+                 assert new_req_data.pooling_params is not None
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index a5a5d7333..7985d7c56 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -40,6 +40,7 @@ def dead_rows_enabled() -> bool:
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
++    from vllm.sampling_params import SamplingParams
+     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+     from vllm.v1.worker.gpu.input_batch import InputBatch
+     from vllm.v1.worker.gpu.states import RequestState
+@@ -142,12 +143,15 @@ class AdaptiveVerificationManager:
+         self.query_start_loc = query_start_loc
+         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+         max_num_reqs = req_states.max_num_reqs
+-        # Current per-slot confidences
+-        self._confidence_probs = torch.empty(
+-            (max_num_reqs, self.num_speculative_steps),
++        # Current per-slot confidences, plus one sentinel row (+inf) that pins
++        # seeded sampled requests' per-request budgets in mixed batches.
++        self._confidence_probs_with_sentinel = torch.empty(
++            (max_num_reqs + 1, self.num_speculative_steps),
+             dtype=torch.float32,
+             device=device,
+         )
++        self._confidence_probs_with_sentinel[max_num_reqs].fill_(float("inf"))
++        self._confidence_probs = self._confidence_probs_with_sentinel[:max_num_reqs]
+         self._batch_draft_capacity = torch.empty(
+             max_num_reqs, dtype=torch.int32, device=device
+         )
+@@ -168,14 +172,38 @@ class AdaptiveVerificationManager:
+         self._pending_resets: list[int] = []
+         # The new requests' confidence rows, set to 1 together (apply_staged_writes).
+         self._new_rows: list[int] = []
++        self._seeded_sampled = np.zeros(max_num_reqs, dtype=bool)
++        self._req_steps_without_drafts = np.zeros(max_num_reqs, dtype=np.int32)
++        self._req_stale_confidences = np.ones(
++            (max_num_reqs, self.num_speculative_steps), dtype=np.float32
++        )
++        self._next_stale_confidences = np.ones(
++            (max_num_reqs, self.num_speculative_steps), dtype=np.float32
++        )
++        self._has_next_confidences = np.zeros(max_num_reqs, dtype=bool)
++        self._in_flight_slots: list[int] = []
+         self._stale_idx = 0
+         for slot in self._stale_confidences:
+             slot.np.fill(1.0)
+ 
+-    def add_request(self, req_idx: int) -> None:
++    def add_request(
++        self, req_idx: int, sampling_params: "SamplingParams | None" = None
++    ) -> None:
+         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
+-        self._pending_resets.append(req_idx)
++        if req_idx not in self._pending_resets:
++            self._pending_resets.append(req_idx)
+         self._new_rows.append(req_idx)
++        self._seeded_sampled[req_idx] = (
++            sampling_params is not None
++            and sampling_params.seed is not None
++            and sampling_params.temperature > 0.0
++        )
++        self._req_steps_without_drafts[req_idx] = 0
++        self._req_stale_confidences[req_idx].fill(1.0)
++        self._next_stale_confidences[req_idx].fill(1.0)
++        self._has_next_confidences[req_idx] = False
++        if req_idx in self._in_flight_slots:
++            self._in_flight_slots.remove(req_idx)
+ 
+     def apply_staged_writes(self) -> None:
+         """Set the new requests' confidences to 1 in one launch."""
+@@ -228,9 +256,41 @@ class AdaptiveVerificationManager:
+         ready_idx = self._stale_idx ^ 1
+         with gpu_sync_allowed():
+             self._copy_events[ready_idx].synchronize()
++        mid_prefill_slots: list[int] = []
++        if (
++            hasattr(input_batch, "idx_mapping_np")
++            and hasattr(input_batch, "num_computed_tokens_np")
++            and hasattr(input_batch, "num_scheduled_tokens")
++            and hasattr(input_batch, "prefill_len_np")
++        ):
++            completed_mask = (
++                input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
++                >= input_batch.prefill_len_np
++            )
++            completed_slots = set(input_batch.idx_mapping_np[completed_mask].tolist())
++            mid_prefill_slots = input_batch.idx_mapping_np[~completed_mask].tolist()
++        else:
++            completed_slots = set(input_batch.idx_mapping.tolist())
+         if self._pending_resets:
+             self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
+-            self._pending_resets.clear()
++            self._pending_resets = [
++                r for r in self._pending_resets if r not in completed_slots
++            ]
++        for slot in mid_prefill_slots:
++            if slot not in self._pending_resets:
++                self._pending_resets.append(slot)
++        req_stale = getattr(self, "_req_stale_confidences", None)
++        if req_stale is not None:
++            for slot in self._in_flight_slots:
++                self._next_stale_confidences[slot] = self._stale_confidences[
++                    ready_idx
++                ].np[slot]
++                self._has_next_confidences[slot] = True
++            for slot in completed_slots:
++                if self._has_next_confidences[slot]:
++                    req_stale[slot] = self._next_stale_confidences[slot]
++                    self._has_next_confidences[slot] = False
++            self._in_flight_slots = sorted(completed_slots)
+         # Last step's copy has landed: budgets read it, this step overwrites the
+         # slot they were reading before.
+         self._stale_idx, write_idx = ready_idx, self._stale_idx
+@@ -238,6 +298,13 @@ class AdaptiveVerificationManager:
+         tilelang_inputs.scatter_rows(
+             input_batch.idx_mapping, confidence_probs, self._confidence_probs
+         )
++        if mid_prefill_slots:
++            rows = async_tensor_h2d(
++                mid_prefill_slots,
++                dtype=torch.int64,
++                device=self._confidence_probs.device,
++            )
++            tilelang_inputs.fill_rows(rows, self._confidence_probs, 1.0)
+         # Replicated projections may differ through unordered floating-point
+         # reductions. Both CPU graph selection and GPU request compaction must
+         # consume one TP-wide confidence snapshot to issue matching collectives.
+@@ -253,6 +320,19 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def _budget_for_scores(
++        self,
++        scores: np.ndarray,
++        num_sampling_requests: int,
++        num_non_draft_rows: int,
++    ) -> int:
++        expected_tokens = np.concatenate(
++            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
++        )
++        rows = num_non_draft_rows + np.arange(len(scores) + 1)
++        utilities = expected_tokens / (1.0 + self.row_cost * rows)
++        return int(np.argmax(utilities))
++
+     def get_num_tokens(
+         self,
+         num_tokens_per_req: dict[str, int],
+@@ -264,8 +344,10 @@ class AdaptiveVerificationManager:
+         sampling requests plus the survival probabilities of the admitted draft
+         slots (best first), over ``1 + row_cost * rows``, where ``rows`` counts
+         the step's non-draft rows and admitted draft rows; within the one-chunk
+-        logits limit. Stashes it in ``_batch_budget`` for the compaction and
+-        reallocation that follow in the same step.
++        logits limit. Seeded sampled requests budget their own draft rows from
++        their own survival probabilities alone, so their verified blocks do not
++        depend on co-scheduled requests. Stashes it in ``_batch_budget`` for the
++        compaction and reallocation that follow in the same step.
+         """
+         req_ids = list(num_tokens_per_req)
+         num_reqs = len(req_ids)
+@@ -283,47 +365,105 @@ class AdaptiveVerificationManager:
+             dtype=np.int32,
+             count=len(req_ids),
+         )
+-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
++        req_stale = getattr(self, "_req_stale_confidences", None)
++        stale_confidences = (
++            req_stale[slots]
++            if req_stale is not None
++            else self._stale_confidences[self._stale_idx].np[slots]
++        )
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+-        steps = np.arange(self.num_speculative_steps)
+-        valid = steps[None, :] < scheduled_drafts[:, None]
+-        scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+             int(scheduled_drafts.sum()),
+             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+         )
+-        scores = scores[:max_draft_budget]
++        is_sampling = (
++            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
++            >= self.req_states.prefill_len.np[slots]
++        )
++        effective_drafts = scheduled_drafts.copy()
++        seeded_sampled = getattr(self, "_seeded_sampled", None)
++        seeded_mask = (
++            seeded_sampled[slots]
++            if seeded_sampled is not None
++            else np.zeros(num_reqs, dtype=bool)
++        )
++        pinned_budget = 0
++        if np.any(seeded_mask):
++            req_idle_steps = getattr(self, "_req_steps_without_drafts", None)
++            if req_idle_steps is None:
++                req_idle_steps = np.zeros(int(slots.max()) + 1, dtype=np.int32)
++                self._req_steps_without_drafts = req_idle_steps
++            for i in np.flatnonzero(seeded_mask):
++                req_drafts = int(scheduled_drafts[i])
++                req_max_budget = min(
++                    req_drafts,
++                    max(0, self._max_total_logits - self.num_bonus_tokens),
++                )
++                req_scores = np.sort(survival_probability[i, :req_drafts])[::-1][
++                    :req_max_budget
++                ]
++                req_budget = self._budget_for_scores(
++                    req_scores,
++                    int(is_sampling[i]),
++                    int(num_non_draft_tokens[i]),
++                )
++                slot = int(slots[i])
++                req_idle = int(req_idle_steps[slot])
++                if req_budget == 0 and req_max_budget > 0:
++                    req_idle += 1
++                    if req_idle >= EXPLORE_AFTER_IDLE_STEPS:
++                        req_budget = min(1, req_max_budget)
++                        req_idle = 0
++                else:
++                    req_idle = 0
++                req_idle_steps[slot] = req_idle
++                effective_drafts[i] = req_budget
++                pinned_budget += req_budget
++
++        unpinned_mask = ~seeded_mask
++        unpinned_budget = 0
++        if np.any(unpinned_mask):
++            unpinned_drafts = scheduled_drafts[unpinned_mask]
++            unpinned_non_draft = num_non_draft_tokens[unpinned_mask]
++            unpinned_survival = survival_probability[unpinned_mask]
++            steps = np.arange(self.num_speculative_steps)
++            valid = steps[None, :] < unpinned_drafts[:, None]
++            scores = np.sort(unpinned_survival[valid])[::-1]
++            unpinned_max_budget = min(
++                int(unpinned_drafts.sum()),
++                max(0, max_draft_budget - pinned_budget),
++            )
++            scores = scores[:unpinned_max_budget]
++            num_sampling_requests = int(np.count_nonzero(is_sampling[unpinned_mask]))
++            unpinned_budget = self._budget_for_scores(
++                scores,
++                num_sampling_requests,
++                int(unpinned_non_draft.sum()),
++            )
++            # The confidences come from an estimator that learns only from admitted
++            # drafts, so a long run of empty budgets would leave it without the
++            # evidence to ever admit one again. Periodically verify one draft per
++            # request to keep it grounded.
++            idle = getattr(self, "_steps_without_drafts", 0)
++            num_unpinned = int(np.count_nonzero(unpinned_mask))
++            if unpinned_budget == 0 and unpinned_max_budget > 0:
++                idle += 1
++                if idle >= EXPLORE_AFTER_IDLE_STEPS:
++                    unpinned_budget = min(num_unpinned, unpinned_max_budget)
++                    idle = 0
++            else:
++                idle = 0
++            self._steps_without_drafts = idle
++
++        draft_budget = min(max_draft_budget, pinned_budget + unpinned_budget)
+         num_drafts_per_req = {
+             req_id: int(num_drafts)
+-            for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
++            for req_id, num_drafts in zip(req_ids, effective_drafts, strict=True)
+         }
+         num_non_draft_tokens_per_req = {
+             req_id: int(num_tokens)
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+-        num_sampling_requests = np.count_nonzero(
+-            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
+-            >= self.req_states.prefill_len.np[slots]
+-        )
+-        expected_tokens = np.concatenate(
+-            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+-        )
+-        rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / (1.0 + self.row_cost * rows)
+-        draft_budget = int(np.argmax(utilities))
+-        # The confidences come from an estimator that learns only from admitted
+-        # drafts, so a long run of empty budgets would leave it without the
+-        # evidence to ever admit one again. Periodically verify one draft per
+-        # request to keep it grounded.
+-        idle = getattr(self, "_steps_without_drafts", 0)
+-        if draft_budget == 0 and max_draft_budget > 0:
+-            idle += 1
+-            if idle >= EXPLORE_AFTER_IDLE_STEPS:
+-                draft_budget = min(num_reqs, max_draft_budget)
+-                idle = 0
+-        else:
+-            idle = 0
+-        self._steps_without_drafts = idle
+         logger.debug(
+             "DSpark adaptive verification selected %d/%d draft rows for %d "
+             "requests at row cost %.3g",
+@@ -427,9 +567,34 @@ class AdaptiveVerificationManager:
+         if draft_budget:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
++                probs = self._confidence_probs
++                budget_idx_mapping = idx_mapping
++                seeded_sampled = getattr(self, "_seeded_sampled", None)
++                sentinel_probs = getattr(self, "_confidence_probs_with_sentinel", None)
++                if seeded_sampled is not None and sentinel_probs is not None:
++                    slots = np.fromiter(
++                        (
++                            self.req_states.req_id_to_index[req_id]
++                            for req_id in req_ids
++                        ),
++                        dtype=np.int64,
++                        count=num_reqs,
++                    )
++                    seeded_mask = seeded_sampled[slots]
++                    if (
++                        np.any(seeded_mask)
++                        and int(scheduled_drafts[seeded_mask].sum()) <= draft_budget
++                    ):
++                        probs = sentinel_probs
++                        slots[seeded_mask] = self.req_states.max_num_reqs
++                        budget_idx_mapping = async_tensor_h2d(
++                            slots,
++                            dtype=idx_mapping.dtype,
++                            device=idx_mapping.device,
++                        )
+                 tilelang_inputs.assign_draft_budget(
+-                    self._confidence_probs,
+-                    idx_mapping,
++                    probs,
++                    budget_idx_mapping,
+                     capacities,
+                     draft_budget,
+                     self.num_speculative_steps,
+-- 
+2.54.0 (Apple Git-157)
+

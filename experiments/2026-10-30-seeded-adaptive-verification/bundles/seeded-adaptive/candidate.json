@@ -1,0 +1,49 @@
+{
+ "description": "spark-ds41f-1030 with per-request seeded adaptive verification (a2b579274): adaptive verification, dead rows, TileLang rejection, input preparation, and kernel preparation tests.",
+ "image": "spark-ds41f:1030",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+  "TILELANG_CACHE_DIR": "/c/tilelang-seeded-adaptive"
+ },
+ "source_root": "/opt/spark-ds41f/candidate",
+ "workdir": "vllm",
+ "argv": [
+  "-m",
+  "pytest",
+  "-q",
+  "-p",
+  "no:cacheprovider",
+  "--noconftest",
+  "-p",
+  "prepare_fixtures",
+  "-rfEs",
+  "--basetemp",
+  "/c/pytest-seeded-adaptive",
+  "tests/v1/spec_decode/test_adaptive_verification.py",
+  "tests/v1/worker/test_dead_rows.py",
+  "tests/v1/spec_decode/test_tilelang_rejection.py",
+  "tests/v1/worker/test_gpu_tilelang_inputs.py",
+  "tests/v1/worker/test_prepare_kernels.py"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/gpu/model_runner.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ],
+  [
+   "tests-v1-spec_decode-test_adaptive_verification.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py"
+  ]
+ ]
+}
