@@ -1,0 +1,41 @@
+{
+ "description": "Piecewise CUDA-graph capture, 16-row/64-row GEMM tile, and dead-row pricing in DSpark AdaptiveVerificationManager.",
+ "image": "spark-ds41f:19f2c20ed4d6-next-12",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+  "TILELANG_CACHE_DIR": "/c/tilelang-row-cost"
+ },
+ "source_root": "/opt/spark-ds41f/candidate",
+ "workdir": "vllm",
+ "argv": [
+  "-m",
+  "pytest",
+  "-q",
+  "-p",
+  "no:cacheprovider",
+  "--noconftest",
+  "-p",
+  "prepare_fixtures",
+  "-rfEs",
+  "--basetemp",
+  "/c/pytest-row-cost",
+  "tests/v1/spec_decode/test_adaptive_verification.py"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "overlay/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ],
+  [
+   "tests-v1-spec_decode-test_adaptive_verification.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py"
+  ]
+ ]
+}
