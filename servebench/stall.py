@@ -127,18 +127,19 @@ def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *
     document, counted = prefill.document(base_url, model, size, seed, vllm)
     probe_texts = [prefill.document(base_url, model, probe_tokens, seed * 100 + 1 + i, vllm)[0]
                    for i in range(len(probes))]
+    stream_bodies = [stream_body(model, text, max_tokens, vllm, extra_body) for text in texts]
+    probe_bodies = [probe_body(model, text, probe_max_tokens, vllm, extra_body) for text in probe_texts]
+    doc_body = probe_body(model, document, 1, vllm, extra_body)
     stop = threading.Event()
     records: list[dict | None] = [None] * len(texts)
     probe_records: list[dict | None] = [None] * len(probes)
 
     def decode(i: int) -> None:
-        records[i] = client.stream_chat(base_url, stream_body(model, texts[i], max_tokens, vllm, extra_body),
-                                        continuous_usage=vllm, stop=stop)
+        records[i] = client.stream_chat(base_url, stream_bodies[i], continuous_usage=vllm, stop=stop)
 
     def probe(i: int) -> None:
         sleep(probes[i])
-        probe_records[i] = client.stream_chat(
-            base_url, probe_body(model, probe_texts[i], probe_max_tokens, vllm, extra_body), continuous_usage=vllm)
+        probe_records[i] = client.stream_chat(base_url, probe_bodies[i], continuous_usage=vllm)
 
     threads = [threading.Thread(target=decode, args=(i,), daemon=True) for i in range(len(texts))]
     for thread in threads:
@@ -148,8 +149,7 @@ def measure(base_url: str, model: str, size: int, seed: int, texts: list[str], *
     for thread in probers:
         thread.start()
     scraped = prom.fetch(base_url) if vllm else None
-    record = client.stream_chat(base_url, probe_body(model, document, 1, vllm, extra_body),
-                                continuous_usage=vllm, timeout=max(900.0, size / 500))
+    record = client.stream_chat(base_url, doc_body, continuous_usage=vllm, timeout=max(900.0, size / 500))
     engine = engine_window(scraped, prom.fetch(base_url) if scraped is not None else None)
     sleep(tail_s)
     stop.set()

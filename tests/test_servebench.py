@@ -344,6 +344,55 @@ class LiveTest(unittest.TestCase):
             server.server_close()
         self.assertEqual(record["error"], "server: max_tokens is too large")
 
+    def test_stream_chat_records_empty_delta_step_when_continuous_usage_advances(self):
+        class Handler(t_http.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+                chunks = (
+                    {"choices": [{"delta": {"role": "assistant", "content": ""}}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 0}},
+                    {"choices": [{"delta": {"content": "a"}}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 1}},
+                    {"choices": [{"delta": {"content": ""}}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+                    {"choices": [{"delta": {"content": "🎉"}, "finish_reason": "length"}],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 3}},
+                    {"choices": [],
+                     "usage": {"prompt_tokens": 5, "completion_tokens": 3}},
+                )
+                for chunk in chunks:
+                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+        server = t_http.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        ticks = iter([1.0, 1.125, 1.25, 2.25, 3.25, 3.25, 3.25])
+        try:
+            record = client.stream_chat(f"http://127.0.0.1:{server.server_address[1]}",
+                                        {"model": "m", "messages": []},
+                                        continuous_usage=True, clock=lambda: next(ticks))
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertIsNone(record["error"])
+        self.assertEqual(record["events"], [[1.25, 1], [2.25, 2], [3.25, 3]])
+        self.assertEqual(stall.split_gaps(record["events"], 1.125, 3.5), ([], [1.0, 1.0]))
+
+    def test_payload_seeds_sampled_requests(self):
+        spec = load.Load(seed=7)
+        prompt = {"id": "p0", "text": "hello"}
+        greedy = load.payload("m", prompt, spec, vllm=True, extra_body={})
+        self.assertNotIn("seed", greedy)
+        sampled = load.payload("m", prompt, spec, vllm=True, extra_body={"temperature": 1.0, "top_p": 1.0})
+        self.assertEqual(sampled["seed"], 7)
+        explicit = load.payload("m", prompt, spec, vllm=True, extra_body={"temperature": 1.0, "seed": 42})
+        self.assertEqual(explicit["seed"], 42)
+
     def test_closed_loop_window_counts_tokens_and_steps(self):
         spec = load.Load(mode="closed", concurrency=3, warmup_s=0.3, duration_s=0.9, batches=3,
                          max_tokens=16)

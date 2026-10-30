@@ -69,6 +69,8 @@ def payload(model: str, prompt: dict, load: Load, *, vllm: bool, extra_body: dic
             body["ignore_eos"] = True
             body["min_tokens"] = load.max_tokens
     body.update(extra_body)
+    if (body.get("temperature") or 0) > 0 and "seed" not in body:
+        body["seed"] = load.seed
     return body
 
 

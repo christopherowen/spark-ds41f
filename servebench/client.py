@@ -35,6 +35,7 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
               "prompt_tokens": None, "completion_tokens": None, "finish_reason": None,
               "token_times": "exact", "error": None}
     counted = True  # every output chunk so far carried a cumulative count
+    prev_tokens = 0
     usage: dict = {}
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -54,6 +55,7 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
                     record["error"] = "server: " + (detail.get("message") if isinstance(detail, dict) else str(detail))[:300]
                     break
                 usage = event.get("usage") or usage
+                tokens = (event.get("usage") or {}).get("completion_tokens")
                 emitted = False
                 for choice in event.get("choices") or []:
                     record["finish_reason"] = choice.get("finish_reason") or record["finish_reason"]
@@ -61,13 +63,17 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
                     for key in ("content", "reasoning_content", "reasoning"):
                         if isinstance(delta.get(key), str) and delta[key]:
                             emitted = True
-                if not emitted:
+                    if choice.get("token_ids"):
+                        emitted = True
+                progressed = continuous_usage and counted and tokens is not None and tokens > prev_tokens
+                if not emitted and not progressed:
                     continue
                 if record["first"] is None:
                     record["first"] = now
-                tokens = (event.get("usage") or {}).get("completion_tokens")
                 if tokens is None:
                     counted = False
+                else:
+                    prev_tokens = tokens
                 record["events"].append([now, tokens])
     except Exception as exception:  # noqa: BLE001 - every failure belongs in the record
         record["error"] = f"{type(exception).__name__}: {exception}"
