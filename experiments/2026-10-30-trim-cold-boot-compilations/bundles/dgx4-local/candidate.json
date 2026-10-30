@@ -1,0 +1,67 @@
+{
+  "name": "trim-cold-boot-compilations",
+  "image": "spark-ds41f:1030",
+  "workdir": "vllm",
+  "verdict": "exit",
+  "env": {
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+  },
+  "mounts": [
+    [
+      "tblib_stub.py",
+      "/b/tblib_stub.py"
+    ],
+    [
+      "vllm/model_executor/layers/fused_moe/tilelang.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/tilelang.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/dspark.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/gemm.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/linear.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/moe.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/prepare.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/prepare.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/router.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/router.py"
+    ],
+    [
+      "vllm/models/deepseek_v4_1/tilelang/vocab.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/vocab.py"
+    ],
+    [
+      "tests/models/test_deepseek_v4_1_prepare.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_prepare.py"
+    ],
+    [
+      "tests/v1/worker/test_prepare_kernels.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_prepare_kernels.py"
+    ]
+  ],
+  "argv": [
+    "-m",
+    "pytest",
+    "-p",
+    "no:cacheprovider",
+    "-p",
+    "tblib_stub",
+    "-v",
+    "tests/models/test_deepseek_v4_1_prepare.py",
+    "tests/v1/worker/test_prepare_kernels.py",
+    "tests/kernels/moe/test_deepseek_v41_tilelang_router.py"
+  ]
+}
