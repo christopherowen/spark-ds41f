@@ -641,7 +641,11 @@ class StallTest(unittest.TestCase):
                 result = json.loads(Path(out).read_text())
                 self.assertEqual(result["schema"], stall.SCHEMA)
                 self.assertEqual(result["workload"]["streams"], 2)
+                self.assertNotIn("samples", result)
+                self.assertIn("samples", result["stall"][0])
                 self.assertEqual(cli.main(["compare", out, out]), 0)
+                self.assertEqual(cli.main([*argv, "--save-samples"]), 0)
+                self.assertIn("samples", json.loads(Path(out).read_text()))
             step = {"id": "stall", "command": "stall",
                     "args": {"sizes": [131072], "streams": 8, "max_tokens": 16384, "warmup": 20, "repeats": 3}}
             parsed = cli.build_parser().parse_args(suite.arguments(step, "http://h:8000", "o.json", "x", None))
