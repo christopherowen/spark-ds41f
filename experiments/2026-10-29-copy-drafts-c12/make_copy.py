@@ -182,6 +182,20 @@ def arm(label: str, notes: str, repo: Path | None = None, files: list[str] = (),
     return f"{FOLDER}/{label}-tp4.json"
 
 
+def export_patches(repo: Path) -> None:
+    """Export the commit series over candidate 12's head into ``HERE / 'vllm'``."""
+    patch_dir = HERE / "vllm"
+    if patch_dir.exists():
+        shutil.rmtree(patch_dir)
+    patch_dir.mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "format-patch", "-o", str(patch_dir), f"{HEAD}..HEAD"],
+        check=True,
+    )
+    patches = sorted(p.name for p in patch_dir.glob("*.patch"))
+    (patch_dir / "series").write_text("\n".join(patches) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__.strip(), file=sys.stderr)
@@ -193,13 +207,21 @@ def main() -> int:
         raise SystemExit("candidate 12 already drafts copies")
     sources, tests = copy_files(repo)
     head = git(repo, "rev-parse", "--short=9", "HEAD").strip()
+    export_patches(repo)
 
     copy_bundle = bundle("copy", "Candidate 12 with copy drafts: the scheduler, copy kernel and proposer, "
-                         "adaptive verification, aligned-chunk and attention-layer tests.",
+                         "adaptive verification, aligned-chunk, attention-layer and stand-in tests.",
                          ["tests/v1/core/test_copy_drafts_scheduler.py", "tests/v1/spec_decode/test_copy_drafts.py",
                           "tests/v1/spec_decode/test_adaptive_verification.py",
                           "tests/v1/core/test_aligned_prefill_chunks.py",
-                          "tests/models/test_deepseek_v4_1_attention.py"],
+                          "tests/models/test_deepseek_v4_1_attention.py",
+                          "tests/models/test_deepseek_v4_1_compressor.py",
+                          "tests/models/test_deepseek_v4_1_sp_prefill.py",
+                          "tests/v1/spec_decode/test_rejection_sampler_utils.py",
+                          "tests/v1/worker/test_gpu_rejection_sampler_chunking.py",
+                          "tests/v1/worker/test_gpu_sink.py",
+                          "tests/v1/worker/test_gpu_verified_logprob_token_ids.py",
+                          "tests/v1/worker/test_display_carveout.py"],
                          repo, sources, tests)
     copy_wide = bundle("copy-wide", "Candidate 12 with copy drafts: TileLang verification at the copy "
                        "lookahead (16 steps), the ratio-2 compressor ring and kernel preparation.",
@@ -208,6 +230,16 @@ def main() -> int:
                         "tests/v1/worker/test_prepare_kernels.py"],
                        repo, sources, tests, {"VLLM_TEST_VERIFICATION_STEPS": "16"})
     gate = release_tests(repo, sources, tests)
+    write_json(HERE / "gate.json", {
+        "experiment": FOLDER,
+        "run": "c12-copy-gate",
+        "jobs": [
+            {"kind": "sync"},
+            {"kind": "kernel", "bundles": [{"bundle": copy_bundle, "node": "dgx4"},
+                                           {"bundle": copy_wide, "node": "dgx4"},
+                                           {"bundle": gate, "node": "dgx4"}]},
+        ],
+    })
 
     control = arm("copy-control", "the copy recipe's ladder (107 rows) and budget (16395 tokens), "
                   "DSpark alone: the copy arm's control", serve_options=COPY_LADDER)

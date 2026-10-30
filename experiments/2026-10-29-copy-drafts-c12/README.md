@@ -6,9 +6,9 @@ not work and none switched off but IKET's debug mode, so copy drafts return only
 candidate that starts, passes the full release gate with their own tests in, keeps the bits,
 and gains.
 
-The branch `copy-drafts-c12` (vLLM, head acd5d49b6, tree 520080a98) is candidate 12's head
-(d984b2e66) with candidate 11's six copy commits cherry-picked unchanged (no conflicts) and two
-fixes; [vllm/](vllm/) holds the eight as patches.
+The branch `copy-drafts-c12` (vLLM, head 230189bbd, tree 5bc5e0621) is candidate 12's head
+(d984b2e66) with candidate 11's six copy commits cherry-picked unchanged (no conflicts) and four
+fixes; [vllm/](vllm/) holds the ten as patches.
 
 - **The start failure** (`c10-copy`, `c10-copy-2`): the warmup's eager step at 214 tokens
   (adaptive verification's tail sizes past the 107-row ladder) lays out 16 requests of 13-14
@@ -82,4 +82,19 @@ AgentX (#574) before the release claims it.
 
   Fixed in vLLM copy-drafts-c12 509a95995; `make_copy.py` regenerated the bundles.
 
-**`c12-copy-gate` (`gate.json`):** the three bundles again at 509a95995. Pending.
+**`c12-copy-gate` (`gate.json`, dgx4, 2026-10-30): pass.**
+
+- At 509a95995, all 46 previously-failing copy-drafts tests passed across `release-tests-copy`
+  (6,725 passed, 163 skipped across 116 gate files); the only failure in chunk 008 was
+  `tests/v1/worker/test_display_carveout.py::test_weights_load_in_place`, whose `_Table`
+  fixture allocated a 64 MiB temporary CPU `torch.randn(rows, width)` tensor before copying
+  into the display carve-out, reducing `cuMemGetInfo` free memory on GB10 unified memory by
+  60.75 MiB (> 32 MiB threshold).
+- Fixed in 0010 (vLLM copy-drafts-c12 230189bbd): `_Table` expands one `width`-element random
+  CPU row (8 KiB on CPU instead of 64 MiB).
+- Re-verified on dgx4 at 230189bbd:
+  - `copy` (including all stand-in test files and `test_display_carveout.py`): **347 passed,
+    1 skipped in 223.86s** (`exit: 0`).
+  - `copy-wide` (TileLang verification at 16-draft lookahead, compressor ring, kernel
+    preparation): **690 passed in 118.97s** (`exit: 0`).
+  - `release-tests-copy` (116 gate files): **6,726 passed, 163 skipped, 0 failed**.
