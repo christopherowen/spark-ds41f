@@ -569,16 +569,14 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## dgx1 headroom
 
-- **Vision tower (926 MiB of BF16 weights on every rank).** Image input is
-  enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads. The served
-  `deepseek_v4_1/nvidia/vl_model.py` sets `use_data_parallel = True` whatever
-  the TP size, so the tower stays replicated even at TP4
-  (`experiments/2026-10-03-tp3-tp4-comparison/padding.md`): full weights on
-  every rank, images split across ranks, embeddings all-gathered. Options, each
-  needing a restart:
-  - Switch the tower to tensor parallel, and at TP3 also pad it to 18 heads and
-    its MLP from 2,816 to 2,820 with zero weights. That saves ~0.6 GiB per
-    rank, including dgx1.
+- **Vision tower (926 MiB of BF16 weights, now tensor-parallelized).** Image
+  input is enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads.
+  `deepseek_v4_1/nvidia/vl_model.py` and `tilelang_vision.py` now shard the ViT
+  (`wqkv`, `wo`, `mlp.w1`, `mlp.w2`) and aligner (`w1`, `w2`) across TP ranks
+  (`use_data_parallel = is_vit_use_data_parallel()`, `False` under default
+  `--mm-encoder-tp-mode weights`), with exact 4-way shards at TP4 (~0.68 GiB
+  saved per rank) and zero-weight tail padding at TP3 (16 -> 18 heads,
+  2,816 -> 2,880 MLP, 5,120 -> 5,184 aligner, ~0.59 GiB saved per rank).
   - If a deployment needs no images, `--limit-mm-per-prompt {"image":0}` or
     `--language-model-only` stubs the tower and skips its weights. That's the
     owner's decision, since image input is a promoted feature.

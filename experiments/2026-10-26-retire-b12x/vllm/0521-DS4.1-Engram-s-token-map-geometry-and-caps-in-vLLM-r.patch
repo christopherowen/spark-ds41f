@@ -1,7 +1,7 @@
-From 7370718b25fb4fb203889df9afd442038ef8dab3 Mon Sep 17 00:00:00 2001
+From f4c005e17b3622c85574075ccf082a3010835b8b Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 08:21:32 +0100
-Subject: [PATCH 521/526] [DS4.1] Engram's token map, geometry and caps in
+Subject: [PATCH 521/528] [DS4.1] Engram's token map, geometry and caps in
  vLLM; resident tables gather with TileLang
 
 engram.py imported B12X at module level (b12x.preparation and
@@ -122,7 +122,7 @@ index 4e358c4e8..2eb10f0b5 100644
      codes, scales, paths = _write_table(_table_dir(), seed=3)
      rows = _rows(paths, 512, 3600)
 diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
-index cc5a379b3..1ffcb0498 100644
+index ccf5cf419..abf1f9dd4 100644
 --- a/tests/models/test_deepseek_v4_1_engram.py
 +++ b/tests/models/test_deepseek_v4_1_engram.py
 @@ -12,9 +12,6 @@ from types import SimpleNamespace
@@ -346,8 +346,8 @@ index cc5a379b3..1ffcb0498 100644
 +    _prepare_engram(resident)
  
      state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
-     state.ced_state = None
-@@ -496,7 +472,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+     state.steering, state.steered_requests = None, None
+@@ -497,7 +473,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
              raise AssertionError("capture preparation/consumer performed table lookup")
  
          with monkeypatch.context() as capture_guard:
@@ -356,7 +356,7 @@ index cc5a379b3..1ffcb0498 100644
              state.prepare_dummy_inputs(2, 4)
              for _ in range(3):
                  compiled_consume()
-@@ -582,8 +558,6 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+@@ -583,8 +559,6 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
          with pytest.raises(RuntimeError, match="not prepared"):
              consume()
      torch.cuda.current_stream().wait_stream(stream)
@@ -365,7 +365,7 @@ index cc5a379b3..1ffcb0498 100644
  
  
  @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@@ -597,15 +571,15 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+@@ -598,15 +572,15 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
      an image token in its history) and a decode-only step."""
      monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
      make_model, weights, paths = tiny_engram_checkpoint
@@ -385,7 +385,7 @@ index cc5a379b3..1ffcb0498 100644
      for engram in _engrams(target):
          assert engram.embed_tokens.disk_rows.check_early
  
-@@ -689,8 +663,6 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+@@ -691,8 +665,6 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
                  engram.prepare_embeddings(hashes[:, index])
                  expected = engram(hidden, hashes[:, index], ids)
                  torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
@@ -394,7 +394,7 @@ index cc5a379b3..1ffcb0498 100644
  
  
  def test_dspark_checkpoint_filter_does_not_read_target_engram(tmp_path, monkeypatch):
-@@ -811,8 +783,8 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+@@ -813,8 +785,8 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
  
      device = torch.device("cuda", torch.cuda.current_device())
      capacity, hidden, streams = 7, HIDDEN, 4
@@ -405,7 +405,7 @@ index cc5a379b3..1ffcb0498 100644
          device=device,
          max_tokens=capacity,
          max_seqs=2,
-@@ -822,15 +794,8 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+@@ -824,15 +796,8 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
          tp_size=1,
          tp_rank=0,
      )
@@ -421,7 +421,7 @@ index cc5a379b3..1ffcb0498 100644
          geometry=geometry,
          table_memory="device",
          projection_tp=False,
-@@ -849,20 +814,7 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+@@ -851,20 +816,7 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
      module.embed_tokens.weight.fill_(2)
      module.embed_tokens.weight_scale_inv.fill_(127)
      module.process_weights_after_loading()
@@ -443,7 +443,7 @@ index cc5a379b3..1ffcb0498 100644
      ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
      residual = torch.randn(
          (capacity, streams, hidden),
-@@ -892,51 +844,44 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+@@ -894,51 +846,44 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
              gate.masked_fill_(~token_mask[:, None], 0)
          return (source + gate[..., None] * value[:, None]).bfloat16()
  
@@ -530,7 +530,7 @@ index cc5a379b3..1ffcb0498 100644
  
  
  @pytest.mark.parametrize("num_layers", [1, 3])
-@@ -1019,14 +964,16 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+@@ -1021,14 +966,16 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
  @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
  @pytest.mark.parametrize("tp_rank", [0, 3])
  @torch.inference_mode()
@@ -552,7 +552,7 @@ index cc5a379b3..1ffcb0498 100644
          device=device,
          max_tokens=capacity,
          max_seqs=2,
-@@ -1038,7 +985,6 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+@@ -1040,7 +987,6 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
      )
      layout = SimpleNamespace(
          caps=(caps,),
@@ -560,7 +560,7 @@ index cc5a379b3..1ffcb0498 100644
          geometry=geometry,
          table_memory="disk",
          projection_tp=False,
-@@ -1065,17 +1011,17 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+@@ -1067,17 +1013,17 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
              stream.write(tensor.view(torch.uint8).numpy().tobytes())
          embed._disk_sources.append((str(path), offset, scale))
      embed.open_disk_rows()
@@ -589,7 +589,7 @@ index cc5a379b3..1ffcb0498 100644
      ids = torch.arange(24, device=device) + embed.shard_start + 1
      ids = ids.expand(capacity, -1).contiguous()
      count = torch.tensor([capacity], device=device, dtype=torch.int32)
-@@ -1107,7 +1053,7 @@ def test_disk_shards_interleave_hash_columns(tp_size):
+@@ -1109,7 +1055,7 @@ def test_disk_shards_interleave_hash_columns(tp_size):
      split allows, so no rank reads only the longest n-grams' distinct rows."""
      from vllm.models.deepseek_v4_1.common.engram import column_shard
  
@@ -599,10 +599,10 @@ index cc5a379b3..1ffcb0498 100644
          shards = [column_shard(geometry, index, tp_size, r) for r in range(tp_size)]
          assert sorted(c for shard in shards for c in shard) == list(range(24))
 diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
-index 555d575fe..00e6977a0 100644
+index fd556254c..ec7b33695 100644
 --- a/tests/models/test_deepseek_v4_1_sp_prefill.py
 +++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
-@@ -470,8 +470,7 @@ def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
+@@ -472,8 +472,7 @@ def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
  
  
  def test_engram_gates_only_the_real_local_rows(monkeypatch):
@@ -612,7 +612,7 @@ index 555d575fe..00e6977a0 100644
      pytest.importorskip("tilelang")
      from vllm.models.deepseek_v4_1.common import engram as engram_ops
      from vllm.models.deepseek_v4_1.tilelang import columns
-@@ -683,7 +682,6 @@ class _Embedding:
+@@ -685,7 +684,6 @@ class _Embedding:
  @pytest.mark.parametrize("num_tokens", (9, 10, 11))
  @pytest.mark.parametrize("use_embeds", (False, True))
  def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
