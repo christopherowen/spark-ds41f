@@ -1,0 +1,546 @@
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 9532ee695..60d5bc900 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -219,6 +219,33 @@ def test_mxfp4_quantize(n=3000):
+     assert torch.equal(q, ref_q)
+ 
+ 
++@pytest.mark.parametrize("rows", [1, 7, 37, 128])
++def test_mxfp4_quantize_with_rope(rows):
++    """Fused index-query RoPE + MXFP4 quantize produces the exact bytes of running
++    ``rope_`` then ``quantize_mxfp4``, without mutating the BF16 input."""
++    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
++
++    gen = _gen(rows + 30)
++    iq = _mxfp4_inputs(rows * INDEX_HEADS, rows + 31).view(
++        rows, INDEX_HEADS, INDEX_DIM
++    )
++    iq_orig = iq.clone()
++    iq_ref = iq.clone()
++    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
++    table = rope_table()
++    rope_(iq_ref, positions, table, 1, False)
++    ref_q = torch.empty((rows, INDEX_HEADS, 64), dtype=torch.uint8, device=DEVICE)
++    ref_scales = torch.empty((rows, INDEX_HEADS, 4), dtype=torch.uint8, device=DEVICE)
++    quantize_mxfp4(iq_ref, ref_q, ref_scales)
++
++    q = torch.empty_like(ref_q)
++    scales = torch.empty_like(ref_scales)
++    quantize_mxfp4(iq, q, scales, positions=positions, cos_sin=table)
++    assert torch.equal(iq.view(torch.int16), iq_orig.view(torch.int16))
++    assert torch.equal(scales, ref_scales)
++    assert torch.equal(q, ref_q)
++
++
+ def test_write_index_keys(page_size=64, pages=5):
+     n = pages * page_size // 2
+     x = _mxfp4_inputs(n, 12)
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 7a5aa4ce4..1c5390b1d 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -335,6 +335,42 @@ def test_block32_reads_its_producers_cast(default_vllm_config, n, k):
+                 fed(rows)
+ 
+ 
++def test_slice_mxfp8_reuses_or_pads_rows(default_vllm_config, n=4096, k=1280):
++    """``slice_mxfp8`` hands a split projection (such as ``indexer.wq_b``) the exact
++    bits of casting the slice on its own, whether the slice is the full batch, an
++    interior SP range with enough trailing rows, or a tail SP range that pads into a
++    decode tile."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangBlock32Rows,
++        cast_mxfp8,
++        provide_mxfp8,
++        slice_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, _ = _block32_weight(n, k, 16)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    casting = TileLangBlock32Rows(layer, 0)
++    casting.declare_kernels()
++    fed = TileLangBlock32Rows(layer, 0)
++    fed.tilelang_mxfp8_input = True
++    fed.declare_kernels()
++    x = torch.randn((200, k), generator=_gen(18), device=DEVICE).bfloat16()
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        full_cast = cast_mxfp8(x)
++        assert slice_mxfp8(full_cast, 0, 200) is full_cast
++        for first, last in ((0, 200), (0, 17), (32, 96), (64, 196), (180, 200)):
++            sub = x[first:last]
++            expected = casting(sub)
++            sliced = slice_mxfp8(full_cast, first, last)
++            with provide_mxfp8(sliced):
++                assert torch.equal(fed(sub), expected), f"slice=({first}, {last})"
++
++
+ def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
+     """A split-K projection's decode scratch is its own: marking it is refused."""
+     from torch import nn
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 373bcc2e0..b22ac232b 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -180,3 +180,50 @@ def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
+     metadata = None
+     assert module._front(torch.zeros(6, 1792), positions, None) is None
+     assert len(launches) == 1
++
++
++def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
++    """``_index_query`` feeds ``indexer.wq_b`` from ``q_cast`` (no second ``cast_mxfp8``)
++    and passes ``positions[first:last]`` straight into ``_quantize_index_query`` without
++    a separate ``_rope`` call."""
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    module = _tilelang_layer(layer_id=3)
++    seen_provided = []
++    quant_calls = []
++
++    def fake_wqb(x):
++        seen_provided.append(x.shape)
++        return torch.zeros((x.shape[0], 32 * 128), dtype=torch.bfloat16)
++
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wq_b=fake_wqb,
++        weights_proj=lambda h: torch.ones((h.shape[0], 32), dtype=torch.bfloat16),
++    )
++    monkeypatch.setattr(
++        kernels,
++        "cast_mxfp8",
++        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected cast_mxfp8")),
++    )
++    module._rope = lambda *args: (_ for _ in ()).throw(
++        AssertionError("unexpected separate _rope")
++    )
++    module._quantize_index_query = (
++        lambda mode, iq, data, scale, positions=None: quant_calls.append(
++            (mode, tuple(iq.shape), positions.tolist())
++        )
++    )
++    qr = torch.zeros((12, 1280), dtype=torch.bfloat16)
++    q_cast = MXFP8Rows(
++        qr,
++        torch.zeros((64, 1280), dtype=torch.float8_e4m3fn),
++        torch.zeros((64, 40), dtype=torch.uint8),
++    )
++    positions = torch.arange(100, 112, dtype=torch.int64)
++    hidden = torch.zeros((12, 5120), dtype=torch.bfloat16)
++    swa = SimpleNamespace(is_decode=False)
++    module._index_query(qr, positions, hidden, None, 4, 9, swa, q_cast)
++    assert seen_provided == [(5, 1280)]
++    assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..c0e7213c7 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -170,6 +170,8 @@ class DeepseekV4Indexer(nn.Module):
+             prefix=f"{prefix}.wq_b",
+         )
+         _native_linear(self.wq_b)
++        # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
++        self.wq_b.tilelang_mxfp8_input = True
+         self.weights_proj = ReplicatedLinear(
+             hf.hidden_size,
+             hf.index_n_heads,
+@@ -635,8 +637,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             (self.n_local_heads, self.head_dim, 1, False),  # q
+             (1, 512, 1, False),  # kv
+         ]
+-        if self.indexer is not None:
+-            roles.append((self.indexer.heads, 128, 1, False))  # index query
+         if self.compressor is not None:
+             roles.append((1, 128, self.compress_ratio, False))  # index key
+             roles.append((1, 512, self.compress_ratio, False))  # latent
+@@ -896,29 +896,61 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 first = split.start if split is not None else 0
+                 last = first + split.real_rows if split is not None else rows
+                 query = self._index_query(
+-                    qr, positions, hidden_states, index_weights, first, last, swa
++                    qr,
++                    positions,
++                    hidden_states,
++                    index_weights,
++                    first,
++                    last,
++                    swa,
++                    q_cast,
+                 )
+                 reference = None
+                 if split is not None and _INDEX_SPLIT_CHECK:
+                     reference = self._index_query(
+-                        qr, positions, hidden_states, index_weights, 0, rows, swa
++                        qr,
++                        positions,
++                        hidden_states,
++                        index_weights,
++                        0,
++                        rows,
++                        swa,
++                        q_cast,
+                     )
+                 index_query = (*query, split, reference)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
+     def _index_query(
+-        self, qr, positions, hidden_states, index_weights, first, last, swa
++        self,
++        qr,
++        positions,
++        hidden_states,
++        index_weights,
++        first,
++        last,
++        swa,
++        q_cast=None,
+     ):
+         """MXFP4 index queries and scaled head weights for rows [first, last)."""
+         rows = last - first
+         h = self.indexer.heads
+-        iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
+-        iq = self._rope(iq, positions[first:last], "index_query")
++        qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
++        cast_rows = (
++            kernels.cast_mxfp8(qr_rows)
++            if q_cast is None
++            else kernels.slice_mxfp8(q_cast, first, last)
++        )
++        with kernels.mxfp8_inputs(cast_rows):
++            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+         self._quantize_index_query(
+-            "decode" if swa.is_decode else "prefill", iq, iq_data, iq_scale
++            "decode" if swa.is_decode else "prefill",
++            iq,
++            iq_data,
++            iq_scale,
++            positions=positions[first:last],
+         )
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 9ccc93676..83bec459e 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -75,6 +75,15 @@ def cast_mxfp8(rows: torch.Tensor):
+     return cast_mxfp8(rows)
+ 
+ 
++def slice_mxfp8(rows, first: int, last: int):
++    """Rows ``[first, last)`` of ``rows`` (``linear.MXFP8Rows``) for a split consumer."""
++    if rows is None:
++        return None
++    from .tilelang.linear import slice_mxfp8
++
++    return slice_mxfp8(rows, first, last)
++
++
+ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+     """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
+     from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index af5f65027..11011a915 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -139,7 +139,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         for args in dict.fromkeys(index.values()):
+             calls.extend(_index_calls(*args))
+         if self.indexer is not None:
+-            calls.append(quantize_call())  # _quantize_index_query
++            calls.append(
++                quantize_call(
++                    rope_heads=self.indexer.heads,
++                    rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
++                )
++            )  # _quantize_index_query
+         if self.compressor is not None:
+             calls.append(quantize_call(self._index_page))  # _write_index_keys
+         return calls
+@@ -228,8 +233,16 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     def _attention_scratch_specs(self, mode: str, rows: int):
+         return self._tilelang().mla.scratch_specs(rows)
+ 
+-    def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
+-        quantize_mxfp4(iq, iq_data, iq_scale)
++    def _quantize_index_query(
++        self, mode: str, iq, iq_data, iq_scale, positions=None
++    ) -> None:
++        quantize_mxfp4(
++            iq,
++            iq_data,
++            iq_scale,
++            positions=positions,
++            cos_sin=self.rotary_emb.cos_sin_cache if positions is not None else None,
++        )
+ 
+     def _write_index_keys(self, key, slot_mapping) -> None:
+         write_index_keys(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index f5858e79c..56c31fc7a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -73,12 +73,21 @@ def _score_call(width, page_size, candidates):
+     return prepare.call(indexer_score_v41, width, page_size, candidates)
+ 
+ 
+-def quantize_call(page_size=None):
++def quantize_call(
++    page_size=None,
++    *,
++    rope_heads: int = 0,
++    rope_dim: int = 0,
++    ratio: int = 1,
++):
+     """The MXFP4 quantizer ``quantize_mxfp4`` launches, or with ``page_size`` the
+     index-key writer ``write_index_keys`` launches, as a ``prepare.call``."""
++    kwargs = {}
++    if rope_heads > 0:
++        kwargs = dict(rope_heads=rope_heads, rope_dim=rope_dim, ratio=ratio)
+     if page_size is None:
+-        return prepare.call(mxfp4_quantize_v41)
+-    return prepare.call(mxfp4_quantize_v41, True, page_size)
++        return prepare.call(mxfp4_quantize_v41, **kwargs)
++    return prepare.call(mxfp4_quantize_v41, True, page_size, **kwargs)
+ 
+ 
+ def _row_extent(Lengths, Active, row, width):
+@@ -393,43 +402,79 @@ def _e2m1_code(x):
+     return code | (sign << 3)
+ 
+ 
+-def _mxfp4_byte(X, row, first, scale):
+-    """Two scaled values ``X[row, first : first + 2]`` packed low nibble first."""
+-    lo = _e2m1_code(T.fmul(T.cast(X[row, first], T.float32), scale))
+-    hi = _e2m1_code(T.fmul(T.cast(X[row, first + 1], T.float32), scale))
++def _mxfp4_byte(vals, first, scale):
++    """Two scaled values ``vals[first : first + 2]`` packed low nibble first."""
++    lo = _e2m1_code(T.fmul(T.cast(vals[first], T.float32), scale))
++    hi = _e2m1_code(T.fmul(T.cast(vals[first + 1], T.float32), scale))
+     return T.cast(lo | (hi << 4), T.uint8)
+ 
+ 
+ @tilelang.jit
+-def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int = 128):
++def mxfp4_quantize_v41(
++    paged: bool = False,
++    page_size: int = 64,
++    threads: int = 128,
++    rope_heads: int = 0,
++    rope_dim: int = 0,
++    ratio: int = 1,
++):
+     """MXFP4-quantize ``[rows, 128]`` BF16 vectors, one thread per 32-value group.
+ 
+     Each group's UE8M0 scale is ``pow2_ceil(max(amax, 6 * 2^-126) * fp32(1/6))``
+     and its values round to nearest even E2M1, as B12X's quantizer does, so
+-    both backends see identical index queries and keys. The output is either
+-    contiguous (``Q`` ``[rows, 64]`` packed, ``S`` ``[rows, 4]``) or, with
+-    ``paged``, written through ``Slots`` (``[rows]`` int64; negative slots
+-    skip) into index-cache pages ``Pool`` (``[pages, page bytes]``, any row
+-    stride).
++    both backends see identical index queries and keys. With ``rope_heads > 0``,
++    the trailing ``rope_dim`` columns of each head are rotated in registers at
++    ``Positions`` (``rope_kernel``'s GPT-J interleaved ``ieee_fmaf`` arithmetic)
++    before quantization. The output is either contiguous (``Q`` ``[rows, 64]``
++    packed, ``S`` ``[rows, 4]``) or, with ``paged``, written through ``Slots``
++    (``[rows]`` int64; negative slots skip) into index-cache pages ``Pool``
++    (``[pages, page bytes]``, any row stride).
+     """
+     rows, pool_pages, pool_stride = T.dynamic("rows, pool_pages, pool_stride")
++    tokens, positions_max = T.dynamic("tokens, positions_max")
+     groups = INDEX_DIM // SF_BLOCK
+     half = SF_BLOCK // 2
++    assert rope_heads == 0 or (rope_dim > 0 and rope_dim % SF_BLOCK == 0)
++    start_group = groups - (rope_dim // SF_BLOCK) if rope_heads > 0 else groups
++    rope_half = rope_dim // 2
+ 
+     @T.macro
+-    def body(X, Q, S, Slots, Pool):
++    def body(X, Positions, CosSin, Q, S, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
+             pdl.chain()
+             tx = T.get_thread_binding()
+             g = bx * threads + tx
+             row, k = g // groups, g % groups
++            vals = T.alloc_local([SF_BLOCK], T.bfloat16)
+             amax = T.alloc_var(T.float32)
+             if row < rows:
++                for i in T.serial(SF_BLOCK):
++                    vals[i] = X[row, k * SF_BLOCK + i]
++                if rope_heads > 0:
++                    if k >= start_group:
++                        token = row // rope_heads
++                        pos = (
++                            Positions[token] // ratio * ratio
++                            if ratio > 1
++                            else Positions[token]
++                        )
++                        pair_base = (k - start_group) * half
++                        for i in T.unroll(half):
++                            first = T.cast(vals[2 * i], T.float32)
++                            second = T.cast(vals[2 * i + 1], T.float32)
++                            cosine = CosSin[pos, pair_base + i]
++                            sine = CosSin[pos, rope_half + pair_base + i]
++                            vals[2 * i] = T.cast(
++                                T.ieee_fmaf(first, cosine, -(second * sine)),
++                                T.bfloat16,
++                            )
++                            vals[2 * i + 1] = T.cast(
++                                T.ieee_fmaf(first, sine, second * cosine),
++                                T.bfloat16,
++                            )
+                 amax = 6.0 * 2.0**-126
+                 for i in T.serial(SF_BLOCK):
+-                    amax = T.max(
+-                        amax, T.abs(T.cast(X[row, k * SF_BLOCK + i], T.float32))
+-                    )
++                    amax = T.max(amax, T.abs(T.cast(vals[i], T.float32)))
+                 bits = T.reinterpret(T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32)
+                 sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
+                     (bits & 0x7FFFFF) != 0, T.int32
+@@ -443,19 +488,32 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+                     if (slot >= 0) & (page < pool_pages):
+                         for i in T.serial(half):
+                             Pool[page, token * (INDEX_DIM // 2) + k * half + i] = (
+-                                _mxfp4_byte(X, row, k * SF_BLOCK + 2 * i, scale)
++                                _mxfp4_byte(vals, 2 * i, scale)
+                             )
+                         Pool[
+                             page, page_size * (INDEX_DIM // 2) + token * groups + k
+                         ] = T.cast(sf, T.uint8)
+                 else:
+                     for i in T.serial(half):
+-                        Q[row, k * half + i] = _mxfp4_byte(
+-                            X, row, k * SF_BLOCK + 2 * i, scale
+-                        )
++                        Q[row, k * half + i] = _mxfp4_byte(vals, 2 * i, scale)
+                     S[row, k] = T.cast(sf, T.uint8)
+ 
+     if paged:
++        if rope_heads > 0:
++
++            @T.prim_func
++            def indexer_mxfp4_quantize(
++                X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
++                Positions: T.Tensor([tokens], T.int64),
++                CosSin: T.Tensor([positions_max, rope_dim], T.float32),
++                Slots: T.Tensor([rows], T.int64),
++                Pool: T.StridedTensor(
++                    [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
++                ),
++            ):
++                body(X, Positions, CosSin, None, None, Slots, Pool)
++
++            return indexer_mxfp4_quantize
+ 
+         @T.prim_func
+         def indexer_mxfp4_quantize(
+@@ -465,7 +523,21 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+                 [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+             ),
+         ):
+-            body(X, None, None, Slots, Pool)
++            body(X, None, None, None, None, Slots, Pool)
++
++        return indexer_mxfp4_quantize
++
++    if rope_heads > 0:
++
++        @T.prim_func
++        def indexer_mxfp4_quantize(
++            X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
++            Positions: T.Tensor([tokens], T.int64),
++            CosSin: T.Tensor([positions_max, rope_dim], T.float32),
++            Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
++            S: T.Tensor([rows, groups], T.uint8),
++        ):
++            body(X, Positions, CosSin, Q, S, None, None)
+ 
+         return indexer_mxfp4_quantize
+ 
+@@ -475,16 +547,34 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+         Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
+         S: T.Tensor([rows, groups], T.uint8),
+     ):
+-        body(X, Q, S, None, None)
++        body(X, None, None, Q, S, None, None)
+ 
+     return indexer_mxfp4_quantize
+ 
+ 
+-def quantize_mxfp4(x, q, scales):
++def quantize_mxfp4(x, q, scales, *, positions=None, cos_sin=None, ratio: int = 1):
+     """MXFP4-quantize ``[..., 128]`` BF16 into ``q`` and ``scales``.
+ 
+-    ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0.
++    ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0. With
++    ``positions`` and ``cos_sin``, rotates the trailing ``cos_sin.shape[1]``
++    columns of each head in registers before quantizing.
+     """
++    if x.shape[0] == 0:
++        return q, scales
++    if positions is not None and cos_sin is not None:
++        heads = x.shape[1] if x.ndim == 3 else 1
++        _make(
++            quantize_call(
++                rope_heads=heads, rope_dim=cos_sin.shape[1], ratio=ratio
++            )
++        )(
++            x.reshape(-1, INDEX_DIM),
++            positions,
++            cos_sin,
++            q.view(-1, INDEX_DIM // 2),
++            scales.view(-1, INDEX_DIM // SF_BLOCK),
++        )
++        return q, scales
+     _make(quantize_call())(
+         x.reshape(-1, INDEX_DIM),
+         q.view(-1, INDEX_DIM // 2),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 071f67d7a..d39b55719 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -143,6 +143,27 @@ def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
+     return out
+ 
+ 
++def slice_mxfp8(rows: MXFP8Rows, first: int, last: int) -> MXFP8Rows:
++    """Rows ``[first, last)`` of ``rows`` as an ``MXFP8Rows`` view when ``rows`` holds
++    enough padded rows past ``first``, else copied into a padded decode tile buffer."""
++    if first == 0 and last == rows.rows.shape[0]:
++        return rows
++    sub = rows.rows[first:last]
++    m = sub.shape[0]
++    needed = mxfp8_rows(m)
++    if rows.values.shape[0] - first >= needed:
++        return MXFP8Rows(
++            sub,
++            rows.values[first : first + needed],
++            rows.scales[first : first + needed],
++        )
++    out = empty_mxfp8(sub)
++    if m:
++        out.values[:m].copy_(rows.values[first:last])
++        out.scales[:m].copy_(rows.scales[first:last])
++    return out
++
++
+ # The MXFP8 rows handed to the projections of the calls in progress, innermost last.
+ _PROVIDED: list[MXFP8Rows] = []
+ 
+@@ -802,4 +823,5 @@ __all__ = [
+     "project_parts",
+     "provide_mxfp8",
+     "provided_mxfp8",
++    "slice_mxfp8",
+ ]
