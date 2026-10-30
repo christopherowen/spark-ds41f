@@ -788,3 +788,27 @@ candidate (owner, 2026-10-29: fold the fix in before promoting).
   [releases/spark-ds41f-1030](../../releases/spark-ds41f-1030/), baseline
   [2026-10-30-spark-ds41f-1030](../../manifests/baselines/2026-10-30-spark-ds41f-1030.json),
   [release notes](release-notes.md).
+
+## spark-ds41f-1030 on the triangle
+
+The owner re-cabled to the dgx1-dgx2-dgx3 triangle on 2026-10-30 for the full TP3 qualification
+of the release (dgx1 and dgx3 back on their `40-cx7.yaml.triangle` addressing; every cable path
+passes a 9000-byte ping and each RoCE GID 3 holds its address). The arm is the frozen release
+at the triangle, [rc14/rc-tp3.json](rc14/rc-tp3.json): the 6,144-token budget the recipe has
+carried since 2026-10-27, which this release qualifies. The image is already on every node.
+
+- **Checks** ([rc14/candidate-tp3.json](rc14/candidate-tp3.json), run `candidate-14-tp3`, about
+  50 min): GLP's dual-serving probe and AdvBench on the release; then candidate 13's checks
+  (determinism with and without logprobs, 16K, c8 and c4 distinct streams, control spellings
+  and controls, the TTFT trace, memory, sink counters and probes, prompt logprobs, seeded
+  sampling, images, CED cross-shape, startup lines) on three boots: spark-ds41f-1025 at its
+  8,192 budget, candidate 14 at 8,192 ([rc14/rc-tp3-8192.json](rc14/rc-tp3-8192.json); one budget
+  with 1025, so digests compare build to build) and the release at 6,144.
+- **Release comparison** ([rc14/release-tp3.json](rc14/release-tp3.json), run
+  `candidate-14-release-tp3`, about 4 h): suites `release-tp3`, `single-stream` and `sampled` on
+  the release, spark-ds41f-1025, the release again. 1025's TP3 record has no request tables, so
+  1025 is measured again.
+
+It qualifies if the 8,192 digests equal 1025's apart from CED-affected prompts (0526), the
+release's checks pass, the host's lowest MemAvailable stays above the 5 GiB startup guard, and
+no verdict is worse than 1025's.
