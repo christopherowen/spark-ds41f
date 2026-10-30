@@ -1,0 +1,238 @@
+From 568702261352ea23d1e7fc4d6a8b0f358ac067eb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:57:35 +0100
+Subject: [PATCH] feat(worker): log per-component GPU and host memory breakdown
+ at startup
+
+Record and log a structured [memory_breakdown] summary at the end of
+Worker._compile_or_warm_up_model_after_preparation covering weights,
+KV cache, workspace, other PyTorch allocated tensors, PyTorch reserved
+memory, caching allocator slack, profiled peak activation headroom,
+captured CUDA graph pool memory, non-PyTorch CUDA/UMA usage, and free
+memory.
+---
+ tests/v1/worker/test_gpu_worker.py | 110 +++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py       |  85 ++++++++++++++++++++++
+ 2 files changed, 195 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 8a9002a4b..c80d52653 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -782,3 +782,113 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+     assert events[0] == "set_torch_threads_for_runtime"
+     assert events.count("set_torch_threads_for_runtime") == 1
+     assert "kernel_warmup" in events and "capture_model" in events
++
++
++def test_compile_or_warm_up_logs_startup_memory_breakdown(monkeypatch):
++    """Warmup records and logs a per-component startup memory breakdown."""
++    import torch
++
++    from vllm.v1.worker import workspace as workspace_mod
++
++    compilation = SimpleNamespace(
++        mode=gpu_worker.CompilationMode.NONE,
++        compilation_time=0.0,
++        encoder_compilation_time=0.0,
++    )
++    worker = SimpleNamespace(
++        rank=2,
++        device="cuda:0",
++        vllm_config=SimpleNamespace(compilation_config=compilation),
++        compilation_config=compilation,
++        model_runner=SimpleNamespace(
++            lora_config=None,
++            maybe_remove_all_loras=lambda config: None,
++            capture_model=lambda: 2 * GiB_bytes,
++            model_memory_usage=31 * GiB_bytes,
++        ),
++        model_config=SimpleNamespace(enforce_eager=False, seed=0),
++        cache_config=SimpleNamespace(kv_cache_memory_bytes=20 * GiB_bytes),
++        available_kv_cache_memory_bytes=20 * GiB_bytes,
++        peak_activation_memory=3 * GiB_bytes,
++        use_v2_model_runner=False,
++        observability_config=SimpleNamespace(
++            jit_monitor_mode="off", jit_monitor_verbose=False
++        ),
++        _roce_failure=lambda: None,
++        _startup_rendezvous=lambda stage: None,
++        _startup_heartbeat=None,
++    )
++    monkeypatch.setattr(
++        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
++    )
++    for name in (
++        "kernel_warmup",
++        "set_random_seed",
++        "freeze_gc_heap",
++        "maybe_attach_gc_debug_callback",
++        "enable_gpu_sync_check",
++        "set_torch_threads_for_runtime",
++    ):
++        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
++    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
++
++    ws_tensor = torch.empty((256 * 1024 * 1024,), dtype=torch.uint8)
++    monkeypatch.setattr(
++        workspace_mod,
++        "_manager",
++        SimpleNamespace(
++            _current_workspaces=[ws_tensor],
++            _moe_output_bytes=128 * 1024 * 1024,
++        ),
++    )
++    monkeypatch.setattr(
++        gpu_worker,
++        "MemorySnapshot",
++        lambda device=None: SimpleNamespace(
++            torch_allocated=53 * GiB_bytes,
++            torch_memory=54 * GiB_bytes,
++            non_torch_memory=4 * GiB_bytes,
++            free_memory=6 * GiB_bytes,
++        ),
++    )
++
++    logged_messages: list[str] = []
++    monkeypatch.setattr(
++        gpu_worker.logger,
++        "info",
++        lambda msg, *args: logged_messages.append(msg % args if args else str(msg)),
++    )
++
++    worker._compile_or_warm_up_model_after_preparation = lambda: (
++        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
++    )
++    worker._b12x_session = None
++    worker._get_cudagraph_capture_context = nullcontext
++    gpu_worker.Worker.compile_or_warm_up_model(worker)
++
++    expected_workspace = (256 + 128) * 1024 * 1024
++    expected_other = 53 * GiB_bytes - 31 * GiB_bytes - 20 * GiB_bytes - expected_workspace
++    assert worker.startup_memory_breakdown == {
++        "weights_bytes": 31 * GiB_bytes,
++        "kv_cache_bytes": 20 * GiB_bytes,
++        "workspace_bytes": expected_workspace,
++        "other_torch_allocated_bytes": expected_other,
++        "torch_allocated_bytes": 53 * GiB_bytes,
++        "torch_reserved_bytes": 54 * GiB_bytes,
++        "torch_allocator_slack_bytes": 1 * GiB_bytes,
++        "peak_activation_bytes": 3 * GiB_bytes,
++        "cudagraph_bytes": 2 * GiB_bytes,
++        "non_torch_cuda_bytes": 4 * GiB_bytes,
++        "free_memory_bytes": 6 * GiB_bytes,
++    }
++    breakdown_logs = [m for m in logged_messages if m.startswith("[memory_breakdown]")]
++    assert len(breakdown_logs) == 1
++    assert "rank=2" in breakdown_logs[0]
++    assert "weights=31.0 GiB" in breakdown_logs[0]
++    assert "kv_cache=20.0 GiB" in breakdown_logs[0]
++    assert "workspace=0.38 GiB" in breakdown_logs[0]
++    assert "torch_allocator_slack=1.0 GiB" in breakdown_logs[0]
++    assert "cudagraph=2.0 GiB" in breakdown_logs[0]
++    assert "non_torch_cuda=4.0 GiB" in breakdown_logs[0]
++    assert "free_memory=6.0 GiB" in breakdown_logs[0]
++
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1ae9fa14a..e496787fb 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1183,6 +1183,8 @@ class Worker(WorkerBase):
+             self._startup_heartbeat.stop()
+             self._startup_heartbeat = None
+ 
++        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
++
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1993,3 +1995,86 @@ def init_worker_distributed_environment(
+     # Init ec connector here before KV caches init
+     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
+     ensure_ec_transfer_initialized(vllm_config)
++
++
++def log_startup_memory_breakdown(
++    worker: Any,
++    cuda_graph_memory_bytes: int = 0,
++) -> dict[str, int]:
++    """Record and log a per-component GPU/UMA memory breakdown after warmup."""
++    device = getattr(worker, "device", None)
++    if device is None:
++        return {}
++
++    snapshot = MemorySnapshot(device=device)
++    model_runner = getattr(worker, "model_runner", None)
++    cache_config = getattr(worker, "cache_config", None)
++
++    weights_bytes = int(getattr(model_runner, "model_memory_usage", 0) or 0)
++    kv_cache_bytes = int(
++        getattr(worker, "available_kv_cache_memory_bytes", 0)
++        or getattr(cache_config, "kv_cache_memory_bytes", 0)
++        or 0
++    )
++
++    from vllm.v1.worker import workspace as workspace_mod
++
++    mgr = workspace_mod._manager
++    workspace_bytes = 0
++    if mgr is not None:
++        workspace_bytes = sum(
++            workspace_mod.WorkspaceManager._workspace_size_bytes(ws)
++            for ws in getattr(mgr, "_current_workspaces", ())
++        ) + int(getattr(mgr, "_moe_output_bytes", 0) or 0)
++
++    torch_allocated_bytes = int(getattr(snapshot, "torch_allocated", 0) or 0)
++    torch_reserved_bytes = int(getattr(snapshot, "torch_memory", 0) or 0)
++    torch_allocator_slack_bytes = max(
++        torch_reserved_bytes - torch_allocated_bytes, 0
++    )
++    other_torch_allocated_bytes = max(
++        torch_allocated_bytes - weights_bytes - kv_cache_bytes - workspace_bytes,
++        0,
++    )
++    peak_activation_bytes = int(
++        getattr(worker, "peak_activation_memory", 0) or 0
++    )
++    cudagraph_bytes = int(cuda_graph_memory_bytes or 0)
++    non_torch_cuda_bytes = int(getattr(snapshot, "non_torch_memory", 0) or 0)
++    free_memory_bytes = int(getattr(snapshot, "free_memory", 0) or 0)
++
++    breakdown = {
++        "weights_bytes": weights_bytes,
++        "kv_cache_bytes": kv_cache_bytes,
++        "workspace_bytes": workspace_bytes,
++        "other_torch_allocated_bytes": other_torch_allocated_bytes,
++        "torch_allocated_bytes": torch_allocated_bytes,
++        "torch_reserved_bytes": torch_reserved_bytes,
++        "torch_allocator_slack_bytes": torch_allocator_slack_bytes,
++        "peak_activation_bytes": peak_activation_bytes,
++        "cudagraph_bytes": cudagraph_bytes,
++        "non_torch_cuda_bytes": non_torch_cuda_bytes,
++        "free_memory_bytes": free_memory_bytes,
++    }
++    worker.startup_memory_breakdown = breakdown
++    logger.info(
++        "[memory_breakdown] rank=%s weights=%s GiB kv_cache=%s GiB "
++        "workspace=%s GiB other_torch_allocated=%s GiB "
++        "torch_allocated=%s GiB torch_reserved=%s GiB "
++        "torch_allocator_slack=%s GiB peak_activation=%s GiB "
++        "cudagraph=%s GiB non_torch_cuda=%s GiB free_memory=%s GiB",
++        getattr(worker, "rank", 0),
++        format_gib(weights_bytes),
++        format_gib(kv_cache_bytes),
++        format_gib(workspace_bytes),
++        format_gib(other_torch_allocated_bytes),
++        format_gib(torch_allocated_bytes),
++        format_gib(torch_reserved_bytes),
++        format_gib(torch_allocator_slack_bytes),
++        format_gib(peak_activation_bytes),
++        format_gib(cudagraph_bytes),
++        format_gib(non_torch_cuda_bytes),
++        format_gib(free_memory_bytes),
++    )
++    return breakdown
++
+-- 
+2.54.0 (Apple Git-157)
+
