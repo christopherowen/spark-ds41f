@@ -17,3 +17,7 @@ class MemoryPlanTest(unittest.TestCase):
         for count, size in ((1, 8), (20, 7), (20, 0)):
             with self.assertRaises(ValueError):
                 placement.memory_plan(80 << 30, count, size)
+
+
+if __name__ == "__main__":
+    unittest.main()

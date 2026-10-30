@@ -1,7 +1,7 @@
-From b748cec19685d6dd67542868fb785e8cfe120698 Mon Sep 17 00:00:00 2001
+From 6b6d35a9f5a408ad06df31c48951b353a9fe1a15 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 08:22:06 +0100
-Subject: [PATCH 524/526] [DS4.1] Names: the V4.1 cache layout and attention
+Subject: [PATCH 524/528] [DS4.1] Names: the V4.1 cache layout and attention
  ops lose B12X's name
 
 The V4.1 cache layout, metadata and builder classes kept B12X's name after
@@ -94,11 +94,11 @@ index 066c44382..c8e1bbdc2 100644
              ]
              self.graph = None
 diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
-index b7137e2a4..061a24f42 100644
+index 95c153bb6..55036fae8 100644
 --- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
 +++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
-@@ -16,7 +16,7 @@ from vllm.models.deepseek_v4_1.ced import (
-     plan_ced,
+@@ -18,7 +18,7 @@ from vllm.models.deepseek_v4_1.ced import (
+     replay_rows,
      scatter_rows,
  )
 -from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
@@ -106,7 +106,7 @@ index b7137e2a4..061a24f42 100644
  
  cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
  
-@@ -138,7 +138,7 @@ def test_mixed_metadata_keeps_context_bounds_and_padding():
+@@ -221,7 +221,7 @@ def test_mixed_metadata_keeps_context_bounds_and_padding():
      positions = torch.cat(
          (torch.tensor([899], device="cuda"), torch.arange(4096, 8192, device="cuda"))
      )
@@ -180,10 +180,10 @@ index ffb2e8b76..18e82203b 100644
              extra_retained_tokens=int(draft),
              prefix_cache_enabled=not bounded,
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 55b2f53ee..342f61d74 100644
+index d127ae810..d5aa20ec6 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
-@@ -31,8 +31,8 @@ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+@@ -34,8 +34,8 @@ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
  from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
  from vllm.models.deepseek_v4_1.sparse_mla import (
      SLOT_DTYPE,
@@ -194,7 +194,7 @@ index 55b2f53ee..342f61d74 100644
      tilelang_builder_kernels,
  )
  from vllm.models.deepseek_v4_1.tilelang import prepare
-@@ -100,7 +100,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+@@ -104,7 +104,7 @@ class _Cache(nn.Module, AttentionLayerBase):
              state_content_bytes=528 if self.kind == "swa" else 68,
              dtype=torch.uint8,
              tokens_per_state=self.ratio,
@@ -203,7 +203,7 @@ index 55b2f53ee..342f61d74 100644
              alignment=None,
              uses_only_written_slots=True,
          )
-@@ -120,7 +120,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+@@ -124,7 +124,7 @@ class _Cache(nn.Module, AttentionLayerBase):
          return MLAAttentionSpec(**common)
  
      def get_attn_backend(self):
@@ -212,7 +212,7 @@ index 55b2f53ee..342f61d74 100644
  
      def forward(self):
          raise RuntimeError("V4.1 caches are consumed by their owning attention layer")
-@@ -197,7 +197,7 @@ class DeepseekV4Indexer(nn.Module):
+@@ -201,7 +201,7 @@ class DeepseekV4Indexer(nn.Module):
          self.ratio = ratio
  
  
@@ -221,7 +221,7 @@ index 55b2f53ee..342f61d74 100644
  def _attention(
      hidden: torch.Tensor,
      positions: torch.Tensor,
-@@ -216,7 +216,7 @@ def _attention_fake(hidden, positions, prefix, global_kv_ready):
+@@ -220,7 +220,7 @@ def _attention_fake(hidden, positions, prefix, global_kv_ready):
      return torch.empty_like(hidden, memory_format=torch.contiguous_format)
  
  
@@ -230,7 +230,7 @@ index 55b2f53ee..342f61d74 100644
  def _prepare_global_kv(
      hidden: torch.Tensor,
      positions: torch.Tensor,
-@@ -241,7 +241,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -245,7 +245,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
      ``_quantize_index_query``, ``_write_index_keys``, ``_index_chunk`` and
      ``_attend``."""
  
@@ -239,7 +239,7 @@ index 55b2f53ee..342f61d74 100644
      # Index scores need bounded row scratch; attention handles the whole batch.
      INDEX_CHUNK = 256
      DECODE_CHUNK = 64
-@@ -454,7 +454,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -461,7 +461,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              state_content_bytes=288,
              dtype=torch.uint8,
              tokens_per_state=self.compress_ratio,
@@ -248,7 +248,7 @@ index 55b2f53ee..342f61d74 100644
              alignment=None,
              uses_only_written_slots=True,
          )
-@@ -734,7 +734,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -753,7 +753,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          # Index K consumes the ordinary-normalized PRE-RoPE latent.
          key = indexer.k_norm(indexer.wk(latent))
          key = self._rope(key, positions, "index_key")
@@ -257,7 +257,7 @@ index 55b2f53ee..342f61d74 100644
          self._write_index_keys(key, index_meta.slot_mapping[:rows])
          latent = self._rope(latent, positions, "latent")
          self._write_v41_cache(
-@@ -804,7 +804,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -874,7 +874,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          q = self._rope(q, positions, "q")
          output = torch.empty_like(q)
          metadata = cast(
@@ -267,7 +267,7 @@ index 55b2f53ee..342f61d74 100644
          )
          if not isinstance(metadata, dict):
 diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
-index 25dd274a8..9c6e1cc07 100644
+index aceb616a0..a2038ee23 100644
 --- a/vllm/models/deepseek_v4_1/ced.py
 +++ b/vllm/models/deepseek_v4_1/ced.py
 @@ -14,7 +14,7 @@ from .tilelang import ced as ced_kernels
@@ -314,20 +314,20 @@ index 4be84e918..24aafff63 100644
      @staticmethod
      def get_supported_kernel_block_sizes():
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
-index ad82bc843..ea1b016bb 100644
+index 9c94d8371..d3ab57854 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
-@@ -15,8 +15,8 @@ from vllm.models.deepseek_v4_1.ced import (
+@@ -16,8 +16,8 @@ from vllm.models.deepseek_v4_1.ced import (
      ced_decoder_start,
-     nonfinal_limits,
+     replay_rows,
  )
 +from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Metadata
  from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 -from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
- from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
  from vllm.v1.core.sched.output import NewRequestData
  from vllm.v1.kv_cache_interface import KVCacheConfig
-@@ -335,7 +335,7 @@ class DeepseekV41ModelState(DefaultModelState):
+ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+@@ -297,7 +297,7 @@ class DeepseekV41ModelState(DefaultModelState):
                  routing_mask = ced_kernels.routing_mask(indices, input_batch.is_padding)
              seen: set[int] = set()
              for value in metadata.values():

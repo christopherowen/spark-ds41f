@@ -7,11 +7,16 @@ import datetime
 import gzip
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
 
 from . import SCHEMA, __version__, behaviour, engine, load, prefill, prompts, report, stall, suite
+
+_SCALAR_ARRAY_RE = re.compile(
+    r"\[\n\s+((?:(?:-?\d+(?:\.\d+)?(?:e[+-]?\d+)?|true|false|null|\"[^\"\\\n]*\"),?\n\s+)+)\]"
+)
 
 
 def model_id(base_url: str) -> str:
@@ -19,12 +24,24 @@ def model_id(base_url: str) -> str:
         return json.load(response)["data"][0]["id"]
 
 
+def format_json(value: dict) -> str:
+    """Pretty JSON with leaf arrays of scalars (such as request_table rows) on one line."""
+    text = json.dumps(value, indent=1)
+    return _SCALAR_ARRAY_RE.sub(
+        lambda match: "[" + ", ".join(part.strip().rstrip(",") for part in match.group(1).strip().splitlines()) + "]",
+        text,
+    ) + "\n"
+
+
 def write_json(path: str, value: dict) -> None:
     """Pretty JSON, gzip-compressed when the path ends in .gz."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "wt", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=None if path.endswith(".gz") else 1)
+        if path.endswith(".gz"):
+            json.dump(value, handle, indent=None)
+        else:
+            handle.write(format_json(value))
 
 
 def read_json(path: str) -> dict:
@@ -259,7 +276,9 @@ def command_stall(args: argparse.Namespace) -> int:
                            "probes": list(probes), "probe_tokens": args.probe_tokens,
                            "probe_max_tokens": args.probe_max_tokens,
                            "extra_body": extra, "question": prefill.QUESTION},
-              "stall": rows, "samples": samples}
+              "stall": rows}
+    if getattr(args, "save_samples", False):
+        result["samples"] = samples
     if args.output:
         write_json(args.output, result)
     failed = sum(row["failed"] for row in rows)
@@ -389,6 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
     waits.add_argument("--no-vllm", action="store_true", help="plain OpenAI requests (no cache salt)")
     waits.add_argument("--label", help="name for tables")
     waits.add_argument("--output", help="write the result JSON here")
+    waits.add_argument("--save-samples", action="store_true",
+                       help="keep every repeat's raw overlapping stream gaps")
     waits.set_defaults(func=command_stall)
     fixed = sub.add_parser("suite", help="run a fixed set of measurements (servebench/suites/*.json)")
     fixed.add_argument("url", help="base URL, e.g. http://127.0.0.1:8000")

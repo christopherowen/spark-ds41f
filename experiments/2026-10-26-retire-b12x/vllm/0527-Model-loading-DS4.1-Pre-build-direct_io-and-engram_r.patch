@@ -1,0 +1,168 @@
+From 308b87a6db1aa1c0906b18bedd3c901c1efa7ad5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:42:19 +0100
+Subject: [PATCH 527/528] [Model loading, DS4.1] Pre-build direct_io and
+ engram_rows io_uring helpers into VLLM_NATIVE_CACHE_DIR
+
+---
+ .../model_loader/test_direct_loader.py        | 19 ++++++++
+ .../model_loader/direct_io/_native.py         | 47 ++++++++++++++++++-
+ .../deepseek_v4_1/engram_rows/_native.py      | 43 ++++++++++++++++-
+ 3 files changed, 107 insertions(+), 2 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
+index 75743fcbb..2494241ba 100644
+--- a/tests/model_executor/model_loader/test_direct_loader.py
++++ b/tests/model_executor/model_loader/test_direct_loader.py
+@@ -643,3 +643,22 @@ def test_the_helper_refuses_to_build_without_liburing(tmp_path, monkeypatch):
+     monkeypatch.setenv("CC", str(tmp_path / "no-such-compiler"))
+     with pytest.raises(RuntimeError, match="needs a C99 compiler"):
+         _native._build()
++
++
++def test_prebuilt_native_helpers_resolve_without_compiler(tmp_path, monkeypatch):
++    import sysconfig
++    from vllm.model_executor.model_loader.direct_io import _native as direct_native
++    from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
++
++    prebuilt_root = tmp_path / "native"
++    monkeypatch.setenv("VLLM_NATIVE_CACHE_DIR", str(prebuilt_root))
++    monkeypatch.delenv("CC", raising=False)
++    monkeypatch.delenv("CUDA_HOME", raising=False)
++    # Simulate a runtime container with no compiler or pkg-config on PATH.
++    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
++    ext = sysconfig.get_config_var("EXT_SUFFIX")
++    for kind, mod in (("direct_io", direct_native), ("engram_rows", engram_native)):
++        expected = prebuilt_root / kind / mod._source_digest() / (mod._NAME + ext)
++        expected.parent.mkdir(parents=True, exist_ok=True)
++        expected.write_bytes(b"\x7fELFprebuilt")
++        assert mod._build() == expected
+diff --git a/vllm/model_executor/model_loader/direct_io/_native.py b/vllm/model_executor/model_loader/direct_io/_native.py
+index 488d5ea92..771e43e77 100644
+--- a/vllm/model_executor/model_loader/direct_io/_native.py
++++ b/vllm/model_executor/model_loader/direct_io/_native.py
+@@ -33,6 +33,7 @@ from pathlib import Path
+ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_storage.c")
+ _NAME = "_direct_io_storage"
++_DEFAULT_PREBUILT_ROOT = Path("/opt/spark-ds41f/native")
+ ABI_VERSION = 1
+ 
+ 
+@@ -40,7 +41,51 @@ def _pkg_config(*args: str) -> str:
+     return subprocess.check_output(["pkg-config", *args, "liburing"], text=True).strip()
+ 
+ 
+-def _build() -> Path:
++def _source_digest() -> str:
++    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
++    return hashlib.sha256(b"".join(path.read_bytes() for path in sources)).hexdigest()[:24]
++
++
++def _prebuilt_target() -> Path | None:
++    if "CC" in os.environ:
++        return None
++    default_cuda = Path("/usr/local/cuda")
++    cuda_env = os.environ.get("CUDA_HOME")
++    if cuda_env and Path(cuda_env).resolve() != default_cuda.resolve():
++        return None
++    cc_path = shutil.which("cc")
++    if cc_path is not None and Path(cc_path).resolve() not in {
++        Path(p).resolve() for p in ("/usr/bin/cc", "/bin/cc") if Path(p).exists()
++    }:
++        return None
++    root = Path(os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT))
++    target = (
++        root
++        / "direct_io"
++        / _source_digest()
++        / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
++    )
++    return target if target.is_file() else None
++
++
++def prebuild(root: Path | str | None = None) -> Path:
++    """Compile the helper and install it under ``root / 'direct_io' / <source_digest>``."""
++    built = _build(ignore_prebuilt=True)
++    dest_dir = Path(
++        root or os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT)
++    ) / "direct_io" / _source_digest()
++    dest_dir.mkdir(parents=True, exist_ok=True)
++    dest = dest_dir / built.name
++    if built.resolve() != dest.resolve():
++        shutil.copy2(built, dest)
++    return dest
++
++
++def _build(*, ignore_prebuilt: bool = False) -> Path:
++    if not ignore_prebuilt:
++        prebuilt = _prebuilt_target()
++        if prebuilt is not None:
++            return prebuilt
+     compiler = shlex.split(os.environ.get("CC", "cc"))
+     if not compiler or not shutil.which(compiler[0]):
+         raise RuntimeError("the direct loader needs a C99 compiler (CC or cc)")
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_native.py b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+index 4131026d0..58b823221 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_native.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+@@ -25,6 +25,7 @@ from pathlib import Path
+ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_reader.c")
+ _NAME = "_engram_rows_reader"
++_DEFAULT_PREBUILT_ROOT = Path("/opt/spark-ds41f/native")
+ ABI_VERSION = 5
+ 
+ 
+@@ -32,7 +33,47 @@ def _pkg_config(*args: str) -> str:
+     return subprocess.check_output(["pkg-config", *args, "liburing"], text=True).strip()
+ 
+ 
+-def _build() -> Path:
++def _source_digest() -> str:
++    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
++    return hashlib.sha256(b"".join(p.read_bytes() for p in sources)).hexdigest()[:24]
++
++
++def _prebuilt_target() -> Path | None:
++    if "CC" in os.environ:
++        return None
++    cc_path = shutil.which("cc")
++    if cc_path is not None and Path(cc_path).resolve() not in {
++        Path(p).resolve() for p in ("/usr/bin/cc", "/bin/cc") if Path(p).exists()
++    }:
++        return None
++    root = Path(os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT))
++    target = (
++        root
++        / "engram_rows"
++        / _source_digest()
++        / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
++    )
++    return target if target.is_file() else None
++
++
++def prebuild(root: Path | str | None = None) -> Path:
++    """Compile the reader and install it under ``root / 'engram_rows' / <source_digest>``."""
++    built = _build(ignore_prebuilt=True)
++    dest_dir = Path(
++        root or os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT)
++    ) / "engram_rows" / _source_digest()
++    dest_dir.mkdir(parents=True, exist_ok=True)
++    dest = dest_dir / built.name
++    if built.resolve() != dest.resolve():
++        shutil.copy2(built, dest)
++    return dest
++
++
++def _build(*, ignore_prebuilt: bool = False) -> Path:
++    if not ignore_prebuilt:
++        prebuilt = _prebuilt_target()
++        if prebuilt is not None:
++            return prebuilt
+     compiler = shlex.split(os.environ.get("CC", "cc"))
+     if not compiler or not shutil.which(compiler[0]):
+         raise RuntimeError("the Engram disk reader needs a C compiler (CC or cc)")
+-- 
+2.54.0 (Apple Git-157)
+

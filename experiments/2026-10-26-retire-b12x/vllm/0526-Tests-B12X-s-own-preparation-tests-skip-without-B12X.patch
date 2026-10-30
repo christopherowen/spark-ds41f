@@ -1,7 +1,7 @@
-From 4672ecc3dfd5bc9a733f12f2f176364337fcdf91 Mon Sep 17 00:00:00 2001
+From e51cff3384b8ce3e8edbf6e13012dd2554ffa9d9 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 08:27:08 +0100
-Subject: [PATCH 526/526] Tests: B12X's own preparation tests skip without B12X
+Subject: [PATCH 526/528] Tests: B12X's own preparation tests skip without B12X
 
 Eighteen tests of the B12X preparation driver and coordinator (progress
 aggregation, tuning shards and their consolidation and cancellation, winner
@@ -13,8 +13,9 @@ tests, which a deployment without B12X still runs (no units, the control
 exchanges), are unchanged.
 ---
  tests/model_executor/test_b12x_warmup.py |  2 ++
+ tests/v1/executor/test_b12x_output.py    |  1 +
  tests/v1/executor/test_b12x_startup.py   | 15 +++++++++++++++
- 2 files changed, 17 insertions(+)
+ 3 files changed, 18 insertions(+)
 
 diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
 index b432d5b80..07e7eba79 100644
@@ -36,6 +37,18 @@ index b432d5b80..07e7eba79 100644
      from b12x.preparation import FrozenMapping
  
      path = tmp_path / "queries.jsonl"
+diff --git a/tests/v1/executor/test_b12x_output.py b/tests/v1/executor/test_b12x_output.py
+index cb92a8e6a..cc6e71e72 100644
+--- a/tests/v1/executor/test_b12x_output.py
++++ b/tests/v1/executor/test_b12x_output.py
+@@ -211,6 +211,7 @@ def _terminal_text(data, rows, columns):
+ 
+ @pytest.mark.parametrize("columns", [84, 133])
+ def test_executor_serializes_bound_handlers_native_writes_and_child_output(columns):
++    pytest.importorskip("b12x")
+     master, slave = os.openpty()
+     rows = 36
+     termios.tcsetwinsize(slave, (rows, columns))
 diff --git a/tests/v1/executor/test_b12x_startup.py b/tests/v1/executor/test_b12x_startup.py
 index 493f6339e..334ae88ed 100644
 --- a/tests/v1/executor/test_b12x_startup.py

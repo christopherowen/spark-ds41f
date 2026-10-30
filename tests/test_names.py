@@ -51,7 +51,23 @@ class SourceLabelTest(unittest.TestCase):
     def test_a_profile_with_the_new_labels_passes_the_same_source_checks(self) -> None:
         """spark-ds41f-1022's checks of its image trees give the same answer under either prefix."""
         args = type("Args", (), {"cluster_config": FROZEN_1022, "shape": "tp4-ring"})()
-        cluster, nodes, upstreams = spark.configuration(args)
+        try:
+            cluster, nodes, upstreams = spark.configuration(args)
+        except FileNotFoundError:
+            ring = spark.read_json("config/examples/nodes-ring4.json")
+            head_ip = spark.read_json("config/cluster.json")["distributed"]["master_addr"]
+            next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
+            ring_text = json.dumps(ring)
+            real_read_text = Path.read_text
+            with mock.patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=lambda self, *a, **kw: (
+                    ring_text if self == ROOT / "config/nodes-ring4.local.json" else real_read_text(self, *a, **kw)
+                ),
+            ):
+                cluster, nodes, upstreams = spark.configuration(args)
         renamed = copy.deepcopy(cluster)
         renamed["container"]["expected_labels"] = relabeled(cluster["container"]["expected_labels"])
         self.assertEqual(spark.local_doctor(renamed, nodes, upstreams), spark.local_doctor(cluster, nodes, upstreams))

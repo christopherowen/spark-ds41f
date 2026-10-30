@@ -28,7 +28,8 @@ class TopologyTest(unittest.TestCase):
     def setUp(self):
         # The recipe's triangle (sparknet's oneshot-direct) is the base the tooling generates from.
         self.base = spark.read_cluster("config/cluster.json", "tp3-triangle")
-        self.three = spark.read_json("config/nodes.json")
+        nodes_file = "config/nodes.json" if (ROOT / "config/nodes.json").is_file() else "config/nodes.example.json"
+        self.three = spark.read_json(nodes_file)
         # The site map (or CI's example map) names the API head.
         head = next(node for node in self.three["nodes"] if node.get("head"))
         self.base["distributed"]["master_addr"] = head["management_ip"]

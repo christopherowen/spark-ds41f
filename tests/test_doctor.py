@@ -1082,3 +1082,7 @@ class GLPTest(unittest.TestCase):
         problems = self.node(self.cluster(), 255, stderr="ssh: connect to host dgx2 port 22: Connection refused\n")
         self.assertEqual(problems, ["dgx2: cannot check the GLP steering file: "
                                     "ssh: connect to host dgx2 port 22: Connection refused"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -820,3 +820,34 @@ with short requests waiting is 4.61% and 3.70% slower (the yield and the 6,144 b
 those requests' first token p50 falls from 16.6 to 2.0 s and from 18.3 to 9.6 s. The owner
 accepted the trade. The numbers are in [release-notes.md](release-notes.md); the suites are
 [manifests/suites/2026-10-30-spark-ds41f-1030-tp3](../../manifests/suites/2026-10-30-spark-ds41f-1030-tp3/).
+
+## Candidate 15 ([rc15/](rc15))
+
+Candidate 14 (`spark-ds41f:1030`, vLLM `d5df88d83`) unified with the DSpark speculative decoding,
+scheduler, memory/loader, L2 prefetch, SP prefill, and cold-boot kernel preparation PRs (`#686`,
+`#687`, `#693`, `#694`, `#695`, `#696`, `#697`, `#698`, `#699`, `#700`, `#701`, `#703`, `#704`,
+`#705`) into a single conflict-free 20-patch series (`0568..0587`).
+
+- **Series:** candidate 14's plus 0568-0587 (vLLM `candidate-15`, head `2954ce4d3`;
+  [rc15/vllm/series](rc15/vllm/series), [rc15/make_series.py](rc15/make_series.py)): patch head
+  `5e6a5da1`, tree `8e3d0de6` (reproduced by `bin/spark build prepare`).
+
+  | Patch | PR(s) | Change | Why |
+  | --- | --- | --- | --- |
+  | 0568-0577 | #687 | Copy drafts (`copy_match` and `copy_select` TileLang kernels, wide 12-token verification lookahead, planned confidences, decode arena at `reorder_batch_threshold = max_decode_rows`, warmup without adaptive verification, stand-ins and display carveout test fix) | Zero-model-weight suffix-array copy drafting alongside DSpark's 5-token block |
+  | 0578-0580 | #698 | Contiguous `cudaMalloc` startup weight arena, Order-13 buddy sponge, static 384-row MoE output buffer, and post-warmup `torch.cuda.empty_cache()` | Collapses 19,586 persistent weight allocations into 1 arena (`+1.69 GiB` startup free RAM headroom on `dgx1`, `-1.50 MiB` MoE workspace) |
+  | 0581 | #705 | Per-type L2 weight prefetch schedule (`COMP`/`WO` on owner layers up to 64 rows, `ENGRAM`/`NEXT` on Engram layers up to 16 rows) | Places L2 prefetches in the collective/gate windows where lines survive until consumer launch (`+8.93%` `c1` decode tok/s) |
+  | 0582 | #703 | Local SP row routing + grouped PyNCCL `gather_mxfp8` of `(values, scales, weights, ids)` | Cuts SP prefill collective payload from 560 B to 60 B per token per layer (`-175.8 MiB` per 6,144-token chunk across 60 MoE layers) and eliminates 60 redundant `router_forward` launches per chunk (`-9.7%` SP prefill time) |
+  | 0583 | #696 | Scheduler prefill-decode interleave (`prefill_decode_interleave_steps`) | Runs $K$ graphed decode steps between full 6,144-token prefill chunks under `prefill_yield`, cutting mixed decode ITL p99 by `-49.2%` |
+  | 0584 | #697 | Scheduler context-aware prefill step-time budgeting on an absolute 2,048-token grid | Scales prefill chunk size with context length on a 2,048-token grid (`6,144 -> 4,096 -> 2,048`), cutting max step time at 128K context by `-40.8%` with zero unaligned tail chunks |
+  | 0585 | #704 | Omit unreachable cold-boot MoE, router, and Markov head TileLang compilations | Trims cold-boot kernel compilations from 247 to 209 (`-38` kernels, `-15.4%`) |
+  | 0586 | #686, #687, #693, #695, #700 | Unified `AdaptiveVerificationManager` (`adaptive_verification.py`, `model_runner.py`, `tilelang_inputs.py`, `input_batch.py`) | Combines per-request seeded sampled budgeting (`100%` `c1 == c8` batch invariance), copy-draft `planned_confidences`, piecewise CUDA-graph / 16-row GEMM / 64-row LM-head tile step cost (`+16.51%` `c1` row yield), device dead-row capacity clamp (`-19.4%` to `-20.9%` dead draft rows), and continuation-value cutoff (`+2.20%` `c8` / `+4.31%` `c16` accepted drafts) |
+  | 0587 | #694, #699, #701 | Unified DSpark speculator (`dspark/speculator.py`, `acceptance_estimator.py`, `speculator.py`, `dspark/greedy.py`, `tilelang_sampling.py`, `tilelang/confidence.py`, `nvidia/dspark.py`, `qwen3_dspark.py`) | Combines online IRLS logistic confidence calibration (`-42.7%` Brier score), packed 64-bit `(top1, idx, top2)` greedy shard runner-up margin in a single `all_gather`, and concurrency-bounded draft depth (`K=5 -> 2` at `c16`, `-1.62 ms/step`, `+12.39%` `c16` tok/s) |
+
+- **Arms:** [rc15/rc-tp4.json](rc15/rc-tp4.json), [rc15/rc-tp3.json](rc15/rc-tp3.json), and
+  [rc15/image-dgx4.json](rc15/image-dgx4.json) on `spark-ds41f:19f2c20ed4d6-next-15`
+  ([rc15/source.json](rc15/source.json), [rc15/upstreams.lock.json](rc15/upstreams.lock.json)).
+- **Kernel & unit verification (`dgx4`, `spark-ds41f:1030`):**
+  [rc15/bundles/candidate-15](rc15/bundles/candidate-15) ([rc15/verdict.json](rc15/verdict.json))
+  and subsystem measurements in [rc15/results.json](rc15/results.json)
+  ([rc15/measure_candidate_15.py](rc15/measure_candidate_15.py)).

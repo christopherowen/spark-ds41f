@@ -128,7 +128,8 @@ def rows_a_step(summary: dict) -> dict:
     drafts every step, so it adds 1 + accepted tokens and 1 + verified rows (the target row
     and its verified drafts). Row yield is tokens per verified row; wasted rows are verified
     rows that gave no token (rejected rows and the rows after them). Per draft position:
-    survival (accepted there a draft) and coverage (verified there a draft)."""
+    survival (accepted there a draft), coverage (verified there a draft), conditional
+    acceptance given survival through the previous position, and verified-row yield."""
     server = summary.get("server", {})
 
     def mean(key):
@@ -138,14 +139,91 @@ def rows_a_step(summary: dict) -> dict:
     tokens, accepted, verified = (mean(k) for k in ("output_tokens_per_step", "accepted_per_draft",
                                                     "draft_tokens_per_draft"))
     out = {"tokens_per_step": tokens, "accepted_per_draft": accepted, "verified_per_draft": verified}
+    if accepted is not None:
+        out["acceptance_length"] = 1 + accepted
     if tokens and accepted is not None and verified is not None:
         requests = tokens / (1 + accepted)
         rows = requests * (1 + verified)
         out |= {"decoding_requests_per_step": requests, "verified_rows_per_step": rows,
                 "row_yield": tokens / rows, "wasted_rows_per_step": rows - tokens}
     positions = sorted({int(key.rsplit("_", 1)[1]) for key in server if key.startswith("survival_at_")})
-    out["positions"] = [{"position": k, "survival": mean(f"survival_at_{k}"), "coverage": mean(f"coverage_at_{k}")}
-                        for k in positions]
+    pos_rows = []
+    for k in positions:
+        survival = mean(f"survival_at_{k}")
+        coverage = mean(f"coverage_at_{k}")
+        prev_survival = 1.0 if k == 0 else mean(f"survival_at_{k - 1}")
+        cond_accept = (survival / prev_survival
+                       if survival is not None and prev_survival is not None and prev_survival > 0
+                       else None)
+        verified_yield = (survival / coverage
+                          if survival is not None and coverage is not None and coverage > 0
+                          else None)
+        pos_rows.append({"position": k, "survival": survival, "coverage": coverage,
+                         "conditional_acceptance": cond_accept, "verified_yield": verified_yield})
+    out["positions"] = pos_rows
+    return out
+
+
+def _log_term(u: float, v: float) -> dict:
+    log_ratio = math.log(v / u)
+    return {
+        "base": u,
+        "candidate": v,
+        "ratio": v / u,
+        "log_change": log_ratio,
+        "change_pct": 100.0 * math.expm1(log_ratio),
+    }
+
+
+def spec_decomposition(base_summary: dict, candidate_summary: dict) -> dict | None:
+    """Exact log-throughput decomposition of server decode output between two runs:
+    ``log(tps_b / tps_a) = log((1 + tau_b) / (1 + tau_a)) + log(steps_s_b / steps_s_a)
+    + log(reqs_step_b / reqs_step_a)``, plus verified-row vs row-yield decomposition of
+    tokens per step and per-position deltas when speculative counters are present."""
+    a, b = rows_a_step(base_summary), rows_a_step(candidate_summary)
+    r_a = (base_summary.get("server", {}).get("steps_per_s") or {}).get("mean")
+    r_b = (candidate_summary.get("server", {}).get("steps_per_s") or {}).get("mean")
+    if (not r_a or not r_b or not a.get("tokens_per_step") or not b.get("tokens_per_step")
+            or a.get("accepted_per_draft") is None or b.get("accepted_per_draft") is None):
+        return None
+    l_a, l_b = 1.0 + a["accepted_per_draft"], 1.0 + b["accepted_per_draft"]
+    if l_a <= 0 or l_b <= 0:
+        return None
+    q_a, q_b = a["tokens_per_step"] / l_a, b["tokens_per_step"] / l_b
+    tps_a, tps_b = r_a * a["tokens_per_step"], r_b * b["tokens_per_step"]
+    out: dict = {
+        "server_tps": _log_term(tps_a, tps_b),
+        "acceptance_length": _log_term(l_a, l_b),
+        "steps_per_s": _log_term(r_a, r_b),
+        "requests_per_step": _log_term(q_a, q_b),
+    }
+    if (a.get("verified_rows_per_step") and b.get("verified_rows_per_step")
+            and a.get("row_yield") and b.get("row_yield")):
+        out["verified_rows_per_step"] = _log_term(a["verified_rows_per_step"], b["verified_rows_per_step"])
+        out["row_yield"] = _log_term(a["row_yield"], b["row_yield"])
+    pos_a = {p["position"]: p for p in a["positions"]}
+    pos_b = {p["position"]: p for p in b["positions"]}
+    positions = []
+    for k in sorted(set(pos_a) & set(pos_b)):
+        pa, pb = pos_a[k], pos_b[k]
+        positions.append({
+            "position": k,
+            "survival_delta": (pb["survival"] - pa["survival"]
+                               if pa["survival"] is not None and pb["survival"] is not None else None),
+            "coverage_delta": (pb["coverage"] - pa["coverage"]
+                               if pa["coverage"] is not None and pb["coverage"] is not None else None),
+            "conditional_acceptance_delta": (
+                pb["conditional_acceptance"] - pa["conditional_acceptance"]
+                if pa.get("conditional_acceptance") is not None and pb.get("conditional_acceptance") is not None
+                else None
+            ),
+            "verified_yield_delta": (
+                pb["verified_yield"] - pa["verified_yield"]
+                if pa.get("verified_yield") is not None and pb.get("verified_yield") is not None
+                else None
+            ),
+        })
+    out["positions"] = positions
     return out
 
 
@@ -322,6 +400,9 @@ def compare(base: dict, candidate: dict, *, tolerance_pct: float = 3.0) -> dict:
             rows.insert(at, row)
             result["note"] = (f"window-paired: {windows['n']} windows, window k against window k (a run without "
                               "request tables); the faster build's windows drift onto later prompts")
+    decomp = spec_decomposition(base["summary"], candidate["summary"])
+    if decomp is not None:
+        result["spec_decomposition"] = decomp
     return result
 
 
@@ -342,6 +423,21 @@ def format_comparison(result: dict, base_label: str, candidate_label: str) -> st
         lines.append(f"{row['metric']:{width}s} {values} {row['change_pct']:+7.2f}% {ci:>7s}  {row['verdict']}")
     if result.get("note"):
         lines.append(result["note"])
+    decomp = result.get("spec_decomposition")
+    if decomp is not None:
+        line = (
+            f"speculative log-tps: total {decomp['server_tps']['change_pct']:+.2f}% "
+            f"(1+tau {decomp['acceptance_length']['change_pct']:+.2f}%, "
+            f"steps/s {decomp['steps_per_s']['change_pct']:+.2f}%, "
+            f"reqs/step {decomp['requests_per_step']['change_pct']:+.2f}%"
+        )
+        if "row_yield" in decomp and "verified_rows_per_step" in decomp:
+            line += (
+                f"; rows/step {decomp['verified_rows_per_step']['change_pct']:+.2f}%, "
+                f"row yield {decomp['row_yield']['change_pct']:+.2f}%"
+            )
+        line += ")"
+        lines.append(line)
     for warning in result["warnings"]:
         lines.append(f"WARNING: {warning}")
     return "\n".join(lines)

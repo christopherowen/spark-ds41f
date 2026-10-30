@@ -33,10 +33,15 @@ before tuning anything on this basis.
 
 ## Next release
 
+<!-- BEGIN GENERATED: next-release-status -->
+Production is **spark-ds41f-1030** (`manifests/baselines/2026-10-30-spark-ds41f-1030.json`, image `spark-ds41f:1030`), promoted 2026-10-30 on `tp4-ring` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md), [suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)). `tp3-triangle`'s current qualified reference is **spark-ds41f-1030** ([suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/)); qualifying `spark-ds41f-1030`'s image on the triangle at its 6,144-token prefill budget is queued once the three-node triangle is cabled (#668).
+<!-- END GENERATED: next-release-status -->
+
+Historical notes from the **r6n / r6s** rounds (2026-10-15 to 2026-10-16):
 **r6s** shipped for TP3 on 2026-10-16
-([experiments/2026-10-16-r6s](experiments/2026-10-16-r6s/README.md)); TP4 stays on
+([experiments/2026-10-16-r6s](experiments/2026-10-16-r6s/README.md)); TP4 stayed on
 **r6n** (2026-10-15, [experiments/2026-10-15-r6n](experiments/2026-10-15-r6n/README.md))
-until r6s is released on the ring. The indexer
+until r6v was released on the ring. The indexer
 ReLU and the index quantizer's NaN handling stay in the kernel contracts' rounds
 (round 6: the BF16 clamp is on the 1% line at 8K x 2048, the quantizer 1-3% slower);
 they join a candidate only within 1% of r6n with its bits.
@@ -191,12 +196,28 @@ r6h on every metric on both topologies.
 
 ## Current reference
 
-`manifests/baselines/2026-10-12-karmic-kraken-r6h.json` (r6h). Releases are
-judged by the release comparison (`docs/lab.md`, `scripts/release_table.py`), on
-measures that do not follow the generated text. Aggregate tok/s, temperature 0,
-reasoning on; benchmark references are
-`manifests/benchmarks/2026-10-12-karmic-kraken-r6h-tp4.json` and
-`-r6h.json`:
+<!-- BEGIN GENERATED: current-reference -->
+Active baseline manifest: [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](manifests/baselines/2026-10-30-spark-ds41f-1030.json) (`spark-ds41f-1030`). Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). Current benchmark references are [`manifests/suites/2026-10-30-spark-ds41f-1030-tp4`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) for `tp4-ring` and [`manifests/suites/2026-10-30-spark-ds41f-1030-tp3`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) for `tp3-triangle`:
+
+| Measure | `tp4-ring` (`spark-ds41f-1030`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1030`, 1M, 8 seqs, 8K/6K batch) |
+| --- | ---: | ---: |
+| Decode grid geometric mean (20 TP4 / 15 TP3 shapes) | 24.58 ms | 25.13 ms |
+| Decode `c16`, 16 streams (output tok/s) | 257.8 | — |
+| Decode `c8`, 8 streams (output tok/s) | 198.4 | 158.6 |
+| Decode `c4`, 4 streams (output tok/s) | — | 121.2 |
+| Single-stream `c1` (output tok/s) | 78.0 | 62.6 |
+| Sampled `c16` / `c8` / `c1` (`temp=1.0`, output tok/s) | 252.2 / 194.9 / 75.6 | 154.9 / 153.8 / 61.4 |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s, output tok/s) | 180.4 | 119.0 |
+| Source-text prefill 32K (tok/s) | 7,313 | 5,888 |
+| Prefill 131K (tok/s) | 7,396 | 5,862 |
+| Prefill 262K (tok/s) | 7,120 | 5,613 |
+| Prefill 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,155 |
+| Prefill 1M (tok/s) | 5,550 | 3,952 |
+| Short-request TTFT p50 during 131K prefill (3 / 11 streams) | 3.30 s / 3.59 s | — |
+<!-- END GENERATED: current-reference -->
+
+Historical reference (**r6h**, `manifests/baselines/2026-10-12-karmic-kraken-r6h.json`,
+`manifests/benchmarks/2026-10-12-karmic-kraken-r6h-tp4.json` and `-r6h.json`):
 
 | Measure | TP4 (1M, 16 sequences) | TP3 (512K, 8) |
 |---|---:|---:|
@@ -208,7 +229,7 @@ reasoning on; benchmark references are
 | Prefill 500K (TP3) / 512K (TP4) | 5,074 | 3,753 |
 | Prefill 1M | 4,391 | |
 
-The bench's decode points send one prompt to every stream, so they follow the
+The old `bin/spark bench` decode points send one prompt to every stream, so they follow the
 text through DSpark acceptance: quote them as direction only. The figures below
 are older.
 
@@ -569,16 +590,14 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## dgx1 headroom
 
-- **Vision tower (926 MiB of BF16 weights on every rank).** Image input is
-  enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads. The served
-  `deepseek_v4_1/nvidia/vl_model.py` sets `use_data_parallel = True` whatever
-  the TP size, so the tower stays replicated even at TP4
-  (`experiments/2026-10-03-tp3-tp4-comparison/padding.md`): full weights on
-  every rank, images split across ranks, embeddings all-gathered. Options, each
-  needing a restart:
-  - Switch the tower to tensor parallel, and at TP3 also pad it to 18 heads and
-    its MLP from 2,816 to 2,820 with zero weights. That saves ~0.6 GiB per
-    rank, including dgx1.
+- **Vision tower (926 MiB of BF16 weights, now tensor-parallelized).** Image
+  input is enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads.
+  `deepseek_v4_1/nvidia/vl_model.py` and `tilelang_vision.py` now shard the ViT
+  (`wqkv`, `wo`, `mlp.w1`, `mlp.w2`) and aligner (`w1`, `w2`) across TP ranks
+  (`use_data_parallel = is_vit_use_data_parallel()`, `False` under default
+  `--mm-encoder-tp-mode weights`), with exact 4-way shards at TP4 (~0.68 GiB
+  saved per rank) and zero-weight tail padding at TP3 (16 -> 18 heads,
+  2,816 -> 2,880 MLP, 5,120 -> 5,184 aligner, ~0.59 GiB saved per rank).
   - If a deployment needs no images, `--limit-mm-per-prompt {"image":0}` or
     `--language-model-only` stubs the tower and skips its weights. That's the
     owner's decision, since image input is a promoted feature.

@@ -1,9 +1,14 @@
 """Profiler workloads must measure their claimed target shape and always stop."""
 import io
 import json
+from pathlib import Path
+import sys
 import unittest
 from unittest import mock
-from servebench import profile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from servebench import profile  # noqa: E402
 
 
 class OneRowTest(unittest.TestCase):
@@ -50,3 +55,7 @@ class CedAttributionTest(unittest.TestCase):
             profile.ced_moe_costs(events + routed(1, 408, 90000), rows=128)
         events = routed(40, 6) + [dict(cat='kernel', name='_prepare_dflash_inputs_kernel', ts=90000, dur=1)] + routed(3, 6, 100000)
         self.assertEqual(profile.ced_moe_costs(events, rows=1)[0]['routed_ffn_ms'], 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

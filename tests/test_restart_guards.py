@@ -168,10 +168,6 @@ class CableSubnetTest(unittest.TestCase):
             self.assertEqual(spark.unrecorded_subnet_problems(example, node, hcas), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SyncRevisionTest(unittest.TestCase):
     """A named revision is resolved after a fetch, so a commit merged since the last fetch
     (or origin/main) deploys instead of failing or detaching at a stale commit."""
@@ -234,3 +230,7 @@ class UnqualifiedShapeTest(unittest.TestCase):
         archived = spark.read_json("experiments/2026-10-14-one-recipe/tp3-r6h-production.json")
         self.assertNotIn("shape", archived)
         self.assertEqual(self.start(archived), "preflight reached")
+
+
+if __name__ == "__main__":
+    unittest.main()

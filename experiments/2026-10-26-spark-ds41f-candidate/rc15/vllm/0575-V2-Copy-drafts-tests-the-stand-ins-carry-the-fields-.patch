@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:49:32 +0100
+Subject: [PATCH 575/575] [V2] Copy drafts tests: the stand-ins carry the
+ fields copy drafts added (num_verification_tokens, num_draft_steps,
+ max_decode_rows, num_draft_tokens_per_req)
+
+---
+ tests/models/test_deepseek_v4_1_compressor.py          | 2 +-
+ tests/models/test_deepseek_v4_1_sp_prefill.py          | 1 +
+ tests/v1/spec_decode/test_rejection_sampler_utils.py   | 4 ++--
+ tests/v1/worker/test_gpu_rejection_sampler_chunking.py | 2 ++
+ tests/v1/worker/test_gpu_sink.py                       | 1 +
+ tests/v1/worker/test_gpu_verified_logprob_token_ids.py | 2 ++
+ 6 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 066c44382..5ab88ad03 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -105,7 +105,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+         compilation_config=SimpleNamespace(static_forward_context={}),
+         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+         speculative_config=SimpleNamespace(
+-            num_speculative_tokens=7, parallel_drafting=False
++            num_speculative_tokens=7, num_verification_tokens=7, parallel_drafting=False
+         ),
+     )
+     ring = CompressorStateCache(config, "layer.state_cache").get_kv_cache_spec(config)
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index fd556254c..e99dd2e24 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -82,6 +82,7 @@ def _config(
+         ),
+         compilation_config=SimpleNamespace(max_cudagraph_capture_size=capture),
+         scheduler_config=SimpleNamespace(max_num_seqs=seqs),
++        max_decode_rows=seqs * (1 + (spec_tokens or 0)),
+         speculative_config=(
+             None
+             if spec_tokens is None
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index ca31d4373..897d40867 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -1391,7 +1391,7 @@ def test_insert_resampled_prepared_before_optional_warmup_return(
+     )
+     owner = module.RejectionSampler.__new__(module.RejectionSampler)
+     owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
+-    owner.num_speculative_steps = 5
++    owner.num_speculative_steps = owner.num_draft_steps = 5
+     owner.watermark_key = watermark
+     registry = JitWarmupRegistry(None)
+     with registry.activate():
+@@ -1557,7 +1557,7 @@ def _rejection_sampler_owner(monkeypatch, *, block, watermark=None, fp64=False):
+     )
+     owner = module.RejectionSampler.__new__(module.RejectionSampler)
+     owner.sampler = SimpleNamespace(use_fp64_gumbel=fp64)
+-    owner.num_speculative_steps = 5
++    owner.num_speculative_steps = owner.num_draft_steps = 5
+     owner.watermark_key = watermark
+     owner.use_block_verification = block
+     return owner
+diff --git a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+index 6dfe180fb..d67bf3955 100644
+--- a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
++++ b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+@@ -35,6 +35,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+     idx_mapping_np = np.array([7, 2, 9, 1], dtype=np.int32)
+     input_batch = SimpleNamespace(
+         num_reqs=4,
++        num_draft_tokens_per_req=num_logits_per_req - 1,
+         cu_num_logits_np=cu_num_logits_np,
+         cu_num_logits=torch.from_numpy(cu_num_logits_np).to(device),
+         idx_mapping_np=idx_mapping_np,
+@@ -53,6 +54,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         logprobs_mode=logprobs_mode, logprob_token_ids_state=None
+     )
+     rejection_sampler.num_speculative_steps = 3
++    rejection_sampler.num_draft_steps = 3
+     rejection_sampler.enable_adaptive_verification = False
+     chunk_offsets: list[torch.Tensor] = []
+ 
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index 9c6e5431d..08fe920c6 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -872,6 +872,7 @@ class MiniRunner:
+         )
+         spec = SimpleNamespace(
+             num_speculative_tokens=k,
++            num_verification_tokens=k,
+             enable_adaptive_verification=False,
+             rejection_sample_method="block",
+             synthetic_acceptance_rates=None,
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+index c64f3a3cc..0d797c083 100644
+--- a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -232,6 +232,7 @@ def _batch(order: list[int]) -> SimpleNamespace:
+     return SimpleNamespace(
+         num_reqs=len(order),
+         num_draft_tokens=total - len(order),
++        num_draft_tokens_per_req=num_logits - 1,
+         cu_num_logits_np=cu_num_logits_np,
+         cu_num_logits=torch.from_numpy(cu_num_logits_np),
+         idx_mapping_np=idx_mapping_np,
+@@ -257,6 +258,7 @@ def _rejection_sampler(
+     rs.sink = sink
+     rs.watermark_key = None
+     rs.num_speculative_steps = 3
++    rs.num_draft_steps = 3
+     rs.enable_adaptive_verification = adaptive
+ 
+     def verify(
