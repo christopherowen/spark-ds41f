@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 MODEL = 'engine="0",model_name="m"'
 

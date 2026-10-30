@@ -98,13 +98,8 @@ def renamed(cluster: dict) -> dict:
 
 
 def load_spark():
-    import importlib.machinery
-    import importlib.util
+    import spark_ds41f as spark
 
-    loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-    spec = importlib.util.spec_from_loader("spark", loader)
-    spark = importlib.util.module_from_spec(spec)
-    loader.exec_module(spark)
     return spark
 
 

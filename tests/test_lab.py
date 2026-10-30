@@ -20,12 +20,9 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("lab", str(ROOT / "scripts" / "lab.py"))
-spec = importlib.util.spec_from_loader("lab", loader)
-lab = importlib.util.module_from_spec(spec)
-loader.exec_module(lab)
-# Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
-lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from spark_ds41f import lab
 # Never read or write the real hold and request files, even when the suite runs on dgx1.
 _STATE = tempfile.TemporaryDirectory()
 lab.HOLD = Path(_STATE.name) / "spark-hold.json"
@@ -205,17 +202,48 @@ class BootTimeTest(unittest.TestCase):
 
 
 SITE_SHAPE = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
+SITE_NODES = mock.patch.object(
+    lab.spark, "site_nodes", side_effect=lambda: lab.spark.read_json("config/nodes.example.json")
+)
+_REAL_CONFIGURATION = lab.spark.configuration
+
+
+def _host_independent_configuration(args=None):
+    try:
+        return _REAL_CONFIGURATION(args)
+    except FileNotFoundError:
+        ring = lab.spark.read_json("config/examples/nodes-ring4.json")
+        head_ip = lab.spark.read_json("config/cluster.json")["distributed"]["master_addr"]
+        next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
+        ring_text = json.dumps(ring)
+        real_read_text = Path.read_text
+        with mock.patch.object(
+            Path,
+            "read_text",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: (
+                ring_text if self == ROOT / "config/nodes-ring4.local.json" else real_read_text(self, *a, **kw)
+            ),
+        ):
+            return _REAL_CONFIGURATION(args)
+
+
+SITE_CONFIGURATION = mock.patch.object(lab.spark, "configuration", side_effect=_host_independent_configuration)
 
 
 def setUpModule() -> None:
     # These tests ran against the default profile when it was TP3 on config/nodes.json;
     # the recipe resolves the same shape for them.
     SITE_SHAPE.start()
+    SITE_NODES.start()
+    SITE_CONFIGURATION.start()
 
 
 def tearDownModule() -> None:
     # pytest runs tearDownModule but not unittest's module cleanups, and a patch left
     # running would choose the site's shape for the modules after this one.
+    SITE_CONFIGURATION.stop()
+    SITE_NODES.stop()
     SITE_SHAPE.stop()
 
 

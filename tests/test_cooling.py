@@ -1,18 +1,16 @@
 """Cooling must restore the normal fan policy before a measurement can start."""
 import contextlib
 import io
-import importlib.machinery
-import importlib.util
 from pathlib import Path
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
-loader = importlib.machinery.SourceFileLoader(
-    "spark_cooling_tests", str(Path(__file__).resolve().parents[1] / "bin/spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 
 class CoolingTest(unittest.TestCase):

@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import copy
-import importlib.machinery
-import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 
 class BuildDirectoryTest(unittest.TestCase):
@@ -147,6 +145,22 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertTrue(stages["runtime"].startswith("runtime-core AS runtime"))
         self.assertTrue(stages["runtime-tilelang"].startswith("${TILELANG_BASE_STAGE} AS runtime-tilelang"))
         self.assertNotIn("b12x", stages["runtime-core"].lower())
+
+
+class PackageStructureTest(unittest.TestCase):
+    def test_spark_ds41f_submodules_and_thin_entrypoints(self) -> None:
+        from spark_ds41f import bench, build, cli, cluster, config, doctor, lab
+
+        self.assertTrue(callable(cli.main))
+        self.assertTrue(callable(config.read_cluster))
+        self.assertTrue(callable(doctor.local_doctor))
+        self.assertTrue(callable(build.build_inputs))
+        self.assertTrue(callable(cluster.deployment_order))
+        self.assertTrue(callable(bench.command_bench))
+        self.assertTrue(callable(lab.kernel_local))
+        self.assertLessEqual(len((ROOT / "bin" / "spark").read_text().splitlines()), 15)
+        self.assertLessEqual(len((ROOT / "scripts" / "lab.py").read_text().splitlines()), 15)
+        self.assertTrue((ROOT / "pyproject.toml").is_file())
 
 
 if __name__ == "__main__":
