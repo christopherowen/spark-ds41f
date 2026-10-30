@@ -36,4 +36,17 @@ What the answer decides:
 
 ## Results
 
-Pending.
+Measured on `dgx4` inside `spark-ds41f:1030` (`launcher_memory.py` with the production argv):
+
+| Stage | `Pss_Anon` | `brk` heap | Single mappings $\ge 1\text{ MiB}$ | Small arenas | CUDA driver open |
+|---|---:|---:|---:|---:|---|
+| `python` | `9 MiB` | `1 MiB` | `3 MiB` | `5 MiB` | No |
+| `import torch` | `303 MiB` | `52 MiB` | `124 MiB` | `126 MiB` | No |
+| `import vllm cli` | `660 MiB` | `204 MiB` | `258 MiB` | `197 MiB` | No |
+| `args parsed` / `engine args` | `736 MiB` | `252 MiB` | `278 MiB` | `204 MiB` | No |
+| `engine config` | `1,001 MiB` | `395 MiB` | `399 MiB` | `206 MiB` | Yes (`13` fds) |
+| `engine config + gc/trim` | `966 MiB` | `392 MiB` | `369 MiB` | `204 MiB` | Yes (`13` fds) |
+
+Conclusion:
+- `gc.collect()` + `malloc_trim(0)` reclaims `35 MiB`, while the remaining `966 MiB` (`~0.95 GiB`) is live Python module and config state (`torch`, `vllm`, `transformers`, and `vllm_config`) plus CUDA driver initialization.
+- On single-rank follower nodes (`node_rank_within_dp > 0`, `local_world_size == 1`, `monitor_workers=False`), `MultiprocExecutor` creates no local `rpc_broadcast_mq` or `response_mqs`; running `WorkerProc.worker_main` inline in the `vllm serve --headless` process (`0059-headless-inline-worker-and-heap-trim.patch`) eliminates the duplicate `~1.00 GiB` parent process on `dgx2`, `dgx3`, and `dgx4` while trimming `~35 MiB` of glibc heap slack after startup across all nodes.
