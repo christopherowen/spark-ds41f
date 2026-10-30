@@ -211,8 +211,8 @@ Active baseline manifest: [`manifests/baselines/2026-10-30-spark-ds41f-1030.json
 | Source-text prefill 32K (tok/s) | 7,313 | 5,888 |
 | Prefill 131K (tok/s) | 7,396 | 5,862 |
 | Prefill 262K (tok/s) | 7,120 | 5,613 |
-| Prefill 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,155 |
-| Prefill 1M (tok/s) | 5,550 | 3,952 |
+| Prefill 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,113 |
+| Prefill 1M (tok/s) | 5,550 | 4,305 |
 | Short-request TTFT p50 during 131K prefill (3 / 11 streams) | 3.30 s / 3.59 s | — |
 <!-- END GENERATED: current-reference -->
 

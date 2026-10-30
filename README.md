@@ -327,8 +327,8 @@ Current qualified reference runs by shape (from `config/cluster.json` and `manif
 | Source-text prefill, 32K (tok/s) | 7,313 | 5,888 |
 | Prefill, 131K (tok/s) | 7,396 | 5,862 |
 | Prefill, 262K (tok/s) | 7,120 | 5,613 |
-| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,155 |
-| Prefill, 1M (tok/s) | 5,550 | 3,952 (cold 1M) |
+| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,113 |
+| Prefill, 1M (tok/s) | 5,550 | 4,305 |
 | Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 3.30 s / 3.59 s | 2.03 s / 9.59 s |
 <!-- END GENERATED: performance-summary -->
 
