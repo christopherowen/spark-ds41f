@@ -1,0 +1,557 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 2b524521d..4ec40168c 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -49,6 +49,7 @@ CHAIN = {
+     "mhc_collapse_column",
+     "mhc_finalize",
+     "mhc_post",
++    "mhc_post_collapse",
+     "mhc_project_streams",
+     "moe_combine",
+     "moe_dispatch",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 57cf6ec67..b98d47fcd 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -42,6 +42,7 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
+     MIXES,
+     TileKernelsMHC,
+     collapse_streams,
++    post_collapse_streams,
+     post_streams,
+     project_streams,
+ )
+@@ -629,19 +630,45 @@ def test_no_tokens_launch_nothing(mhc):
+     x, residual, post, comb = _post_inputs(0, seed=0)
+     assert mhc.post(x, residual, post, comb).shape == (0, 4, HIDDEN)
+     assert mhc.collapse(residual).shape == (0, HIDDEN)
++    assert mhc.post_collapse(x, residual, post, comb).shape == (0, HIDDEN)
++
++
++@pytest.mark.parametrize("tokens", SERVING_TOKENS)
++def test_post_collapse_bits_match_post_then_collapse(mhc, tokens):
++    """Fused ``post_collapse`` matches ``collapse(post(...))`` and TileKernels'
++    ``mhc_pre_apply_mix_fwd(mhc_post_fwd(...))`` bit for bit, both for weighted
++    ``pre`` and for the default mean mix."""
++    x, residual, post, comb = _post_inputs(tokens, seed=1100 + tokens)
++    mix = _pre_mix(tokens, seed=1200 + tokens)
++    tk_streams = _tk_post(x, residual, post, comb)
++    expected_mix = _tk_collapse(tk_streams, mix)
++    quarter = torch.full((tokens, 4), 0.25, device=DEVICE)
++    expected_mean = _tk_collapse(tk_streams, quarter)
++    _assert_bits_equal(
++        mhc.post_collapse(x, residual, post, comb, mix), expected_mix, "mix: "
++    )
++    out_buf = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++    returned = mhc.post_collapse(x, residual, post, comb, out=out_buf)
++    assert returned is out_buf
++    _assert_bits_equal(out_buf, expected_mean, "mean: ")
+ 
+ 
+ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+-    """The post and the collapse are declared exactly as the forward launches them,
+-    and nothing is left to warm: TileKernels' kernels no longer run."""
++    """The post, the collapse and the fused post_collapse are declared exactly as the
++    forward launches them, and nothing is left to warm: TileKernels' kernels no longer
++    run."""
+     registry = JitWarmupRegistry(vllm_config=None)
+     with registry.activate():
+         mhc.declare_kernels()
+     declared = prepare.declared_calls(registry)
+     assert prepare.warm_declared(registry) == 0
+-    factories = (post_streams, collapse_streams)
++    factories = (post_streams, collapse_streams, post_collapse_streams)
+     ours = [call for call in declared if call[0] in factories]
+-    assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
++    assert ours == [
++        (post_streams, (HIDDEN,), {}),
++        (collapse_streams, (HIDDEN,), {}),
++        (post_collapse_streams, (HIDDEN,), {}),
++    ]
+ 
+     def by_factory(call):
+         # TileLang's JIT objects have no __name__; order by the factory itself.
+@@ -650,7 +677,7 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+ 
+     # The forward's calls, recorded as its cached lookups make them.
+     launched = []
+-    for name in ("post_streams", "collapse_streams"):
++    for name in ("post_streams", "collapse_streams", "post_collapse_streams"):
+         factory = getattr(mhc_module, name)
+ 
+         def record(*args, _factory=factory, **kwargs):
+@@ -658,7 +685,7 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+             return _factory(*args, **kwargs)
+ 
+         monkeypatch.setattr(mhc_module, name, record)
+-    for name in ("_post", "_collapse"):
++    for name in ("_post", "_collapse", "_post_collapse"):
+         lookup = getattr(mhc_module, name)
+         monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
+     x, residual, post, comb = _post_inputs(6, seed=71)
+@@ -666,4 +693,8 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
+     mhc.collapse(residual, _pre_mix(6, seed=72))
+     mhc.collapse(residual)
++    mhc.post_collapse(x, residual, post, comb)
++    mhc.post_collapse(
++        RankOrderParts(torch.stack((x, x))), residual, post, comb, _pre_mix(6, seed=72)
++    )
+     assert sorted(launched, key=by_factory) == ours
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 80e7b3449..8c61a5a39 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -153,17 +153,35 @@ def _scatter(source, indices, full_rows):
+ 
+ 
+ class _Mix:
+-    def collapse(self, hidden, mix=None):
+-        if mix is None:
+-            return hidden.mean(dim=1)
+-        return (hidden * mix[:, :, None]).sum(dim=1)
++    def __init__(self):
++        self.calls: list[str] = []
++
++    def collapse(self, hidden, mix=None, out=None):
++        self.calls.append("collapse")
++        res = (
++            hidden.mean(dim=1) if mix is None else (hidden * mix[:, :, None]).sum(dim=1)
++        )
++        if out is not None:
++            out.copy_(res)
++            return out
++        return res
+ 
+     def post(self, x, residual, post, comb):
++        self.calls.append("post")
+         return residual + x[:, None, :] * 0.25
+ 
++    def post_collapse(self, x, residual, post, comb, pre=None, out=None):
++        self.calls.append("post_collapse")
++        recon = residual + x[:, None, :] * 0.25
++        res = recon.mean(dim=1) if pre is None else (recon * pre[:, :, None]).sum(dim=1)
++        if out is not None:
++            out.copy_(res)
++            return out
++        return res
++
+     def pre(self, residual, fn, scale, base, norm, pre, **previous):
+         if previous.get("previous_output") is not None:
+-            residual = self.post(previous["previous_output"], residual, None, None)
++            residual = residual + previous["previous_output"][:, None, :] * 0.25
+         if residual.ndim == 2:
+             residual = residual[:, None, :].expand(-1, 4, -1).clone()
+         rows = residual.shape[0]
+@@ -179,7 +197,9 @@ class _Mix:
+         )
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+-        return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
++        return self.pre(
++            residual + x[:, None, :] * 0.25, fn, scale, base, norm, pre
++        )
+ 
+     def cast_rows(self, rows):
+         return None
+@@ -244,7 +264,13 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         "get_pp_group",
+         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+     )
+-    monkeypatch.setattr(native, "gather_rows", _gather)
++    gather_calls: list[int] = []
++
++    def tracked_gather(source, indices):
++        gather_calls.append(source.data_ptr())
++        return _gather(source, indices)
++
++    monkeypatch.setattr(native, "gather_rows", tracked_gather)
+     monkeypatch.setattr(native, "scatter_rows", _scatter)
+     # L2 prefetch is on by default on GB10; this stand-in model has no prefetcher.
+     monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+@@ -313,3 +339,13 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         for i in range(4)
+         for kind in ("attention", "experts")
+     ]
++    # Non-final aux layer (layer 2 -> idx+1 == 3) uses fused post_collapse;
++    # final aux layer (layer 3 -> idx+1 == 4 == end_layer) uses post + collapse
++    # once and reuses final_aux_recon for the head collapse.
++    assert target.layers[2].mhc.calls == ["post_collapse"]
++    assert target.layers[3].mhc.calls == ["post", "collapse", "collapse"]
++    if compact:
++        # At the CED boundary, positions and input_ids are gathered once each,
++        # not twice (once inside layer 2 and once in DeepseekV4Model.forward).
++        assert gather_calls.count(positions.data_ptr()) == 1
++        assert gather_calls.count(ids.data_ptr()) == 1
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9c645e313..84ffdc605 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -426,6 +426,11 @@ class DSparkDeepseekV4Model(nn.Module):
+                 residual,
+             )
+         l2_prefetch.join()
++        assert pre_mix is not None
++        if not self.use_sequence_parallel and hasattr(layer.mhc, "post_collapse"):
++            return layer.mhc.post_collapse(
++                hidden_states, residual, post_mix, res_mix, pre_mix
++            )
+         hidden_states = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+         if self.use_sequence_parallel:
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+@@ -434,7 +439,6 @@ class DSparkDeepseekV4Model(nn.Module):
+         # mixes — the mix the reference forward_head applies (hc_pre with the
+         # last block's ffn pre-mix). Return the PRE-norm head hidden;
+         # compute_logits applies self.norm.
+-        assert pre_mix is not None
+         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
+         return hidden_states
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..6171b7bd3 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -301,6 +301,9 @@ class DeepseekV4DecoderLayer(nn.Module):
+         engram_mask: torch.Tensor | None = None,
+         ced_indices: torch.Tensor | None = None,
+         sp_rows: sp_prefill.SPRows | None = None,
++        *,
++        ced_positions: torch.Tensor | None = None,
++        ced_input_ids: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         previous_output = x if residual is not None else None
+         apply_engram = self.engram is not None and engram_hashes is not None
+@@ -345,9 +348,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+             post_mix = gather_rows(post_mix, ced_indices)
+             res_mix = gather_rows(res_mix, ced_indices)
+             attn_pre = gather_rows(attn_pre, ced_indices)
+-            positions = gather_rows(positions, ced_indices)
++            positions = (
++                gather_rows(positions, ced_indices)
++                if ced_positions is None
++                else ced_positions
++            )
+             if input_ids is not None:
+-                input_ids = gather_rows(input_ids, ced_indices)
++                input_ids = (
++                    gather_rows(input_ids, ced_indices)
++                    if ced_input_ids is None
++                    else ced_input_ids
++                )
+         if sp_rows is None:
+             with kernels.mxfp8_inputs(x_q):
+                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+@@ -857,6 +868,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+                 )
+                 sp = None
++            ced_positions = (
++                gather_rows(positions, boundary_indices)
++                if boundary_indices is not None
++                else None
++            )
++            ced_input_ids = (
++                gather_rows(input_ids, boundary_indices)
++                if boundary_indices is not None and input_ids is not None
++                else None
++            )
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                 hidden_states,
+                 positions,
+@@ -869,11 +890,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 engram_mask,
+                 ced_indices=boundary_indices,
+                 sp_rows=sp,
++                ced_positions=ced_positions,
++                ced_input_ids=ced_input_ids,
+             )
+             if boundary_indices is not None:
+-                positions = gather_rows(positions, ced_indices)
+-                if input_ids is not None:
+-                    input_ids = gather_rows(input_ids, ced_indices)
++                assert ced_positions is not None
++                positions = ced_positions
++                input_ids = ced_input_ids
+                 if steer_rows is not None:
+                     steer_rows = gather_rows(
+                         self.glp.step_rows(full_num_tokens), ced_indices
+@@ -885,7 +908,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 )
+             if idx + 1 in self.aux_hidden_state_layers:
+                 # Reconstruct the aux hidden state for draft models
+-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                 aux_out = (
+                     self._graph_out(len(aux_hidden_states), full_num_tokens)
+                     if sp is None
+@@ -893,11 +915,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     and not self.use_sequence_parallel
+                     else None
+                 )
+-                aux_hidden_state = (
+-                    layer.mhc.collapse(aux_recon)
+-                    if aux_out is None
+-                    else layer.mhc.collapse(aux_recon, out=aux_out)
+-                )
++                if idx + 1 != self.end_layer and hasattr(layer.mhc, "post_collapse"):
++                    aux_hidden_state = layer.mhc.post_collapse(
++                        hidden_states, residual, post_mix, res_mix, out=aux_out
++                    )
++                else:
++                    aux_recon = layer.mhc.post(
++                        hidden_states, residual, post_mix, res_mix
++                    )
++                    aux_hidden_state = (
++                        layer.mhc.collapse(aux_recon)
++                        if aux_out is None
++                        else layer.mhc.collapse(aux_recon, out=aux_out)
++                    )
++                    final_aux_recon = aux_recon
+                 if self.use_sequence_parallel:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                 elif sp is not None:
+@@ -907,9 +938,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
+-                final_aux_recon = aux_recon
+         l2_prefetch.join()
+-        if layer is not None:
++        last_rank = get_pp_group().is_last_rank
++        fused_final_collapse = (
++            layer is not None
++            and last_rank
++            and self.end_layer not in self.aux_hidden_state_layers
++            and self._sink_columns is None
++            and hasattr(layer.mhc, "post_collapse")
++        )
++        if fused_final_collapse:
++            hidden_states = layer.mhc.post_collapse(
++                hidden_states, residual, post_mix, res_mix, pre_mix
++            )
++        elif layer is not None:
+             # Reuse if the last layer was captured as an aux hidden state
+             if self.end_layer in self.aux_hidden_state_layers:
+                 hidden_states = final_aux_recon
+@@ -918,7 +960,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     hidden_states, residual, post_mix, res_mix
+                 )
+ 
+-        if not get_pp_group().is_last_rank:
++        if not last_rank:
+             if decoder_compacted:
+                 hidden_states = scatter_rows(
+                     hidden_states, ced_indices, full_num_tokens
+@@ -946,13 +988,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference applies via
+         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+-        hidden_states = (
+-            layer.mhc.collapse(hidden_states, pre_mix)
+-            if columns is None
+-            else layer.mhc.collapse(
+-                hidden_states, pre_mix, columns=columns, column=self._sink_column
++        if not fused_final_collapse:
++            hidden_states = (
++                layer.mhc.collapse(hidden_states, pre_mix)
++                if columns is None
++                else layer.mhc.collapse(
++                    hidden_states, pre_mix, columns=columns, column=self._sink_column
++                )
+             )
+-        )
+         if columns is not None and not (rows_here and not self.use_sequence_parallel):
+             # A gather of hc_mult values per token under sequence parallelism.
+             if self.use_sequence_parallel:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index f8b36da99..13c3ddce0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -510,6 +510,70 @@ def post_streams(hidden_size: int, threads: int = 128):
+     return mhc_post
+ 
+ 
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_collapse_streams(hidden_size: int, threads: int = 128):
++    """The standalone ``post`` followed by the stream ``collapse`` in one launch:
++    each stream is updated and rounded to BF16 with ``post_streams``' exact FMA
++    sequence, then collapsed with ``mix`` and rounded to BF16 with
++    ``collapse_streams``' exact FMA sequence, without allocating, writing or reading
++    the ``[M, MULT, hidden_size]`` intermediate stream tensor."""
++    assert hidden_size % (threads * VEC) == 0
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def mhc_post_collapse(
++        x: T.Tensor((M, hidden_size), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        mix: T.Tensor((M, MULT), T.float32),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
++            token = pid // blocks
++            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            ov = T.alloc_local((VEC,), T.bfloat16)
++            pm = T.alloc_local((MULT,), T.float32)
++            cm = T.alloc_local((MULT * MULT,), T.float32)
++            mv = T.alloc_local((MULT,), T.float32)
++            acc = T.alloc_var(T.float32)
++            for n in T.vectorized(MULT):
++                pm[n] = post[token, n]
++            for m in T.unroll(MULT):
++                for n in T.vectorized(MULT):
++                    cm[m * MULT + n] = comb[token, m, n]
++            for m in T.vectorized(MULT):
++                mv[m] = mix[token, m]
++            for v in T.vectorized(VEC):
++                xv[v] = x[token, col + v]
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    rv[m * VEC + v] = residual[token, m, col + v]
++            for n in T.unroll(MULT):
++                for v in T.unroll(VEC):
++                    acc = cm[n] * T.Cast(T.float32, rv[v])
++                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                    for m in T.unroll(1, MULT):
++                        acc = T.fma(
++                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                        )
++                    sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
++            for v in T.unroll(VEC):
++                acc = T.float32(0)
++                for m in T.unroll(MULT):
++                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++                ov[v] = T.Cast(T.bfloat16, acc)
++            for v in T.vectorized(VEC):
++                out[token, col + v] = ov[v]
++
++    return mhc_post_collapse
++
++
+ # Shared memory each collapse block holds without using it, which caps residency at
+ # four blocks an SM. On GB10 the long-prefill collapse reads the four streams faster
+ # with fewer blocks resident (TileKernels' kernel is capped by its own shared memory);
+@@ -644,6 +708,11 @@ def _post_call(hidden: int) -> prepare.TileLangCall:
+     return prepare.call(post_streams, hidden)
+ 
+ 
++def _post_collapse_call(hidden: int) -> prepare.TileLangCall:
++    """The fused ``post_collapse``'s call."""
++    return prepare.call(post_collapse_streams, hidden)
++
++
+ def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
+     """The stream collapse's call, and with ``column`` its variant that also writes
+     that column of every stream."""
+@@ -672,6 +741,11 @@ def _post(hidden: int):
+     return _make(_post_call(hidden))
+ 
+ 
++@cache
++def _post_collapse(hidden: int):
++    return _make(_post_collapse_call(hidden))
++
++
+ @cache
+ def _collapse(hidden: int, column: int = -1):
+     return _make(_collapse_call(hidden, column))
+@@ -800,6 +874,35 @@ def _mhc_post_fake(x, residual, post, comb, out):
+     return None
+ 
+ 
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_mhc_post_collapse", mutates_args=("out",)
++)
++def _mhc_post_collapse(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    _post_collapse(hidden)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++    )
++
++
++@_mhc_post_collapse.register_fake
++def _mhc_post_collapse_fake(x, residual, post, comb, mix, out):
++    return None
++
++
+ @torch.library.custom_op("vllm::dsv41_tilelang_mhc_collapse", mutates_args=("out",))
+ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
+     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
+@@ -906,6 +1009,7 @@ class TileKernelsMHC(nn.Module):
+                 *(_finalize_call(hidden, k, *mix) for k in widths),
+                 _post_call(hidden),
+                 _collapse_call(hidden),
++                _post_collapse_call(hidden),
+             ]
+ 
+         def bind() -> None:
+@@ -916,6 +1020,7 @@ class TileKernelsMHC(nn.Module):
+                 _finalize(hidden, k, *mix)
+             _post(hidden)
+             _collapse(hidden)
++            _post_collapse(hidden)
+             # The constant mixes for the batch limit, before any graph captures.
+             _constant_mixes(
+                 get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+@@ -1002,6 +1107,32 @@ class TileKernelsMHC(nn.Module):
+         _mhc_post(x, residual, post, comb, out)
+         return out
+ 
++    def post_collapse(
++        self,
++        x,
++        residual,
++        post,
++        comb,
++        pre: torch.Tensor | None = None,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """The standalone ``post`` followed by ``collapse`` with ``pre`` (or the
++        streams' mean when ``pre`` is None), into ``out`` when given, in one launch
++        without materializing the ``[tokens, MULT, hidden]`` stream buffer."""
++        if isinstance(x, RankOrderParts):
++            x = x.sum()
++        tokens, device = int(residual.shape[0]), residual.device
++        if pre is None:
++            pre = _constant_mixes(tokens, device)[1]
++        if out is None:
++            out = torch.empty(
++                (tokens, self.hidden_size),
++                dtype=residual.dtype,
++                device=device,
++            )
++        _mhc_post_collapse(x, residual, post, comb, pre, out)
++        return out
++
+     @staticmethod
+     def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
+         """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
+@@ -1043,6 +1174,7 @@ __all__ = [
+     "TileKernelsMHC",
+     "collapse_streams",
+     "finalize",
++    "post_collapse_streams",
+     "post_streams",
+     "project_streams",
+ ]
