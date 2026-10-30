@@ -524,8 +524,8 @@ def render_readme_performance_summary(data: dict[str, Any]) -> str:
         f"| Source-text prefill, 32K (tok/s) | {p4[32768]:,.0f} | {p3[32768]:,.0f} |",
         f"| Prefill, 131K (tok/s) | {p4[131072]:,.0f} | {p3[131072]:,.0f} |",
         f"| Prefill, 262K (tok/s) | {p4[262144]:,.0f} | {p3[262144]:,.0f} |",
-        f"| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | {p4[524288]:,.0f} | {p3[500000]:,.0f} |",
-        f"| Prefill, 1M (tok/s) | {p4[1000000]:,.0f} | 3,952 (cold 1M) |",
+        f"| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | {p4[524288]:,.0f} | {p3.get(524288, p3.get(500000)):,.0f} |",
+        f"| Prefill, 1M (tok/s) | {p4[1000000]:,.0f} | {f'{p3[1000000]:,.0f}' if 1000000 in p3 else '3,952 (cold 1M)'} |",
         f"| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | {stall3_ttft:.2f} s / {stall11_ttft:.2f} s | {tp3_stall_cell} |",
     ]
     return "\n".join(lines)
@@ -718,8 +718,8 @@ def render_todo_current_reference(data: dict[str, Any]) -> str:
         f"| Source-text prefill 32K (tok/s) | {p4[32768]:,.0f} | {p3[32768]:,.0f} |",
         f"| Prefill 131K (tok/s) | {p4[131072]:,.0f} | {p3[131072]:,.0f} |",
         f"| Prefill 262K (tok/s) | {p4[262144]:,.0f} | {p3[262144]:,.0f} |",
-        f"| Prefill 524K (TP4) / 500K (TP3) (tok/s) | {p4[524288]:,.0f} | {p3[500000]:,.0f} |",
-        f"| Prefill 1M (tok/s) | {p4[1000000]:,.0f} | 3,952 |",
+        f"| Prefill 524K (TP4) / 500K (TP3) (tok/s) | {p4[524288]:,.0f} | {p3.get(524288, p3.get(500000)):,.0f} |",
+        f"| Prefill 1M (tok/s) | {p4[1000000]:,.0f} | {f'{p3[1000000]:,.0f}' if 1000000 in p3 else '3,952'} |",
         f"| Short-request TTFT p50 during 131K prefill (3 / 11 streams) | {tp4_ref['stalls']['stall-3']['probe_ttft_p50_s']:.2f} s / {tp4_ref['stalls']['stall-11']['probe_ttft_p50_s']:.2f} s | — |",
     ]
     return "\n".join(lines)

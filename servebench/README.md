@@ -106,10 +106,11 @@ Built in:
   streams with short probes, and 15, which with the long prompt fills every slot: the
   scheduler admits nothing during the prefill, and a scheduler change can help one depth
   and cost another. Version 1 had no Poisson step, version 2 no stall steps.
-- `screen-tp3` and `release-tp3`: the same for a server of eight streams and 512K of
+- `screen-tp3` and `release-tp3`: the same for a server of eight streams and 1M of
   context. They run eight (and four) streams, the grid up to eight requests
   (`--max-requests`), Poisson at 0.42 requests/s, stalls at 3, 6 and 7 streams, and
-  prefill to 500K. `release-tp3` version 1 had no stall steps.
+  prefill from 32K to 1M. `release-tp3` version 1 had no stall steps, version 2 stopped
+  prefill at 500K.
 
 Every built-in suite times the engine grid, so it needs a development server (below).
 

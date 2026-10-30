@@ -884,7 +884,7 @@ class SuiteTest(unittest.TestCase):
                     cli.build_parser().parse_args(suite.arguments(step, "http://x", "/tmp/o.json", "l", "/tmp/c.json.gz"))
 
     def test_tp3_suites_fit_three_nodes(self):
-        """Eight streams and 512K of context: no step asks for more."""
+        """Eight streams and 1M of context: no step asks for more."""
         for name in ("screen-tp3", "release-tp3"):
             for step in suite.load(name)["steps"]:
                 with self.subTest(suite=name, step=step["id"]):
@@ -892,7 +892,9 @@ class SuiteTest(unittest.TestCase):
                     self.assertLessEqual(args.get("concurrency", 1), 8)
                     if step["command"] == "engine":
                         self.assertEqual(args["max_requests"], 8)
-                    self.assertTrue(all(size <= 524288 - 1024 for size in args.get("sizes", [])))
+                    self.assertTrue(all(size <= 1048576 - 1024 for size in args.get("sizes", [])))
+        prefill = next(s for s in suite.load("release-tp3")["steps"] if s["id"] == "prefill")
+        self.assertIn(1000000, prefill["args"]["sizes"])
 
     def test_release_measures_open_loop_goodput(self):
         poisson = next(s for s in suite.load("release")["steps"] if s["id"] == "poisson")

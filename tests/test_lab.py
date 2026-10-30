@@ -1498,7 +1498,8 @@ class ReleaseTP3ProfileTest(unittest.TestCase):
         args = lab.PROFILES["release-tp3"]["bench_args"]
         self.assertEqual(args[args.index("--concurrency") + 1], "1,2,4,8")
         sizes = [int(x) for x in args[args.index("--prefill-sizes") + 1].split(",")]
-        self.assertTrue(all(size < 524288 - 64 for size in sizes))
+        self.assertTrue(all(size < 1048576 - 64 for size in sizes))
+        self.assertIn(1000000, sizes)
         stems = [extra[2] for extra in lab.PROFILES["release-tp3"]["extras"]]
         self.assertNotIn("c16-distinct", stems)
         self.assertIn("c8-distinct", stems)
