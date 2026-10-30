@@ -516,15 +516,74 @@ class PairedTest(unittest.TestCase):
             "output_tokens_per_step": {"mean": 2.28}, "accepted_per_draft": {"mean": 1.28},
             "draft_tokens_per_draft": {"mean": 3.09}, "survival_at_0": {"mean": 0.75},
             "coverage_at_0": {"mean": 1.0}, "survival_at_1": {"mean": 0.52}, "coverage_at_1": {"mean": 0.9}}})
+        self.assertAlmostEqual(card["acceptance_length"], 2.28)
         self.assertAlmostEqual(card["decoding_requests_per_step"], 1.0)
         self.assertAlmostEqual(card["verified_rows_per_step"], 4.09)
         self.assertAlmostEqual(card["row_yield"], 2.28 / 4.09)
         self.assertAlmostEqual(card["wasted_rows_per_step"], 4.09 - 2.28)
         self.assertEqual([p["position"] for p in card["positions"]], [0, 1])
+        self.assertAlmostEqual(card["positions"][0]["conditional_acceptance"], 0.75)
+        self.assertAlmostEqual(card["positions"][0]["verified_yield"], 0.75)
+        self.assertAlmostEqual(card["positions"][1]["conditional_acceptance"], 0.52 / 0.75)
+        self.assertAlmostEqual(card["positions"][1]["verified_yield"], 0.52 / 0.9)
         self.assertEqual(report.rows_a_step({"server": {}})["positions"], [])
         text = suite.format_accounting({"cand": {"c1": card}, "ref": {"c1": report.rows_a_step({"server": {}})}})
         self.assertIn("0:0.750/1.000 1:0.520/0.900", text)
+        self.assertIn("[cond/yield 0:0.750/0.750 1:0.693/0.578]", text)
         self.assertIn("(no speculative counters)", text)
+
+    def test_spec_decomposition_identities_and_formatting(self):
+        base_summary = {"server": {
+            "steps_per_s": {"mean": 32.0},
+            "output_tokens_per_step": {"mean": 18.24},
+            "accepted_per_draft": {"mean": 1.28},
+            "draft_tokens_per_draft": {"mean": 3.00},
+            "survival_at_0": {"mean": 0.75}, "coverage_at_0": {"mean": 1.00},
+            "survival_at_1": {"mean": 0.53}, "coverage_at_1": {"mean": 0.90},
+        }}
+        cand_summary = {"server": {
+            "steps_per_s": {"mean": 34.4},
+            "output_tokens_per_step": {"mean": 19.04},
+            "accepted_per_draft": {"mean": 1.38},
+            "draft_tokens_per_draft": {"mean": 2.60},
+            "survival_at_0": {"mean": 0.78}, "coverage_at_0": {"mean": 1.00},
+            "survival_at_1": {"mean": 0.60}, "coverage_at_1": {"mean": 0.85},
+        }}
+        decomp = report.spec_decomposition(base_summary, cand_summary)
+        self.assertIsNotNone(decomp)
+        self.assertAlmostEqual(
+            decomp["server_tps"]["log_change"],
+            decomp["acceptance_length"]["log_change"]
+            + decomp["steps_per_s"]["log_change"]
+            + decomp["requests_per_step"]["log_change"],
+            places=12,
+        )
+        tokens_log_change = math.log(19.04 / 18.24)
+        self.assertAlmostEqual(
+            tokens_log_change,
+            decomp["verified_rows_per_step"]["log_change"] + decomp["row_yield"]["log_change"],
+            places=12,
+        )
+        self.assertEqual(len(decomp["positions"]), 2)
+        self.assertAlmostEqual(decomp["positions"][1]["survival_delta"], 0.07)
+        self.assertAlmostEqual(decomp["positions"][1]["coverage_delta"], -0.05)
+        self.assertAlmostEqual(
+            decomp["positions"][1]["conditional_acceptance_delta"],
+            (0.60 / 0.78) - (0.53 / 0.75),
+        )
+        self.assertAlmostEqual(
+            decomp["positions"][1]["verified_yield_delta"],
+            (0.60 / 0.85) - (0.53 / 0.90),
+        )
+        base_run = {"workload": {"mode": "closed", "concurrency": 8, "prompts_sha256": "x"},
+                    "summary": base_summary | {"output_tps": {"mean": 583.68, "batches": [583.0, 584.0]}}}
+        cand_run = {"workload": {"mode": "closed", "concurrency": 8, "prompts_sha256": "x"},
+                    "summary": cand_summary | {"output_tps": {"mean": 654.98, "batches": [654.0, 656.0]}}}
+        compared = report.compare(base_run, cand_run)
+        self.assertIn("spec_decomposition", compared)
+        formatted = report.format_comparison(compared, "base", "cand")
+        self.assertIn("speculative log-tps:", formatted)
+        self.assertIn("row yield", formatted)
 
 
 class StallTest(unittest.TestCase):

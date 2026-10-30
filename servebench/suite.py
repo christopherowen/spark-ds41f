@@ -168,9 +168,17 @@ def format_accounting(by_label: dict) -> str:
                 continue
             positions = " ".join(f"{p['position']}:{p['survival']:.3f}/{p['coverage']:.3f}" for p in card["positions"]
                                  if p["survival"] is not None and p["coverage"] is not None)
+            cond_yield = " ".join(
+                f"{p['position']}:{p['conditional_acceptance']:.3f}/{p['verified_yield']:.3f}"
+                for p in card["positions"]
+                if p.get("conditional_acceptance") is not None and p.get("verified_yield") is not None
+            )
+            pos_str = positions or "-"
+            if cond_yield:
+                pos_str += f" [cond/yield {cond_yield}]"
             lines.append(f"{step:8s} {label:{width}s} {card['tokens_per_step']:7.3f} "
                          f"{card['decoding_requests_per_step']:8.2f} {card['verified_rows_per_step']:6.2f} "
-                         f"{card['row_yield']:6.3f} {card['wasted_rows_per_step']:7.2f}  {positions or '-'}")
+                         f"{card['row_yield']:6.3f} {card['wasted_rows_per_step']:7.2f}  {pos_str}")
     return "\n".join(lines)
 
 
