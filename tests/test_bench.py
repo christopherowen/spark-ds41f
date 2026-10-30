@@ -8,7 +8,6 @@ import http.server
 import io
 import random
 import tempfile
-import importlib.machinery
 import importlib.util
 import json
 import sys
@@ -18,10 +17,9 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 
 class StatisticsTest(unittest.TestCase):

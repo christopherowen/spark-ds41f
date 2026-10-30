@@ -5,12 +5,15 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def load(name, path):
@@ -22,7 +25,7 @@ def load(name, path):
 
 
 probe = load("weight_fragmentation", ROOT / "scripts/weight_fragmentation.py")
-spark = load("spark", ROOT / "bin/spark")
+import spark_ds41f as spark
 
 
 class FragmentationTest(unittest.TestCase):

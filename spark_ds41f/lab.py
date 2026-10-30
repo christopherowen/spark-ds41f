@@ -1,0 +1,2275 @@
+#!/usr/bin/env python3
+"""Experiment windows, runs and kernel-lab jobs on the Spark cluster.
+
+usage (on dgx1, from the deployment checkout):
+  scripts/lab.py window open [--minutes M] [--note TEXT] [--production-config PATH]   (M=0: no cap)
+  scripts/lab.py window status
+  scripts/lab.py window close [--production-config PATH]
+  scripts/lab.py run SPEC.json [--dry-run] [--keep-open] [--production-config PATH]
+  scripts/lab.py queue add SPEC.json      (queue a spec for the open or next window)
+  scripts/lab.py queue run [--idle-minutes M] [--minutes M] [--production-config PATH]   (0: never)
+  scripts/lab.py queue status
+  scripts/lab.py report RUN               (the run's table and each step's node telemetry)
+  scripts/lab.py kernel-local BUNDLE_DIR [--out DIR] [--dry-run]   (on any node, cluster stopped)
+  scripts/lab.py watchdog [--max-age SECONDS] [--once]
+
+A window holds the cluster for one experiment session. While it is open the hold file
+(~/spark-hold.json on dgx1) names this runner as holder; other agents must not stop,
+restart, sync or benchmark the cluster, and this runner refuses to open a window over a
+hold someone else wrote. Jobs inside a window run back to back with no restore of the
+promoted service in between; the window closes (production booted, doctor --live, hold
+removed) when the run ends, when someone writes ~/spark-request.json, or when it is closed
+(window close). It has no time cap unless one is asked for (--minutes M; the hold's
+expected_end is null without one), so no job is cut short by a clock. A watchdog started
+with the window closes it if the runner stops refreshing the heartbeat.
+
+The production profile is the cluster configuration a window restores and whose node map
+every cluster action uses (--production-config, default config/cluster.json). A window
+opens only while that profile is the live cluster, records it in the hold file as
+"production_config", and every later command in the window (close, watchdog, runs, the
+queue) follows the record.
+
+A queue runner opens one window and runs queued specs back to back (oldest first), so the
+cluster keeps working while results are read and the next spec is written. An empty
+queue keeps the window held for the next spec; --idle-minutes M closes it after M idle
+minutes instead. Terminal lines for watchers:
+"QUEUE job <name> done|failed", "QUEUE idle", "QUEUE closed". A "sync" job moves the node
+checkouts to origin/main between jobs, so newly published arms can join an open window.
+
+A run spec is JSON: {"experiment": "experiments/<dir>", "run": "rec6", "jobs": [...]} with
+jobs of kind "measure" (arms booted in turn and measured; profile "lean" or "full";
+"bracket" re-measures the first arm at the end; scripts/lab_sweep.py writes one for a
+one-variable environment sweep), "validate" (a trace arm: boot A, scenario
+traces, optional restart, per-node analysis in parallel while stopped) and "kernel" (a
+kernel-lab bundle per node, run concurrently on the named nodes while the cluster is
+stopped). Results keep the layout tables_arms.py reads.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.machinery
+import io
+import importlib.util
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import traceback
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+import spark_ds41f as spark
+
+HOLD = Path.home() / "spark-hold.json"
+LAB_HOME = Path.home() / "spark-lab"
+REQUEST = Path.home() / "spark-request.json"
+# The names before the project was renamed from spark3: a hold or request an
+# agent still writes there counts the same.
+LEGACY_HOLD = Path.home() / "spark3-hold.json"
+LEGACY_REQUEST = Path.home() / "spark3-request.json"
+HOLDER_PREFIX = "spark-lab"
+# The image's source trees (vLLM, B12X) live under its candidate root: /opt/spark-ds41f/candidate
+# from the release after spark-ds41f-1022, /opt/spark3/candidate in the images before it.
+SOURCE_ROOTS = ("/opt/spark-ds41f/candidate", "/opt/spark3/candidate")
+# The GPU's DRM card by PCI path, as the serving container mounts it for the display carve-out.
+DRM_CARD = "/dev/dri/by-path/pci-000f:01:00.0-card"
+DEFAULT_MINUTES = 0  # no time cap: a window ends when its work is done or it is asked for
+HEARTBEAT_MAX_AGE = 900
+# The profile a window restores; main() sets it from --production-config or the open window's hold.
+PRODUCTION_CONFIG = spark.DEFAULT_CLUSTER_CONFIG
+TRACE_LOG_DIR = "/cache/spark-ds41f/moe-checksums"
+# Present while a gpu_clocks job has the SM clocks locked; restoring production resets them.
+GPU_CLOCKS_MARKER = LAB_HOME / "gpu-clocks-locked.json"
+
+# Measurement profiles: (script, extra arguments, output stem). The bench command is built apart.
+PROFILES = {
+    "full": {
+        "bench": ["--min-samples", "5", "--max-samples", "5", "--prefill-sizes", "1024,4096,16384,65536",
+                  "--prefill-repeats", "3"],
+        "extras": [("c1_distinct.py", ["--tokens", "256"], "c1-distinct"),
+                   ("c8_distinct.py", ["--samples", "3", "--tokens", "256"], "c8-distinct"),
+                   ("ttft_short.py", [], "ttft"),
+                   ("mixed_latency.py", ["--rounds", "3"], "mixed")],
+    },
+    "lean": {
+        "bench": ["--min-samples", "3", "--max-samples", "3", "--prefill-sizes", "1024,16384",
+                  "--prefill-repeats", "2"],
+        "extras": [("c1_distinct.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
+                   ("c8_distinct.py", ["--samples", "2", "--tokens", "256"], "c8-distinct"),
+                   ("ttft_short.py", ["--reps", "3"], "ttft"),
+                   ("mixed_latency.py", ["--rounds", "3"], "mixed")],
+    },
+}
+# The release comparison (docs/lab.md, "Release comparison"): the previous release and
+# the candidate in one session, with the same workloads every release.
+# scripts/release_table.py writes the over/under table.
+_DETERMINISM = "experiments/2026-10-09-tilelang-migration/token_determinism.py"
+_LATENCY = "experiments/2026-09-29-determinism"
+PROFILES["release"] = {
+    "bench_args": ["--suites", "quality,decode,prefill", "--min-samples", "5", "--max-samples", "10",
+                   "--precision", "2", "--concurrency", "1,2,4,8,16", "--decode-cases", "prose,code",
+                   "--prefill-text", "source", "--prefill-sizes", "1024,32768,131072,262144,524288,1000000",
+                   "--prefill-repeats", "3", "--compare", "none"],
+    "extras": [(_DETERMINISM, ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"),
+               ("scripts/acceptance_sweep.py", ["--tokens", "256"], "sweep"),
+               # One stream: twelve prompts one at a time (distinct_streams.py --streams 1 is one prompt).
+               (f"{_LATENCY}/c1_distinct.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
+               *[("scripts/distinct_streams.py", ["--streams", str(n), "--samples", str(s), "--tokens", "256"],
+                  f"c{n}-distinct") for n, s in ((4, 3), (8, 4), (16, 4))],
+               (f"{_LATENCY}/ttft_short.py", ["--reps", "3"], "ttft"),
+               (f"{_LATENCY}/mixed_latency.py", ["--rounds", "3"], "mixed")],
+    "table": "scripts/release_table.py",
+}
+# TP3's recipe limits: eight streams, 512K context (sizes below max-model-len - 64).
+PROFILES["release-tp3"] = {
+    **PROFILES["release"],
+    "bench_args": [{"1,2,4,8,16": "1,2,4,8",
+                    "1024,32768,131072,262144,524288,1000000": "1024,32768,131072,262144,500000"}.get(a, a)
+                   for a in PROFILES["release"]["bench_args"]],
+    "extras": [extra for extra in PROFILES["release"]["extras"] if extra[2] != "c16-distinct"],
+}
+BENCH_BASE = ["--compare", "none", "--suites", "decode,prefill",
+              "--decode-cases", "prose,json-nothink", "--concurrency", "1", "--prefill-text", "source"]
+# Validation tiers: scenario sets for boot A and the restart (None = every scenario).
+TIERS = {
+    "full": {"scenarios": None, "restart_scenarios": None, "mixes": True},
+    "quick": {"scenarios": "mixed,chunked,chunked_end,cache_long,distinct",
+              "restart_scenarios": "cache_long,distinct", "mixes": False},
+}
+
+
+# ---------------------------------------------------------------- small helpers
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(message: str) -> None:
+    print(f"{now()} {message}", flush=True)
+
+
+def parse_time(text: str) -> float:
+    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def production_configuration() -> tuple[dict, dict, dict]:
+    return spark.configuration(argparse.Namespace(cluster_config=PRODUCTION_CONFIG))
+
+
+def nodes_config() -> dict:
+    return production_configuration()[1]
+
+
+def head_url() -> str:
+    head = next(node for node in nodes_config()["nodes"] if node["head"])
+    return f"http://{head['management_ip']}:8000"
+
+
+# ---------------------------------------------------------------- hold file and guards
+
+def read_hold(path: Path | None = None) -> dict | None:
+    for candidate in (path,) if path else (HOLD, LEGACY_HOLD):
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError:
+            return {"holder": "unreadable hold file"}
+    return None
+
+
+def hold_is_ours(hold: dict | None) -> bool:
+    return bool(hold) and str(hold.get("holder", "")).startswith(HOLDER_PREFIX)
+
+
+def new_hold(minutes: int, note: str, at: float | None = None) -> dict:
+    """The hold file of a new window; ``expected_end`` is null without a cap (minutes 0)."""
+    at = time.time() if at is None else at
+    stamp = dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = (dt.datetime.fromtimestamp(at + 60 * minutes, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+           if minutes > 0 else None)
+    return {
+        "holder": f"{HOLDER_PREFIX}: {note}" if note else HOLDER_PREFIX,
+        "window": f"{socket.gethostname()}-{int(at)}",
+        "since": stamp,
+        "expected_end": end,
+        "heartbeat": stamp,
+        "rule": "no GPU experiments, restarts, cluster sync or serving changes while this file exists",
+        "request": f"to ask for the cluster, write {REQUEST}; the window closes after the current job",
+        "production_config": PRODUCTION_CONFIG,
+    }
+
+
+def resolve_production(explicit: str | None, hold: dict | None) -> str:
+    """The profile to restore: our open window's record, else --production-config, else the default.
+
+    A window keeps the profile it opened with; an explicit profile that differs is refused
+    rather than silently restoring something else. Holds written before the field existed
+    (and foreign holds) carry no record."""
+    recorded = hold.get("production_config") if hold_is_ours(hold) else None
+
+    def canonical(raw: str) -> str:
+        return spark.cluster_config_path(argparse.Namespace(cluster_config=raw))[1]
+
+    if recorded and explicit and canonical(explicit) != canonical(recorded):
+        raise SystemExit(f"window {hold.get('window')} restores {recorded}; "
+                         f"--production-config {explicit} differs")
+    return canonical(recorded or explicit or spark.DEFAULT_CLUSTER_CONFIG)
+
+
+def heartbeat_age(hold: dict, at: float | None = None) -> float:
+    at = time.time() if at is None else at
+    return at - parse_time(hold["heartbeat"])
+
+
+def beat(note: str | None = None) -> None:
+    hold = read_hold()
+    if not hold_is_ours(hold):
+        raise SystemExit("the hold file is not ours; refusing to continue")
+    hold["heartbeat"] = now()
+    if note:
+        hold["current"] = note
+    write_json_atomic(HOLD, hold)
+
+
+def window_should_close(hold: dict, at: float | None = None) -> str | None:
+    at = time.time() if at is None else at
+    for request in (REQUEST, LEGACY_REQUEST):
+        if request.exists():
+            return f"cluster requested ({request})"
+    if hold.get("expected_end") and at > parse_time(hold["expected_end"]):
+        return "time cap reached"
+    return None
+
+
+def requests_in_flight(url: str | None = None) -> float | None:
+    """Running plus waiting requests, or None when no server answers."""
+    try:
+        with urllib.request.urlopen((url or head_url()) + "/metrics", timeout=5) as response:
+            text = response.read().decode()
+    except OSError:
+        return None
+    total = 0.0
+    for line in text.splitlines():
+        if line.startswith(("vllm:num_requests_running{", "vllm:num_requests_waiting{")):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+def idle_for(seconds: int = 30, interval: int = 5) -> bool:
+    deadline = time.time() + seconds
+    while True:
+        load = requests_in_flight()
+        if load not in (None, 0.0):
+            log(f"cluster busy ({load:g} requests)")
+            return False
+        if time.time() >= deadline:
+            return True
+        time.sleep(interval)
+
+
+def published_problems() -> list[str]:
+    problems = []
+    subprocess.run(["git", "-C", str(ROOT), "fetch", "-q", "origin"], check=False)
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True,
+                          capture_output=True).stdout.strip()
+    if subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "origin/main"]).returncode:
+        problems.append(f"deployment commit {head[:8]} is not on origin/main")
+    cluster, nodes, _ = production_configuration()
+    repo = spark.repository_path(cluster)
+    for node in nodes["nodes"]:
+        if node["head"]:
+            continue
+        theirs = spark.run_ssh(nodes, node, "git", "-C", repo, "rev-parse", "HEAD").stdout.strip()
+        if theirs != head:
+            problems.append(f"{node['name']} checkout {theirs[:8]} differs from {head[:8]}")
+    return problems
+
+
+# ---------------------------------------------------------------- cluster actions
+
+def spark_cli(*arguments: str, dry: bool = False, capture: list | None = None) -> int:
+    command = [sys.executable, str(ROOT / "bin" / "spark"), *arguments]
+    if dry:
+        print("  $ " + shlex.join(command[1:]))
+        return 0
+    process = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in process.stdout.splitlines():
+        if "docker run" not in line:
+            print(line, flush=True)
+    if capture is not None:
+        capture.extend(process.stdout.splitlines())
+    return process.returncode
+
+
+def ready_seconds(lines: list[str]) -> float | None:
+    """Seconds from launch to ready, from bin/spark's 'cluster ready ... (+N.Ns)' line."""
+    for line in lines:
+        found = re.search(r"cluster ready.*\(\+([0-9.]+)s\)", line)
+        if found:
+            return float(found.group(1))
+    return None
+
+
+def boot(config: str, dry: bool = False) -> bool:
+    # A lab window restores the promoted physical fabric. It cannot undo
+    # recabling or safely clean up a candidate with a different node set.
+    candidate_nodes = spark.configuration(argparse.Namespace(cluster_config=config))[1]
+    if candidate_nodes != nodes_config():
+        log(f"lab windows require the promoted node topology ({PRODUCTION_CONFIG}); qualify a new fabric "
+            "with explicit cluster commands before using it in lab runs")
+        return False
+    if not stop_other_engine(config, dry=dry):
+        return False
+    log(f"start {config}")
+    started, lines = time.time(), []
+    # Arms may change context or KV size; the node map is already pinned to production's above.
+    ok = spark_cli("--cluster-config", config, "cluster", "start", "--replace", "--change-shape", "--apply",
+                   dry=dry, capture=lines) == 0
+    if not dry:
+        log(f"boot {Path(config).name}: ready +{ready_seconds(lines)} s, command {time.time() - started:.0f} s"
+            f"{'' if ok else ' FAILED'}")
+    return ok
+
+
+def buddy_free(text: str, page_bytes: int) -> dict:
+    """/proc/buddyinfo as free GiB per block size (summed over zones) and the GiB free in
+    blocks of 2 MiB or more, the size a GPU large page needs."""
+    free: dict[int, int] = {}
+    for line in text.splitlines():
+        counts = line.split()[4:]
+        for order, count in enumerate(counts):
+            free[order] = free.get(order, 0) + int(count)
+    by_block = {f"{page_bytes * 2 ** order // 1024} KiB": round(count * page_bytes * 2 ** order / 2 ** 30, 3)
+                for order, count in sorted(free.items())}
+    large = sum(count * page_bytes * 2 ** order for order, count in free.items() if page_bytes * 2 ** order >= 2 ** 21)
+    return {"free_gib_by_block": by_block, "free_gib_2mib_blocks": round(large / 2 ** 30, 3),
+            "free_gib": round(sum(c * page_bytes * 2 ** o for o, c in free.items()) / 2 ** 30, 3)}
+
+
+def memory_before_boot(compact: bool) -> dict:
+    """With serving stopped: each node's free memory by block size, then (when asked) after
+    ``echo 1 > /proc/sys/vm/compact_memory``."""
+    nodes, out = nodes_config(), {}
+    for node in nodes["nodes"]:
+        page = int(spark.run_ssh(nodes, node, "getconf", "PAGESIZE").stdout.strip() or 4096)
+        record = {"page_bytes": page,
+                  "stopped": buddy_free(spark.run_ssh(nodes, node, "cat", "/proc/buddyinfo").stdout, page)}
+        if compact:
+            began = time.time()
+            result = spark.run_ssh(nodes, node, "sudo", "-n", "sh", "-c", "sync; echo 1 > /proc/sys/vm/compact_memory")
+            record["compact"] = {"exit": result.returncode, "seconds": round(time.time() - began, 1),
+                                 **buddy_free(spark.run_ssh(nodes, node, "cat", "/proc/buddyinfo").stdout, page)}
+        out[node["name"]] = record
+        log(f"{node['name']}: {record['stopped']['free_gib_2mib_blocks']} GiB free in blocks of 2 MiB or more"
+            + (f", {record['compact']['free_gib_2mib_blocks']} GiB after compaction" if compact else ""))
+    return out
+
+
+# One line every 0.25 s: time, then MemAvailable, MemFree and Cached in KiB. The loop ends at
+# the first write that fails (the runner stopped reading) and in any case after an hour, the
+# deployment's ready timeout, so a lost runner leaves no unbounded sampler on a node.
+STARTUP_MEMORY_SAMPLER = (
+    "for _ in $(seq 14400); do "
+    "awk -v t=\"$(date +%s.%N)\" '/^(MemAvailable|MemFree|Cached):/ {v[$1] = $2} "
+    "END {print t, v[\"MemAvailable:\"], v[\"MemFree:\"], v[\"Cached:\"]}' /proc/meminfo || exit 0; "
+    "sleep 0.25; done"
+)
+
+
+def start_memory_samplers(prefix: Path) -> list[tuple[str, Path, subprocess.Popen]]:
+    """Sample each node's memory through a boot: the startup guard reads MemAvailable, and
+    GB10's allocator needs MemFree, which the page cache takes (TODO.md, boot)."""
+    nodes, samplers = nodes_config(), []
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    for node in nodes["nodes"]:
+        path = prefix.with_name(f"{prefix.name}-{node['name']}.txt")
+        with path.open("w") as handle:
+            process = subprocess.Popen(
+                ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node),
+                 shlex.join(["bash", "-c", STARTUP_MEMORY_SAMPLER])],
+                stdout=handle, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        samplers.append((node["name"], path, process))
+    return samplers
+
+
+def stop_memory_samplers(samplers: list[tuple[str, Path, subprocess.Popen]]) -> dict:
+    out = {}
+    for name, path, process in samplers:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        out[name] = memory_series(path.read_text())
+    return out
+
+
+def memory_series(text: str) -> dict:
+    """A node's samples through a boot, summarized in GiB: the lowest MemAvailable (the
+    startup guard's measure) and when it fell, the lowest MemFree and the largest page cache."""
+    samples = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            continue  # a line cut off when the sampler stopped
+        try:
+            samples.append((float(fields[0]), *(int(field) for field in fields[1:])))
+        except ValueError:
+            continue
+    if not samples:
+        return {"samples": 0}
+    start = samples[0][0]
+
+    def gib(kib: int) -> float:
+        return round(kib / 1024**2, 3)
+
+    lowest = min(samples, key=lambda sample: sample[1])
+    return {
+        "samples": len(samples),
+        "seconds": round(samples[-1][0] - start, 1),
+        "first": {"available_gib": gib(samples[0][1]), "free_gib": gib(samples[0][2]), "cached_gib": gib(samples[0][3])},
+        "min_available_gib": gib(lowest[1]),
+        "min_available_at_seconds": round(lowest[0] - start, 1),
+        "min_free_gib": gib(min(sample[2] for sample in samples)),
+        "max_cached_gib": gib(max(sample[3] for sample in samples)),
+        "last": {"available_gib": gib(samples[-1][1]), "free_gib": gib(samples[-1][2]), "cached_gib": gib(samples[-1][3])},
+    }
+
+
+def stop_arguments(remove: bool = False) -> list[str]:
+    """Stop the production profile's containers; they are kept (stopped) unless removal is asked for."""
+    return ["--cluster-config", PRODUCTION_CONFIG, "cluster", "stop", *(["--remove"] if remove else []),
+            "--apply", "--parallel"]
+
+
+def stop_cluster(dry: bool = False, remove: bool = False) -> bool:
+    log("stop")
+    ok = spark_cli(*stop_arguments(remove), dry=dry) == 0
+    # An arm serving under another container name than production's stops with its own profile.
+    return stop_other_engine(PRODUCTION_CONFIG, remove=remove, dry=dry) and ok
+
+
+def production_live(problems: list | None = None) -> bool:
+    process = subprocess.run([sys.executable, str(ROOT / "bin" / "spark"), "--cluster-config", PRODUCTION_CONFIG,
+                              "doctor", "--live"], cwd=ROOT, text=True, capture_output=True)
+    if problems is not None:
+        problems.extend(line for line in process.stdout.splitlines() if line.startswith("ERROR"))
+    return process.returncode == 0 and "live cluster matches" in process.stdout
+
+
+def set_gpu_clocks(lock: list[int] | None) -> bool:
+    """Lock every node's GPU SM clock to ``lock`` [min, max] MHz (``nvidia-smi -lgc``), or
+    reset it (``-rgc``) when ``lock`` is None. A lock that fails on any node is reset
+    everywhere, so no measurement runs with nodes at different clocks."""
+    nodes = nodes_config()
+    command = ("sudo", "-n", "nvidia-smi") + (("-lgc", f"{lock[0]},{lock[1]}") if lock else ("-rgc",))
+    ok = True
+    for node in nodes["nodes"]:
+        result = spark.run_ssh(nodes, node, *command)
+        now = spark.run_ssh(nodes, node, "nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm",
+                            "--format=csv,noheader").stdout.strip()
+        log(f"{node['name']}: GPU clocks {'locked to ' + '-'.join(map(str, lock)) if lock else 'reset'} "
+            f"(exit {result.returncode}; now {now})" + (f": {result.stderr.strip()[:200]}" if result.returncode else ""))
+        ok = ok and result.returncode == 0
+    if lock and ok:
+        write_json_atomic(GPU_CLOCKS_MARKER, {"lock_mhz": lock, "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    elif lock:
+        set_gpu_clocks(None)
+    elif ok:
+        GPU_CLOCKS_MARKER.unlink(missing_ok=True)
+    return ok
+
+
+TELEMETRY_FIELDS = ("clocks.sm", "clocks.mem", "power.draw", "temperature.gpu", "clocks_event_reasons.active")
+
+
+def summarize_telemetry(text: str) -> dict:
+    """``nvidia-smi --query-gpu=timestamp,<TELEMETRY_FIELDS> --format=csv,noheader,nounits``
+    lines as per-field percentiles, plus how many samples showed each clock-event reason."""
+    columns: dict[str, list[float]] = {field: [] for field in TELEMETRY_FIELDS[:-1]}
+    reasons: dict[str, int] = {}
+    samples = 0
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 1 + len(TELEMETRY_FIELDS):
+            continue
+        samples += 1
+        for field, value in zip(TELEMETRY_FIELDS[:-1], parts[1:-1]):
+            try:
+                columns[field].append(float(value))
+            except ValueError:
+                pass
+        reasons[parts[-1]] = reasons.get(parts[-1], 0) + 1
+    out: dict = {"samples": samples, "event_reasons": reasons}
+    for field, values in columns.items():
+        if values:
+            ranked = sorted(values)
+            pick = lambda q: ranked[min(len(ranked) - 1, max(0, round(q / 100 * len(ranked)) - 1))]
+            out[field] = {"min": ranked[0], "p10": pick(10), "p50": pick(50), "p90": pick(90),
+                          "max": ranked[-1], "mean": round(sum(values) / len(values), 3)}
+    return out
+
+
+# Runs on each node (python3 - CONTAINER_NAME SECONDS): every 2 s, one JSON line with the serving
+# container's threads (name, CPU seconds, current core); the first line lists the fast cores
+# (cpu_capacity above the midpoint, as sparknet's "big") and the cores that share each L3.
+# Ends at SECONDS or a closed pipe.
+THREAD_SAMPLER = r"""
+import json, os, subprocess, sys, time
+caps = {}
+for name in os.listdir("/sys/devices/system/cpu"):
+    if name[3:].isdigit():
+        try:
+            caps[int(name[3:])] = int(open(f"/sys/devices/system/cpu/{name}/cpu_capacity").read())
+        except OSError:
+            pass
+middle = (min(caps.values()) + max(caps.values())) / 2 if caps else 0
+def cpu_list(text):
+    cpus = []
+    for part in text.strip().split(","):
+        low, _, high = part.partition("-")
+        if low:
+            cpus += range(int(low), int(high or low) + 1)
+    return cpus
+clusters = []
+for cpu in sorted(caps):
+    try:
+        group = cpu_list(open(f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list").read())
+    except OSError:
+        continue
+    if group not in clusters:
+        clusters.append(group)
+tick = os.sysconf("SC_CLK_TCK")
+end = time.time() + float(sys.argv[2])
+try:
+    print(json.dumps({"fast": sorted(c for c, v in caps.items() if v > middle), "clusters": clusters}),
+          flush=True)
+    while time.time() < end:
+        pids = subprocess.run(["docker", "top", sys.argv[1], "-eo", "pid"], capture_output=True,
+                              text=True).stdout.split()[1:]
+        threads = {}
+        for pid in pids:
+            try:
+                tids = os.listdir(f"/proc/{pid}/task")
+            except OSError:
+                continue
+            for tid in tids:
+                try:
+                    stat = open(f"/proc/{pid}/task/{tid}/stat").read()
+                except OSError:
+                    continue
+                fields = stat[stat.rindex(")") + 2:].split()
+                threads[tid] = [stat[stat.index("(") + 1:stat.rindex(")")],
+                                (int(fields[11]) + int(fields[12])) / tick, int(fields[36])]
+        print(json.dumps({"t": time.time(), "threads": threads}), flush=True)
+        time.sleep(2)
+except BrokenPipeError:
+    pass
+"""
+
+
+def summarize_threads(text: str, busy_share: float = 0.10) -> dict:
+    """Thread-sampler lines as each busy thread's share of a core, how much of its CPU time
+    ran on slow cores, and (when the sampler listed the L3 clusters) the cluster where most
+    of it ran, that share, and how many intervals ended on a different core than they began
+    (each interval's CPU time counted on the core seen at its end). ``busy_l3`` lists the
+    clusters the busy threads mostly ran in: two means one step's hot threads span both
+    L3s, so their shared cache lines cross clusters."""
+    fast, clusters, samples = None, None, []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if "fast" in record:
+            fast = set(record["fast"])
+            clusters = record.get("clusters")
+        elif "threads" in record:
+            samples.append(record)
+    if fast is None or len(samples) < 2:
+        return {"samples": len(samples)}
+    l3 = {cpu: index for index, group in enumerate(clusters or []) for cpu in group}
+    used: dict[str, list] = {}  # tid -> [name, cpu seconds, seconds on slow cores, {l3: seconds}, moves]
+    for before, after in zip(samples, samples[1:]):
+        for tid, (name, cpu, core) in after["threads"].items():
+            if tid in before["threads"]:
+                spent = max(0.0, cpu - before["threads"][tid][1])
+                entry = used.setdefault(tid, [name, 0.0, 0.0, {}, 0])
+                entry[1] += spent
+                entry[2] += spent if core not in fast else 0.0
+                if core in l3:
+                    entry[3][l3[core]] = entry[3].get(l3[core], 0.0) + spent
+                if spent and core != before["threads"][tid][2]:
+                    entry[4] += 1
+    window = samples[-1]["t"] - samples[0]["t"]
+    total = sum(entry[1] for entry in used.values())
+    busy = []
+    for tid, (name, cpu, slow, by_l3, moves) in used.items():
+        if cpu / window < busy_share:
+            continue
+        thread = {"name": name, "tid": tid, "core_share": round(cpu / window, 3),
+                  "slow_share": round(slow / cpu if cpu else 0.0, 3)}
+        if clusters:
+            home = max(by_l3, key=by_l3.get) if by_l3 else None
+            thread.update(l3=home, l3_share=round(by_l3.get(home, 0.0) / cpu, 3) if cpu and home is not None else None,
+                          core_changes=moves)
+        busy.append(thread)
+    busy.sort(key=lambda thread: thread["core_share"], reverse=True)
+    summary = {"samples": len(samples), "window_s": round(window, 1), "fast_cores": sorted(fast),
+               "container_cores": round(total / window, 3) if window else None,
+               "slow_core_share": round(sum(e[2] for e in used.values()) / total, 3) if total else None,
+               "busy_threads": busy}
+    if clusters:
+        summary["l3_clusters"] = clusters
+        summary["busy_l3"] = sorted({thread["l3"] for thread in busy if thread["l3"] is not None})
+    return summary
+
+
+class Telemetry:
+    """Every node's GPU clocks, power, temperature and clock-event reasons, sampled each
+    second, and the serving container's threads (their CPU use and how much of it ran on
+    slow cores), sampled every 2 s, while a measured step runs; summarized beside its
+    output (``<out>.telemetry.json``, with the GPU clock lock in force, if any). Telemetry
+    never fails a step: a node that cannot be sampled is recorded as such. ``config`` is the
+    booted arm, whose container the thread sampler watches (default: production's)."""
+
+    def __init__(self, out: str, config: str | None = None):
+        self.path = ROOT / f"{out}.telemetry.json"
+        self.config = config
+        self.processes: dict[str, subprocess.Popen] = {}
+        self.threads: dict[str, subprocess.Popen] = {}
+
+    def __enter__(self) -> "Telemetry":
+        self.started = time.time()
+        try:
+            nodes = nodes_config()
+            container = container_name(self.config)
+            command = shlex.join(["timeout", "21600", "nvidia-smi", "--query-gpu=timestamp," + ",".join(TELEMETRY_FIELDS),
+                                  "--format=csv,noheader,nounits", "-lms", "1000"])
+            for node in nodes["nodes"]:
+                self.processes[node["name"]] = subprocess.Popen(
+                    ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), command],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
+                sampler = subprocess.Popen(
+                    ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), "python3", "-", container, "21600"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE, text=True)
+                sampler.stdin.write(THREAD_SAMPLER)
+                sampler.stdin.close()
+                sampler.stdin = None  # sent and closed: communicate() must not flush it again
+                self.threads[node["name"]] = sampler
+        except Exception as error:  # noqa: BLE001 - telemetry is advisory
+            log(f"telemetry not started: {error}")
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        lock = json.loads(GPU_CLOCKS_MARKER.read_text()) if GPU_CLOCKS_MARKER.exists() else None
+        summary: dict = {"started_utc": dt.datetime.fromtimestamp(self.started, dt.timezone.utc).isoformat(timespec="seconds"),
+                         "seconds": round(time.time() - self.started, 1), "gpu_clocks_lock": lock, "nodes": {}}
+        def collect(process: subprocess.Popen) -> str:
+            process.terminate()  # the remote command ends on its next write to the closed pipe
+            try:
+                return process.communicate(timeout=20)[0] or ""
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return process.communicate()[0] or ""
+
+        for name, process in self.processes.items():
+            try:
+                summary["nodes"][name] = summarize_telemetry(collect(process))
+            except Exception as error:  # noqa: BLE001 - telemetry never fails a step
+                summary["nodes"][name] = {"error": f"{type(error).__name__}: {error}"[:200]}
+        for name, process in self.threads.items():
+            try:
+                threads = summarize_threads(collect(process))
+            except Exception as error:  # noqa: BLE001
+                threads = {"error": f"{type(error).__name__}: {error}"[:200]}
+            summary["nodes"].setdefault(name, {})["threads"] = threads
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(self.path, summary)
+        except OSError as error:
+            log(f"telemetry not saved: {error}")
+        return False
+
+
+def restore_production(dry: bool = False) -> bool:
+    if GPU_CLOCKS_MARKER.exists():
+        log("resetting the GPU clocks a lab job locked")
+        if not dry:
+            set_gpu_clocks(None)
+    if not dry and production_live():
+        log(f"{PRODUCTION_CONFIG} already serving")
+        return True
+    ok = boot(PRODUCTION_CONFIG, dry=dry)
+    if not dry:
+        ok = production_live() and ok
+        log("doctor --live " + ("OK" if ok else "FAILED"))
+    return ok
+
+
+def container_name(config: str | None = None) -> str:
+    """The serving container's name in a profile (default: the production profile)."""
+    return spark.read_cluster(config or PRODUCTION_CONFIG)["container"]["name"]
+
+
+def container_running(node: dict | None = None) -> bool:
+    """A serving container runs: production's, or one under any other serving name (an arm
+    from before the rename to spark-ds41f, dsv41-*, or after it)."""
+    command = ["docker", "ps", "-q", *spark.serving_filters(spark.read_cluster(PRODUCTION_CONFIG))]
+    if node is None:
+        output = subprocess.run(command, text=True, capture_output=True).stdout
+    else:
+        output = spark.run_ssh(nodes_config(), node, *command).stdout
+    return bool(output.strip())
+
+
+def other_engines(config: str) -> list[tuple[str, str | None]]:
+    """Every serving container on any node running under another name than ``config``'s, with
+    the profile that started it (None if it records none), each pair once. Every node is asked:
+    when an arm's engine dies its head container exits, but the ranks' keep serving."""
+    cluster = spark.read_cluster(config)
+    nodes = nodes_config()
+    found: list[tuple[str, str | None]] = []
+    for node in nodes["nodes"]:
+        result = spark.run_ssh(nodes, node, "docker", "ps", *spark.serving_filters(cluster),
+                               "--format", f'{{{{.Names}}}}\t{{{{.Label "{spark.PROFILE_LABEL}"}}}}')
+        for line in result.stdout.splitlines():
+            name, _, profile = line.partition("\t")
+            engine = (name, profile or None)
+            if name and name != cluster["container"]["name"] and engine not in found:
+                found.append(engine)
+    return found
+
+
+def stop_other_engine(config: str, remove: bool = False, dry: bool = False) -> bool:
+    """``cluster start --replace`` and ``cluster stop`` act on their profile's container name
+    only, so engines serving under another name (the previous release's arm beside a renamed
+    candidate, or the ranks a dead arm left behind) are stopped first, each with the profile
+    that started it."""
+    if dry:
+        return True
+    found = other_engines(config)
+    for name, profile in found:
+        if profile is None:
+            log(f"{name} is serving and records no profile; stop it before using {config}")
+            return False
+    ok = True
+    for profile in dict.fromkeys(profile for _, profile in found):
+        names = ", ".join(dict.fromkeys(name for name, started in found if started == profile))
+        log(f"{names} is serving (started from {profile}); stopping it with that profile")
+        ok = spark_cli("--cluster-config", profile, "cluster", "stop", *(["--remove"] if remove else []),
+                       "--apply", "--parallel") == 0 and ok
+    return ok
+
+
+# ---------------------------------------------------------------- windows
+
+def window_open(minutes: int, note: str, dry: bool = False) -> None:
+    hold = read_hold()
+    if hold and not hold_is_ours(hold):
+        raise SystemExit(f"cluster held by {hold.get('holder')!r} since {hold.get('since')}; not opening")
+    if hold_is_ours(hold):
+        log(f"window {hold['window']} already open")
+        return
+    if dry:
+        print(f"  would open a {minutes}-minute window restoring {PRODUCTION_CONFIG} after the publish, "
+              "live and idle guards")
+        return
+    problems = published_problems()
+    if problems:
+        raise SystemExit("not opening: " + "; ".join(problems))
+    # The window restores this profile when it closes; it must be what is serving now.
+    live_problems = []
+    if not production_live(live_problems):
+        raise SystemExit(f"not opening: {PRODUCTION_CONFIG} is not the live cluster (doctor --live failed); "
+                         "pass --production-config with the profile that is serving"
+                         + "".join(f"\n  {line}" for line in live_problems))
+    if not idle_for(30):
+        raise SystemExit("not opening: the cluster is serving requests")
+    hold = new_hold(minutes, note)
+    write_json_atomic(HOLD, hold)
+    log(f"window {hold['window']} open until {hold['expected_end'] or 'released'}; "
+        f"restores {PRODUCTION_CONFIG}")
+    watchdog_log = ROOT / "results" / "private" / "lab" / f"watchdog-{hold['window']}.log"
+    watchdog_log.parent.mkdir(parents=True, exist_ok=True)
+    with watchdog_log.open("a") as handle:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watchdog",
+                          "--production-config", PRODUCTION_CONFIG], cwd=ROOT,
+                         stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def window_close(reason: str, dry: bool = False) -> bool:
+    hold = read_hold()
+    if hold and not hold_is_ours(hold):
+        log(f"hold belongs to {hold.get('holder')!r}; leaving the cluster alone")
+        return False
+    log(f"closing window ({reason})")
+    ok = restore_production(dry=dry)
+    if not dry and ok and hold_is_ours(read_hold()):
+        HOLD.unlink()
+        log("window closed; hold removed")
+    elif not ok:
+        log("restore FAILED; hold kept so nobody assumes production is up")
+    return ok
+
+
+def watchdog(max_age: int, once: bool) -> None:
+    log(f"watchdog: heartbeat limit {max_age} s")
+    while True:
+        hold = read_hold()
+        if not hold_is_ours(hold):
+            log("watchdog: no window of ours; exiting")
+            return
+        age = heartbeat_age(hold)
+        if age > max_age:
+            log(f"watchdog: heartbeat {age:.0f} s old; closing the window")
+            window_close("watchdog: stale heartbeat")
+            return
+        if once:
+            return
+        time.sleep(60)
+
+
+# ---------------------------------------------------------------- overlays
+
+def overlay_manifest(config: dict) -> list[str]:
+    """The SHA-256 of every file the arm mounts over the image's source trees."""
+    lines = []
+    for source, destination, _mode in config["container"]["mounts"]:
+        path = Path(spark.host_path(config, source))
+        if any(destination.startswith(f"{root}/") for root in SOURCE_ROOTS) and path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            lines.append(f"{digest}  {path} -> {destination}")
+    return lines
+
+
+# ---------------------------------------------------------------- plans
+
+def arm_config_path(experiment: str, config: str) -> str:
+    return config if "/" in config else f"{experiment}/{config}"
+
+
+def stop_step(job: dict) -> dict:
+    """Stopped containers are kept for inspection unless the job sets "remove_stopped": true."""
+    return {"kind": "stop", "remove": bool(job.get("remove_stopped", False))}
+
+
+def boot_step(run: str, arm: dict, config: str) -> dict:
+    """An arm's boot; with "memory_snapshot" (or "compact_memory") serving stops first and
+    each node's free memory by block size is recorded, compacted first with "compact_memory";
+    with "startup_memory" each node's memory is sampled from the start command to ready."""
+    step = {"kind": "boot", "config": config, "label": arm["label"]}
+    if arm.get("memory_snapshot") or arm.get("compact_memory"):
+        step.update(memory_out=f"results/private/determinism/{run}/memory-{arm['label']}.json",
+                    compact=bool(arm.get("compact_memory")))
+    if arm.get("startup_memory"):
+        step["startup_memory_out"] = f"results/private/determinism/{run}/startup-memory-{arm['label']}.json"
+    return step
+
+
+def measure_steps(spec: dict, job: dict) -> list[dict]:
+    experiment, run = spec["experiment"], spec["run"]
+    profile = dict(PROFILES[job.get("profile", "lean")])
+    if "extras" in job:  # [[script, [args...], stem], ...]: the job's own workloads
+        profile["extras"] = [tuple(extra) for extra in job["extras"]]
+    arms = list(job["arms"])
+    if "suite" in job:
+        return suite_steps(spec, job, arms)
+    if job.get("bracket") and len(arms) > 1:
+        first = dict(arms[0])
+        first["label"] = f"{first['label']}-end"
+        arms.append(first)
+    steps = []
+    for arm in arms:
+        config, label = arm_config_path(experiment, arm["config"]), arm["label"]
+        out = f"results/private/determinism/{run}"
+        steps.append(boot_step(run, arm, config))
+        steps.append({"kind": "curves", "label": label, "config": config, "out": f"{out}/curves-{label}.json"})
+        if job.get("bench", True):
+            # "bench_args" replaces the screen's bench with the job's own (an acceptance run).
+            bench = ([str(a) for a in job["bench_args"]] if "bench_args" in job
+                     else list(profile["bench_args"]) if "bench_args" in profile
+                     else [*BENCH_BASE, *profile["bench"]])
+            steps.append({"kind": "cli", "label": label,
+                          "argv": ["--cluster-config", config, "bench", *bench,
+                                   "--output", f"results/private/bench/{run}-{label}"]})
+        for script, extra, stem in profile["extras"]:
+            # A bare name is the experiment's own script; a path is repository-relative.
+            # "{label}" and "{run}" in an argument become the arm's label and the run's name.
+            extra = [str(a).replace("{label}", label).replace("{run}", run) for a in extra]
+            steps.append({"kind": "script", "label": label, "telemetry": job.get("telemetry", True),
+                          "argv": [arm_config_path(experiment, script), head_url(), *extra],
+                          "out": f"{out}/{stem}-{label}.jsonl"})
+    table = profile.get("table", f"{experiment}/tables_arms.py")
+    steps.append({"kind": "table", "argv": [table, run, *[a["label"] for a in arms]],
+                  "out": f"results/private/lab/{run}-table.txt",
+                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms],
+                  "summaries": [f"results/private/determinism/{run}/{stem}-{a['label']}.jsonl"
+                                for _, _, stem in profile["extras"] for a in arms]})
+    return steps
+
+
+def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
+    """A measure job with "suite": each arm boots and runs the servebench suite through
+    bin/spark bench --suite (cooled nodes, the fan performance curve, the memory and
+    temperature watch, the arm's identity in the run) into results/private/suites/<run>/<label>;
+    arms after the first score the first arm's text in model steps; the table compares the
+    arms' suite runs. A failed step leaves the other arms to run; a refused bench ends the job.
+
+    "suite" may also be a list: the release suite first, then companion suites (such as
+    single-stream) on the same boot, each in results/private/suites/<run>-<suite>/<label> with
+    its own table, so the release suite and its recorded references stay unchanged."""
+    experiment, run = spec["experiment"], spec["run"]
+    suites = [job["suite"]] if isinstance(job["suite"], str) else list(job["suite"])
+
+    def run_of(name: str) -> str:
+        return run if name == suites[0] else f"{run}-{name}"
+
+    first = f"results/private/suites/{run}/{arms[0]['label']}/model.json.gz"
+    steps = []
+    for index, arm in enumerate(arms):
+        config, label = arm_config_path(experiment, arm["config"]), arm["label"]
+        steps.append(boot_step(run, arm, config))
+        steps.append({"kind": "curves", "label": label, "config": config,
+                      "out": f"results/private/determinism/{run}/curves-{label}.json"})
+        for name in suites:
+            argv = ["--cluster-config", config, "bench", "--suite", name, "--compare", "none",
+                    "--output", f"results/private/suites/{run_of(name)}/{label}", "--label", label]
+            if index and name == suites[0]:
+                argv += ["--corpus", first]
+            suffix = "" if name == suites[0] else f"-{name}"
+            steps.append({"kind": "cli", "label": label, "argv": argv, "suite": name,
+                          "telemetry_out": f"results/private/determinism/{run}/suite-{label}{suffix}"})
+    labels = [a["label"] for a in arms]
+    reference, unresolved = (recorded_reference(experiment, job["reference"], arms[0]["config"])
+                             if "reference" in job else (None, None))
+    for name in suites:
+        table = {"kind": "table", "argv": ["scripts/servebench_suite_table.py", run_of(name), *labels],
+                 "out": f"results/private/lab/{run_of(name)}-table.txt",
+                 "curves": [f"results/private/determinism/{run}/curves-{label}.json" for label in labels]}
+        if "reference" in job:
+            recorded = reference if name == suites[0] or reference is None else f"{reference}-{name}"
+            table["argv"][2:] = [labels[0], recorded or "?", *labels[1:]]
+            table.update(reference=recorded, suite=name, arms=len(arms), unresolved=unresolved)
+        steps.append(table)
+    return steps
+
+
+def recorded_reference(experiment: str, reference: str, config: str) -> tuple[str | None, str | None]:
+    """A suite job's recorded reference: a suite run directory (repository-relative), or
+    "release", the benchmark_reference of the recipe shape the arm is built on (an arm
+    overlay carries none, so its extends chain is followed to the recipe). Returns the path,
+    or None and why it cannot be resolved; plan_problems reports the reason."""
+    if reference != "release":
+        return reference, None
+    config, shape = arm_config_path(experiment, config), None
+    try:
+        data = spark.read_json(config)
+        while spark.cluster_recipe.is_overlay(data):
+            config, shape = data["extends"]["config"], data["extends"].get("shape")
+            data = spark.read_json(config)
+        cluster = spark.read_cluster(config, shape)
+    except (OSError, ValueError, SystemExit) as error:
+        return None, f"cannot resolve the release the arm is built on: {error}"
+    if "benchmark_reference" not in cluster:
+        return None, f"{config} (shape {shape or 'of the site'}) names no benchmark_reference"
+    return cluster["benchmark_reference"], None
+
+
+def reference_problems(step: dict) -> list[str]:
+    """A table step's recorded reference: a run of the same suite definition, and a
+    candidate measured at least twice (a boot and a repeat boot) so the verdict keeps an
+    interval."""
+    if step["unresolved"]:
+        return [f"reference: {step['unresolved']}"]
+    problems = [] if step["arms"] >= 2 else [
+        "a recorded reference needs the candidate measured at least twice: a boot and a repeat boot"]
+    path = ROOT / step["reference"]
+    if not (path / "suite.json").is_file():
+        return problems + [f"reference {step['reference']} is not a suite run (no suite.json)"]
+    sys.path.insert(0, str(ROOT))
+    from servebench import suite
+    try:
+        digest = suite.digest(suite.load(step["suite"]))
+    except (ValueError, OSError):
+        return problems
+    recorded = json.loads((path / "suite.json").read_text(encoding="utf-8"))["suite_sha256"]
+    if recorded != digest:
+        problems.append(f"reference {step['reference']} is a run of suite {step['suite']} {recorded[:12]}, "
+                        f"which is now {digest[:12]}; a changed suite is a new suite: measure the reference again")
+    return problems
+
+
+def validate_steps(spec: dict, job: dict) -> list[dict]:
+    experiment = spec["experiment"]
+    tier = TIERS[job.get("tier", "full")]
+    config = arm_config_path(experiment, job["config"])
+    out = f"results/private/determinism/{job['name']}"
+    url = head_url()
+    chunk = str(job.get("chunk", 4000))
+    steps = [{"kind": "boot", "config": config, "label": job["name"]},
+             {"kind": "fresh_inventory", "config": config},
+             {"kind": "script", "argv": [f"{experiment}/c8_trace.py", url, f"{out}/c8", "--rounds", "1",
+                                         "--tokens", "16"], "out": f"{out}/c8-runs.jsonl"}]
+    scenarios = [f"{experiment}/scenario_trace.py", url, f"{out}/scenarios", "--repeats", "1", "--chunk", chunk]
+    if tier["scenarios"]:
+        scenarios += ["--scenarios", tier["scenarios"]]
+    steps.append({"kind": "script", "argv": scenarios, "out": f"{out}/scenario-runs.jsonl"})
+    dirs = ["c8", "scenarios"]
+    if tier["mixes"]:
+        steps.append({"kind": "script", "argv": [f"{experiment}/trace_mixes.py", url, f"{out}/mixes",
+                                                 "--repeats", "1", "--tokens", "64", "--prompts",
+                                                 "json,prose,long"], "out": f"{out}/mixes-runs.jsonl"})
+        dirs.append("mixes")
+    if job.get("restart", True):
+        restart = [f"{experiment}/scenario_trace.py", url, f"{out}/scenarios", "--repeats", "1", "--chunk",
+                   chunk, "--suffix", "-bootB"]
+        if tier["restart_scenarios"]:
+            restart += ["--scenarios", tier["restart_scenarios"]]
+        steps.append({"kind": "boot", "config": config, "label": f"{job['name']} boot B"})
+        steps.append({"kind": "script", "argv": restart, "out": f"{out}/scenario-runs-bootB.jsonl"})
+    steps.append(stop_step(job))
+    steps.append({"kind": "analyze", "out": out, "dirs": dirs, "config": config})
+    return steps
+
+
+PROFILE_WORKLOADS = {
+    "decode": ("profile_decode.py", ["--tokens", "128"]),
+    "c8": ("profile_c8.py", ["--case", "json", "--streams", "8", "--tokens", "128"]),
+    "prefill": ("profile_prefill.py", ["--tokens", "16384"]),
+    "one_row": ("profile_one_row.py", []),
+    # The bench's code point at sixteen streams (the experiment's profile_c8.py needs a
+    # code case).
+    "code16": ("profile_c8.py", ["--case", "code", "--streams", "16", "--tokens", "256"]),
+}
+
+
+def profile_steps(spec: dict, job: dict) -> list[dict]:
+    """Torch-profiled arms (run55's method): per arm and workload every rank's trace, with
+    each node's thread telemetry beside it, then kernel summaries and cost comparisons against
+    the first arm, computed while the cluster is stopped."""
+    experiment = spec["experiment"]
+    out = f"results/private/determinism/{spec['run']}"
+    workloads = job.get("workloads", [name for name in PROFILE_WORKLOADS if name != "one_row"])
+    steps = []
+    for arm in job["arms"]:
+        config = arm_config_path(experiment, arm["config"])
+        steps.append({"kind": "boot", "config": config, "label": arm["label"]})
+        steps.append({"kind": "curves", "label": arm["label"], "config": config,
+                      "out": f"{out}/curves-{arm['label']}.json"})
+        for workload in workloads:
+            script, defaults = PROFILE_WORKLOADS[workload]
+            extra = job.get("workload_args", {}).get(workload, defaults)
+            steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
+                          "argv": [f"{experiment}/{script}", head_url(), *extra],
+                          "out": f"{out}/{arm['label']}"})
+    steps.append(stop_step(job))
+    steps.append({"kind": "costs", "experiment": experiment, "out": out, "workloads": workloads,
+                  "labels": [arm["label"] for arm in job["arms"]],
+                  "config": arm_config_path(experiment, job["arms"][0]["config"])})
+    return steps
+
+
+def kernel_steps(spec: dict, job: dict) -> list[dict]:
+    return [stop_step(job),
+            {"kind": "kernel", "bundles": job["bundles"], "out": f"results/private/lab/{spec['run']}"}]
+
+
+def sync_steps(spec: dict, job: dict) -> list[dict]:
+    return [{"kind": "sync"}]
+
+
+def image_steps(spec: dict, job: dict) -> list[dict]:
+    """Build an arm's image on one node with serving stopped (unless that node has the tag),
+    copy it to the others in the listed order ([source node, target ssh address]: the CX7
+    links), and require one image ID on every node. A tag whose vLLM tree label differs
+    from the recipe's is stale and is removed from every node first."""
+    experiment = spec["experiment"]
+    return [stop_step(job),
+            {"kind": "image", "config": arm_config_path(experiment, job["config"]), "node": job["node"],
+             "copies": [list(c) for c in job.get("copies", [])], "out": f"results/private/lab/{spec['run']}"}]
+
+
+def fabric_steps(spec: dict, job: dict) -> list[dict]:
+    """A model-free script on every node at once (rank = the node's rank), in one arm's image,
+    environment and mounts: the collective probe's container with the arm's overlays, while
+    serving is stopped. The job's "environment" overrides variables of the arm's (a sweep of
+    transport settings without an arm each). Each node's output is saved under the run."""
+    experiment = spec["experiment"]
+    return [stop_step(job),
+            {"kind": "fabric", "config": arm_config_path(experiment, job["config"]),
+             "script": arm_config_path(experiment, job["script"]), "args": [str(a) for a in job.get("args", [])],
+             "environment": {k: str(v) for k, v in job.get("environment", {}).items()},
+             "label": job.get("label", Path(job["script"]).stem), "out": f"results/private/lab/{spec['run']}"}]
+
+
+def gpu_clocks_steps(spec: dict, job: dict) -> list[dict]:
+    """Lock every node's GPU SM clock to "lock_mhz" [min, max] for the jobs that follow, or
+    reset it ("reset": true). The lock survives boots; closing the window resets it."""
+    if job.get("reset"):
+        return [{"kind": "gpu_clocks", "lock": None}]
+    low, high = (int(v) for v in job["lock_mhz"])
+    if not 0 < low <= high:
+        raise SystemExit(f"gpu_clocks lock_mhz needs 0 < min <= max, got {job['lock_mhz']}")
+    return [{"kind": "gpu_clocks", "lock": [low, high]}]
+
+
+# Lab extras that are servebench commands; their arguments are checked with its parser.
+SERVEBENCH_SHIMS = {"scripts/servebench_run.py": "run", "scripts/servebench_engine.py": "engine",
+                    "scripts/servebench_model.py": "model", "scripts/servebench_suite.py": "suite"}
+
+
+def plan_problems(steps: list[dict]) -> list[str]:
+    """What would fail only after a boot: a missing arm configuration or script, or
+    servebench arguments its parser rejects."""
+    problems = []
+    for step in steps:
+        if step["kind"] == "boot":
+            if not (ROOT / step["config"]).is_file():
+                problems.append(f"arm configuration {step['config']} does not exist")
+            else:
+                problems.extend(f"{step['config']}: {problem}" for problem in arm_problems(step["config"]))
+        if step["kind"] == "cli" and step.get("suite"):
+            problems.extend(suite_problems(step))
+        if step["kind"] == "table" and "reference" in step:
+            problems.extend(reference_problems(step))
+        if step["kind"] not in ("script", "profile"):
+            continue
+        script, args = step["argv"][0], step["argv"][1:]
+        if not (ROOT / script).is_file():
+            problems.append(f"script {script} does not exist")
+        elif script in SERVEBENCH_SHIMS:
+            sys.path.insert(0, str(ROOT))
+            from servebench.__main__ import build_parser
+            errors = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(errors):
+                    parsed = build_parser().parse_args([SERVEBENCH_SHIMS[script], *args])
+                    if SERVEBENCH_SHIMS[script] == "suite":
+                        # Every step of the suite, as the suite will run it.
+                        from servebench import suite
+                        for suite_step in suite.load(parsed.suite)["steps"]:
+                            build_parser().parse_args(suite.arguments(suite_step, parsed.url, "o.json", "l", parsed.corpus))
+            except SystemExit:
+                problems.append(f"{script} {shlex.join(args[1:])}: {errors.getvalue().strip().splitlines()[-1]}")
+            except (ValueError, OSError) as error:
+                problems.append(f"{script} {shlex.join(args[1:])}: {error}")
+    return list(dict.fromkeys(problems))
+
+
+def arm_problems(config: str) -> list[str]:
+    """The checks cluster start --apply makes on the arm before it touches a node (its
+    locks, kernel backend, topology and benchmark reference), so a refusal shows before
+    the window stops serving."""
+    cluster, nodes, upstreams = spark.configuration(argparse.Namespace(cluster_config=config))
+    return spark.local_doctor(cluster, nodes, upstreams)
+
+
+def suite_problems(step: dict) -> list[str]:
+    """A bench --suite step: the suite and every step's servebench arguments parse, and a
+    suite that times the engine grid runs on an arm with the dev-mode collective RPC."""
+    sys.path.insert(0, str(ROOT))
+    from servebench import suite
+    from servebench.__main__ import build_parser
+    config = step["argv"][step["argv"].index("--cluster-config") + 1]
+    errors = io.StringIO()
+    try:
+        definition = suite.load(step["suite"])
+        with contextlib.redirect_stderr(errors):
+            for suite_step in definition["steps"]:
+                build_parser().parse_args(suite.arguments(suite_step, "http://head:8000", "o.json", "l", None))
+    except SystemExit:
+        return [f"suite {step['suite']}: {errors.getvalue().strip().splitlines()[-1]}"]
+    except (ValueError, OSError) as error:
+        return [f"suite {step['suite']}: {error}"]
+    if (ROOT / config).is_file() and suite.needs_dev_rpc(definition):
+        if spark.read_cluster(config).get("environment", {}).get("VLLM_SERVER_DEV_MODE") != "1":
+            return [f"suite {step['suite']} times the engine grid, but {config} lacks VLLM_SERVER_DEV_MODE=1 "
+                    "(the dev-mode collective RPC)"]
+    return []
+
+
+def plan(spec: dict) -> list[dict]:
+    builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
+                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps,
+                "gpu_clocks": gpu_clocks_steps}
+    steps = []
+    for job in spec["jobs"]:
+        if job["kind"] not in builders:
+            raise SystemExit(f"unknown job kind {job['kind']!r}")
+        steps.extend(builders[job["kind"]](spec, job))
+    return steps
+
+
+def describe_step(step: dict) -> str:
+    if step["kind"] == "boot":
+        memory = (", compact memory first" if step.get("compact") else ", memory snapshot first") if step.get("memory_out") else ""
+        if step.get("startup_memory_out"):
+            memory += ", memory sampled to ready"
+        return f"boot {step['config']} ({step['label']}{memory})"
+    if step["kind"] == "cli":
+        return "bin/spark " + shlex.join(step["argv"])
+    if step["kind"] == "script":
+        return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
+    if step["kind"] == "profile":
+        return f"profile {step['label']} {step['workload']}: python3 " + shlex.join(step["argv"])
+    if step["kind"] == "costs":
+        return f"summarize kernels and compare costs against {step['labels'][0]} ({', '.join(step['workloads'])})"
+    if step["kind"] == "sync":
+        return "sync node checkouts to origin/main"
+    if step["kind"] == "stop":
+        return "bin/spark " + shlex.join(stop_arguments(step.get("remove", False)))
+    if step["kind"] == "curves":
+        return f"save the boot's measured step costs > {step['out']}"
+    if step["kind"] == "table":
+        return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
+    if step["kind"] == "analyze":
+        return f"analyze {step['out']} {','.join(step['dirs'])} on every node, in parallel"
+    if step["kind"] == "kernel":
+        return "kernel-lab " + ", ".join(f"{b['bundle']}@{b['node']}" for b in step["bundles"])
+    if step["kind"] == "fabric":
+        return f"fabric {step['script']} on every node ({step['config']})"
+    if step["kind"] == "image":
+        return f"image of {step['config']} built on {step['node']}, copied {len(step['copies'])} times"
+    if step["kind"] == "gpu_clocks":
+        lock = step["lock"]
+        return f"lock GPU SM clocks to {lock[0]}-{lock[1]} MHz on every node" if lock else "reset GPU clocks on every node"
+    return step["kind"]
+
+
+# ---------------------------------------------------------------- execution
+
+def run_script(step: dict) -> int:
+    out = ROOT / step["out"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w") as handle:
+        return subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+                              stderr=subprocess.STDOUT).returncode
+
+
+def fresh_inventory(config: str | None = None) -> None:
+    nodes, container = nodes_config(), container_name(config)
+    for node in nodes["nodes"]:
+        spark.run_ssh(nodes, node, "docker", "exec", container, "sh", "-c",
+                       f"rm -f {TRACE_LOG_DIR}/inventory-* {TRACE_LOG_DIR}/plans-*")
+
+
+def analyze(step: dict) -> dict:
+    """analyze_trace4.py per node, the three nodes concurrently (cluster stopped: memory is free)."""
+    if container_running():
+        raise SystemExit("analysis needs the cluster stopped")
+    config = spark.read_cluster(step["config"])
+    image = config["container"]["image"]
+    experiment = str(Path(step["config"]).parent)
+    out = ROOT / step["out"]
+
+    def one_node(node: str) -> None:
+        for d in step["dirs"]:
+            with (out / f"analysis4-{d}-{node}.jsonl").open("w") as handle:
+                process = subprocess.run(
+                    ["docker", "run", "--rm", "--memory=16g", "-e", "CUDA_VISIBLE_DEVICES=",
+                     "-v", f"{ROOT / experiment / 'analyze_trace4.py'}:/a.py:ro", "-v", f"{out / d}:/t:ro",
+                     "--entrypoint", "python3", image, "/a.py", "/t", "--node", node, "--chain", "12",
+                     "--all-pairs"], text=True, capture_output=True)
+                handle.write("".join(line + "\n" for line in (process.stdout + process.stderr).splitlines()
+                                     if "Warn" not in line))
+
+    names = [node["name"] for node in nodes_config()["nodes"]]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as pool:
+        list(pool.map(one_node, names))
+    summary = summarize_analysis(out)
+    write_json_atomic(out / "analysis-summary.json", summary)
+    return summary
+
+
+def profiler_dir(config_path: str) -> str:
+    """The container's torch profiler directory, from the arm's --profiler-config."""
+    args = spark.read_cluster(config_path)["serve_args"]
+    return json.loads(args[args.index("--profiler-config") + 1])["torch_profiler_dir"]
+
+
+def profile_workload(step: dict) -> None:
+    """One workload under the torch profiler. Every rank's trace is collected (rank r runs on
+    node r): rank 0 alone hides time the others spend computing while it waits in collectives."""
+    container_dir = profiler_dir(step["config"])
+    host_relative = container_dir.replace("/cache/", "cache/", 1)
+    nodes = nodes_config()
+    repo = spark.repository_path(production_configuration()[0])
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    workload = step["workload"]
+    container = container_name(step["config"])
+
+    def in_container(node: dict, script: str) -> subprocess.CompletedProcess:
+        return spark.run_ssh(nodes, node, "docker", "exec", container, "sh", "-c", script)
+
+    def each(function):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            return list(pool.map(function, nodes["nodes"]))
+
+    each(lambda node: in_container(node, f"mkdir -p {container_dir} && rm -rf {container_dir}/*.json.gz "
+                                         f"{container_dir}/{workload}"))
+    with (out / f"{workload}.json").open("w") as handle:
+        code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+                              stderr=subprocess.STDOUT).returncode
+    log(f"profile {step['label']} {workload} exit {code}")
+    if code:
+        raise RuntimeError(f"profile {step['label']} {workload} failed with exit {code}; see {out / (workload + '.json')}")
+
+    def trace_bytes(node: dict) -> int:
+        result = spark.run_ssh(nodes, node, "sh", "-c",
+                                f"cat {repo}/{host_relative}/*rank*.json.gz 2>/dev/null | wc -c")
+        return int(result.stdout.strip() or 0)
+
+    before = None
+    for _ in range(120):  # traces are written after /stop_profile; wait until every node's stops growing
+        sizes = each(trace_bytes)
+        if all(sizes) and sizes == before:
+            break
+        before = sizes
+        time.sleep(5)
+    else:
+        raise RuntimeError(f"profile {step['label']} {workload}: traces under {host_relative} "
+                           f"did not settle on every rank: {before}")
+    each(lambda node: in_container(node, f"mkdir -p {container_dir}/{workload} && "
+                                         f"mv {container_dir}/*rank*.json.gz {container_dir}/{workload}/"))
+
+    def fetch(node: dict) -> None:
+        target = out / f"{workload}-trace" / node["name"]
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["rsync", "-a", "-e", "ssh " + " ".join(spark.ssh_options()),
+                        f"{spark.transfer_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
+                       check=False)
+
+    each(fetch)
+
+
+def profile_costs(step: dict) -> None:
+    """summarize_kernels.py per arm, workload and rank (three at a time), then analyze_costs.py of
+    each arm against the first, rank by rank; the cluster is stopped, so memory is free."""
+    if container_running():
+        raise SystemExit("kernel summaries need the cluster stopped")
+    image = spark.read_cluster(step["config"])["container"]["image"]
+    experiment, out = ROOT / step["experiment"], ROOT / step["out"]
+    names = [node["name"] for node in nodes_config()["nodes"]]
+
+    def docker_python(script: str, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["docker", "run", "--rm", "--memory=16g", "-e", "CUDA_VISIBLE_DEVICES=",
+                               "-v", f"{experiment / script}:/s.py:ro", "-v", f"{out}:/o",
+                               "--entrypoint", "python3", image, "/s.py", *args], text=True, capture_output=True)
+
+    def summarize(item: tuple[str, str, str]) -> None:
+        label, workload, node = item
+        traces = sorted((out / label / f"{workload}-trace" / node).glob("*.json.gz"))
+        if traces:
+            docker_python("summarize_kernels.py", f"/o/{label}/{workload}-kernels-{node}.json",
+                          f"/o/{label}/{workload}-trace/{node}/{traces[0].name}")
+
+    items = [(label, workload, node) for label in step["labels"] for workload in step["workloads"]
+             for node in names]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(summarize, items))
+    base = step["labels"][0]
+    for label in step["labels"][1:]:
+        for workload in step["workloads"]:
+            for node in names:
+                extra = ["--total"] if workload == "prefill" else []
+                result = docker_python("analyze_costs.py", f"/o/{base}/{workload}-kernels-{node}.json",
+                                       f"/o/{label}/{workload}-kernels-{node}.json", *extra, "--top", "25")
+                (out / f"costs-{label}-{workload}-{node}.txt").write_text(result.stdout + result.stderr)
+                log(f"costs {label} {workload} {node} against {base}:")
+                print("\n".join(result.stdout.splitlines()[:12]), flush=True)
+
+
+def sync_checkouts() -> bool:
+    """Move every node's checkout to origin/main (between jobs: nothing runs from them)."""
+    subprocess.run(["git", "-C", str(ROOT), "fetch", "-q", "origin"], check=False)
+    moved = subprocess.run(["git", "-C", str(ROOT), "checkout", "-q", "--detach", "origin/main"])
+    if moved.returncode:
+        return False
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True,
+                          capture_output=True).stdout.strip()
+    ok = spark_cli("--cluster-config", PRODUCTION_CONFIG, "cluster", "sync", "--apply") == 0
+    log(f"sync to {head} " + ("OK" if ok else "FAILED"))
+    return ok
+
+
+def summary_lines(paths: list[str]) -> str:
+    """The last JSON line carrying a "summary" key of each workload output, grouped by workload."""
+    lines = []
+    for path in paths:
+        file = ROOT / path
+        if not file.exists():
+            continue
+        records = [l for l in file.read_text().splitlines() if l.startswith("{") and '"summary"' in l]
+        lines.append(f"{file.stem}: {records[-1] if records else '(no summary)'}")
+    return "\n".join(lines) + "\n"
+
+
+CURVE_POINTS = (1, 6, 12, 24, 48, 256, 1024, 2048, 4096)
+
+
+def save_engine_logs(out: str, lines: int = 4000, config: str | None = None) -> None:
+    """After a failed step: every node's serving-container log tail, beside the step's
+    output (``<out>.engine-<node>.log``), so a crash keeps its stack trace after the next
+    boot replaces the container. ``config`` is the booted arm (default: production)."""
+    try:
+        nodes, container = nodes_config(), container_name(config)
+        for node in nodes["nodes"]:
+            result = spark.run_ssh(nodes, node, "docker", "logs", "--tail", str(lines), container)
+            path = ROOT / f"{out}.engine-{node['name']}.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(result.stdout + result.stderr)
+        log(f"saved serving logs beside {out}")
+    except Exception as error:  # noqa: BLE001 - never fail the run over its evidence
+        log(f"serving logs not saved: {error}")
+
+
+def save_curves(step: dict) -> None:
+    """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them.
+
+    Only images before vLLM 0184 time a boot profile; it runs on padding rows, which the
+    MoE routers skip, so padded-row costs leave out a real step's largest part."""
+    logs = subprocess.run(["docker", "logs", container_name(step.get("config"))], text=True, capture_output=True)
+    lines = [l for l in (logs.stdout + logs.stderr).splitlines() if "Profiled DSpark step costs" in l]
+    if not lines:
+        return
+    found = re.search(r"verify (\[.*?\]\]) draft (\[.*\]\])", lines[-1])
+    if not found:
+        return
+    out = ROOT / step["out"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(out, {"rows": "padded", "verify": json.loads(found.group(1)),
+                            "draft": json.loads(found.group(2))})
+
+
+def curves_table(paths: list[str]) -> str:
+    """Verify step cost (ms) at fixed token counts per arm, against the first arm with the
+    same row kind (padded rows skip routed MoE, so they never compare with real rows)."""
+    rows, bases = [], {}
+    for path in paths:
+        file = ROOT / path
+        if not file.exists():
+            continue
+        data = json.loads(file.read_text())
+        kind = data.get("rows", "padded")
+        verify = dict((int(x), float(y)) for x, y in data["verify"])
+        label = file.stem.removeprefix("curves-")
+        base = bases.get(kind)
+        cells = []
+        for point in CURVE_POINTS:
+            nearest = min(verify, key=lambda tokens: abs(tokens - point)) if verify else None
+            value = verify.get(nearest)
+            if base is None or value is None or base.get(point) is None:
+                cells.append(f"{nearest}:{value:.2f}" if value is not None else "-")
+            else:
+                cells.append(f"{nearest}:{value:.2f} ({100 * (value / base[point] - 1):+.1f}%)")
+        if base is None:
+            bases[kind] = {point: verify.get(min(verify, key=lambda t: abs(t - point))) for point in CURVE_POINTS}
+        rows.append(f"  {label:<14} {kind:<6} " + "  ".join(cells))
+    if not rows:
+        return ""
+    return ("target step cost at fixed token counts, ms (boot profile, vllm-0048; padded rows skip "
+            "routed MoE, real rows include it):\n" + "\n".join(rows))
+
+
+def summarize_analysis(out: Path) -> dict:
+    totals = {}
+    for path in sorted(out.glob("analysis4-*.jsonl")):
+        entry = {"pairs": 0, "rows": 0, "differing": 0, "outputs_differ": 0, "cross_boot_pairs": 0,
+                 "cross_boot_rows": 0, "recompute_mismatches": 0}
+        for line in path.read_text().splitlines():
+            if not line.startswith("{"):
+                continue
+            record = json.loads(line)
+            if "rows_compared" in record:
+                entry["pairs"] += 1
+                entry["rows"] += record["rows_compared"]
+                entry["differing"] += record["rows_differing"]
+                entry["outputs_differ"] += not record["outputs_equal"]
+                if ("bootB" in record["request"]) != ("bootB" in record["against"]):
+                    entry["cross_boot_pairs"] += 1
+                    entry["cross_boot_rows"] += record["rows_compared"]
+            entry["recompute_mismatches"] += len(record.get("recomputed_mismatch") or [])
+        totals[path.stem] = entry
+    totals["passed"] = all(e["differing"] == 0 and e["outputs_differ"] == 0 and e["recompute_mismatches"] == 0
+                           for k, e in totals.items() if k != "passed") and len(totals) > 0
+    return totals
+
+
+FABRIC_PORT = 29581  # the fabric scripts' rendezvous, apart from serving's
+
+
+def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: list[str],
+                   environment: dict | None = None) -> list[str]:
+    """The collective probe's container (image, per-node environment, devices, limits) with the
+    arm's mounts and ``environment`` over its variables, running ``script`` with the probe's
+    rank arguments followed by ``args``."""
+    base = spark.collective_probe_command(cluster, nodes, node, FABRIC_PORT)
+    repo = spark.repository_path(cluster)
+    start = base.index("python3")
+    head = [f"{repo}/{script}:/fabric.py:ro" if arg == f"{repo}/scripts/probe_collectives.py:/probe.py:ro"
+            else arg for arg in base[:start]]
+    environment = environment or {}
+    kept = []
+    for i, arg in enumerate(head):  # drop the arm's value of an overridden variable
+        if i > 0 and head[i - 1] == "--env" and arg.split("=", 1)[0] in environment:
+            kept.pop()
+            continue
+        kept.append(arg)
+    image = kept.index(cluster["container"]["image"])
+    overrides = [value for key, item in sorted(environment.items()) for value in ("--env", f"{key}={item}")]
+    mounts = [value for bind in spark.expected_binds(cluster) for value in ("--volume", bind)]
+    return (kept[:image] + overrides + mounts + kept[image:]
+            + ["python3", "/fabric.py", *base[start + 2:], *args])
+
+
+def run_fabric(step: dict) -> list[dict]:
+    """Run a fabric step on every node concurrently; save each node's output."""
+    cluster, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=step["config"]))
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+
+    def one(node: dict) -> dict:
+        process = spark.run_ssh(nodes, node, *fabric_command(cluster, nodes, node, step["script"], step["args"],
+                                                              step.get("environment")))
+        (out / f"fabric-{step['label']}-{node['name']}.txt").write_text(process.stdout + process.stderr)
+        return {"node": node["name"], "exit": process.returncode}
+
+    with concurrent.futures.ThreadPoolExecutor(len(nodes["nodes"])) as pool:
+        return list(pool.map(one, nodes["nodes"]))
+
+
+def run_image(step: dict) -> str | None:
+    """Build and distribute an image step's image; None on success, else the failure."""
+    cluster, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=step["config"]))
+    image = cluster["container"]["image"]
+    repo = spark.repository_path(cluster)
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+
+    def image_id(node: dict) -> str:
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format", "{{.Id}}")
+        return process.stdout.strip() if process.returncode == 0 else ""
+
+    def image_layers(node: dict) -> str:
+        """The image's layers (uncompressed content digests, in order): one image on every
+        node has the same, whatever each node's storage. The image ID is not that: Docker's
+        containerd image store names an image by its manifest, the overlay2 driver by its
+        config, so a faithful copy between the two changes the ID (#488)."""
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format",
+                                "{{json .RootFS.Layers}}")
+        return process.stdout.strip() if process.returncode == 0 else ""
+
+    def tree(node: dict) -> str:
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format",
+                                "{{json .Config.Labels}}")
+        if process.returncode:
+            return ""
+        return spark.source_labels.get(json.loads(process.stdout or "null") or {}, "vllm.tree") or ""
+
+    # A tag whose vLLM tree differs from the recipe's is a stale build of the same name:
+    # remove it everywhere (docker refuses while a container uses it) and build again.
+    expected = spark.source_labels.get(cluster["container"].get("expected_labels", {}), "vllm.tree")
+    for node in nodes["nodes"]:
+        found = tree(node)
+        if found and expected and found != expected:
+            process = spark.run_ssh(nodes, node, "docker", "image", "rm", image)
+            if process.returncode:
+                return f"stale {image} on {node['name']} (tree {found[:12]}) could not be removed"
+            log(f"removed stale {image} from {node['name']} (tree {found[:12]}, recipe {expected[:12]})")
+    builder = spark.node_by_name(nodes, step["node"])
+    if image_id(builder):
+        log(f"image {image} already on {builder['name']}; not rebuilt")
+    else:
+        config = shlex.quote(step["config"])
+        process = spark.run_ssh(nodes, builder, "bash", "-lc",
+                                f"cd {shlex.quote(repo)} && bin/spark --cluster-config {config} build prepare"
+                                f" && bin/spark --cluster-config {config} build image --apply")
+        (out / f"image-build-{builder['name']}.txt").write_text(process.stdout + process.stderr)
+        if process.returncode or not image_id(builder):
+            return f"build of {image} on {builder['name']} failed (exit {process.returncode})"
+        log(f"image {image} built on {builder['name']}")
+    for source, target in step["copies"]:
+        node = spark.node_by_name(nodes, source)
+        started = time.time()
+        process = spark.run_ssh(nodes, node, "bash", "-o", "pipefail", "-c",
+                                f"docker save {shlex.quote(image)} | ssh -o BatchMode=yes {shlex.quote(target)}"
+                                f" docker load")
+        if process.returncode:
+            return f"copy {source} -> {target} failed: {process.stderr.strip()[-300:]}"
+        log(f"image copied {source} -> {target} in {time.time() - started:.0f} s")
+    layers = {node["name"]: image_layers(node) for node in nodes["nodes"]}
+    if len(set(layers.values())) != 1 or not all(layers.values()):
+        differing = {name: value[:80] for name, value in layers.items()}
+        return f"{image} differs between nodes (layers): {differing}"
+    ids = {node["name"]: image_id(node)[:19] for node in nodes["nodes"]}
+    log(f"image {image}: the same {len(json.loads(next(iter(layers.values()))))} layers on every node "
+        f"(IDs {', '.join(sorted(set(ids.values())))})")
+    return None
+
+
+def run_kernel_bundles(step: dict) -> list[dict]:
+    """Ship each bundle to ~/spark-lab on its node and run kernel-local there, nodes concurrently.
+
+    Bundles, their inputs and outputs stay outside the deployment checkout: a bundle under
+    development never dirties a node's checkout (a dirty checkout blocks cluster start), and
+    ignored files never enter a checkout by copy. Paths listed under "sync" (inputs such as
+    captures, kept out of git) go to ~/spark-lab/inputs/<path> on the other nodes.
+    """
+    cluster, nodes, _ = production_configuration()
+    repo = spark.repository_path(cluster)
+    run = Path(step["out"]).name
+    home = cluster["host"]["home"]
+
+    def rsync(node: dict, source: Path, destination: str) -> None:
+        spark.run_ssh(nodes, node, "mkdir", "-p", str(Path(destination).parent))
+        subprocess.run(["rsync", "-a", "--delete" if source.is_dir() else "--checksum",
+                        "-e", "ssh " + " ".join(spark.ssh_options()),
+                        f"{source}/" if source.is_dir() else str(source),
+                        f"{spark.transfer_target(nodes, node)}:{destination}{'/' if source.is_dir() else ''}"],
+                       check=False)
+
+    def one(entry: dict) -> dict:
+        node = spark.node_by_name(nodes, entry["node"])
+        bundle = ROOT / entry["bundle"]
+        candidate = json.loads((bundle / "candidate.json").read_text())
+        remote = f"{home}/spark-lab/bundles/{run}/{bundle.name}"
+        out = f"{home}/spark-lab/results/{run}/{bundle.name}-{entry['node']}"
+        rsync(node, bundle, remote)
+        if not node["head"]:
+            for relative in candidate.get("sync", []):
+                rsync(node, ROOT / relative, f"{home}/spark-lab/inputs/{relative}")
+        process = spark.run_ssh(nodes, node, "bash", "-lc",
+                                 f"cd {shlex.quote(repo)} && python3 scripts/lab.py kernel-local "
+                                 f"{shlex.quote(remote)} --out {shlex.quote(out)}")
+        verdict = {"node": entry["node"], "bundle": entry["bundle"], "exit": process.returncode}
+        fetched = spark.run_ssh(nodes, node, "cat", f"{out}/verdict.json")
+        if fetched.returncode == 0:
+            verdict.update(json.loads(fetched.stdout))
+        else:
+            verdict.update({"passed": False, "errors": [process.stdout[-2000:], process.stderr[-2000:]]})
+        return verdict
+
+    # Same thermal starting point as a bench: every node below the cooling threshold.
+    # The site's fan policy applies here too: on a board that cannot run the fan
+    # control (host.fan_control false) cool_nodes returns without touching the fans,
+    # exactly as command_bench passes it.
+    names = sorted({entry["node"] for entry in step["bundles"]})
+    spark.cool_nodes(nodes, [spark.node_by_name(nodes, name) for name in names],
+                      spark.COOL_BELOW_C, spark.COOL_TIMEOUT_S,
+                      fan_control=spark.fan_control_enabled(cluster))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(step["bundles"])) as pool:
+        verdicts = list(pool.map(one, step["bundles"]))
+    local = ROOT / step["out"]
+    local.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(local / "verdicts.json", {"verdicts": verdicts, "agree": verdicts_agree(verdicts)})
+    return verdicts
+
+
+def verdicts_agree(verdicts: list[dict]) -> bool:
+    """The same bundle on different nodes must give the same row groups and bit-equality sets."""
+    by_bundle = {}
+    for verdict in verdicts:
+        key = (tuple((g["op"], g["groups"]) for g in verdict.get("groups", [])),
+               tuple((b["bits"], tuple(b.get("differs_at", []))) for b in verdict.get("bits", [])),
+               tuple(verdict.get("failed", [])))
+        by_bundle.setdefault(verdict["bundle"], set()).add(key)
+    return all(len(keys) == 1 for keys in by_bundle.values())
+
+
+# Returned by execute when a sync step moved this checkout to another commit: the queue
+# puts the job back and restarts on that commit, which runs the job from its start.
+RESTART_ON_NEW_COMMIT = 75
+
+
+def checkout_commit() -> str:
+    return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+COMMIT_AT_START = checkout_commit()
+
+
+def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = True) -> int:
+    """Run a spec's steps in the window (opening one unless held). The window closes when
+    the run ends (unless ``keep_open``), when the window itself must end (hold lost, time
+    cap, a cluster request), and when a step fails unless ``close_on_failure`` is false
+    (the queue: a failed job is recorded and the next one runs)."""
+    steps = plan(spec)
+    if dry:
+        print(f"run {spec['run']}: {len(steps)} steps; production {PRODUCTION_CONFIG}")
+        for index, step in enumerate(steps, 1):
+            print(f"{index:3d}. {describe_step(step)}")
+        for problem in plan_problems(steps):
+            print(f"  problem: {problem}")
+        return 0
+    hold = read_hold()
+    if not hold_is_ours(hold):
+        window_open(spec.get("minutes", DEFAULT_MINUTES), f"run {spec['run']}")
+    checked = set()
+    failed = None
+    window_ending = None  # a reason the window itself must close, not just this run
+    current = {"note": "starting"}
+    stop_beating = threading.Event()
+
+    def heartbeat() -> None:
+        # The heartbeat proves the runner is alive, not that a step is quick: the watchdog
+        # catches a dead runner; a hung step is for whoever watches the run (or a cap).
+        while not stop_beating.wait(60):
+            try:
+                beat(current["note"])
+            except SystemExit:
+                return
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+    validated = False
+    restart = False
+    booted = None  # the arm serving now: its container is the one sampled and whose logs are kept
+    for step in steps:
+        hold = read_hold()
+        if not hold_is_ours(hold):
+            failed = window_ending = "hold file lost"
+            break
+        reason = window_should_close(hold)
+        if reason:
+            failed = window_ending = reason
+            break
+        current["note"] = describe_step(step)
+        beat(current["note"])
+        if step["kind"] != "sync" and not validated:
+            # After any sync, before the first boot: every file and servebench argument
+            # the run needs, so a mistake costs seconds rather than a boot.
+            validated = True
+            problems = plan_problems(steps)
+            if problems:
+                failed = "invalid spec: " + "; ".join(problems)
+                break
+        try:
+            if step["kind"] == "boot":
+                if step["config"] not in checked:
+                    config = spark.read_cluster(step["config"])
+                    manifest = ROOT / "results" / "private" / "lab" / f"overlays-{spec['run']}.txt"
+                    manifest.parent.mkdir(parents=True, exist_ok=True)
+                    with manifest.open("a") as handle:
+                        handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config)))
+                    checked.add(step["config"])
+                if step.get("memory_out"):
+                    if not stop_cluster():
+                        failed = "stop before the memory snapshot failed"
+                        break
+                    snapshot = memory_before_boot(step.get("compact", False))
+                    (ROOT / step["memory_out"]).parent.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(ROOT / step["memory_out"], snapshot)
+                booted = step["config"]
+                samplers = (start_memory_samplers(ROOT / step["startup_memory_out"].removesuffix(".json"))
+                            if step.get("startup_memory_out") else None)
+                try:
+                    started = boot(step["config"])
+                finally:
+                    if samplers is not None:
+                        startup = stop_memory_samplers(samplers)
+                        (ROOT / step["startup_memory_out"]).parent.mkdir(parents=True, exist_ok=True)
+                        write_json_atomic(ROOT / step["startup_memory_out"], startup)
+                        for name, summary in startup.items():
+                            log(f"{name}: lowest MemAvailable {summary.get('min_available_gib')} GiB during the boot, "
+                                f"page cache up to {summary.get('max_cached_gib')} GiB")
+                if not started:
+                    failed = f"boot of {step['config']} failed"
+                    # A boot that dies keeps its evidence: the next boot replaces the containers.
+                    save_engine_logs(f"results/private/lab/{spec['run']}/boot-{step['label']}", config=booted)
+                    break
+            elif step["kind"] == "cli":
+                # A bench refuses a cluster that differs from its arm; that ends the job.
+                with Telemetry(step.get("telemetry_out")
+                               or (step["argv"][step["argv"].index("--output") + 1] if "--output" in step["argv"]
+                                   else f"results/private/lab/{spec['run']}-{step['label']}-bench"), booted):
+                    code = spark_cli(*step["argv"])
+                log(f"bench {step['label']} exit {code}")
+                if code == 1 and step.get("suite"):
+                    # A suite step failed or the run was halted: keep its other results and
+                    # measure the remaining arms.
+                    save_engine_logs(f"results/private/suites/{spec['run']}/{step['label']}", config=booted)
+                elif code:
+                    failed = f"bench {step['label']} exited {code}"
+                    break
+            elif step["kind"] == "script":
+                with Telemetry(step["out"], booted) if step.get("telemetry", True) else contextlib.nullcontext():
+                    code = run_script(step)
+                log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {code}")
+                if code:
+                    save_engine_logs(step["out"], config=booted)
+            elif step["kind"] == "sync":
+                if not sync_checkouts():
+                    failed = "sync failed"
+                    break
+                if keep_open and checkout_commit() != COMMIT_AT_START:
+                    # The rest of the job must not run on the code this process loaded.
+                    restart = True
+                    break
+            elif step["kind"] == "gpu_clocks":
+                if not set_gpu_clocks(step["lock"]):
+                    failed = "GPU clock change failed"
+                    break
+            elif step["kind"] == "profile":
+                # The threads' cores and L3 clusters beside the kernel traces.
+                with Telemetry(f"{step['out']}/{step['workload']}", step["config"]):
+                    profile_workload(step)
+            elif step["kind"] == "costs":
+                profile_costs(step)
+            elif step["kind"] == "curves":
+                save_curves(step)
+            elif step["kind"] == "table":
+                if (ROOT / step["argv"][0]).exists():
+                    run_script(step)
+                    table = (ROOT / step["out"]).read_text()
+                else:  # an experiment without tables_arms.py: each workload's summary line per arm
+                    table = summary_lines(step.get("summaries", []))
+                    (ROOT / step["out"]).parent.mkdir(parents=True, exist_ok=True)
+                    (ROOT / step["out"]).write_text(table)
+                curves = curves_table(step.get("curves", []))
+                if curves:
+                    table += "\n" + curves + "\n"
+                    (ROOT / step["out"]).write_text(table)
+                print(table, flush=True)
+            elif step["kind"] == "fresh_inventory":
+                fresh_inventory(step.get("config"))
+            elif step["kind"] == "stop":
+                if container_running() and not stop_cluster(remove=step.get("remove", False)):
+                    failed = "stop failed"
+                    break
+            elif step["kind"] == "analyze":
+                summary = analyze(step)
+                passed = summary["passed"]
+                log(f"analysed {step['out']}: {'PASSED' if passed else 'DIFFERENCES'}")
+                if not passed:
+                    failed = f"analysis of {step['out']} found differences"
+                    break
+            elif step["kind"] == "image":
+                problem = run_image(step)
+                if problem:
+                    failed = problem
+                    break
+            elif step["kind"] == "fabric":
+                for verdict in run_fabric(step):
+                    log(f"fabric {step['label']}@{verdict['node']}: exit {verdict['exit']}")
+            elif step["kind"] == "kernel":
+                verdicts = run_kernel_bundles(step)
+                for verdict in verdicts:
+                    log(f"kernel {verdict['bundle']}@{verdict['node']}: "
+                        f"{'pass' if verdict.get('passed') else 'FAIL'} ({verdict.get('seconds', '?')} s)")
+                log(f"kernel verdicts {'agree' if verdicts_agree(verdicts) else 'DISAGREE'} across nodes")
+        except Exception as error:  # a step that raises fails the run; the window still closes
+            log("".join(traceback.format_exception(error)).rstrip())
+            failed = f"{describe_step(step)} raised {type(error).__name__}: {error}"
+            break
+    stop_beating.set()
+    if restart:
+        log("sync moved the checkout to another commit: the job restarts on it")
+        return RESTART_ON_NEW_COMMIT
+    if failed:
+        log(f"run stopped: {failed}")
+    if window_ending or not keep_open or (failed and close_on_failure):
+        window_close(failed or "run complete")
+    log("done")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- queue
+
+QUEUE = ROOT / "results" / "private" / "lab" / "queue"
+
+
+def queue_add(spec_path: str) -> Path:
+    spec = json.loads(Path(spec_path).read_text())
+    # Reject a malformed spec now, not when its turn comes after a boot. A spec that syncs
+    # first may name files this checkout does not have yet: warn, and the run checks again
+    # after its sync, before the first boot.
+    problems = plan_problems(plan(spec))
+    if problems and not any(job["kind"] == "sync" for job in spec["jobs"]):
+        raise SystemExit("not queued:\n  " + "\n  ".join(problems))
+    for problem in problems:
+        print(f"warning (checked again after the run's sync): {problem}", file=sys.stderr)
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    target = QUEUE / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{Path(spec_path).name}"
+    target.write_text(json.dumps(spec, indent=2) + "\n")
+    log(f"QUEUE added {target.name}")
+    return target
+
+
+def queued() -> list[Path]:
+    return sorted(QUEUE.glob("*.json")) if QUEUE.is_dir() else []
+
+
+def queue_run(idle_minutes: int, minutes: int) -> int:
+    """Run queued specs back to back in one window. An empty queue keeps the window held
+    for the next spec unless ``idle_minutes`` > 0 closes it after that long."""
+    window_open(minutes, "queue")
+    if not hold_is_ours(read_hold()):
+        return 1
+    me = Path(__file__).resolve()
+    for state in ("running", "done", "failed"):
+        (QUEUE / state).mkdir(parents=True, exist_ok=True)
+    idle_since = None
+    while True:
+        hold = read_hold()
+        if not hold_is_ours(hold):
+            log("QUEUE closed (hold lost)")
+            return 1
+        reason = window_should_close(hold)
+        if reason:
+            window_close(reason)
+            log(f"QUEUE closed ({reason})")
+            return 0
+        pending = queued()
+        if not pending:
+            if idle_since is None:
+                idle_since = time.time()
+                log(f"QUEUE idle (closing in {idle_minutes} min unless a spec arrives)" if idle_minutes
+                    else "QUEUE idle (held for the next spec)")
+            if idle_minutes and time.time() - idle_since > 60 * idle_minutes:
+                window_close("queue empty")
+                log("QUEUE closed (empty)")
+                return 0
+            beat("queue idle")
+            time.sleep(10)
+            continue
+        idle_since = None
+        job = pending[0]
+        running = QUEUE / "running" / job.name
+        os.replace(job, running)
+        log(f"QUEUE job {job.name} started")
+        code = execute(json.loads(running.read_text()), dry=False, keep_open=True,
+                       close_on_failure=False)
+        if code == RESTART_ON_NEW_COMMIT:
+            os.replace(running, job)
+            log(f"QUEUE job {job.name} requeued; restarting on the new commit (window stays open)")
+            os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
+                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes),
+                                      "--production-config", PRODUCTION_CONFIG])
+        os.replace(running, QUEUE / ("done" if code == 0 else "failed") / job.name)
+        log(f"QUEUE job {job.name} {'done' if code == 0 else 'failed'}")
+        if code and not hold_is_ours(read_hold()):
+            log("QUEUE closed (the window was closed by the run)")
+            return code
+        if code:
+            # A failed job (a boot that never came up, a step that raised) costs only
+            # itself: the next spec stops and boots what it needs.
+            log("QUEUE continuing after the failed job")
+        if checkout_commit() != COMMIT_AT_START:
+            # A sync job moved the checkout: continue the same window on the new commit.
+            log("QUEUE restarting on the new commit (window stays open)")
+            os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
+                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes),
+                                      "--production-config", PRODUCTION_CONFIG])
+
+
+def queue_status() -> None:
+    hold = read_hold()
+    print("window:", (hold or {}).get("holder", "none"), (hold or {}).get("current", ""))
+    for state in ("", "running", "done", "failed"):
+        directory = QUEUE / state if state else QUEUE
+        names = sorted(p.name for p in directory.glob("*.json")) if directory.is_dir() else []
+        print(f"{state or 'pending'}: {', '.join(names) if names else '-'}")
+
+
+# ---------------------------------------------------------------- kernel lab (node-local)
+
+def compile_cache(candidate: dict) -> Path:
+    """Per-node compile caches shared by every bundle; the GPU lock keeps jobs one at a time."""
+    return Path(os.path.expanduser(candidate.get("cache", "~/.cache/spark-lab/compile")))
+
+
+def bundle_mounts(bundle: Path, candidate: dict) -> list[tuple[Path, str]]:
+    """Mount sources: ~-paths and absolute paths as given; otherwise the bundle's own file, else a
+    synced input under ~/spark-lab/inputs, else the path in this node's checkout. A source that
+    exists nowhere is reported by kernel-local; nothing falls back silently to an empty mount."""
+    mounts = []
+    for source, destination in candidate.get("mounts", []):
+        resolved = Path(os.path.expanduser(source))
+        if not resolved.is_absolute():
+            for base in (bundle, LAB_HOME / "inputs", ROOT):
+                if (base / source).exists():
+                    resolved = base / source
+                    break
+            else:
+                resolved = ROOT / source
+        mounts.append((resolved, destination))
+    return mounts
+
+
+def image_source_root(image: str) -> str:
+    """The candidate root of ``image``'s source trees: the parent of the vLLM tree its
+    ``PYTHONPATH`` names, one of ``SOURCE_ROOTS``."""
+    process = subprocess.run(["docker", "image", "inspect", image, "--format", "{{json .Config.Env}}"],
+                             text=True, capture_output=True)
+    if process.returncode:
+        raise SystemExit(f"cannot inspect {image}: {process.stderr.strip()}")
+    for entry in json.loads(process.stdout or "null") or []:
+        name, _, value = entry.partition("=")
+        if name == "PYTHONPATH":
+            for path in value.split(":"):
+                root = path.removesuffix("/vllm")
+                if path.endswith("/vllm") and root in SOURCE_ROOTS:
+                    return root
+    raise SystemExit(f"{image} names none of {', '.join(SOURCE_ROOTS)} on its PYTHONPATH")
+
+
+def bundle_command(bundle: Path, candidate: dict, out: Path) -> list[str]:
+    """docker run for one kernel-lab bundle: overlay/{vllm,b12x}/... mounted at the image's candidate
+    tree (``source_root``, else the image's own). A relative ``workdir`` is under that root."""
+    image = candidate["image"]
+    root = candidate.get("source_root") or image_source_root(image)
+    command = ["docker", "run", "--rm", "--gpus", "all", "--ipc=host", "--ulimit=core=0"]
+    for key, value in sorted(candidate.get("env", {}).items()):
+        command += ["-e", f"{key}={value}"]
+    if candidate.get("display_carveout"):
+        # Tests that allocate from the display carve-out get the serving container's DRM access.
+        command += [f"--mount=type=bind,source={DRM_CARD},target=/dev/dri/card0",
+                    "--device-cgroup-rule=c 226:* rw"]
+    if candidate.get("io_uring"):
+        # Tests of io_uring readers (disk Engram rows) get the serving container's
+        # allowance: Docker's default seccomp profile refuses io_uring.
+        command += ["--security-opt=seccomp=unconfined", "--ulimit=memlock=-1:-1"]
+    overlay = bundle / "overlay"
+    if overlay.is_dir():
+        for path in sorted(p for p in overlay.rglob("*") if p.is_file()):
+            relative = path.relative_to(overlay)
+            package = relative.parts[0]
+            if package not in ("vllm", "b12x"):
+                continue
+            command += ["-v", f"{path}:{root}/{package}/{package}/{Path(*relative.parts[1:])}:ro"]
+    for source, destination in bundle_mounts(bundle, candidate):
+        command += ["-v", f"{source}:{destination}:ro"]
+    command += ["-v", f"{compile_cache(candidate)}:/c"]
+    command += ["-w", str(Path(root) / candidate.get("workdir", "b12x")), "--entrypoint", "python3", image,
+                *candidate["argv"]]
+    return command
+
+
+def suite_verdict(lines: list[str]) -> dict:
+    """A test-suite bundle ("verdict": "exit", e.g. pytest): it passes when tests passed and none
+    failed; kernel_local also requires exit status 0. Failed test ids are what nodes must agree on."""
+    failed = sorted({line.split(" - ", 1)[0].split(" ", 1)[1].strip()
+                     for line in lines if line.startswith(("FAILED ", "ERROR ")) and " " in line})
+    summary = next((line.strip("= \n") for line in reversed(lines)
+                    if re.search(r"\b\d+ (passed|failed|errors?|skipped)\b", line)), "")
+    return {
+        "passed": not failed and re.search(r"\b\d+ passed\b", summary) is not None
+                  and re.search(r"\b\d+ (failed|errors?)\b", summary) is None,
+        "summary": summary,
+        "failed": failed,
+        "batch_variant": [],
+        "bits_unequal": [],
+        "errors": failed[:20],
+        "groups": [],
+        "bits": [],
+        "timings": [],
+    }
+
+
+def status_verdict() -> dict:
+    """A script bundle ("verdict": "status", e.g. a benchmark with its own gate): its exit status
+    is the verdict, which kernel_local applies."""
+    return {"passed": True, "summary": "", "failed": [], "batch_variant": [], "bits_unequal": [],
+            "errors": [], "groups": [], "bits": [], "timings": []}
+
+
+def verdict_from_lines(lines: list[str], candidate: dict) -> dict:
+    """Pass when every invariant configuration has one row group and every expected-equal pair matches."""
+    if candidate.get("verdict") == "exit":
+        return suite_verdict(lines)
+    if candidate.get("verdict") == "status":
+        return status_verdict()
+    exempt = tuple(candidate.get("variant_configs", ["production", "ref2"]))
+    groups, bits, timings, errors = [], [], [], []
+    for line in lines:
+        if "Traceback" in line or line.startswith(("RuntimeError", "ValueError", "AssertionError")):
+            errors.append(line.strip())
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "groups" in record:
+            groups.append(record)
+        elif "bits" in record:
+            bits.append(record)
+        elif "timing_us" in record:
+            timings.append(record)
+        elif "error" in record:
+            errors.append(f"{record.get('config')}: {record['error']}")
+    variant = []
+    for record in groups:
+        name = record["op"].split()[1] if len(record["op"].split()) > 1 else record["op"]
+        if record["groups"] != 1 and not name.startswith(exempt):
+            variant.append(record["op"])
+    unequal = [record["bits"] for record in bits if record.get("differs_at")]
+    return {
+        "passed": not (variant or unequal or errors) and bool(groups or bits),
+        "batch_variant": variant,
+        "bits_unequal": unequal,
+        "errors": errors[:20],
+        "groups": groups,
+        "bits": bits,
+        "timings": timings,
+    }
+
+
+def kernel_local(bundle_dir: str, out_dir: str | None, dry: bool) -> int:
+    bundle = Path(bundle_dir).resolve()
+    candidate = json.loads((bundle / "candidate.json").read_text())
+    out = Path(out_dir).resolve() if out_dir else bundle / "out"
+    command = bundle_command(bundle, candidate, out)
+    if dry:
+        print(shlex.join(command))
+        return 0
+    if container_running():
+        raise SystemExit("a serving container is running on this node; the kernel lab needs the GPU to itself")
+    missing = [str(source) for source, _ in bundle_mounts(bundle, candidate) if not source.exists()]
+    if missing:
+        raise SystemExit("missing bundle inputs: " + ", ".join(missing))
+    out.mkdir(parents=True, exist_ok=True)
+    compile_cache(candidate).mkdir(parents=True, exist_ok=True)
+    with open("/tmp/spark-lab-gpu.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.time()
+        process = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        elapsed = time.time() - started
+    (out / "output.txt").write_text(process.stdout)
+    verdict = verdict_from_lines(process.stdout.splitlines(), candidate)
+    image_id = subprocess.run(["docker", "image", "inspect", candidate["image"], "--format", "{{.Id}}"],
+                              text=True, capture_output=True).stdout.strip()
+    inputs = sorted(p for p in bundle.rglob("*") if p.is_file() and out not in p.parents)
+    verdict.update({
+        "node": socket.gethostname(), "image": image_id, "exit": process.returncode,
+        "seconds": round(elapsed, 1),
+        "inputs_sha256": {str(p.relative_to(bundle)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs},
+    })
+    if process.returncode:
+        verdict["passed"] = False
+    write_json_atomic(out / "verdict.json", verdict)
+    log(f"kernel {bundle.name}: {'pass' if verdict['passed'] else 'FAIL'} in {elapsed:.0f} s")
+    return 0 if verdict["passed"] else 1
+
+
+# ---------------------------------------------------------------- CLI
+
+def report(run: str) -> str:
+    """A run's table, then each measured step's node telemetry: SM clock p10/p50/p90 (min),
+    power, peak temperature, any clock-event reasons, and the lock in force."""
+    lines = []
+    table = ROOT / "results" / "private" / "lab" / f"{run}-table.txt"
+    if table.exists():
+        lines.append(table.read_text().rstrip())
+    telemetry = sorted((ROOT / "results" / "private" / "determinism" / run).glob("*.telemetry.json"))
+    if telemetry:
+        lines.append(f"\ntelemetry ({run})")
+    for path in telemetry:
+        data = json.loads(path.read_text())
+        lock = data.get("gpu_clocks_lock")
+        lines.append(f"{path.name.removesuffix('.telemetry.json')}: {data['seconds']:.0f} s, "
+                     f"clocks {'locked to ' + '-'.join(map(str, lock['lock_mhz'])) + ' MHz' if lock else 'unlocked'}")
+        for name, node in data["nodes"].items():
+            sm, power, temp = (node.get(k, {}) for k in ("clocks.sm", "power.draw", "temperature.gpu"))
+            events = {reason: count for reason, count in node.get("event_reasons", {}).items()
+                      if reason.strip().lower() not in ("0x0000000000000000", "0x0", "not active")}
+            show = lambda value: "?" if value is None else f"{value:g}"
+            lines.append(f"  {name}: SM {show(sm.get('p10'))}/{show(sm.get('p50'))}/{show(sm.get('p90'))} MHz "
+                         f"(min {show(sm.get('min'))}), {show(power.get('p50'))} W, {show(temp.get('max'))} °C max"
+                         + (f", clock events {events}" if events else "") + ("" if node.get("samples") else " (no samples)"))
+    return "\n".join(lines) if lines else f"nothing recorded for run {run}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    global PRODUCTION_CONFIG
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    production = argparse.ArgumentParser(add_help=False)
+    production.add_argument(
+        "--production-config", metavar="PATH",
+        help="repository-relative cluster config the window restores and whose node map it uses "
+             f"(default: the open window's record, else {spark.DEFAULT_CLUSTER_CONFIG})")
+    commands = parser.add_subparsers(dest="command", required=True)
+    window = commands.add_parser("window", parents=[production])
+    window.add_argument("action", choices=("open", "status", "close"))
+    window.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
+    window.add_argument("--note", default="")
+    window.add_argument("--dry-run", action="store_true")
+    run = commands.add_parser("run", parents=[production])
+    run.add_argument("spec")
+    run.add_argument("--dry-run", action="store_true")
+    run.add_argument("--keep-open", action="store_true", help="leave the window open after the run")
+    queue = commands.add_parser("queue", parents=[production])
+    queue.add_argument("action", choices=("add", "run", "status"))
+    queue.add_argument("spec", nargs="?")
+    queue.add_argument("--idle-minutes", type=int, default=0)  # 0: hold while idle
+    queue.add_argument("--minutes", type=int, default=0)  # 0: no time cap
+    kernel = commands.add_parser("kernel-local")
+    kernel.add_argument("bundle")
+    kernel.add_argument("--out")
+    kernel.add_argument("--dry-run", action="store_true")
+    shown = commands.add_parser("report", help="a run's table and node telemetry")
+    shown.add_argument("run")
+    dog = commands.add_parser("watchdog", parents=[production])
+    dog.add_argument("--max-age", type=int, default=HEARTBEAT_MAX_AGE)
+    dog.add_argument("--once", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "report":
+        print(report(args.run))
+        return 0
+    if args.command != "kernel-local":
+        PRODUCTION_CONFIG = resolve_production(args.production_config, read_hold())
+
+    if args.command == "window":
+        if args.action == "open":
+            window_open(args.minutes, args.note, dry=args.dry_run)
+        elif args.action == "close":
+            return 0 if window_close("closed by hand", dry=args.dry_run) else 1
+        else:
+            hold = read_hold()
+            print(json.dumps(hold, indent=2) if hold else "no hold")
+            if hold and "heartbeat" in hold:
+                print(f"heartbeat age {heartbeat_age(hold):.0f} s")
+        return 0
+    if args.command == "run":
+        spec = json.loads(Path(args.spec).read_text())
+        return execute(spec, args.dry_run, args.keep_open)
+    if args.command == "queue":
+        if args.action == "add":
+            if not args.spec:
+                raise SystemExit("queue add needs a spec")
+            queue_add(args.spec)
+            return 0
+        if args.action == "status":
+            queue_status()
+            return 0
+        return queue_run(args.idle_minutes, args.minutes)
+    if args.command == "kernel-local":
+        return kernel_local(args.bundle, args.out, args.dry_run)
+    watchdog(args.max_age, args.once)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

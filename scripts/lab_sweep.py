@@ -22,18 +22,15 @@ checkout must hold the arm configs.
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-_spec = importlib.util.spec_from_loader("spark", _loader)
-spark = importlib.util.module_from_spec(_spec)
-_loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 VALUE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import contextlib
 import io
-import importlib.machinery
-import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 # A recipe frozen for these tests, so a release does not move them.
 FIXTURE = "tests/fixtures/cluster.json"
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+import spark_ds41f as spark
 
 
 class DesktopTest(unittest.TestCase):
