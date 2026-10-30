@@ -1,0 +1,165 @@
+verdicts: spark-ds41f-1025 -> spark-ds41f-1030, against the run's own repeat (spark-ds41f-1030 -> spark-ds41f-1030-again)
+metric                                 change    ±95%   repeat   floor  margin  verdict
+c16: decode tok/s, paired              +2.76%   1.29%   +0.74%   0.64%   1.44%  better (both candidate boots; window tok/s +2.65% ±1.53%)
+c16: output tok/s                      +2.65%   1.53%   +0.30%       -   1.82%  better
+c8: decode tok/s, paired               +2.41%   1.23%   +0.67%   0.58%   1.37%  better (both candidate boots; window tok/s +1.99% ±1.42%)
+c8: output tok/s                       +1.99%   1.42%   +0.92%       -   2.33%  same
+c1: decode tok/s, paired               +2.94%   1.61%   -0.01%   0.30%   1.64%  better (both candidate boots; window tok/s +3.87% ±6.71%)
+c1: output tok/s                       +3.87%   6.71%   -0.02%       -   6.73%  same
+paired rows: margin = ±95% (over requests) and floor (the recorded A/A bound, or the repeat when larger, for the boots averaged) in quadrature; other rows: ±95% + |repeat|
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                       tokens requests   rows  yield  wasted  by position (survival/coverage)
+c16      spark-ds41f-1030          16.242     7.23  21.16  0.768    4.92  0:0.688/1.000 1:0.317/0.532 2:0.141/0.234 3:0.067/0.106 4:0.034/0.054
+c16      spark-ds41f-1025          16.292     7.25  21.29  0.765    5.00  0:0.693/1.000 1:0.320/0.542 2:0.137/0.238 3:0.065/0.106 4:0.032/0.052
+c16      spark-ds41f-1030-again    16.340     7.23  21.20  0.771    4.86  0:0.695/1.000 1:0.323/0.538 2:0.141/0.235 3:0.067/0.107 4:0.034/0.052
+c8       spark-ds41f-1030          16.116     7.23  21.16  0.762    5.04  0:0.686/1.000 1:0.316/0.537 2:0.134/0.236 3:0.061/0.103 4:0.030/0.049
+c8       spark-ds41f-1025          16.236     7.22  21.14  0.768    4.91  0:0.691/1.000 1:0.317/0.531 2:0.141/0.234 3:0.066/0.109 4:0.034/0.055
+c8       spark-ds41f-1030-again    16.341     7.26  21.27  0.768    4.93  0:0.694/1.000 1:0.320/0.539 2:0.140/0.236 3:0.065/0.104 4:0.032/0.051
+c1       spark-ds41f-1030           2.228     1.00   4.11  0.542    1.88  0:0.636/1.000 1:0.333/0.966 2:0.145/0.636 3:0.072/0.331 4:0.039/0.172
+c1       spark-ds41f-1025           2.219     1.00   4.08  0.543    1.87  0:0.639/1.000 1:0.334/0.963 2:0.144/0.629 3:0.068/0.325 4:0.035/0.169
+c1       spark-ds41f-1030-again     2.228     1.00   4.11  0.542    1.88  0:0.636/1.000 1:0.333/0.966 2:0.145/0.636 3:0.072/0.331 4:0.039/0.172
+
+######## spark-ds41f-1025 -> spark-ds41f-1030
+suite sampled (ab647d385024): spark-ds41f-1025 -> spark-ds41f-1030
+
+== c16
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                150.867      154.860   +2.65%   1.53%  better
+decode tok/s, paired         18.795       18.919   +2.48%   1.08%  better
+engine steps/s                9.270        9.543   +2.95%   2.89%  better
+output tokens/step           16.292       16.242   -0.31%   3.71%  same
+accepted/draft                1.248        1.245   -0.24%   6.45%  same
+TTFT p50 s                   14.120       13.760   -2.55%          same (no interval)
+TTFT p99 s                   17.011       16.555   -2.68%          same (no interval)
+TTFT, paired                 14.120       13.769   -2.57%   1.51%  better
+TPOT p50 ms                  52.788       52.064   -1.37%          same (no interval)
+TPOT p99 ms                  67.943       67.481   -0.68%          same (no interval)
+per-user tok/s p50           18.944       19.207   +1.39%          same (no interval)
+paired: 175 requests in both windows, each the same prompt on both builds; 13 streamed in as many chunks on both
+
+== c8
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                150.813      153.813   +1.99%   1.42%  better
+decode tok/s, paired         18.881       19.157   +1.93%   1.23%  better
+engine steps/s                9.297        9.550   +2.72%   2.82%  same
+output tokens/step           16.236       16.116   -0.74%   2.87%  same
+accepted/draft                1.250        1.227   -1.79%   5.04%  same
+TTFT p50 s                    0.371        0.362   -2.60%          same (no interval)
+TTFT p99 s                    0.441        0.477   +8.12%          worse (no interval)
+TTFT, paired                  0.371        0.362   -2.53%   1.81%  better
+TPOT p50 ms                  52.548       51.575   -1.85%          same (no interval)
+TPOT p99 ms                  68.465       67.289   -1.72%          same (no interval)
+per-user tok/s p50           19.016       19.368   +1.85%          same (no interval)
+paired: 175 requests in both windows, each the same prompt on both builds; 5 streamed in as many chunks on both
+
+== c1
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                 59.107       61.393   +3.87%   6.71%  same
+decode tok/s, paired         60.143       61.357   +2.99%   1.61%  better
+engine steps/s               26.717       27.620   +3.38%   2.85%  better
+output tokens/step            2.219        2.228   +0.38%   9.47%  same
+accepted/draft                1.220        1.225   +0.41%  17.33%  same
+TTFT p50 s                    0.154        0.147   -4.89%          better (no interval)
+TTFT p99 s                    0.192        0.187   -2.31%          same (no interval)
+TTFT, paired                  0.156        0.149   -4.07%   0.90%  better
+TPOT p50 ms                  16.473       15.919   -3.36%          better (no interval)
+TPOT p99 ms                  20.431       19.687   -3.64%          better (no interval)
+per-user tok/s p50           60.629       61.394   +1.26%          same (no interval)
+paired: 69 requests in both windows, each the same prompt on both builds; 10 streamed in as many chunks on both
+
+######## spark-ds41f-1025 -> spark-ds41f-1030-again
+suite sampled (ab647d385024): spark-ds41f-1025 -> spark-ds41f-1030-again
+
+== c16
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                150.867      155.320   +2.95%   1.75%  better
+decode tok/s, paired         18.795       19.094   +3.04%   1.29%  better
+engine steps/s                9.270        9.513   +2.62%   2.79%  same
+output tokens/step           16.292       16.340   +0.29%   3.75%  same
+accepted/draft                1.248        1.260   +0.96%   6.71%  same
+TTFT p50 s                   14.120       13.755   -2.59%          same (no interval)
+TTFT p99 s                   17.011       16.309   -4.13%          better (no interval)
+TTFT, paired                 14.120       13.755   -3.07%   2.44%  better
+TPOT p50 ms                  52.788       51.847   -1.78%          same (no interval)
+TPOT p99 ms                  67.943       67.104   -1.23%          same (no interval)
+per-user tok/s p50           18.944       19.252   +1.63%          same (no interval)
+paired: 175 requests in both windows, each the same prompt on both builds; 12 streamed in as many chunks on both
+
+== c8
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                150.813      155.223   +2.92%   0.92%  better
+decode tok/s, paired         18.881       19.142   +2.89%   1.25%  better
+engine steps/s                9.297        9.507   +2.26%   2.86%  same
+output tokens/step           16.236       16.341   +0.65%   3.07%  same
+accepted/draft                1.250        1.251   +0.13%   5.27%  same
+TTFT p50 s                    0.371        0.358   -3.49%          better (no interval)
+TTFT p99 s                    0.441        0.460   +4.24%          worse (no interval)
+TTFT, paired                  0.371        0.358   -3.17%   1.75%  better
+TPOT p50 ms                  52.548       51.860   -1.31%          same (no interval)
+TPOT p99 ms                  68.465       68.088   -0.55%          same (no interval)
+per-user tok/s p50           19.016       19.270   +1.33%          same (no interval)
+paired: 175 requests in both windows, each the same prompt on both builds; 6 streamed in as many chunks on both
+
+== c1
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                 59.107       61.383   +3.85%   6.71%  same
+decode tok/s, paired         60.143       61.357   +2.89%   1.54%  better
+engine steps/s               26.717       27.613   +3.36%   2.85%  better
+output tokens/step            2.219        2.228   +0.38%   9.48%  same
+accepted/draft                1.220        1.225   +0.42%  17.35%  same
+TTFT p50 s                    0.154        0.148   -4.24%          better (no interval)
+TTFT p99 s                    0.192        0.190   -0.69%          same (no interval)
+TTFT, paired                  0.156        0.148   -3.74%   1.52%  better
+TPOT p50 ms                  16.473       15.961   -3.11%          better (no interval)
+TPOT p99 ms                  20.431       19.697   -3.60%          better (no interval)
+per-user tok/s p50           60.629       61.409   +1.29%          same (no interval)
+paired: 69 requests in both windows, each the same prompt on both builds; 10 streamed in as many chunks on both
+
+######## spark-ds41f-1030 -> spark-ds41f-1030-again
+suite sampled (ab647d385024): spark-ds41f-1030 -> spark-ds41f-1030-again
+
+== c16
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                154.860      155.320   +0.30%   1.32%  same
+decode tok/s, paired         19.059       19.188   +0.74%   1.20%  same
+engine steps/s                9.543        9.513   -0.31%   2.78%  same
+output tokens/step           16.242       16.340   +0.60%   3.28%  same
+accepted/draft                1.245        1.260   +1.20%   5.87%  same
+TTFT p50 s                   13.760       13.755   -0.04%          same (no interval)
+TTFT p99 s                   16.555       16.309   -1.49%          same (no interval)
+TTFT, paired                 13.765       13.770   -0.84%   1.65%  same
+TPOT p50 ms                  52.064       51.847   -0.42%          same (no interval)
+TPOT p99 ms                  67.481       67.104   -0.56%          same (no interval)
+per-user tok/s p50           19.207       19.252   +0.23%          same (no interval)
+paired: 180 requests in both windows, each the same prompt on both builds; 19 streamed in as many chunks on both
+
+== c8
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                153.813      155.223   +0.92%   1.39%  same
+decode tok/s, paired         19.254       19.179   +0.67%   1.16%  same
+engine steps/s                9.550        9.507   -0.45%   2.58%  same
+output tokens/step           16.116       16.341   +1.40%   2.99%  same
+accepted/draft                1.227        1.251   +1.95%   5.07%  same
+TTFT p50 s                    0.362        0.358   -0.91%          same (no interval)
+TTFT p99 s                    0.477        0.460   -3.59%          better (no interval)
+TTFT, paired                  0.362        0.358   -1.56%   1.28%  better
+TPOT p50 ms                  51.575       51.860   +0.55%          same (no interval)
+TPOT p99 ms                  67.289       68.088   +1.19%          same (no interval)
+per-user tok/s p50           19.368       19.270   -0.50%          same (no interval)
+paired: 180 requests in both windows, each the same prompt on both builds; 6 streamed in as many chunks on both
+
+== c1
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                 61.393       61.383   -0.02%   5.85%  same
+decode tok/s, paired         61.877       61.760   -0.01%   0.03%  same
+engine steps/s               27.620       27.613   -0.02%   2.60%  same
+output tokens/step            2.228        2.228   +0.00%   8.43%  same
+accepted/draft                1.225        1.225   +0.01%  15.37%  same
+TTFT p50 s                    0.147        0.148   +0.69%          same (no interval)
+TTFT p99 s                    0.187        0.190   +1.66%          same (no interval)
+TTFT, paired                  0.148        0.148   +0.29%   0.62%  same
+TPOT p50 ms                  15.919       15.961   +0.26%          same (no interval)
+TPOT p99 ms                  19.687       19.697   +0.05%          same (no interval)
+per-user tok/s p50           61.394       61.409   +0.03%          same (no interval)
+paired: 72 requests in both windows, each the same prompt on both builds; 72 streamed in as many chunks on both

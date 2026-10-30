@@ -28,9 +28,15 @@ the same; a short request's first token beside a 131K prefill 3.6-3.7x sooner; P
 sampled c16 +1.87%, c8 +2.77%, c1 +2.68%; greedy 256/256 identical, teacher-forced KL 4.2e-8.
 `tp4-ring`'s `benchmark_reference` is
 [manifests/suites/2026-10-30-spark-ds41f-1030-tp4](../manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)
-(candidate 12's first release arm). `tp3-triangle` is not qualified on this image (its reference
-stays spark-ds41f-1025's); candidate 13's TP3 arms move to this image once the triangle is
-cabled (#668). spark-ds41f-1025's recipe and lock, the rollback, are frozen in
+(candidate 12's first release arm). On the triangle (qualified 2026-10-30 at the 6,144 budget,
+run `candidate-14-release-tp3`): decode grid -5.99%; paired decode c8 +2.29%, c4 +2.68%, one
+stream +3.76%; prefill +4.4% / +4.1% / +5.3% / +7.0% at 32K / 131K / 262K / 500K; 131K prefill
+beside 7 streams +3.0%, beside 3 and 6 with short requests waiting -4.6% and -3.7% (the yield
+and the 6,144 budget; those requests' first token p50 16.6 to 2.0 s and 18.3 to 9.6 s); sampled
+c16 +2.76%, c8 +2.41%, c1 +2.94%; greedy 256/256 identical, KL 4.2e-8. `tp3-triangle`'s
+`benchmark_reference` is
+[manifests/suites/2026-10-30-spark-ds41f-1030-tp3](../manifests/suites/2026-10-30-spark-ds41f-1030-tp3/).
+spark-ds41f-1025's recipe and lock, the rollback, are frozen in
 [releases/spark-ds41f-1025](../releases/spark-ds41f-1025/) (image
 `spark-ds41f:19f2c20ed4d6-next-6`, still on every node).
 

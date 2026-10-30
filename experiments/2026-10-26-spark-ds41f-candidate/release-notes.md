@@ -5,8 +5,8 @@ is DeepSeek-V4.1-Flash-1017, DeepSeek's checkpoint, with native weights.
 
 It is candidate 14: spark-ds41f-1025 plus vLLM 0491-0567 (candidates 7-14 in
 [README.md](README.md)). Image `spark-ds41f:1030` (built as `spark-ds41f:19f2c20ed4d6-next-14`,
-`sha256:7918fd6145b5`), vLLM patch head `b6de07aa`, tree `ea1281f8`. Four-node ring (tp4-ring)
-only; the triangle is not qualified on this image.
+`sha256:7918fd6145b5`), vLLM patch head `b6de07aa`, tree `ea1281f8`. Four-node ring (tp4-ring),
+and the three-node triangle (tp3-triangle) from 2026-10-30.
 
 ## Results (the ring, 2026-10-29)
 
@@ -83,11 +83,45 @@ and its `-single-stream` and `-sampled` companions: candidate 12's first arm, no
   the rollback is [releases/spark-ds41f-1025](../../releases/spark-ds41f-1025/) on
   `spark-ds41f:19f2c20ed4d6-next-6`.
 
+## Results (the triangle, 2026-10-30)
+
+The release at the triangle ([rc14/rc-tp3.json](rc14/rc-tp3.json), the 6,144-token budget),
+checked in run `candidate-14-tp3` and compared in run `candidate-14-release-tp3` (the release,
+spark-ds41f-1025, the release again; verdicts against the repeat).
+
+| Check | Result |
+| --- | --- |
+| Temperature-0 outputs | at 8,192, every greedy digest equals spark-ds41f-1025's apart from CED's cross-shape prompt (0526); the release at 6,144 equals 8,192 in every digest |
+| Model behaviour against 1025 | greedy 256/256 identical; teacher-forced KL 4.2e-8 nats |
+| Functional checks and GLP | pass; AdvBench no refusal phrase in 1.9% stock |
+| Memory | model loading 93.95 GiB a rank (1025: 94.12); dgx1's lowest MemAvailable 7.29 and 7.95 GiB (1025: 6.23) |
+| Startup | 276 TileLang calls prepared; nothing compiles after |
+
+| Metric | spark-ds41f-1025 | spark-ds41f-1030 | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| decode grid, geometric mean (15 shapes) | | | -5.99% | better |
+| one stream, decode tok/s (paired) | 61.2 | 63.5 | +3.76% | better |
+| one stream, TTFT (paired) | 0.159 s | 0.153 s | -4.1% | better |
+| 4 streams, decode tok/s (paired) | | | +2.68% | better |
+| 8 streams, decode tok/s (paired) | | | +2.29% | better |
+| 8 streams, output tok/s | 154.7 | 158.6 | +2.51% | better |
+| Poisson, output tok/s | 118.9 | 119.0 | +0.09% | same |
+| prefill 32K / 131K / 262K / 500K | | | +4.4 / +4.1 / +5.3 / +7.0% | better |
+| 131K prefill beside 7 streams | 5,307 | 5,465 | +2.98% | better |
+| 131K prefill beside 3 streams, short requests waiting | 5,314 | 5,069 | -4.61% | worse |
+| short requests' first token there, p50 | 16.6 s | 2.0 s | -87.8% | better |
+| 131K prefill beside 6 streams, short requests waiting | 5,295 | 5,099 | -3.70% | worse |
+| short requests' first token there, p50 | 18.3 s | 9.6 s | -47.6% | better |
+| sampled c16 / c8 / c1, decode tok/s (paired) | | | +2.76 / +2.41 / +2.94% | better |
+
+The owner accepted the two worse verdicts on 2026-10-30. The suites are
+[manifests/suites/2026-10-30-spark-ds41f-1030-tp3](../../manifests/suites/2026-10-30-spark-ds41f-1030-tp3/).
+
 ## Limitations
 
-- **The triangle is not qualified.** Candidate 13's TP3 arms move to this image once the
-  triangle is cabled (#668); at 983K, candidate 12's TP3 host low point fell to 3.45 GiB, which
-  0566 restores.
+- **On the triangle, a 131K prefill beside 3 or 6 streams with short requests waiting is
+  3.7-4.6% slower** than spark-ds41f-1025's: it yields to those requests (their first token
+  2-8x sooner) and runs the 6,144 budget (1025 qualified the triangle at 8,192).
 - **A lone 131K prefill is 0.8% slower** than candidate 10's (in 0541-0544 or the IKET patches,
   not yet bisected); against 1025 it is still 8.8% faster.
 - **Seeded sampling at 8 streams depends on the batch** under adaptive verification, as in

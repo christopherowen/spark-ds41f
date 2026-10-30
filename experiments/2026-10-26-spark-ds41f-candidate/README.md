@@ -812,3 +812,11 @@ carried since 2026-10-27, which this release qualifies. The image is already on 
 It qualifies if the 8,192 digests equal 1025's apart from CED-affected prompts (0526), the
 release's checks pass, the host's lowest MemAvailable stays above the 5 GiB startup guard, and
 no verdict is worse than 1025's.
+
+**Result: qualified 2026-10-30.** The checks pass: the 8,192 digests equal 1025's apart from CED's
+cross-shape prompt, 6,144's equal 8,192's, and dgx1's lowest MemAvailable is 7.29 GiB (1025:
+6.23). Every verdict is better or the same except two: the 131K prefill beside 3 and 6 streams
+with short requests waiting is 4.61% and 3.70% slower (the yield and the 6,144 budget), while
+those requests' first token p50 falls from 16.6 to 2.0 s and from 18.3 to 9.6 s. The owner
+accepted the trade. The numbers are in [release-notes.md](release-notes.md); the suites are
+[manifests/suites/2026-10-30-spark-ds41f-1030-tp3](../../manifests/suites/2026-10-30-spark-ds41f-1030-tp3/).
