@@ -1,0 +1,59 @@
+{
+ "description": "spark-ds41f-1030 with SP prefill local MoE routing and grouped MXFP8 + route all-gather (61fd194ba): SP prefill, TileLang router, and kernel preparation tests.",
+ "image": "spark-ds41f:1030",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+  "TILELANG_CACHE_DIR": "/c/tilelang-sp-prefill-mxfp8-route"
+ },
+ "source_root": "/opt/spark-ds41f/candidate",
+ "workdir": "vllm",
+ "argv": [
+  "-m",
+  "pytest",
+  "-q",
+  "-p",
+  "no:cacheprovider",
+  "--noconftest",
+  "-p",
+  "prepare_fixtures",
+  "-rfEs",
+  "--basetemp",
+  "/c/pytest-sp-prefill-mxfp8-route",
+  "tests/models/test_deepseek_v4_1_sp_prefill.py",
+  "tests/kernels/moe/test_deepseek_v41_tilelang_router.py",
+  "tests/v1/worker/test_prepare_kernels.py"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/kernels.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/kernels.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/sp_prefill.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py"
+  ],
+  [
+   "overlay/vllm/models/deepseek_v4_1/tilelang/router.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/router.py"
+  ],
+  [
+   "tests-kernels-moe-test_deepseek_v41_tilelang_router.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_router.py"
+  ],
+  [
+   "tests-models-test_deepseek_v4_1_sp_prefill.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_sp_prefill.py"
+  ]
+ ]
+}
