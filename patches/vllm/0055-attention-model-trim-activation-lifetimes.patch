@@ -1,0 +1,406 @@
+From 457179cf5a44ab1fe6315ca8717787dbd1ee8d70 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:42:27 +0100
+Subject: [PATCH] perf(attention,model): trim activation and MXFP8 cast
+ lifetimes across attention and decoder layer
+
+---
+ tests/models/test_deepseek_v4_1_attention.py |  72 +++++++++++++
+ tests/models/test_deepseek_v4_1_ced_model.py | 102 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       |  21 +++-
+ vllm/models/deepseek_v4_1/nvidia/model.py    |  41 ++++++--
+ 4 files changed, 225 insertions(+), 11 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 373bcc2e0..f5325f260 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -180,3 +180,75 @@ def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
+     metadata = None
+     assert module._front(torch.zeros(6, 1792), positions, None) is None
+     assert len(launches) == 1
++
++
++def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
++    """``_forward`` releases ``qr_kv``, ``q_cast``, ``qr``, ``q``, ``kv`` and
++    ``_index_query``'s ``iq`` before ``_o_proj`` allocates the output projection."""
++    import weakref
++    from vllm.models.deepseek_v4_1 import attention, kernels
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    module = _tilelang_layer(layer_id=3)
++    module._ready = True
++    module.q_lora_rank = 16
++    module.n_local_heads = 2
++    module._l2pf_wo = None
++    module.swa_cache_layer = SimpleNamespace(prefix="swa")
++    refs = {}
++
++    def track(name, tensor):
++        refs[name] = weakref.ref(tensor)
++        return tensor
++
++    module.fused_wqa_wkv = lambda h: (track("qr_kv", torch.ones(4, 528)), None)
++    module._front = lambda qr_kv, pos, sp: None
++    module.q_norm = lambda x: track("qr", x.clone())
++    module.kv_norm = lambda x: track("kv", x.clone())
++    monkeypatch.setattr(
++        kernels,
++        "cast_mxfp8",
++        lambda rows: MXFP8Rows(
++            rows,
++            track("q_cast", torch.ones(4, 16, dtype=torch.uint8)),
++            torch.ones(4, 4, dtype=torch.uint8),
++        ),
++    )
++    module.wq_b = lambda qr: track("q", torch.ones(4, 2 * 512))
++    module._rope = lambda x, pos, role: x
++    module._cache_context_kv = lambda kv, pos: None
++    module.indexer = SimpleNamespace(
++        heads=4,
++        wq_b=lambda qr: track("iq", torch.ones(4, 4 * 128)),
++        weights_proj=lambda h: (
++            # iq must already be released when weights_proj runs
++            assert_dead("iq"),
++            torch.ones(4, 4),
++        )[1],
++    )
++    module._quantize_index_query = lambda mode, iq, data, scale: None
++
++    def assert_dead(*names):
++        for name in names:
++            assert refs[name]() is None, f"{name} is still alive"
++
++    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
++        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden")
++        output.zero_()
++
++    def check_o_proj(output, sp_rows=None):
++        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden", "q", "kv")
++        return torch.zeros(4, 32)
++
++    module.forward_mqa = check_forward_mqa
++    module._o_proj = check_o_proj
++    metadata = {"swa": SimpleNamespace(is_decode=False)}
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    positions = torch.arange(4)
++    out = module._forward(positions, track("hidden", torch.ones(4, 32)))
++    assert out.shape == (4, 32)
++
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 80e7b3449..abb3ac1a1 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -313,3 +313,105 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         for i in range(4)
+         for kind in ("attention", "experts")
+     ]
++
++
++def test_decoder_layer_and_model_release_transient_activations_early(monkeypatch):
++    """``DeepseekV4DecoderLayer.forward`` releases ``previous_output`` and
++    attention's ``x_q`` before ``mhc.post_pre``, and ``DeepseekV4Model.forward``
++    releases non-final ``aux_recon`` tensors before subsequent layers."""
++    import weakref
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++    refs = {}
++
++    class _TrackingMix(_Mix):
++        def pre(self, residual, fn, scale, base, norm, pre, **previous):
++            res, post, comb, y, mix, _ = super().pre(
++                residual, fn, scale, base, norm, pre, **previous
++            )
++            y = y.clone()
++            values = torch.ones_like(y)
++            cast = MXFP8Rows(y, values, torch.ones_like(y))
++            refs["attn_cast"] = weakref.ref(values)
++            refs["attn_in"] = weakref.ref(y)
++            return res, post, comb, y, mix, cast
++
++        def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
++            # Attention's x_q, x_in, and the previous layer's output must be
++            # released before post_pre allocates the FFN entry buffers.
++            assert refs["attn_cast"]() is None
++            assert refs["attn_in"]() is None
++            if "prev_out" in refs:
++                assert refs["prev_out"]() is None
++            if "prev_res" in refs:
++                assert refs["prev_res"]() is None
++            res, post, comb, y, mix, _ = super().post_pre(
++                x, residual, post, comb, fn, scale, base, norm, pre
++            )
++            y = y.clone()
++            values = torch.ones_like(y)
++            cast = MXFP8Rows(y, values, torch.ones_like(y))
++            refs["ffn_cast"] = weakref.ref(values)
++            refs["prev_res"] = weakref.ref(res)
++            return res, post, comb, y, mix, cast
++
++        def post(self, x, residual, post, comb):
++            out = super().post(x, residual, post, comb)
++            refs.setdefault("aux_recons", []).append(weakref.ref(out))
++            return out
++
++    shared: dict[str, torch.Tensor | int] = {}
++    row_work: list[tuple[str, int, int]] = []
++    layers = nn.ModuleList(_Layer(i, shared, row_work) for i in range(4))
++    for layer in layers:
++        layer.mhc = _TrackingMix()
++
++    orig_ffn0_forward = layers[0].ffn.forward
++
++    def tracked_ffn0_forward(hidden, ids):
++        out = orig_ffn0_forward(hidden, ids)
++        refs["prev_out"] = weakref.ref(out)
++        return out
++
++    layers[0].ffn.forward = tracked_ffn0_forward
++
++    orig_layer3_forward = layers[3].forward
++
++    def tracked_layer3_forward(x, *args, **kwargs):
++        # Layer 2 (idx=2, idx+1=3 in aux_hidden_state_layers) is not end_layer=4,
++        # so its 4-stream aux_recon must already be released when layer 3 runs.
++        assert refs["aux_recons"][-1]() is None
++        return orig_layer3_forward(x, *args, **kwargs)
++
++    layers[3].forward = tracked_layer3_forward
++
++    inputs = torch.ones((4, 2), dtype=torch.float32)
++    target = SimpleNamespace(
++        embed_input_ids=lambda _: inputs.clone(),
++        use_mega_moe=False,
++        use_sequence_parallel=False,
++        prefill_sp_min_rows=0,
++        disk_engram=False,
++        engram_hash=None,
++        start_layer=0,
++        end_layer=4,
++        ced_decoder_start=None,
++        layers=layers,
++        aux_hidden_state_layers={3, 4},
++        _sink_columns=None,
++        _graph_out=lambda index, rows: None,
++        glp=None,
++        norm=lambda hidden: hidden,
++    )
++    output, aux = native.DeepseekV4Model.forward(
++        target, torch.arange(4), torch.arange(4), None
++    )
++    assert output.shape == (4, 2) and len(aux) == 2
++    assert refs["ffn_cast"]() is None
++
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..5e3482c8e 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -844,10 +844,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             # its product, narrower than the hidden state, is gathered.
+             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++            del qr_kv
+             parts = self._gather_front(sp_rows, hidden_states, qr, kv)
+             qr, kv = parts[0], parts[1]
+             if self.indexer is not None:
+                 index_weights = parts[2]
++            del parts
+             hidden_states = None
+             rows = sp_rows.num_tokens
+         else:
+@@ -860,30 +862,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             rows = hidden_states.shape[0]
+             with kernels.mxfp8_inputs(gathered):
+                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++            del gathered
+             front = self._front(qr_kv, positions, sp_rows)
+             if front is None:
+                 qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++                del qr_kv
+                 qr, kv = self.q_norm(qr), self.kv_norm(kv)
++            else:
++                del qr_kv
+         if front is None:
+             q_cast = kernels.cast_mxfp8(qr)
++            front_wrote_kv = False
+         else:
+             qr, kv, q_cast = front
++            front = None
++            front_wrote_kv = True
+         with kernels.mxfp8_inputs(q_cast):
+             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++        del q_cast
+         l2_prefetch.issue(self._l2pf_wo, rows)
+         q = self._rope(q, positions, "q")
+-        output = torch.empty_like(q)
+         metadata = cast(
+             dict[str, DeepseekV41B12xMetadata] | None,
+             get_forward_context().attn_metadata,
+         )
+         if not isinstance(metadata, dict):
+             # Memory profiling has no cache pages; serving does not use this branch.
+-            output.zero_()
++            del qr, kv, hidden_states, index_weights
++            output = torch.zeros_like(q)
++            del q
+         else:
+             original_swa = metadata[self.swa_cache_layer.prefix]
+             swa = self._query_metadata(original_swa)
+-            if front is None:  # the front's kernel wrote the record
++            if not front_wrote_kv:  # the front's kernel wrote the record
+                 self._cache_context_kv(kv, positions)
+             if swa is original_swa and hidden_states is not None:
+                 self._prepare_global_kv(positions, hidden_states)
+@@ -904,7 +915,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         qr, positions, hidden_states, index_weights, 0, rows, swa
+                     )
+                 index_query = (*query, split, reference)
++            del qr, hidden_states, index_weights
++            output = torch.empty_like(q)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
++            del q, kv, index_query
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
+     def _index_query(
+@@ -920,6 +934,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._quantize_index_query(
+             "decode" if swa.is_decode else "prefill", iq, iq_data, iq_scale
+         )
++        del iq
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..8122fb298 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -290,7 +290,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+     def forward(
+         self,
+-        x: torch.Tensor,
++        x: torch.Tensor | list[torch.Tensor | None],
+         positions: torch.Tensor,
+         input_ids: torch.Tensor | None,
+         pre_mix: torch.Tensor | None = None,
+@@ -302,6 +302,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+         ced_indices: torch.Tensor | None = None,
+         sp_rows: sp_prefill.SPRows | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        if isinstance(x, list):
++            # Pop the caller's carry list in place so nn.Module.__call__'s *args
++            # tuple does not pin the previous layer's residual and hidden state
++            # across attention, post_pre, and FFN.
++            x, pre_mix, post_mix, res_mix, residual = (
++                x.pop(),
++                x.pop(),
++                x.pop(),
++                x.pop(),
++                x.pop(),
++            )
+         previous_output = x if residual is not None else None
+         apply_engram = self.engram is not None and engram_hashes is not None
+         if residual is None:
+@@ -334,11 +345,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+             previous_post=post_mix if previous_output is not None else None,
+             previous_comb=res_mix if previous_output is not None else None,
+         )
++        del previous_output, pre_mix
+         global_kv_ready = None
+         if ced_indices is not None:
+             # Decoder global KV needs every encoder row, but decoder queries,
+             # residual updates and experts only need the selected replay rows.
+             global_kv_ready = self.attn.prepare_global_kv(positions, x)
++            del x_q
+             x = gather_rows(x, ced_indices)
+             x_q = self.mhc.cast_rows(x)
+             residual = gather_rows(residual, ced_indices)
+@@ -357,6 +370,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
++        del x_q
+         residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
+             x,
+             residual,
+@@ -368,19 +382,25 @@ class DeepseekV4DecoderLayer(nn.Module):
+             self.ffn_norm.weight,
+             attn_pre,
+         )
++        del attn_pre
+         if sp_rows is None:
+             with kernels.mxfp8_inputs(x_q):
+                 x = self.ffn(x, input_ids)
++            del x_q
+         else:
++            del x_q
+             # SP: route every row; the TP partial sum is reduce-scattered.
+             with sp_prefill.activate(sp_rows):
+                 rows = sp_rows.gather(x)
+-                with kernels.mxfp8_inputs(self.mhc.cast_rows(rows)):
++                del x
++                rows_q = self.mhc.cast_rows(rows)
++                with kernels.mxfp8_inputs(rows_q):
+                     x = self.ffn(
+                         rows,
+                         input_ids,
+                         reduce_scatter_rows=sp_rows.padded_rows,
+                     )
++                del rows, rows_q
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+         return x, residual, post_mix, res_mix, ffn_pre
+@@ -857,14 +877,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+                 )
+                 sp = None
++            carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
++            hidden_states = pre_mix = post_mix = res_mix = residual = None
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+-                hidden_states,
++                carry,
+                 positions,
+                 input_ids,
+-                pre_mix,
+-                post_mix,
+-                res_mix,
+-                residual,
++                None,
++                None,
++                None,
++                None,
+                 engram_hashes,
+                 engram_mask,
+                 ced_indices=boundary_indices,
+@@ -907,7 +929,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
+-                final_aux_recon = aux_recon
++                if idx + 1 == self.end_layer:
++                    final_aux_recon = aux_recon
++                del aux_recon
+         l2_prefetch.join()
+         if layer is not None:
+             # Reuse if the last layer was captured as an aux hidden state
+@@ -917,6 +941,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 hidden_states = layer.mhc.post(
+                     hidden_states, residual, post_mix, res_mix
+                 )
++            del final_aux_recon, residual, post_mix, res_mix
+ 
+         if not get_pp_group().is_last_rank:
+             if decoder_compacted:
+-- 
+2.54.0 (Apple Git-157)
+
