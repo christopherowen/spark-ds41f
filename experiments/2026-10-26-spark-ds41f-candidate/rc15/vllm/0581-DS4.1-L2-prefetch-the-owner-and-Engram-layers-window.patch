@@ -1,0 +1,442 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 15:27:54 +0100
+Subject: [PATCH 581/581] [DS4.1] L2 prefetch: the owner and Engram layers'
+ windows placed where their lines survive
+
+A layer that owns a compressor lost its WO lines to the compressor's
+projection before WO-A ran (WO-A at DRAM speed with its fill long done). It
+now issues a COMP window (the compressor's weight) after Q-B in WO's place, and
+WO right after the compressor.
+
+An Engram layer runs its projection before anything the NEXT window holds,
+and NEXT's lines did not survive it. The layer before it issues an ENGRAM
+window (the projection's first 20 MB) in NEXT's place, and the Engram layer
+issues NEXT between its projection's GEMM and its all-gather
+(common/engram.py: project_rows, the hook between the two).
+
+Forty decode layers at one rank's shapes on GB10 (real projections and routed
+experts, spin kernels for the attention core and all-reduces): TP4 1.5% faster
+at one stream, 0.7% at eight, 0.3% at sixteen; TP3 1.5 / 0.5 / 0.3%; every
+buffer bit-identical. Cache hints only.
+---
+ .../models/test_deepseek_v4_1_l2_schedule.py  | 180 ++++++++++++++++++
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   1 +
+ vllm/models/deepseek_v4_1/attention.py        |  15 +-
+ vllm/models/deepseek_v4_1/common/engram.py    |  31 ++-
+ vllm/models/deepseek_v4_1/l2_prefetch.py      |  27 ++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  29 ++-
+ 6 files changed, 274 insertions(+), 9 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_l2_schedule.py
+
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+new file mode 100644
+index 000000000..5284b965e
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -0,0 +1,180 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Where each layer type issues its L2 prefetch windows (``l2_prefetch``), on fake
++layers: the windows are cache hints, so what matters is the point and the plan."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v4_1 import l2_prefetch
++from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
++from vllm.models.deepseek_v4_1.common import engram as engram_module
++from vllm.models.deepseek_v4_1.nvidia.model import DeepseekV4DecoderLayer
++
++
++@pytest.fixture
++def issued(monkeypatch):
++    """Every plan ``l2_prefetch.issue`` is given (None, a window the layer lacks, is
++    not recorded)."""
++    calls = []
++
++    def issue(plan, rows):
++        if plan is not None:
++            calls.append((plan, rows))
++
++    monkeypatch.setattr(l2_prefetch, "issue", issue)
++    return calls
++
++
++@pytest.mark.parametrize(
++    "indexer, compressor, expected",
++    [
++        # window-only and reuse layers: WO after Q-B
++        (None, None, {"q-b": ["wo"], "compressor": []}),
++        # owner layers: COMP in WO's place, WO behind it after the compressor
++        ("indexer", "compressor", {"q-b": ["comp"], "compressor": ["wo"]}),
++        # indexer-only layers: WO after Q-B
++        ("indexer", None, {"q-b": ["wo"], "compressor": []}),
++    ],
++)
++def test_wo_and_idx_points_by_layer_type(issued, indexer, compressor, expected):
++    layer = SimpleNamespace(
++        indexer=indexer,
++        compressor=compressor,
++        _l2pf_wo="wo",
++        _l2pf_comp="comp" if compressor is not None else None,
++    )
++    for point, plans in expected.items():
++        issued.clear()
++        DeepseekV4Attention._issue_wo_prefetch(layer, 6, after=point)
++        assert issued == [(plan, 6) for plan in plans], point
++
++
++def test_next_window_between_engram_projection_and_all_gather(monkeypatch):
++    events = []
++
++    def all_gather(x):
++        events.append("all-gather")
++        return torch.cat([x, x], dim=-1)
++
++    def local_product(x):
++        events.append("gemm")
++        return torch.ones(x.shape[0], 4)
++
++    monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
++    cls = engram_module._PaddedColumnParallelLinear
++    linear = cls.__new__(cls)
++    torch.nn.Module.__init__(linear)
++    linear.gather_output, linear.tp_size = True, 2
++    linear.logical_output_size, linear.padded_output_size = 6, 8
++    linear.local_product = local_product
++
++    def hook(rows):
++        events.append(("next", rows))
++
++    kv = engram_module.project_rows(linear, torch.zeros(5, 3), hook)
++    assert events == ["gemm", ("next", 5), "all-gather"]
++    assert kv.shape == (5, 6)
++
++    # A replicated projection has no all-gather: the window follows the GEMM.
++    events.clear()
++
++    def replicated(x):
++        events.append("gemm")
++        return torch.ones(x.shape[0], 6)
++
++    engram_module.project_rows(replicated, torch.zeros(5, 3), hook)
++    assert events == ["gemm", ("next", 5)]
++
++
++class _Plan(tuple):
++    def describe(self):
++        return ", ".join(self)
++
++
++def _layer(*, owner=False, indexer=False, engram=False):
++    """A decoder layer's attributes ``build_l2_prefetch`` reads; projections are their
++    segment names."""
++    index = None
++    if owner or indexer:
++        index = SimpleNamespace(
++            wk="wk" if owner else None, wq_b="wq_b", weights_proj="hw"
++        )
++    attn = SimpleNamespace(
++        _wo_projection_weights=SimpleNamespace(l2_segments=lambda: ["wo"]),
++        compressor=SimpleNamespace(fused_wkv_wgate="wkv_wgate") if owner else None,
++        indexer=index,
++        fused_wqa_wkv="qa_kv",
++        wq_b="q_b",
++        _l2pf_comp=None,
++    )
++    return SimpleNamespace(
++        attn=attn,
++        hc_attn_fn=torch.empty(1),
++        ffn_norm=SimpleNamespace(),
++        attn_norm=SimpleNamespace(),
++        ffn=SimpleNamespace(
++            gate="gate",
++            shared_experts=SimpleNamespace(gate_up_proj="gate_up", down_proj="down"),
++            experts=SimpleNamespace(),
++        ),
++        engram=SimpleNamespace(wkv="engram_wkv", l2_prefetch_after_projection=None)
++        if engram
++        else None,
++    )
++
++
++@pytest.fixture
++def segments(monkeypatch):
++    monkeypatch.setattr(
++        l2_prefetch,
++        "param_segments",
++        lambda name, owner, attrs: [f"{name}.{attr}" for attr in attrs],
++    )
++    monkeypatch.setattr(
++        l2_prefetch,
++        "linear_segments",
++        lambda name, linear: [] if linear is None else [name],
++    )
++    monkeypatch.setattr(
++        l2_prefetch,
++        "make_plan",
++        lambda segs, budget, device: _Plan(segs) if segs else None,
++    )
++
++
++def test_owner_layer_gets_a_compressor_window(segments):
++    layer, nxt = _layer(owner=True), _layer()
++    DeepseekV4DecoderLayer.build_l2_prefetch(layer, nxt)
++    assert layer.attn._l2pf_comp == ("compressor",)
++    plain = _layer(indexer=True)
++    DeepseekV4DecoderLayer.build_l2_prefetch(plain, nxt)
++    assert plain.attn._l2pf_comp is None
++
++
++def test_engram_layer_moves_next_after_its_projection(segments, issued):
++    layer, nxt = _layer(), _layer(engram=True)
++    DeepseekV4DecoderLayer.build_l2_prefetch(layer, nxt)
++    layer.ffn.experts._l2_prefetch_pre_reduce_hook(6)
++    assert issued == [(("engram.wkv",), 6)]
++    issued.clear()
++    nxt.engram.l2_prefetch_after_projection(6)
++    (plan, rows), *rest = issued
++    assert not rest and rows == 6
++    assert plan[:4] == (
++        "mhc.hc_attn_fn_broadcast",
++        "mhc.hc_attn_fn",
++        "mhc.hc_attn_scale",
++        "mhc.hc_attn_base",
++    )
++    assert plan[-2:] == ("wqa_wkv", "wq_b")
++
++    # Any other next layer: NEXT on the MoE hook, no ENGRAM window.
++    issued.clear()
++    other = _layer()
++    DeepseekV4DecoderLayer.build_l2_prefetch(other, _layer(indexer=True))
++    other.ffn.experts._l2_prefetch_pre_reduce_hook(6)
++    (plan, _), *rest = issued
++    assert not rest and plan[-2:] == ("indexer.wq_b", "indexer.weights_proj")
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index e99dd2e24..f84c45d1b 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -499,6 +499,7 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+         overlap_epochs=None,
+         staged_rows=staged,
+         wkv=lambda rows: rows.repeat(1, 2),
++        l2_prefetch_after_projection=None,
+         norm_weights=None,
+         eps=1e-6,
+         hc_mult=streams,
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 028b7fc1b..71a78ec60 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -395,6 +395,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._wo_projection_weights = None
+         self._l2pf_wo = None
+         self._l2pf_ffn = None
++        self._l2pf_comp = None
+         for linear in (self.fused_wqa_wkv, self.wq_b):
+             _native_linear(linear)
+         # Q-B reads its input's MXFP8 cast from the input's producer: the front's one
+@@ -756,6 +757,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             else None
+         )
+         latent, slots = self.compressor(hidden_states, main, state)
++        self._issue_wo_prefetch(rows, after="compressor")
+         # Index K consumes the ordinary-normalized PRE-RoPE latent.
+         key = indexer.k_norm(indexer.wk(latent))
+         key = self._rope(key, positions, "index_key")
+@@ -876,7 +878,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr, kv, q_cast = front
+         with kernels.mxfp8_inputs(q_cast):
+             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+-        l2_prefetch.issue(self._l2pf_wo, rows)
++        self._issue_wo_prefetch(rows, after="q-b")
+         q = self._rope(q, positions, "q")
+         output = torch.empty_like(q)
+         metadata = cast(
+@@ -913,6 +915,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
++    def _issue_wo_prefetch(self, rows, *, after):
++        """Issue the WO window's L2 prefetch at its point in this layer's forward
++        (``l2_prefetch``): after Q-B, or right after the compressor in a layer that
++        owns one. There the compressor's projection between Q-B and WO-A would evict
++        WO's lines; the COMP window, the compressor's own weight, takes WO's place
++        after Q-B, and WO's fill queues behind it."""
++        if after == ("q-b" if self.compressor is None else "compressor"):
++            l2_prefetch.issue(self._l2pf_wo, rows)
++        if after == "q-b":
++            l2_prefetch.issue(self._l2pf_comp, rows)
++
+     def _index_query(
+         self, qr, positions, hidden_states, index_weights, first, last, swa
+     ):
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 477b20d7e..5f52017e1 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -53,14 +53,23 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+         self.logical_output_size = output_size
+         self.padded_output_size = padded
+         super().__init__(input_size, padded, **kwargs)
++        if self.bias is not None or self.return_bias:
++            raise ValueError("the padded Engram projection is bias-free")
+         if padded != output_size:
+             for name in ("weight", "weight_scale_inv", "weight_scale"):
+                 param = getattr(self, name, None)
+                 if param is not None:
+                     param.allow_tp_padding = True
+ 
+-    def forward(self, input_):
+-        output = super().forward(input_)
++    def forward(self, input_, after_product=None):
++        """The gathered product; ``after_product(rows)``, when given, runs between
++        this rank's GEMM and the all-gather. Bias-free: Engram's projection has
++        none."""
++        output = self.local_product(input_)
++        if after_product is not None:
++            after_product(input_.shape[0])
++        if self.gather_output and self.tp_size > 1:
++            output = tensor_model_parallel_all_gather(output)
+         if self.padded_output_size == self.logical_output_size:
+             return output
+         return output[..., : self.logical_output_size].contiguous()
+@@ -70,6 +79,18 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+         return self.quant_method.apply(self, input_, None)
+ 
+ 
++def project_rows(wkv, rows, after_projection=None):
++    """Engram's projection of ``rows``. ``after_projection(rows)``, when given, runs
++    between the GEMM and a column-parallel projection's all-gather (the model's NEXT
++    L2 prefetch window, ``build_l2_prefetch``), else after the GEMM."""
++    if isinstance(wkv, _PaddedColumnParallelLinear):
++        return wkv(rows, after_product=after_projection)
++    kv = wkv(rows)
++    if after_projection is not None:
++        after_projection(rows.shape[0])
++    return kv
++
++
+ logger = init_logger(__name__)
+ DEAD_ID = -1
+ 
+@@ -661,6 +682,10 @@ class Engram(nn.Module):
+         # The smallest forward the model runs sequence-parallel (0: never); the
+         # model sets it.
+         self.prefill_sp_min_rows = 0
++        # Called with the row count between the projection's GEMM and its
++        # all-gather: the model issues the layer's NEXT L2 prefetch window there
++        # (``build_l2_prefetch``).
++        self.l2_prefetch_after_projection = None
+         projection_tp = getattr(layout, "projection_tp", False)
+         projection_cls = (
+             _PaddedColumnParallelLinear if projection_tp else ReplicatedLinear
+@@ -864,7 +889,7 @@ class Engram(nn.Module):
+             kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
+             kv_start = 0
+         else:
+-            kv = self.wkv(rows)
++            kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
+             kv_start = 0 if sp_rows is None else sp_rows.start
+         state = hidden_states.flatten(1)
+         out = torch.empty_like(state)
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index 6301a373f..6c1ae0030 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -14,11 +14,32 @@ At a fixed eight-row verifier, TP4 decode cycles fall from 49.36 to 47.45 ms
+ (49.13 ms); WO alone is nearly neutral (49.12 ms) because the fill slows the
+ latency-bound sparse-MLA preparation kernels it overlaps.
+ 
+-Windows per decoder layer:
+-  WO    after the query up-projection: this layer's WO-A and WO-B
++Windows per decoder layer, in fill order on the one prefetch stream (a window
++issued while the one before it still fills starts when that one ends):
++  WO    after the query up-projection: this layer's WO-A and WO-B. A layer that
++        owns a compressor (and an indexer) issues it right after the compressor
++        instead: issued after Q-B, its lines did not survive the compressor's
++        projection, and WO-A ran at DRAM speed with its fill long done.
++  COMP  an owner layer's compressor projection, after Q-B in WO's place. (The
++        indexer's projections after it gained nothing in this window: the WO
++        fill behind it evicted them before they ran.)
+   FFN   before the attention all-reduce: router, mHC FFN mix, shared expert
+   NEXT  before the MoE all-reduce: next layer's mHC attention mix, fused
+-        Q-A/KV and Q-B projections, and indexer projections
++        Q-A/KV and Q-B projections, and indexer projections. An Engram layer
++        runs its projection before anything NEXT holds, and NEXT's lines did not
++        survive it: that layer issues NEXT between its Engram projection's GEMM
++        and all-gather instead.
++  ENGRAM  before the MoE all-reduce ahead of an Engram layer, in NEXT's place:
++        the first bytes of its Engram projection, over the all-reduce, mHC post
++        and row wait.
++
++A window issued before the lines of the one ahead of it are read evicts those
++unread lines: the consumers' reads keep the lines they read, so the unread ones
++are the oldest. Issuing WO right after the fused Q-A/KV or FFN between WO-A and
++WO-B made forty TP4 decode layers 8-10% slower on one GB10; the owner and Engram
++points made them 1.6% faster at one stream, 0.7% at eight and 0.3% at sixteen,
++spin kernels standing in for the attention core and all-reduces
++(experiments/2026-10-26-l2-prefetch-schedule in spark-ds41f).
+ 
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..95c0ecd7a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -255,6 +255,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+         for name in ("gate_up_proj", "down_proj"):
+             ffn += l2_prefetch.linear_segments(name, getattr(shared, name, None))
+         attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
++        if attn.compressor is not None:
++            # COMP: the compressor's projection, the first weight an owner layer
++            # reads after Q-B.
++            comp = l2_prefetch.linear_segments(
++                "compressor", attn.compressor.fused_wkv_wgate
++            )
++            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
+         plan_next = None
+         if nxt is not None:
+             segments = l2_prefetch.param_segments(
+@@ -273,18 +280,36 @@ class DeepseekV4DecoderLayer(nn.Module):
+                     f"indexer.{name}", getattr(indexer, name, None)
+                 )
+             plan_next = l2_prefetch.make_plan(segments, l2_prefetch.BUDGET_NEXT, device)
+-        if plan_next is not None:
++        plan_engram = None
++        engram = getattr(nxt, "engram", None)
++        if plan_next is not None and engram is not None:
++            # The next layer runs its Engram projection before anything NEXT holds,
++            # and NEXT's lines would not survive it: that layer issues NEXT between
++            # the projection and its all-gather, and this window prefetches the
++            # projection's first bytes over the latency-bound work before it.
++            plan_engram = l2_prefetch.make_plan(
++                l2_prefetch.linear_segments("engram.wkv", engram.wkv),
++                l2_prefetch.BUDGET_NEXT,
++                device,
++            )
++            engram.l2_prefetch_after_projection = (
++                lambda n, p=plan_next: l2_prefetch.issue(p, n)
++            )
++        hooked = plan_engram if plan_engram is not None else plan_next
++        if hooked is not None:
+             object.__setattr__(
+                 self.ffn.experts,
+                 "_l2_prefetch_pre_reduce_hook",
+-                lambda n, p=plan_next: l2_prefetch.issue(p, n),
++                lambda n, p=hooked: l2_prefetch.issue(p, n),
+             )
+         return " | ".join(
+             f"{label} {plan.describe() if plan else '-'}"
+             for label, plan in (
+                 ("WO", attn._l2pf_wo),
++                ("COMP", attn._l2pf_comp),
+                 ("FFN", attn._l2pf_ffn),
+                 ("NEXT", plan_next),
++                ("ENGRAM", plan_engram),
+             )
+         )
+ 

@@ -1,0 +1,512 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from collections.abc import Callable
+from dataclasses import InitVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, cast
+
+from pydantic import Field, field_validator
+from typing_extensions import Self
+
+from vllm.config.utils import config
+from vllm.logger import init_logger
+from vllm.utils.hashing import safe_hash
+from vllm.utils.import_utils import resolve_obj_by_qualname
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.interface import SchedulerInterface
+
+logger = init_logger(__name__)
+
+RunnerType = Literal["generate", "pooling", "draft"]
+SchedulerPolicy = Literal["fcfs", "priority"]
+PrefillComputeShare = Annotated[float, Field(gt=0.0, lt=1.0)] | Literal["auto"]
+PrefillComputeHalfLife = (
+    Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    | Literal["smooth", "responsive"]
+)
+MaxParallelPrefills = Annotated[int, Field(ge=1)] | Literal["auto"]
+PrefillPolicy = Literal["round-robin", "decode-aware"]
+DecodeRefillTarget = Annotated[int, Field(ge=1)] | Literal["auto"]
+PrefillYield = Literal["off", "short"]
+
+
+@config
+class SchedulerConfig:
+    """Scheduler configuration."""
+
+    max_model_len: InitVar[int]
+    """Maximum length of a sequence (including prompt and generated text).
+
+    Note: This is stored in the ModelConfig, and is used only here to
+    provide fallbacks and validate other attributes."""
+
+    is_encoder_decoder: InitVar[bool]
+    """True if the model is an encoder-decoder model.
+
+    Note: This is stored in the ModelConfig, and is used only here to
+    disable chunked prefill and prefix caching for encoder-decoder models.
+    """
+
+    DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
+    DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP: ClassVar[int] = 256
+    DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
+
+    runner_type: RunnerType = "generate"
+    """The runner type to launch for the model."""
+
+    max_num_batched_tokens: int = Field(default=DEFAULT_MAX_NUM_BATCHED_TOKENS, ge=1)
+    """Maximum number of tokens that can be processed in a single iteration.
+
+    The default value here is mainly for convenience when testing.
+    In real usage, this should be set in `EngineArgs.create_engine_config`.
+    """
+
+    max_num_scheduled_tokens: int | None = Field(default=None, ge=0)
+    """Maximum number of tokens that the scheduler may issue in a single iteration.
+    
+    This is usually equal to max_num_batched_tokens, but can be smaller in cases
+    when the model might append tokens into the batch (such as speculative decoding).
+    Defaults to max_num_batched_tokens."""
+
+    max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)
+    """Maximum number of sequences to be processed in a single iteration.
+
+    The default value here is mainly for convenience when testing.
+    In real usage, this should be set in `EngineArgs.create_engine_config`.
+    """
+
+    long_prefill_token_threshold: int = Field(default=0, ge=0)
+    """For chunked prefill, a request is considered long if the prompt is
+    longer than this number of tokens. 0 disables the cap (default)."""
+
+    align_prefill_chunks: bool = False
+    """Prefill chunks end at absolute multiples of `long_prefill_token_threshold`,
+    whatever else the step holds; otherwise a chunk takes whatever budget the
+    step's other requests leave. Set by models whose temperature-0 determinism
+    needs it (DeepSeek V4.1)."""
+
+    max_num_queued_reqs: int | None = Field(default=None, ge=0)
+    """Maximum number of requests that can be in-flight (waiting or running)
+    at the same time, or None for no limit. When the limit is reached, new
+    requests are rejected with HTTP 503 so the client can retry on another
+    instance. This bounds vLLM's otherwise unbounded request queue and is
+    primarily a coarse capacity valve.
+
+    Unlike ``max_num_seqs``, which applies per data-parallel rank, this
+    limit is enforced in the API server process and counts in-flight
+    requests across all DP ranks it routes to. Size it as roughly
+    ``data_parallel_size * max_num_seqs`` plus the desired queue depth if
+    it should not bind before per-rank admission does."""
+
+    max_num_queued_tokens: int | None = Field(default=None, ge=0)
+    """Maximum total prompt tokens of requests currently in the prefill
+    phase, or None for no limit. When the limit is reached, new requests
+    are rejected with HTTP 503.
+
+    This is a TTFT QoS mechanism: by setting it to
+    ``target_TTFT * prefill_throughput`` you reject requests when the
+    prefill backlog would exceed the latency target.  In a disaggregated
+    prefill-decode setup this maps directly to the prefill pool's
+    capacity.
+
+    Like ``max_num_queued_reqs``, this limit is enforced in the API
+    server process and covers the prefill backlog across all DP ranks it
+    routes to, so ``prefill_throughput`` in the formula above is the
+    aggregate throughput of the deployment.
+
+    Note: the count is conservative.  A partially prefilled request
+    still contributes its full ``prompt_len`` until it transitions out
+    of the prefill phase, because the scheduler's per-iteration
+    ``num_computed_tokens`` progress is not propagated to the API
+    server process during prefill (``EngineCoreOutput`` is only
+    emitted once the request starts producing tokens).  Similarly,
+    prefix-cache hits (``num_cached_tokens``) are only known to the
+    OutputProcessor after prefill completes.  This overestimates the
+    real backlog, causing earlier rejection than strictly necessary
+    — the safe direction for QoS.  The impact is limited to long
+    prompts under chunked prefill; short prompts that prefill in a
+    single iteration are unaffected."""
+
+    enable_chunked_prefill: bool = True
+    """If True, prefill requests can be chunked based
+    on the remaining `max_num_batched_tokens`.
+
+    The default value here is mainly for convenience when testing.
+    In real usage, this should be set in `EngineArgs.create_engine_config`.
+    """
+
+    is_multimodal_model: bool = False
+    """True if the model is multimodal."""
+
+    # TODO (ywang96): Make this configurable.
+    max_num_encoder_input_tokens: int = Field(init=False)
+    """Multimodal encoder compute budget, only used in V1.
+
+    NOTE: This is not currently configurable. It will be overridden by
+    max_num_batched_tokens in case max multimodal embedding size is larger."""
+
+    # TODO (ywang96): Make this configurable.
+    encoder_cache_size: int = Field(init=False)
+    """Multimodal encoder cache size, only used in V1.
+
+    NOTE: This is not currently configurable. It will be overridden by
+    max_num_batched_tokens in case max multimodal embedding size is larger."""
+
+    policy: SchedulerPolicy = "fcfs"
+    """The scheduling policy to use:
+
+    - "fcfs" means first come first served, i.e. requests are handled in order 
+      of arrival.
+    - "priority" means requests are handled based on given priority (lower
+      value means earlier handling) and time of arrival deciding any ties)."""
+
+    disable_chunked_mm_input: bool = False
+    """If set to true and chunked prefill is enabled, we do not want to
+    partially schedule a multimodal item. Only used in V1
+    This ensures that if a request has a mixed prompt
+    (like text tokens TTTT followed by image tokens IIIIIIIIII) where only
+    some image tokens can be scheduled (like TTTTIIIII, leaving IIIII),
+    it will be scheduled as TTTT in one step and IIIIIIIIII in the next."""
+
+    # scheduler class or path. "vllm.v1.core.sched.scheduler.Scheduler"
+    # (default) or "mod.custom_class".
+    scheduler_cls: str | type[object] | None = None
+    """The scheduler class to use. "vllm.v1.core.sched.scheduler.Scheduler" is
+    the default scheduler. Can be a class directly or the path to a class of
+    form "mod.custom_class"."""
+
+    disable_hybrid_kv_cache_manager: bool | None = None
+    """If set to True, KV cache manager will allocate the same size of KV cache
+    for all attention layers even if there are multiple type of attention layers
+    like full attention and sliding window attention.
+    If set to None, the default value will be determined based on the environment
+    and starting configuration.
+    """
+
+    scheduler_reserve_full_isl: bool = True
+    """If True, the scheduler checks whether the full input sequence length
+    fits in the KV cache before admitting a new request, rather than only
+    checking the first chunk. Prevents over-admission and KV cache thrashing
+    with chunked prefill."""
+
+    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """Fraction of total KV cache blocks to keep free (the watermark) when
+    admitting waiting or preempted requests into the running queue. This headroom
+    helps avoid frequent KV cache eviction and the resulting repeated preemption
+    of requests when GPU memory is scarce. Must be in the range [0.0, 1.0); 0.0
+    (the default) disables the watermark."""
+
+    prefill_schedule_interval: int = Field(default=1, ge=1)
+    """Schedule prefill work once every N engine steps while decode requests
+    are running. Data-parallel engines align the cadence across DP ranks."""
+
+    prefill_compute_share: PrefillComputeShare | None = None
+    """Target fraction of contended model-execution time assigned to prefill.
+
+    ``auto`` balances observed decode delay against local-prefill slowdown.
+    Numeric values must be strictly between zero and one. When unset, scheduling
+    behavior is unchanged.
+    """
+
+    prefill_compute_half_life: PrefillComputeHalfLife | None = None
+    """Response half-life in seconds for automatic prefill compute sharing.
+
+    ``smooth`` selects 2 seconds and ``responsive`` selects 0.5 seconds. When
+    omitted in auto mode, ``smooth`` is used. This setting is invalid outside
+    auto mode.
+    """
+
+    max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Maximum local prefill tokens in a contended compute-share step.
+
+    Zero keeps the normal batched-token budget. Decode-only and uncontended
+    prefill steps are unchanged.
+    """
+
+    max_parallel_prefills: MaxParallelPrefills = 1
+    """Maximum local prefills that may share one model step.
+
+    ``auto`` enables fair round-robin service for at most four prefills and
+    caps that count by ``max_num_seqs``. The scheduler's normal token budget
+    limits actual work, so this remains independent of cache block size and
+    ``max_num_batched_tokens``. A lone prefill retains the full token budget
+    and unused shares are redistributed within the step. ``1`` preserves
+    legacy behavior.
+    """
+
+    prefill_policy: PrefillPolicy = "round-robin"
+    """Select prefills when parallel prefill service is enabled.
+
+    ``round-robin`` gives every queued prefill bounded progress.
+    ``decode-aware`` reserves one parallel lane for the prefill nearest to
+    decode while runnable decode occupancy is below the effective parallel
+    prefill count; remaining lanes continue round-robin service.
+    """
+
+    decode_refill_target: DecodeRefillTarget = "auto"
+    """Runnable decode count maintained by ``decode-aware`` prefill selection.
+
+    ``auto`` uses the effective parallel-prefill count. An explicit value is
+    useful for workload qualification; it must not exceed ``max_num_seqs``.
+    This setting is ignored by ``round-robin`` when left at ``auto``.
+    """
+
+    prefill_yield: PrefillYield = "off"
+    """Which work a long prompt's prefill chunk yields its step to.
+
+    With aligned prefill chunks a long prompt's whole chunk takes the step's
+    budget beside the decode rows, so a request that arrives while it prefills
+    waits for its last chunk. ``short`` lets a step that would carry such a
+    chunk carry instead the waiting prompts whose prefill finishes within one
+    chunk, and, with sink rejection, the first decode step of a prompt that
+    just finished prefilling (it releases the held first token). The long
+    prompt's chunks keep their boundaries; only the step a chunk runs in
+    changes. ``off`` keeps first-come-first-served prefill.
+    """
+
+    prefill_yield_limit_s: float = Field(default=10.0, gt=0)
+    """With ``prefill_yield``: a long prefill that has yielded this long stops
+    yielding until its next chunk runs."""
+
+    prefill_decode_interleave_steps: int = Field(default=0, ge=0)
+    """Number of graphed decode steps to interleave between multi-chunk prefill
+    chunks while decode requests are runnable.
+
+    During interleaved decode steps, the in-progress long prefill chunk is
+    deferred via ``defer_prefills`` while active decode streams advance, and
+    any waiting prompt whose prefill finishes within one chunk is also admitted.
+    ``0`` disables decode interleaving between prefill chunks.
+    """
+
+    prefill_step_target_s: float = Field(default=0.0, ge=0.0)
+    """Target maximum duration (seconds) of a mixed prefill + decode step when
+    ``align_prefill_chunks`` is enabled and decode requests are runnable.
+
+    When ``num_runnable_decodes == 0`` (solo prefill) or
+    ``prefill_step_target_s == 0``, the full ``long_prefill_token_threshold``
+    is used so solo prefill speed is unchanged. When ``num_runnable_decodes > 0``
+    and ``prefill_step_target_s > 0``, ``_aligned_prefill_chunk`` chooses a
+    context-aware threshold ``T(c) in {2048, 4096, 8192, long_prefill_token_threshold}``
+    on the absolute ``prefill_chunk_grid`` grid to keep single-step stalls
+    bounded within ``prefill_step_target_s``.
+    """
+
+    prefill_chunk_grid: int = Field(default=2048, ge=1)
+    """Absolute token grid used by context-aware step-time budgeting when
+    ``prefill_step_target_s > 0`` and decode requests are runnable.
+    """
+
+    async_scheduling: bool | None = None
+    """If set to False, disable async scheduling. Async scheduling helps to
+    avoid gaps in GPU utilization, leading to better latency and throughput.
+    """
+
+    stream_interval: int = Field(default=1, ge=1)
+    """The interval (or buffer size) for streaming in terms of token length.
+    A smaller value (1) makes streaming smoother by sending each token immediately,
+    while a larger value (e.g., 10) reduces host overhead and may increase throughput
+    by batching multiple tokens before sending."""
+
+    @staticmethod
+    def default_factory(**kwargs):
+        """
+        Factory method to create `SchedulerConfig` with default values for `InitVar`s.
+        """
+        if "max_model_len" not in kwargs:
+            kwargs["max_model_len"] = 8192
+        if "is_encoder_decoder" not in kwargs:
+            kwargs["is_encoder_decoder"] = False
+        return SchedulerConfig(**kwargs)
+
+    def get_scheduler_cls(self) -> type["SchedulerInterface"]:
+        if self.scheduler_cls is None:
+            if self.async_scheduling:
+                from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+                return AsyncScheduler
+            from vllm.v1.core.sched.scheduler import Scheduler
+
+            return Scheduler
+
+        # The first half of this warning can be removed once the Scheduler interface is
+        # finalized and we can maintain support for scheduler classes that implement it
+        logger.warning_once(
+            "Using custom scheduler class %s. This scheduler interface is not public "
+            "and compatibility may not be maintained. If you have subclassed Scheduler "
+            "instead of AsyncScheduler, you will see degraded performance due to async "
+            "scheduling being disabled.",
+            self.scheduler_cls,  # type: ignore[arg-type]
+        )
+        if not isinstance(self.scheduler_cls, str):
+            return cast(type["SchedulerInterface"], self.scheduler_cls)
+        return resolve_obj_by_qualname(self.scheduler_cls)
+
+    def compute_hash(self) -> str:
+        """
+        WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
+
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        factors: list[Any] = []
+
+        # max_num_batched_tokens need to be included in the hash due
+        # to two reasons:
+        # 1. LoRA creates static buffers based on max_num_batched_tokens.
+        #   The tensor sizes and strides get captured in the torch.compile
+        #   graph explicitly.
+        # 2. Inductor decides whether using 32-bit or 64-bit indexing integer
+        #   based on the data sizes. `max_num_batched_tokens` has an
+        #   impact on that. For more details, please check
+        #   https://github.com/vllm-project/vllm/issues/29585
+        factors.append(self.max_num_batched_tokens)
+
+        # PLE and other model components allocate static per-request buffers.
+        # Their shapes are captured in compiled graphs.
+        factors.append(self.max_num_seqs)
+
+        hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+        return hash_str
+
+    @field_validator("scheduler_cls", "async_scheduling", mode="wrap")
+    @classmethod
+    def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
+        """Skip validation if the value is `None` when initialisation is delayed."""
+        return None if value is None else handler(value)
+
+    def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if (
+            self.prefill_compute_half_life is not None
+            and self.prefill_compute_share != "auto"
+        ):
+            raise ValueError(
+                "prefill_compute_half_life requires prefill_compute_share='auto'"
+            )
+        if (
+            self.prefill_compute_share is not None
+            and self.prefill_schedule_interval > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share cannot be combined with "
+                "prefill_schedule_interval greater than one"
+            )
+        if (
+            self.max_num_prefill_tokens_per_step > 0
+            and self.prefill_compute_share is None
+        ):
+            raise ValueError(
+                "max_num_prefill_tokens_per_step requires prefill_compute_share"
+            )
+        if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
+            raise ValueError(
+                "max_num_prefill_tokens_per_step cannot exceed max_num_batched_tokens"
+            )
+        if (
+            isinstance(self.max_parallel_prefills, int)
+            and self.max_parallel_prefills > self.max_num_seqs
+        ):
+            raise ValueError("max_parallel_prefills cannot exceed max_num_seqs")
+        interleaving_enabled = self.max_parallel_prefills != 1
+        if not interleaving_enabled and self.prefill_policy != "round-robin":
+            raise ValueError(
+                "prefill_policy requires max_parallel_prefills greater than one"
+            )
+        if (
+            isinstance(self.decode_refill_target, int)
+            and self.decode_refill_target > self.max_num_seqs
+        ):
+            raise ValueError("decode_refill_target cannot exceed max_num_seqs")
+        if (
+            self.prefill_yield != "off"
+            or self.prefill_decode_interleave_steps > 0
+            or self.prefill_step_target_s > 0
+        ) and (
+            interleaving_enabled
+            or self.prefill_compute_share is not None
+            or self.prefill_schedule_interval > 1
+        ):
+            raise ValueError(
+                "prefill_yield, prefill_decode_interleave_steps, and "
+                "prefill_step_target_s replace prefill lanes, compute sharing "
+                "and the prefill schedule interval; set none of them with it"
+            )
+        if (
+            self.prefill_policy != "decode-aware"
+            and self.decode_refill_target != "auto"
+        ):
+            raise ValueError(
+                "decode_refill_target requires prefill_policy='decode-aware'"
+            )
+        if interleaving_enabled and not self.enable_chunked_prefill:
+            raise ValueError(
+                "prefill interleaving requires enable_chunked_prefill=True"
+            )
+
+        if is_encoder_decoder:
+            if interleaving_enabled:
+                raise ValueError(
+                    "prefill interleaving does not support encoder-decoder models"
+                )
+            # Chunked prefill should be disabled for encoder-decoder models.
+            self.disable_chunked_mm_input = True
+            self.enable_chunked_prefill = False
+            self.long_prefill_token_threshold = 0
+            logger.info(
+                "Encoder-decoder models do not support chunked prefill nor"
+                " prefix caching; disabling both."
+            )
+
+        self.max_num_encoder_input_tokens = self.max_num_batched_tokens
+        self.encoder_cache_size = self.max_num_batched_tokens
+
+        if self.enable_chunked_prefill:
+            logger.info_once(
+                "Chunked prefill is enabled with max_num_batched_tokens=%d.",
+                self.max_num_batched_tokens,
+            )
+
+        self.verify_max_model_len(max_model_len)
+
+    def verify_max_model_len(self, max_model_len: int) -> Self:
+        if (
+            self.max_num_batched_tokens < max_model_len
+            and not self.enable_chunked_prefill
+        ):
+            raise ValueError(
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) is "
+                f"smaller than max_model_len ({max_model_len}). "
+                "This effectively limits the maximum sequence length to "
+                "max_num_batched_tokens and makes vLLM reject longer "
+                "sequences. Please increase max_num_batched_tokens or "
+                "decrease max_model_len."
+            )
+
+        if self.max_num_batched_tokens < self.max_num_seqs:
+            raise ValueError(
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) must "
+                "be greater than or equal to max_num_seqs "
+                f"({self.max_num_seqs})."
+            )
+
+        if self.max_num_batched_tokens > self.max_num_seqs * max_model_len:
+            logger.warning(
+                "max_num_batched_tokens (%d) exceeds max_num_seqs "
+                "* max_model_len (%d). This may lead to unexpected behavior.",
+                self.max_num_batched_tokens,
+                self.max_num_seqs * max_model_len,
+            )
+
+        if self.long_prefill_token_threshold > max_model_len:
+            raise ValueError(
+                "long_prefill_token_threshold "
+                f"({self.long_prefill_token_threshold}) cannot be greater "
+                f"than the max_model_len ({max_model_len})."
+            )
+
+        return self

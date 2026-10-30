@@ -1,0 +1,447 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""``predict`` and ``calibrate_confidence_probs`` write one probability into two
+index spaces at once.
+
+Adaptive verification reads the estimate in this step's batch order, while the
+next step's refit reads it in persistent request-state slots. A mix-up between
+the two is silent -- every value stays a plausible probability, it just belongs
+to another request -- so it is asserted here rather than left to acceptance
+metrics to hint at.
+"""
+
+import pytest
+import torch
+
+from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
+
+pytest.importorskip("triton")
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required for acceptance estimator tests", allow_module_level=True)
+
+MAX_NUM_REQS = 16
+NUM_STEPS = 4
+VOCAB_SIZE = 2048
+
+
+def _make_estimator(device: torch.device) -> OnlineAcceptanceEstimator:
+    estimator = OnlineAcceptanceEstimator(MAX_NUM_REQS, NUM_STEPS, device)
+    # Distinct per-position intercepts, so reading the wrong one shows up.
+    estimator.slope.fill_(0.7)
+    estimator.intercepts[:] = torch.tensor([1.5, 1.0, 0.5, 0.0], device=device)
+    return estimator
+
+
+def _expected_probs(
+    estimator: OnlineAcceptanceEstimator,
+    logits: torch.Tensor,
+    steps: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor:
+    """logit(q_max) by a different route than the kernel takes.
+
+    The kernel shifts by the max and drops the unit term; here the argmax is
+    masked out and the complement is reduced with logsumexp, so agreement is
+    evidence about the value rather than about a shared formula.
+    """
+    temp = torch.where(temperature > 0, temperature, torch.ones_like(temperature))
+    scaled = logits.double() / temp[:, None].double()
+    top = scaled.max(dim=-1)
+    rest = scaled.scatter(1, top.indices[:, None], float("-inf"))
+    feature = (top.values - torch.logsumexp(rest, dim=-1)).clamp(-40.0, 40.0)
+    weight, bias = estimator.slope, estimator.intercepts
+    return torch.sigmoid(weight.double() * feature + bias[steps].double()).float()
+
+
+@pytest.mark.parametrize("tokens_per_req", [1, NUM_STEPS])
+def test_predict_agrees_across_slot_and_batch_order(tokens_per_req: int):
+    """One row per request (per-step drafting) and a whole block at once.
+
+    Which one it is is inferred from whether the draft step is per-row, so the
+    two cases differ only in how ``draft_step`` is shaped.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    estimator = _make_estimator(device)
+    num_reqs = 5
+
+    # Batch position i holds a shuffled persistent slot, as a served batch would.
+    slots = torch.randperm(MAX_NUM_REQS, device=device)[:num_reqs].to(torch.int32)
+    if tokens_per_req == 1:
+        idx_mapping = slots
+        draft_step = torch.tensor(2, device=device, dtype=torch.int32)
+        steps = draft_step.expand(num_reqs)
+    else:
+        idx_mapping = slots.repeat_interleave(NUM_STEPS)
+        draft_step = torch.arange(NUM_STEPS, device=device, dtype=torch.int32).repeat(
+            num_reqs
+        )
+        steps = draft_step
+    batch_rows = torch.arange(num_reqs, device=device).repeat_interleave(tokens_per_req)
+    logits = torch.randn(idx_mapping.shape[0], VOCAB_SIZE, device=device) * 4.0
+
+    confidence_probs = torch.zeros(MAX_NUM_REQS, NUM_STEPS, device=device)
+    temperature = torch.rand(MAX_NUM_REQS, device=device) + 0.5
+    estimator.predict(logits, idx_mapping, draft_step, confidence_probs, temperature)
+
+    expected = _expected_probs(
+        estimator, logits, steps.long(), temperature[idx_mapping.long()]
+    )
+    torch.testing.assert_close(
+        estimator.predictions[idx_mapping.long(), steps.long()],
+        expected,
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        confidence_probs[batch_rows, steps.long()], expected, atol=2e-3, rtol=2e-3
+    )
+
+
+def test_predict_skips_cudagraph_padded_rows():
+    """Padded rows carry slot -1 and must not land on a live request."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    estimator = _make_estimator(device)
+    num_reqs, num_padded = 3, 6
+
+    slots = torch.tensor([7, 2, 11], device=device, dtype=torch.int32)
+    idx_mapping = torch.cat(
+        [slots, torch.full((num_padded,), -1, device=device, dtype=torch.int32)]
+    )
+    draft_step = torch.tensor(1, device=device, dtype=torch.int32)
+    logits = torch.randn(num_reqs + num_padded, VOCAB_SIZE, device=device) * 4.0
+
+    confidence_probs = torch.zeros(MAX_NUM_REQS, NUM_STEPS, device=device)
+    temperature = torch.rand(MAX_NUM_REQS, device=device) + 0.5
+    estimator.predict(logits, idx_mapping, draft_step, confidence_probs, temperature)
+
+    live = (slots.long(), torch.full((num_reqs,), 1, device=device))
+    expected = _expected_probs(
+        estimator, logits[:num_reqs], live[1], temperature[slots.long()]
+    )
+    torch.testing.assert_close(
+        estimator.predictions[live], expected, atol=2e-3, rtol=2e-3
+    )
+    # Nothing outside the live (request, position) cells was touched.
+    untouched = torch.ones(MAX_NUM_REQS, NUM_STEPS, dtype=torch.bool, device=device)
+    untouched[live] = False
+    assert not estimator.predictions[untouched].any()
+    assert not confidence_probs[num_reqs:].any()
+
+
+# A refit takes one undamped Newton step, so it needs a realistic number of
+# observations per round to be well conditioned -- a handful of requests can
+# send the step far past the optimum. This is the batch a served step sees.
+REFIT_NUM_REQS = 512
+
+
+def _drive_round(estimator, features, num_accepted, slots):
+    """Feed one step's graded drafts through predict's buffers into `step`."""
+    estimator.features[slots.long()] = features
+    estimator.predictions[slots.long()] = torch.sigmoid(
+        estimator.slope * features + estimator.intercepts
+    )
+    estimator.step(
+        slots,
+        (num_accepted + 1).to(torch.int32),
+        (features.shape[1] - num_accepted).to(torch.int32),
+    )
+
+
+def test_refit_recovers_a_shared_slope_and_per_position_intercepts():
+    """The fit must find the logistic that generated the observations.
+
+    One slope is shared across draft positions and each keeps its own intercept,
+    so the arrowhead solve is only correct if it recovers both from data whose
+    positions differ in level but not in slope.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    true_slope = 0.6
+    true_bias = torch.tensor([1.4, 0.9, 0.4, -0.1], device=device)
+
+    estimator = OnlineAcceptanceEstimator(REFIT_NUM_REQS, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 5
+    slots = torch.arange(REFIT_NUM_REQS, device=device, dtype=torch.int32)
+    for _ in range(60):
+        features = torch.rand(REFIT_NUM_REQS, NUM_STEPS, device=device) * 8.0
+        accepted = torch.rand_like(features) < torch.sigmoid(
+            true_slope * features + true_bias
+        )
+        # Verification stops at the first rejection, so a position's label is
+        # conditional on every shallower one having been accepted.
+        num_accepted = (~accepted).float().argmax(dim=1)
+        num_accepted[accepted.all(dim=1)] = NUM_STEPS
+        _drive_round(estimator, features, num_accepted, slots)
+
+    slope, bias = estimator.slope, estimator.intercepts
+    torch.testing.assert_close(
+        slope[0], torch.tensor(true_slope, device=device), atol=0.1, rtol=0
+    )
+    torch.testing.assert_close(bias, true_bias, atol=0.3, rtol=0)
+
+
+def test_refit_survives_a_position_with_no_observations():
+    """A draft position nobody reached must not stall the shared slope.
+
+    Its statistics stay zero while the others accumulate, which is the degenerate
+    case the arrowhead denominator has to tolerate.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    estimator = OnlineAcceptanceEstimator(REFIT_NUM_REQS, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 5
+    slots = torch.arange(REFIT_NUM_REQS, device=device, dtype=torch.int32)
+    before_slope = estimator.slope.clone()
+    before_intercepts = estimator.intercepts.clone()
+
+    # Every request is rejected at position 1, so positions 2+ are never graded.
+    num_accepted = torch.ones(REFIT_NUM_REQS, device=device)
+    for _ in range(20):
+        features = torch.rand(REFIT_NUM_REQS, NUM_STEPS, device=device) * 8.0
+        _drive_round(estimator, features, num_accepted, slots)
+
+    assert estimator.slope.isfinite().all()
+    assert estimator.intercepts.isfinite().all()
+    assert not torch.equal(estimator.slope, before_slope), "slope never moved"
+    # Positions 2 and 3 were never observed, so their intercepts must be untouched.
+    torch.testing.assert_close(
+        estimator.intercepts[2:], before_intercepts[2:], rtol=0, atol=0
+    )
+
+
+def test_step_damping_scales_with_the_evidence():
+    """A round moves a coefficient in proportion to the samples behind it.
+
+    The Newton step itself barely changes with how much data a round carries --
+    curvature and score both scale with it -- so scaling a round's statistics
+    isolates the damping factor n / (n + DAMPING_OBSERVATIONS). The slope/
+    intercept coupling is zeroed so the two parameters can be checked apart.
+    """
+    device = torch.device("cuda")
+    damping = OnlineAcceptanceEstimator.DAMPING_OBSERVATIONS
+    per_position_n = 20.0
+
+    def refit_with(scale):
+        estimator = OnlineAcceptanceEstimator(MAX_NUM_REQS, NUM_STEPS, device)
+        estimator.info[:, 1] = 0.0  # sum(w*margin): no slope/intercept coupling
+        estimator.info[:, 2] = 1.0 * scale  # sum(w)
+        estimator.grad[:, 1] = 0.5 * scale  # sum(y - p)
+        # The slope's information and score are accumulated as per-position
+        # partials that the refit sums, so spread each total over the positions.
+        estimator.info[:, 0] = 30.0 * scale / NUM_STEPS  # sum(w*margin^2)
+        estimator.grad[:, 0] = 2.0 * scale / NUM_STEPS  # sum((y - p)*margin)
+        estimator.counts[:] = per_position_n * scale
+        estimator._steps_since_refit = estimator.REFIT_INTERVAL - 1
+        before_slope = estimator.slope.clone()
+        before_intercepts = estimator.intercepts.clone()
+        empty = torch.zeros(0, dtype=torch.int32, device=device)
+        estimator.step(empty, empty, empty)
+        return (
+            (estimator.slope - before_slope)[0].item(),
+            (estimator.intercepts - before_intercepts)[0].item(),
+        )
+
+    for scale in (1.0, 10.0, 100.0):
+        total_n = per_position_n * scale * NUM_STEPS
+        slope_delta, bias_delta = refit_with(scale)
+        assert slope_delta == pytest.approx(
+            (2.0 / 30.0) * total_n / (total_n + damping), rel=1e-3
+        )
+        assert bias_delta == pytest.approx(
+            0.5 * (per_position_n * scale) / (per_position_n * scale + damping),
+            rel=1e-3,
+        )
+
+    # A round with no observations at all must leave the coefficients alone.
+    assert refit_with(0.0) == (0.0, 0.0)
+
+
+def test_feature_ignores_which_token_was_drawn():
+    """The score must depend on the draft distribution, not on the draw.
+
+    This is what keeps rejection sampling lossless: if the score read the drawn
+    token, trimming a draft would condition on the token being trimmed and tilt
+    the emitted distribution toward the drafter's confident modes. ``predict``
+    takes no token argument, and this pins that -- two rows with identical
+    logits must score identically no matter what was sampled from them.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    estimator = _make_estimator(device)
+
+    row = torch.randn(VOCAB_SIZE, device=device) * 4.0
+    logits = row.expand(2, VOCAB_SIZE).contiguous()
+    idx_mapping = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    draft_step = torch.tensor(0, device=device, dtype=torch.int32)
+    temperature = torch.ones(MAX_NUM_REQS, device=device)
+    confidence_probs = torch.zeros(MAX_NUM_REQS, NUM_STEPS, device=device)
+
+    estimator.predict(logits, idx_mapping, draft_step, confidence_probs, temperature)
+    assert estimator.features[0, 0] == estimator.features[1, 0]
+
+    # And the value is the top token's log-odds, not the top-2 margin.
+    scaled = row.double()
+    top = scaled.max(dim=-1)
+    rest = scaled.scatter(0, top.indices[None], float("-inf"))
+    torch.testing.assert_close(
+        estimator.features[0, 0].double(),
+        (top.values - torch.logsumexp(rest, dim=-1)).clamp(-40.0, 40.0),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+
+
+def test_refit_stays_bounded_after_a_confidently_wrong_draft():
+    """One confidently wrong draft must not end drafting.
+
+    A draft predicted near certain carries almost no IRLS weight, so dividing
+    its residual by that weight plus the small ridge moved the position-0
+    intercept by about -20 in one refit. Every later prediction then rounded
+    to ~1e-8, adaptive verification admitted no drafts, and no graded drafts
+    arrived to move it back.
+    """
+    device = torch.device("cuda")
+    estimator = OnlineAcceptanceEstimator(MAX_NUM_REQS, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 1
+    before = estimator.intercepts.clone()
+    slots = torch.zeros(1, dtype=torch.int32, device=device)
+    features = torch.full((1, NUM_STEPS), 30.0, device=device)
+    _drive_round(estimator, features, torch.zeros(1, device=device), slots)
+
+    typical = torch.sigmoid(estimator.slope * 3.0 + estimator.intercepts[0])
+    assert typical.item() > 0.05
+    step = (estimator.intercepts - before).abs().max().item()
+    assert step <= estimator.MAX_STEP + 1e-6
+
+
+def test_for_confidence_head_starts_as_identity_on_probabilities():
+    """Before any refit, calibrating confidence_head probabilities must return
+    the exact head probabilities while recording logit(p_head) as the feature."""
+    device = torch.device("cuda")
+    estimator = OnlineAcceptanceEstimator.for_confidence_head(
+        MAX_NUM_REQS, 5, device
+    )
+    assert estimator.slope.item() == pytest.approx(1.0)
+    assert torch.all(estimator.intercepts == 0.0)
+
+    raw_probs = torch.tensor(
+        [
+            [0.78, 0.72, 0.71, 0.71, 0.73],
+            [0.65, 0.54, 0.44, 0.30, 0.20],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    probs = raw_probs.clone()
+    slots = torch.tensor([5, 11], dtype=torch.int32, device=device)
+    idx_mapping = slots.repeat_interleave(5)
+    estimator.calibrate_confidence_probs(probs, idx_mapping)
+
+    torch.testing.assert_close(probs, raw_probs, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        estimator.predictions[slots.long()], raw_probs, atol=1e-6, rtol=1e-6
+    )
+    expected_logits = torch.log(raw_probs / (1.0 - raw_probs))
+    torch.testing.assert_close(
+        estimator.features[slots.long()], expected_logits, atol=1e-5, rtol=1e-5
+    )
+
+
+def test_calibrate_confidence_probs_skips_cudagraph_padded_rows():
+    """Padded rows carry slot -1 in sample_idx_mapping and must not overwrite
+    live persistent request slots."""
+    device = torch.device("cuda")
+    estimator = OnlineAcceptanceEstimator.for_confidence_head(
+        MAX_NUM_REQS, NUM_STEPS, device
+    )
+    estimator.slope.fill_(0.85)
+    estimator.intercepts[:] = torch.tensor([0.0, -0.3, -0.7, -1.1], device=device)
+
+    num_live, num_padded = 2, 2
+    total_reqs = num_live + num_padded
+    raw_probs = torch.full((total_reqs, NUM_STEPS), 0.72, device=device)
+    probs = raw_probs.clone()
+    live_slots = torch.tensor([3, 9], dtype=torch.int32, device=device)
+    padded_slots = torch.full((num_padded,), -1, dtype=torch.int32, device=device)
+    idx_mapping = torch.cat([live_slots, padded_slots]).repeat_interleave(NUM_STEPS)
+
+    estimator.calibrate_confidence_probs(probs, idx_mapping)
+
+    expected_f = torch.log(raw_probs[:num_live] / (1.0 - raw_probs[:num_live]))
+    expected_p = torch.sigmoid(estimator.slope * expected_f + estimator.intercepts)
+    torch.testing.assert_close(probs[:num_live], expected_p, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        estimator.predictions[live_slots.long()], expected_p, atol=1e-5, rtol=1e-5
+    )
+    untouched = torch.ones(MAX_NUM_REQS, dtype=torch.bool, device=device)
+    untouched[live_slots.long()] = False
+    assert not estimator.predictions[untouched].any()
+    assert not estimator.features[untouched].any()
+
+
+def test_online_calibration_corrects_overconfident_dspark_tail_survival():
+    """When DSpark parallel drafting causes errors to compound at positions 2..4,
+    online IRLS calibration shifts tail intercepts negative so calibrated
+    survival matches empirical target acceptance."""
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    num_steps = 5
+    estimator = OnlineAcceptanceEstimator.for_confidence_head(
+        REFIT_NUM_REQS, num_steps, device
+    )
+    estimator.REFIT_INTERVAL = 5
+    slots = torch.arange(REFIT_NUM_REQS, device=device, dtype=torch.int32)
+    idx_mapping = slots.repeat_interleave(num_steps)
+
+    # Static confidence head predicts ~[0.78, 0.72, 0.71, 0.71, 0.73], while
+    # true conditional acceptance decays faster at positions 2..4 due to
+    # parallel mask-token compounding and temperature-1.0 target verification.
+    head_means = torch.tensor([0.78, 0.72, 0.71, 0.71, 0.73], device=device)
+    true_bias = torch.tensor([-0.60, -0.75, -1.10, -1.05, -0.95], device=device)
+    true_slope = 0.90
+
+    for _ in range(40):
+        # Sample per-request head confidences around head_means in logit space.
+        head_logits = torch.log(head_means / (1.0 - head_means)) + 0.5 * torch.randn(
+            REFIT_NUM_REQS, num_steps, device=device
+        )
+        raw_probs = torch.sigmoid(head_logits)
+        probs = raw_probs.clone()
+        estimator.calibrate_confidence_probs(probs, idx_mapping)
+
+        true_cond_probs = torch.sigmoid(true_slope * head_logits + true_bias)
+        accepted = torch.rand_like(true_cond_probs) < true_cond_probs
+        num_accepted = (~accepted).float().argmax(dim=1)
+        num_accepted[accepted.all(dim=1)] = num_steps
+        estimator.step(
+            slots,
+            (num_accepted + 1).to(torch.int32),
+            (num_steps - num_accepted).to(torch.int32),
+        )
+
+    # Tail intercepts at positions 2, 3, 4 must become strongly negative.
+    assert estimator.intercepts[2].item() < -0.5
+    assert estimator.intercepts[3].item() < -0.5
+    assert estimator.intercepts[4].item() < -0.4
+
+    # Evaluate calibrated survival vs empirical survival on a test batch at head_means.
+    test_probs = head_means.unsqueeze(0).clone()
+    estimator.calibrate_confidence_probs(
+        test_probs, torch.zeros(num_steps, dtype=torch.int32, device=device)
+    )
+    calibrated_survival = torch.cumprod(test_probs[0], dim=0)
+    head_logits_mean = torch.log(head_means / (1.0 - head_means))
+    true_survival = torch.cumprod(
+        torch.sigmoid(true_slope * head_logits_mean + true_bias), dim=0
+    )
+    uncalibrated_survival = torch.cumprod(head_means, dim=0)
+
+    # Uncalibrated tail survival at pos 3/4 is >0.20, while calibrated survival
+    # tracks true survival (<0.09 at pos 3, <0.05 at pos 4) within 0.03.
+    assert uncalibrated_survival[3].item() > 0.25
+    assert calibrated_survival[3].item() < 0.11
+    torch.testing.assert_close(calibrated_survival, true_survival, atol=0.03, rtol=0)

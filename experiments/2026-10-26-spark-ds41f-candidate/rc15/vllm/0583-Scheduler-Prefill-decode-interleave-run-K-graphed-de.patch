@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:38:33 +0100
+Subject: [PATCH 583/583] [Scheduler] Prefill-decode interleave: run K graphed
+ decode steps between full prefill chunks
+
+---
+ tests/v1/core/test_prefill_yield.py | 134 +++++++++++++++++++++++++++-
+ vllm/config/scheduler.py            |  17 +++-
+ vllm/engine/arg_utils.py            |   8 ++
+ vllm/v1/core/sched/scheduler.py     | 101 +++++++++++++++++----
+ 4 files changed, 239 insertions(+), 21 deletions(-)
+
+diff --git a/tests/v1/core/test_prefill_yield.py b/tests/v1/core/test_prefill_yield.py
+index ecf56e327..61d896b45 100644
+--- a/tests/v1/core/test_prefill_yield.py
++++ b/tests/v1/core/test_prefill_yield.py
+@@ -30,7 +30,13 @@ SEQS = 16
+ THRESHOLD = BUDGET - SEQS
+ 
+ 
+-def _scheduler(monkeypatch, tmp_path, prefill_yield="short", limit_s=10.0):
++def _scheduler(
++    monkeypatch,
++    tmp_path,
++    prefill_yield="short",
++    limit_s=10.0,
++    interleave_steps=0,
++):
+     utils = pytest.importorskip("tests.v1.core.utils")
+     # DeepSeek V4.1's configuration sets align_prefill_chunks; this OPT model takes
+     # it, and the yield option, here.
+@@ -42,6 +48,7 @@ def _scheduler(monkeypatch, tmp_path, prefill_yield="short", limit_s=10.0):
+             align_prefill_chunks=True,
+             prefill_yield=prefill_yield,
+             prefill_yield_limit_s=limit_s,
++            prefill_decode_interleave_steps=interleave_steps,
+         ),
+     )
+     (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
+@@ -162,3 +169,128 @@ def test_yield_excludes_lanes_and_cadence():
+             max_model_len=8192, is_encoder_decoder=False,
+             prefill_yield="short", prefill_schedule_interval=2,
+         )
++    with pytest.raises(ValueError):
++        SchedulerConfig(
++            max_model_len=8192, is_encoder_decoder=False,
++            prefill_decode_interleave_steps=2, max_parallel_prefills=2,
++        )
++    with pytest.raises(ValueError):
++        SchedulerConfig(
++            max_model_len=8192, is_encoder_decoder=False,
++            prefill_decode_interleave_steps=2, prefill_schedule_interval=2,
++        )
++
++
++def _step_and_advance_decodes(scheduler):
++    output = scheduler.schedule()
++    scheduled = dict(output.num_scheduled_tokens)
++    for req_id in scheduled:
++        req = scheduler.requests[req_id]
++        if not req.is_prefill_chunk:
++            req.append_output_token_ids(0)
++    return scheduled
++
++
++def test_interleave_k_graphed_decode_steps_between_full_prefill_chunks(
++    monkeypatch, tmp_path
++):
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, prefill_yield="off", interleave_steps=2
++    )
++    dec = _request(utils, "dec", 20)
++    dec.max_tokens = 100
++    scheduler.add_request(dec)
++    assert _step_and_advance_decodes(scheduler) == {"dec": 20}
++
++    long_req = _request(utils, "long", 3000)
++    long_req.max_tokens = 10
++    scheduler.add_request(long_req)
++    # Chunk 1 of long + dec, then 2 pure decode steps, Chunk 2 + dec, 2 pure
++    # decode steps, Chunk 3 (final) + dec.
++    steps = [_step_and_advance_decodes(scheduler) for _ in range(7)]
++    assert steps == [
++        {"dec": 1, "long": THRESHOLD},
++        {"dec": 1},
++        {"dec": 1},
++        {"dec": 1, "long": THRESHOLD},
++        {"dec": 1},
++        {"dec": 1},
++        {"dec": 1, "long": 3000 - 2 * THRESHOLD},
++    ]
++
++
++def test_interleave_works_at_full_slot_occupancy_stall_15(monkeypatch, tmp_path):
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, prefill_yield="off", interleave_steps=2
++    )
++    for idx in range(SEQS - 1):
++        req = _request(utils, f"d{idx}", 10)
++        req.max_tokens = 100
++        scheduler.add_request(req)
++    first_step = _step_and_advance_decodes(scheduler)
++    assert len(first_step) == SEQS - 1
++
++    long_req = _request(utils, "long", 2500)
++    long_req.max_tokens = 10
++    scheduler.add_request(long_req)
++    # All 16 sequence slots are now full (15 decodes + 1 long prefill).
++    step1 = _step_and_advance_decodes(scheduler)
++    assert step1["long"] == THRESHOLD
++    assert len(step1) == SEQS
++
++    step2 = _step_and_advance_decodes(scheduler)
++    step3 = _step_and_advance_decodes(scheduler)
++    assert "long" not in step2 and len(step2) == SEQS - 1
++    assert "long" not in step3 and len(step3) == SEQS - 1
++
++    step4 = _step_and_advance_decodes(scheduler)
++    assert step4["long"] == THRESHOLD
++    assert len(step4) == SEQS
++
++
++def test_interleave_admits_waiting_short_prefill_during_decode_step(
++    monkeypatch, tmp_path
++):
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, prefill_yield="off", interleave_steps=2
++    )
++    dec = _request(utils, "dec", 20)
++    dec.max_tokens = 100
++    scheduler.add_request(dec)
++    assert _step_and_advance_decodes(scheduler) == {"dec": 20}
++
++    long_req = _request(utils, "long", 3000)
++    long_req.max_tokens = 10
++    scheduler.add_request(long_req)
++    assert _step_and_advance_decodes(scheduler) == {"dec": 1, "long": THRESHOLD}
++
++    # Queue both a second long request and a short request during chunk 1:
++    # the interleaved step skips long2, admits short, and keeps long's chunk
++    # boundaries intact.
++    long2 = _request(utils, "long2", 3000)
++    short = _request(utils, "short", 200)
++    short.max_tokens = 50
++    scheduler.add_request(long2)
++    scheduler.add_request(short)
++
++    assert _step_and_advance_decodes(scheduler) == {"dec": 1, "short": 200}
++    assert _step_and_advance_decodes(scheduler) == {"dec": 1, "short": 1}
++    assert _step_and_advance_decodes(scheduler) == {
++        "dec": 1,
++        "short": 1,
++        "long": THRESHOLD,
++    }
++
++
++def test_interleave_does_not_pause_when_no_decodes_are_runnable(
++    monkeypatch, tmp_path
++):
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, prefill_yield="off", interleave_steps=2
++    )
++    scheduler.add_request(_request(utils, "long", 3000))
++    assert _steps(scheduler, 3) == [
++        {"long": THRESHOLD},
++        {"long": THRESHOLD},
++        {"long": 3000 - 2 * THRESHOLD},
++    ]
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index ef98fad4f..ba571568d 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -269,6 +269,16 @@ class SchedulerConfig:
+     """With ``prefill_yield``: a long prefill that has yielded this long stops
+     yielding until its next chunk runs."""
+ 
++    prefill_decode_interleave_steps: int = Field(default=0, ge=0)
++    """Number of graphed decode steps to interleave between multi-chunk prefill
++    chunks while decode requests are runnable.
++
++    During interleaved decode steps, the in-progress long prefill chunk is
++    deferred via ``defer_prefills`` while active decode streams advance, and
++    any waiting prompt whose prefill finishes within one chunk is also admitted.
++    ``0`` disables decode interleaving between prefill chunks.
++    """
++
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+@@ -394,14 +404,15 @@ class SchedulerConfig:
+             and self.decode_refill_target > self.max_num_seqs
+         ):
+             raise ValueError("decode_refill_target cannot exceed max_num_seqs")
+-        if self.prefill_yield != "off" and (
++        if (self.prefill_yield != "off" or self.prefill_decode_interleave_steps > 0) and (
+             interleaving_enabled
+             or self.prefill_compute_share is not None
+             or self.prefill_schedule_interval > 1
+         ):
+             raise ValueError(
+-                "prefill_yield replaces prefill lanes, compute sharing and the "
+-                "prefill schedule interval; set none of them with it"
++                "prefill_yield and prefill_decode_interleave_steps replace "
++                "prefill lanes, compute sharing and the prefill schedule "
++                "interval; set none of them with it"
+             )
+         if (
+             self.prefill_policy != "decode-aware"
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 398cfe7b3..f2b49d7da 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -731,6 +731,9 @@ class EngineArgs:
+     decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
+     prefill_yield: PrefillYield = SchedulerConfig.prefill_yield
+     prefill_yield_limit_s: float = SchedulerConfig.prefill_yield_limit_s
++    prefill_decode_interleave_steps: int = (
++        SchedulerConfig.prefill_decode_interleave_steps
++    )
+ 
+     watermark: float = SchedulerConfig.watermark
+ 
+@@ -1775,6 +1778,10 @@ class EngineArgs:
+         scheduler_group.add_argument(
+             "--prefill-yield-limit-s", **scheduler_kwargs["prefill_yield_limit_s"]
+         )
++        scheduler_group.add_argument(
++            "--prefill-decode-interleave-steps",
++            **scheduler_kwargs["prefill_decode_interleave_steps"],
++        )
+         scheduler_group.add_argument(
+             "--disable-hybrid-kv-cache-manager",
+             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
+@@ -2629,6 +2636,7 @@ class EngineArgs:
+             decode_refill_target=self.decode_refill_target,
+             prefill_yield=self.prefill_yield,
+             prefill_yield_limit_s=self.prefill_yield_limit_s,
++            prefill_decode_interleave_steps=(self.prefill_decode_interleave_steps),
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+             async_scheduling=self.async_scheduling,
+             stream_interval=self.stream_interval,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ce3f7f2b6..9a3caa1ba 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -480,6 +480,12 @@ class Scheduler(SchedulerInterface):
+         # rejection, to the first decode step of a prompt that just prefilled.
+         self.prefill_yield = self.scheduler_config.prefill_yield == "short"
+         self.prefill_yield_limit_s = self.scheduler_config.prefill_yield_limit_s
++        self.prefill_decode_interleave_steps = (
++            self.scheduler_config.prefill_decode_interleave_steps
++        )
++        # Remaining graphed decode steps to interleave before the next multi-chunk
++        # prefill chunk runs.
++        self._interleave_decode_steps_remaining = 0
+         # Requests whose last prefill chunk is scheduled and whose first decode
+         # step is not: that step releases their held first token.
+         self._first_decode_due: set[str] = set()
+@@ -1062,6 +1068,7 @@ class Scheduler(SchedulerInterface):
+             has_possible_prefill
+             and (
+                 self.compute_share_controller is not None
++                or self.prefill_decode_interleave_steps > 0
+                 or (
+                     self.max_parallel_prefills > 1
+                     and self.scheduler_config.prefill_policy == "decode-aware"
+@@ -1082,14 +1089,35 @@ class Scheduler(SchedulerInterface):
+             and len(self.running) + self.num_waiting_for_streaming_input
+             < self.max_num_running_reqs
+         )
++        has_inflight_multi_chunk_prefill = any(
++            request.is_prefill_chunk
++            and self.current_step >= request.next_decode_eligible_step
++            for request in self.running
++        )
++        if not has_inflight_multi_chunk_prefill:
++            self._interleave_decode_steps_remaining = 0
++        first_decode_due = (
++            (self.prefill_yield or self.prefill_decode_interleave_steps > 0)
++            and self.sink_rejection
++            and any(r.request_id in self._first_decode_due for r in self.running)
++        )
++        interleave_decode_step = (
++            self.prefill_decode_interleave_steps > 0
++            and has_eligible_decode
++            and has_inflight_multi_chunk_prefill
++            and (self._interleave_decode_steps_remaining > 0 or first_decode_due)
++        )
++        if interleave_decode_step and self._interleave_decode_steps_remaining > 0:
++            self._interleave_decode_steps_remaining -= 1
+         # Prefill yield: a long prompt's chunk waits while a held first token is
+         # due or a waiting prompt can prefill whole in this step. Otherwise this
+         # step schedules exactly as without the option.
+         yield_now = time.monotonic() if self.prefill_yield else 0.0
+-        first_decode_due = (
+-            self.prefill_yield
+-            and self.sink_rejection
+-            and any(r.request_id in self._first_decode_due for r in self.running)
++        interleave_admit_short = (
++            interleave_decode_step
++            and admission_open
++            and bool(self.waiting or self.skipped_waiting)
++            and self._short_prefill_waiting(yield_now)
+         )
+         yield_long = self.prefill_yield and (
+             first_decode_due
+@@ -1176,7 +1204,11 @@ class Scheduler(SchedulerInterface):
+         adaptive_defer_prefills = (
+             selected_compute_class == "decode" and compute_contention
+         )
+-        defer_prefills = legacy_defer_prefills or adaptive_defer_prefills
++        defer_prefills = (
++            legacy_defer_prefills
++            or adaptive_defer_prefills
++            or interleave_decode_step
++        )
+ 
+         needs_multiple_running_passes = (
+             self.compute_share_controller is not None
+@@ -1861,16 +1893,25 @@ class Scheduler(SchedulerInterface):
+                         continue
+ 
+                 if (
+-                    yield_long
++                    (yield_long or interleave_admit_short)
+                     and not load_kv_async
+                     and not self._prefill_finishes_in_chunk(
+                         num_computed_tokens, request.num_tokens
+                     )
+-                    and not self._prefill_yield_expired(request_id, yield_now)
++                    and not (
++                        self.prefill_yield
++                        and self._prefill_yield_expired(request_id, yield_now)
++                    )
++                    and (
++                        not interleave_admit_short
++                        or self._short_prefill_waiting(yield_now)
++                    )
+                 ):
+-                    # Prefill yield: a long prompt waits behind this step's short
+-                    # work without holding up the requests queued after it.
+-                    self._yielding_since.setdefault(request_id, yield_now)
++                    # Prefill yield / interleave: a long prompt waits behind this
++                    # step's short work without holding up the requests queued
++                    # after it.
++                    if self.prefill_yield:
++                        self._yielding_since.setdefault(request_id, yield_now)
+                     request_queue.remove_request(request)
+                     step_skipped_waiting.prepend_request(request)
+                     continue
+@@ -1894,7 +1935,16 @@ class Scheduler(SchedulerInterface):
+                     assert num_external_computed_tokens > 0
+                     num_new_tokens = 0
+                 else:
+-                    if defer_prefills and has_local_prefill:
++                    if (
++                        defer_prefills
++                        and has_local_prefill
++                        and not (
++                            interleave_admit_short
++                            and self._prefill_finishes_in_chunk(
++                                num_computed_tokens, request.num_tokens
++                            )
++                        )
++                    ):
+                         if adaptive_defer_prefills and not num_scheduled_tokens:
+                             # The selected decode class proved unrunnable after
+                             # its resource checks. Fall back immediately.
+@@ -2270,20 +2320,29 @@ class Scheduler(SchedulerInterface):
+         # selected decode turn produced no work, give an already-running
+         # prefill an immediate chance before returning an empty step.
+         if (
+-            selected_compute_class == "decode"
+-            and compute_contention
++            (
++                (selected_compute_class == "decode" and compute_contention)
++                or interleave_decode_step
++            )
+             and not num_scheduled_tokens
+             and not legacy_defer_prefills
+         ):
+             adaptive_defer_prefills = False
++            interleave_decode_step = False
+             defer_prefills = False
+-            if self.prefill_fairness_max_tokens is not None:
++            self._interleave_decode_steps_remaining = 0
++            if (
++                selected_compute_class == "decode"
++                and self.prefill_fairness_max_tokens is not None
++            ):
+                 token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+                 input_budget = min(
+                     input_budget,
+                     self.prefill_fairness_max_tokens + draft_slots,
+                 )
+-            schedule_running_requests("prefill")
++            schedule_running_requests(
++                "prefill" if selected_compute_class == "decode" else None
++            )
+ 
+         # A prefill turn gives prefills first use of the model-step capacity.
+         # Existing decodes then consume only capacity genuinely left over. New
+@@ -2761,8 +2820,9 @@ class Scheduler(SchedulerInterface):
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+         for req_id, num_scheduled_token in num_scheduled_tokens.items():
+             request = self.requests[req_id]
+-            if self.prefill_yield:
+-                self._yielding_since.pop(req_id, None)
++            if self.prefill_yield or self.prefill_decode_interleave_steps > 0:
++                if self.prefill_yield:
++                    self._yielding_since.pop(req_id, None)
+                 if request.num_computed_tokens >= request.num_prompt_tokens:
+                     self._first_decode_due.discard(req_id)
+                 elif (
+@@ -2782,6 +2842,13 @@ class Scheduler(SchedulerInterface):
+             request.is_prefill_chunk = request.num_computed_tokens < (
+                 request.num_tokens + request.num_output_placeholders
+             )
++            if (
++                self.prefill_decode_interleave_steps > 0
++                and request.is_prefill_chunk
++            ):
++                self._interleave_decode_steps_remaining = (
++                    self.prefill_decode_interleave_steps
++                )
+             if self.sink_rejection and not request.is_prefill_chunk:
+                 # This step samples a provisional token: the request's next
+                 # step starts with it as draft zero.

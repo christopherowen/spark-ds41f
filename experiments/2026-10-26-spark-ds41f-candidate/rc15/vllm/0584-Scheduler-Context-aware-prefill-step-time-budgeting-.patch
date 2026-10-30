@@ -1,0 +1,580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:38:33 +0100
+Subject: [PATCH 584/584] [Scheduler] Context-aware prefill step-time budgeting
+ on an absolute 2,048-token grid
+
+---
+ tests/v1/core/test_aligned_prefill_chunks.py | 108 +++++++++-
+ vllm/config/scheduler.py                     |  30 ++-
+ vllm/engine/arg_utils.py                     |  12 ++
+ vllm/v1/core/sched/scheduler.py              | 213 +++++++++++++++++--
+ 4 files changed, 340 insertions(+), 23 deletions(-)
+
+diff --git a/tests/v1/core/test_aligned_prefill_chunks.py b/tests/v1/core/test_aligned_prefill_chunks.py
+index dde813218..f34ec8659 100644
+--- a/tests/v1/core/test_aligned_prefill_chunks.py
++++ b/tests/v1/core/test_aligned_prefill_chunks.py
+@@ -11,11 +11,28 @@ import pytest
+ from vllm.v1.core.sched import scheduler as scheduler_module
+ 
+ 
+-def _chunk(threshold, computed, remaining):
++def _chunk(
++    threshold,
++    computed,
++    remaining,
++    *,
++    num_runnable_decodes=0,
++    step_target_s=0.0,
++    grid=2048,
++):
+     owner = SimpleNamespace(
+-        scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold)
++        scheduler_config=SimpleNamespace(
++            long_prefill_token_threshold=threshold,
++            prefill_step_target_s=step_target_s,
++            prefill_chunk_grid=grid,
++        )
++    )
++    return scheduler_module.Scheduler._aligned_prefill_chunk(
++        owner,
++        computed,
++        remaining,
++        num_runnable_decodes=num_runnable_decodes,
+     )
+-    return scheduler_module.Scheduler._aligned_prefill_chunk(owner, computed, remaining)
+ 
+ 
+ def test_chunks_end_at_multiples_of_the_threshold():
+@@ -107,3 +124,88 @@ def test_no_partial_chunk_when_the_budget_is_short(monkeypatch, tmp_path):
+ def test_off_the_third_request_takes_what_is_left(monkeypatch, tmp_path):
+     requests, scheduled = _scheduled(monkeypatch, tmp_path, aligned=False)
+     assert scheduled[requests[2].request_id] == 224
++
++
++def test_context_aware_chunk_grid_preserves_solo_prefill_and_caps_mixed_steps():
++    # Solo prefill (num_runnable_decodes == 0): full threshold at all contexts.
++    for context in (0, 32768, 131072, 900000):
++        assert (
++            _chunk(
++                16288,
++                context,
++                32768,
++                num_runnable_decodes=0,
++                step_target_s=1.0,
++            )
++            == 16288 - context % 16288
++        )
++        assert (
++            _chunk(
++                6096,
++                context,
++                32768,
++                num_runnable_decodes=0,
++                step_target_s=1.0,
++            )
++            == 6096 - context % 6096
++        )
++
++    # Low context (c < 64K) with active decodes: T(c) = 8,192 on the 2,048 grid.
++    for context in (0, 8192, 32768, 57344):
++        assert (
++            _chunk(
++                16288,
++                context,
++                32768,
++                num_runnable_decodes=4,
++                step_target_s=1.0,
++            )
++            == 8192
++        )
++
++    # Deep context (c > 500K) with active decodes: T(c) = 4,096 on the 2,048 grid.
++    for context in (524288, 655360, 901120):
++        assert (
++            _chunk(
++                16288,
++                context,
++                32768,
++                num_runnable_decodes=4,
++                step_target_s=1.0,
++            )
++            == 4096
++        )
++
++    # Prefix-cache hit (1,536 tokens) snaps chunk end to 8,192 on the 2,048 grid.
++    assert (
++        _chunk(
++            16288,
++            1536,
++            32768,
++            num_runnable_decodes=4,
++            step_target_s=1.0,
++        )
++        == 8192 - 1536
++    )
++
++    # Transition from a solo 16,288-token chunk to active-decode prefill snaps
++    # onto the absolute 2,048-token grid at 22,528 (6,240 tokens), then 8,192.
++    first_mixed = _chunk(
++        16288,
++        16288,
++        32768,
++        num_runnable_decodes=4,
++        step_target_s=1.0,
++    )
++    assert first_mixed == 22528 - 16288
++    assert (16288 + first_mixed) % 2048 == 0
++    assert (
++        _chunk(
++            16288,
++            16288 + first_mixed,
++            32768,
++            num_runnable_decodes=4,
++            step_target_s=1.0,
++        )
++        == 8192
++    )
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index ba571568d..ee426e56b 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -279,6 +279,24 @@ class SchedulerConfig:
+     ``0`` disables decode interleaving between prefill chunks.
+     """
+ 
++    prefill_step_target_s: float = Field(default=0.0, ge=0.0)
++    """Target maximum duration (seconds) of a mixed prefill + decode step when
++    ``align_prefill_chunks`` is enabled and decode requests are runnable.
++
++    When ``num_runnable_decodes == 0`` (solo prefill) or
++    ``prefill_step_target_s == 0``, the full ``long_prefill_token_threshold``
++    is used so solo prefill speed is unchanged. When ``num_runnable_decodes > 0``
++    and ``prefill_step_target_s > 0``, ``_aligned_prefill_chunk`` chooses a
++    context-aware threshold ``T(c) in {2048, 4096, 8192, long_prefill_token_threshold}``
++    on the absolute ``prefill_chunk_grid`` grid to keep single-step stalls
++    bounded within ``prefill_step_target_s``.
++    """
++
++    prefill_chunk_grid: int = Field(default=2048, ge=1)
++    """Absolute token grid used by context-aware step-time budgeting when
++    ``prefill_step_target_s > 0`` and decode requests are runnable.
++    """
++
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+@@ -404,15 +422,19 @@ class SchedulerConfig:
+             and self.decode_refill_target > self.max_num_seqs
+         ):
+             raise ValueError("decode_refill_target cannot exceed max_num_seqs")
+-        if (self.prefill_yield != "off" or self.prefill_decode_interleave_steps > 0) and (
++        if (
++            self.prefill_yield != "off"
++            or self.prefill_decode_interleave_steps > 0
++            or self.prefill_step_target_s > 0
++        ) and (
+             interleaving_enabled
+             or self.prefill_compute_share is not None
+             or self.prefill_schedule_interval > 1
+         ):
+             raise ValueError(
+-                "prefill_yield and prefill_decode_interleave_steps replace "
+-                "prefill lanes, compute sharing and the prefill schedule "
+-                "interval; set none of them with it"
++                "prefill_yield, prefill_decode_interleave_steps, and "
++                "prefill_step_target_s replace prefill lanes, compute sharing "
++                "and the prefill schedule interval; set none of them with it"
+             )
+         if (
+             self.prefill_policy != "decode-aware"
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index f2b49d7da..7cff6b2e5 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -734,6 +734,8 @@ class EngineArgs:
+     prefill_decode_interleave_steps: int = (
+         SchedulerConfig.prefill_decode_interleave_steps
+     )
++    prefill_step_target_s: float = SchedulerConfig.prefill_step_target_s
++    prefill_chunk_grid: int = SchedulerConfig.prefill_chunk_grid
+ 
+     watermark: float = SchedulerConfig.watermark
+ 
+@@ -1782,6 +1784,14 @@ class EngineArgs:
+             "--prefill-decode-interleave-steps",
+             **scheduler_kwargs["prefill_decode_interleave_steps"],
+         )
++        scheduler_group.add_argument(
++            "--prefill-step-target-s",
++            **scheduler_kwargs["prefill_step_target_s"],
++        )
++        scheduler_group.add_argument(
++            "--prefill-chunk-grid",
++            **scheduler_kwargs["prefill_chunk_grid"],
++        )
+         scheduler_group.add_argument(
+             "--disable-hybrid-kv-cache-manager",
+             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
+@@ -2637,6 +2647,8 @@ class EngineArgs:
+             prefill_yield=self.prefill_yield,
+             prefill_yield_limit_s=self.prefill_yield_limit_s,
+             prefill_decode_interleave_steps=(self.prefill_decode_interleave_steps),
++            prefill_step_target_s=self.prefill_step_target_s,
++            prefill_chunk_grid=self.prefill_chunk_grid,
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+             async_scheduling=self.async_scheduling,
+             stream_interval=self.stream_interval,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 9a3caa1ba..67f6fa298 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -483,6 +483,8 @@ class Scheduler(SchedulerInterface):
+         self.prefill_decode_interleave_steps = (
+             self.scheduler_config.prefill_decode_interleave_steps
+         )
++        self.prefill_step_target_s = self.scheduler_config.prefill_step_target_s
++        self.prefill_chunk_grid = self.scheduler_config.prefill_chunk_grid
+         # Remaining graphed decode steps to interleave before the next multi-chunk
+         # prefill chunk runs.
+         self._interleave_decode_steps_remaining = 0
+@@ -923,11 +925,85 @@ class Scheduler(SchedulerInterface):
+                 f"{self.max_num_scheduled_tokens}-token step budget"
+             )
+ 
++    # Calibrated step-time model parameters (DeepSeek V4.1 Flash, calibrate.py):
++    #   t_chunk(q, c) ~= F + alpha * t_dec(n_dec) + m0 * q + m1 * q * c
++    _PREFILL_FIXED_COST_S = 0.1535
++    _PREFILL_DECODE_ALPHA = 1.56
++    _PREFILL_M0_S_PER_TOK = 1.2532308400535526e-4
++    _PREFILL_M1_S_PER_TOK2 = 1.3289467958204244e-10
++    _DECODE_STEP_KNOTS: tuple[tuple[int, float], ...] = (
++        (1, 0.02983160068849846),
++        (8, 0.08379558412906112),
++        (16, 0.11908994468658608),
++    )
++
++    @staticmethod
++    def _estimate_decode_step_s(num_runnable_decodes: int) -> float:
++        if num_runnable_decodes <= 0:
++            return 0.0
++        knots = Scheduler._DECODE_STEP_KNOTS
++        if num_runnable_decodes <= knots[0][0]:
++            return knots[0][1]
++        for (n0, t0), (n1, t1) in zip(knots, knots[1:]):
++            if num_runnable_decodes <= n1:
++                return t0 + (t1 - t0) * (num_runnable_decodes - n0) / (n1 - n0)
++        (n0, t0), (n1, t1) = knots[-2], knots[-1]
++        return t1 + (num_runnable_decodes - n1) * (t1 - t0) / (n1 - n0)
++
++    def _context_aware_chunk_threshold(
++        self, num_computed_tokens: int, num_runnable_decodes: int = 0
++    ) -> int:
++        """Select the context-aware chunk threshold ``T(c)`` on the absolute
++        ``prefill_chunk_grid`` grid when decode requests are runnable.
++
++        When ``num_runnable_decodes == 0`` (solo prefill) or
++        ``prefill_step_target_s <= 0``, returns the full
++        ``long_prefill_token_threshold`` so solo prefill speed is unchanged.
++        When ``num_runnable_decodes > 0`` and ``prefill_step_target_s > 0``,
++        quantizes ``(tau_max - F - alpha * t_dec) / (m0 + m1 * c)`` onto
++        ``{grid, 2 * grid, 4 * grid, long_prefill_token_threshold}`` capped by
++        ``long_prefill_token_threshold``.
++        """
++        threshold = self.scheduler_config.long_prefill_token_threshold
++        step_target_s = getattr(self.scheduler_config, "prefill_step_target_s", 0.0)
++        if threshold <= 0 or num_runnable_decodes <= 0 or step_target_s <= 0.0:
++            return threshold
++        grid = max(int(getattr(self.scheduler_config, "prefill_chunk_grid", 2048)), 1)
++        t_dec = Scheduler._estimate_decode_step_s(num_runnable_decodes)
++        avail_s = max(
++            step_target_s
++            - Scheduler._PREFILL_FIXED_COST_S
++            - Scheduler._PREFILL_DECODE_ALPHA * t_dec,
++            0.0,
++        )
++        denom = (
++            Scheduler._PREFILL_M0_S_PER_TOK
++            + Scheduler._PREFILL_M1_S_PER_TOK2 * max(num_computed_tokens, 0)
++        )
++        q_raw = avail_s / denom if denom > 0.0 else float(threshold)
++        grid_units = max(1, int((q_raw + 0.75 * grid) // grid))
++        if grid_units <= 1:
++            tier = grid
++        elif grid_units == 2:
++            tier = 2 * grid
++        elif grid_units <= 4:
++            tier = 4 * grid
++            if tier > threshold >= 2 * grid:
++                tier = 2 * grid
++        else:
++            tier = threshold
++        return min(tier, threshold)
++
+     def _aligned_prefill_chunk(
+-        self, num_computed_tokens: int, num_new_tokens: int
++        self,
++        num_computed_tokens: int,
++        num_new_tokens: int,
++        *,
++        num_runnable_decodes: int = 0,
+     ) -> int:
+         """The prefill chunk that ends at the next multiple of the long-prefill
+-        threshold, or at the prompt end.
++        threshold (or the context-aware 2,048-token grid when decodes are active),
++        or at the prompt end.
+ 
+         Where a prompt splits decides which rows each step computes and, for
+         DeepSeek V4.1, where its CED decoder windows start; counting from the
+@@ -937,25 +1013,54 @@ class Scheduler(SchedulerInterface):
+         threshold = self.scheduler_config.long_prefill_token_threshold
+         if threshold <= 0:
+             return num_new_tokens
+-        return min(num_new_tokens, threshold - num_computed_tokens % threshold)
++        tier = Scheduler._context_aware_chunk_threshold(
++            self, num_computed_tokens, num_runnable_decodes
++        )
++        if tier >= threshold:
++            return min(num_new_tokens, threshold - num_computed_tokens % threshold)
++        grid = max(int(getattr(self.scheduler_config, "prefill_chunk_grid", 2048)), 1)
++        end = ((num_computed_tokens + tier) // grid) * grid
++        if end <= num_computed_tokens:
++            end = ((num_computed_tokens // grid) + 1) * grid
++        return min(num_new_tokens, end - num_computed_tokens)
+ 
+     def _prefill_finishes_in_chunk(
+-        self, num_computed_tokens: int, num_tokens: int
++        self,
++        num_computed_tokens: int,
++        num_tokens: int,
++        *,
++        num_runnable_decodes: int = 0,
+     ) -> bool:
+         """Whether a prompt's next chunk ends its prefill."""
+         remaining = num_tokens - num_computed_tokens
+-        threshold = self.scheduler_config.long_prefill_token_threshold
++        threshold = Scheduler._context_aware_chunk_threshold(
++            self, num_computed_tokens, num_runnable_decodes
++        )
+         if threshold <= 0:
+             return True
+         if self.scheduler_config.align_prefill_chunks:
+-            return self._aligned_prefill_chunk(num_computed_tokens, remaining) >= remaining
++            return (
++                Scheduler._aligned_prefill_chunk(
++                    self,
++                    num_computed_tokens,
++                    remaining,
++                    num_runnable_decodes=num_runnable_decodes,
++                )
++                >= remaining
++            )
+         return remaining <= threshold
+ 
+     def _prefill_yield_expired(self, request_id: str, now: float) -> bool:
+         since = self._yielding_since.get(request_id)
+         return since is not None and now - since >= self.prefill_yield_limit_s
+ 
+-    def _short_prefill_waiting(self, now: float, scan: int = 16) -> bool:
++    def _short_prefill_waiting(
++        self,
++        now: float,
++        scan: int = 16,
++        *,
++        num_runnable_decodes: int = 0,
++    ) -> bool:
+         """Whether one of the first ``scan`` waiting requests can be admitted and
+         prefills within one chunk (after its prefix-cache hit). A long prefill
+         that outwaited its yield limit counts as well: it goes first."""
+@@ -974,7 +1079,11 @@ class Scheduler(SchedulerInterface):
+                 computed = request.num_computed_tokens
+                 if computed == 0 and lookup:
+                     computed = self.kv_cache_manager.get_computed_blocks(request)[1]
+-                if self._prefill_finishes_in_chunk(computed, request.num_tokens):
++                if self._prefill_finishes_in_chunk(
++                    computed,
++                    request.num_tokens,
++                    num_runnable_decodes=num_runnable_decodes,
++                ):
+                     return True
+         return False
+ 
+@@ -1051,6 +1160,7 @@ class Scheduler(SchedulerInterface):
+         # Whether any scheduled request has a synchronous connector KV load.
+         has_sync_kv_loads = False
+         scheduled_prefill_req_ids: set[str] = set()
++        scheduled_prefill_tier_caps: dict[str, int] = {}
+ 
+         # For logging.
+         scheduled_timestamp = time.monotonic()
+@@ -1069,6 +1179,7 @@ class Scheduler(SchedulerInterface):
+             and (
+                 self.compute_share_controller is not None
+                 or self.prefill_decode_interleave_steps > 0
++                or self.prefill_step_target_s > 0
+                 or (
+                     self.max_parallel_prefills > 1
+                     and self.scheduler_config.prefill_policy == "decode-aware"
+@@ -1117,14 +1228,18 @@ class Scheduler(SchedulerInterface):
+             interleave_decode_step
+             and admission_open
+             and bool(self.waiting or self.skipped_waiting)
+-            and self._short_prefill_waiting(yield_now)
++            and self._short_prefill_waiting(
++                yield_now, num_runnable_decodes=num_runnable_decodes
++            )
+         )
+         yield_long = self.prefill_yield and (
+             first_decode_due
+             or (
+                 admission_open
+                 and bool(self.waiting or self.skipped_waiting)
+-                and self._short_prefill_waiting(yield_now)
++                and self._short_prefill_waiting(
++                    yield_now, num_runnable_decodes=num_runnable_decodes
++                )
+             )
+         )
+         deferred_long: list[Request] = []
+@@ -1328,7 +1443,9 @@ class Scheduler(SchedulerInterface):
+                     and request.is_prefill_chunk
+                     and request not in deferred_long
+                     and not self._prefill_finishes_in_chunk(
+-                        request.num_computed_tokens, request.num_tokens
++                        request.num_computed_tokens,
++                        request.num_tokens,
++                        num_runnable_decodes=num_runnable_decodes,
+                     )
+                     and not self._prefill_yield_expired(request.request_id, yield_now)
+                 ):
+@@ -1368,7 +1485,28 @@ class Scheduler(SchedulerInterface):
+                     and request.is_prefill_chunk
+                 ):
+                     aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+-                        request.num_computed_tokens, num_new_tokens
++                        request.num_computed_tokens,
++                        num_new_tokens,
++                        num_runnable_decodes=num_runnable_decodes,
++                    )
++                if (
++                    request.is_prefill_chunk
++                    and self.prefill_step_target_s > 0
++                    and num_runnable_decodes > 0
++                ):
++                    context_tier = self._context_aware_chunk_threshold(
++                        request.num_computed_tokens, num_runnable_decodes
++                    )
++                    step_prefill_cap = min(
++                        context_tier,
++                        *scheduled_prefill_tier_caps.values(),
++                    )
++                    scheduled_prefill_tokens = sum(
++                        num_scheduled_tokens[rid] for rid in scheduled_prefill_req_ids
++                    )
++                    num_new_tokens = min(
++                        num_new_tokens,
++                        max(step_prefill_cap - scheduled_prefill_tokens, 0),
+                     )
+                 if request.is_prefill_chunk and prefill_interleave_step is not None:
+                     num_new_tokens = min(
+@@ -1500,6 +1638,9 @@ class Scheduler(SchedulerInterface):
+                                 input_budget += restored + draft_slots
+                                 draft_input_budget += separate_draft_input_tokens
+                                 scheduled_prefill_req_ids.discard(preempted_req_id)
++                                scheduled_prefill_tier_caps.pop(
++                                    preempted_req_id, None
++                                )
+                                 if prefill_interleave_step is not None:
+                                     prefill_interleave_step.mark_unavailable(
+                                         preempted_req_id
+@@ -1545,6 +1686,12 @@ class Scheduler(SchedulerInterface):
+                 prefill_scheduled |= request.is_prefill_chunk
+                 if request.is_prefill_chunk:
+                     scheduled_prefill_req_ids.add(request.request_id)
++                    if self.prefill_step_target_s > 0 and num_runnable_decodes > 0:
++                        scheduled_prefill_tier_caps[request.request_id] = (
++                            self._context_aware_chunk_threshold(
++                                request.num_computed_tokens, num_runnable_decodes
++                            )
++                        )
+                 request_id = request.request_id
+                 req_to_new_blocks[request_id] = new_blocks
+                 num_scheduled_tokens[request_id] = num_new_tokens
+@@ -1896,7 +2043,9 @@ class Scheduler(SchedulerInterface):
+                     (yield_long or interleave_admit_short)
+                     and not load_kv_async
+                     and not self._prefill_finishes_in_chunk(
+-                        num_computed_tokens, request.num_tokens
++                        num_computed_tokens,
++                        request.num_tokens,
++                        num_runnable_decodes=num_runnable_decodes,
+                     )
+                     and not (
+                         self.prefill_yield
+@@ -1904,7 +2053,9 @@ class Scheduler(SchedulerInterface):
+                     )
+                     and (
+                         not interleave_admit_short
+-                        or self._short_prefill_waiting(yield_now)
++                        or self._short_prefill_waiting(
++                            yield_now, num_runnable_decodes=num_runnable_decodes
++                        )
+                     )
+                 ):
+                     # Prefill yield / interleave: a long prompt waits behind this
+@@ -1941,7 +2092,9 @@ class Scheduler(SchedulerInterface):
+                         and not (
+                             interleave_admit_short
+                             and self._prefill_finishes_in_chunk(
+-                                num_computed_tokens, request.num_tokens
++                                num_computed_tokens,
++                                request.num_tokens,
++                                num_runnable_decodes=num_runnable_decodes,
+                             )
+                         )
+                     ):
+@@ -2017,7 +2170,29 @@ class Scheduler(SchedulerInterface):
+                         and num_new_tokens > 1
+                     ):
+                         aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+-                            num_computed_tokens, num_new_tokens
++                            num_computed_tokens,
++                            num_new_tokens,
++                            num_runnable_decodes=num_runnable_decodes,
++                        )
++                    if (
++                        has_local_prefill
++                        and self.prefill_step_target_s > 0
++                        and num_runnable_decodes > 0
++                    ):
++                        context_tier = self._context_aware_chunk_threshold(
++                            num_computed_tokens, num_runnable_decodes
++                        )
++                        step_prefill_cap = min(
++                            context_tier,
++                            *scheduled_prefill_tier_caps.values(),
++                        )
++                        scheduled_prefill_tokens = sum(
++                            num_scheduled_tokens[rid]
++                            for rid in scheduled_prefill_req_ids
++                        )
++                        request_token_budget = min(
++                            request_token_budget,
++                            max(step_prefill_cap - scheduled_prefill_tokens, 0),
+                         )
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+@@ -2241,6 +2416,12 @@ class Scheduler(SchedulerInterface):
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 if has_local_prefill:
+                     scheduled_prefill_req_ids.add(request_id)
++                    if self.prefill_step_target_s > 0 and num_runnable_decodes > 0:
++                        scheduled_prefill_tier_caps[request_id] = (
++                            self._context_aware_chunk_threshold(
++                                num_computed_tokens, num_runnable_decodes
++                            )
++                        )
+                 token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 draft_input_budget -= separate_draft_input_tokens
