@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Chris Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 17:50:00 +0100
+Subject: [PATCH] perf(tilelang): streamline _prepare_kernels registration,
+ warm_declared, and bind_declared
+
+- Deduplicate `JitWarmupRegistry._add` registrations in O(1) for
+  hashable/callable arguments instead of scanning all prior
+  registrations in O(N^2).
+- Track `calls` callables already compiled by `prepare_declared` in
+  `TileLangKernels` so the subsequent `registry.warmup()` pass only
+  compiles newly registered step kernels instead of re-evaluating and
+  re-preparing all ~1,200 module registrations a second time.
+- Deduplicate `warm_declared` closures with identical bytecode and
+  captured values across homogeneous layers, and bind primitive layer
+  attributes (`q_lora_rank`, `hidden_size`, router shape) instead of
+  `self` in `warm` closures.
+- Cache resolved `TileLangCall` kernels across layers within
+  `bind_declared` via `prepare.launch`.
+---
+diff --git a/tests/models/test_deepseek_v4_1_prepare.py b/tests/models/test_deepseek_v4_1_prepare.py
+index 6919a376f..d998c82e6 100644
+--- a/tests/models/test_deepseek_v4_1_prepare.py
++++ b/tests/models/test_deepseek_v4_1_prepare.py
+@@ -61,3 +61,75 @@ def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
+     bound = []
+     prepare.declare(lambda: [prepare.call(_rope, 2, 64)], bind=lambda: bound.append(1))
+     assert prepared == [(_rope, (2, 64), {})] and bound == [1]
++
++
++def test_prepare_declared_skips_recompilation_in_registry_warmup(monkeypatch):
++    batches = []
++    monkeypatch.setattr(
++        tilelang, "prepare", lambda calls, **kw: batches.append(list(calls))
++    )
++    registry = JitWarmupRegistry(vllm_config=None)
++    calls_invocations = 0
++
++    def first_calls():
++        nonlocal calls_invocations
++        calls_invocations += 1
++        return [prepare.call(_gemm, 1024, 512, block_M=16)]
++
++    with registry.activate():
++        prepare.declare(first_calls)
++    assert prepare.prepare_declared(registry) == 1
++    assert calls_invocations == 1
++    assert batches == [[(_gemm, (1024, 512), {"block_M": 16})]]
++
++    # Registering step kernels after prepare_declared and calling registry.warmup()
++    # must only compile the newly registered step kernels.
++    with registry.activate():
++        prepare.declare(lambda: [prepare.call(_rope, 8, 128)])
++    registry.warmup()
++    assert calls_invocations == 1
++    assert batches == [
++        [(_gemm, (1024, 512), {"block_M": 16})],
++        [(_rope, (8, 128), {})],
++    ]
++
++
++def test_warm_declared_deduplicates_equivalent_closures():
++    registry = JitWarmupRegistry(vllm_config=None)
++    warmed = []
++
++    def make_layer_warm(hidden: int):
++        return lambda: warmed.append(hidden)
++
++    with registry.activate():
++        for _ in range(8):
++            prepare.declare(warm=make_layer_warm(3072))
++        for _ in range(4):
++            prepare.declare(warm=make_layer_warm(1536))
++
++    assert prepare.warm_declared(registry) == 2
++    assert warmed == [3072, 1536]
++
++
++def test_bind_declared_reuses_launched_kernels():
++    registry = JitWarmupRegistry(vllm_config=None)
++    invocations = 0
++
++    def fake_jit(n, k, block_M=16):
++        nonlocal invocations
++        invocations += 1
++        return ("kernel", n, k, block_M)
++
++    bound = []
++    with registry.activate():
++        for _ in range(6):
++            entry = prepare.call(fake_jit, 1024, 512, block_M=32)
++            prepare.declare(
++                lambda e=entry: [e],
++                bind=lambda e=entry: bound.append(prepare.launch(e)),
++            )
++
++    prepare.bind_declared(registry)
++    assert invocations == 1
++    assert len(bound) == 6
++    assert all(k == ("kernel", 1024, 512, 32) for k in bound)
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index 749e8ab3a..0f54c22e8 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1005,6 +1005,24 @@ def _same_registration(
+     ) and all(_same_value(left_kwargs[k], right_kwargs[k]) for k in left_kwargs)
+ 
+ 
++_FAST_KEY_ATOMS = (int, float, str, bytes, bool, type(None), type)
++
++
++def _fast_registration_key(value: Any) -> Any:
++    if isinstance(value, _FAST_KEY_ATOMS):
++        return (type(value), value)
++    if callable(value):
++        return (id, id(value))
++    if isinstance(value, tuple):
++        return (tuple, tuple(_fast_registration_key(x) for x in value))
++    if isinstance(value, dict) and all(isinstance(k, str) for k in value):
++        return (
++            dict,
++            tuple((k, _fast_registration_key(value[k])) for k in sorted(value)),
++        )
++    raise TypeError
++
++
+ class JitWarmupRegistry:
+     """Collect and compile JIT kernels selected during runner setup."""
+ 
+@@ -1019,6 +1037,11 @@ class JitWarmupRegistry:
+             VllmJitKernel[Any],
+             list[tuple[tuple[Any, ...], dict[str, Any]]],
+         ] = {}
++        self._fast_registration_keys: dict[VllmJitKernel[Any], set[Any]] = {}
++        self._slow_registrations: dict[
++            VllmJitKernel[Any],
++            list[tuple[tuple[Any, ...], dict[str, Any]]],
++        ] = {}
+ 
+     @classmethod
+     def capture(cls, init_fn: Callable[..., None]) -> Callable[..., None]:
+@@ -1072,11 +1095,21 @@ class JitWarmupRegistry:
+         # get_warmup_keys once per distinct registration is sufficient. Dedup on
+         # identity-or-equality -- identity short-circuits shared singletons like
+         # vllm_config before any deep __eq__.
+-        if any(
+-            _same_registration(registered, (args, kwargs))
+-            for registered in registrations
+-        ):
+-            return
++        try:
++            fast_key = _fast_registration_key((args, kwargs))
++        except TypeError:
++            slow = self._slow_registrations.setdefault(kernel, [])
++            if any(
++                _same_registration(registered, (args, kwargs))
++                for registered in slow
++            ):
++                return
++            slow.append((args, kwargs))
++        else:
++            fast_keys = self._fast_registration_keys.setdefault(kernel, set())
++            if fast_key in fast_keys:
++                return
++            fast_keys.add(fast_key)
+         registrations.append((args, kwargs))
+ 
+     def __len__(self) -> int:
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..8dce29907 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -554,8 +554,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+         self._attention_geometry()
+         calls = self._tilelang_calls()
++        q_lora_rank = self.q_lora_rank
+         # Q-B's input cast where the front's one kernel does not write it.
+-        prepare.declare(lambda: calls, warm=lambda: _warm_casts(self.q_lora_rank))
++        prepare.declare(lambda: calls, warm=lambda: _warm_casts(q_lora_rank))
+         declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
+         if declare_wo is not None:
+             declare_wo()
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..2f98608f6 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -238,7 +238,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+         declare = getattr(router, "declare_kernels", None)
+         if declare is not None:
+             declare()
+-        prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
++        hidden_size = self.hidden_size
++        prepare.declare(warm=lambda: _warm_casts(hidden_size))
+ 
+     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 071f67d7a..c0504ca2c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -384,15 +384,10 @@ def _calls(kernels: dict) -> list[prepare.TileLangCall]:
+ 
+ def _launch(kernels: dict) -> dict:
+     """A ``*_kernels`` table with each call made (prepared: cache hits)."""
+-
+-    def make(entry):
+-        function, args, kwargs = entry
+-        return function(*args, **kwargs)
+-
+     return {
+-        name: {key: make(c) for key, c in value.items()}
++        name: {key: prepare.launch(c) for key, c in value.items()}
+         if isinstance(value, dict)
+-        else make(value)
++        else prepare.launch(value)
+         for name, value in kernels.items()
+     }
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 29869d116..f571dbf39 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -21,6 +21,7 @@ processing transforms weights only.
+ from __future__ import annotations
+ 
+ import threading
++import weakref
+ from collections.abc import Callable, Iterable
+ from typing import Any
+ 
+@@ -70,13 +71,28 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
+     the owner's kernels once the cache is frozen.
+     """
+ 
+-    def get_warmup_keys(
++    def __init__(self) -> None:
++        super().__init__()
++        self._prepared_calls: weakref.WeakSet[Calls] = weakref.WeakSet()
++
++    def declared_keys(
+         self, calls: Calls | None, bind=None, warm=None
+     ) -> list[_CallKey]:
+         if calls is None:
+             return []
+         return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
+ 
++    def get_warmup_keys(
++        self, calls: Calls | None, bind=None, warm=None
++    ) -> list[_CallKey]:
++        if calls is None or calls in self._prepared_calls:
++            return []
++        return self.declared_keys(calls, bind, warm)
++
++    def mark_prepared(self, calls: Calls | None) -> None:
++        if calls is not None:
++            self._prepared_calls.add(calls)
++
+     def compile(self, compile_key: _CallKey) -> None:
+         self.compile_many([compile_key])
+ 
+@@ -183,7 +199,7 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
+         if kernel is not TILELANG:
+             continue
+         for args, kwargs in registrations:
+-            for key in kernel.get_warmup_keys(*args, **kwargs):
++            for key in kernel.declared_keys(*args, **kwargs):
+                 calls.setdefault(key, (key.function, key.args, key.kwargs))
+     return list(calls.values())
+ 
+@@ -205,6 +221,12 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+     calls = declared_calls(registry)
+     PROGRESS.start(len(calls))
+     tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
++    for kernel, registrations in registry.registrations():
++        if kernel is not TILELANG:
++            continue
++        for args, _ in registrations:
++            if args:
++                TILELANG.mark_prepared(args[0])
+     return len(calls)
+ 
+ 
+@@ -218,21 +240,54 @@ def release_host_memory() -> None:
+         ctypes.CDLL("libc.so.6").malloc_trim(0)
+ 
+ 
+-def _callbacks(registry: JitWarmupRegistry, index: int) -> list[Callable[[], None]]:
+-    found: dict[int, Callable[[], None]] = {}
++_SAFE_CELL_ATOMS = (int, float, str, bytes, bool, type(None), type)
++
++
++def _cell_key(value: Any) -> Any:
++    if isinstance(value, _SAFE_CELL_ATOMS):
++        return (type(value), value)
++    if isinstance(value, tuple):
++        return (tuple, tuple(_cell_key(x) for x in value))
++    return ("id", id(value))
++
++
++def _callback_dedup_key(callback: Callable[[], None], deduplicate_closures: bool) -> Any:
++    if not deduplicate_closures:
++        return ("id", id(callback))
++    code = getattr(callback, "__code__", None)
++    if code is None or getattr(callback, "__self__", None) is not None:
++        return ("id", id(callback))
++    closure = getattr(callback, "__closure__", None)
++    if not closure:
++        return ("code", code)
++    try:
++        cells = tuple(_cell_key(cell.cell_contents) for cell in closure)
++    except (TypeError, ValueError):
++        return ("id", id(callback))
++    return ("closure", code, cells)
++
++
++def _callbacks(
++    registry: JitWarmupRegistry,
++    index: int,
++    *,
++    deduplicate_closures: bool = False,
++) -> list[Callable[[], None]]:
++    found: dict[Any, Callable[[], None]] = {}
+     for kernel, registrations in registry.registrations():
+         if kernel is not TILELANG:
+             continue
+         for args, _ in registrations:
+             callback = args[index] if len(args) > index else None
+             if callback is not None:
+-                found.setdefault(id(callback), callback)
++                key = _callback_dedup_key(callback, deduplicate_closures)
++                found.setdefault(key, callback)
+     return list(found.values())
+ 
+ 
+ def warm_declared(registry: JitWarmupRegistry) -> int:
+     """Run every owner's ``warm()`` (before ``freeze``); return how many ran."""
+-    callbacks = _callbacks(registry, 2)
++    callbacks = _callbacks(registry, 2, deduplicate_closures=True)
+     for warm in callbacks:
+         warm()
+     return len(callbacks)
+@@ -245,8 +300,29 @@ def freeze(reason: str) -> None:
+     freeze_cache(reason)
+ 
+ 
++_BOUND_CACHE: dict[_CallKey, Any] | None = None
++
++
++def launch(entry: TileLangCall) -> Any:
++    """Return the prepared kernel for ``entry``, reusing bindings within ``bind_declared``."""
++    function, args, kwargs = entry
++    if _BOUND_CACHE is not None:
++        key = _CallKey(function, args, kwargs)
++        kernel = _BOUND_CACHE.get(key)
++        if kernel is None:
++            kernel = function(*args, **kwargs)
++            _BOUND_CACHE[key] = kernel
++        return kernel
++    return function(*args, **kwargs)
++
++
+ def bind_declared(registry: JitWarmupRegistry) -> None:
+     """Let every owner store its prepared kernels (after ``freeze``, so a bind that
+     asks for an undeclared call fails by name)."""
+-    for bind in _callbacks(registry, 1):
+-        bind()
++    global _BOUND_CACHE
++    _BOUND_CACHE = {}
++    try:
++        for bind in _callbacks(registry, 1):
++            bind()
++    finally:
++        _BOUND_CACHE = None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index aadf8a3ab..cd8f91f58 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -614,13 +614,23 @@ class TileLangGateRouter(TileKernelsRouter):
+         kernels."""
+ 
+         def bind() -> None:
+-            for key, (function, args, kwargs) in self._partials_kernels().items():
+-                self._kernels[key] = function(*args, **kwargs)
++            for key, entry in self._partials_kernels().items():
++                self._kernels[key] = prepare.launch(entry)
++
++        top_k = self.top_k
++        num_experts = self.gate.weight.shape[0]
++        image = self.bias_vl is not None and self.image_sentinel_lo > 0
++        masks = self._mask_variants
++        warm = (
++            (lambda: [_warm_topk_gate(top_k, num_experts, image, m) for m in masks])
++            if self._gates_every_row()
++            else None
++        )
+ 
+         prepare.declare(
+             lambda: [*self._partials_kernels().values(), *self._mask_calls()],
+             bind=bind,
+-            warm=self._warm,
++            warm=warm,
+         )
+ 
+     def _compute_routing(
