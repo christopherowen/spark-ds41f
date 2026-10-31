@@ -1635,7 +1635,6 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "bin/spark doctor --fragmentation-commands",
         (
             "weight shards are not at ext4's best extent count",
-            "weight fragmentation:",
         ),
     ),
     (
@@ -1664,7 +1663,7 @@ def summarize_live_warnings(
     matched_labels: dict[str, None] = {}
     passthrough: list[str] = []
     for warning in warnings:
-        if warning.startswith("Kernel corrections (not executed):"):
+        if warning.startswith(("Kernel corrections (not executed):", "weight fragmentation:")):
             continue
         node, separator, detail = warning.partition(": ")
         text = detail if separator else warning
@@ -1721,7 +1720,8 @@ def command_doctor(args: argparse.Namespace) -> int:
     findings = local_doctor(cluster, nodes, upstreams)
     if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
-        findings.extend(weight_fragmentation_findings(cluster, nodes))
+        if not split_findings(findings)[0]:
+            findings.extend(weight_fragmentation_findings(cluster, nodes))
     problems, warnings = split_findings(findings)
     if args.live and not getattr(args, "verbose", False):
         warnings = summarize_live_warnings(warnings, canonical)
