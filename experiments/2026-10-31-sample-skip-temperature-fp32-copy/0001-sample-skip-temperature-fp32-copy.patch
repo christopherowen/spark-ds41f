@@ -1,0 +1,613 @@
+From 24c33bbabf8e8510b3de5854a00ad12733122737 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:38:50 +0100
+Subject: [PATCH] [V1][Sampler] Fuse temperature scaling into TileLang sampling
+ and block verification
+
+When active requests only scale by temperature (no logit bias, penalties, bad
+words, thinking budget, min_p, top_k, or top_p) and processed logprobs are not
+requested:
+- Skip allocating the [num_rows, vocab_size] FP32 copy and launching
+  apply_temperature in Sampler.apply_sampling_params.
+- Fuse temperature scaling into tilelang_sampling.gumbel_sample_kernel
+  (apply_temperature=True) for target sampling.
+- Add an in-kernel apply_temperature runtime flag to tilelang_rejection's
+  local_stats_kernel, verify_kernel, and resample_kernel so block verification
+  reads raw BF16 target logits directly.
+---
+ tests/v1/worker/test_gpu_sampler_flags.py     | 154 ++++++++++++++++++
+ vllm/v1/worker/gpu/sample/sampler.py          |  59 ++++++-
+ .../v1/worker/gpu/sample/tilelang_sampling.py |   8 +-
+ .../worker/gpu/sample/tilelang_topk_topp.py   |   2 +-
+ .../gpu/spec_decode/rejection_sampler.py      |  13 ++
+ .../spec_decode/rejection_sampler_utils.py    |   2 +
+ .../gpu/spec_decode/tilelang_rejection.py     |  46 +++++-
+ 7 files changed, 267 insertions(+), 17 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sampler_flags.py b/tests/v1/worker/test_gpu_sampler_flags.py
+index 4686187a5..9f0926753 100644
+--- a/tests/v1/worker/test_gpu_sampler_flags.py
++++ b/tests/v1/worker/test_gpu_sampler_flags.py
+@@ -130,3 +130,157 @@ def test_seeded_filtered_sampler_uses_precompiled_target_kernel():
+     assert gumbel_kernels() == compiled, (
+         "seeded filtered sampling compiled a Gumbel kernel after target warmup"
+     )
++
++
++def test_temperature_only_sampling_skips_fp32_copy_and_matches_fp32_path(monkeypatch):
++    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++
++    sampler = _make_sampler()
++    sampler.add_request(0, 1, SamplingParams(temperature=0.0, seed=11))
++    sampler.add_request(1, 1, SamplingParams(temperature=1.0, seed=22))
++    sampler.add_request(2, 1, SamplingParams(temperature=0.6, seed=33))
++    sampler.apply_staged_writes()
++
++    assert sampler.needs_logits_processing[2]
++    assert not sampler.needs_non_temperature_logits_processing[2]
++
++    mapping_np = np.array([0, 1, 2], dtype=np.intp)
++    mapping = torch.from_numpy(mapping_np).to(DEVICE)
++    gen = torch.Generator(device=DEVICE).manual_seed(1234)
++    logits = torch.randn((3, VOCAB_SIZE), generator=gen, device=DEVICE).to(
++        torch.bfloat16
++    )
++    position = torch.tensor([5, 6, 7], dtype=torch.int64, device=DEVICE)
++    input_ids = torch.ones(3, dtype=torch.int32, device=DEVICE)
++    local_position = torch.zeros(3, dtype=torch.int32, device=DEVICE)
++
++    ref_processed = sampler.apply_sampling_params(
++        logits,
++        mapping,
++        mapping,
++        mapping_np,
++        position,
++        input_ids,
++        local_position,
++        skip_top_k_top_p=True,
++    )
++    assert ref_processed.dtype == torch.float32
++    ref_sampled = gumbel_sample(
++        ref_processed,
++        mapping,
++        sampler.sampling_states.temperature.gpu,
++        sampler.sampling_states.seeds.gpu,
++        position,
++        apply_temperature=False,
++        is_drafting=False,
++    )
++
++    def forbid_temp(*args, **kwargs):
++        raise AssertionError("standalone apply_temperature should be skipped")
++
++    monkeypatch.setattr(sampler.sampling_states, "apply_temperature", forbid_temp)
++    sampled, processed = sampler.sample(
++        logits,
++        mapping,
++        mapping,
++        mapping_np,
++        position,
++        input_ids,
++        local_position,
++    )
++    torch.accelerator.synchronize()
++
++    assert processed.data_ptr() == logits.data_ptr()
++    assert processed.dtype == torch.bfloat16
++    assert torch.equal(sampled, ref_sampled)
++
++
++def test_temperature_only_block_verification_skips_fp32_copy_and_matches(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
++
++    sampler = _make_sampler()
++    sampler.add_request(0, 1, SamplingParams(temperature=0.0, seed=101))
++    sampler.add_request(1, 1, SamplingParams(temperature=0.6, seed=202))
++    sampler.add_request(2, 1, SamplingParams(temperature=1.3, seed=303))
++    sampler.apply_staged_writes()
++
++    rs = RejectionSampler.__new__(RejectionSampler)
++    rs.sampler = sampler
++    rs.watermark_key = None
++    rs.sink = None
++    rs.num_speculative_steps = 3
++    rs.num_draft_steps = 3
++    rs.enable_adaptive_verification = False
++    rs.use_block_verification = True
++    rs.synthetic_conditional_rates = None
++
++    idx_mapping_np = np.array([0, 1, 2], dtype=np.intp)
++    idx_mapping = torch.from_numpy(idx_mapping_np).to(DEVICE)
++    cu_num_logits = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device=DEVICE)
++    expanded_idx_mapping = idx_mapping.repeat_interleave(4)
++    expanded_local_pos = torch.tensor([0, 1, 2, 3] * 3, dtype=torch.int32, device=DEVICE)
++    pos = torch.arange(12, dtype=torch.int64, device=DEVICE)
++
++    gen = torch.Generator(device=DEVICE).manual_seed(5678)
++    logits = (
++        torch.randn((12, VOCAB_SIZE), generator=gen, device=DEVICE) * 3.0
++    ).to(torch.bfloat16)
++    draft_sampled = torch.randint(
++        0, VOCAB_SIZE, (12,), generator=gen, dtype=torch.int32, device=DEVICE
++    )
++    for r in range(11):
++        logits[r, draft_sampled[r + 1]] += 4.0
++
++    ref_processed = sampler.apply_sampling_params(
++        logits,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        pos,
++        draft_sampled,
++        expanded_local_pos,
++    )
++    assert ref_processed.dtype == torch.float32
++    ref_sampled, ref_num_sampled = rejection_sample(
++        ref_processed,
++        None,
++        draft_sampled,
++        cu_num_logits,
++        pos,
++        idx_mapping,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        sampler.sampling_states.temperature.gpu,
++        sampler.sampling_states.seeds.gpu,
++        rs.num_speculative_steps,
++        None,
++        use_fp64=False,
++        use_block_verification=True,
++    )
++
++    def forbid_temp(*args, **kwargs):
++        raise AssertionError("standalone apply_temperature should be skipped")
++
++    monkeypatch.setattr(sampler.sampling_states, "apply_temperature", forbid_temp)
++    processed, sampled, num_sampled = rs._verify(
++        logits,
++        None,
++        draft_sampled,
++        pos,
++        cu_num_logits,
++        idx_mapping,
++        idx_mapping_np,
++        expanded_idx_mapping,
++        expanded_local_pos,
++    )
++    torch.accelerator.synchronize()
++
++    assert processed.data_ptr() == logits.data_ptr()
++    assert processed.dtype == torch.bfloat16
++    assert torch.equal(num_sampled, ref_num_sampled)
++    for req in range(3):
++        n = int(num_sampled[req].item())
++        assert torch.equal(sampled[req, :n], ref_sampled[req, :n])
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 5b81da050..96867ab9e 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -66,6 +66,9 @@ class Sampler:
+             TraceReplayState(req_states) if enable_trace_replay else None
+         )
+         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
++        self.needs_non_temperature_logits_processing = np.zeros(
++            max_num_reqs, dtype=bool
++        )
+         self.num_speculative_tokens = num_speculative_tokens
+         self.return_sampling_mask = return_sampling_mask
+         self.use_flashinfer = (
+@@ -89,7 +92,7 @@ class Sampler:
+ 
+         states = self.sampling_states
+         temperature = states.temperature.np[req_idx]
+-        self.needs_logits_processing[req_idx] = (
++        non_temperature = (
+             self.logit_bias_state.use_logit_bias[req_idx]
+             or self.penalties_state.use_penalty[req_idx]
+             or self.bad_words_state.num_bad_words.np[req_idx] > 0
+@@ -97,11 +100,24 @@ class Sampler:
+                 self.thinking_budget_state.enabled
+                 and self.thinking_budget_state.use_thinking_budget[req_idx]
+             )
+-            or (temperature != 0.0 and temperature != 1.0)
+             or states.min_p.np[req_idx] != 0.0
+             or states.top_k.np[req_idx] != states.vocab_size
+             or states.top_p.np[req_idx] != 1.0
+         )
++        self.needs_non_temperature_logits_processing[req_idx] = non_temperature
++        self.needs_logits_processing[req_idx] = non_temperature or (
++            temperature != 0.0 and temperature != 1.0
++        )
++
++    def any_non_temperature_logits_processing(
++        self, idx_mapping_np: np.ndarray
++    ) -> bool:
++        flags = getattr(
++            self,
++            "needs_non_temperature_logits_processing",
++            self.needs_logits_processing,
++        )
++        return bool(np.any(flags[idx_mapping_np]))
+ 
+     def register_warmups(
+         self,
+@@ -295,8 +311,12 @@ class Sampler:
+         input_ids: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+         skip_top_k_top_p: bool = False,
++        skip_temperature: bool = False,
+     ) -> torch.Tensor:
+-        if not np.any(self.needs_logits_processing[idx_mapping_np]):
++        if skip_temperature:
++            if not self.any_non_temperature_logits_processing(idx_mapping_np):
++                return logits
++        elif not np.any(self.needs_logits_processing[idx_mapping_np]):
+             return logits
+ 
+         # Copy logits to a new FP32 tensor.
+@@ -336,10 +356,11 @@ class Sampler:
+             expanded_local_pos,
+         )
+ 
+-        # Apply temperature in place.
+-        self.sampling_states.apply_temperature(
+-            logits, expanded_idx_mapping, idx_mapping_np
+-        )
++        if not skip_temperature:
++            # Apply temperature in place.
++            self.sampling_states.apply_temperature(
++                logits, expanded_idx_mapping, idx_mapping_np
++            )
+ 
+         # Apply min_p in place.
+         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+@@ -363,6 +384,15 @@ class Sampler:
+         expanded_local_pos: torch.Tensor,
+         return_logprobs: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        in_kernel_temperature = (
++            type(self) is Sampler
++            and not getattr(self, "use_fp64_gumbel", False)
++            and bool(np.any(self.needs_logits_processing[idx_mapping_np]))
++            and not self.any_non_temperature_logits_processing(idx_mapping_np)
++            and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
++            and not getattr(self, "return_sampling_mask", False)
++            and getattr(self, "sink", None) is None
++        )
+         processed_logits = self.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -372,6 +402,7 @@ class Sampler:
+             input_ids,
+             expanded_local_pos,
+             skip_top_k_top_p=True,
++            skip_temperature=in_kernel_temperature,
+         )
+         top_k, top_p = self.sampling_states.get_top_k_top_p(
+             expanded_idx_mapping, idx_mapping_np
+@@ -386,6 +417,17 @@ class Sampler:
+             or self.sampling_states.any_explicit_seed(idx_mapping_np)
+         )
+ 
++        if in_kernel_temperature:
++            return self._sample_random(
++                processed_logits,
++                expanded_idx_mapping,
++                idx_mapping_np,
++                pos,
++                top_k,
++                top_p,
++                use_flashinfer,
++                apply_temperature=True,
++            )
+         return self._sample_random(
+             processed_logits,
+             expanded_idx_mapping,
+@@ -405,6 +447,7 @@ class Sampler:
+         top_k: torch.Tensor | None,
+         top_p: torch.Tensor | None,
+         use_flashinfer: bool,
++        apply_temperature: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         if use_flashinfer:
+             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+@@ -418,7 +461,7 @@ class Sampler:
+                 self.sampling_states.temperature.gpu,
+                 self.sampling_states.seeds.gpu,
+                 pos,
+-                apply_temperature=False,
++                apply_temperature=apply_temperature,
+                 is_drafting=False,
+                 use_fp64=self.use_fp64_gumbel,
+             )
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 2df49deb8..2e3e92360 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -2768,19 +2768,21 @@ def sampling_calls(
+     temperature_strides: Sequence[int] | None = None,
+ ) -> list:
+     """The target sampler's calls: Gumbel-max sampling of logits of each of
+-    ``logits_dtypes`` without a logits cache, the temperature already applied,
+-    and the temperature of processed FP32 logits."""
++    ``logits_dtypes`` without a logits cache (with and without in-kernel
++    temperature scaling), and the temperature of processed FP32 logits."""
+     strides_by_dtype: dict[torch.dtype, list[int]] = {}
+     if logits_strides is not None:
+         for dtype, stride in logits_strides:
+             strides_by_dtype.setdefault(dtype, []).append(stride)
++    apply_temps = (False, True) if temperature else (False,)
+     calls = [
+         _call(
+             gumbel_sample_kernel,
+-            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, False, False, run=run),
++            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, apply_temp, False, run=run),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype, strides_by_dtype.get(dtype))
++        for apply_temp in apply_temps
+     ]
+     if temperature:
+         calls += [
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py b/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
+index 6a687fc0c..ca53fe36e 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
+@@ -2051,10 +2051,10 @@ def apply_top_k_top_p(
+     top-k by logit, then top-p by probability over what top-k kept. Returns the
+     masked logits (FP32): ``logits`` itself unless its columns are strided."""
+     assert logits.ndim == 2
+-    assert logits.dtype == torch.float32
+     rows, vocab = logits.shape
+     if rows == 0 or (k is None and p is None):
+         return logits
++    assert logits.dtype == torch.float32
+     if logits.stride(1) != 1:
+         logits = logits.contiguous()
+     if k is not None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 42b1a0380..664722a31 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -302,6 +302,17 @@ class RejectionSampler:
+         methods cap the count (the insertion of the resampled token stores it so).
+         ``kernel_steps``: the drafts every request of the step verifies at most,
+         the width block verification's kernels run at."""
++        in_kernel_temperature = (
++            self.use_block_verification
++            and draft_logits is None
++            and self.synthetic_conditional_rates is None
++            and self.watermark_key is None
++            and not getattr(self.sampler, "use_fp64_gumbel", False)
++            and sink is None
++            and self.sampler.logprobs_mode not in PROCESSED_LOGPROBS_MODES
++            and bool(np.any(self.sampler.needs_logits_processing[idx_mapping_np]))
++            and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
++        )
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -310,6 +321,7 @@ class RejectionSampler:
+             pos,
+             draft_sampled,
+             expanded_local_pos,
++            skip_temperature=in_kernel_temperature,
+         )
+         cut = None
+         if sink is not None:
+@@ -338,6 +350,7 @@ class RejectionSampler:
+             use_block_verification=self.use_block_verification,
+             dead_row_cut=dead_row_cut,
+             kernel_steps=kernel_steps,
++            **({"apply_temperature": True} if in_kernel_temperature else {}),
+             **self._watermarking_kwargs(
+                 draft_sampled, expanded_idx_mapping, expanded_local_pos
+             ),
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 4fb8822c7..52d1787db 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1339,6 +1339,7 @@ def rejection_sample(
+     # Block verification's TileLang kernels at this many drafts for a step whose
+     # requests verify no more (copy drafts: DSpark's block without a copy).
+     kernel_steps: int | None = None,
++    apply_temperature: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+     assert draft_logits is None or (
+@@ -1376,6 +1377,7 @@ def rejection_sample(
+                 num_speculative_steps,
+                 dead_row_cut,
+                 kernel_steps,
++                apply_temperature,
+             )
+         )
+         # A block that ends at the cut commits at most the cut + 1: no cap.
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+index 71ecf351f..ff5017a33 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -371,6 +371,7 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run:
+         expanded_local_pos: T.Tensor((step_len,), step_dtype),
+         temperature: T.Tensor((temp_len,), T.float32),
+         num_speculative_steps: T.int32,
++        apply_temperature: T.int32,
+     ):
+         with T.Kernel(rows, blocks, threads=_THREADS) as (t, blk):
+             T.import_source(_HEADER)
+@@ -429,6 +430,17 @@ def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run:
+                         )
+                         local_max[t, blk] = best[0]
+                 else:
++                    if (apply_temperature != 0) & (temp != T.float32(1)):
++                        for j in T.unroll(_STATS_PER_THREAD):
++                            if blk * STATS_BLOCK + _element(j, tx, run) < vocab:
++                                values[j] = T.call_extern(
++                                    "float32", "vllm_div_full", values[j], temp
++                                )
++                        best[0] = values[0]
++                        for j in T.unroll(1, _STATS_PER_THREAD):
++                            best[0] = T.call_extern(
++                                "float32", "vllm_max", best[0], values[j]
++                            )
+                     _block_reduce(best, partial, tx, "vllm_max")
+                     if tx == 0:
+                         maximum[0] = best[0]
+@@ -489,6 +501,7 @@ def compute_local_stats(
+     expanded_local_pos: torch.Tensor,  # [num_logits]
+     temperature: torch.Tensor,  # [max_num_reqs]
+     num_speculative_steps: int,
++    apply_temperature: bool = False,
+ ) -> None:
+     """``_compute_local_logits_stats_kernel``'s launch without draft logits, into
+     the given ``[num_logits, cdiv(vocab_size, 8192)]`` statistics."""
+@@ -512,6 +525,7 @@ def compute_local_stats(
+         expanded_local_pos.contiguous(),
+         temperature,
+         num_speculative_steps,
++        int(apply_temperature),
+     )
+ 
+ 
+@@ -582,6 +596,7 @@ def verify_kernel(
+         seeds: T.Tensor((seed_len,), T.int64),
+         pos: T.Tensor((pos_len,), pos_dtype),
+         dead_row_cut: T.Tensor((cut_len,), T.int32),
++        apply_temperature: T.int32,
+     ):
+         with T.Kernel(reqs, threads=threads) as req:
+             T.import_source(_HEADER)
+@@ -636,6 +651,12 @@ def verify_kernel(
+                 T.float32,
+                 init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
+             )
++            if (
++                (apply_temperature != 0)
++                & (temp != T.float32(0))
++                & (temp != T.float32(1))
++            ):
++                logit = T.call_extern("float32", "vllm_div_full", logit, temp)
+ 
+             # The step's S: the blocks' maximum, the first block holding it (a NaN
+             # maximum holds none), then the block sums rescaled to it, each with its
+@@ -835,6 +856,7 @@ def verify(
+     pos: torch.Tensor,  # [num_logits]
+     num_speculative_steps: int,
+     dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
++    apply_temperature: bool = False,
+ ) -> None:
+     """The launches of ``_compute_cumulative_log_p_kernel`` and
+     ``_rejection_kernel`` (block verification, one-hot drafts) as one, into the
+@@ -871,6 +893,7 @@ def verify(
+         pos.contiguous(),
+         # Without a cut it is not read: the counts stand in.
+         num_sampled if dead_row_cut is None else dead_row_cut,
++        int(apply_temperature),
+     )
+ 
+ 
+@@ -905,8 +928,8 @@ def resample_kernel(
+     )
+ 
+     @T.macro
+-    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, blk,
+-               tx, noisy):  # fmt: skip
++    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, temp,
++               apply_temperature, blk, tx, noisy):  # fmt: skip
+         """The thread's residual scores, combined into ``(best, best_index)``; with
+         ``noisy`` each element's Philox word is drawn ahead of its bound check (the
+         Gumbel sampler's ``passes``)."""
+@@ -925,10 +948,16 @@ def resample_kernel(
+                     )
+                 score[0] = -T.infinity(T.float32)
+                 if index < vocab:
++                    score[0] = T.cast(raw[k], T.float32)
++                    if noisy:
++                        if (apply_temperature != 0) & (temp != T.float32(1)):
++                            score[0] = T.call_extern(
++                                "float32", "vllm_div_full", score[0], temp
++                            )
+                     score[0] = T.if_then_else(
+                         T.cast(index, T.int64) == rejected[0],
+                         -T.infinity(T.float32),
+-                        T.cast(raw[k], T.float32),
++                        score[0],
+                     )
+                     if noisy:
+                         score[0] = T.call_extern(
+@@ -953,6 +982,7 @@ def resample_kernel(
+         seeds: T.Tensor((seed_len,), T.int64),
+         pos: T.Tensor((pos_len,), pos_dtype),
+         dead_row_cut: T.Tensor((cut_len,), T.int32),
++        apply_temperature: T.int32,
+     ):
+         with T.Kernel(reqs, blocks, threads=_THREADS) as (req, blk):
+             T.import_source(_HEADER)
+@@ -1008,10 +1038,10 @@ def resample_kernel(
+                 word_seed[0] = _randint_at(seed, pos[row], pos_dtype, False)
+                 if T.if_then_else(state >= 0, temp, T.float32(0)) != T.float32(0):
+                     passes(logits, raw, score, best, best_index, row, rejected,
+-                           word_seed, blk, tx, True)  # fmt: skip
++                           word_seed, temp, apply_temperature, blk, tx, True)  # fmt: skip
+                 else:
+                     passes(logits, raw, score, best, best_index, row, rejected,
+-                           word_seed, blk, tx, False)  # fmt: skip
++                           word_seed, temp, apply_temperature, blk, tx, False)  # fmt: skip
+                 _block_argmax(
+                     best, best_index, other, other_index, partial, partial_index, tx
+                 )
+@@ -1054,6 +1084,7 @@ def resample(
+     seed: torch.Tensor,  # [max_num_reqs]
+     pos: torch.Tensor,  # [num_logits]
+     dead_row_cut: torch.Tensor | None = None,  # [num_reqs] int32
++    apply_temperature: bool = False,
+ ) -> None:
+     """``_resample_kernel``'s launch without draft logits or watermark (FP32), into
+     the given ``[num_reqs, cdiv(vocab_size, 1024)]`` block winners; with
+@@ -1084,6 +1115,7 @@ def resample(
+         pos.contiguous(),
+         # Without a cut it is not read: the counts stand in.
+         num_sampled if dead_row_cut is None else dead_row_cut,
++        int(apply_temperature),
+     )
+ 
+ 
+@@ -1113,6 +1145,7 @@ def verify_and_resample(
+     # [num_reqs] int32
+     dead_row_cut: torch.Tensor | None = None,
+     kernel_steps: int | None = None,
++    apply_temperature: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """``rejection_sample``'s launches before the insertion, with one-hot drafts,
+     block verification, FP32 draws and no watermark: the sampled tokens
+@@ -1146,6 +1179,7 @@ def verify_and_resample(
+         expanded_local_pos,
+         temperature,
+         steps,
++        apply_temperature,
+     )
+ 
+     # Verification up to the first rejected or bonus token.
+@@ -1174,6 +1208,7 @@ def verify_and_resample(
+         pos,
+         steps,
+         dead_row_cut,
++        apply_temperature,
+     )
+ 
+     # Resample the rejected/bonus tokens.
+@@ -1196,6 +1231,7 @@ def verify_and_resample(
+         seed,
+         pos,
+         dead_row_cut,
++        apply_temperature,
+     )
+     return sampled, num_sampled, resampled_local_argmax, resampled_local_max
+ 
+-- 
+2.54.0 (Apple Git-157)
+
