@@ -1,0 +1,734 @@
+From bc30c48fab384a866a13ecd2cce72c02773dcabf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:28:43 +0100
+Subject: [PATCH] feat(ds41-tilelang): native TileLang online NVFP4 draft and
+ Markov vocabulary head
+
+---
+ .../test_deepseek_v41_tilelang_vocab.py       | 121 ++++++
+ .../layers/quantization/online/nvfp4.py       |  87 ++++-
+ .../layers/vocab_parallel_embedding.py        |   4 +
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   | 351 +++++++++++++++++-
+ 4 files changed, 538 insertions(+), 25 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 55678ff11..a4ded789b 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -20,8 +20,10 @@ packed_format = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
+ 
+ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
+     ROW_TILES,
++    nvfp4_vocab_projection,
+     packed_vocab_projection,
+     prepare_bf16_head,
++    prepare_nvfp4_head,
+     prepare_packed_head,
+     project_head,
+     project_head_greedy_pairs,
+@@ -263,3 +265,122 @@ def test_packed_head_greedy_pairs_match_greedy_shard_pair(n, k, out_dtype):
+             )
+             assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
+             assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
++
++
++def _nvfp4_layer(weight: torch.Tensor):
++    from vllm._custom_ops import scaled_fp4_quant
++    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++        FLOAT4_E2M1_MAX,
++        dequantize_to_dtype,
++    )
++
++    float8_e4m3_max = torch.finfo(torch.float8_e4m3fn).max
++    amax = weight.abs().amax().float().clamp_min(1e-8)
++    global_scale = (FLOAT4_E2M1_MAX * float8_e4m3_max) / amax
++    packed, scales = scaled_fp4_quant(
++        weight.contiguous(), global_scale, is_sf_swizzled_layout=False
++    )
++    weight_global_scale = global_scale.reciprocal().reshape(1).to(torch.float32)
++    dequant = dequantize_to_dtype(
++        packed,
++        scales.view(torch.float8_e4m3fn),
++        weight_global_scale,
++        dtype=torch.float32,
++        block_size=16,
++        swizzle=False,
++    )
++    layer = SimpleNamespace(
++        weight=packed,
++        weight_scale=scales,
++        weight_global_scale=weight_global_scale,
++        nvfp4_in_features=int(weight.shape[1]),
++    )
++    return layer, dequant
++
++
++@pytest.mark.parametrize("n,k", [(1000, 256), (32320, 256), (1000, 512)])
++def test_nvfp4_head_matches_dequantized_reference_and_is_batch_invariant(n, k):
++    generator = torch.Generator(device=DEVICE).manual_seed(n + k + 23)
++    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
++    layer, dequant_weight = _nvfp4_layer(weight)
++    prepare_nvfp4_head(layer)
++    assert set(layer.tilelang_vocab) == set(ROW_TILES)
++    x = (torch.randn(130, k, generator=generator, device=DEVICE) * 0.5).bfloat16()
++    full = project_head(layer, x)
++    assert _close_to_fp32(full, x, dequant_weight)
++    for rows in (1, 5, 16, 17, 33, 64, 96, 128):
++        assert torch.equal(project_head(layer, x[:rows].contiguous()), full[:rows]), rows
++    assert torch.equal(project_head(layer, x[70:71].contiguous()), full[70:71])
++
++
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
++def test_nvfp4_head_greedy_pairs_match_greedy_shard_pair(out_dtype):
++    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
++        vocab_parallel_pairs,
++        vocab_parallel_pairs_from_head,
++    )
++
++    n, k = 1000, 256
++    generator = torch.Generator(device=DEVICE).manual_seed(109)
++    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
++    weight[100] = weight[5]
++    weight[500] = weight[5]
++    layer, _ = _nvfp4_layer(weight)
++    prepare_nvfp4_head(layer, out_dtype)
++    assert set(layer.tilelang_vocab_greedy) == set(ROW_TILES)
++    x = (torch.randn(96, k, generator=generator, device=DEVICE) * 0.5).bfloat16()
++    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
++        for rows in (1, 6, 24, 48, 65, 96):
++            part = x[:rows].contiguous()
++            logits = project_head(layer, part)
++            expected = vocab_parallel_pairs(logits, vocab, vocab_start, tp_size=1)
++            actual = project_head_greedy_pairs(
++                layer, part, vocab=vocab, vocab_start=vocab_start
++            )
++            from_head = vocab_parallel_pairs_from_head(
++                layer, part, vocab, vocab_start, tp_size=1
++            )
++            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
++            assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
++
++
++def test_nvfp4_online_linear_method_tilelang_without_b12x(monkeypatch):
++    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
++    from vllm.model_executor.kernels.linear.nvfp4.b12x import B12xNvFp4LinearKernel
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
++    from vllm.model_executor.layers.quantization.online.nvfp4 import (
++        Nvfp4OnlineLinearMethod,
++    )
++
++    monkeypatch.setattr(
++        B12xNvFp4LinearKernel,
++        "is_supported",
++        classmethod(lambda cls, *_args, **_kwargs: (False, "b12x disabled")),
++    )
++    config = VllmConfig(kernel_config=KernelConfig(linear_backend="tilelang"))
++    with set_current_vllm_config(config):
++        method = Nvfp4OnlineLinearMethod()
++        assert method.tilelang and method.kernel is None
++        layer = torch.nn.Module()
++        generator = torch.Generator(device=DEVICE).manual_seed(83)
++        original = (
++            torch.randn(1000, 256, generator=generator, device=DEVICE) * 0.05
++        ).bfloat16()
++        layer.register_parameter(
++            "weight", torch.nn.Parameter(original.clone(), requires_grad=False)
++        )
++        method.process_weights_after_loading(layer)
++        method.declare_layer_kernels(layer)
++
++        _, dequant = _nvfp4_layer(original)
++        x = (torch.randn(2, 5, 256, generator=generator, device=DEVICE) * 0.5).bfloat16()
++        out = method.apply(layer, x)
++        assert out.shape == (2, 5, 1000) and out.dtype == torch.bfloat16
++        assert _close_to_fp32(out.reshape(-1, 1000), x.reshape(-1, 256), dequant)
++
++        processor = LogitsProcessor.__new__(LogitsProcessor)
++        torch.nn.Module.__init__(processor)
++        processor.head_dtype = None
++        processor.use_tilelang_vocab_projection = True
++        logits = processor._apply_head(layer, x, None)
++        assert torch.equal(logits, out)
+diff --git a/vllm/model_executor/layers/quantization/online/nvfp4.py b/vllm/model_executor/layers/quantization/online/nvfp4.py
+index 2d5c32076..4f47561c4 100644
+--- a/vllm/model_executor/layers/quantization/online/nvfp4.py
++++ b/vllm/model_executor/layers/quantization/online/nvfp4.py
+@@ -1,10 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import importlib.util
++
+ import torch
+ from torch.nn import Module
+ 
+ from vllm._custom_ops import create_fp4_output_tensors, scaled_fp4_quant
++from vllm.config import get_current_vllm_config
+ from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+     B12xNvFp4LinearKernel,
+     run_b12x_nvfp4_serialized_linear,
+@@ -40,15 +43,37 @@ from vllm.platforms import current_platform
+ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+ 
+ 
++def _tilelang_nvfp4_head_supported() -> bool:
++    return (
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(120)
++        and importlib.util.find_spec("tilelang") is not None
++    )
++
++
+ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+     """Online NVFP4 draft head with selectable activation precision."""
+ 
+     def __init__(self, *, use_a16: bool = False):
+-        super().__init__()
+-        supported, reason = B12xNvFp4LinearKernel.is_supported()
+-        if not supported:
+-            raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
+-        self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
++        vllm_config = get_current_vllm_config()
++        if vllm_config.model_config is not None:
++            super().__init__()
++        else:
++            self.out_dtype = torch.get_default_dtype()
++            self.input_dtype = torch.bfloat16
++        kernel_config = vllm_config.kernel_config
++        self.tilelang = kernel_config.linear_backend == "tilelang"
++        if self.tilelang:
++            if not _tilelang_nvfp4_head_supported():
++                raise ValueError(
++                    "Online NVFP4 draft head with TileLang requires SM120/SM121 and tilelang"
++                )
++            self.kernel = None
++        else:
++            supported, reason = B12xNvFp4LinearKernel.is_supported()
++            if not supported:
++                raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
++            self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
+         self.use_a16 = use_a16
+         if use_a16 and self.input_dtype != torch.bfloat16:
+             raise ValueError("A16 LM heads require BF16 activations")
+@@ -57,8 +82,11 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+         weight = layer.weight.contiguous()
+-        if weight.shape[1] % 16:
++        in_features = int(weight.shape[1])
++        if in_features % 16:
+             raise ValueError("Online NVFP4 head requires K divisible by 16")
++        if self.tilelang and in_features % 128:
++            raise ValueError("TileLang online NVFP4 head requires K divisible by 128")
+         amax = weight.abs().amax().float().clamp_min(1e-8)
+         global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
+         packed, scales = scaled_fp4_quant(
+@@ -69,20 +97,55 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+         replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
+         replace_parameter(layer, "input_global_scale_inv", torch.ones_like(amax))
+         replace_parameter(layer, "alpha", layer.weight_global_scale.clone())
+-        # The quantized head scales its activations per call and runs the
+-        # serialized GEMM, so its exact-M plans are serialized declarations
+-        # even though the activations arrive in BF16.
+-        layer.b12x_nvfp4_serialized_activations = not self.use_a16
+-        layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+-        self.kernel.process_weights_after_loading(layer)
++        layer.nvfp4_in_features = in_features
++        if self.tilelang:
++            model_config = get_current_vllm_config().model_config
++            layer.tilelang_vocab_dtype = (
++                (model_config.head_dtype or torch.bfloat16)
++                if model_config
++                else torch.bfloat16
++            )
++        else:
++            # The quantized head scales its activations per call and runs the
++            # serialized GEMM, so its exact-M plans are serialized declarations
++            # even though the activations arrive in BF16.
++            layer.b12x_nvfp4_serialized_activations = not self.use_a16
++            layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
++            assert self.kernel is not None
++            self.kernel.process_weights_after_loading(layer)
+         layer._already_called_process_weights_after_loading = True
+ 
++    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
++        """With the TileLang backend, declare the online NVFP4 head's projection."""
++        if not self.tilelang or not hasattr(layer, "nvfp4_in_features"):
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_nvfp4_head
++
++        prepare_nvfp4_head(
++            layer, getattr(layer, "tilelang_vocab_dtype", torch.bfloat16)
++        )
++
+     def apply(
+         self,
+         layer: torch.nn.Module,
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if self.tilelang:
++            from vllm.models.deepseek_v4_1.tilelang.vocab import (
++                prepare_nvfp4_head,
++                project_head,
++            )
++
++            if not hasattr(layer, "tilelang_vocab"):
++                prepare_nvfp4_head(
++                    layer, getattr(layer, "tilelang_vocab_dtype", x.dtype)
++                )
++            output = project_head(layer, x.reshape(-1, x.shape[-1]))
++            if bias is not None:
++                output = output + bias
++            return output.view(*x.shape[:-1], layer.weight.shape[0])
++        assert self.kernel is not None
+         if self.use_a16 or (
+             x.numel() // x.shape[-1] <= layer.b12x_linear.a16_max_tokens
+         ):
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 9ff2cf754..791d5a08b 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -93,6 +93,10 @@ def _supports_default_lm_head_quantization(
+         return False
+ 
+     if recipe == "nvfp4":
++        if config.kernel_config.linear_backend == "tilelang":
++            import importlib.util
++
++            return importlib.util.find_spec("tilelang") is not None
+         from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+             B12xNvFp4LinearKernel,
+         )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index c6a8ab9c0..6566adae4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -30,12 +30,30 @@ from .gemm import bf16_gemm, bf16_gemm_decode
+ GROUP = 128  # columns per code group
+ HALF = GROUP // 2  # one code byte holds a column of each half
+ VEC = 16  # columns of each half one thread decodes at a time
++NVFP4_GROUP = 16  # columns per FP8 E4M3 scale byte in NVFP4
++NVFP4_PACKED = NVFP4_GROUP // 2  # packed E2M1 bytes per NVFP4 group
+ # Token tiles: one decode row in a 16-row tile reads the weights once, like 64;
+ # 65-128 verification rows read the packed weight shard once in a 128-row tile.
+ ROW_TILES = (16, 32, 64, 128)
+ SHARED_MEMORY = 101_376  # dynamic shared memory per block on SM120 / SM121
+ 
+ 
++def nvfp4_shared_memory_bytes(
++    block_M: int,
++    block_N: int,
++    num_stages: int,
++    step_groups: int = 1,
++    act_stages: int | None = None,
++) -> int:
++    """Shared memory for ``nvfp4_vocab_projection`` across ``step_groups`` groups
++    per step."""
++    a_stages = num_stages if act_stages is None else act_stages
++    act = a_stages * (block_M * GROUP * 2)
++    packed = num_stages * (block_N * (GROUP // 2 + GROUP // NVFP4_GROUP))
++    decoded = block_N * GROUP * 2
++    return step_groups * (act + packed + decoded)
++
++
+ def shared_memory_bytes(
+     block_M: int,
+     block_N: int,
+@@ -98,6 +116,18 @@ def _decode(low, code, base_minus_one):
+     return T.reinterpret(T.Cast(T.uint16, bits), T.bfloat16)
+ 
+ 
++def _decode_e2m1(nibble):
++    """The FP32 value of a 4-bit E2M1 nibble (1 sign bit + 3 magnitude bits)."""
++    n = T.Cast(T.int32, nibble)
++    mag = n & 0x07
++    sign = (n >> 3) & 1
++    fp32_bits = 0x3F000000 + (mag << 22)
++    val = T.reinterpret(T.Cast(T.uint32, fp32_bits), T.float32)
++    val = T.if_then_else(mag == 0, T.float32(0.0), val)
++    val = T.if_then_else(mag == 1, T.float32(0.5), val)
++    return T.if_then_else(sign == 1, -val, val)
++
++
+ _GREEDY_HEADER = r"""
+ #include <math_constants.h>
+ 
+@@ -502,6 +532,198 @@ def finish_vocab_greedy_pairs(
+     return vocab_greedy_finish
+ 
+ 
++@tilelang.jit
++def nvfp4_vocab_projection(
++    N: int,
++    K: int,
++    block_M: int = 16,
++    block_N: int = 64,
++    num_stages: int = 3,
++    threads: int = 128,
++    step_groups: int = 1,
++    act_stages: int | None = None,
++    out_dtype: T.dtype = T.bfloat16,
++):
++    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and online NVFP4 ``W``
++    (packed E2M1 nibbles ``W[N, K // 2]``, group-16 E4M3 scales
++    ``W_scale[N, K // 16]``, and FP32 ``W_global_scale[1]``), accumulated in FP32
++    and written as ``out_dtype``."""
++    assert K % (GROUP * step_groups) == 0
++    assert (
++        nvfp4_shared_memory_bytes(
++            block_M, block_N, num_stages, step_groups, act_stages=act_stages
++        )
++        <= SHARED_MEMORY
++    )
++    STEP = GROUP * step_groups
++    steps = K // STEP
++    packed_cols = K // 2
++    scale_cols = K // NVFP4_GROUP
++    step_packed = STEP // 2
++    step_scales = STEP // NVFP4_GROUP
++    items = block_N * step_scales
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vocab_nvfp4_projection(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, packed_cols), T.uint8),
++        W_scale: T.Tensor((N, scale_cols), T.float8_e4m3fn),
++        W_global_scale: T.Tensor((1,), T.float32),
++        C: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(
++            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
++        ) as (by, bx):
++            A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
++            packed_shared = T.alloc_shared((block_N, step_packed), T.uint8)
++            scale_shared = T.alloc_shared((block_N, step_scales), T.float8_e4m3fn)
++            B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            packed_local = T.alloc_local((NVFP4_PACKED,), T.uint8)
++            out_local = T.alloc_local((NVFP4_GROUP,), T.bfloat16)
++            tx = T.get_thread_binding()
++            T.clear(C_local)
++            last = num_stages - 1
++            act_stage = 0 if act_stages is None else last - act_stages + 1
++            for s in T.Pipelined(
++                steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++            ):
++                T.copy(A[by * block_M, s * STEP], A_shared)
++                T.copy(W[bx * block_N, s * step_packed], packed_shared)
++                T.copy(W_scale[bx * block_N, s * step_scales], scale_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if item < items:
++                        j = item // step_scales
++                        g = item % step_scales
++                        scale = T.Cast(T.float32, scale_shared[j, g])
++                        for v in T.vectorized(NVFP4_PACKED):
++                            packed_local[v] = packed_shared[j, g * NVFP4_PACKED + v]
++                        for v in T.unroll(NVFP4_PACKED):
++                            out_local[2 * v] = T.Cast(
++                                T.bfloat16, _decode_e2m1(packed_local[v] & 0xF) * scale
++                            )
++                            out_local[2 * v + 1] = T.Cast(
++                                T.bfloat16, _decode_e2m1(packed_local[v] >> 4) * scale
++                            )
++                        for v in T.vectorized(NVFP4_GROUP):
++                            B_shared[j, g * NVFP4_GROUP + v] = out_local[v]
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            global_scale = W_global_scale[0]
++            for i, j in T.Parallel(block_M, block_N):
++                C_local[i, j] = C_local[i, j] * global_scale
++            T.copy(C_local, C[by * block_M, bx * block_N])
++
++    return vocab_nvfp4_projection
++
++
++@tilelang.jit
++def nvfp4_vocab_greedy_partials(
++    N: int,
++    K: int,
++    block_M: int = 16,
++    block_N: int = 64,
++    num_stages: int = 3,
++    threads: int = 128,
++    step_groups: int = 1,
++    act_stages: int | None = None,
++    out_dtype: T.dtype = T.bfloat16,
++):
++    """Per-tile ``(max, shard index)`` of ``A @ W^T`` for BF16 ``A[M, K]`` and
++    online NVFP4 ``W``, reduced in each CTA's epilogue without writing ``[M, N]``
++    logits to DRAM."""
++    assert K % (GROUP * step_groups) == 0
++    assert (
++        nvfp4_shared_memory_bytes(
++            block_M, block_N, num_stages, step_groups, act_stages=act_stages
++        )
++        <= SHARED_MEMORY
++    )
++    STEP = GROUP * step_groups
++    steps = K // STEP
++    packed_cols = K // 2
++    scale_cols = K // NVFP4_GROUP
++    step_packed = STEP // 2
++    step_scales = STEP // NVFP4_GROUP
++    items = block_N * step_scales
++    num_tiles = (N + block_N - 1) // block_N
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vocab_nvfp4_greedy_partials(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, packed_cols), T.uint8),
++        W_scale: T.Tensor((N, scale_cols), T.float8_e4m3fn),
++        W_global_scale: T.Tensor((1,), T.float32),
++        partial_vals: T.Tensor((M, num_tiles), T.float32),
++        partial_idxs: T.Tensor((M, num_tiles), T.int32),
++        vocab: T.int32,
++    ):
++        with T.Kernel(
++            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
++        ) as (by, bx):
++            T.import_source(_GREEDY_HEADER)
++            A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
++            packed_shared = T.alloc_shared((block_N, step_packed), T.uint8)
++            scale_shared = T.alloc_shared((block_N, step_scales), T.float8_e4m3fn)
++            B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
++            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            packed_local = T.alloc_local((NVFP4_PACKED,), T.uint8)
++            out_local = T.alloc_local((NVFP4_GROUP,), T.bfloat16)
++            tx = T.get_thread_binding()
++            T.clear(C_local)
++            last = num_stages - 1
++            act_stage = 0 if act_stages is None else last - act_stages + 1
++            for s in T.Pipelined(
++                steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++            ):
++                T.copy(A[by * block_M, s * STEP], A_shared)
++                T.copy(W[bx * block_N, s * step_packed], packed_shared)
++                T.copy(W_scale[bx * block_N, s * step_scales], scale_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if item < items:
++                        j = item // step_scales
++                        g = item % step_scales
++                        scale = T.Cast(T.float32, scale_shared[j, g])
++                        for v in T.vectorized(NVFP4_PACKED):
++                            packed_local[v] = packed_shared[j, g * NVFP4_PACKED + v]
++                        for v in T.unroll(NVFP4_PACKED):
++                            out_local[2 * v] = T.Cast(
++                                T.bfloat16, _decode_e2m1(packed_local[v] & 0xF) * scale
++                            )
++                            out_local[2 * v + 1] = T.Cast(
++                                T.bfloat16, _decode_e2m1(packed_local[v] >> 4) * scale
++                            )
++                        for v in T.vectorized(NVFP4_GROUP):
++                            B_shared[j, g * NVFP4_GROUP + v] = out_local[v]
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            global_scale = W_global_scale[0]
++            for i, j in T.Parallel(block_M, block_N):
++                val = C_local[i, j] * global_scale
++                if out_dtype == T.bfloat16:
++                    val = T.Cast(T.float32, T.Cast(T.bfloat16, val))
++                C_local[i, j] = val
++            T.copy(C_local, C_shared)
++            T.call_extern(
++                "handle",
++                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
++                T.address_of(C_shared[0, 0]),
++                T.address_of(partial_vals[0, 0]),
++                T.address_of(partial_idxs[0, 0]),
++                by,
++                bx,
++                M,
++                vocab,
++                num_tiles,
++                tx,
++            )
++
++    return vocab_nvfp4_greedy_partials
++
++
+ _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
+ 
+ 
+@@ -558,6 +780,48 @@ def _packed_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dic
+     return {"partials": partials, "finishes": finishes}
+ 
+ 
++def _nvfp4_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
++    """An online NVFP4 head's projection for every token tile, as calls."""
++    n = int(layer.weight.shape[0])
++    k = getattr(layer, "nvfp4_in_features", int(layer.weight.shape[1]) * 2)
++    return {
++        block_M: prepare.call(
++            nvfp4_vocab_projection,
++            n,
++            k,
++            block_M=block_M,
++            out_dtype=_OUT[out_dtype],
++            **tile_config(block_M, k),
++        )
++        for block_M in _head_row_tiles(layer)
++    }
++
++
++def _nvfp4_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
++    """An online NVFP4 head's fused greedy-pair projection and reduction for every
++    token tile, as calls."""
++    n = int(layer.weight.shape[0])
++    k = getattr(layer, "nvfp4_in_features", int(layer.weight.shape[1]) * 2)
++    partials = {}
++    finishes = {}
++    for block_M in _head_row_tiles(layer):
++        config = tile_config(block_M, k)
++        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
++        partials[block_M] = prepare.call(
++            nvfp4_vocab_greedy_partials,
++            n,
++            k,
++            block_M=block_M,
++            out_dtype=_OUT[out_dtype],
++            **config,
++        )
++        finishes.setdefault(
++            num_tiles,
++            prepare.call(finish_vocab_greedy_pairs, num_tiles),
++        )
++    return {"partials": partials, "finishes": finishes}
++
++
+ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     """A BF16 head's projection for every token tile, as calls."""
+     n, k = map(int, layer.weight.shape)
+@@ -627,6 +891,43 @@ def prepare_packed_head(
+     )
+ 
+ 
++def prepare_nvfp4_head(
++    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
++) -> None:
++    """Declare an online NVFP4 head's projection and fused greedy pairs for every
++    token tile, writing ``out_dtype`` logits."""
++    if not hasattr(layer, "nvfp4_in_features"):
++        layer.nvfp4_in_features = int(layer.weight.shape[1]) * 2
++    _declare_head(layer, _nvfp4_head_kernels(layer, out_dtype), out_dtype)
++    greedy = _nvfp4_head_greedy_kernels(layer, out_dtype)
++    partials = greedy["partials"]
++    finishes = greedy["finishes"]
++
++    def bind_greedy() -> None:
++        n, k = int(layer.weight.shape[0]), layer.nvfp4_in_features
++        compiled_finishes = {
++            num_tiles: function(*args, **kwargs)
++            for num_tiles, (function, args, kwargs) in finishes.items()
++        }
++        layer.tilelang_vocab_greedy = {
++            block_M: (
++                function(*args, **kwargs),
++                compiled_finishes[
++                    (n + tile_config(block_M, k)["block_N"] - 1)
++                    // tile_config(block_M, k)["block_N"]
++                ],
++                (n + tile_config(block_M, k)["block_N"] - 1)
++                // tile_config(block_M, k)["block_N"],
++            )
++            for block_M, (function, args, kwargs) in partials.items()
++        }
++
++    prepare.declare(
++        lambda: list(partials.values()) + list(finishes.values()),
++        bind=bind_greedy,
++    )
++
++
+ def prepare_bf16_head(
+     layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+ ) -> None:
+@@ -653,6 +954,14 @@ def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+             layer.weight_row_offsets,
+             out,
+         )
++    elif hasattr(layer, "nvfp4_in_features"):
++        kernel(
++            x,
++            layer.weight,
++            layer.weight_scale.view(torch.float8_e4m3fn),
++            layer.weight_global_scale.reshape(1),
++            out,
++        )
+     else:
+         kernel(x, layer.weight, out)
+     return out
+@@ -666,9 +975,9 @@ def project_head_greedy_pairs(
+     pair_width: int = 4,
+ ) -> torch.Tensor:
+     """Each row's ``(max, global index)`` pair of ``x[rows, K]`` through a prepared
+-    packed head over its ``vocab`` real columns starting at ``vocab_start``, written
+-    into the first two columns of ``[rows, pair_width]`` FP32 without materializing
+-    the shard's logits."""
++    packed or NVFP4 head over its ``vocab`` real columns starting at ``vocab_start``,
++    written into the first two columns of ``[rows, pair_width]`` FP32 without
++    materializing the shard's logits."""
+     x = x.contiguous()
+     rows = x.shape[0]
+     n = int(layer.weight.shape[0])
+@@ -680,28 +989,44 @@ def project_head_greedy_pairs(
+     partial_vals = torch.empty((rows, num_tiles), dtype=torch.float32, device=x.device)
+     partial_idxs = torch.empty((rows, num_tiles), dtype=torch.int32, device=x.device)
+     pairs = torch.empty((rows, pair_width), dtype=torch.float32, device=x.device)
+-    partials_kernel(
+-        x,
+-        layer.weight,
+-        layer.weight_exception_rows,
+-        layer.weight_exception_entries,
+-        layer.weight_row_offsets,
+-        partial_vals,
+-        partial_idxs,
+-        vocab,
+-    )
++    if hasattr(layer, "nvfp4_in_features"):
++        partials_kernel(
++            x,
++            layer.weight,
++            layer.weight_scale.view(torch.float8_e4m3fn),
++            layer.weight_global_scale.reshape(1),
++            partial_vals,
++            partial_idxs,
++            vocab,
++        )
++    else:
++        partials_kernel(
++            x,
++            layer.weight,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            partial_vals,
++            partial_idxs,
++            vocab,
++        )
+     finish_kernel(partial_vals, partial_idxs, pairs, vocab_start)
+     return pairs
+ 
+ 
+ __all__ = [
+     "BF16_HEAD_CONFIGS",
++    "NVFP4_GROUP",
+     "ROW_TILES",
+     "TILE_CONFIGS",
+     "finish_vocab_greedy_pairs",
++    "nvfp4_shared_memory_bytes",
++    "nvfp4_vocab_greedy_partials",
++    "nvfp4_vocab_projection",
+     "packed_vocab_greedy_partials",
+     "packed_vocab_projection",
+     "prepare_bf16_head",
++    "prepare_nvfp4_head",
+     "prepare_packed_head",
+     "project_head",
+     "project_head_greedy_pairs",
+-- 
+2.54.0 (Apple Git-157)
+
