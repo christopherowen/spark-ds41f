@@ -1,0 +1,320 @@
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 41901baf6..f1f26311f 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -144,6 +144,40 @@ def test_sampled_ctas_guard_every_event():
+     assert "TL_IKET_WHEN" not in unsampled
+ 
+ 
++def test_sampled_warps_and_payloads():
++    out, sites = iket.annotate(KERNEL, _token, ctas=4, warps=2, payloads=True)
++    lines = out.splitlines()
++    body = next(
++        i for i, line in enumerate(lines) if line.endswith("{") and "k_kernel" in line
++    )
++    assert lines[body + 1].startswith("  const bool __tl_iket_cta = ")
++    assert lines[body + 2].startswith("  const bool __tl_iket_warp = ")
++    assert "((blockDim.x * blockDim.y * blockDim.z + 31u) >> 5) / 2u" in lines[body + 2]
++    starts = [line.strip() for line in lines if "TL_IKET_EVENT_PAYLOAD_U32(" in line]
++    assert len(starts) == len(sites)
++    assert all(
++        s.startswith("TL_IKET_WHEN(__tl_iket_cta && __tl_iket_warp) ") for s in starts
++    )
++    # Loop ranges attach the innermost loop variable; outer ranges attach the CTA index.
++    by_range = {s["range"]: s for s in sites}
++    assert by_range["compute.mma"]["payload_expr"] == "ko"
++    assert (
++        by_range["load.global"]["payload_expr"]
++        == "((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x)"
++    )
++    assert any("TL_IKET_EVENT_PAYLOAD_U32(1, ko," in s for s in starts)
++    # Static load byte extraction records cp_async and TMA transaction sizes.
++    assert by_range["load.cp_async"]["cp_async_bytes_per_thread"] == 16
++    tma_code = (
++        'extern "C" __global__ void tma_k(const float* A) {\n'
++        "  loaded[0].expect_transaction(8192);\n"
++        "  tl::tma_load(B_desc, loaded[0], smem, 0, 0, 0);\n"
++        "}\n"
++    )
++    _, tma_sites = iket.annotate(tma_code, _token)
++    assert tma_sites[0]["tma_bytes"] == 8192
++
++
+ def test_sampled_iterations_guard_loop_ranges():
+     out, sites = iket.annotate(KERNEL, _token, iters=2)
+     # Iterations 1 and 3 of four: the middle of each half.
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d651e1ce3..af1255fac 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -229,6 +229,8 @@ if TYPE_CHECKING:
+     VLLM_DS41_IKET_CTAS: int = 0
+     VLLM_DS41_IKET_ITERS: int = 0
+     VLLM_DS41_IKET_SKIP: str = ""
++    VLLM_DS41_IKET_WARPS: int = 0
++    VLLM_DS41_IKET_PAYLOADS: bool = False
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+@@ -1934,6 +1936,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
+     # without ranges (run-iket still records their warps' lifetimes).
+     "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
++    # With VLLM_DS41_IKET: record ranges in about this many warps per traced CTA,
++    # evenly spaced across warp groups (0: all).
++    "VLLM_DS41_IKET_WARPS": lambda: int(os.getenv("VLLM_DS41_IKET_WARPS", "0")),
++    # With VLLM_DS41_IKET: attach uint32 payloads (innermost loop variable or CTA
++    # index) to range start events.
++    "VLLM_DS41_IKET_PAYLOADS": lambda: bool(
++        int(os.getenv("VLLM_DS41_IKET_PAYLOADS", "0"))
++    ),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+     # the served model name whose requests alone it steers (vllm/weightless.py),
+     # set together or not at all. Part of the compile key, as every variable here
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 41689ab11..1026c1306 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -122,6 +122,10 @@ _JUMP = re.compile(r"(?:return|break|continue|goto)\b")
+ _KEYWORDS = ("for", "while", "if", "switch", "do")
+ _IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+ _ATTRIBUTE = re.compile(r"__\w+__\s*")
++_TMA_BYTES = re.compile(
++    r"(?:\.expect_transaction|\barrive_and_expect_tx)\s*\(\s*(?:[^,)]+,\s*)?(\d+)\s*\)"
++)
++_CP_ASYNC_BYTES = re.compile(r"\btl::cp_async_gs\w*\s*<\s*(\d+)\s*>")
+ # A preprocessor line other than a pragma: a range could split its #if and #endif.
+ _CONDITIONAL = re.compile(r"^[ \t]*#(?!\s*pragma\b)", re.M)
+ 
+@@ -431,8 +435,22 @@ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
+         yield name.group(0), pointers, j, parser.scan(j, None)
+ 
+ 
++def _loop_var(headers: tuple[str, ...]) -> str | None:
++    """The innermost ``for`` loop's induction variable, or None."""
++    for header in reversed(headers):
++        loop = _FOR.match(header)
++        if loop is not None:
++            return loop.group(1).strip()
++    return None
++
++
+ def annotate(
+-    code: str, token: Callable[[str, int], str], ctas: int = 0, iters: int = 0
++    code: str,
++    token: Callable[[str, int], str],
++    ctas: int = 0,
++    iters: int = 0,
++    warps: int = 0,
++    payloads: bool = False,
+ ) -> tuple[str, list[dict]]:
+     """``code`` with each phase of each kernel in an IKET range, and its sites.
+ 
+@@ -440,11 +458,15 @@ def annotate(
+     ``name``. With ``ctas`` > 0 only about that many CTAs of a launch, evenly
+     spread, record their ranges (run-iket still records every warp's lifetime):
+     a kernel with many CTAs and loop-carried ranges otherwise writes millions of
+-    records a launch. With ``iters`` > 0 a range inside a ``for`` loop records in
+-    at most that many of its iterations, evenly spread (a ``while`` loop has no
+-    variable to sample: its site lists it, unsampled): run-iket reserves the run's
+-    largest warp record for every warp of every instrumented launch, so one long
+-    kernel sizes the whole run's buffer. A module with
++    records a launch. With ``warps`` > 0 only about that many warps per traced
++    CTA, evenly spread across warp groups, record their ranges so trace stores do
++    not contend across every warp of a CTA. With ``iters`` > 0 a range inside a
++    ``for`` loop records in at most that many of its iterations, evenly spread
++    (a ``while`` loop has no variable to sample: its site lists it, unsampled):
++    run-iket reserves the run's largest warp record for every warp of every
++    instrumented launch, so one long kernel sizes the whole run's buffer. With
++    ``payloads=True``, range start events emit ``TL_IKET_EVENT_PAYLOAD_U32``
++    carrying the innermost loop variable (or CTA index outside loops). A module with
+     no ``__global__`` definition comes back unchanged; a kernel with a
+     preprocessor conditional in its body is left as it is."""
+     found: list[_Range] = []
+@@ -498,13 +520,25 @@ def annotate(
+                 " * gridDim.x + blockIdx.x) % max(1u, gridDim.x * gridDim.y * gridDim.z"
+                 f" / {ctas}u)) == 0u;\n"
+             )
++        if warps:
++            # Uniform in a warp, evenly spaced across the CTA's warps.
++            sample += (
++                "  const bool __tl_iket_warp = ((((threadIdx.z * blockDim.y +"
++                " threadIdx.y) * blockDim.x + threadIdx.x) >> 5) % max(1u,"
++                " ((blockDim.x * blockDim.y * blockDim.z + 31u) >> 5)"
++                f" / {warps}u)) == 0u;\n"
++            )
+         if sample:
+             inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
+     for item in found:
+-        # Each condition holds through a range: the CTA's and its loops' iterations (a
+-        # loop variable does not change inside one iteration). Both are uniform in a
+-        # warp, so a range opens and closes in a warp's every lane or in none.
+-        conditions = ["__tl_iket_cta"] if ctas else []
++        # Each condition holds through a range: the CTA's, the warp's, and its loops'
++        # iterations (a loop variable does not change inside one iteration). All are
++        # uniform in a warp, so a range opens and closes in a warp's every lane or in none.
++        conditions = []
++        if ctas:
++            conditions.append("__tl_iket_cta")
++        if warps:
++            conditions.append("__tl_iket_warp")
+         unsampled = []
+         for header in item.loops if iters else ():
+             condition = _iterations(header, iters)
+@@ -515,6 +549,17 @@ def annotate(
+         condition = " && ".join(conditions)
+         guard = f"if ({condition}) " if conditions else ""
+         when = f"TL_IKET_WHEN({condition}) " if conditions else ""
++        tma_bytes = sum(
++            int(m) for m in _TMA_BYTES.findall(code, item.first.start, item.last.end)
++        )
++        cp_async_bytes = sum(
++            int(m)
++            for m in _CP_ASYNC_BYTES.findall(code, item.first.start, item.last.end)
++        )
++        payload_expr = (
++            _loop_var(item.loops)
++            or "((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x)"
++        )
+         sites.append(
+             {
+                 "kernel": item.kernel,
+@@ -528,6 +573,13 @@ def annotate(
+                 # A trace holds the sampled iterations; these scale them to the loops.
+                 **({"loop_trips": _loop_trips(item.loops)} if item.loops else {}),
+                 **({"unsampled_loops": unsampled} if unsampled else {}),
++                **({"tma_bytes": tma_bytes} if tma_bytes else {}),
++                **(
++                    {"cp_async_bytes_per_thread": cp_async_bytes}
++                    if cp_async_bytes
++                    else {}
++                ),
++                **({"payload_expr": payload_expr} if payloads else {}),
+                 "traced": item.name in traced,
+             }
+         )
+@@ -535,11 +587,16 @@ def annotate(
+             continue
+         indent = re.match(r"[ \t]*", code[item.first.start :]).group(0)
+         range_id = zlib.crc32(item.name.encode()) & 0xFFFFFFFF or 1
++        start_call = (
++            f'TL_IKET_EVENT_PAYLOAD_U32(1, {payload_expr}, "{token(item.name, range_id)}");'
++            if payloads
++            else f'TL_IKET_EVENT(1, "{token(item.name, range_id)}");'
++        )
+         inserts.append(
+             (
+                 item.first.start,
+                 1,
+-                f'{indent}{when}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
++                f"{indent}{when}{start_call}\n",
+             )
+         )
+         # Settled: a barrier inside the range (a block sync, TileLang's AllReduce)
+@@ -579,8 +636,8 @@ def annotate(
+ 
+ _lock = threading.Lock()
+ _directory: Path | None = None
+-# (CTAs a launch, iterations a loop, kernels left as they are); 0 and "": all, none
+-_sampling: tuple[int, int, str] = (0, 0, "")
++# (CTAs a launch, iterations a loop, kernels left as they are, warps a CTA, payloads)
++_sampling: tuple[int, int, str, int, bool] = (0, 0, "", 0, False)
+ 
+ 
+ def directory() -> Path | None:
+@@ -589,15 +646,21 @@ def directory() -> Path | None:
+ 
+ 
+ def enable(
+-    output: str | os.PathLike[str], ctas: int = 0, iters: int = 0, skip: str = ""
++    output: str | os.PathLike[str],
++    ctas: int = 0,
++    iters: int = 0,
++    skip: str = "",
++    warps: int = 0,
++    payloads: bool = False,
+ ) -> Path:
+     """Turn the IKET mode on for this process, before it compiles any TileLang
+-    kernel; ``ctas`` and ``iters`` > 0 sample CTAs and loop iterations
+-    (``annotate``), and kernels whose name ``skip`` matches (a regex) compile
++    kernel; ``ctas``, ``warps`` and ``iters`` > 0 sample CTAs, warps per CTA and
++    loop iterations (``annotate``), ``payloads=True`` emits runtime ``uint32``
++    payloads, and kernels whose name ``skip`` matches (a regex) compile
+     uninstrumented. Idempotent for the same directory and settings."""
+     global _directory, _sampling
+     root = Path(output).expanduser().resolve()
+-    sampling = (int(ctas), int(iters), skip or "")
++    sampling = (int(ctas), int(iters), skip or "", int(warps), bool(payloads))
+     if skip:
+         re.compile(skip)
+     with _lock:
+@@ -633,27 +696,50 @@ def enable(
+     return root
+ 
+ 
+-def _token(name: str, range_id: int) -> str:
++def _token(name: str, range_id: int, payloads: bool = False) -> str:
+     from tilelang.tools.cuda.iket.metadata import Event, encode_event
+ 
+     if len(name.encode()) > MAX_NAME_BYTES:
+         raise ValueError(f"IKET range name over {MAX_NAME_BYTES} bytes: {name!r}")
+-    return encode_event(Event(name=name, event_id=1, kind="range", range_id=range_id))
++    return encode_event(
++        Event(
++            name=name,
++            event_id=1,
++            kind="range",
++            range_id=range_id,
++            payload_type="uint32" if payloads else "NoPayload",
++            payload_iket_id=6 if payloads else 0,
++        )
++    )
+ 
+ 
+ def _postproc(code: str, target) -> str:
+     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
+ 
+     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
+-    ctas, iters, skip = _sampling
++    ctas, iters, skip, warps, payloads = _sampling
+     kernel = next((name for name, *_ in _kernels(code)), "module")
+     if skip and re.search(skip, kernel):
+         return code  # run-iket still records its warps' lifetimes
+-    annotated, sites = annotate(code, _token, ctas, iters)
+-    instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
++    annotated, sites = annotate(
++        code,
++        lambda name, range_id: _token(name, range_id, payloads=payloads),
++        ctas,
++        iters,
++        warps=warps,
++        payloads=payloads,
++    )
++    instrumented = inject_iket_cuda(annotated, target, runtime_payloads=payloads)
+     stem = f"{kernel}.{digest}"
+     (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
+-    manifest = {"kernel": kernel, "ctas": ctas, "iters": iters, "sites": sites}
++    manifest = {
++        "kernel": kernel,
++        "ctas": ctas,
++        "iters": iters,
++        "warps": warps,
++        "payloads": payloads,
++        "sites": sites,
++    }
+     (_directory / "sources" / f"{stem}.json").write_text(
+         json.dumps(manifest, indent=1) + "\n"
+     )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1ae9fa14a..710c9810d 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -436,6 +436,8 @@ class Worker(WorkerBase):
+                 envs.VLLM_DS41_IKET_CTAS,
+                 envs.VLLM_DS41_IKET_ITERS,
+                 envs.VLLM_DS41_IKET_SKIP,
++                warps=envs.VLLM_DS41_IKET_WARPS,
++                payloads=envs.VLLM_DS41_IKET_PAYLOADS,
+             )
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
