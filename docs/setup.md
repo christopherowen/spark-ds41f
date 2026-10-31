@@ -577,16 +577,10 @@ an existing tag, and runs a GPU import smoke test. The first build takes
 longer because it builds TileLang and TileKernels. More detail is in
 [docker/README.md](../docker/README.md).
 
-Copy the image to the other nodes and confirm the same image everywhere, by its layers:
+Copy the image to the other nodes in your node map and confirm the same image layers everywhere:
 
 ```sh
-image=$(python3 -c 'import json; print(json.load(open("config/cluster.json"))["container"]["image"])')
-for host in dgx2 dgx3; do            # add dgx4 for TP4
-  docker save "$image" | ssh "$host" docker load
-done
-for host in dgx1 dgx2 dgx3; do       # add dgx4 for TP4
-  ssh "$host" docker image inspect "$image" --format '{{json .RootFS.Layers}}' | sha256sum
-done
+bin/spark --cluster-config config/cluster.json build distribute --apply
 ```
 
 Compare the layers, not the image ID: a node on Docker's containerd image store names an image

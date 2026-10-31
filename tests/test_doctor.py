@@ -1163,7 +1163,7 @@ class NewUserOnboardingTest(unittest.TestCase):
             "sp2: serving container spark-ds41f is not running",
             "Kernel corrections (not executed):\n  sp1: sudo apt-get install ...",
         ]
-        summary = spark.summarize_live_warnings(raw)
+        summary = spark.summarize_live_warnings(raw, "config/switched.local.json")
         self.assertEqual(len(summary), 13)
         expected = [
             ("install 64kb page kernel (sp1, sp2)", "sudo scripts/install-64k-kernel"),
@@ -1177,8 +1177,14 @@ class NewUserOnboardingTest(unittest.TestCase):
             ("set cpu governor to performance (sp1)", "sudo systemctl restart nv-cpu-governor.service"),
             ("disable idle desktop services and boot splash (sp1)", "scripts/host-recovery apply"),
             ("enable nvidia-drm modeset (sp1)", "sudo apt-get purge -y nvidia-drm-options-modeset0"),
-            ("build and distribute runtime image (sp1)", "bin/spark image build --apply"),
-            ("start serving container (sp2)", "cluster start --apply"),
+            (
+                "build and distribute runtime image (sp1)",
+                "bin/spark build prepare && bin/spark --cluster-config config/switched.local.json build image --apply && bin/spark --cluster-config config/switched.local.json build distribute --apply",
+            ),
+            (
+                "start serving container (sp2)",
+                "bin/spark --cluster-config config/switched.local.json cluster start --apply",
+            ),
         ]
         for line, (label, command) in zip(summary, expected, strict=True):
             self.assertIn(f"recommend: {label} -> run: ", line)
