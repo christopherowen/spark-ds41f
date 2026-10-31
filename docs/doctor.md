@@ -73,17 +73,17 @@ revert it.
 | Boot target is `multi-user.target` | warn | the desktop's processes and GPU buffers come out of the model's unified memory | `sudo systemctl set-default multi-user.target` |
 | Display manager is not running | error | same | `sudo systemctl disable --now display-manager.service` |
 | Installed OS is first in the UEFI boot order | warn | a network (PXE) entry first adds about a minute of DHCP timeouts to every boot | the printed `sudo efibootmgr --bootorder …` |
-| `nvidia-drm` kernel mode setting (`modeset=Y`) | error | the display carve-out that holds the embedding and output head needs it (the worker refuses to start without it), and a display attached after boot stays dark | `sudo apt purge nvidia-drm-options-modeset0`, then reboot with the service stopped |
-| `nvidia-drm` framebuffer console (`fbdev=Y`) | error | an attached display gets no text console | remove the `fbdev=0` option from `/etc/modprobe.d`, `sudo update-initramfs -u`, reboot |
+| `nvidia-drm` kernel mode setting (`modeset=Y`) | error when `SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS` is on; warn when off or unreadable | the display carve-out that holds the embedding and output head needs it (the worker refuses to start without it), and a display attached after boot stays dark | `sudo apt purge nvidia-drm-options-modeset0`, then reboot with the service stopped |
+| `nvidia-drm` framebuffer console (`fbdev=Y`) | error (unreadable: warn) | an attached display gets no text console | remove the `fbdev=0` option from `/etc/modprobe.d`, `sudo update-initramfs -u`, reboot |
 | A DRM card belongs to the nvidia driver | error | the display carve-out allocates through it | check that `nvidia-drm` loaded with `modeset=Y` (`ls -l /dev/dri/by-path`) |
 | No process holds DRM master | error (unreadable: warn) | the text console stops drawing while one does | stop or restart that process |
-| Active console is in text mode | error | an attached display shows nothing | `scripts/host-recovery apply` |
+| Active console is in text mode | warn | an attached display shows nothing | `scripts/host-recovery apply` |
 | Kernel command line has no `splash` | warn | Plymouth leaves the console in graphics mode after boot | `scripts/host-recovery apply`, then reboot with the service stopped |
 | Unused desktop services | warn | Bluetooth, CUPS, snapd, fwupd's refresh timer and the DGX Dashboard hold memory; the dashboard's update checks peak near 850 MiB | `sudo systemctl disable --now …` (`scripts/host-recovery apply` does the same) |
 | NVMe interrupt coalescing off | warn | Engram's small direct disk reads wait for the coalescing timer | `sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable` |
 | NVMe APST: no sleep state of 5 ms or more to wake before 1 s idle, nor of 20 ms or more before 30 s | warn | the first Engram read after a pause waits for the drive to wake (11 ms from PS3, 46 ms from PS4) | `nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000` ([setup](setup.md#nvme-power-states-apst)) |
-| Fan-floor control: DKMS module (version 0.1.4), loaded module, cooling device | error, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
-| `dgx-fan-control.service` installed | error | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
+| Fan-floor control: DKMS module (version 0.1.4), loaded module, cooling device | warn, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
+| `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
 
 ### Kernel and memory saver
 
@@ -100,13 +100,15 @@ These compare each node with the kernel policy in
 | `cpupower` for the 64 KiB kernel and the `performance` CPU governor | warn |
 | NVIDIA, ConnectX and fan-control modules built for the 64 KiB kernel; fan-control DKMS installed for it; with Secure Boot, a signed fan module and an enrolled key | warn |
 | A GRUB entry for the 64 KiB kernel, normal boot pinned to the policy's default, and no pending one-shot or recovery override | warn |
-| On 64 KiB: THP `never`, `vm.min_free_kbytes=45166`, `/swap-64k.img` active and `spark-ds41f-kernel-memory.service` active | warn |
+| On 64 KiB: THP `never`, `vm.min_free_kbytes=45166`, `/swap-64k.img` active and `spark-ds41f-kernel-memory.service` active (`spark3-kernel-memory.service` counts as the same policy, with a rename warning) | warn |
 | Memory-saver DKMS installed for the 64 KiB kernel and selected for UVM; with Secure Boot, signed; on 64 KiB, loaded with leaf-table packing on | warn |
 | **The selected profile's kernel requirements**: the running kernel and page size equal the profile's `host.kernel`; for a profile with `memory_saver_required`, the memory saver is loaded with packing on and the driver is 580.178.04 | error |
 | All nodes agree on kernel, page size, driver, loaded NVIDIA module sources, packing, THP, free-memory reserve, Secure Boot state and CPU governors | error |
 
-The 4 KiB shape (`tp3-triangle-4k`) requires only the 4 KiB kernel,
-so on that profile the memory-saver lines stay warnings.
+A 4 KiB profile (`tp3-triangle-4k`, or an arm with `page_size: 4096` and
+`memory_saver_required: false`) requires only a running 4 KiB kernel (and that
+all nodes run the same release), and skips the 64 KiB candidate and memory-saver
+checks.
 
 ### Fabric
 

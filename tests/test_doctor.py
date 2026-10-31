@@ -110,10 +110,19 @@ class ModesetTest(unittest.TestCase):
     def test_disabled_mode_setting_is_reported(self) -> None:
         problems = spark.modeset_problems("dgx1", facts(modeset="N"))
         self.assertEqual(len(problems), 1)
+        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIn("modeset is N, expected Y", problems[0])
+
+    def test_disabled_mode_setting_warns_when_carveout_weights_are_off(self) -> None:
+        problems = spark.modeset_problems("dgx1", facts(modeset="N"), carveout_weights=False)
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("modeset is N, expected Y", problems[0])
 
     def test_unreadable_mode_setting_is_reported(self) -> None:
         problems = spark.modeset_problems("dgx1", facts(modeset=""))
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("modeset is unreadable", problems[0])
 
 
@@ -130,6 +139,8 @@ class ConsoleTest(unittest.TestCase):
 
     def test_unreadable_fbdev_is_reported(self) -> None:
         problems = spark.fbdev_problems("dgx3", facts(fbdev=""))
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("fbdev is unreadable", problems[0])
 
     def test_drm_master_holder_is_reported(self) -> None:
@@ -310,7 +321,6 @@ class SeverityTest(unittest.TestCase):
             spark.modeset_problems("dgx1", facts(modeset="N")),
             spark.fbdev_problems("dgx1", facts(fbdev="N")),
             spark.drm_master_problems("dgx1", facts(drm_masters="Xorg/123")),
-            spark.console_mode_problems("dgx1", facts(console="tty1:1")),
         ):
             self.assertEqual(len(problems), 1)
             self.assertNotIsInstance(problems[0], spark.Warn)
@@ -320,10 +330,15 @@ class SeverityTest(unittest.TestCase):
             spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1")),
             spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0")),
             spark.drm_master_problems("dgx1", facts(drm_masters="unreadable")),
+            spark.console_mode_problems("dgx1", facts(console="tty1:1")),
             spark.console_mode_problems("dgx1", facts(console="tty1:")),
             spark.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
             spark.desktop_problems("dgx1", "graphical.target\ninactive\n"),
             spark.boot_order_problems("dgx1", ""),
+            spark.modeset_problems("dgx1", facts(modeset="")),
+            spark.modeset_problems("dgx1", facts(modeset="N"), carveout_weights=False),
+            spark.fbdev_problems("dgx1", facts(fbdev="")),
+            spark.fan_control_problems("dgx1", facts(fan_dkms="")),
         ):
             self.assertEqual(len(problems), 1)
             self.assertIsInstance(problems[0], spark.Warn)
@@ -349,10 +364,10 @@ class FanControlTest(unittest.TestCase):
         problems = spark.fan_control_problems(
             "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0")
         )
-        self.assertEqual(
-            problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia; run "
-                "sudo dkms autoinstall -k 7.0.0-1019-nvidia"]
-        )
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
+        self.assertIn("DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia", problems[0])
+        self.assertIn("sudo dkms autoinstall -k 7.0.0-1019-nvidia", problems[0])
 
     def test_other_dkms_version_is_reported(self) -> None:
         problems = spark.fan_control_problems(
@@ -373,18 +388,18 @@ class FanControlTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
 
-    def test_missing_service_is_an_error(self) -> None:
-        # bench needs it; whether it runs while serving is not checked.
+    def test_missing_service_warns(self) -> None:
+        # bench needs it; serving does not, so doctor must not fail a live cluster.
         problems = spark.fan_control_problems("dgx2", facts(fan_service="absent"))
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("dgx-fan-control.service is not installed", problems[0])
         self.assertIn("sudo systemctl daemon-reload", problems[0])
 
     def test_missing_driver_layer_is_reported_before_the_service(self) -> None:
         problems = spark.fan_control_problems("dgx2", facts(fan_module="0", fan_service="absent"))
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("dgx_ec_fan_control is not loaded", problems[0])
 
 
@@ -1097,6 +1112,27 @@ class GLPTest(unittest.TestCase):
         problems = self.node(self.cluster(), 255, stderr="ssh: connect to host dgx2 port 22: Connection refused\n")
         self.assertEqual(problems, ["dgx2: cannot check the GLP steering file: "
                                     "ssh: connect to host dgx2 port 22: Connection refused"])
+
+
+class NewUserOnboardingTest(unittest.TestCase):
+    def test_missing_node_map_prints_setup_guidance_for_each_shape(self) -> None:
+        self.assertIn("cp config/nodes.example.json config/nodes.json",
+                      spark.missing_nodes_message("config/nodes.json"))
+        self.assertIn("cp config/examples/nodes-ring4.json config/nodes-ring4.local.json",
+                      spark.missing_nodes_message("config/nodes-ring4.local.json"))
+        self.assertIn("cp config/examples/nodes-switched.json config/nodes-switched.local.json",
+                      spark.missing_nodes_message("config/nodes-switched.local.json"))
+        self.assertIn("docs/setup.md", spark.missing_nodes_message("config/nodes.json"))
+        self.assertNotIn("docs/replicate.md", spark.missing_nodes_message("config/nodes.json"))
+
+    def test_docker_permission_denied_points_to_docker_group(self) -> None:
+        stderr = (
+            "permission denied while trying to connect to the Docker daemon socket at "
+            "unix:///var/run/docker.sock: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.45/info\": "
+            "dial unix /var/run/docker.sock: connect: permission denied"
+        )
+        detail = spark.docker_error_detail("dgx1", stderr)
+        self.assertIn("sudo usermod -aG docker", detail)
 
 
 if __name__ == "__main__":

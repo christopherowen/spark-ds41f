@@ -335,8 +335,6 @@ def overlay(arm: dict, base: dict) -> dict:
         _with_model_mounts(cluster)
     if "generation_defaults" in arm.get("set", {}):
         _with_generation_defaults(cluster)
-    for key in ("shape", "benchmark_reference"):
-        cluster.pop(key, None)
     for dotted in arm.get("unset", []):
         *parents, last = dotted.split(".")
         node = cluster
@@ -345,6 +343,16 @@ def overlay(arm: dict, base: dict) -> dict:
         if not isinstance(node, dict) or last not in node:
             raise SystemExit(f"the arm unsets {dotted}, which its base does not set")
         del node[last]
+    for key in ("shape", "benchmark_reference"):
+        cluster.pop(key, None)
+    if (cluster.get("fabric", {}).get("topology") == "switched"
+            and base.get("fabric", {}).get("topology") != "switched"):
+        explicit_env = sets.get("environment", {})
+        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
+            if key not in explicit_env:
+                cluster.get("environment", {}).pop(key, None)
     if base.get("glp") or cluster.get("glp"):
         # Rendered again whatever the arm changed: a serve_args or mount list it sets
         # replaces the base's, which held the rendering.

@@ -153,10 +153,23 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(any("64 KiB swap" in x for x in issues))
         # The service is spark-ds41f's since the release after spark-ds41f-1022 (host/kernel-memory).
         self.assertTrue(any("journalctl -u spark-ds41f-kernel-memory.service" in x for x in fixes))
-        data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active")
+        data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active",
+                    memory_service_unit="spark-ds41f-kernel-memory.service")
         data["uvm_leaf_packing"] = "Y"
         data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
         self.assertEqual(kernel.findings("dgx1", data, POLICY), ([], []))
+
+    def test_legacy_spark3_memory_service_is_the_same_policy(self):
+        data = ready()
+        data.update(kernel=NEW, page_size=65536, thp="always madvise [never]",
+                    active_swap=["/swap-64k.img"], memory_service="active",
+                    memory_service_unit="spark3-kernel-memory.service")
+        data["uvm_leaf_packing"] = "Y"
+        data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
+        issues, fixes = kernel.findings("dgx1", data, POLICY)
+        self.assertTrue(any("still spark3-kernel-memory.service" in x for x in issues))
+        self.assertFalse(any("is not active" in x for x in issues))
+        self.assertTrue(any("journalctl -u spark3-kernel-memory.service" in x for x in fixes))
 
     def test_missing_memory_saver_warns_even_on_stock_kernel(self):
         data = ready()
@@ -166,6 +179,16 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(any("memory-saver DKMS" in x and "missing" in x for x in issues))
         self.assertTrue(any("dkms install" in x for x in fixes))
         profile = {"release": OLD, "page_size": 4096, "memory_saver_required": False}
+        self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
+
+    def test_stock_4k_profile_suppresses_64k_warnings_and_accepts_newer_stock_kernel(self):
+        profile = {"release": OLD, "page_size": 4096, "memory_saver_required": False}
+        data = {"kernel": "7.0.0-1024-nvidia", "page_size": 4096, "driver": "580.142",
+                "errors": [], "packages": {}, "files": {}, "headers": False, "config_64k": False,
+                "cpu_tools": False, "governors": ["performance"], "modules": {}, "fan_dkms": "",
+                "memory_saver_dkms": "", "memory_saver_disk": {"srcversion": ""},
+                "grub": {"entries": {}, "default": "0", "next_entry": "", "recordfail": "", "initrdfail": ""}}
+        self.assertEqual(kernel.findings("dgx1", data, POLICY, profile), ([], []))
         self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
 
     def test_large_profile_refuses_stock_kernel_even_with_installed_module(self):

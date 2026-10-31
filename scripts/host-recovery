@@ -10,18 +10,24 @@ if [[ "$action" != check && "$action" != apply ]]; then
   exit 2
 fi
 
+tailscaled_installed() {
+  [[ "$(systemctl show tailscaled.service --property=LoadState --value 2>/dev/null)" == loaded ]]
+}
+
 files=(
   "systemd-system.conf:/etc/systemd/system.conf.d/95-spark-recovery.conf:0644"
   "sysctl.conf:/etc/sysctl.d/95-spark-recovery.conf:0644"
   "sshd.conf:/etc/ssh/sshd_config.d/95-spark-recovery.conf:0644"
   "ssh.service.conf:/etc/systemd/system/ssh.service.d/95-spark-recovery.conf:0644"
-  "tailscaled.service.conf:/etc/systemd/system/tailscaled.service.d/95-spark-recovery.conf:0644"
   "plymouth-quit-wait.service.conf:/etc/systemd/system/plymouth-quit-wait.service.d/95-spark-recovery.conf:0644"
   "spark-management-health:/usr/local/libexec/spark-management-health:0755"
   "spark-management-health.service:/etc/systemd/system/spark-management-health.service:0644"
   "spark-management-health.timer:/etc/systemd/system/spark-management-health.timer:0644"
   "grub-console.cfg:/etc/default/grub.d/zz-spark-console.cfg:0644"
 )
+if tailscaled_installed; then
+  files+=("tailscaled.service.conf:/etc/systemd/system/tailscaled.service.d/95-spark-recovery.conf:0644")
+fi
 
 # Desktop services that serve nothing on a headless inference node (every
 # installed snap is a desktop application), and fwupd's daily refresh, which
@@ -124,16 +130,20 @@ check_files() {
     echo "ssh.service MemoryMin is not 128 MiB" >&2
     failed=1
   fi
-  if [[ "$(systemctl show tailscaled.service --property=MemoryMin --value)" != 268435456 ]]; then
-    echo "tailscaled.service MemoryMin is not 256 MiB" >&2
+  if [[ "$(systemctl show ssh.service --property=OOMScoreAdjust --value)" != -900 ]]; then
+    echo "ssh.service OOMScoreAdjust is not -900" >&2
     failed=1
   fi
-  for service in ssh.service tailscaled.service; do
-    if [[ "$(systemctl show "$service" --property=OOMScoreAdjust --value)" != -900 ]]; then
-      echo "$service OOMScoreAdjust is not -900" >&2
+  if tailscaled_installed; then
+    if [[ "$(systemctl show tailscaled.service --property=MemoryMin --value)" != 268435456 ]]; then
+      echo "tailscaled.service MemoryMin is not 256 MiB" >&2
       failed=1
     fi
-  done
+    if [[ "$(systemctl show tailscaled.service --property=OOMScoreAdjust --value)" != -900 ]]; then
+      echo "tailscaled.service OOMScoreAdjust is not -900" >&2
+      failed=1
+    fi
+  fi
   if [[ "$(sysctl -n kernel.panic)" != 30 \
     || "$(sysctl -n kernel.panic_on_oops)" != 1 \
     || "$(sysctl -n vm.panic_on_oom)" != 0 ]]; then
@@ -206,7 +216,9 @@ for unit in spark-restart-ssh spark-restart-tailscaled; do
 done
 sudo -n systemd-run --quiet --collect --unit=spark-restart-ssh \
   --on-active=3s /usr/bin/systemctl try-restart ssh.service
-sudo -n systemd-run --quiet --collect --unit=spark-restart-tailscaled \
-  --on-active=8s /usr/bin/systemctl restart tailscaled.service
+if tailscaled_installed; then
+  sudo -n systemd-run --quiet --collect --unit=spark-restart-tailscaled \
+    --on-active=8s /usr/bin/systemctl try-restart tailscaled.service
+fi
 
 echo "host recovery policy installed on $(hostname); management restarts scheduled"

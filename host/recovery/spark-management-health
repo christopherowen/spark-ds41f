@@ -13,8 +13,10 @@ elif grep -q 'beginning MaxStartups throttling' \
   systemctl restart ssh.service
 fi
 
-if ! systemctl is-active --quiet tailscaled.service \
-  || ! timeout --kill-after=5s 10s tailscale status --json >/dev/null 2>&1; then
-  logger -t "$tag" "Tailscale control socket is unresponsive; restarting tailscaled.service"
-  systemctl restart tailscaled.service
+if systemctl is-enabled --quiet tailscaled.service 2>/dev/null; then
+  if ! systemctl is-active --quiet tailscaled.service \
+    || ! timeout --kill-after=5s 10s tailscale status --json >/dev/null 2>&1; then
+    logger -t "$tag" "Tailscale control socket is unresponsive; restarting tailscaled.service"
+    systemctl restart tailscaled.service
+  fi
 fi

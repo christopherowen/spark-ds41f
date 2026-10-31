@@ -46,7 +46,9 @@ which pays for their larger context.
 Each node needs:
 
 - a DGX Spark (GB10, 128 GB unified memory) on DGX OS 26.09.2 or later;
-- Docker with the NVIDIA container runtime and `buildx`, and `/dev/infiniband`;
+- Docker with the NVIDIA container runtime and `buildx`, `/dev/infiniband`,
+  and the SSH user in the `docker` group (`sudo usermod -aG docker "$USER"`,
+  then reconnect);
 - about 480 GiB of free disk (the model, including Engram tables read from
   disk, plus caches); the build host also needs 64 GiB of free memory;
 - a management network for SSH, the API and Gloo, with passwordless SSH from
@@ -60,12 +62,12 @@ Each node needs:
 | --- | --- | --- | --- | --- |
 | [Host recovery policy](#host-recovery-policy) (watchdog, SSH/Tailscale protection, text console) | recommended | recommended | `scripts/host-recovery check`, `doctor --live` | [remove the drop-ins](#revert-the-host-baseline) |
 | [Headless boot](#headless-boot-the-trade-off) (no desktop, idle services off) | required by `doctor --live` | same | `doctor --live` | `sudo systemctl set-default graphical.target`, re-enable the services |
-| [Kernel mode setting](#kernel-mode-setting) (`nvidia-drm modeset=Y`) | required | required | `doctor --live` | reinstall `nvidia-drm-options-modeset0` |
+| [Kernel mode setting](#kernel-mode-setting) (`nvidia-drm modeset=Y`) | required (TP3); recommended (TP4) | required (TP3); recommended (TP4) | `doctor --live` | reinstall `nvidia-drm-options-modeset0` |
 | [`vm.watermark_boost_factor=0`](#memory-accounting) | recommended | recommended | — | delete the sysctl file |
 | [NVMe interrupt coalescing off](#nvme-interrupt-coalescing) | optional | optional | `doctor --live` (warn) | unmask the service |
 | [NVMe sleeps only when idle](#nvme-power-states-apst) (APST timeouts 2 s / 60 s) | recommended | recommended | `doctor --live` (warn) | delete the modprobe file |
 | [UEFI boot order](#boot-order) | optional | optional | `doctor --live` (warn) | `efibootmgr --bootorder` |
-| [Fan-floor control](#fan-floor-control) | recommended | recommended | `doctor --live` (error until installed) | its [uninstall guide](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/maintenance.md#uninstall) |
+| [Fan-floor control](#fan-floor-control) | recommended | recommended | `doctor --live` (warn until installed) | its [uninstall guide](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/maintenance.md#uninstall) |
 | [64 KiB kernel, swap and memory policy](#2-kernel-64-kib-profiles) | — | required | `doctor --live`, launch | [boot the 4 KiB kernel](#revert-the-64-kib-kernel) |
 | [Memory saver](#2-kernel-64-kib-profiles) (signed DKMS UVM module) | — | required | `doctor --live`, launch | its [removal guide](https://github.com/christopherowen/dgx-spark-memory-saver/blob/main/docs/dkms.md#remove-and-restore-stock-uvm) |
 | [ConnectX-7 addressing](#3-fabric-cabling-and-addressing) (netplan) | required | required | `doctor --live`, launch | remove `40-cx7.yaml` |
@@ -111,8 +113,9 @@ It installs a narrow management-plane policy ([host/recovery](../host/recovery/R
 
 - systemd feeds the SBSA hardware watchdog, which reboots only after a real
   system stall;
-- SSH and Tailscale get a little reclaim protection and strongly negative OOM
-  scores, and a once-a-minute timer restarts either if it stops answering;
+- SSH (and Tailscale, when installed) get a little reclaim protection and
+  strongly negative OOM scores, and a once-a-minute timer restarts either if it
+  stops answering;
 - Plymouth's boot gate is bounded, and `splash` is removed from the kernel
   command line, so an attached display shows a text console;
 - the display manager (`gdm3`) and unused desktop services are disabled
@@ -234,15 +237,15 @@ the `sudo efibootmgr --bootorder …` that puts Ubuntu first.
 [dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)
 (version 0.1.4, which `doctor --live` checks) adds a fan floor the EC enforces on top of NVIDIA's curve
 ([installation](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/installation.md)). Serving does not use
-it, but `doctor --live` reports it as an error until it is installed.
+it; `doctor --live` warns until it is installed and does not fail the command.
 `bin/spark bench` and kernel-lab jobs use it to cool every node below 55 °C
 before measuring; without it they wait for the nodes to cool on NVIDIA's
 curve. With Secure Boot, its installation creates and enrolls a MOK signing
 key, and the memory saver's install script in [stage 2](#2-kernel-64-kib-profiles)
 signs with the same key.
 
-Install its `dgx-fan-control.service` as well; `doctor --live` reports an
-error until it is installed. `bin/spark bench` requires it: it starts the
+Install its `dgx-fan-control.service` as well; `doctor --live` warns until it
+is installed. `bin/spark bench` requires it: it starts the
 service's performance curve on every node while it measures, so every
 benchmark runs under the same fan policy, and stops it again where it started
 it. Whether it also runs while serving is your choice. The curve raises the fan floor from 50 °C, well before
@@ -302,7 +305,9 @@ yours to run, as root, with the service stopped:
    16 GiB `/swap-64k.img` with a 64 KiB header, marks the original
    `/swap.img` `noauto`, and enables `spark-ds41f-kernel-memory.service`, which at
    boot activates the swap file that matches the running page size and, on
-   64 KiB only, sets THP to `never` and `vm.min_free_kbytes=45166`
+   64 KiB only, sets THP to `never` and `vm.min_free_kbytes=45166`. Sites that
+   still run `spark3-kernel-memory.service` have the same policy; `doctor --live`
+   accepts that unit and warns to run this installer so the name matches.
    ([host/kernel-memory](../host/kernel-memory/README.md)). It does not
    reboot or touch the running system.
 3. **Memory saver.** Run `bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh`
@@ -416,9 +421,12 @@ the cables that moved; re-run the discovery.
 Two files describe your site and stay out of git:
 
 - **Node map.** `config/nodes.json` for the three-node profiles (start from
-  [config/nodes.example.json](../config/nodes.example.json)), or
-  `config/nodes-ring4.local.json` for the TP4 profile (start from
-  [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)).
+  [config/nodes.example.json](../config/nodes.example.json)),
+  `config/nodes-ring4.local.json` for the TP4 ring profile (start from
+  [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)), or
+  `config/nodes-switched.local.json` for a switched four-node deployment (start from
+  [config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and see
+  [switched-fabric.md](switched-fabric.md)).
   It names each node, its rank (the head is rank 0), management IP,
   `ssh_user`, and `roce_peer_hcas`: for each peer rank, the local RoCE
   devices cabled to it (`rdma link` shows them). `sparknet topology discover`

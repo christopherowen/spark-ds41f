@@ -24,4 +24,5 @@ verify the original swap is active. Never remove an active swap file.
 The service is `spark-ds41f-kernel-memory.service`, running
 `/usr/local/sbin/spark-ds41f-kernel-memory`. Until the release after spark-ds41f-1022 it was
 `spark3-kernel-memory.service` with its backup under `/var/lib/spark3`; the installer
-replaces that service and moves the backup.
+replaces that service and moves the backup. `doctor --live` treats an active
+`spark3-kernel-memory.service` as the same policy and warns to rename it.

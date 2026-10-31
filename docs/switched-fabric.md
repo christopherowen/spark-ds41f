@@ -36,7 +36,8 @@ topology alone has no runtime.
 {"fabric": {"transport": "oneshot-switched", "topology": "switched"}}
 ```
 
-The node map follows sparknet's switched schema (sparknet's `docs/topology.md`), which
+The node map follows sparknet's switched schema (sparknet's `docs/topology.md`; see
+[config/examples/nodes-switched.json](../config/examples/nodes-switched.json)), which
 validates and renders it at the revision the upstream lock pins. Each node needs three
 fields the switchless maps do not use:
 

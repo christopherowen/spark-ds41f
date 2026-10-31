@@ -704,6 +704,20 @@ class GLPTest(unittest.TestCase):
         self.assertIn([recipe.glp_file(base), "/glp/vector.gguf", "ro"], mounts["container"]["mounts"])
         self.assertEqual(recipe.overlay({"extends": {}}, base)["serve_args"], base["serve_args"])
 
+    def test_a_switched_arm_over_a_ring_base_strips_ring_controls(self):
+        base = self.resolved()
+        arm = {
+            "extends": {},
+            "set": {"fabric": {"transport": "oneshot-switched", "topology": "switched"}},
+        }
+        switched = recipe.overlay(arm, base)
+        for key in ("NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+                    "NCCL_THREAD_THRESHOLDS", "NCCL_SWITCHLESS_BIDIRECTIONAL"):
+            self.assertNotIn(key, switched["environment"])
+        explicit = recipe.overlay({**arm, "unset": ["benchmark_reference", "environment.NCCL_ALGO"]}, base)
+        self.assertNotIn("NCCL_ALGO", explicit["environment"])
+        self.assertNotIn("benchmark_reference", explicit)
+
 
 if __name__ == "__main__":
     unittest.main()

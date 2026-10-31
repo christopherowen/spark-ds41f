@@ -32,7 +32,7 @@ _real_configuration = lab.spark.configuration
 def _host_independent_configuration(args=None):
     try:
         return _real_configuration(args)
-    except FileNotFoundError:
+    except (FileNotFoundError, SystemExit):
         ring = lab.spark.read_json("config/examples/nodes-ring4.json")
         head_ip = lab.spark.read_json("config/cluster.json")["distributed"]["master_addr"]
         next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip

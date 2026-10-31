@@ -199,7 +199,17 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
     if spec:
         spec["draft_tensor_parallel_size"] = count
         set_argument(result, "--speculative-config", json.dumps(spec, separators=(",", ":")))
-    if count == 4 and not switched(transport(result)):
+    switched_map = any("roce_hcas" in n and "roce_peer_hcas" not in n for n in nodes.get("nodes", []))
+    if switched_map and not switched(transport(result)):
+        result["fabric"] = {"transport": "oneshot-switched", "topology": "switched"}
+        result.pop("benchmark_reference", None)
+        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
+            result["environment"].pop(key, None)
+        if "--disable-custom-all-reduce" in result["serve_args"]:
+            result["serve_args"].remove("--disable-custom-all-reduce")
+    elif count == 4 and not switched(transport(result)):
         result["fabric"] = {"transport": "nccl-ring"}
         result["environment"].update({**fabric(result).render.RING_ENV, **VLLM_RING_ENV,
                                       "NCCL_MIN_NCHANNELS": "1", "NCCL_MAX_NCHANNELS": "1"})
