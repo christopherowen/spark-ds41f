@@ -1,0 +1,163 @@
+From 0397ac2ac45727c678c4d0a27e4d07336d89529a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:57:37 +0100
+Subject: [PATCH] perf(spec_decode): borrow vocab_parallel_pairs scratch from
+ WorkspaceManager
+
+vocab_parallel_pairs previously allocated fresh values, indices, and
+(when tp_size > 1) pre-gather pairs tensors on every greedy verification
+step. When WorkspaceManager is initialized and has capacity (or is
+unlocked), borrow those temporary buffers simultaneously from the active
+workspace slot, eliminating 3 caching-allocator calls per greedy decode
+step on TP>1 (and 2 on TP1).
+---
+ .../v1/worker/gpu/test_greedy_verification.py | 55 +++++++++++++++++++
+ .../gpu/spec_decode/greedy_verification.py    | 44 +++++++++++++--
+ 2 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_greedy_verification.py b/tests/v1/worker/gpu/test_greedy_verification.py
+index 6c58ce94d..04db6cb35 100644
+--- a/tests/v1/worker/gpu/test_greedy_verification.py
++++ b/tests/v1/worker/gpu/test_greedy_verification.py
+@@ -85,6 +85,61 @@ def test_vocab_parallel_pairs_on_one_rank():
+     assert torch.equal(pairs[:, 1].long(), logits[:, :4000].argmax(-1))
+ 
+ 
++def test_vocab_parallel_pairs_borrows_workspace_scratch(monkeypatch):
++    """When WorkspaceManager is initialized, vocab_parallel_pairs borrows its
++    temporary reduction scratch (and pre-gather pairs on TP > 1) from the
++    active workspace slot instead of allocating fresh tensors every step."""
++    import vllm.v1.worker.gpu.spec_decode.greedy_verification as gv
++    import vllm.v1.worker.workspace as ws
++
++    torch.manual_seed(3)
++    logits = torch.randn((12, 32320), device=DEVICE)
++    expected = vocab_parallel_pairs(logits, 32320, 0, 1)
++
++    manager = ws.WorkspaceManager(torch.device(DEVICE))
++    monkeypatch.setattr(ws, "_manager", manager)
++
++    captured_ptrs: list[tuple[int, int, int]] = []
++    orig_greedy_shard_pair = gv.greedy_shard_pair
++
++    def spy_greedy_shard_pair(
++        local_logits, vocab, vocab_start, pairs, values, indices
++    ):
++        captured_ptrs.append(
++            (values.data_ptr(), indices.data_ptr(), pairs.data_ptr())
++        )
++        return orig_greedy_shard_pair(
++            local_logits, vocab, vocab_start, pairs, values, indices
++        )
++
++    monkeypatch.setattr(gv, "greedy_shard_pair", spy_greedy_shard_pair)
++    monkeypatch.setattr(
++        gv,
++        "tensor_model_parallel_all_gather",
++        lambda t, dim=-1: t.repeat(1, 4),
++    )
++
++    pairs_tp1_a = vocab_parallel_pairs(logits, 32320, 0, 1)
++    manager.lock()
++    pairs_tp1_b = vocab_parallel_pairs(logits, 32320, 0, 1)
++    assert torch.equal(pairs_tp1_a[:, :2], expected[:, :2])
++    assert torch.equal(pairs_tp1_b[:, :2], expected[:, :2])
++    assert captured_ptrs[0][0] == captured_ptrs[1][0]
++    assert captured_ptrs[0][1] == captured_ptrs[1][1]
++
++    manager.unlock()
++    pairs_tp4 = vocab_parallel_pairs(logits, 32320, 0, 4)
++    assert pairs_tp4.shape == (12, PAIR_WIDTH * 4)
++    assert torch.equal(pairs_tp4[:, :2], expected[:, :2])
++    ws_base = manager._current_workspaces[0].data_ptr()
++    ws_end = ws_base + manager.available_bytes()
++    val_ptr, idx_ptr, local_pair_ptr = captured_ptrs[2]
++    assert ws_base <= val_ptr < ws_end
++    assert ws_base <= idx_ptr < ws_end
++    assert ws_base <= local_pair_ptr < ws_end
++    assert pairs_tp4.data_ptr() != local_pair_ptr
++
++
+ @pytest.mark.parametrize("ranks", [1, 3, 4])
+ @pytest.mark.parametrize("block_verification", [True, False])
+ def test_greedy_rejection_matches_rejection_sample(ranks, block_verification):
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index 8b2d99ac7..b75858c33 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -14,21 +14,58 @@ accepted while it equals the target's argmax; the first mismatch commits the
+ argmax, and a fully accepted block commits the argmax at the bonus position.
+ """
+ 
++from math import prod
++
+ import torch
+ 
+ from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.triton_utils import tl, triton
++from vllm.utils.math_utils import round_up
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     greedy_shard_pair,
+     register_greedy_shard_pair_warmup,
+     scratch_shape,
+ )
++from vllm.v1.worker.workspace import (
++    current_workspace_manager,
++    is_workspace_manager_initialized,
++)
+ 
+ # Columns of a rank's pair row: 16 bytes, which the one-shot all-gather writes in
+ # place (the pair in the first two).
+ PAIR_WIDTH = 4
+ 
+ 
++def _greedy_pair_buffers(
++    rows: int, vocab: int, tp_size: int, device: torch.device
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    shape = scratch_shape(rows, vocab)
++    pair_shape = (rows, PAIR_WIDTH)
++    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
++        (shape, torch.float32),
++        (shape, torch.int32),
++    ]
++    if tp_size > 1:
++        specs.append((pair_shape, torch.float32))
++    if is_workspace_manager_initialized():
++        manager = current_workspace_manager()
++        required_bytes = sum(round_up(prod(s) * d.itemsize, 256) for s, d in specs)
++        if (
++            manager._device.type == device.type
++            and manager._device.index in (None, device.index)
++            and (not manager.is_locked() or manager.available_bytes() >= required_bytes)
++        ):
++            buffers = manager.get_simultaneous(*specs)
++            if tp_size > 1:
++                return buffers[0], buffers[1], buffers[2]
++            pairs = torch.empty(pair_shape, dtype=torch.float32, device=device)
++            return buffers[0], buffers[1], pairs
++    values = torch.empty(shape, dtype=torch.float32, device=device)
++    indices = torch.empty(shape, dtype=torch.int32, device=device)
++    pairs = torch.empty(pair_shape, dtype=torch.float32, device=device)
++    return values, indices, pairs
++
++
+ def vocab_parallel_pairs(
+     local_logits: torch.Tensor, vocab: int, vocab_start: int, tp_size: int
+ ) -> torch.Tensor:
+@@ -37,11 +74,8 @@ def vocab_parallel_pairs(
+     the logits (``vocab`` real columns starting at ``vocab_start``):
+     ``greedy_rejection_sample`` selects each row's first maximum from them."""
+     rows = local_logits.shape[0]
+-    shape = scratch_shape(rows, vocab)
+-    values = torch.empty(shape, dtype=torch.float32, device=local_logits.device)
+-    indices = torch.empty(shape, dtype=torch.int32, device=local_logits.device)
+-    pairs = torch.empty(
+-        (rows, PAIR_WIDTH), dtype=torch.float32, device=local_logits.device
++    values, indices, pairs = _greedy_pair_buffers(
++        rows, vocab, tp_size, local_logits.device
+     )
+     greedy_shard_pair(local_logits, vocab, vocab_start, pairs, values, indices)
+     if tp_size > 1:
+-- 
+2.54.0 (Apple Git-157)
+
