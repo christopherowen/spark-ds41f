@@ -1,0 +1,221 @@
+{
+  "candidate": "rc23",
+  "base_image": "spark-ds41f:1030",
+  "base_vllm_commit": "d5df88d83",
+  "head_vllm_commit": "2945b1eb2",
+  "patch_head": "1c77d4e4ba9c04f2b484208049e03042129ee781",
+  "expected_tree": "ff730d1c56c477a9ffbbec5cccfa11b3df19a9f7",
+  "num_patches_over_rc14": 27,
+  "unified_prs": [
+    "#686",
+    "#687",
+    "#688",
+    "#693",
+    "#694",
+    "#695",
+    "#696",
+    "#697",
+    "#698",
+    "#699",
+    "#700",
+    "#701",
+    "#703",
+    "#704",
+    "#705",
+    "#706",
+    "#707",
+    "#708",
+    "#710",
+    "#711"
+  ],
+  "kernel_local_verdict": {
+    "passed": true,
+    "summary": "2451 passed, 2 skipped, 14 warnings in 107.91s (0:01:47)",
+    "node": "dgx4",
+    "image": "sha256:67e7b2f2569a1f5dda41ff707e27b94805bf7e628b2d59065ff04a9945288cc2",
+    "seconds": 107.9,
+    "failed": [],
+    "errors": []
+  },
+  "subsystems": {
+    "adaptive_verification": {
+      "prs": [
+        "#686",
+        "#687",
+        "#693",
+        "#695",
+        "#700"
+      ],
+      "seeded_batch_invariance": {
+        "num_requests": 8,
+        "decode_steps": 6,
+        "matching_request_steps": 48,
+        "total_request_steps": 48,
+        "match_rate": 1.0
+      },
+      "copy_drafts_wide_verification": {
+        "dspark_speculative_tokens": 5,
+        "copy_draft_max_tokens": 7,
+        "num_verification_tokens": 12,
+        "max_decode_rows_per_req": 12,
+        "planned_confidence_buffers": 3
+      },
+      "piecewise_step_cost_and_dead_row_clamp": {
+        "c1_legacy_verify_rows": 5,
+        "c1_legacy_padded_graph_rows": 6,
+        "c1_unified_verify_rows": 2,
+        "c1_unified_padded_graph_rows": 2,
+        "c1_row_yield_gain_pct": 16.51,
+        "c8_dead_draft_rows_eliminated_pct": 19.4,
+        "c16_dead_draft_rows_eliminated_pct": 20.9
+      },
+      "continuation_value_cutoff": {
+        "continuation_alpha": 0.47,
+        "cascade_pos0_myopic_survival": 0.46,
+        "cascade_pos0_continuation_score": 1.0456,
+        "myopic_admits_at_threshold_048": false,
+        "continuation_admits_at_threshold_048": true,
+        "c8_accepted_drafts_gain_pct": 2.2,
+        "c16_accepted_drafts_gain_pct": 4.31
+      }
+    },
+    "dspark_speculator": {
+      "prs": [
+        "#694",
+        "#699",
+        "#701"
+      ],
+      "online_irls_confidence_calibration": {
+        "uncalibrated_mean_p_top1": 0.858,
+        "empirical_step0_acceptance": 0.54,
+        "uncalibrated_overconfidence_gap_pp": 31.8,
+        "calibrated_mae_pp": 0.84,
+        "brier_score_reduction_pct": 42.7
+      },
+      "greedy_shard_runner_up_margin": {
+        "packed_arg_max_bits": 64,
+        "shard_outputs_per_rank": [
+          "top1_val",
+          "top1_idx",
+          "top2_val"
+        ],
+        "all_gather_rounds_per_step": 1,
+        "extra_bytes_per_row_per_rank": 4,
+        "margin_feature": "sigmoid((z1 - z2) / tau)"
+      },
+      "concurrency_bounded_draft_depth": {
+        "max_draft_verify_rows": 60,
+        "schedule": {
+          "c1": {
+            "active_decode_reqs": 1,
+            "effective_draft_steps": 5,
+            "drafter_passes_per_step": 4,
+            "saved_drafter_passes_per_step": 0,
+            "verify_rows_before_budgeting": 6
+          },
+          "c4": {
+            "active_decode_reqs": 4,
+            "effective_draft_steps": 5,
+            "drafter_passes_per_step": 4,
+            "saved_drafter_passes_per_step": 0,
+            "verify_rows_before_budgeting": 24
+          },
+          "c8": {
+            "active_decode_reqs": 8,
+            "effective_draft_steps": 5,
+            "drafter_passes_per_step": 4,
+            "saved_drafter_passes_per_step": 0,
+            "verify_rows_before_budgeting": 48
+          },
+          "c10": {
+            "active_decode_reqs": 10,
+            "effective_draft_steps": 5,
+            "drafter_passes_per_step": 4,
+            "saved_drafter_passes_per_step": 0,
+            "verify_rows_before_budgeting": 60
+          },
+          "c12": {
+            "active_decode_reqs": 12,
+            "effective_draft_steps": 4,
+            "drafter_passes_per_step": 3,
+            "saved_drafter_passes_per_step": 1,
+            "verify_rows_before_budgeting": 60
+          },
+          "c16": {
+            "active_decode_reqs": 16,
+            "effective_draft_steps": 2,
+            "drafter_passes_per_step": 1,
+            "saved_drafter_passes_per_step": 3,
+            "verify_rows_before_budgeting": 48
+          }
+        },
+        "c16_saved_drafter_ms_per_step": 1.62,
+        "c16_step_latency_reduction_pct": 11.0,
+        "c16_throughput_gain_pct": 12.39
+      }
+    },
+    "scheduler": {
+      "prs": [
+        "#696",
+        "#697"
+      ],
+      "prefill_decode_interleave": {
+        "prefill_chunk_tokens": 6144,
+        "decode_interleave_steps_k": 2,
+        "mixed_decode_itl_p99_before_ms": 382.4,
+        "mixed_decode_itl_p99_after_ms": 194.1,
+        "mixed_decode_itl_p99_reduction_pct": 49.24
+      },
+      "context_aware_chunk_grid": {
+        "grid_tokens": 2048,
+        "base_chunk_tokens": 6144,
+        "prompt_tokens_128k": 131072,
+        "num_chunks_128k": 55,
+        "all_chunks_2048_aligned": true,
+        "fixed_6144_max_step_ms": 580.4,
+        "context_aware_max_step_ms": 311.68,
+        "max_step_time_reduction_pct": 46.3
+      }
+    },
+    "model_memory_and_kernels": {
+      "prs": [
+        "#698",
+        "#703",
+        "#704",
+        "#705"
+      ],
+      "startup_weight_arena_and_buddy_sponge": {
+        "weight_arena_gib": 45.32,
+        "persistent_weight_cuda_mallocs_before": 19586,
+        "persistent_weight_cuda_mallocs_after": 1,
+        "order13_sponge_startup_free_ram_gain_gib": 1.69,
+        "static_moe_output_buffer_saved_mib": 1.5
+      },
+      "l2_prefetch_pertype_schedule": {
+        "owner_comp_wo_max_rows": 64,
+        "engram_next_max_rows": 16,
+        "c1_decode_tps_before": 45.8,
+        "c1_decode_tps_after": 49.89,
+        "c1_decode_tps_gain_pct": 8.93
+      },
+      "sp_prefill_mxfp8_route_gather": {
+        "bytes_per_token_per_layer_before": 560,
+        "bytes_per_token_per_layer_after": 60,
+        "saved_bytes_per_token_per_layer": 500,
+        "saved_mib_per_6144_chunk_60_layers": 175.78,
+        "eliminated_router_launches_per_chunk": 60,
+        "sp_prefill_latency_reduction_pct": 9.7
+      },
+      "cold_boot_kernel_compilation_trim": {
+        "cold_boot_compilations_before": 247,
+        "cold_boot_compilations_after": 209,
+        "compilations_removed": 38,
+        "cold_boot_compilation_reduction_pct": 15.38
+      }
+    }
+  },
+  "image": "spark-ds41f:19f2c20ed4d6-next-23",
+  "image_id": "sha256:455c0141c6f25d8d64a76db5cbf3f00811cd90f830ef93dc0c3f8eb53f37e24e",
+  "pytest_summary": "2462 passed, 2 skipped, 14 warnings in 110.11s (0:01:50)",
+  "pdl_sources_summary": "65 passed, 14 warnings in 49.64s (PDL sources: 144 kernels launched, 103 with PDL, 0 violations)"
+}

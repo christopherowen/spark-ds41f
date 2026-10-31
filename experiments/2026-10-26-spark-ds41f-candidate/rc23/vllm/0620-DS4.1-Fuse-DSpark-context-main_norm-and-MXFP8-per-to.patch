@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:22:11 +0100
+Subject: [PATCH 620/620] DS4.1: Fuse DSpark context main_norm and MXFP8
+ per-token cast
+
+When the DSpark context KV projections read a producer's MXFP8 cast, run
+TileKernels' norm_forward_and_per_token_cast in main_norm so main_x (BF16) and
+its MXFP8 (E4M3 + packed UE8M0) cast are emitted in a single PDL-enabled launch
+during combine_hidden_states / combine_aux_hidden_states_into, eliminating the
+standalone cast_mxfp8(main_x) launch in precompute_and_store_context_kv.
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 98 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 47 ++++++---
+ vllm/models/deepseek_v4_1/tilelang/norm.py    | 52 ++++++++++
+ vllm/models/deepseek_v4_1/tilelang/pdl.py     |  6 ++
+ 4 files changed, 192 insertions(+), 11 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 12410ddfa..a296471a5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -205,3 +205,101 @@ def test_precompute_and_store_context_kv_casts_once_and_fuses_front(monkeypatch)
+         assert layer_idx == i
+         assert torch.equal(kv_raw, main_x[:, :512] + i)
+         assert pos is positions and slot is slots[i]
++
++
++@pytest.mark.parametrize("rows", [1, 6, 32, LIMIT])
++def test_rmsnorm_forward_with_cast_matches_separate_cast(rows):
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
++
++    gen = torch.Generator(device=DEVICE).manual_seed(rows * 97 + 3)
++    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
++    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
++    x = torch.randn(rows, WIDTH, generator=gen, device=DEVICE).to(torch.bfloat16)
++    ref_out = torch.empty_like(x)
++    norm(x, out=ref_out)
++    ref_cast = kernels.cast_mxfp8(ref_out)
++
++    fused_out = torch.empty_like(x)
++    fused_cast = norm.forward_with_cast(x, out=fused_out)
++    torch.accelerator.synchronize()
++
++    assert fused_cast.rows.data_ptr() == fused_out.data_ptr()
++    assert torch.equal(fused_out.view(torch.int16), ref_out.view(torch.int16))
++    assert torch.equal(
++        fused_cast.values[:rows].view(torch.uint8),
++        ref_cast.values[:rows].view(torch.uint8),
++    )
++    assert torch.equal(
++        fused_cast.scales[:rows].view(torch.uint8),
++        ref_cast.scales[:rows].view(torch.uint8),
++    )
++
++
++def test_combine_and_precompute_context_kv_fuses_cast_into_main_norm(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
++    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
++    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
++
++    def forbid_cast(x):
++        raise AssertionError("standalone cast_mxfp8 should not run after main_norm")
++
++    monkeypatch.setattr(kernels, "cast_mxfp8", forbid_cast)
++    seen_casts = []
++    inserts = []
++
++    class Proj:
++        tilelang_mxfp8_input = True
++
++        def __init__(self, idx):
++            self.idx = idx
++
++        def __call__(self, x):
++            seen_casts.append(provided_mxfp8(x))
++            return x[:, :512] + self.idx
++
++    gen = torch.Generator(device=DEVICE).manual_seed(42)
++    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
++    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
++    joined = dspark_context.NUM_SOURCES * WIDTH
++
++    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
++    torch.nn.Module.__init__(model)
++    model.hidden_size = WIDTH
++    model.main_proj = lambda x: x[:, :WIDTH] * 2 + x[:, WIDTH : 2 * WIDTH]
++    model.main_norm = norm
++    model._context_kv_projections = [Proj(i) for i in range(3)]
++    model.layers = [
++        SimpleNamespace(
++            attn=SimpleNamespace(
++                insert_raw_context_kv=lambda kv_raw, pos, slots, i=i: inserts.append(
++                    (i, kv_raw, pos, slots)
++                )
++            )
++        )
++        for i in range(3)
++    ]
++
++    aux = torch.randn(6, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
++    out = torch.empty(6, WIDTH, dtype=torch.bfloat16, device=DEVICE)
++    main_x = model.combine_hidden_states(aux, out=out)
++    expected_norm = norm(model.main_proj(aux))
++    positions = torch.arange(6, dtype=torch.int64, device=DEVICE)
++    slots = [
++        torch.arange(6, dtype=torch.int64, device=DEVICE) + i * 10 for i in range(3)
++    ]
++    model.precompute_and_store_context_kv(main_x, positions, slots)
++    torch.accelerator.synchronize()
++
++    assert main_x.data_ptr() == out.data_ptr()
++    assert torch.equal(main_x.view(torch.int16), expected_norm.view(torch.int16))
++    assert len(seen_casts) == 3
++    assert all(c is not None and c is seen_casts[0] for c in seen_casts)
++    assert len(inserts) == 3
++    for i, (layer_idx, kv_raw, pos, slot) in enumerate(inserts):
++        assert layer_idx == i
++        assert torch.equal(kv_raw, main_x[:, :512] + i)
++        assert pos is positions and slot is slots[i]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 2041a0ab3..4a50071e7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -254,6 +254,8 @@ class DSparkDeepseekV4Model(nn.Module):
+             **({"gather_output": True} if main_proj_tp else {}),
+         )
+         self.main_norm = kernels.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
++        if hasattr(self.main_norm, "with_cast"):
++            self.main_norm.with_cast = True
+ 
+         current_vllm_config = get_current_vllm_config()
+         self._l2pf_ready = False
+@@ -325,6 +327,8 @@ class DSparkDeepseekV4Model(nn.Module):
+         for projection in self._context_kv_projections:
+             projection.declare_kernels()
+         if self._context_kv_projections:
++            if hasattr(self.main_norm, "with_cast"):
++                self.main_norm.with_cast = True
+             prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -337,9 +341,19 @@ class DSparkDeepseekV4Model(nn.Module):
+         """main_x = main_norm(main_proj(concat of target aux hidden states)).
+ 
+         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)]. With
+-        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there.
++        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there; when
++        the context KV projections read a producer's MXFP8 cast, ``main_norm``
++        also emits ``main_x``'s MXFP8 cast in the same launch.
+         """
+-        return self.main_norm(self.main_proj(aux_hidden_states), out=out)
++        projected = self.main_proj(aux_hidden_states)
++        if _casts_context_main_x(self) and hasattr(
++            self.main_norm, "forward_with_cast"
++        ):
++            cast = self.main_norm.forward_with_cast(projected, out=out)
++            self._context_main_cast = cast
++            return cast.rows
++        self._context_main_cast = None
++        return self.main_norm(projected, out=out)
+ 
+     def combine_aux_hidden_states_into(
+         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
+@@ -351,7 +365,7 @@ class DSparkDeepseekV4Model(nn.Module):
+         rows = out.shape[0]
+         joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
+         columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
+-        self.main_norm(self.main_proj(joined), out=out)
++        self.combine_hidden_states(joined, out=out)
+ 
+     @torch.inference_mode()
+     def precompute_and_store_context_kv(
+@@ -372,14 +386,18 @@ class DSparkDeepseekV4Model(nn.Module):
+         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
+         but writes nothing (profiling).
+         """
+-        main_cast = (
+-            kernels.cast_mxfp8(main_x)
+-            if any(
+-                getattr(proj, "tilelang_mxfp8_input", False)
+-                for proj in self._context_kv_projections
+-            )
+-            else None
+-        )
++        cached_cast = getattr(self, "_context_main_cast", None)
++        self._context_main_cast = None
++        if (
++            cached_cast is not None
++            and cached_cast.rows.data_ptr() == main_x.data_ptr()
++            and cached_cast.rows.shape == main_x.shape
++        ):
++            main_cast = cached_cast
++        elif _casts_context_main_x(self):
++            main_cast = kernels.cast_mxfp8(main_x)
++        else:
++            main_cast = None
+         with kernels.mxfp8_inputs(main_cast):
+             for i, layer in enumerate(self.layers):
+                 slot_mapping = (
+@@ -442,6 +460,13 @@ class DSparkDeepseekV4Model(nn.Module):
+         return hidden_states
+ 
+ 
++def _casts_context_main_x(model: object) -> bool:
++    return any(
++        getattr(proj, "tilelang_mxfp8_input", False)
++        for proj in getattr(model, "_context_kv_projections", ())
++    )
++
++
+ def _insert_context_kv(
+     attn: nn.Module,
+     kv: torch.Tensor,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 7832eb9c1..f7baedc09 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -8,6 +8,8 @@ import torch
+ from torch import nn
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.gemm import SF_BLOCK
++from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, empty_mxfp8
+ 
+ 
+ def _rmsnorm(
+@@ -26,6 +28,27 @@ def _warm(hidden: int, eps: float, dtype: torch.dtype) -> None:
+     _rmsnorm(x, weight, torch.empty_like(x), eps)
+ 
+ 
++@functools.cache
++def _warm_with_cast(hidden: int, eps: float, dtype: torch.dtype) -> None:
++    """TileKernels' fused RMSNorm + MXFP8 per-token cast of one zero row."""
++    x = torch.zeros((1, hidden), dtype=dtype, device="cuda")
++    weight = torch.ones(hidden, dtype=dtype, device="cuda")
++    out_bf16 = torch.empty_like(x)
++    cast = empty_mxfp8(out_bf16)
++    pdl.norm_forward_and_per_token_cast(
++        x,
++        weight,
++        eps,
++        "e4m3",
++        SF_BLOCK,
++        round_sf=True,
++        use_packed_ue8m0=True,
++        with_out_bf16=True,
++        out=(cast.values[:1], cast.scales[:1].view(torch.int32)),
++        out_bf16=out_bf16,
++    )
++
++
+ class TileLangRMSNorm(nn.Module):
+     """``y = x * rsqrt(mean(x^2) + eps) * weight`` in FP32, in the input dtype."""
+ 
+@@ -35,6 +58,7 @@ class TileLangRMSNorm(nn.Module):
+             torch.ones(hidden_size, dtype=torch.bfloat16), requires_grad=False
+         )
+         self.variance_epsilon = eps
++        self.with_cast = False
+ 
+     def declare_kernels(self) -> None:
+         """TileKernels' norm of this width; its input has the weight's dtype."""
+@@ -44,6 +68,34 @@ class TileLangRMSNorm(nn.Module):
+             self.weight.dtype,
+         )
+         prepare.declare(warm=lambda: _warm(hidden, eps, dtype))
++        if self.with_cast:
++            prepare.declare(warm=lambda: _warm_with_cast(hidden, eps, dtype))
++
++    def forward_with_cast(
++        self, x: torch.Tensor, out: torch.Tensor | None = None
++    ) -> MXFP8Rows:
++        """The normalized rows (written into ``out`` when given) beside their
++        MXFP8 cast, in one TileKernels ``norm_forward_and_per_token_cast`` launch."""
++        if x.ndim != 2 or (out is not None and out.ndim != 2):
++            raise ValueError("forward_with_cast requires 2D input and output")
++        if out is None:
++            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
++        cast = empty_mxfp8(out)
++        m = x.shape[0]
++        if m:
++            pdl.norm_forward_and_per_token_cast(
++                x,
++                self.weight,
++                self.variance_epsilon,
++                "e4m3",
++                SF_BLOCK,
++                round_sf=True,
++                use_packed_ue8m0=True,
++                with_out_bf16=True,
++                out=(cast.values[:m], cast.scales[:m].view(torch.int32)),
++                out_bf16=out,
++            )
++        return cast
+ 
+     def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         """The normalized rows, into ``out`` (contiguous, ``x``'s rows) when given."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/pdl.py b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+index 5fa01b18a..c348f1d19 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/pdl.py
++++ b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+@@ -95,6 +95,12 @@ def norm_forward(*args, **kwargs):
+         return tk.quant.norm_forward(*args, **kwargs)
+ 
+ 
++def norm_forward_and_per_token_cast(*args, **kwargs):
++    """TileKernels' ``quant.norm_forward_and_per_token_cast``, chained."""
++    with _tile_kernels() as tk:
++        return tk.quant.norm_forward_and_per_token_cast(*args, **kwargs)
++
++
+ def moe_topk_gate_forward(*args, **kwargs):
+     """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
+     with _tile_kernels() as tk:
