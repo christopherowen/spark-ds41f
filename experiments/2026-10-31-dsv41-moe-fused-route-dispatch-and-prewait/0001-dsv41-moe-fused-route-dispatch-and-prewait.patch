@@ -1,0 +1,1057 @@
+From 115626da000c7b602bfe998414ef28e833a3e6c5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:20:03 +0100
+Subject: [PATCH] dsv4.1 tilelang: fuse decode route_partials + moe_dispatch
+ and hoist pre-wait metadata
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |  12 +-
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  30 ++
+ .../moe/test_deepseek_v41_tilelang_router.py  |  75 ++++
+ vllm/model_executor/layers/fused_moe/layer.py |   1 +
+ .../layers/fused_moe/tilelang.py              |   2 +
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 268 +++++++------
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 370 +++++++++++++++++-
+ 7 files changed, 616 insertions(+), 142 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab846..191b5a2f3 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -57,6 +57,7 @@ CHAIN = {
+     "moe_grouped_fp8_fp4_gemm",
+     "moe_swiglu_cast_kernel",
+     "rope",
++    "router_and_dispatch_partials",
+     "router_partials",
+     "routing_masks",
+     "sparse_mla",
+@@ -64,6 +65,12 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Pointer parameters written before the immediate predecessor kernel (or static
++# weights), which may be pre-loaded before cudaGridDependencySynchronize().
++EARLY_PARAMETERS: dict[str, set[str]] = {
++    "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
++    "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +123,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 936103885..706cac92e 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -775,3 +775,33 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     assert torch.equal(
+         out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
+     )
++
++
++def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
++    """Empty CTAs return before barrier initialization, and decode down GEMMs use
++    two stages (2 CTAs/SM) with identical bits to three stages."""
++    plan = MoeExpertsV41Plan(384, 6, 5120, 576, swiglu_limit=LIMIT)
++    calls = plan.kernels()
++    assert calls["gate_up"][2]["num_stages"] == 3
++    assert calls["late_gate_up"][2]["num_stages"] == 3
++    assert calls["prefill_gate_up"][2]["num_stages"] == 3
++    assert calls["down"][2]["num_stages"] == 2
++    assert calls["late_down"][2]["num_stages"] == 2
++    assert calls["prefill_down"][2]["num_stages"] == 3
++
++    for gather in (True, False):
++        kernel = grouped_fp8_fp4_gemm(
++            32, 384, 576, 6, gather, 32, 128, num_stages=2, coded_scales=True, narrow_codes=True
++        )
++        src = kernel.get_kernel_source()
++        early_return = src.index("if (expert < 0)")
++        rows_write = src.index("((int*)rows_shared)[")
++        barrier_init = src.index("loaded[0].init(")
++        fence_init = src.index("tl::fence_barrier_init()")
++        a_row_read = src.index("a_row[c] = ((int*)rows_shared)[")
++        assert "__syncthreads()" not in src[:early_return]
++        assert early_return < barrier_init < fence_init < a_row_read
++        assert rows_write < barrier_init
++        # Writing rows_shared and initializing loaded share a single __syncthreads().
++        assert src[rows_write:a_row_read].count("__syncthreads()") == 1
++
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 5f5636863..f8565907a 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -572,3 +572,78 @@ def test_gate_router_route_local_matches_full_rows(
+             None, handle, None, input_ids=input_ids
+         )
+     assert handed_w is gathered_weights and handed_ids is gathered_ids
++
++
++@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
++@pytest.mark.parametrize("rows", [1, 6, 16, 17, 32])
++@pytest.mark.parametrize("vision", [False, True])
++def test_fused_route_and_dispatch_partials_matches_separate_route_and_dispatch(
++    plain_scratch, padded_step, experts, topk, rows, vision
++):
++    """When paired with a MoeDispatchV41Plan (dispatch_block_M=32), decode routing
++    and dispatch fuse into a single 1-CTA launch that produces the exact same
++    layout tensors bit-for-bit as separate route_partials + moe_dispatch_v41."""
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.models.deepseek_v4_1.tilelang.linear import _calls
++    from vllm.models.deepseek_v4_1.tilelang.moe import (
++        MoeDispatchV41Plan,
++        carve,
++        workspace_bytes,
++    )
++
++    padded_step(rows, 1 if rows >= 4 else 0)
++    gate = _Gate(experts, seed=experts + rows)
++    generator = torch.Generator(device="cuda").manual_seed(rows * 13 + int(vision))
++    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
++    bias = torch.randn(experts, device="cuda", generator=generator) * 0.1
++    kwargs = dict(
++        top_k=topk,
++        global_num_experts=experts,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    input_ids = None
++    if vision:
++        kwargs.update(
++            bias_vl=torch.nn.Parameter(
++                torch.randn(experts, device="cuda", generator=generator) * 0.1,
++                requires_grad=False,
++            ),
++            image_sentinel_lo=LO,
++            image_sentinel_count=1,
++        )
++        input_ids = torch.randint(0, 1000, (rows,), device="cuda", generator=generator)
++        input_ids[::2] = LO
++
++    dispatch = MoeDispatchV41Plan(experts, topk, 32, 5120, torch.int64, torch.bfloat16)
++    prepare.declare(lambda: _calls(dispatch.kernels()), bind=dispatch.bind)
++    specs = dispatch.workspace_specs(rows)
++
++    # 1. Separate route_partials + moe_dispatch_v41
++    separate_router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    separate_router.declare_kernels()
++    sep_w, sep_ids = separate_router._compute_routing(
++        None, x, None, input_ids=input_ids
++    )
++    ws_sep = torch.zeros(workspace_bytes(specs), dtype=torch.uint8, device="cuda")
++    layout_sep = dispatch.dispatch(sep_ids, sep_w, carve(ws_sep, specs))
++
++    # 2. Fused route_and_dispatch_partials
++    fused_router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    fused_router.dispatch_block_M = 32
++    fused_router.declare_kernels()
++    fused_w, fused_ids = fused_router._compute_routing(
++        None, x, None, input_ids=input_ids
++    )
++    ws_fused = torch.zeros(workspace_bytes(specs), dtype=torch.uint8, device="cuda")
++    layout_fused = dispatch.dispatch(fused_ids, fused_w, carve(ws_fused, specs))
++
++    for name in dispatch._LAYOUT:
++        a, b = layout_fused[name], layout_sep[name]
++        if a.dtype == torch.float32:
++            assert torch.equal(a.view(torch.int32), b.view(torch.int32)), name
++        else:
++            assert torch.equal(a, b), name
++
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 02149fe7f..cc0b684a0 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -403,6 +403,7 @@ def FusedMoEFactory(
+         apply_router_weight_on_input=apply_router_weight_on_input,
+         **routed_experts_args if routed_experts_args is not None else {},
+     )
++    routed_experts.router = router
+ 
+     if runner_cls is None:
+         runner_cls = MoERunner
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index e76770094..ea273e07a 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -213,6 +213,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             else (torch.int32, torch.int64),
+             max_rows=getattr(router, "max_rows", None),
+         )
++        if router is not None and hasattr(router, "dispatch_block_M"):
++            router.dispatch_block_M = self._plan.block_M
+         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
+         # weights and scale codes are contiguous. A K that ends 64 past a multiple
+         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index c8f776295..3219402a3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -543,8 +543,14 @@ class MoeDispatchV41Plan:
+ 
+         Returns the named layout.
+         """
++        from .router import consume_partials_dispatch
++
+         rows = topk_idx.shape[0]
+         layout = dict(zip(self._LAYOUT, workspace))
++        deferred = consume_partials_dispatch(topk_idx)
++        if deferred is not None:
++            deferred(*(layout[name] for name in self._LAYOUT))
++            return layout
+         if rows * self.topk <= _CHUNK:
+             self.fused(topk_idx, topk_weights, *(layout[name] for name in self._LAYOUT))
+         else:
+@@ -799,10 +805,11 @@ def grouped_fp8_fp4_gemm(
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+-            if trigger_after_loop:
+-                pdl.wait()
+-            else:
+-                pdl.chain()
++            if gather:
++                if trigger_after_loop:
++                    pdl.wait()
++                else:
++                    pdl.chain()
+             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
+             B_shared = T.alloc_shared(
+                 (stages, block_N, block_K), T.float4_e2m1_unpacked
+@@ -827,90 +834,110 @@ def grouped_fp8_fp4_gemm(
+             rows_shared = T.alloc_shared((block_M,), T.int32)
+             a_row = T.alloc_local((a_copies,), T.int32)
+             sfa_row = T.alloc_local((sfa_copies,), T.int32)
+-            loaded = T.alloc_barrier([threads] * stages)
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+             tx = T.get_thread_binding()
+ 
+             expert = TileExpert[t]
+-            if expert < 0:
++            if gather and expert < 0:
+                 T.thread_return()
+-            for i in T.Parallel(block_M):
+-                route = Order[t * block_M + i]
+-                rows_shared[i] = T.if_then_else(
+-                    route >= 0, route // topk if gather else t * block_M + i, -1
+-                )
+-            T.sync_threads()
+-            # Each thread copies the same rows at every K block.
+-            for c in T.unroll(a_copies):
+-                a_row[c] = rows_shared[
+-                    T.min((c * threads + tx) // row_segments, block_M - 1)
+-                ]
+-            for c in T.unroll(sfa_copies):
+-                sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
+-            if coded_scales:
+-                for c in T.unroll(sfb_copies):
+-                    j = c * threads + tx
+-                    if j < block_N:
+-                        base_words[c] = T.cast(
+-                            SFBase[expert, bx * block_N + j], T.uint32
+-                        ) * T.uint32(0x01010101)
+-                if narrow_codes:
+-                    narrow_entry = T.cast(Narrow[expert], T.int32)
+-                    Narrow_flag = narrow_entry & 1
+-                    code_base = (
+-                        (narrow_entry >> 1) * n_blocks
+-                        + bx * (2 - Narrow_flag)
+-                    ) * k_blocks
+-            sf_dest = SFC_shared if coded_scales else SFB_shared
+-
+-            T.clear(C_local)
+-            for p in T.unroll(stages - 1):
+-                if p < k_blocks:
+-                    if narrow_codes:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                             p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
+-                    else:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                             p, SFB, SFB_shared)  # fmt: skip
+-                else:
+-                    T.ptx_commit_group()
+-            for ko in T.serial(k_blocks):
+-                # The stage loaded next was last read by iteration ko - 1.
+-                T.sync_threads()
+-                nxt = ko + stages - 1
+-                if nxt < k_blocks:
+-                    if narrow_codes:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                             nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
+-                    else:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                             nxt % stages, SFB, SFB_shared)  # fmt: skip
+-                else:
+-                    T.ptx_commit_group()
+-                T.ptx_wait_group(stages - 1)
+-                T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
+-                s = ko % stages
++            if expert >= 0:
++                for i in T.Parallel(block_M):
++                    route = Order[t * block_M + i]
++                    rows_shared[i] = T.if_then_else(
++                        route >= 0, route // topk if gather else t * block_M + i, -1
++                    )
+                 if coded_scales:
+-                    # Every thread expands its own rows: the stage's barrier
+-                    # waited for every thread's copies. A narrow expert's row
+-                    # is one byte of four 2-bit deltas; the expert is one per
+-                    # CTA, so the branch is uniform.
+                     for c in T.unroll(sfb_copies):
+                         j = c * threads + tx
+                         if j < block_N:
+-                            if narrow_codes:
+-                                if Narrow_flag != 0:
+-                                    code8 = T.cast(SFC8[s, j], T.uint32)
+-                                    SFB_shared[s, j, 0] = (
+-                                        (code8 & T.uint32(0x3))
+-                                        | ((code8 >> 2) & T.uint32(0x3)) << 8
+-                                        | ((code8 >> 4) & T.uint32(0x3)) << 16
+-                                        | ((code8 >> 6) & T.uint32(0x3)) << 24
+-                                    ) + base_words[c]
++                            base_words[c] = T.cast(
++                                SFBase[expert, bx * block_N + j], T.uint32
++                            ) * T.uint32(0x01010101)
++                    if narrow_codes:
++                        narrow_entry = T.cast(Narrow[expert], T.int32)
++                        Narrow_flag = narrow_entry & 1
++                        code_base = (
++                            (narrow_entry >> 1) * n_blocks
++                            + bx * (2 - Narrow_flag)
++                        ) * k_blocks
++            if not gather:
++                if trigger_after_loop:
++                    pdl.wait()
++                else:
++                    pdl.chain()
++                if expert < 0:
++                    T.thread_return()
++            # Allocating the stage barriers in a child block after the TileExpert
++            # early return keeps empty CTAs free of barrier initialization, cluster
++            # barrier fences, and block synchronization, while the barrier-init
++            # sync publishes rows_shared to the active CTA in one barrier.
++            with T.sblock("gemm"):
++                loaded = T.alloc_barrier([threads] * stages)
++                # Each thread copies the same rows at every K block.
++                for c in T.unroll(a_copies):
++                    a_row[c] = rows_shared[
++                        T.min((c * threads + tx) // row_segments, block_M - 1)
++                    ]
++                for c in T.unroll(sfa_copies):
++                    sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
++                sf_dest = SFC_shared if coded_scales else SFB_shared
++
++                T.clear(C_local)
++                for p in T.unroll(stages - 1):
++                    if p < k_blocks:
++                        if narrow_codes:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
++                                 p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++                        else:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
++                                 p, SFB, SFB_shared)  # fmt: skip
++                    else:
++                        T.ptx_commit_group()
++                for ko in T.serial(k_blocks):
++                    # The stage loaded next was last read by iteration ko - 1.
++                    T.sync_threads()
++                    nxt = ko + stages - 1
++                    if nxt < k_blocks:
++                        if narrow_codes:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
++                                 nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++                        else:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
++                                 nxt % stages, SFB, SFB_shared)  # fmt: skip
++                    else:
++                        T.ptx_commit_group()
++                    T.ptx_wait_group(stages - 1)
++                    T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
++                    s = ko % stages
++                    if coded_scales:
++                        # Every thread expands its own rows: the stage's barrier
++                        # waited for every thread's copies. A narrow expert's row
++                        # is one byte of four 2-bit deltas; the expert is one per
++                        # CTA, so the branch is uniform.
++                        for c in T.unroll(sfb_copies):
++                            j = c * threads + tx
++                            if j < block_N:
++                                if narrow_codes:
++                                    if Narrow_flag != 0:
++                                        code8 = T.cast(SFC8[s, j], T.uint32)
++                                        SFB_shared[s, j, 0] = (
++                                            (code8 & T.uint32(0x3))
++                                            | ((code8 >> 2) & T.uint32(0x3)) << 8
++                                            | ((code8 >> 4) & T.uint32(0x3)) << 16
++                                            | ((code8 >> 6) & T.uint32(0x3)) << 24
++                                        ) + base_words[c]
++                                    else:
++                                        code = T.cast(SFC_shared[s, j], T.uint32)
++                                        SFB_shared[s, j, 0] = (
++                                            (code & T.uint32(0xF))
++                                            | ((code >> 4) & T.uint32(0xF)) << 8
++                                            | ((code >> 8) & T.uint32(0xF)) << 16
++                                            | ((code >> 12) & T.uint32(0xF)) << 24
++                                        ) + base_words[c]
+                                 else:
+                                     code = T.cast(SFC_shared[s, j], T.uint32)
+                                     SFB_shared[s, j, 0] = (
+@@ -919,32 +946,11 @@ def grouped_fp8_fp4_gemm(
+                                         | ((code >> 8) & T.uint32(0xF)) << 16
+                                         | ((code >> 12) & T.uint32(0xF)) << 24
+                                     ) + base_words[c]
+-                            else:
+-                                code = T.cast(SFC_shared[s, j], T.uint32)
+-                                SFB_shared[s, j, 0] = (
+-                                    (code & T.uint32(0xF))
+-                                    | ((code >> 4) & T.uint32(0xF)) << 8
+-                                    | ((code >> 8) & T.uint32(0xF)) << 16
+-                                    | ((code >> 12) & T.uint32(0xF)) << 24
+-                                ) + base_words[c]
+-                T.sync_threads()
+-                if ko < k_full:
+-                    T.mma_gemm_blockscaled(
+-                        A_shared[s, :, :],
+-                        B_shared[s, :, :],
+-                        C_local,
+-                        SFA_shared[s, :, :],
+-                        SFB_shared[s, :, :],
+-                        transpose_B=True,
+-                        k_start=0,
+-                        sf_a_granularity_k=SF_BLOCK,
+-                        sf_b_granularity_k=SF_BLOCK,
+-                    )
+-                if BT is not None:  # noqa: SIM102
+-                    if ko == k_full:
++                    T.sync_threads()
++                    if ko < k_full:
+                         T.mma_gemm_blockscaled(
+-                            A_shared[s, :, 0:tail],
+-                            B_shared[s, :, 0:tail],
++                            A_shared[s, :, :],
++                            B_shared[s, :, :],
+                             C_local,
+                             SFA_shared[s, :, :],
+                             SFB_shared[s, :, :],
+@@ -953,12 +959,25 @@ def grouped_fp8_fp4_gemm(
+                             sf_a_granularity_k=SF_BLOCK,
+                             sf_b_granularity_k=SF_BLOCK,
+                         )
+-            if trigger_after_loop:
+-                pdl.trigger()
+-            # Only real rows are stored; padding rows of the layout stay untouched.
+-            for i, j in T.Parallel(block_M, block_N):
+-                if rows_shared[i] >= 0:
+-                    C[t * block_M + i, bx * block_N + j] = C_local[i, j]
++                    if BT is not None:  # noqa: SIM102
++                        if ko == k_full:
++                            T.mma_gemm_blockscaled(
++                                A_shared[s, :, 0:tail],
++                                B_shared[s, :, 0:tail],
++                                C_local,
++                                SFA_shared[s, :, :],
++                                SFB_shared[s, :, :],
++                                transpose_B=True,
++                                k_start=0,
++                                sf_a_granularity_k=SF_BLOCK,
++                                sf_b_granularity_k=SF_BLOCK,
++                            )
++                if trigger_after_loop:
++                    pdl.trigger()
++                # Only real rows are stored; padding rows of the layout stay untouched.
++                for i, j in T.Parallel(block_M, block_N):
++                    if rows_shared[i] >= 0:
++                        C[t * block_M + i, bx * block_N + j] = C_local[i, j]
+ 
+     sfb_spec = (
+         T.Tensor((code_rows, block_N // 2), T.uint16)
+@@ -1164,7 +1183,6 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+         TileExpert: T.Tensor((tiles,), T.int32),
+     ):
+         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
+-            pdl.chain()
+             tid = T.get_thread_binding()
+             col = (tid // warp) * chunk + (tid % warp) * vec
+             orders = T.alloc_local((rows_per_cta,), T.int32)
+@@ -1179,15 +1197,17 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+             cert_min_l = T.alloc_local((2,), T.float32)
+             weight = T.alloc_var(T.float32)
+             base = t * block_M + slab * rows_per_cta
+-            # Every row's loads issue before any row's arithmetic, so a cold call
+-            # waits once for the layout words and once for its rows. ``Order`` is
+-            # read in bounds for unused tiles too; their stale words are not used.
+-            for r in T.unroll(rows_per_cta):
+-                orders[r] = Order[base + r]
+-            if TileExpert[t] >= 0:
++            expert = TileExpert[t]
++            if expert >= 0:
++                for r in T.unroll(rows_per_cta):
++                    orders[r] = Order[base + r]
+                 for r in T.unroll(rows_per_cta):
+                     if orders[r] >= 0:
+                         weights[r] = Weights[base + r]
++            pdl.chain()
++            if expert >= 0:
++                for r in T.unroll(rows_per_cta):
++                    if orders[r] >= 0:
+                         for j in T.vectorized(vec):
+                             xl[r, j] = H[base + r, col + j]
+                         for j in T.vectorized(vec):
+@@ -1224,7 +1244,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+                         cert_max_metric = T.alloc_var(T.uint32, init=0)
+                         for j in T.vectorized(2):
+                             cert_min_l[j] = T.float32(0)
+-                        for j in T.vectorized(vec):
++                        for j in T.unroll(vec):
+                             cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_f[j])
+                         cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
+                         for j in T.unroll(vec):
+@@ -1254,7 +1274,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+                                 x[j] = val
+                         for j in T.vectorized(2):
+                             amax[j] = 0
+-                        for j in T.vectorized(vec):
++                        for j in T.unroll(vec):
+                             amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
+                         amax[0] = T.max(amax[0], amax[1])
+                         for j in T.unroll(reduce_rounds):
+@@ -1348,6 +1368,7 @@ class MoeExpertsV41Plan:
+         prefill_block_M=64,
+         block_N=128,
+         num_stages=3,
++        down_num_stages=2,
+         out_dtype=torch.bfloat16,
+         idx_dtypes=(torch.int32, torch.int64),
+         max_rows: int | None = None,
+@@ -1364,6 +1385,7 @@ class MoeExpertsV41Plan:
+             block_N,
+         )
+         self.num_stages = num_stages
++        self.down_num_stages = down_num_stages
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+@@ -1428,7 +1450,6 @@ class MoeExpertsV41Plan:
+         ``prefill_`` prefix at ``prefill_block_M``, whose GEMMs trigger late too."""
+         config = dict(
+             block_N=self.block_N,
+-            num_stages=self.num_stages,
+             coded_scales=True,
+             narrow_codes=True,
+         )
+@@ -1445,6 +1466,11 @@ class MoeExpertsV41Plan:
+             tiers.append(("prefill_", self.prefill_block_M, True))
+         kernels = {}
+         for prefix, block_M, late in tiers:
++            down_stages = (
++                self.down_num_stages
++                if block_M == self.block_M
++                else self.num_stages
++            )
+             kernels[f"{prefix}gate_up"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+@@ -1453,6 +1479,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 True,
+                 block_M,
++                num_stages=self.num_stages,
+                 **config,
+                 trigger_after_loop=late,
+             )
+@@ -1464,6 +1491,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 False,
+                 block_M,
++                num_stages=down_stages,
+                 **config,
+                 trigger_after_loop=late,
+             )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index a07a285b6..db8bdff6b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -528,6 +528,249 @@ def route_partials(
+     return router_partials
+ 
+ 
++_FUSED_DISPATCH_MAX_ROWS = 32
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++    },
++)
++def route_and_dispatch_partials(
++    num_topk: int,
++    num_experts: int,
++    shards: int,
++    block_M: int,
++    image_mask: bool,
++    routing_mask: bool,
++    image_ids: str | None = None,
++    image_lo: int = 0,
++    image_count: int = 0,
++    padding: bool = False,
++    max_rows: int = _FUSED_DISPATCH_MAX_ROWS,
++):
++    """Fused decode split-K partial reduction, sqrtsoftplus top-k routing, and
++    contiguous MoE dispatch in a single 1-CTA kernel launch for ``rows <= max_rows``."""
++    from .moe import _CHUNK, _dispatch_macros
++
++    threads = _CHUNK
++    warps = threads // _WARP
++    assert num_topk <= _WARP and num_experts % _VECTOR == 0
++    assert max_rows * num_topk <= threads
++    per_lane = tilelang.cdiv(tilelang.cdiv(num_experts, _WARP), _VECTOR) * _VECTOR
++    rows, image_len, mask_len, tiles = T.dynamic("rows, image_len, mask_len, tiles")
++    image_dtype = image_ids if image_ids is not None else T.bool
++    rank_routes, layout = _dispatch_macros(num_experts, threads)
++
++    @T.prim_func
++    def router_and_dispatch_partials(
++        P: T.Tensor((shards, rows, num_experts), T.float32),
++        bias: T.Tensor((num_experts,), T.float32),
++        image_bias: T.Tensor((num_experts,), T.float32),
++        image_token_mask: T.Tensor((image_len,), image_dtype),
++        route_mask: T.Tensor((mask_len,), T.bool),
++        routed_scaling_factor: T.float32,
++        Order: T.Tensor((tiles * block_M,), T.int32),
++        LayoutWeights: T.Tensor((tiles * block_M,), T.float32),
++        RoutePos: T.Tensor((rows, num_topk), T.int32),
++        TileExpert: T.Tensor((tiles,), T.int32),
++        ExpertCount: T.Tensor((num_experts,), T.int32),
++        ExpertOffset: T.Tensor((num_experts,), T.int32),
++        Psum: T.Tensor((num_experts,), T.int32),
++        NumTiles: T.Tensor((1,), T.int32),
++    ):
++        with T.Kernel(1, threads=threads):
++            pdl.chain()
++            warp_count = T.alloc_shared((warps + 1, num_experts), T.int32)
++            scan = T.alloc_shared((threads,), T.int32)
++            topk_idx_s = T.alloc_shared((max_rows, num_topk), T.int32)
++            topk_weights_s = T.alloc_shared((max_rows, num_topk), T.float32)
++
++            tx = T.get_thread_binding()
++            warp = tx // _WARP
++            lane = tx % _WARP
++
++            bias_local = T.alloc_local((per_lane,), T.float32)
++            scores = T.alloc_local((per_lane,), T.float32)
++            ids = T.alloc_local((per_lane,), T.int32)
++            finite = T.alloc_var(T.bool, init=True)
++            best_score = T.alloc_var(T.float32)
++            best_idx = T.alloc_var(T.int32, init=-1)
++            previous = T.alloc_var(T.int32, init=-1)
++            chosen_idx = T.alloc_var(T.int32, init=-1)
++            chosen_score = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            is_image = T.alloc_var(T.bool)
++
++            for p in T.serial(T.ceildiv(rows, warps)):
++                row = p * warps + warp
++                if row < rows:
++                    if routing_mask and route_mask[row] == padding:
++                        if lane < num_topk:
++                            topk_idx_s[row, lane] = -1
++                            topk_weights_s[row, lane] = 0.0
++                    else:
++                        if image_mask and image_ids is not None:
++                            is_image = (image_token_mask[row] >= image_lo) & (
++                                image_token_mask[row] < image_lo + image_count
++                            )
++                        elif image_mask:
++                            is_image = image_token_mask[row]
++                        else:
++                            is_image = False
++
++                        T.fill(ids, -1)
++                        T.fill(scores, -T.infinity(T.float32))
++                        T.fill(bias_local, 0.0)
++                        for i in T.unroll(0, per_lane // _VECTOR):
++                            start = i * _VECTOR * _WARP + lane * _VECTOR
++                            if start < num_experts:
++                                for j in T.vectorized(_VECTOR):
++                                    scores[i * _VECTOR + j] = P[0, row, start + j]
++                                    bias_local[i * _VECTOR + j] = (
++                                        image_bias[start + j]
++                                        if is_image
++                                        else bias[start + j]
++                                    )
++                                for s in T.serial(1, shards):
++                                    for j in T.vectorized(_VECTOR):
++                                        scores[i * _VECTOR + j] += P[s, row, start + j]
++                                for j in T.unroll(_VECTOR):
++                                    if not T.isfinite(scores[i * _VECTOR + j]):
++                                        finite = False
++                        T.device_assert(
++                            finite,
++                            msg="route_partials: gate logits contain nan or inf",
++                        )
++
++                        for i in T.unroll(0, T.ceildiv(num_experts, _VECTOR * _WARP)):
++                            start = i * _VECTOR * _WARP + lane * _VECTOR
++                            if start < num_experts:
++                                for j in T.unroll(_VECTOR):
++                                    x = scores[i * _VECTOR + j]
++                                    val = T.sqrt(
++                                        T.Select(x > 20.0, x, T.log1p(T.exp(x)))
++                                    )
++                                    warp_count[warp, start + j] = T.reinterpret(
++                                        val, T.int32
++                                    )
++                                    scores[i * _VECTOR + j] = (
++                                        val + bias_local[i * _VECTOR + j]
++                                    )
++                                    ids[i * _VECTOR + j] = start + j
++                        T.sync_warp()
++
++                        previous = -1
++                        for k in T.unroll(num_topk):
++                            best_score = -T.infinity(T.float32)
++                            best_idx = -1
++                            for i in T.unroll(0, per_lane):
++                                if k != 0 and previous == ids[i]:
++                                    scores[i] = -T.infinity(T.float32)
++                                elif scores[i] > best_score:
++                                    best_score = scores[i]
++                                    best_idx = ids[i]
++                            bits = T.reinterpret(best_score, T.int32)
++                            key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
++                            top = T.warp_reduce_max(key)
++                            best_idx = T.warp_reduce_min(
++                                T.if_then_else(key == top, best_idx, 0x7FFFFFFF)
++                            )
++                            previous = best_idx
++                            if lane == k:
++                                chosen_idx = best_idx
++
++                        chosen_score = 0.0
++                        if lane < num_topk:
++                            chosen_score = T.reinterpret(
++                                warp_count[warp, chosen_idx], T.float32
++                            )
++                        total = chosen_score
++                        for i in T.unroll(0, 5):
++                            total += T.shfl_xor(total, 1 << (4 - i))
++                        total += 1e-20
++                        if lane < num_topk:
++                            topk_idx_s[row, lane] = chosen_idx
++                            topk_weights_s[row, lane] = (
++                                chosen_score / total * routed_scaling_factor
++                            )
++                        T.sync_warp()
++
++            T.sync_threads()
++            count = T.alloc_var(T.int32)
++            routes = rows * num_topk
++            expert, rank = rank_routes(topk_idx_s, routes, 0, num_topk, tx, warp_count)
++            count = T.if_then_else(
++                tx < num_experts, warp_count[warps, T.min(tx, num_experts - 1)], 0
++            )
++            offset = layout(
++                count,
++                block_M,
++                tx,
++                scan,
++                ExpertCount,
++                ExpertOffset,
++                Psum,
++                Order,
++                LayoutWeights,
++                TileExpert,
++                NumTiles,
++                tiles,
++            )
++            T.sync_threads()
++            if tx < num_experts:
++                scan[tx] = offset
++            T.sync_threads()
++            if tx < routes:
++                if expert >= 0:
++                    Order[scan[expert] + rank] = tx
++                    LayoutWeights[scan[expert] + rank] = topk_weights_s[
++                        tx // num_topk, tx % num_topk
++                    ]
++                    RoutePos[tx // num_topk, tx % num_topk] = scan[expert] + rank
++                else:
++                    RoutePos[tx // num_topk, tx % num_topk] = -1
++
++    return router_and_dispatch_partials
++
++
++_DEFERRED_PARTIALS_DISPATCH: list[tuple[int, tuple[int, ...], object]] = []
++_DECODE_PARTIALS_BUFFERS: dict[tuple[torch.device, int], torch.Tensor] = {}
++
++
++def _decode_partials_buffer(
++    device: torch.device, shards: int, rows: int, num_experts: int
++) -> torch.Tensor:
++    cap = shards * max(rows, _FUSED_DISPATCH_MAX_ROWS) * num_experts
++    buf = _DECODE_PARTIALS_BUFFERS.get((device, cap))
++    if buf is None or buf.numel() < cap:
++        buf = torch.empty(cap, dtype=torch.float32, device=device)
++        _DECODE_PARTIALS_BUFFERS[(device, cap)] = buf
++    return buf[: shards * rows * num_experts].view(shards, rows, num_experts)
++
++
++def defer_partials_dispatch(ids_handle: torch.Tensor, launcher) -> None:
++    """Register a deferred ``route_and_dispatch_partials`` launch for ``ids_handle``."""
++    _DEFERRED_PARTIALS_DISPATCH.append(
++        (ids_handle.data_ptr(), tuple(ids_handle.shape), launcher)
++    )
++
++
++def consume_partials_dispatch(ids_handle: torch.Tensor):
++    """Consume and return the deferred ``route_and_dispatch_partials`` launch for
++    ``ids_handle``, or None when ``ids_handle`` carries materialized routes."""
++    ptr = ids_handle.data_ptr()
++    shape = tuple(ids_handle.shape)
++    for i in range(len(_DEFERRED_PARTIALS_DISPATCH) - 1, -1, -1):
++        entry_ptr, entry_shape, launcher = _DEFERRED_PARTIALS_DISPATCH[i]
++        if entry_ptr == ptr and entry_shape == shape:
++            _DEFERRED_PARTIALS_DISPATCH.pop(i)
++            return launcher
++    return None
++
++
+ class RoutedRows(NamedTuple):
+     """Top-k routing weights and expert ids computed on local SP rows and
+     gathered beside ``rows``' MXFP8 cast."""
+@@ -576,6 +819,10 @@ class TileLangGateRouter(TileKernelsRouter):
+         super().__init__(*args, **kwargs)
+         self.gate = gate
+         self._kernels: dict[tuple, object] = {}
++        self._dispatch_kernels: dict[tuple, object] = {}
++        self.dispatch_block_M: int | None = None
++        self._deferred_ids: torch.Tensor | None = None
++        self._deferred_weights: torch.Tensor | None = None
+         # Text-only layers pass no image tokens; one all-false mask serves them.
+         self._no_image = None
+         vllm_config = get_current_vllm_config_or_none()
+@@ -589,18 +836,10 @@ class TileLangGateRouter(TileKernelsRouter):
+         gate.tilelang_router = self
+         self._mask_variants = _routing_mask_variants(vllm_config)
+ 
+-    def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
+-        """``route_partials`` for each (input ids' dtype, routing mask) a decode
+-        step can pass, keyed as ``_compute_routing`` looks it up; none when the
+-        gate does not split. A vision layer reads its image tokens from the input
+-        ids (the runner's int32, or int64); the mask is the step's padding mask,
+-        a CED decoder layer's routing mask, or none."""
+-        gate = self.gate
+-        if gate.tilelang_shards == 1:
+-            return {}
++    def _partials_keys(self) -> tuple[bool, tuple[str | None, ...], list[str | None]]:
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         ids = ("int32", "int64") if image else (None,)
+-        masks = []
++        masks: list[str | None] = []
+         for mask in self._mask_variants:
+             if not mask:
+                 masks.append(None)
+@@ -608,6 +847,18 @@ class TileLangGateRouter(TileKernelsRouter):
+             masks.append("padding")
+             if getattr(self, "_ds41_is_ced_decoder", False):
+                 masks.append("route")
++        return image, ids, masks
++
++    def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
++        """``route_partials`` for each (input ids' dtype, routing mask) a decode
++        step can pass, keyed as ``_compute_routing`` looks it up; none when the
++        gate does not split. A vision layer reads its image tokens from the input
++        ids (the runner's int32, or int64); the mask is the step's padding mask,
++        a CED decoder layer's routing mask, or none."""
++        gate = self.gate
++        if gate.tilelang_shards == 1:
++            return {}
++        image, ids, masks = self._partials_keys()
+         return {
+             (ids_dtype, mask): prepare.call(
+                 route_partials,
+@@ -625,6 +876,31 @@ class TileLangGateRouter(TileKernelsRouter):
+             for mask in masks
+         }
+ 
++    def _dispatch_partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
++        """``route_and_dispatch_partials`` for each (input ids' dtype, routing mask)
++        when paired with a ``MoeDispatchV41Plan`` at ``self.dispatch_block_M``."""
++        gate = self.gate
++        if gate.tilelang_shards == 1 or self.dispatch_block_M is None:
++            return {}
++        image, ids, masks = self._partials_keys()
++        return {
++            (ids_dtype, mask): prepare.call(
++                route_and_dispatch_partials,
++                self.top_k,
++                gate.weight.shape[0],
++                gate.tilelang_shards,
++                self.dispatch_block_M,
++                image,
++                mask is not None,
++                image_ids=ids_dtype,
++                image_lo=self.image_sentinel_lo if image else 0,
++                image_count=self.image_sentinel_count if image else 0,
++                padding=mask == "padding",
++            )
++            for ids_dtype in ids
++            for mask in masks
++        }
++
+     def _gates_every_row(self) -> bool:
+         """Whether every forward's rows take TileKernels' gate path: a gate without
+         split-K decode rows, or forwards that can have more rows than they."""
+@@ -662,13 +938,16 @@ class TileLangGateRouter(TileKernelsRouter):
+ 
+     def declare_kernels(self) -> None:
+         """Declare the router's kernels (its layer calls this when preparing): the
+-        decode rows' ``route_partials``, the prefill rows' TileKernels gate and its
++        decode rows' ``route_partials`` (and ``route_and_dispatch_partials`` when
++        paired with a dispatch plan), the prefill rows' TileKernels gate and its
+         masks. They read the gate's split, set when the gate declares its own
+         kernels."""
+ 
+         def bind() -> None:
+             for key, entry in self._partials_kernels().items():
+                 self._kernels[key] = prepare.launch(entry)
++            for key, entry in self._dispatch_partials_kernels().items():
++                self._dispatch_kernels[key] = prepare.launch(entry)
+ 
+         top_k = self.top_k
+         num_experts = self.gate.weight.shape[0]
+@@ -681,7 +960,11 @@ class TileLangGateRouter(TileKernelsRouter):
+         )
+ 
+         prepare.declare(
+-            lambda: [*self._partials_kernels().values(), *self._mask_calls()],
++            lambda: [
++                *self._partials_kernels().values(),
++                *self._dispatch_partials_kernels().values(),
++                *self._mask_calls(),
++            ],
+             bind=bind,
+             warm=warm,
+         )
+@@ -736,14 +1019,26 @@ class TileLangGateRouter(TileKernelsRouter):
+             raise ValueError(
+                 f"TileLang routing writes int64 expert ids, not {indices_type}"
+             )
+-        (partials,) = _scratch(specs, None)
+-        partials_kernel(gate, x.shape[0])(x, gate.weight, partials)
++        rows = x.shape[0]
++        use_fused_dispatch = (
++            self.dispatch_block_M is not None
++            and self.capture_fn is None
++            and sp_rows is None
++            and rows <= _FUSED_DISPATCH_MAX_ROWS
++        )
++        if use_fused_dispatch:
++            partials = _decode_partials_buffer(
++                x.device, gate.tilelang_shards, rows, gate.weight.shape[0]
++            )
++        else:
++            (partials,) = _scratch(specs, None)
++        partials_kernel(gate, rows)(x, gate.weight, partials)
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+         ced_decoder = getattr(self, "_ds41_is_ced_decoder", False)
+         route_mask, padding = _partials_mask(
+-            x.shape[0],
++            rows,
+             ced_decoder=ced_decoder,
+             sp_rows=sp_rows,
+         )
+@@ -753,11 +1048,6 @@ class TileLangGateRouter(TileKernelsRouter):
+             else None,
+             None if route_mask is None else "padding" if padding else "route",
+         )
+-        rows = x.shape[0]
+-        topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
+-        topk_weights = torch.empty(
+-            rows, self.top_k, dtype=torch.float32, device=x.device
+-        )
+         bias = self.e_score_correction_bias.data
+         if (
+             self._no_image is None
+@@ -774,12 +1064,50 @@ class TileLangGateRouter(TileKernelsRouter):
+         # text layer's, and an absent routing mask, read nothing of these rows.
+         ids = _local_mask(input_ids, rows, sp_rows) if image else self._no_image[:rows]
+         image_bias, mask = (self.bias_vl.data, ids) if image else (bias, ids)
++        mask_arg = route_mask if route_mask is not None else self._no_image[:rows]
++        if use_fused_dispatch:
++            if (
++                self._deferred_ids is None
++                or self._deferred_ids.device != x.device
++                or self._deferred_ids.shape[0] < rows
++            ):
++                self._deferred_ids = torch.empty(
++                    (_FUSED_DISPATCH_MAX_ROWS, self.top_k),
++                    dtype=torch.int64,
++                    device=x.device,
++                )
++                self._deferred_weights = torch.empty(
++                    (_FUSED_DISPATCH_MAX_ROWS, self.top_k),
++                    dtype=torch.float32,
++                    device=x.device,
++                )
++            topk_ids = self._deferred_ids[:rows]
++            topk_weights = self._deferred_weights[:rows]
++            dispatch_kernel = self._dispatch_kernels[key]
++            scaling = self.routed_scaling_factor
++            defer_partials_dispatch(
++                topk_ids,
++                lambda *layout_tensors: dispatch_kernel(
++                    partials,
++                    bias,
++                    image_bias,
++                    mask,
++                    mask_arg,
++                    scaling,
++                    *layout_tensors,
++                ),
++            )
++            return topk_weights, topk_ids
++        topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
++        topk_weights = torch.empty(
++            rows, self.top_k, dtype=torch.float32, device=x.device
++        )
+         self._kernels[key](
+             partials,
+             bias,
+             image_bias,
+             mask,
+-            route_mask if route_mask is not None else self._no_image[:rows],
++            mask_arg,
+             topk_ids,
+             topk_weights,
+             self.routed_scaling_factor,
+-- 
+2.54.0 (Apple Git-157)
+
