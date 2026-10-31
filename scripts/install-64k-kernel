@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Install the pinned 64 KiB kernel packages from config/kernel-trial.json and pin GRUB default.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo "$0" "$@"
+fi
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readarray -t specs < <(python3 - "$root/config/kernel-trial.json" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1]))
+print(policy["candidate"])
+for pkg, ver in policy["packages"].items():
+    print(pkg if pkg.startswith("linux-modules-nvidia-") else f"{pkg}={ver}")
+PY
+)
+
+candidate=${specs[0]}
+packages=("${specs[@]:1}")
+
+apt-get update
+apt-get install -y "${packages[@]}"
+
+if dkms status -m dgx-spark-fan-control 2>/dev/null | grep -q dgx-spark-fan-control; then
+  dkms autoinstall -k "$candidate"
+fi
+
+uuid=$(findmnt -n -o UUID /)
+printf 'GRUB_DEFAULT="gnulinux-advanced-%s>gnulinux-%s-advanced-%s"\n' "$uuid" "$candidate" "$uuid" \
+  >/etc/default/grub.d/zz-spark-kernel-trial.cfg
+update-grub
+echo "Installed $candidate and pinned GRUB default; reboot with the service stopped to activate."

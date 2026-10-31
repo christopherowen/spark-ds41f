@@ -91,7 +91,7 @@ with `bin/spark --cluster-config <profile> cluster stop --remove --apply --paral
 published deployment checkout on each node, run:
 
 ```sh
-bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh
+scripts/install-memory-saver
 ```
 
 The script clones the revision pinned in `config/kernel-trial.json`, checks the

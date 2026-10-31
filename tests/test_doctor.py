@@ -1163,13 +1163,13 @@ class NewUserOnboardingTest(unittest.TestCase):
         summary = spark.summarize_live_warnings(raw)
         self.assertEqual(len(summary), 10)
         expected = [
-            ("install 64kb page kernel (dgx1, dgx2)", "sudo apt-get install linux-image-7.0.0-1019-nvidia-64k"),
-            ("install memory-saver (dgx1, dgx2)", "bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh"),
-            ("configure swap (dgx1)", "sudo bash experiments/2026-10-02-kernel-64k/install-boot-support.sh"),
-            ("configure nvme sleep settings (dgx1)", "apst_primary_timeout_ms=2000"),
-            ("disable nvme interrupt coalescing (dgx1)", "nvidia-nvme-interrupt-coalescing.service"),
+            ("install 64kb page kernel (dgx1, dgx2)", "sudo scripts/install-64k-kernel"),
+            ("install memory-saver (dgx1, dgx2)", "scripts/install-memory-saver"),
+            ("configure swap (dgx1)", "sudo scripts/configure-swap"),
+            ("configure nvme sleep settings (dgx1)", "sudo scripts/configure-nvme-sleep"),
+            ("disable nvme interrupt coalescing (dgx1)", "sudo scripts/disable-nvme-coalescing"),
             ("management port off wireless (dgx1)", "sudo nmcli radio wifi off"),
-            ("install fan-control (dgx1)", "dgx-spark-fan-control.git"),
+            ("install fan-control (dgx1)", "scripts/install-fan-control"),
             ("set cpu governor to performance (dgx1)", "sudo systemctl restart nv-cpu-governor.service"),
             ("disable idle desktop services and boot splash (dgx1)", "scripts/host-recovery apply"),
             ("enable nvidia-drm modeset (dgx1)", "sudo apt-get purge -y nvidia-drm-options-modeset0"),

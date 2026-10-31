@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Disable NVMe interrupt coalescing now and mask nvidia-nvme-interrupt-coalescing.service.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo "$0" "$@"
+fi
+
+systemctl mask --now nvidia-nvme-interrupt-coalescing.service
+/usr/bin/nvidia-nvme-interrupt-coalescing.sh disable
+echo "Disabled NVMe interrupt coalescing and masked nvidia-nvme-interrupt-coalescing.service."

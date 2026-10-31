@@ -13,7 +13,7 @@ changing the base page size alone determines every memory or timing difference.
 The 4 KiB THP policy remains unchanged.
 
 Installation and the initial swap formatting are performed by the published
-`experiments/2026-10-02-kernel-64k/install-boot-support.sh`. It does not reboot,
+`scripts/configure-swap`. It does not reboot,
 activate the service, or swap off a live file. The service runs at boot before
 swap.target and Docker, with no GPU operations or serving control.
 

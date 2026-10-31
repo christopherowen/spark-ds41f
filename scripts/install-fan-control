@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Install dgx-spark-fan-control v0.1.4 and build its DKMS module for installed kernels.
+set -euo pipefail
+
+version=v0.1.4
+repo="https://github.com/christopherowen/dgx-spark-fan-control.git"
+source_dir="$HOME/projects/dgx-spark-fan-control"
+
+if [ ! -e "$source_dir" ]; then
+  git clone --branch "$version" "$repo" "$source_dir"
+else
+  git -C "$source_dir" fetch --tags origin
+  git -C "$source_dir" checkout --detach "$version"
+fi
+
+cd "$source_dir"
+sudo ./install.sh
+if [ -d /lib/modules/7.0.0-1019-nvidia-64k ]; then
+  sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k
+fi
