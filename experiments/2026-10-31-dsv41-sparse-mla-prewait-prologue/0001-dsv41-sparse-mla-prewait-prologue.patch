@@ -1,0 +1,127 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab8..e2eec1f 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -64,6 +64,11 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Predecessor-independent weights and RoPE/sink metadata that may be pre-loaded
++# before cudaGridDependencySynchronize().
++EARLY_PARAMETERS: dict[str, set[str]] = {
++    "sparse_mla": {"CosSin", "Positions", "Sinks"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +121,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 577af60..66a6b67 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -114,8 +114,8 @@ def wo_input(O_shared, heads, position, CosSin, X, amax, inv, scale):
+     for h, i in T.Parallel(heads, half):
+         first = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i])
+         second = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i + 1])
+-        cosine = CosSin[position, i]
+-        sine = CosSin[position, half + i]
++        cosine = CosSin[i] if position is None else CosSin[position, i]
++        sine = CosSin[half + i] if position is None else CosSin[position, half + i]
+         O_shared[h, NOPE_DIM + 2 * i] = T.Cast(
+             T.bfloat16, T.ieee_fmaf(first, cosine, second * sine)
+         )
+@@ -400,10 +400,10 @@ def sparse_mla_fwd_v41(
+         Output,
+     ):
+         with T.Kernel(head_blocks, rows, threads=threads) as (hb, row):
+-            pdl.chain()
+             Q_shared = T.alloc_shared([block_H, D], dtype)
+             KV_shared = T.alloc_shared([BI, D], dtype)
+             P_shared = T.alloc_shared([block_H, BI], dtype)
++            cs_shared = T.alloc_shared([ROPE_DIM], accum_dtype)
+             # Raw records, one 528-byte row per entry; indexed records use 288 bytes.
+             staged = T.alloc_shared([BI, SWA_RECORD_BYTES], T.uint8)
+             staged_fp8 = T.view(staged, dtype=T.float8_e4m3fn)
+@@ -427,6 +427,15 @@ def sparse_mla_fwd_v41(
+             inv = T.alloc_fragment([block_H * D // 32], accum_dtype)
+             scale = T.alloc_fragment([block_H * D // 32], accum_dtype)
+ 
++            h0 = hb * block_H
++            for h in T.Parallel(block_H):
++                M[h] = sink_log2(Sinks, h0 + h)
++            pos_ext = Positions[row]
++            for i in T.Parallel(ROPE_DIM):
++                cs_shared[i] = CosSin[pos_ext, i]
++
++            pdl.chain()
++
+             # Resolve the row's slots once, so record copies never wait on index loads.
+             gather_swa(SwaIndices, SwaLengths, row, 0, swa_blocks * BI, slots, 0)
+             if idx_blocks:
+@@ -442,12 +451,9 @@ def sparse_mla_fwd_v41(
+                 )
+             T.sync_threads()
+             stage_chunk(SwaRecords, IdxRecords, 0, slots, 0, staged, copy_slot)
+-            h0 = hb * block_H
+             load_q(Q, row, h0, Q_shared)
+             T.fill(acc_o, 0)
+             T.fill(L, 1)
+-            for h in T.Parallel(block_H):
+-                M[h] = sink_log2(Sinks, h0 + h)
+ 
+             for seg in T.serial(segments):
+                 clear_segment(acc_g, m_g, l_g)
+@@ -500,7 +506,7 @@ def sparse_mla_fwd_v41(
+             T.sync_threads()
+             for h, d in T.Parallel(block_H, D):
+                 Q_shared[h, d] = T.fmul(acc_o[h, d], L[h])
+-            wo_input(Q_shared, block_H, Positions[row], CosSin, X, amax, inv, scale)
++            wo_input(Q_shared, block_H, None, cs_shared, X, amax, inv, scale)
+             for h, d in T.Parallel(block_H, D):
+                 if h0 + h < heads:
+                     Output[row, h0 + h, d] = Q_shared[h, d]
+@@ -608,9 +614,9 @@ def sparse_mla_fwd_v41(
+ 
+         # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+-            pdl.chain()
+             o = T.alloc_fragment([D], accum_dtype)
+             O_shared = T.alloc_shared([1, D], dtype)
++            cs_shared = T.alloc_shared([ROPE_DIM], accum_dtype)
+             X = T.alloc_fragment([D // 32, 32], accum_dtype)
+             amax = T.alloc_fragment([D // 32], accum_dtype)
+             inv = T.alloc_fragment([D // 32], accum_dtype)
+@@ -622,8 +628,12 @@ def sparse_mla_fwd_v41(
+             m_new = T.alloc_var(accum_dtype)
+ 
+             M = sink_log2(Sinks, hc)
++            pos_dec = Positions[rc]
++            for i in T.Parallel(ROPE_DIM):
++                cs_shared[i] = CosSin[pos_dec, i]
+             L = 1.0
+             T.clear(o)
++            pdl.chain()
+             for c in T.unroll(segments):
+                 m_new = T.max(M, PartialStats[rc, c, hc, 0])
+                 a = T.exp2(M - m_new)
+@@ -635,7 +645,7 @@ def sparse_mla_fwd_v41(
+             L = 1.0 / L
+             for d in T.Parallel(D):
+                 O_shared[0, d] = T.fmul(o[d], L)
+-            wo_input(O_shared, 1, Positions[rc], CosSin, X, amax, inv, scale)
++            wo_input(O_shared, 1, None, cs_shared, X, amax, inv, scale)
+             for d in T.Parallel(D):
+                 Output[rc, hc, d] = O_shared[0, d]
+ 
