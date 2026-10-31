@@ -77,21 +77,22 @@ NODE_MAP_EXAMPLES = {
 }
 
 
-def missing_nodes_message(relative: str) -> str:
+def missing_nodes_message(relative: str | None = None) -> str:
+    if relative is None:
+        return (
+            "no site node map is configured: copy one of the site templates and edit it for your nodes "
+            "(docs/setup.md, Site configuration):\n"
+            "  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json\n"
+            "  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json\n"
+            "  3-node triangle: cp config/nodes.example.json config/nodes.json"
+        )
     example = NODE_MAP_EXAMPLES.get(relative)
-    if example:
-        lines = [
-            f"{relative} is missing: run `cp {example} {relative}` and edit it for your site (docs/setup.md, Site configuration).",
-        ]
-        if not any((ROOT / path).is_file() for path in NODE_MAP_EXAMPLES):
-            lines.extend([
-                "Available site templates:",
-                "  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json",
-                "  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json",
-                "  3-node triangle: cp config/nodes.example.json config/nodes.json",
-            ])
-        return "\n".join(lines)
-    return f"{relative} is missing: create the node map for your site (docs/setup.md, Site configuration)"
+    hint = (
+        f"run `cp {example} {relative}` and edit it for your site "
+        if example
+        else "create the node map for your site "
+    )
+    return f"{relative} is missing: {hint}(docs/setup.md, Site configuration)"
 
 
 def site_nodes() -> dict:
@@ -128,6 +129,8 @@ def configuration(
                 auto_switched = True
             elif (ROOT / NODES_FILE).is_file() and "tp3-triangle" in cluster.get("shapes", {}):
                 shape = "tp3-triangle"
+            else:
+                raise SystemExit(missing_nodes_message())
         if shape is None:
             raise SystemExit(
                 f"{canonical} serves {', '.join(sorted(cluster['shapes']))}; name this site's cabling with "
@@ -156,10 +159,15 @@ def configuration(
             f"{cluster.get('nodes_config', NODES_FILE)} has {len(nodes['nodes'])}"
         )
     if auto_switched:
+        launch_enabled = cluster.get("deployment", {}).get("launch_enabled", True)
+        branch = cluster.get("deployment", {}).get("branch")
         try:
             cluster = topology.candidate(cluster, nodes, "config/nodes-switched.local.json")
         except (ValueError, StopIteration) as error:
             raise SystemExit(f"invalid topology: {error}") from error
+        cluster["deployment"]["launch_enabled"] = launch_enabled
+        if branch is not None:
+            cluster["deployment"]["branch"] = branch
     ssh_user = nodes.get("ssh_user")
     if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         cluster["host"]["home"] = f"/home/{ssh_user}"
