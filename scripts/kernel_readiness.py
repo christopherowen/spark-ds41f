@@ -224,6 +224,8 @@ def findings(name, data, policy):
     if grub.get("next_entry") or grub.get("initrdfail") or grub.get("prev_entry"):
         issues.append(f"{name}: a GRUB next-boot/recovery override is armed; kernel is not merely staged")
         fixes.append(f"{name}: inspect sudo grub-editenv list; cancel an unintended one-shot with sudo grub-editenv unset next_entry (review recovery state separately)")
+    if data.get("page_size") == 4096 and "active_swap" in data and data.get("active_swap") != ["/swap.img"]:
+        issues.append(f"{name}: 4 KiB swap (/swap.img) is not active")
     if data.get("page_size") == 65536:
         if "[never]" not in data.get("thp", "") or data.get("min_free_kbytes") != "45166":
             issues.append(f"{name}: 64 KiB THP/reserve policy differs from never/45166 KiB")
