@@ -41,8 +41,14 @@ import recipe as cluster_recipe
 
 
 def read_json(relative: str) -> dict:
-    with (ROOT / relative).open(encoding="utf-8") as handle:
-        return json.load(handle)
+    path = ROOT / relative
+    if not path.is_file():
+        raise SystemExit(f"configuration file does not exist: {relative}")
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid JSON in {relative}: {error}") from error
 
 
 def cluster_config_path(args: argparse.Namespace | None = None) -> tuple[Path, str]:
@@ -64,14 +70,26 @@ def cluster_config_path(args: argparse.Namespace | None = None) -> tuple[Path, s
 # keeps its own copy (git-ignored), started from config/nodes.example.json;
 # cluster sync copies the head node's file to every node.
 NODES_FILE = "config/nodes.json"
+NODE_MAP_EXAMPLES = {
+    NODES_FILE: "config/nodes.example.json",
+    "config/nodes-ring4.local.json": "config/examples/nodes-ring4.json",
+    "config/nodes-switched.local.json": "config/examples/nodes-switched.json",
+}
+
+
+def missing_nodes_message(relative: str) -> str:
+    example = NODE_MAP_EXAMPLES.get(relative)
+    hint = (
+        f"run `cp {example} {relative}` and edit it for your site, or run scripts/example_site.py "
+        if example
+        else "create the node map for your site "
+    )
+    return f"{relative} is missing: {hint}(docs/setup.md, Site configuration)"
 
 
 def site_nodes() -> dict:
     if not (ROOT / NODES_FILE).is_file():
-        raise SystemExit(
-            f"{NODES_FILE} is missing: copy config/nodes.example.json to it and edit "
-            "it for your site (docs/replicate.md, Site configuration)"
-        )
+        raise SystemExit(missing_nodes_message(NODES_FILE))
     return read_json(NODES_FILE)
 
 
@@ -84,7 +102,10 @@ def configuration(
     as (``config/site.json``), or to ``--shape``.
     """
     cluster_path, canonical = cluster_config_path(args)
-    cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
+    try:
+        cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid JSON in {canonical}: {error}") from error
     shape_nodes = None
     if cluster_recipe.is_overlay(cluster):
         cluster = read_cluster(canonical)
@@ -97,15 +118,27 @@ def configuration(
             )
         shape_nodes = int(cluster_recipe.shape_entry(cluster, shape)["nodes"])
         cluster = cluster_recipe.resolve(cluster, shape)
-    nodes_path = repository_config_path(cluster.get("nodes_config", "config/nodes.json"))
-    upstreams_path = repository_config_path(cluster.get("upstreams_config", "upstreams.lock.json"))
-    nodes = site_nodes() if nodes_path == ROOT / NODES_FILE else json.loads(nodes_path.read_text())
+    nodes_relative = cluster.get("nodes_config", NODES_FILE)
+    nodes_path = repository_config_path(nodes_relative)
+    upstreams_relative = cluster.get("upstreams_config", "upstreams.lock.json")
+    upstreams_path = repository_config_path(upstreams_relative)
+    if nodes_path == ROOT / NODES_FILE:
+        nodes = site_nodes()
+    else:
+        try:
+            nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise SystemExit(missing_nodes_message(nodes_relative)) from None
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"invalid JSON in {nodes_relative}: {error}") from error
+    if not upstreams_path.is_file():
+        raise SystemExit(f"upstreams lock does not exist: {upstreams_relative}")
     if shape_nodes is not None and len(nodes["nodes"]) != shape_nodes:
         raise SystemExit(
             f"shape {cluster['shape']} needs {shape_nodes} nodes and its node map "
             f"{cluster.get('nodes_config', NODES_FILE)} has {len(nodes['nodes'])}"
         )
-    return cluster, nodes, json.loads(upstreams_path.read_text())
+    return cluster, nodes, json.loads(upstreams_path.read_text(encoding="utf-8"))
 
 
 def read_cluster(relative: str, shape: str | None = None) -> dict:
@@ -795,14 +828,22 @@ def host_facts(output: str) -> dict[str, str]:
     return facts
 
 
-def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when nvidia-drm does not drive displays (kernel mode setting, required).
+def carveout_weights_enabled(cluster: dict) -> bool:
+    return cluster.get("environment", {}).get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "1") != "0"
+
+
+def modeset_problems(node_name: str, facts: dict[str, str],
+                     *, carveout_weights: bool = True) -> list[str]:
+    """Problems when nvidia-drm does not drive displays (kernel mode setting).
 
     Without it only the firmware framebuffer shows a console, and only for a
     display attached at boot: a monitor or KVM connected later stays dark.
-    nvidia-drm also offers DRM dumb buffers only with mode setting, so the
-    display carve-out that holds the embedding and output head (vLLM patch
-    0021) cannot be allocated and the worker refuses to start.
+    nvidia-drm also offers DRM dumb buffers only with mode setting, so a
+    profile that places the embedding and output head in the display carve-out
+    (vLLM patch 0021, SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1) cannot allocate
+    it and the worker refuses to start. When the profile keeps weights in
+    regular memory (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0), modeset=N only
+    affects an attached monitor after boot and is a warning.
     """
     value = facts.get("modeset", "")
     if value == "Y":
@@ -813,6 +854,15 @@ def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
                 f"{node_name}: nvidia-drm modeset is unreadable "
                 "(/sys/module/nvidia_drm/parameters/modeset); doctor needs "
                 "passwordless sudo -n to read it"
+            )
+        ]
+    if not carveout_weights:
+        return [
+            Warn(
+                f"{node_name}: nvidia-drm modeset is {value}, expected Y "
+                "(a display attached after boot stays dark; serving does not use "
+                "the display carve-out on this profile); run sudo apt purge "
+                "nvidia-drm-options-modeset0 and reboot with the service stopped"
             )
         ]
     return [
@@ -891,19 +941,22 @@ def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 
 
 def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when the active virtual console is in graphics mode.
+    """Warnings when the active virtual console is in graphics mode.
 
     The boot splash can leave it there after Plymouth quits; the kernel then
-    draws no text on an attached display although fbcon is available.
+    draws no text on an attached display although fbcon is available. Serving
+    does not depend on the text console.
     """
     console, _, mode = facts.get("console", "").partition(":")
     if mode == "0":
         return []
     if mode == "1":
         return [
-            f"{node_name}: the active console ({console}) is in graphics mode, so an "
-            "attached display shows no text; run scripts/host-recovery apply on the node "
-            "(it switches the console to text mode now and removes splash from later boots)"
+            Warn(
+                f"{node_name}: the active console ({console}) is in graphics mode, so an "
+                "attached display shows no text; run scripts/host-recovery apply on the node "
+                "(it switches the console to text mode now and removes splash from later boots)"
+            )
         ]
     return [Warn(f"{node_name}: cannot read the active console mode")]
 
@@ -1251,6 +1304,16 @@ def kernel_policy_path(cluster: dict) -> Path:
     return path
 
 
+def docker_error_detail(node_name: str, stderr: str) -> str:
+    detail = stderr.strip()
+    if "permission denied" in detail.lower() and "docker.sock" in detail:
+        return (
+            f"{detail}; add the SSH user to the docker group on {node_name} "
+            "(sudo usermod -aG docker $USER) and reconnect"
+        )
+    return detail
+
+
 def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     """Findings about the live cluster: errors, and Warn for the minor ones."""
     problems: list[str] = []
@@ -1259,21 +1322,25 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     kernel_inventories = {}
     corrections = []
     name = cluster["container"]["name"]
+    kernel_profile = cluster.get("host", {}).get("kernel")
+    carveout = carveout_weights_enabled(cluster)
     for node in nodes["nodes"]:
         if trial:
             inventory = node_kernel_inventory(nodes, node, trial)
             kernel_inventories[node["name"]] = inventory
-            warnings, fixes = kernel_readiness.findings(node["name"], inventory, trial)
+            warnings, fixes = kernel_readiness.findings(
+                node["name"], inventory, trial, kernel_profile
+            )
             problems.extend(Warn(warning) for warning in warnings)
             corrections.extend(fixes)
             problems.extend(kernel_readiness.profile_problems(
-                node["name"], inventory, cluster["host"].get("kernel"), trial))
+                node["name"], inventory, kernel_profile, trial))
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
         problems.extend(desktop_problems(node["name"], desktop.stdout))
         boot = run_ssh(nodes, node, "efibootmgr")
         problems.extend(boot_order_problems(node["name"], boot.stdout))
         facts = host_facts(remote_shell(nodes, node, HOST_FACTS_QUERY).stdout)
-        problems.extend(modeset_problems(node["name"], facts))
+        problems.extend(modeset_problems(node["name"], facts, carveout_weights=carveout))
         problems.extend(fbdev_problems(node["name"], facts))
         problems.extend(drm_card_problems(node["name"], facts))
         problems.extend(drm_master_problems(node["name"], facts))
@@ -1291,7 +1358,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(node_glp_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
-            problems.append(f"{node['name']}: cannot inspect {name}: {result.stderr.strip()}")
+            problems.append(f"{node['name']}: cannot inspect {name}: {docker_error_detail(node['name'], result.stderr)}")
             continue
         inspection = json.loads(result.stdout)[0]
         if not inspection["State"]["Running"]:
@@ -1415,9 +1482,12 @@ def command_topology_create(args: argparse.Namespace) -> int:
     cluster, _, _ = configuration(args)
     nodes_path = repository_config_path(args.nodes_config)
     output = repository_config_path(args.output)
-    nodes = json.loads(nodes_path.read_text())
+    nodes_relative = nodes_path.relative_to(ROOT.resolve()).as_posix()
+    if not nodes_path.is_file():
+        raise SystemExit(missing_nodes_message(nodes_relative))
+    nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
     try:
-        candidate = topology.candidate(cluster, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
+        candidate = topology.candidate(cluster, nodes, nodes_relative)
     except (ValueError, StopIteration) as error:
         raise SystemExit(f"invalid topology: {error}") from error
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1731,9 +1801,15 @@ def node_runtime_problems(
         cluster["container"]["image"],
     )
     if image.returncode:
-        problems.append(
-            f"{node['name']}: image is unavailable: {cluster['container']['image']}"
-        )
+        if "permission denied" in image.stderr.lower() and "docker.sock" in image.stderr:
+            problems.append(
+                f"{node['name']}: cannot inspect Docker image {cluster['container']['image']}: "
+                f"{docker_error_detail(node['name'], image.stderr)}"
+            )
+        else:
+            problems.append(
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+            )
     else:
         labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
         for key, wanted in cluster["container"]["expected_labels"].items():
@@ -1832,9 +1908,10 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
 
     # Read before any checkout: on the head node the checkout can be ROOT, and
     # moving it off a commit that still tracked the file removes it.
-    site_paths = {NODES_FILE, cluster.get("nodes_config", NODES_FILE)}
-    if (ROOT / cluster_recipe.SITE_FILE).is_file():
-        site_paths.add(cluster_recipe.SITE_FILE)
+    site_paths = {cluster.get("nodes_config", NODES_FILE)}
+    for optional in (NODES_FILE, cluster_recipe.SITE_FILE):
+        if (ROOT / optional).is_file():
+            site_paths.add(optional)
     site_texts = {relative: repository_config_path(relative).read_text(encoding="utf-8") for relative in site_paths}
     quoted_path = shlex.quote(path)
     fetch_script = (
@@ -2207,6 +2284,10 @@ def live_engine(cluster: dict, nodes: dict) -> dict | None:
     result = run_ssh(nodes, head, "docker", "inspect", cluster["container"]["name"])
     if result.returncode == 255:
         raise RuntimeError(f"cannot reach {head['name']} to inspect the live engine: {result.stderr.strip()}")
+    if result.returncode and "permission denied" in result.stderr.lower() and "docker.sock" in result.stderr:
+        raise RuntimeError(
+            f"cannot inspect Docker on {head['name']}: {docker_error_detail(head['name'], result.stderr)}"
+        )
     if result.returncode:
         return None
     inspection = json.loads(result.stdout)[0]

@@ -85,6 +85,14 @@ class SwitchedTopologyTest(unittest.TestCase):
         self.assertNotIn('benchmark_reference', result)
         self.assertNotIn('--disable-custom-all-reduce', result['serve_args'])
 
+    def test_candidate_generation_from_switched_example_map_and_ring_base(self):
+        ring_base = spark.read_cluster('config/cluster.json', 'tp4-ring')
+        switched_nodes = spark.read_json('config/examples/nodes-switched.json')
+        result = topology.candidate(ring_base, switched_nodes, 'config/examples/nodes-switched.json')
+        self.assertEqual(result['fabric'], {'transport': 'oneshot-switched', 'topology': 'switched'})
+        self.assertEqual(topology.problems(result, switched_nodes), [])
+        self.assertNotIn('benchmark_reference', result)
+
     def test_nccl_switched_is_capability_rejected_on_locked_image(self):
         cluster, nodes = fixture()
         cluster['fabric']['transport'] = 'nccl-switched'

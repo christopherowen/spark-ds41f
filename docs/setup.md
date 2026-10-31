@@ -46,7 +46,9 @@ which pays for their larger context.
 Each node needs:
 
 - a DGX Spark (GB10, 128 GB unified memory) on DGX OS 26.09.2 or later;
-- Docker with the NVIDIA container runtime and `buildx`, and `/dev/infiniband`;
+- Docker with the NVIDIA container runtime and `buildx`, `/dev/infiniband`,
+  and the SSH user in the `docker` group (`sudo usermod -aG docker "$USER"`,
+  then reconnect);
 - about 480 GiB of free disk (the model, including Engram tables read from
   disk, plus caches); the build host also needs 64 GiB of free memory;
 - a management network for SSH, the API and Gloo, with passwordless SSH from
@@ -60,7 +62,7 @@ Each node needs:
 | --- | --- | --- | --- | --- |
 | [Host recovery policy](#host-recovery-policy) (watchdog, SSH/Tailscale protection, text console) | recommended | recommended | `scripts/host-recovery check`, `doctor --live` | [remove the drop-ins](#revert-the-host-baseline) |
 | [Headless boot](#headless-boot-the-trade-off) (no desktop, idle services off) | required by `doctor --live` | same | `doctor --live` | `sudo systemctl set-default graphical.target`, re-enable the services |
-| [Kernel mode setting](#kernel-mode-setting) (`nvidia-drm modeset=Y`) | required | required | `doctor --live` | reinstall `nvidia-drm-options-modeset0` |
+| [Kernel mode setting](#kernel-mode-setting) (`nvidia-drm modeset=Y`) | required (TP3); recommended (TP4) | required (TP3); recommended (TP4) | `doctor --live` | reinstall `nvidia-drm-options-modeset0` |
 | [`vm.watermark_boost_factor=0`](#memory-accounting) | recommended | recommended | — | delete the sysctl file |
 | [NVMe interrupt coalescing off](#nvme-interrupt-coalescing) | optional | optional | `doctor --live` (warn) | unmask the service |
 | [NVMe sleeps only when idle](#nvme-power-states-apst) (APST timeouts 2 s / 60 s) | recommended | recommended | `doctor --live` (warn) | delete the modprobe file |
@@ -418,9 +420,12 @@ the cables that moved; re-run the discovery.
 Two files describe your site and stay out of git:
 
 - **Node map.** `config/nodes.json` for the three-node profiles (start from
-  [config/nodes.example.json](../config/nodes.example.json)), or
-  `config/nodes-ring4.local.json` for the TP4 profile (start from
-  [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)).
+  [config/nodes.example.json](../config/nodes.example.json)),
+  `config/nodes-ring4.local.json` for the TP4 ring profile (start from
+  [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)), or
+  `config/nodes-switched.local.json` for a switched four-node deployment (start from
+  [config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and see
+  [switched-fabric.md](switched-fabric.md)).
   It names each node, its rank (the head is rank 0), management IP,
   `ssh_user`, and `roce_peer_hcas`: for each peer rank, the local RoCE
   devices cabled to it (`rdma link` shows them). `sparknet topology discover`

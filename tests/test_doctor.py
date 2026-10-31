@@ -110,6 +110,13 @@ class ModesetTest(unittest.TestCase):
     def test_disabled_mode_setting_is_reported(self) -> None:
         problems = spark.modeset_problems("dgx1", facts(modeset="N"))
         self.assertEqual(len(problems), 1)
+        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIn("modeset is N, expected Y", problems[0])
+
+    def test_disabled_mode_setting_warns_when_carveout_weights_are_off(self) -> None:
+        problems = spark.modeset_problems("dgx1", facts(modeset="N"), carveout_weights=False)
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("modeset is N, expected Y", problems[0])
 
     def test_unreadable_mode_setting_is_reported(self) -> None:
@@ -314,7 +321,6 @@ class SeverityTest(unittest.TestCase):
             spark.modeset_problems("dgx1", facts(modeset="N")),
             spark.fbdev_problems("dgx1", facts(fbdev="N")),
             spark.drm_master_problems("dgx1", facts(drm_masters="Xorg/123")),
-            spark.console_mode_problems("dgx1", facts(console="tty1:1")),
         ):
             self.assertEqual(len(problems), 1)
             self.assertNotIsInstance(problems[0], spark.Warn)
@@ -324,11 +330,13 @@ class SeverityTest(unittest.TestCase):
             spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1")),
             spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0")),
             spark.drm_master_problems("dgx1", facts(drm_masters="unreadable")),
+            spark.console_mode_problems("dgx1", facts(console="tty1:1")),
             spark.console_mode_problems("dgx1", facts(console="tty1:")),
             spark.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
             spark.desktop_problems("dgx1", "graphical.target\ninactive\n"),
             spark.boot_order_problems("dgx1", ""),
             spark.modeset_problems("dgx1", facts(modeset="")),
+            spark.modeset_problems("dgx1", facts(modeset="N"), carveout_weights=False),
             spark.fbdev_problems("dgx1", facts(fbdev="")),
             spark.fan_control_problems("dgx1", facts(fan_dkms="")),
         ):
@@ -1104,6 +1112,27 @@ class GLPTest(unittest.TestCase):
         problems = self.node(self.cluster(), 255, stderr="ssh: connect to host dgx2 port 22: Connection refused\n")
         self.assertEqual(problems, ["dgx2: cannot check the GLP steering file: "
                                     "ssh: connect to host dgx2 port 22: Connection refused"])
+
+
+class NewUserOnboardingTest(unittest.TestCase):
+    def test_missing_node_map_prints_setup_guidance_for_each_shape(self) -> None:
+        self.assertIn("cp config/nodes.example.json config/nodes.json",
+                      spark.missing_nodes_message("config/nodes.json"))
+        self.assertIn("cp config/examples/nodes-ring4.json config/nodes-ring4.local.json",
+                      spark.missing_nodes_message("config/nodes-ring4.local.json"))
+        self.assertIn("cp config/examples/nodes-switched.json config/nodes-switched.local.json",
+                      spark.missing_nodes_message("config/nodes-switched.local.json"))
+        self.assertIn("docs/setup.md", spark.missing_nodes_message("config/nodes.json"))
+        self.assertNotIn("docs/replicate.md", spark.missing_nodes_message("config/nodes.json"))
+
+    def test_docker_permission_denied_points_to_docker_group(self) -> None:
+        stderr = (
+            "permission denied while trying to connect to the Docker daemon socket at "
+            "unix:///var/run/docker.sock: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.45/info\": "
+            "dial unix /var/run/docker.sock: connect: permission denied"
+        )
+        detail = spark.docker_error_detail("dgx1", stderr)
+        self.assertIn("sudo usermod -aG docker", detail)
 
 
 if __name__ == "__main__":

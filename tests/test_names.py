@@ -53,7 +53,7 @@ class SourceLabelTest(unittest.TestCase):
         args = type("Args", (), {"cluster_config": FROZEN_1022, "shape": "tp4-ring"})()
         try:
             cluster, nodes, upstreams = spark.configuration(args)
-        except FileNotFoundError:
+        except (FileNotFoundError, SystemExit):
             ring = spark.read_json("config/examples/nodes-ring4.json")
             head_ip = spark.read_json("config/cluster.json")["distributed"]["master_addr"]
             next(node for node in ring["nodes"] if node.get("head"))["management_ip"] = head_ip
