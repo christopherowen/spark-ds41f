@@ -6,8 +6,10 @@ import contextlib
 import io
 import importlib.machinery
 import importlib.util
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # A recipe frozen for these tests, so a release does not move them.
@@ -1138,6 +1140,36 @@ class NewUserOnboardingTest(unittest.TestCase):
         findings = spark.live_doctor(cluster, nodes)
         self.assertEqual(len(findings), 1)
         self.assertIn("example placeholder addresses (192.0.2.x)", findings[0])
+
+    def test_ssh_resolution_problem_checks_ssh_config_or_dns(self) -> None:
+        nodes = {"ssh_user": "ubuntu", "nodes": [{"name": "unresolvable-label-xyz", "management_ip": "192.168.20.10"}]}
+        with mock.patch("subprocess.run") as run_mock, mock.patch("socket.getaddrinfo") as gai_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                ["ssh", "-G", "ubuntu@unresolvable-label-xyz"], 0, "hostname unresolvable-label-xyz\n", ""
+            )
+            gai_mock.side_effect = spark.socket.gaierror("nodename nor servname provided")
+            problem = spark.ssh_resolution_problem(nodes, nodes["nodes"][0])
+            self.assertIsNotNone(problem)
+            assert problem is not None
+            self.assertIn("cannot resolve SSH target", problem)
+            self.assertIn("Host unresolvable-label-xyz", problem)
+            self.assertIn("192.168.20.10", problem)
+
+        with mock.patch("subprocess.run") as run_mock, mock.patch("socket.getaddrinfo") as gai_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                ["ssh", "-G", "ubuntu@unresolvable-label-xyz"], 0, "hostname 192.168.20.10\n", ""
+            )
+            gai_mock.return_value = [(spark.socket.AF_INET, spark.socket.SOCK_STREAM, 6, "", ("192.168.20.10", 0))]
+            self.assertIsNone(spark.ssh_resolution_problem(nodes, nodes["nodes"][0]))
+            gai_mock.assert_called_once_with("192.168.20.10", None)
+
+    def test_topology_flags_deprecated_ssh_host_field(self) -> None:
+        cluster = spark.read_cluster("config/cluster.json")
+        nodes = spark.read_json("config/examples/nodes-ring4.json")
+        nodes["nodes"][0]["ssh_host"] = "192.168.20.10"
+        errors = spark.topology.problems(cluster, nodes)
+        self.assertTrue(any("ssh_host is no longer used because name is now the SSH target" in e for e in errors))
+        self.assertFalse(any("unknown fields" in e for e in errors))
 
     def test_docker_permission_denied_points_to_docker_group(self) -> None:
         stderr = (
