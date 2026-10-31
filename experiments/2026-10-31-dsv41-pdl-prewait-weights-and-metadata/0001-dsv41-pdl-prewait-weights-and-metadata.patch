@@ -1,0 +1,357 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab8..4f94f24 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -64,6 +64,15 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Predecessor-independent weights, metadata, and sublayer-entry state that may be
++# pre-loaded before cudaGridDependencySynchronize().
++EARLY_PARAMETERS: dict[str, set[str]] = {
++    "attention_front": {"cos_sin", "kv_weight", "positions", "q_weight", "slots"},
++    "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
++    "mhc_post": {"comb", "post", "residual"},
++    "mhc_post_collapse": {"comb", "mix", "post", "residual"},
++    "rope": {"cos_sin", "positions"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +125,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index 58bac0e..cfd5831 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -213,7 +213,6 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+     ):
+         with T.Kernel(T.ceildiv(M, qb) + T.ceildiv(M, kb), threads=_THREADS) as bx:
+             T.import_source(_CVT_HEADER)
+-            pdl.chain()
+             tid = T.get_thread_binding()
+             q_sum_partial = T.alloc_fragment((qb, qt), T.float32)
+             q_warp_reducer = T.alloc_reducer((qb, qw), T.float32, op="sum")
+@@ -243,15 +242,46 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+             )
+             q_x = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
+             q_y = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
++            q_w = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
+             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             y_fp32_local = T.alloc_local((_VEC,), T.float32)
+             sum_local = T.alloc_local((2,), T.float32)
+-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
+             sf_local = T.alloc_local((q["num_thread_vec"],), out_config.sf_dtype)
+             amax_local = T.alloc_local((q["num_thread_vec"],), T.float32)
+             cs = T.alloc_local((_VEC,), T.float32)
+             values = T.alloc_local((_VEC,), T.float32)
++            slot_local = T.alloc_local((1,), T.int64)
++
++            if bx < T.ceildiv(M, qb):
++                row_offset = tid % qt
++                for vi in T.unroll(q["num_thread_vec"]):
++                    token_offset = (vi * qt + row_offset) * _VEC
++                    if token_offset < Q_LATENT:
++                        for j in T.vectorized(_VEC):
++                            q_w[vi, j] = q_weight[token_offset + j]
++            else:
++                pid = bx - T.ceildiv(M, qb)
++                lane = tid % kt
++                token_id = pid * kb + tid // kt
++                for vi in T.unroll(k["num_thread_vec"]):
++                    token_offset = (vi * kt + lane) * _VEC
++                    for j in T.vectorized(_VEC):
++                        k_w[vi, j] = kv_weight[token_offset + j]
++                if token_id < M:
++                    slot_local[0] = T.cast(slots[token_id], T.int64)
++                    if last * kt + lane >= rope_vec:
++                        rope_lane = last * kt + lane - rope_vec
++                        position = positions[token_id]
++                        for i in T.vectorized(_VEC // 2):
++                            cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
++                        for i in T.vectorized(_VEC // 2):
++                            cs[_VEC // 2 + i] = cos_sin[
++                                position, half + rope_lane * (_VEC // 2) + i
++                            ]
++
++            pdl.chain()
+ 
+             if bx < T.ceildiv(M, qb):
+                 # The q latent: TileKernels' norm with its cast, and a BF16 copy.
+@@ -281,14 +311,11 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+                 for vi in T.unroll(q["num_thread_vec"]):
+                     token_offset = (vi * qt + row_offset) * _VEC
+                     is_valid = token_id < M and token_offset < Q_LATENT
+-                    if token_offset < Q_LATENT:
+-                        for j in T.vectorized(_VEC):
+-                            weight_local[j] = q_weight[token_offset + j]
+                     for j in T.vectorized(_VEC):
+                         y_fp32_local[j] = (
+                             T.float32(q_x[vi, j])
+                             * rstd_value
+-                            * (T.float32(weight_local[j]) * out_scale)
++                            * (T.float32(q_w[vi, j]) * out_scale)
+                         )
+                     for j in T.vectorized(_VEC):
+                         q_y[vi, j] = y_fp32_local[j]
+@@ -346,28 +373,17 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+                     init=T.rsqrt(k_sum_fragment[tid // kt, lane] / KV_LATENT + eps),
+                 )
+                 for vi in T.unroll(k["num_thread_vec"]):
+-                    token_offset = (vi * kt + lane) * _VEC
+-                    for j in T.vectorized(_VEC):
+-                        weight_local[j] = kv_weight[token_offset + j]
+                     for j in T.vectorized(_VEC):
+                         y_fp32_local[j] = (
+                             T.float32(k_x[vi, j])
+                             * rstd_value
+-                            * (T.float32(weight_local[j]) * out_scale)
++                            * (T.float32(k_w[vi, j]) * out_scale)
+                         )
+                     for j in T.vectorized(_VEC):
+                         k_y[vi, j] = y_fp32_local[j]
+                 # rope_kernel's rotation of the last 64 columns (GPT-J pairs): the
+                 # last vector of lanes 8-15, rope_kernel's lanes 0-7.
+                 if (last * kt + lane >= rope_vec) & (token_id < M):
+-                    rope_lane = last * kt + lane - rope_vec
+-                    position = positions[token_id]
+-                    for i in T.vectorized(_VEC // 2):
+-                        cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
+-                    for i in T.vectorized(_VEC // 2):
+-                        cs[_VEC // 2 + i] = cos_sin[
+-                            position, half + rope_lane * (_VEC // 2) + i
+-                        ]
+                     for j in T.unroll(_VEC // 2):
+                         first = T.cast(k_y[last, 2 * j], T.float32)
+                         second = T.cast(k_y[last, 2 * j + 1], T.float32)
+@@ -392,7 +408,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+                     amax = T.max(amax, T.shfl_xor(amax, 1))
+                     amax = T.max(amax, T.shfl_xor(amax, 2))
+                     if token_id < M:
+-                        slot = T.cast(slots[token_id], T.int64)
++                        slot = slot_local[0]
+                         page = slot // page_size
+                         if (slot >= 0) & (page < pages):
+                             base = (slot % page_size) * record
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index abd8927..70bb9dd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -455,15 +455,14 @@ def mxfp4_quantize_v41(
+     @T.macro
+     def body(X, Positions, CosSin, Q, S, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             g = bx * threads + tx
+             row, k = g // groups, g % groups
+             vals = T.alloc_local([SF_BLOCK], T.bfloat16)
++            cs = T.alloc_local([SF_BLOCK], T.float32)
++            slot_l = T.alloc_local([1], T.int64)
+             amax = T.alloc_var(T.float32)
+             if row < rows:
+-                for i in T.serial(SF_BLOCK):
+-                    vals[i] = X[row, k * SF_BLOCK + i]
+                 if rope_heads > 0:
+                     if k >= start_group:
+                         token = row // rope_heads
+@@ -473,11 +472,22 @@ def mxfp4_quantize_v41(
+                             else Positions[token]
+                         )
+                         pair_base = (k - start_group) * half
++                        for i in T.unroll(half):
++                            cs[i] = CosSin[pos, pair_base + i]
++                            cs[half + i] = CosSin[pos, rope_half + pair_base + i]
++                if paged:
++                    slot_l[0] = Slots[row]
++            pdl.chain()
++            if row < rows:
++                for i in T.serial(SF_BLOCK):
++                    vals[i] = X[row, k * SF_BLOCK + i]
++                if rope_heads > 0:
++                    if k >= start_group:
+                         for i in T.unroll(half):
+                             first = T.cast(vals[2 * i], T.float32)
+                             second = T.cast(vals[2 * i + 1], T.float32)
+-                            cosine = CosSin[pos, pair_base + i]
+-                            sine = CosSin[pos, rope_half + pair_base + i]
++                            cosine = cs[i]
++                            sine = cs[half + i]
+                             vals[2 * i] = T.cast(
+                                 T.ieee_fmaf(first, cosine, -(second * sine)),
+                                 T.bfloat16,
+@@ -497,7 +507,7 @@ def mxfp4_quantize_v41(
+                     T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
+                 )
+                 if paged:
+-                    slot = Slots[row]
++                    slot = slot_l[0]
+                     page, token = slot // page_size, slot % page_size
+                     if (slot >= 0) & (page < pool_pages):
+                         for i in T.serial(half):
+@@ -641,7 +651,6 @@ def mxfp4_norm_rope_quantize_v41(
+         ),
+     ):
+         with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
+-            pdl.chain()
+             tid = T.get_thread_binding()
+             k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
+             k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
+@@ -660,14 +669,33 @@ def mxfp4_norm_rope_quantize_v41(
+             )
+             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             y_fp32_local = T.alloc_local((_VEC,), T.float32)
+             sum_local = T.alloc_local((2,), T.float32)
+-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
+             cs = T.alloc_local((_VEC,), T.float32)
++            slot_l = T.alloc_local((1,), T.int64)
+ 
+             row_id = tid // kt
+             lane = tid % kt
+             token_id = bx * kb + row_id
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                for j in T.vectorized(_VEC):
++                    k_w[vi, j] = Weight[token_offset + j]
++            if token_id < rows:
++                slot_l[0] = T.cast(Slots[token_id], T.int64)
++                pos = (
++                    Positions[token_id] // ratio * ratio
++                    if ratio > 1
++                    else Positions[token_id]
++                )
++                for i in T.vectorized(pairs):
++                    cs[i] = CosSin[pos, lane * pairs + i]
++                for i in T.vectorized(pairs):
++                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
++
++            pdl.chain()
++
+             T.clear(sum_local)
+             for vi in T.unroll(k["num_thread_vec"]):
+                 token_offset = (vi * kt + lane) * _VEC
+@@ -700,28 +728,16 @@ def mxfp4_norm_rope_quantize_v41(
+                 init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
+             )
+             for vi in T.unroll(k["num_thread_vec"]):
+-                token_offset = (vi * kt + lane) * _VEC
+-                for j in T.vectorized(_VEC):
+-                    weight_local[j] = Weight[token_offset + j]
+                 for j in T.vectorized(_VEC):
+                     y_fp32_local[j] = (
+                         T.float32(k_x[vi, j])
+                         * rstd_value
+-                        * (T.float32(weight_local[j]) * out_scale)
++                        * (T.float32(k_w[vi, j]) * out_scale)
+                     )
+                 for j in T.vectorized(_VEC):
+                     k_y[vi, j] = y_fp32_local[j]
+ 
+             if token_id < rows:
+-                pos = (
+-                    Positions[token_id] // ratio * ratio
+-                    if ratio > 1
+-                    else Positions[token_id]
+-                )
+-                for i in T.vectorized(pairs):
+-                    cs[i] = CosSin[pos, lane * pairs + i]
+-                for i in T.vectorized(pairs):
+-                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
+                 for j in T.unroll(pairs):
+                     first = T.cast(k_y[1, 2 * j], T.float32)
+                     second = T.cast(k_y[1, 2 * j + 1], T.float32)
+@@ -743,7 +759,7 @@ def mxfp4_norm_rope_quantize_v41(
+                 amax = T.max(amax, T.shfl_xor(amax, 1))
+                 amax = T.max(amax, T.shfl_xor(amax, 2))
+                 if token_id < rows:
+-                    slot = T.cast(Slots[token_id], T.int64)
++                    slot = slot_l[0]
+                     page = slot // page_size
+                     tok = slot % page_size
+                     if (slot >= 0) & (page < pool_pages):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index a388e7f..9d5c5da 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -817,7 +817,6 @@ def post_streams(hidden_size: int, threads: int = 128):
+         out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+     ):
+         with T.Kernel(M * blocks, threads=threads) as pid:
+-            pdl.chain()
+             token = pid // blocks
+             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+             xv = T.alloc_local((VEC,), T.bfloat16)
+@@ -831,11 +830,12 @@ def post_streams(hidden_size: int, threads: int = 128):
+             for m in T.unroll(MULT):
+                 for n in T.vectorized(MULT):
+                     cm[m * MULT + n] = comb[token, m, n]
+-            for v in T.vectorized(VEC):
+-                xv[v] = x[token, col + v]
+             for m in T.unroll(MULT):
+                 for v in T.vectorized(VEC):
+                     rv[m * VEC + v] = residual[token, m, col + v]
++            pdl.chain()
++            for v in T.vectorized(VEC):
++                xv[v] = x[token, col + v]
+             for n in T.unroll(MULT):
+                 for v in T.unroll(VEC):
+                     acc = cm[n] * T.Cast(T.float32, rv[v])
+@@ -873,7 +873,6 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
+         out: T.Tensor((M, hidden_size), T.bfloat16),
+     ):
+         with T.Kernel(M * blocks, threads=threads) as pid:
+-            pdl.chain()
+             token = pid // blocks
+             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
+             xv = T.alloc_local((VEC,), T.bfloat16)
+@@ -891,11 +890,12 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
+                     cm[m * MULT + n] = comb[token, m, n]
+             for m in T.vectorized(MULT):
+                 mv[m] = mix[token, m]
+-            for v in T.vectorized(VEC):
+-                xv[v] = x[token, col + v]
+             for m in T.unroll(MULT):
+                 for v in T.vectorized(VEC):
+                     rv[m * VEC + v] = residual[token, m, col + v]
++            pdl.chain()
++            for v in T.vectorized(VEC):
++                xv[v] = x[token, col + v]
+             for n in T.unroll(MULT):
+                 for v in T.unroll(VEC):
+                     acc = cm[n] * T.Cast(T.float32, rv[v])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/rope.py b/vllm/models/deepseek_v4_1/tilelang/rope.py
+index 160b95b..5e5bad9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/rope.py
++++ b/vllm/models/deepseek_v4_1/tilelang/rope.py
+@@ -46,7 +46,6 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+             T.ceildiv(heads, heads_per_block),
+             threads=threads,
+         ) as (tb, hb):
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             t = tb * tokens_per_block + tx // per_token
+             head = hb * heads_per_block + tx % per_token // lanes
+@@ -59,6 +58,8 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+                     cs[i] = cos_sin[position, lane * _PAIRS + i]
+                 for i in T.vectorized(_PAIRS):
+                     cs[_PAIRS + i] = cos_sin[position, half + lane * _PAIRS + i]
++            pdl.chain()
++            if t < tokens and head < heads:
+                 for j in T.vectorized(2 * _PAIRS):
+                     xs[j] = x[t, head, start + lane * 2 * _PAIRS + j]
+                 for j in T.unroll(_PAIRS):
