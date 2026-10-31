@@ -80,6 +80,15 @@ class FragmentationTest(unittest.TestCase):
             self.assertEqual(len(report["shards"]), 1)
             self.assertEqual(report["shards"][0]["current"], 2)
 
+    def test_actionable_best_accepts_full_128mib_extents_and_flags_smaller_fragments(self):
+        # 6.88 GiB shard: e4defrag is a no-op at 5 extents, and defragments 120 extents.
+        shard_bytes = 7_389_759_032
+        self.assertEqual(probe.actionable_best(5, 4, shard_bytes), 5)
+        self.assertEqual(probe.actionable_best(120, 4, shard_bytes), 4)
+        # 94.56 GiB Engram shard: e4defrag -c reports best=48, physical minimum is 51-53.
+        engram_bytes = 101_535_150_936
+        self.assertEqual(probe.actionable_best(53, 48, engram_bytes), 53)
+
 
 if __name__ == "__main__":
     unittest.main()
