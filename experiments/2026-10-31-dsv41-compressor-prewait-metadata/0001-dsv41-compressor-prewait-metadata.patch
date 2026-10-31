@@ -1,0 +1,170 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab8..dae2d37 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -64,6 +64,12 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Predecessor-independent weights and step metadata that may be pre-loaded
++# before cudaGridDependencySynchronize().
++EARLY_PARAMETERS: dict[str, set[str]] = {
++    "compress": {"counts", "positions", "slots", "starts", "state_slots", "weight"},
++    "compress_gather_partial_state": {"counts", "positions", "starts", "table"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +122,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index 66e19e7..e71e240 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -65,7 +65,6 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+         local_ids: T.Tensor((max_requests,), T.int64),
+     ):
+         with T.Kernel(max_requests, threads=128) as r:
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             buf = T.alloc_local((_VEC,), T.float32)
+             nt = counts[0]
+@@ -83,6 +82,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+             page_id = T.if_then_else(needed, T.Cast(T.int64, table[r, 0]), T.int64(0))
+             valid = needed & (page_id > 0)
+             base = ((pos - 1) % page) * STATE
++            pdl.chain()
+             for half in T.serial(2):
+                 for i in T.vectorized(_VEC):
+                     buf[i] = T.if_then_else(
+@@ -132,7 +132,6 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+         emitted_slots: T.Tensor((rows,), T.int64),
+     ):
+         with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             token = bx * warps + tx // 32
+             lane = tx % 32
+@@ -141,12 +140,20 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+             g1 = T.alloc_local((_VEC,), T.float32)
+             v0 = T.alloc_local((_VEC,), T.float32)
+             g0 = T.alloc_local((_VEC,), T.float32)
+-            w = T.alloc_local((_VEC,), T.float32)
++            w = T.alloc_local((_CHUNKS * _VEC,), T.float32)
+             y = T.alloc_local((_VEC,), T.bfloat16)
+-            # request, first, position, valid, pending carry, request end
+-            info = T.alloc_local((6,), T.int64)
++            # request, first, position, valid, pending carry, request end, nt
++            info = T.alloc_local((7,), T.int64)
++            slot_info = T.alloc_local((2,), T.int64)
+             ss = T.alloc_local((1,), T.float32)
++            for c in T.unroll(_CHUNKS):
++                col = (c * 32 + lane) * _VEC
++                for i in T.vectorized(_VEC):
++                    w[c * _VEC + i] = weight[col + i]
+             if token < rows:
++                slot_info[0] = slots[token]
++                if ratio == 2:
++                    slot_info[1] = state_slots[token]
+                 nt = counts[0]
+                 nr = counts[1]
+                 info[0] = T.int64(-1)
+@@ -155,6 +162,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                 info[3] = T.int64(0)
+                 info[4] = T.int64(0)
+                 info[5] = T.int64(-1)
++                info[6] = T.Cast(T.int64, nt)
+                 if (nt >= 0) & (nr > 0) & (nr <= max_requests) & (token < nt):
+                     # The request whose rows contain the token: the first whose end
+                     # passes it (empty requests never match).
+@@ -165,7 +173,6 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                         q = info[0]
+                         first = T.Cast(T.int64, starts[q])
+                         end = T.Cast(T.int64, starts[q + 1])
+-                        sid = state_ids[q]
+                         start_pos = positions[q]
+                         info[5] = end
+                         if (
+@@ -173,21 +180,28 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                             & (first <= token)
+                             & (end <= nt)
+                             & (token < end)
+-                            & (sid >= 0)
+-                            & (sid < max_requests)
+                             & (start_pos >= 0)
+                         ):
+                             info[1] = first
+                             info[2] = start_pos + (token - first)
+                             info[3] = T.int64(1)
+-                            if ratio == 2:
+-                                if info[2] % 2 == 1:
+-                                    if token == first:
+-                                        info[4] = T.int64(1)
+-                                        if tags[sid] != info[2] - 1:
+-                                            info[3] = T.int64(0)
+-                                else:
+-                                    info[3] = T.int64(0)
++            pdl.chain()
++            if token < rows:
++                nt = T.Cast(T.int32, info[6])
++                if info[3] == 1:
++                    q = info[0]
++                    sid = state_ids[q]
++                    if (sid >= 0) & (sid < max_requests):
++                        if ratio == 2:
++                            if info[2] % 2 == 1:
++                                if token == info[1]:
++                                    info[4] = T.int64(1)
++                                    if tags[sid] != info[2] - 1:
++                                        info[3] = T.int64(0)
++                            else:
++                                info[3] = T.int64(0)
++                    else:
++                        info[3] = T.int64(0)
+                 valid = info[3] == 1
+                 ss[0] = T.float32(0)
+                 for c in T.serial(_CHUNKS):
+@@ -234,7 +248,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                         # metadata gives only a request's last ``page`` rows of the step
+                         # a ring slot (earlier rows would share slots); the kernel keeps
+                         # that bound itself as well.
+-                        slot = state_slots[token]
++                        slot = slot_info[1]
+                         if (token < nt) & (slot >= page) & (token >= info[5] - page):
+                             base = (slot % page) * STATE + col
+                             for i in T.vectorized(_VEC):
+@@ -243,18 +257,18 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                                 pool[slot // page, base + DIM + i] = g1[i]
+                 total = T.warp_reduce_sum(ss[0])
+                 inverse = T.rsqrt(total / DIM + EPS)
+-                for c in T.serial(_CHUNKS):
++                for c in T.unroll(_CHUNKS):
+                     col = (c * 32 + lane) * _VEC
+-                    for i in T.vectorized(_VEC):
+-                        w[i] = weight[col + i]
+                     for i in T.unroll(_VEC):
+-                        y[i] = T.Cast(T.bfloat16, x[c * _VEC + i] * inverse * w[i])
++                        y[i] = T.Cast(
++                            T.bfloat16, x[c * _VEC + i] * inverse * w[c * _VEC + i]
++                        )
+                     for i in T.vectorized(_VEC):
+                         out[token, col + i] = y[i]
+                 if lane == 0:
+                     emitted[token] = valid
+                     emitted_slots[token] = T.if_then_else(
+-                        valid, slots[token], T.int64(-1)
++                        valid, slot_info[0], T.int64(-1)
+                     )
+ 
+     return compress
