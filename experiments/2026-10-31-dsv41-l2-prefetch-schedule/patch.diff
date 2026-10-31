@@ -1,0 +1,177 @@
+commit f676b723acb93ddd544d92fe8945a831b50e4287
+Author: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date:   Sat Oct 31 12:42:23 2026 +0100
+
+    Defer V4.1 WO L2 prefetch until after indexing and order NEXT segments chronologically
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 373bcc2e0..c138e82c7 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -180,3 +180,86 @@ def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
+     metadata = None
+     assert module._front(torch.zeros(6, 1792), positions, None) is None
+     assert len(launches) == 1
++
++
++def test_wo_l2_prefetch_issues_after_indexing_and_metadata(monkeypatch):
++    """The WO L2 prefetch window issues immediately before ``_attend`` (after
++    indexing and metadata preparation), so it neither evicts ``NEXT``'s indexer
++    weights nor contends with latency-bound sparse-MLA preparation kernels."""
++    from vllm.models.deepseek_v4_1 import attention, l2_prefetch
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    events = []
++    monkeypatch.setattr(
++        tl_metadata,
++        "pages",
++        lambda *args, **kwargs: events.append("index_pages"),
++    )
++    monkeypatch.setattr(
++        l2_prefetch,
++        "issue",
++        lambda plan, rows: events.append(("l2pf", plan, rows)),
++    )
++    monkeypatch.setattr(
++        attention,
++        "current_workspace_manager",
++        lambda: SimpleNamespace(
++            get_simultaneous=lambda *specs: [torch.zeros(s, dtype=dt) for s, dt in specs]
++        ),
++    )
++
++    layer = _tilelang_layer(layer_id=2)
++    layer.is_draft = False
++    layer._draft_replays = False
++    layer._draft_replay_start = None
++    layer.window_size = 128
++    layer.swa_cache_layer = SimpleNamespace(prefix="swa", block_size=64)
++    layer._owner = lambda: SimpleNamespace(prefix="main")
++    layer.index_source_layer_id = 2
++    layer.indexer = SimpleNamespace(heads=32, k_cache=SimpleNamespace(prefix="idx"))
++    layer._l2pf_wo = "wo_plan"
++    layer._attention_geometry()
++    layer._prepare("cpu")
++    layer._check_attention_rows = lambda mode, rows: None
++    layer._attention_scratch_specs = lambda mode, rows: (((rows, 4), torch.uint8),)
++    layer._index_chunk = lambda *args, **kwargs: events.append("index_chunk")
++    layer._write_decode_metadata = lambda *args, **kwargs: events.append("write_meta")
++    layer._attend = lambda *args, **kwargs: events.append("attend")
++    layer._context = {layer.prefix: layer}
++
++    swa_meta = SimpleNamespace(
++        is_decode=True, num_decode_tokens=0, swa_replay_start=None
++    )
++    main_meta = SimpleNamespace()
++    index_meta = SimpleNamespace(
++        req_id_per_token=torch.zeros(6, dtype=torch.int32),
++        cache_lengths=torch.ones(6, dtype=torch.int32),
++        block_table=torch.zeros((1, 4), dtype=torch.int32),
++        max_seq_len=128,
++    )
++    forward_ctx = SimpleNamespace(
++        attn_metadata={"swa": swa_meta, "main": main_meta, "idx": index_meta}
++    )
++    monkeypatch.setattr(attention, "get_forward_context", lambda: forward_ctx)
++
++    rows = 6
++    q = torch.zeros((rows, 4, 512))
++    kv = torch.zeros((rows, 512))
++    positions = torch.zeros(rows, dtype=torch.int64)
++    output = torch.zeros_like(q)
++    iq = (
++        torch.zeros((rows, 32, 64), dtype=torch.uint8),
++        torch.zeros((rows, 32, 4), dtype=torch.uint8),
++        torch.zeros((rows, 32), dtype=torch.float32),
++        None,
++        None,
++    )
++    layer.forward_mqa(q, kv, positions, output, index_query=iq)
++    assert events == [
++        "index_pages",
++        "index_chunk",
++        "write_meta",
++        ("l2pf", "wo_plan", rows),
++        "attend",
++    ]
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..dc0d2c2d3 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -870,7 +870,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr, kv, q_cast = front
+         with kernels.mxfp8_inputs(q_cast):
+             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+-        l2_prefetch.issue(self._l2pf_wo, rows)
+         q = self._rope(q, positions, "q")
+         output = torch.empty_like(q)
+         metadata = cast(
+@@ -1205,6 +1204,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             )
+         # Keep the borrowed arena, not aliases of the transient query storage.
+         retain_cuda_graph_capture_resource(arena)
++        l2_prefetch.issue(self._l2pf_wo, rows)
+         self._attend(
+             mode,
+             q,
+@@ -1229,6 +1229,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             for shape, dtype in self._attention_workspace_specs["extend"]
+         )
+         self._write_decode_metadata(metadata, swa, main, rows)
++        l2_prefetch.issue(self._l2pf_wo, rows)
+         swa_indices, swa_lengths, top_lengths = metadata[:3]
+         for mode, lo, hi in (("decode", 0, decode_rows), ("extend", decode_rows, rows)):
+             if hi == lo:
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index 6301a373f..d0cc0a047 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -15,10 +15,10 @@ At a fixed eight-row verifier, TP4 decode cycles fall from 49.36 to 47.45 ms
+ latency-bound sparse-MLA preparation kernels it overlaps.
+ 
+ Windows per decoder layer:
+-  WO    after the query up-projection: this layer's WO-A and WO-B
++  WO    before sparse-MLA attention (after indexing/metadata): WO-A and WO-B
+   FFN   before the attention all-reduce: router, mHC FFN mix, shared expert
+   NEXT  before the MoE all-reduce: next layer's mHC attention mix, fused
+-        Q-A/KV and Q-B projections, and indexer projections
++        Q-A/KV, Q/KV norms, Q-B, compressor and indexer projections
+ 
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..fe75cfc3b 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -266,8 +266,30 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 "attn_norm", nxt.attn_norm, ("weight",)
+             )
+             segments += l2_prefetch.linear_segments("wqa_wkv", nxt.attn.fused_wqa_wkv)
++            segments += l2_prefetch.param_segments(
++                "q_norm", getattr(nxt.attn, "q_norm", None), ("weight",)
++            )
++            segments += l2_prefetch.param_segments(
++                "kv_norm", getattr(nxt.attn, "kv_norm", None), ("weight",)
++            )
+             segments += l2_prefetch.linear_segments("wq_b", nxt.attn.wq_b)
++            compressor = getattr(nxt.attn, "compressor", None)
++            if compressor is not None:
++                segments += l2_prefetch.linear_segments(
++                    "compressor.wkv_wgate",
++                    getattr(compressor, "fused_wkv_wgate", None),
++                )
++                segments += l2_prefetch.param_segments(
++                    "compressor.norm", getattr(compressor, "norm", None), ("weight",)
++                )
+             indexer = getattr(nxt.attn, "indexer", None)
++            if getattr(indexer, "owns_k", False):
++                segments += l2_prefetch.linear_segments(
++                    "indexer.wk", getattr(indexer, "wk", None)
++                )
++                segments += l2_prefetch.param_segments(
++                    "indexer.k_norm", getattr(indexer, "k_norm", None), ("weight",)
++                )
+             for name in ("wq_b", "weights_proj"):
+                 segments += l2_prefetch.linear_segments(
+                     f"indexer.{name}", getattr(indexer, name, None)
