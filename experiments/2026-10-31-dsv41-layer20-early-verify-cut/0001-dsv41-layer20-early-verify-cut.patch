@@ -1,0 +1,973 @@
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 75080c8..52b4879 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -839,3 +839,232 @@ def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes
+         manager._stale_confidences[manager._stale_idx].np[1],
+         np.full(steps, 0.7, dtype=np.float32),
+     )
++
++
++@torch.no_grad()
++def test_mid_layer_dead_rows_prunes_diverging_tail_and_updates_routed_mask():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
++        pytest.skip("SM12x required for TileLang mid-layer dead-row test")
++    from vllm.config import VllmConfig, set_current_vllm_config
++    from vllm.forward_context import set_forward_context
++    from vllm.models.deepseek_v4_1.nvidia.model import DeepseekV4Model
++    from vllm.models.deepseek_v4_1.tilelang.router import _routing_masks
++    from vllm.v1.worker.gpu.input_batch import (
++        DeadRows,
++        MidDeadRows,
++        combine_sampled_and_draft_tokens,
++        get_mid_dead_rows,
++        register_mid_dead_rows,
++    )
++
++    device = torch.device("cuda", torch.cuda.current_device())
++    num_reqs = 1
++    drafts = 5
++    num_tokens = 1 + drafts  # 1 anchor + 5 drafts = 6 rows
++    hidden_size = 5120
++
++    input_ids = torch.zeros(16, dtype=torch.int32, device=device)
++    is_padding = torch.zeros(16, dtype=torch.bool, device=device)
++    idx_mapping = torch.tensor([0], dtype=torch.int64, device=device)
++    last_sampled = torch.tensor([101], dtype=torch.int64, device=device)
++    query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++    seq_lens = torch.tensor([20], dtype=torch.int32, device=device)
++    prefill_len = torch.tensor([10], dtype=torch.int32, device=device)
++    draft_tokens = torch.tensor(
++        [[201, 202, 203, 204, 205]], dtype=torch.int64, device=device
++    )
++    cu_num_logits = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++
++    # Confidences: [0.9, 0.85, 0.60, 0.50, 0.20]
++    # Cumulative survival: [0.90, 0.765, 0.459, 0.2295, 0.0459]
++    # Layer-0 tau = 0.05 -> cut_0 = 4 (row 5, draft j=4, is pruned at Layer 0).
++    confidence = torch.tensor(
++        [[0.90, 0.85, 0.60, 0.50, 0.20]], dtype=torch.float32, device=device
++    )
++    dead_cut = torch.zeros(4, dtype=torch.int32, device=device)
++    draft_row_base = torch.full((4,), -1, dtype=torch.int32, device=device)
++    log_survival = torch.zeros((4, drafts), dtype=torch.float32, device=device)
++
++    # Mid-layer tau = 0.35, cos_weight = 1.0, cos_floor = 0.85, layer = 20
++    mid = MidDeadRows(
++        draft_row_base=draft_row_base,
++        log_survival=log_survival,
++        cut=dead_cut,
++        mid_log_tau=float(np.log(0.35)),
++        cos_weight=1.0,
++        cos_floor=0.85,
++        layer=20,
++    )
++    register_mid_dead_rows(is_padding, mid)
++    try:
++        assert get_mid_dead_rows(is_padding[:num_tokens]) is mid
++        dead_rows = DeadRows(
++            confidence=confidence,
++            is_padding=is_padding,
++            cut=dead_cut[:num_reqs],
++            log_tau=float(np.log(0.05)),
++            mid=mid,
++        )
++        combine_sampled_and_draft_tokens(
++            input_ids,
++            idx_mapping,
++            last_sampled,
++            query_start_loc,
++            seq_lens,
++            prefill_len,
++            draft_tokens,
++            cu_num_logits,
++            num_tokens,
++            1,
++            dead_rows=dead_rows,
++        )
++        assert int(dead_cut[0].item()) == 4
++        assert int(draft_row_base[0].item()) == 1
++        assert is_padding[:num_tokens].tolist() == [
++            False,
++            False,
++            False,
++            False,
++            False,
++            True,
++        ]
++
++        # Build Layer-20 aux_hidden_state where rows 0, 1, 2 (anchor + draft 0, 1)
++        # are aligned (cos ~ 1.0), while row 3 (draft 2) flips direction (cos = -1.0),
++        # causing effective survival at j=2 to drop below mid_log_tau.
++        base_vec = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
++        aux_hidden = torch.stack(
++            [
++                base_vec,
++                base_vec,
++                base_vec,
++                -base_vec,
++                base_vec,
++                base_vec,
++            ],
++            dim=0,
++        )
++
++        vllm_config = VllmConfig()
++        with (
++            set_current_vllm_config(vllm_config),
++            set_forward_context(
++                None,
++                vllm_config,
++                num_tokens=num_tokens,
++                is_padding=is_padding[:num_tokens],
++            ),
++        ):
++            _, routed = _routing_masks(num_tokens, None, 0, 0)
++            assert routed is not None
++            assert routed.tolist() == [True, True, True, True, True, False]
++
++            # Layer 2 returns without pruning (mid.layer == 20).
++            DeepseekV4Model._maybe_prune_mid_layer_dead_rows(2, aux_hidden)
++            assert int(dead_cut[0].item()) == 4
++            assert int(draft_row_base[0].item()) == 1
++
++            # Layer 20 prunes j=2, 3 (rows 3, 4), updating dead_cut[0] -> 2,
++            # is_padding[3:5] -> True, routed[3:5] -> False, and self-clears
++            # draft_row_base[0] -> -1.
++            DeepseekV4Model._maybe_prune_mid_layer_dead_rows(20, aux_hidden)
++            assert int(dead_cut[0].item()) == 2
++            assert int(draft_row_base[0].item()) == -1
++            assert is_padding[:num_tokens].tolist() == [
++                False,
++                False,
++                False,
++                True,
++                True,
++                True,
++            ]
++            assert routed.tolist() == [True, True, True, False, False, False]
++
++            # Subsequent call without re-arming draft_row_base is a clean no-op.
++            is_padding[1] = False
++            DeepseekV4Model._maybe_prune_mid_layer_dead_rows(20, aux_hidden)
++            assert not bool(is_padding[1].item())
++
++            # Verify full CUDA graph capture & replay with route_partials:
++            # 1) Capture with draft_row_base == -1 (no-op).
++            # 2) Replay after combine_sampled_and_draft_tokens arms draft_row_base,
++            #    verifying that live rows [0..2] receive bit-identical router
++            #    topk_ids and topk_weights while newly-pruned rows [3..4] are
++            #    skipped (topk_ids == -1, topk_weights == 0).
++            from vllm.models.deepseek_v4_1.tilelang.router import route_partials
++
++            router_kernel = route_partials(8, 256, 2, False, True, padding=True)
++            router_partials = torch.randn(
++                2, num_tokens, 256, dtype=torch.float32, device=device
++            )
++            router_bias = torch.randn(256, dtype=torch.float32, device=device)
++            no_image = torch.zeros(num_tokens, dtype=torch.bool, device=device)
++            ref_ids = torch.empty(num_tokens, 8, dtype=torch.int64, device=device)
++            ref_weights = torch.empty(num_tokens, 8, dtype=torch.float32, device=device)
++            g_ids = torch.empty(num_tokens, 8, dtype=torch.int64, device=device)
++            g_weights = torch.empty(num_tokens, 8, dtype=torch.float32, device=device)
++
++            # Reference without mid-layer pruning for live rows [0..2]:
++            is_padding[:num_tokens].copy_(
++                torch.tensor([False, False, False, False, False, True], device=device)
++            )
++            routed.copy_(
++                torch.tensor([True, True, True, True, True, False], device=device)
++            )
++            router_kernel(
++                router_partials,
++                router_bias,
++                router_bias,
++                no_image,
++                is_padding[:num_tokens],
++                ref_ids,
++                ref_weights,
++                2.5,
++            )
++
++            # Capture CUDA graph of Layer 20 mid-layer prune + Layer 20 router:
++            draft_row_base.fill_(-1)
++            g = torch.cuda.CUDAGraph()
++            torch.cuda.synchronize(device)
++            with torch.cuda.graph(g):
++                DeepseekV4Model._maybe_prune_mid_layer_dead_rows(20, aux_hidden)
++                router_kernel(
++                    router_partials,
++                    router_bias,
++                    router_bias,
++                    no_image,
++                    is_padding[:num_tokens],
++                    g_ids,
++                    g_weights,
++                    2.5,
++                )
++
++            # Arm via combine_sampled_and_draft_tokens and replay graph:
++            is_padding.zero_()
++            routed.copy_(
++                torch.tensor([True, True, True, True, True, False], device=device)
++            )
++            combine_sampled_and_draft_tokens(
++                input_ids,
++                idx_mapping,
++                last_sampled,
++                query_start_loc,
++                seq_lens,
++                prefill_len,
++                draft_tokens,
++                cu_num_logits,
++                num_tokens,
++                1,
++                dead_rows=dead_rows,
++            )
++            g.replay()
++            torch.cuda.synchronize(device)
++
++            assert int(dead_cut[0].item()) == 2
++            assert int(draft_row_base[0].item()) == -1
++            assert torch.equal(g_ids[:3], ref_ids[:3])
++            assert torch.equal(g_weights[:3], ref_weights[:3])
++            assert (g_ids[3:] == -1).all()
++            assert (g_weights[3:] == 0).all()
++    finally:
++        register_mid_dead_rows(is_padding, None)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index d0d95d8..95fa0aa 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -753,6 +753,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         layers = list(islice(self.layers, self.start_layer, self.end_layer))
+         self._l2pf_ready = build_l2_prefetch_plans(layers, self.start_layer)
+ 
++    @staticmethod
++    def _maybe_prune_mid_layer_dead_rows(
++        layer_num: int, aux_hidden_state: torch.Tensor
++    ) -> None:
++        if not is_forward_context_available():
++            return
++        context = get_forward_context()
++        is_padding = context.is_padding
++        if is_padding is None:
++            return
++        from vllm.v1.worker.gpu.input_batch import get_mid_dead_rows
++
++        mid = get_mid_dead_rows(is_padding)
++        if mid is None or mid.layer != layer_num:
++            return
++        from vllm.v1.worker.gpu import tilelang_inputs
++
++        cached = getattr(context, "_ds41_routing_mask", None)
++        routed = cached[1] if cached is not None and cached[0] is is_padding else None
++        tilelang_inputs.mid_layer_dead_rows(aux_hidden_state, is_padding, routed, mid)
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+@@ -956,6 +977,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
++                if sp is None and not decoder_compacted:
++                    self._maybe_prune_mid_layer_dead_rows(idx + 1, aux_hidden_state)
+         l2_prefetch.join()
+         last_rank = get_pp_group().is_last_rank
+         fused_final_collapse = (
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 309f14d..56e950c 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -561,6 +561,51 @@ def _combine_sampled_and_draft_tokens_kernel(
+             )
+ 
+ 
++class MidDeadRows(NamedTuple):
++    """Mid-network (e.g. Layer 20) dead-row pruning state, decided on device.
++
++    draft_row_base: [max_num_reqs] per-request first draft row in batch
++        (-1 when inactive; self-clearing to -1 when the mid-layer kernel runs).
++    log_survival: [max_num_reqs, num_steps] per-request log survival.
++    cut: [max_num_reqs] per-request live draft count, updated in place.
++    mid_log_tau: log of the mid-layer survival threshold.
++    cos_weight: weight on step-to-step mid-layer hidden-state cosine drop.
++    cos_floor: cosine similarity floor below which penalty accrues.
++    layer: 1-based layer index at which mid-network pruning runs (default 20).
++    """
++
++    draft_row_base: torch.Tensor
++    log_survival: torch.Tensor
++    cut: torch.Tensor
++    mid_log_tau: float
++    cos_weight: float = 0.5
++    cos_floor: float = 0.85
++    layer: int = 20
++
++
++_MID_DEAD_ROWS_BY_PADDING: dict[int, MidDeadRows] = {}
++
++
++def register_mid_dead_rows(
++    is_padding: torch.Tensor | None, mid: MidDeadRows | None
++) -> None:
++    """Bind or clear ``mid`` for ``is_padding``'s underlying device address."""
++    if is_padding is None:
++        return
++    ptr = int(is_padding.data_ptr())
++    if mid is None:
++        _MID_DEAD_ROWS_BY_PADDING.pop(ptr, None)
++    else:
++        _MID_DEAD_ROWS_BY_PADDING[ptr] = mid
++
++
++def get_mid_dead_rows(is_padding: torch.Tensor | None) -> MidDeadRows | None:
++    """Return the ``MidDeadRows`` bound to ``is_padding``'s base address, if any."""
++    if is_padding is None:
++        return None
++    return _MID_DEAD_ROWS_BY_PADDING.get(int(is_padding.data_ptr()))
++
++
+ class DeadRows(NamedTuple):
+     """Verification rows to leave out of routed MoE, decided on device.
+ 
+@@ -568,12 +613,14 @@ class DeadRows(NamedTuple):
+     is_padding: the batch's padding flags; dead rows are set in place.
+     cut: per-request output, the number of live drafts.
+     log_tau: log of the survival threshold below which a row is dead.
++    mid: optional mid-network (e.g. Layer 20) dead-row refinement state.
+     """
+ 
+     confidence: torch.Tensor
+     is_padding: torch.Tensor
+     cut: torch.Tensor
+     log_tau: float
++    mid: MidDeadRows | None = None
+ 
+ 
+ def combine_sampled_and_draft_tokens(
+@@ -915,6 +962,7 @@ def declare_input_batch_kernels(
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
+     draft_widths: Sequence[int] = (),
++    mid_dead_rows: bool = False,
+ ) -> None:
+     """Declare the TileLang kernels that prepare a step's inputs from the request
+     states and commit its sampled tokens: prefill inputs (``num_lookahead`` tokens
+@@ -937,5 +985,6 @@ def declare_input_batch_kernels(
+             sampled_widths=sampled_widths,
+             commits=commits,
+             draft_widths=draft_widths,
++            mid_dead_rows=mid_dead_rows,
+         )
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fe7a192..d1c52dd 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -195,6 +195,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+     AdaptiveVerificationManager,
+     dead_rows_enabled,
+     maybe_create_adaptive_verification_manager,
++    mid_dead_rows_enabled,
+     resolve_adaptive_cudagraph_mode,
+ )
+ from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
+@@ -831,6 +832,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
++            is_padding=self.input_buffers.is_padding,
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+@@ -2181,6 +2183,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # speculator's flag is what decides it exists.
+         adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
+         dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
++        mid_dead_rows = dead_rows and mid_dead_rows_enabled()
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+             # A stage before the last commits what the last stage sampled.
+@@ -2196,6 +2199,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_speculative_steps=self.req_states.draft_tokens.shape[-1],
+             num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
+             dead_rows=dead_rows,
++            mid_dead_rows=mid_dead_rows,
+             draft_widths=(
+                 (num_draft_steps, self.req_states.draft_tokens.shape[-1])
+                 if 0 < num_draft_steps < self.req_states.draft_tokens.shape[-1]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index e521970..2513529 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+     get_query_lens_mismatch_unsupported_backend,
+ )
+-from vllm.v1.worker.gpu.input_batch import DeadRows
++from vllm.v1.worker.gpu.input_batch import DeadRows, MidDeadRows, register_mid_dead_rows
+ 
+ logger = init_logger(__name__)
+ # Dead rows: verification rows past the first draft whose survival (running
+@@ -31,11 +31,29 @@ logger = init_logger(__name__)
+ # token past its last live row. Decided on device, inside the draft combine,
+ # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
+ _DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_DEAD_ROWS_TAU", "0"))
++# Mid-network (Layer 20) dead-row refinement: combines draft log-survival with
++# consecutive-token hidden-state cosine coherence at the mid-network auxiliary
++# checkpoint (Layer 20) to prune diverging tail draft rows from Layers 20..39.
++_MID_DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_MID_DEAD_ROWS_TAU", "0"))
++_MID_DEAD_ROWS_COS_WEIGHT = float(
++    os.environ.get("SPARK_DS41F_DSPARK_MID_DEAD_ROWS_COS_WEIGHT", "0.5")
++)
++_MID_DEAD_ROWS_COS_FLOOR = float(
++    os.environ.get("SPARK_DS41F_DSPARK_MID_DEAD_ROWS_COS_FLOOR", "0.85")
++)
++_MID_DEAD_ROWS_LAYER = int(
++    os.environ.get("SPARK_DS41F_DSPARK_MID_DEAD_ROWS_LAYER", "20")
++)
++
++
++def mid_dead_rows_enabled() -> bool:
++    """Whether mid-network (e.g. Layer 20) dead-row refinement is enabled."""
++    return _MID_DEAD_ROWS_TAU > 0
+ 
+ 
+ def dead_rows_enabled() -> bool:
+     """Whether an adaptive verification manager marks dead verification rows."""
+-    return _DEAD_ROWS_TAU > 0
++    return _DEAD_ROWS_TAU > 0 or _MID_DEAD_ROWS_TAU > 0
+ 
+ 
+ if TYPE_CHECKING:
+@@ -121,6 +139,7 @@ class AdaptiveVerificationManager:
+         slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+         *,
+         tp_invariant_confidence: bool = False,
++        is_padding: torch.Tensor | None = None,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -141,13 +160,34 @@ class AdaptiveVerificationManager:
+         self.row_cost = row_cost
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
++        self.mid_dead_rows_tau = _MID_DEAD_ROWS_TAU
++        self.mid_dead_rows_cos_weight = _MID_DEAD_ROWS_COS_WEIGHT
++        self.mid_dead_rows_cos_floor = _MID_DEAD_ROWS_COS_FLOOR
++        self.mid_dead_rows_layer = _MID_DEAD_ROWS_LAYER
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+         )
++        self._mid_draft_row_base = torch.full(
++            (req_states.max_num_reqs,), -1, dtype=torch.int32, device=device
++        )
++        self._mid_log_survival = torch.zeros(
++            (req_states.max_num_reqs, self.num_speculative_steps),
++            dtype=torch.float32,
++            device=device,
++        )
+         if self.dead_rows_tau > 0:
+             logger.info(
+                 "DSpark dead verification rows below survival %.3g", self.dead_rows_tau
+             )
++        if self.mid_dead_rows_tau > 0:
++            logger.info(
++                "DSpark mid-layer (%d) dead verification rows below survival %.3g "
++                "(cos_weight=%.3g, cos_floor=%.3g)",
++                self.mid_dead_rows_layer,
++                self.mid_dead_rows_tau,
++                self.mid_dead_rows_cos_weight,
++                self.mid_dead_rows_cos_floor,
++            )
+         self.query_start_loc = query_start_loc
+         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+         max_num_reqs = req_states.max_num_reqs
+@@ -167,6 +207,8 @@ class AdaptiveVerificationManager:
+         )
+         self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])
+         self._cu_num_logits = torch.empty_like(query_start_loc)
++        if is_padding is not None:
++            self.dead_row_args(is_padding, max_num_reqs)
+ 
+         # Two D2H slots preserve stale inputs for budget selection.
+         self._stale_confidences = [
+@@ -451,13 +493,33 @@ class AdaptiveVerificationManager:
+         The confidences are the current drafts', broadcast from rank 0, so
+         every rank marks the same rows.
+         """
+-        if self.dead_rows_tau <= 0:
++        mid_tau = getattr(self, "mid_dead_rows_tau", 0.0)
++        if self.dead_rows_tau <= 0 and mid_tau <= 0:
++            register_mid_dead_rows(is_padding, None)
+             return None
++        log_tau = (
++            float(np.log(self.dead_rows_tau))
++            if self.dead_rows_tau > 0
++            else -float("inf")
++        )
++        mid: MidDeadRows | None = None
++        if mid_tau > 0:
++            mid = MidDeadRows(
++                self._mid_draft_row_base,
++                self._mid_log_survival,
++                self._dead_row_cut,
++                float(np.log(mid_tau)),
++                getattr(self, "mid_dead_rows_cos_weight", _MID_DEAD_ROWS_COS_WEIGHT),
++                getattr(self, "mid_dead_rows_cos_floor", _MID_DEAD_ROWS_COS_FLOOR),
++                getattr(self, "mid_dead_rows_layer", _MID_DEAD_ROWS_LAYER),
++            )
++        register_mid_dead_rows(is_padding, mid)
+         return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            float(np.log(self.dead_rows_tau)),
++            log_tau,
++            mid,
+         )
+ 
+     def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+@@ -549,6 +611,7 @@ def maybe_create_adaptive_verification_manager(
+     planned_confidences: bool = False,
+     slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+     tp_invariant_confidence: bool = False,
++    is_padding: torch.Tensor | None = None,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -625,4 +688,5 @@ def maybe_create_adaptive_verification_manager(
+         or None,
+         slot_draft_limits=slot_draft_limits,
+         tp_invariant_confidence=tp_invariant_confidence,
++        is_padding=is_padding,
+     )
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 8eeb525..83777d1 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -1411,7 +1411,11 @@ def prepare_pos_seq_lens_kernel(idx_dtype: str):
+ # where Triton gives a finite log).
+ @tilelang.jit(pass_configs=_PASS)
+ def combine_sampled_and_draft_tokens_kernel(
+-    drafts: int, num_new: int, dead_rows: bool, idx_dtype: str
++    drafts: int,
++    num_new: int,
++    dead_rows: bool,
++    idx_dtype: str,
++    mid_dead_rows: bool = False,
+ ):
+     """A request's logits indices, and for a decoding request its last sampled
+     token and its drafts into the input ids; ``drafts`` is the draft tokens' width
+@@ -1442,13 +1446,17 @@ def combine_sampled_and_draft_tokens_kernel(
+     conf_stride = T.dynamic("conf_stride")
+     padding_len = T.dynamic("padding_len")
+     cut_len = T.dynamic("cut_len")
++    base_len = T.dynamic("base_len")
++    surv_rows = T.dynamic("surv_rows")
++    surv_cols = T.dynamic("surv_cols")
++    surv_stride = T.dynamic("surv_stride")
+     scan_strides = tuple(1 << i for i in range(max(block - 1, 0).bit_length()))
+ 
+     @T.macro
+     def request(
+         b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens, prefill_len,
+         draft_tokens, cu_num_logits, logits_indices, confidence, is_padding, dead_cut,
+-        log_tau,
++        log_tau, draft_row_base, log_survival_out,
+     ):  # fmt: skip
+         req = T.alloc_var(T.int64, init=T.cast(idx_mapping[b], T.int64))
+         first = T.alloc_var(T.int32, init=cu_num_logits[b])
+@@ -1496,6 +1504,7 @@ def combine_sampled_and_draft_tokens_kernel(
+         if dead_rows:
+             # Requests without drafts are never clamped.
+             cut = T.alloc_var(T.int32, init=block + 1)
++            row_base = T.alloc_var(T.int32, init=-1)
+             if seq > prefill and num_drafts > 0:
+                 survival = T.alloc_local((block,), T.float32)
+                 for j in tuple(range(block)):
+@@ -1517,7 +1526,14 @@ def combine_sampled_and_draft_tokens_kernel(
+                 for j in T.unroll(block):
+                     if j < num_drafts and j >= cut:
+                         is_padding[query_end - num_drafts + j] = T.uint8(1)
++                if mid_dead_rows:
++                    for j in T.unroll(drafts):
++                        log_survival_out[b, j] = survival[j]
++                    if cut > 0 and query_end - num_drafts >= 1:
++                        row_base = query_end - num_drafts
+             dead_cut[b] = cut
++            if mid_dead_rows:
++                draft_row_base[b] = row_base
+ 
+     if not dead_rows:
+ 
+@@ -1542,7 +1558,41 @@ def combine_sampled_and_draft_tokens_kernel(
+                     request(
+                         b, input_ids, idx_mapping, last_sampled, query_start_loc,
+                         seq_lens, prefill_len, draft_tokens, cu_num_logits,
+-                        logits_indices, None, None, None, None,
++                        logits_indices, None, None, None, None, None, None,
++                    )  # fmt: skip
++
++        return combine_sampled_and_draft_tokens
++
++    if not mid_dead_rows:
++
++        @T.prim_func
++        def combine_sampled_and_draft_tokens(
++            input_ids: T.Tensor((ids_len,), T.int32),
++            idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++            last_sampled: T.Tensor((sampled_len,), T.int64),
++            query_start_loc: T.Tensor((starts_len,), T.int32),
++            seq_lens: T.Tensor((seq_len,), T.int32),
++            prefill_len: T.Tensor((prefill_rows,), T.int32),
++            draft_tokens: T.StridedTensor(
++                (draft_rows, drafts), (draft_stride, 1), T.int64
++            ),
++            cu_num_logits: T.Tensor((cu_len,), T.int32),
++            logits_indices: T.Tensor((logits_len,), T.int64),
++            confidence: T.StridedTensor(
++                (conf_rows, conf_cols), (conf_stride, 1), T.float32
++            ),
++            is_padding: T.Tensor((padding_len,), T.uint8),
++            dead_cut: T.Tensor((cut_len,), T.int32),
++            log_tau: T.float32,
++        ):
++            with T.Kernel(num_reqs, threads=32) as b:
++                T.import_source(_LOAD_IF + _STORE_IF)
++                if T.get_thread_binding() == 0:
++                    request(
++                        b, input_ids, idx_mapping, last_sampled, query_start_loc,
++                        seq_lens, prefill_len, draft_tokens, cu_num_logits,
++                        logits_indices, confidence, is_padding, dead_cut, log_tau,
++                        None, None,
+                     )  # fmt: skip
+ 
+         return combine_sampled_and_draft_tokens
+@@ -1564,6 +1614,10 @@ def combine_sampled_and_draft_tokens_kernel(
+         is_padding: T.Tensor((padding_len,), T.uint8),
+         dead_cut: T.Tensor((cut_len,), T.int32),
+         log_tau: T.float32,
++        draft_row_base: T.Tensor((base_len,), T.int32),
++        log_survival_out: T.StridedTensor(
++            (surv_rows, surv_cols), (surv_stride, 1), T.float32
++        ),
+     ):
+         with T.Kernel(num_reqs, threads=32) as b:
+             T.import_source(_LOAD_IF + _STORE_IF)
+@@ -1571,12 +1625,169 @@ def combine_sampled_and_draft_tokens_kernel(
+                 request(
+                     b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
+                     prefill_len, draft_tokens, cu_num_logits, logits_indices,
+-                    confidence, is_padding, dead_cut, log_tau,
++                    confidence, is_padding, dead_cut, log_tau, draft_row_base,
++                    log_survival_out,
+                 )  # fmt: skip
+ 
+     return combine_sampled_and_draft_tokens
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def mid_layer_dead_rows_kernel(
++    drafts: int, hidden_size: int = 5120, has_routed: bool = True
++):
++    """Mid-network (Layer 20) dead-row refinement: for each request with live
++    draft rows (``draft_row_base[b] >= 1`` and ``dead_cut[b] > 0``), measures the
++    step-to-step cosine coherence of the mid-layer auxiliary hidden states across
++    ``[base - 1 .. base + cut_0 - 1]`` and combines it with ``log_survival[b, j]``.
++    Rows falling below ``mid_log_tau`` are marked in ``is_padding`` (and ``routed``
++    when cached) and ``dead_cut[b]`` is tightened in place. ``draft_row_base[b]``
++    self-clears to ``-1`` on entry so replay in a full CUDA graph is race-free."""
++    num_tokens = T.dynamic("num_tokens")
++    hidden_stride = T.dynamic("hidden_stride")
++    base_len = T.dynamic("base_len")
++    surv_rows = T.dynamic("surv_rows")
++    surv_cols = T.dynamic("surv_cols")
++    surv_stride = T.dynamic("surv_stride")
++    cut_len = T.dynamic("cut_len")
++    padding_len = T.dynamic("padding_len")
++    routed_len = T.dynamic("routed_len")
++    active_reqs = T.dynamic("active_reqs")
++    col_steps = (hidden_size + 127) // 128
++
++    @T.macro
++    def prune_request(
++        b, aux_hidden_state, draft_row_base, log_survival, dead_cut, is_padding,
++        routed, mid_log_tau, cos_weight, cos_floor,
++    ):  # fmt: skip
++        tx = T.get_thread_binding()
++        s_meta = T.alloc_shared((2,), T.int32)
++        s_norm_sq = T.alloc_shared((128, drafts + 1), T.float32)
++        s_dot = T.alloc_shared((128, drafts), T.float32)
++        if tx == 0:
++            base_val = draft_row_base[b]
++            cut_val = dead_cut[b]
++            s_meta[0] = base_val
++            s_meta[1] = cut_val
++            if base_val >= 0:
++                draft_row_base[b] = -1
++        T.sync_threads()
++        base = s_meta[0]
++        cut_0 = T.min(s_meta[1], drafts)
++        if base >= 1 and cut_0 > 0 and base + cut_0 <= num_tokens:
++            loc_norm_sq = T.alloc_local((drafts + 1,), T.float32)
++            loc_dot = T.alloc_local((drafts,), T.float32)
++            for r in T.unroll(drafts + 1):
++                loc_norm_sq[r] = T.float32(0.0)
++            for j in T.unroll(drafts):
++                loc_dot[j] = T.float32(0.0)
++            vals = T.alloc_local((drafts + 1,), T.float32)
++            for step in T.serial(col_steps):
++                col = step * 128 + tx
++                if col < hidden_size:
++                    for r in T.unroll(drafts + 1):
++                        row_idx = base - 1 + r
++                        vals[r] = T.if_then_else(
++                            r <= cut_0,
++                            T.cast(aux_hidden_state[row_idx, col], T.float32),
++                            T.float32(0.0),
++                        )
++                        loc_norm_sq[r] = loc_norm_sq[r] + vals[r] * vals[r]
++                    for j in T.unroll(drafts):
++                        loc_dot[j] = loc_dot[j] + vals[j] * vals[j + 1]
++            for r in T.unroll(drafts + 1):
++                s_norm_sq[tx, r] = loc_norm_sq[r]
++            for j in T.unroll(drafts):
++                s_dot[tx, j] = loc_dot[j]
++            T.sync_threads()
++            for stride in (64, 32, 16, 8, 4, 2, 1):
++                if tx < stride:
++                    for r in T.unroll(drafts + 1):
++                        s_norm_sq[tx, r] = s_norm_sq[tx, r] + s_norm_sq[tx + stride, r]
++                    for j in T.unroll(drafts):
++                        s_dot[tx, j] = s_dot[tx, j] + s_dot[tx + stride, j]
++                T.sync_threads()
++            if tx == 0:
++                cum_penalty = T.alloc_var(T.float32, init=T.float32(0.0))
++                cut_mid = T.alloc_var(T.int32, init=0)
++                alive = T.alloc_var(T.int32, init=1)
++                for j in tuple(range(drafts)):
++                    if j < cut_0:
++                        denom = T.sqrt(
++                            s_norm_sq[0, j] * s_norm_sq[0, j + 1] + T.float32(1e-12)
++                        )
++                        cos_j = s_dot[0, j] / denom
++                        drop = T.min(cos_j - cos_floor, T.float32(0.0))
++                        cum_penalty = cum_penalty + cos_weight * drop
++                        eff_surv = log_survival[b, j] + cum_penalty
++                        if alive != 0 and eff_surv >= mid_log_tau:
++                            cut_mid = cut_mid + 1
++                        else:
++                            alive = 0
++                if cut_mid < cut_0:
++                    for j in T.unroll(drafts):
++                        if j >= cut_mid and j < cut_0:
++                            is_padding[base + j] = T.uint8(1)
++                            if has_routed:
++                                routed[base + j] = T.uint8(0)
++                    dead_cut[b] = cut_mid
++
++    if not has_routed:
++
++        @T.prim_func
++        def mid_layer_dead_rows(
++            aux_hidden_state: T.StridedTensor(
++                (num_tokens, hidden_size), (hidden_stride, 1), T.bfloat16
++            ),
++            draft_row_base: T.Tensor((base_len,), T.int32),
++            log_survival: T.StridedTensor(
++                (surv_rows, surv_cols), (surv_stride, 1), T.float32
++            ),
++            dead_cut: T.Tensor((cut_len,), T.int32),
++            is_padding: T.Tensor((padding_len,), T.uint8),
++            mid_log_tau: T.float32,
++            cos_weight: T.float32,
++            cos_floor: T.float32,
++            active_reqs: T.int32,
++        ):
++            with T.Kernel(active_reqs, threads=128) as b:
++                T.pdl_sync()
++                T.pdl_trigger()
++                prune_request(
++                    b, aux_hidden_state, draft_row_base, log_survival, dead_cut,
++                    is_padding, None, mid_log_tau, cos_weight, cos_floor,
++                )  # fmt: skip
++
++        return mid_layer_dead_rows
++
++    @T.prim_func
++    def mid_layer_dead_rows(
++        aux_hidden_state: T.StridedTensor(
++            (num_tokens, hidden_size), (hidden_stride, 1), T.bfloat16
++        ),
++        draft_row_base: T.Tensor((base_len,), T.int32),
++        log_survival: T.StridedTensor(
++            (surv_rows, surv_cols), (surv_stride, 1), T.float32
++        ),
++        dead_cut: T.Tensor((cut_len,), T.int32),
++        is_padding: T.Tensor((padding_len,), T.uint8),
++        routed: T.Tensor((routed_len,), T.uint8),
++        mid_log_tau: T.float32,
++        cos_weight: T.float32,
++        cos_floor: T.float32,
++        active_reqs: T.int32,
++    ):
++        with T.Kernel(active_reqs, threads=128) as b:
++            T.pdl_sync()
++            T.pdl_trigger()
++            prune_request(
++                b, aux_hidden_state, draft_row_base, log_survival, dead_cut,
++                is_padding, routed, mid_log_tau, cos_weight, cos_floor,
++            )  # fmt: skip
++
++    return mid_layer_dead_rows
++
++
+ # Triton stores under a mask with predicated instructions. A guarded store written as
+ # a branch lets ptxas sink the loads that feed it below the branch, behind the loads
+ # the guard waits for: two round trips to memory where Triton has one. Kernels whose
+@@ -1959,11 +2170,28 @@ def combine_key(
+     num_new_sampled_tokens: int,
+     dead_rows: bool,
+     idx_dtype: str,
++    mid_dead_rows: bool = False,
+ ) -> tuple:
+     # The kernel's Triton BLOCK_SIZE covers the last sampled token and every draft.
++    if mid_dead_rows:
++        return (
++            num_speculative_steps,
++            num_new_sampled_tokens,
++            dead_rows,
++            idx_dtype,
++            True,
++        )
+     return (num_speculative_steps, num_new_sampled_tokens, dead_rows, idx_dtype)
+ 
+ 
++def mid_layer_dead_rows_key(
++    num_speculative_steps: int,
++    hidden_size: int = 5120,
++    has_routed: bool = True,
++) -> tuple:
++    return (num_speculative_steps, hidden_size, has_routed)
++
++
+ def expand_idx_mapping_key(max_expand_len: int, idx_dtype: str) -> tuple:
+     return (_next_power_of_2(max_expand_len), idx_dtype)
+ 
+@@ -2037,10 +2265,14 @@ def combine_sampled_and_draft_tokens(
+     """``dead_rows``: ``input_batch.DeadRows`` or None."""
+     if idx_mapping.shape[0] == 0:
+         return
++    mid = getattr(dead_rows, "mid", None) if dead_rows is not None else None
+     key = combine_key(
+-        draft_tokens.shape[-1], num_new_sampled_tokens, dead_rows is not None,
++        draft_tokens.shape[-1],
++        num_new_sampled_tokens,
++        dead_rows is not None,
+         _DTYPES[idx_mapping.dtype],
+-    )  # fmt: skip
++        mid is not None,
++    )
+     args = [
+         input_ids,
+         idx_mapping,
+@@ -2059,9 +2291,47 @@ def combine_sampled_and_draft_tokens(
+             dead_rows.cut,
+             dead_rows.log_tau,
+         ]
++        if mid is not None:
++            args += [
++                _as(mid.draft_row_base, torch.int32),
++                _as(mid.log_survival, torch.float32),
++            ]
+     _kernel(combine_sampled_and_draft_tokens_kernel, *key)(*args)
+ 
+ 
++def mid_layer_dead_rows(
++    aux_hidden_state: torch.Tensor,
++    is_padding: torch.Tensor,
++    routed: torch.Tensor | None,
++    mid: Any,
++) -> None:
++    """Run mid-network dead-row refinement on ``aux_hidden_state``."""
++    num_tokens, hidden_size = aux_hidden_state.shape
++    max_reqs, drafts = mid.log_survival.shape
++    active_reqs = min(num_tokens, max_reqs)
++    if active_reqs <= 0 or drafts <= 0:
++        return
++    has_routed = routed is not None
++    key = mid_layer_dead_rows_key(drafts, hidden_size, has_routed)
++    args = [
++        _as(aux_hidden_state, torch.bfloat16),
++        _as(mid.draft_row_base, torch.int32),
++        _as(mid.log_survival, torch.float32),
++        _as(mid.cut, torch.int32),
++        is_padding.view(torch.uint8),
++    ]
++    if has_routed:
++        assert routed is not None
++        args.append(routed.view(torch.uint8))
++    args += [
++        float(mid.mid_log_tau),
++        float(mid.cos_weight),
++        float(mid.cos_floor),
++        int(active_reqs),
++    ]
++    _kernel(mid_layer_dead_rows_kernel, *key)(*args)
++
++
+ def expand_idx_mapping(
+     idx_mapping: torch.Tensor,
+     expanded_idx_mapping: torch.Tensor,
+@@ -2565,6 +2835,8 @@ def input_batch_calls(
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
+     draft_widths: Sequence[int] = (),
++    mid_dead_rows: bool = False,
++    hidden_size: int = 5120,
+ ) -> list:
+     """The step-input kernels for the runner's buffers: prefill inputs, positions
+     and sequence lengths, the draft combine (with its dead-row variant when
+@@ -2591,6 +2863,26 @@ def input_batch_calls(
+                     ),
+                 )
+             )
++            if dead and mid_dead_rows:
++                calls.append(
++                    _call(
++                        combine_sampled_and_draft_tokens_kernel,
++                        *combine_key(
++                            steps,
++                            num_new_sampled_tokens,
++                            True,
++                            RUNNER_IDX_DTYPE,
++                            True,
++                        ),
++                    )
++                )
++                for has_routed in (False, True):
++                    calls.append(
++                        _call(
++                            mid_layer_dead_rows_kernel,
++                            *mid_layer_dead_rows_key(steps, hidden_size, has_routed),
++                        )
++                    )
+     if num_speculative_steps > 0:
+         calls.append(
+             _call(
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index d2febed..033e4ab 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -334,6 +334,8 @@ def _warmup_dead_row_kernels(model_runner: GPUModelRunner) -> None:
+             req_states.prefill_len.gpu,
+             dead_rows.cut,
+         )
++        if dead_rows.mid is not None:
++            dead_rows.mid.draft_row_base.fill_(-1)
+     torch.accelerator.synchronize()
+ 
+ 
