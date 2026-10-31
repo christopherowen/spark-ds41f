@@ -1,0 +1,813 @@
+From 512fdfffeadd3ade9f739873278e7e8dfcff0d67 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 22:09:29 +0100
+Subject: [PATCH] Decouple b12x from TileLang backend and port V2 worker Triton
+ holdouts
+
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py   |  23 ++
+ tests/v1/worker/test_gpu_trace_replay.py      |  74 ++++++
+ tests/v1/worker/test_prepare_kernels.py       |  42 ++++
+ .../device_communicators/cuda_communicator.py |  16 +-
+ .../model_executor/layers/logits_processor.py |  31 ++-
+ vllm/models/deepseek_v4_1/mxfp4_csf.py        |   2 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |   8 +-
+ vllm/v1/worker/gpu/input_batch.py             |   6 +-
+ vllm/v1/worker/gpu/model_runner.py            |  12 +-
+ vllm/v1/worker/gpu/sample/output.py           |  12 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |  16 +-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 210 ++++++++++++++++++
+ vllm/v1/worker/gpu/sample/trace_replay.py     |  14 +-
+ vllm/v1/worker/gpu/tilelang_inputs.py         |  59 +++++
+ 14 files changed, 499 insertions(+), 26 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 2b46fd379..e09d95352 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -1475,3 +1475,26 @@ def test_fill_rows(num_rows, dtype, width, value):
+     assert torch.equal(state, expected)
+     ((_, declared, _),) = tli.fill_rows_calls(torch.int64, dtype)
+     assert declared == tli.fill_rows_key(torch.int64, dtype)
++
++
++@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
++@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
++def test_post_update_num_computed_tokens(num_reqs, idx_dtype):
++    """Pooling runner's computed-token commit matches Triton's reference bit for bit."""
++    gen = _gen(num_reqs * 13 + 7)
++    idx = _idx(num_reqs, gen, idx_dtype)
++    starts = _starts(_query_lens(num_reqs, prefill=True))
++    initial = _randint(0, 1000, (MAX_REQS,), gen)
++    expected = initial.clone()
++    actual = initial.clone()
++    if num_reqs > 0:
++        ib._post_update_num_computed_tokens_kernel[(num_reqs,)](
++            idx, expected, starts
++        )
++    ib.post_update_num_computed_tokens(idx, actual, starts)
++    torch.accelerator.synchronize()
++    assert torch.equal(actual, expected)
++    ((_, declared, _),) = tli.post_update_num_computed_tokens_calls(
++        tli._DTYPES[idx_dtype]
++    )
++    assert declared == tli.post_update_num_computed_tokens_key(tli._DTYPES[idx_dtype])
+diff --git a/tests/v1/worker/test_gpu_trace_replay.py b/tests/v1/worker/test_gpu_trace_replay.py
+index 9d418101f..d8918b1ed 100644
+--- a/tests/v1/worker/test_gpu_trace_replay.py
++++ b/tests/v1/worker/test_gpu_trace_replay.py
+@@ -193,3 +193,77 @@ def test_slot_reuse_clears_trace():
+     _set_lens(state, [3, 0], [3, 0])
+     state.apply_trace(sampled, idx_mapping)
+     assert sampled.tolist() == [888]
++
++
++@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
++def test_tilelang_trace_replay_and_compact_sampling_mask_match_triton(idx_dtype):
++    """TileLang trace_replay and compact_sampling_mask match their Triton references."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
++    from vllm.v1.worker.gpu.sample.output import (
++        SamplingMaskTensors,
++        _compact_sampling_mask_kernel,
++    )
++    from vllm.v1.worker.gpu.sample.trace_replay import _trace_replay_kernel
++
++    gen = torch.Generator(device=DEVICE).manual_seed(42)
++    trace_token_ids = torch.randint(
++        0, 50000, (8, 128), generator=gen, dtype=torch.int32, device=DEVICE
++    )
++    trace_len = torch.tensor([0, 4, 10, 2, 0, 8, 1, 5], dtype=torch.int32, device=DEVICE)
++    prompt_len = torch.tensor([5, 3, 12, 8, 4, 2, 9, 1], dtype=torch.int32, device=DEVICE)
++    total_len = torch.tensor([5, 5, 12, 10, 7, 9, 9, 4], dtype=torch.int32, device=DEVICE)
++    idx_mapping = torch.tensor([1, -1, 2, 3, 5, 6, 7, 0], dtype=idx_dtype, device=DEVICE)
++    expected = torch.arange(100, 108, dtype=torch.int64, device=DEVICE)
++    actual = expected.clone()
++    _trace_replay_kernel[(idx_mapping.shape[0],)](
++        expected,
++        idx_mapping,
++        trace_token_ids,
++        trace_token_ids.stride(0),
++        trace_len,
++        total_len,
++        prompt_len,
++    )
++    apply_trace_tokens(
++        actual, idx_mapping, trace_token_ids, trace_len, total_len, prompt_len
++    )
++    assert torch.equal(actual, expected)
++    assert tls.trace_replay_calls(idx_dtype) == [
++        (tls.trace_replay_kernel, tls.trace_replay_key(idx_dtype), {})
++    ]
++
++    vocab_size = 4099
++    max_num_kept = 64
++    logits = torch.full((4, vocab_size), -float("inf"), dtype=torch.float32, device=DEVICE)
++    logits[0, [0, 7, 511, 512, 2048, 4098]] = torch.tensor(
++        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=DEVICE
++    )
++    logits[1, :150] = torch.linspace(-1.0, 1.0, 150, device=DEVICE)
++    logits[2, [3, 9, 15]] = 0.5
++    num_sampled = torch.tensor([1, 1, 0, 1], dtype=torch.int32, device=DEVICE)
++
++    ref_ids = torch.zeros((4, max_num_kept), dtype=torch.int32, device=DEVICE)
++    ref_mask = torch.empty((4, (vocab_size + 7) // 8), dtype=torch.uint8, device=DEVICE)
++    ref_counts = torch.empty(4, dtype=torch.int32, device=DEVICE)
++    _compact_sampling_mask_kernel[(4,)](
++        logits,
++        logits.stride(0),
++        logits.stride(1),
++        num_sampled,
++        ref_ids,
++        ref_ids.stride(0),
++        ref_mask,
++        ref_mask.stride(0),
++        ref_counts,
++        vocab_size,
++        max_num_kept,
++        BLOCK_SIZE=8192,
++    )
++    masks = SamplingMaskTensors.from_logits(logits, num_sampled, max_num_kept)
++    assert torch.equal(masks.counts, ref_counts)
++    assert torch.equal(masks.packed_mask, ref_mask)
++    assert torch.equal(masks.token_ids[0, :6], ref_ids[0, :6])
++    assert torch.equal(masks.token_ids[1], ref_ids[1])
++    assert masks.tolists().to_nested_list() == SamplingMaskTensors(
++        ref_ids, ref_mask, ref_counts, vocab_size
++    ).tolists().to_nested_list()
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 55fa4d0cd..2f04d2090 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -376,3 +376,45 @@ def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels(
+         tilelang_max_rows=16,
+     )
+     assert set(vocab._bf16_head_kernels(markov_head, torch.bfloat16)) == {16}
++
++
++def test_tilelang_backend_decouples_b12x_and_declares_pooling_and_sampling_holdouts(
++    monkeypatch,
++):
++    """TileLang backend initializes LogitsProcessor, sp_prefill, and mxfp4_csf
++    without b12x coupling, and declares pooling and sampling holdouts."""
++    import sys
++    import torch
++
++    import vllm.models.deepseek_v4_1.mxfp4_csf as mxfp4_csf
++    import vllm.models.deepseek_v4_1.sp_prefill as sp_prefill
++    from vllm.model_executor.layers import logits_processor as lp_mod
++
++    assert "B12xExperts" not in mxfp4_csf.__dict__
++
++    cfg = SimpleNamespace(
++        model_config=SimpleNamespace(head_dtype=None),
++        kernel_config=SimpleNamespace(linear_backend="tilelang", moe_backend="tilelang"),
++    )
++    monkeypatch.setattr(lp_mod, "get_current_vllm_config", lambda: cfg)
++    monkeypatch.setitem(sys.modules, "vllm.utils.b12x", None)
++    lp = lp_mod.LogitsProcessor(32768)
++    assert lp.use_tilelang_vocab_projection is True
++    assert lp.use_b12x_vocab_projection is False
++    assert lp.use_b12x_packed_vocab_projection is False
++
++    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
++    dev_comm = SimpleNamespace(all_reduce_capacity_bytes=1048576)
++    monkeypatch.setattr(
++        sp_prefill, "get_tp_group", lambda: SimpleNamespace(device_communicator=dev_comm)
++    )
++    assert sp_prefill._prefill_sp_capacity_bytes() == 1048576
++    dev_comm_roce = SimpleNamespace(
++        roce_ar_comm=SimpleNamespace(all_reduce_capacity_bytes=2097152)
++    )
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(device_communicator=dev_comm_roce),
++    )
++    assert sp_prefill._prefill_sp_capacity_bytes() == 2097152
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index c67e1cc70..4b77a852e 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -190,6 +190,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+         self.use_aiter_ag_rs: bool = False
+         self.b12x_ar_comm = None
++        self.roce_ar_comm = None
+         self._roce_policy = False
+ 
+         if self.use_b12x_allreduce and self.use_roce_allreduce:
+@@ -211,7 +212,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+             from vllm.distributed.parallel_state import in_the_same_node_as
+ 
+-            self.b12x_ar_comm = SparknetOneShotAllReduce(
++            self.roce_ar_comm = self.b12x_ar_comm = SparknetOneShotAllReduce(
+                 group=self.cpu_group,
+                 device_group=self.device_group,
+                 device=self.device,
+@@ -235,6 +236,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 device=self.device,
+             )
+ 
++    @property
++    def all_reduce_capacity_bytes(self) -> int:
++        comm = getattr(self, "roce_ar_comm", None) or getattr(
++            self, "b12x_ar_comm", None
++        )
++        return (
++            int(getattr(comm, "all_reduce_capacity_bytes", 0))
++            if comm is not None
++            else 0
++        )
++
++    def _init_collectives(self) -> None:
++
+         if self.use_flashinfer_allreduce and self.world_size > 1:
+             self.fi_ar_comm = FlashInferAllReduce(
+                 group=self.cpu_group,
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index fffff730f..469d831e1 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -2,8 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A layer that compute logits from hidden_stats."""
+ 
++from __future__ import annotations
++
+ from collections.abc import Callable, Sequence
+ from functools import cache
++from typing import TYPE_CHECKING
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -21,15 +24,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.platforms import current_platform
+-from vllm.utils.b12x import (
+-    B12xPreparationUnit,
+-    B12xWorkload,
+-    get_b12x_bf16_vocab_projection,
+-    get_b12x_packed_bf16_vocab_projection,
+-    set_b12x_preparation_provider,
+-)
+ from vllm.utils.flashinfer import has_flashinfer
+ 
++if TYPE_CHECKING:
++    from vllm.utils.b12x import B12xPreparationUnit, B12xWorkload
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -130,15 +129,26 @@ class LogitsProcessor(PluggableLayer):
+         self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
+         # BF16 heads registered here, whose TileLang kernels this processor declares.
+         self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
+-        self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
+         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
+         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
++        if kernel_config.linear_backend == "b12x":
++            from vllm.utils.b12x import (
++                get_b12x_bf16_vocab_projection,
++                get_b12x_packed_bf16_vocab_projection,
++            )
++
++            self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
++            self._b12x_packed_vocab_projection = (
++                get_b12x_packed_bf16_vocab_projection()
++            )
++        else:
++            self._b12x_vocab_projection = None
++            self._b12x_packed_vocab_projection = None
+         self.use_b12x_vocab_projection = bool(
+             kernel_config.linear_backend == "b12x"
+             and self._b12x_vocab_projection is not None
+             and self._b12x_vocab_projection.is_supported()
+         )
+-        self._b12x_packed_vocab_projection = get_b12x_packed_bf16_vocab_projection()
+         self.use_b12x_packed_vocab_projection = bool(
+             kernel_config.linear_backend == "b12x"
+             and self._b12x_packed_vocab_projection is not None
+@@ -186,6 +196,8 @@ class LogitsProcessor(PluggableLayer):
+             self._b12x_vocab_plans = owner._b12x_vocab_plans
+             self._b12x_vocab_heads = owner._b12x_vocab_heads
+             return
++        from vllm.utils.b12x import set_b12x_preparation_provider
++
+         self._b12x_vocab_heads[id(lm_head)] = lm_head
+         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
+         set_b12x_preparation_provider(self, self)
+@@ -302,6 +314,7 @@ class LogitsProcessor(PluggableLayer):
+     ) -> Sequence[B12xPreparationUnit]:
+         if layer is not self:
+             return ()
++        from vllm.utils.b12x import B12xPreparationUnit
+         units = []
+         for head_id, head in self._b12x_vocab_heads.items():
+             if head.weight.is_meta:
+diff --git a/vllm/models/deepseek_v4_1/mxfp4_csf.py b/vllm/models/deepseek_v4_1/mxfp4_csf.py
+index 32ea19c7e..96b50b973 100644
+--- a/vllm/models/deepseek_v4_1/mxfp4_csf.py
++++ b/vllm/models/deepseek_v4_1/mxfp4_csf.py
+@@ -14,7 +14,6 @@ from vllm.distributed import (
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+-from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+     FusedMoEQuantDesc,
+@@ -162,6 +161,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
+     def process_weights_after_loading(self, layer):
+         from b12x.moe import fused_moe
+ 
++        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+         from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+             read_mxfp4_csf_layer,
+         )
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 154327b66..375325ceb 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -112,7 +112,13 @@ def _prefill_sp_capacity_bytes() -> int:
+     """Registered RoCE capacity used as the conservative SP floor; 0 if none."""
+     if not model_parallel_is_initialized():
+         return 0
+-    comm = getattr(get_tp_group().device_communicator, "b12x_ar_comm", None)
++    dev_comm = get_tp_group().device_communicator
++    capacity = getattr(dev_comm, "all_reduce_capacity_bytes", None)
++    if capacity is not None:
++        return int(capacity)
++    comm = getattr(dev_comm, "roce_ar_comm", None) or getattr(
++        dev_comm, "b12x_ar_comm", None
++    )
+     return int(getattr(comm, "all_reduce_capacity_bytes", 0)) if comm is not None else 0
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 309f14d3d..adce4cd6c 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -821,6 +821,7 @@ def post_update(
+     )
+ 
+ 
++# Reference for ``tilelang_inputs``; the runner no longer launches it.
+ @triton.jit
+ def _post_update_num_computed_tokens_kernel(
+     idx_mapping_ptr,
+@@ -845,8 +846,9 @@ def post_update_num_computed_tokens(
+     # [num_reqs + 1]
+     query_start_loc: torch.Tensor,
+ ) -> None:
+-    num_reqs = idx_mapping.shape[0]
+-    _post_update_num_computed_tokens_kernel[(num_reqs,)](
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    tilelang_inputs.post_update_num_computed_tokens(
+         idx_mapping,
+         num_computed_tokens,
+         query_start_loc,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fe7a1929c..2ba78e074 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -272,9 +272,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.speculative_config is not None and self.speculative_config.use_dspark()
+         )
+         self.observability_config = vllm_config.observability_config
+-        from vllm.utils.b12x import is_b12x_a4_prefill_enabled
++        kernel_config = getattr(vllm_config, "kernel_config", None)
++        if getattr(kernel_config, "moe_backend", None) == "tilelang":
++            self._b12x_a4_prefill_enabled = False
++        else:
++            from vllm.utils.b12x import is_b12x_a4_prefill_enabled
+ 
+-        self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
++            self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
+         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
+ 
+         self.device = device
+@@ -2276,6 +2280,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.req_states.register_warmups()
+         if self.copy_drafter is not None:
+             self.copy_drafter.register_warmups()
++        if self.is_pooling_model:
++            tilelang_inputs.declare(
++                tilelang_inputs.post_update_num_computed_tokens_calls
++            )
+         if not samples:
+             return
+         assert self.sampler is not None
+diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
+index 741b0ed42..9d2d2dda2 100644
+--- a/vllm/v1/worker/gpu/sample/output.py
++++ b/vllm/v1/worker/gpu/sample/output.py
+@@ -29,6 +29,9 @@ class SamplerOutput:
+     sink: SinkStepOutput | None = None
+ 
+ 
++# The reference the TileLang compact sampling mask
++# (``tilelang_sampling.compact_sampling_mask_kernel``) is tested against; the
++# sampler no longer launches it.
+ @triton.jit
+ def _compact_sampling_mask_kernel(
+     logits_ptr,
+@@ -112,19 +115,16 @@ class SamplingMaskTensors(NamedTuple):
+             (num_reqs, (vocab_size + 7) // 8), dtype=torch.uint8, device=device
+         )
+         counts = torch.empty(num_reqs, dtype=torch.int32, device=device)
+-        _compact_sampling_mask_kernel[(num_reqs,)](
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++        tilelang_sampling.compact_sampling_mask(
+             logits,
+-            logits.stride(0),
+-            logits.stride(1),
+             num_sampled_tokens,
+             token_ids,
+-            token_ids.stride(0),
+             packed_mask,
+-            packed_mask.stride(0),
+             counts,
+             vocab_size,
+             max_num_kept,
+-            BLOCK_SIZE=8192,
+         )
+         return cls(token_ids, packed_mask, counts, vocab_size)
+ 
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 5b81da050..4f5d39afb 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -142,7 +142,21 @@ class Sampler:
+             tilelang_auxiliary.register_nan_counts(logits=logits, vocab_size=vocab_size)
+         self.logprob_token_ids_state.register_warmups()
+         if self.trace_replay_state is not None:
+-            self.trace_replay_state.trace_token_ids.register_warmup()
++            register_trace_warmups = getattr(
++                self.trace_replay_state, "register_warmups", None
++            )
++            if register_trace_warmups is not None:
++                register_trace_warmups()
++            else:
++                self.trace_replay_state.trace_token_ids.register_warmup()
++        if getattr(self, "return_sampling_mask", False):
++            from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++            tilelang_sampling.declare(
++                lambda: tilelang_sampling.compact_sampling_mask_calls(
++                    logits_dtypes=(torch.float32, *(dtype for dtype, _ in logits))
++                )
++            )
+         register_topk_scores_warmup(
+             logits=processed
+             if self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 2df49deb8..5a440408d 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -2709,6 +2709,197 @@ def apply_temperature(
+     kernel(logits, expanded_idx_mapping.contiguous(), temperature)
+ 
+ 
++# --- Trace replay & compact sampling mask ------------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def trace_replay_kernel(idx_dtype: str):
++    """``trace_replay._trace_replay_kernel``: for each request in the batch,
++    overwrites ``sampled[r]`` with ``trace_token_ids[req, total_len[req] -
++    prompt_len[req]]`` when ``req >= 0``, ``trace_len[req] > 0``, and
++    ``0 <= step < trace_len[req]``."""
++    num_reqs, states, max_len, len_states, total_states, prompt_states = T.dynamic(
++        "num_reqs, states, max_len, len_states, total_states, prompt_states"
++    )
++    trace_stride = T.dynamic("trace_stride", "int64")
++
++    @T.prim_func
++    def trace_replay(
++        sampled: T.Tensor((num_reqs,), T.int64),
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        trace_token_ids: T.StridedTensor(
++            (states, max_len), (trace_stride, 1), T.int32
++        ),
++        trace_len: T.Tensor((len_states,), T.int32),
++        total_len: T.Tensor((total_states,), T.int32),
++        prompt_len: T.Tensor((prompt_states,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(num_reqs, 32), threads=32) as b:
++            r = b * 32 + T.get_thread_binding()
++            if r < num_reqs:
++                req = T.cast(idx_mapping[r], T.int64)
++                if req >= 0:
++                    t_len = trace_len[req]
++                    if t_len > 0:
++                        step = total_len[req] - prompt_len[req]
++                        if (step >= 0) & (step < t_len):
++                            sampled[r] = T.cast(trace_token_ids[req, step], T.int64)
++
++    return trace_replay
++
++
++def trace_replay_key(idx_dtype: torch.dtype) -> tuple:
++    return (_DTYPES[idx_dtype],)
++
++
++def apply_trace_tokens(
++    sampled: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    trace_token_ids: torch.Tensor,
++    trace_len: torch.Tensor,
++    total_len: torch.Tensor,
++    prompt_len: torch.Tensor,
++) -> None:
++    """``trace_replay.apply_trace_tokens``'s launch."""
++    if idx_mapping.shape[0] == 0:
++        return
++    key = trace_replay_key(idx_mapping.dtype)
++    _kernel(trace_replay_kernel, *key)(
++        sampled.view(-1),
++        idx_mapping,
++        trace_token_ids,
++        trace_len,
++        total_len,
++        prompt_len,
++    )
++
++
++_COMPACT_MASK_THREADS = 256
++_COMPACT_MASK_BITS = 8
++_COMPACT_MASK_BLOCK = _COMPACT_MASK_THREADS * _COMPACT_MASK_BITS
++
++
++@tilelang.jit(pass_configs=_PASS)
++def compact_sampling_mask_kernel(logits_dtype: str, sampled_dtype: str):
++    """``output._compact_sampling_mask_kernel``: for each request row, records the
++    first ``max_num_kept`` finite-logit vocabulary indices in ascending order in
++    ``token_ids[req, :]``, the packed little-endian bitmask in ``packed_mask[req,
++    :]``, and the full finite-logit count in ``counts[req]``. Rows with
++    ``num_sampled_tokens[req] <= 0`` record an empty mask and count 0."""
++    num_reqs, vocab, sampled_len, kept_cols, mask_cols = T.dynamic(
++        "num_reqs, vocab, sampled_len, kept_cols, mask_cols"
++    )
++    logits_stride, ids_stride, mask_stride = T.dynamic(
++        "logits_stride, ids_stride, mask_stride", "int64"
++    )
++    threads = _COMPACT_MASK_THREADS
++    warps = threads // 32
++
++    @T.prim_func
++    def compact_sampling_mask(
++        logits: T.StridedTensor((num_reqs, vocab), (logits_stride, 1), logits_dtype),
++        num_sampled_tokens: T.Tensor((sampled_len,), sampled_dtype),
++        token_ids: T.StridedTensor((num_reqs, kept_cols), (ids_stride, 1), T.int32),
++        packed_mask: T.StridedTensor((num_reqs, mask_cols), (mask_stride, 1), T.uint8),
++        counts: T.Tensor((num_reqs,), T.int32),
++        vocab_size: T.int32,
++        max_num_kept: T.int32,
++    ):
++        with T.Kernel(num_reqs, threads=threads) as req:
++            tx = T.get_thread_binding()
++            lane = tx % 32
++            warp = tx // 32
++            smem_counts = T.alloc_shared((threads,), T.int32)
++            warp_totals = T.alloc_shared((warps,), T.int32)
++            active = T.alloc_var(T.bool, init=num_sampled_tokens[req] > 0)
++            running_count = T.alloc_var(T.int32, init=0)
++            mask_bytes = T.ceildiv(vocab_size, 8)
++            num_passes = T.ceildiv(vocab_size, _COMPACT_MASK_BLOCK)
++            for p in T.serial(num_passes):
++                byte_idx = p * threads + tx
++                col0 = byte_idx * 8
++                mask_byte = T.alloc_var(T.int32, init=0)
++                thread_kept = T.alloc_var(T.int32, init=0)
++                if active:
++                    for b in T.unroll(8):
++                        col = col0 + b
++                        if col < vocab_size:
++                            val = T.cast(logits[req, col], T.float32)
++                            if (val > -T.infinity(T.float32)) & (
++                                val < T.infinity(T.float32)
++                            ):
++                                mask_byte = mask_byte | (1 << b)
++                                thread_kept = thread_kept + 1
++                if byte_idx < mask_bytes:
++                    packed_mask[req, byte_idx] = T.cast(mask_byte, T.uint8)
++                smem_counts[tx] = thread_kept
++                T.sync_threads()
++                local_offset = T.alloc_var(T.int32, init=0)
++                for i in T.unroll(32):
++                    if i < lane:
++                        local_offset = local_offset + smem_counts[warp * 32 + i]
++                if lane == 31:
++                    warp_totals[warp] = local_offset + thread_kept
++                T.sync_threads()
++                for w in T.unroll(warps):
++                    if w < warp:
++                        local_offset = local_offset + warp_totals[w]
++                pass_total = T.alloc_var(T.int32, init=0)
++                for w in T.unroll(warps):
++                    pass_total = pass_total + warp_totals[w]
++                pos = T.alloc_var(T.int32, init=running_count + local_offset)
++                if thread_kept > 0:
++                    for b in T.unroll(8):
++                        if ((mask_byte >> b) & 1) != 0:
++                            if pos < max_num_kept:
++                                token_ids[req, pos] = col0 + b
++                            pos = pos + 1
++                running_count = running_count + pass_total
++                T.sync_threads()
++            if tx == 0:
++                counts[req] = running_count
++
++    return compact_sampling_mask
++
++
++def compact_sampling_mask_key(
++    logits_dtype: torch.dtype, sampled_dtype: torch.dtype = torch.int32
++) -> tuple:
++    return (_DTYPES[logits_dtype], _DTYPES[sampled_dtype])
++
++
++def compact_sampling_mask(
++    logits: torch.Tensor,
++    num_sampled_tokens: torch.Tensor,
++    token_ids: torch.Tensor,
++    packed_mask: torch.Tensor,
++    counts: torch.Tensor,
++    vocab_size: int,
++    max_num_kept: int,
++) -> None:
++    """``SamplingMaskTensors.from_logits``'s launch."""
++    if logits.shape[0] == 0:
++        return
++    if logits.stride(1) != 1:
++        logits = logits.contiguous()
++    ids_arg = token_ids if token_ids.shape[1] > 0 else counts.view(-1, 1)
++    mask_arg = (
++        packed_mask
++        if packed_mask.shape[1] > 0
++        else counts.view(torch.uint8).view(logits.shape[0], -1)
++    )
++    key = compact_sampling_mask_key(logits.dtype, num_sampled_tokens.dtype)
++    _kernel(compact_sampling_mask_kernel, *key)(
++        logits[:, :vocab_size],
++        num_sampled_tokens,
++        ids_arg,
++        mask_arg,
++        counts,
++        vocab_size,
++        max_num_kept,
++    )
++
++
+ # --- Preparation --------------------------------------------------------------
+ 
+ # The runner's batch-to-request-state index is ``np.intp``.
+@@ -2982,3 +3173,22 @@ def greedy_calls(
+         for dtype in (torch.int32, torch.int64)
+     ]
+     return _unique(calls)
++
++
++def trace_replay_calls(idx_dtype: torch.dtype = RUNNER_IDX_DTYPE) -> list:
++    return [_call(trace_replay_kernel, *trace_replay_key(idx_dtype))]
++
++
++def compact_sampling_mask_calls(
++    logits_dtypes: Sequence[torch.dtype] = (torch.float32,),
++    sampled_dtype: torch.dtype = torch.int32,
++) -> list:
++    return _unique(
++        [
++            _call(
++                compact_sampling_mask_kernel,
++                *compact_sampling_mask_key(dtype, sampled_dtype),
++            )
++            for dtype in dict.fromkeys(logits_dtypes)
++        ]
++    )
+diff --git a/vllm/v1/worker/gpu/sample/trace_replay.py b/vllm/v1/worker/gpu/sample/trace_replay.py
+index 9b58d4cf2..6a20d1068 100644
+--- a/vllm/v1/worker/gpu/sample/trace_replay.py
++++ b/vllm/v1/worker/gpu/sample/trace_replay.py
+@@ -43,6 +43,12 @@ class TraceReplayState:
+         self.trace_len.copy_to_uva()
+         self.trace_token_ids.apply_write()
+ 
++    def register_warmups(self) -> None:
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++        self.trace_token_ids.register_warmup()
++        tilelang_sampling.declare(tilelang_sampling.trace_replay_calls)
++
+     def apply_trace(
+         self,
+         sampled: torch.Tensor,
+@@ -58,6 +64,8 @@ class TraceReplayState:
+         )
+ 
+ 
++# The reference the TileLang trace replay (``tilelang_sampling.trace_replay_kernel``)
++# is tested against; the sampler no longer launches it.
+ @triton.jit
+ def _trace_replay_kernel(
+     sampled_ptr,  # [num_reqs], int64, mutated in place
+@@ -101,12 +109,12 @@ def apply_trace_tokens(
+     prompt_len: torch.Tensor,
+ ) -> None:
+     """Overwrite ``sampled`` in place with trace tokens for the current step."""
+-    num_reqs = idx_mapping.shape[0]
+-    _trace_replay_kernel[(num_reqs,)](
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.apply_trace_tokens(
+         sampled,
+         idx_mapping,
+         trace_token_ids,
+-        trace_token_ids.stride(0),
+         trace_len,
+         total_len,
+         prompt_len,
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 8eeb5251e..1e5fe47cb 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -19,6 +19,8 @@ reference):
+   ``input_batch._combine_sampled_and_draft_tokens_kernel``
+ - ``expand_idx_mapping``: ``input_batch._expand_idx_mapping_kernel``
+ - ``post_update``: ``input_batch._post_update_kernel``
++- ``post_update_num_computed_tokens``:
++  ``input_batch._post_update_num_computed_tokens_kernel``
+ - ``prepare_dflash_inputs``: ``dflash.speculator._prepare_dflash_inputs_kernel``
+ 
+ Integer arithmetic follows Triton's: C division and remainder (``truncdiv``,
+@@ -2134,6 +2136,63 @@ def post_update(
+     _kernel(post_update_kernel, *key)(*args)
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def post_update_num_computed_tokens_kernel(idx_dtype: str):
++    """``input_batch._post_update_num_computed_tokens_kernel``: for each request in
++    the batch, adds its step query length ``query_start_loc[r + 1] -
++    query_start_loc[r]`` to ``num_computed_tokens[idx_mapping[r]]``. A block of
++    ``_REQUESTS`` threads, one request a thread."""
++    num_reqs = T.dynamic("num_reqs")
++    counts_len = T.dynamic("counts_len")
++    starts_len = T.dynamic("starts_len")
++
++    @T.prim_func
++    def post_update_num_computed_tokens(
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        num_computed_tokens: T.Tensor((counts_len,), T.int32),
++        query_start_loc: T.Tensor((starts_len,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as b:
++            r = b * _REQUESTS + T.get_thread_binding()
++            if r < num_reqs:
++                req = T.cast(idx_mapping[r], T.int64)
++                query_len = query_start_loc[r + 1] - query_start_loc[r]
++                num_computed_tokens[req] = num_computed_tokens[req] + query_len
++
++    return post_update_num_computed_tokens
++
++
++def post_update_num_computed_tokens_key(idx_dtype: str) -> tuple:
++    return (idx_dtype,)
++
++
++def post_update_num_computed_tokens(
++    idx_mapping: torch.Tensor,
++    num_computed_tokens: torch.Tensor,
++    query_start_loc: torch.Tensor,
++) -> None:
++    """``input_batch.post_update_num_computed_tokens``'s launch."""
++    if idx_mapping.shape[0] == 0:
++        return
++    key = post_update_num_computed_tokens_key(_DTYPES[idx_mapping.dtype])
++    _kernel(post_update_num_computed_tokens_kernel, *key)(
++        idx_mapping,
++        num_computed_tokens,
++        _as(query_start_loc, torch.int32),
++    )
++
++
++def post_update_num_computed_tokens_calls(
++    idx_dtype: str = "int64",
++) -> list:
++    return [
++        _call(
++            post_update_num_computed_tokens_kernel,
++            *post_update_num_computed_tokens_key(idx_dtype),
++        )
++    ]
++
++
+ # --- DFlash drafting ----------------------------------------------------------
+ 
+ _DFLASH_THREADS = 256  # Triton's BLOCK_SIZE: a thread a context or query row
+-- 
+2.54.0 (Apple Git-157)
+
