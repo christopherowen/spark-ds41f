@@ -14,6 +14,17 @@ import sys
 import time
 
 
+EXT4_MAX_EXTENT_BYTES = 128 * 1024 * 1024
+
+
+def actionable_best(current, best, size_bytes):
+    """e4defrag operates in 128 MiB max-extent units and is a no-op once average extent >= 128 MiB."""
+    max_extent_count = max(1, (size_bytes + EXT4_MAX_EXTENT_BYTES - 1) // EXT4_MAX_EXTENT_BYTES)
+    if current <= max(best, max_extent_count):
+        return current
+    return best
+
+
 def extent_counts(output, expected):
     counts = [tuple(map(int, pair)) for pair in re.findall(
         r"^\s*Total/best extents\s+(\d+)/(\d+)\s*$", output, re.M,
@@ -40,7 +51,12 @@ def measure(root):
     counts = extent_counts(result.stdout, len(names))
     return {
         "shards": [
-            {"name": name, "path": str(path), "current": current, "best": best}
+            {
+                "name": name,
+                "path": str(path),
+                "current": current,
+                "best": actionable_best(current, best, path.stat().st_size),
+            }
             for name, path, (current, best) in zip(names, paths, counts)
         ],
         "elapsed_seconds": time.monotonic() - started,
