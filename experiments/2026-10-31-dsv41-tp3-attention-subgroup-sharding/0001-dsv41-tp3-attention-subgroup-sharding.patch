@@ -1,0 +1,288 @@
+From 592c1265b614885b48d68ff7c5cf8e4ed79392db Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sat, 31 Oct 2026 15:55:32 +0100
+Subject: [PATCH] [DeepSeek-V4.1] Trim TP3 zero-padded attention group on Rank
+ 2 and add TP3 decode tiles
+
+---
+ tests/models/test_deepseek_v4_1_attention.py | 88 ++++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       | 68 ++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py   | 39 ++++++++-
+ 3 files changed, 190 insertions(+), 5 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 0dbdd99..f83db42 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -375,3 +375,91 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+     positions = torch.arange(4)
+     out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+     assert out.shape == (4, 32)
++
++
++def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
++    """On TP3 (8 output groups padded to 9), rank 2 trims its zero-padded 3rd group
++    (heads 16..23) in ``setup_wo_projection`` before kernel declaration, while ranks
++    0 and 1 keep all 3 real groups (24 heads)."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang import wo
++
++    monkeypatch.setattr(
++        wo,
++        "TileLangWOProjection",
++        lambda wo_a, wo_b, groups: SimpleNamespace(
++            wo_a=wo_a, wo_b=wo_b, groups=groups
++        ),
++    )
++
++    def make_layer():
++        module = _tilelang_layer(layer_id=0)
++        module.config.model_config = SimpleNamespace(
++            hf_config=SimpleNamespace(original_o_groups=8, o_groups=9)
++        )
++        module.n_groups = 9
++        module.n_local_groups = 3
++        module.n_local_heads = 24
++        module.head_dim = 512
++        module.o_lora_rank = 1024
++        module.hidden_size = 5120
++        module.attn_sink = nn.Parameter(
++            torch.arange(24, dtype=torch.float32), requires_grad=False
++        )
++        module.wq_b = nn.Module()
++        module.wq_b.weight = nn.Parameter(
++            torch.zeros((24 * 512, 1280), dtype=torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        module.wq_b.weight_scale_inv = nn.Parameter(
++            torch.ones((24 * 512 // 32, 1280 // 32), dtype=torch.uint8),
++            requires_grad=False,
++        )
++        module.wo_a = nn.Module()
++        module.wo_a.weight = nn.Parameter(
++            torch.zeros((3 * 1024, 4096), dtype=torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        module.wo_a.weight_scale_inv = nn.Parameter(
++            torch.ones((3 * 1024 // 32, 4096 // 32), dtype=torch.uint8),
++            requires_grad=False,
++        )
++        module.wo_b = nn.Module()
++        module.wo_b.weight = nn.Parameter(
++            torch.zeros((5120, 3 * 1024), dtype=torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        module.wo_b.weight_scale_inv = nn.Parameter(
++            torch.ones((5120 // 32, 3 * 1024 // 32), dtype=torch.uint8),
++            requires_grad=False,
++        )
++        return module
++
++    monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 3)
++
++    for rank in (0, 1):
++        monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda: rank)
++        layer = make_layer()
++        layer.setup_wo_projection()
++        assert layer.n_local_groups == 3
++        assert layer.n_local_heads == 24
++        assert layer.wq_b.weight.shape == (12288, 1280)
++        assert layer._wo_projection_weights.groups == 3
++
++    monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda: 2)
++    layer_r2 = make_layer()
++    layer_r2.setup_wo_projection()
++    layer_r2.setup_wo_projection()  # idempotent
++    assert layer_r2.n_local_groups == 2
++    assert layer_r2.n_local_heads == 16
++    assert layer_r2.attn_sink.shape == (16,)
++    assert layer_r2.wq_b.weight.shape == (8192, 1280)
++    assert layer_r2.wq_b.weight_scale_inv.shape == (8192 // 32, 1280 // 32)
++    assert layer_r2.wo_a.weight.shape == (2048, 4096)
++    assert layer_r2.wo_a.weight_scale_inv.shape == (2048 // 32, 4096 // 32)
++    assert layer_r2.wo_b.weight.shape == (5120, 2048)
++    assert layer_r2.wo_b.weight_scale_inv.shape == (5120 // 32, 2048 // 32)
++    assert layer_r2._wo_projection_weights.groups == 2
++
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 16ac898..225f7f7 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -15,7 +15,11 @@ from vllm.compilation.breakable_cudagraph import (
+     is_breakable_cudagraph_enabled,
+ )
+ from vllm.config import CacheConfig
+-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    get_tp_group,
++)
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+@@ -1390,7 +1394,69 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 **window,
+             )
+ 
++    def _trim_padded_groups(self) -> None:
++        """Drop trailing TP-padded output groups whose loaded weights are all zero."""
++        hf = getattr(getattr(self.config, "model_config", None), "hf_config", None)
++        orig_groups = getattr(hf, "original_o_groups", self.n_groups)
++        if orig_groups >= self.n_groups:
++            return
++        tp_size = get_tensor_model_parallel_world_size()
++        tp_rank = get_tensor_model_parallel_rank()
++        padded_groups = self.n_groups // tp_size
++        real_groups = max(0, min(orig_groups - tp_rank * padded_groups, padded_groups))
++        groups = self.n_local_groups
++        if not 0 < real_groups < groups:
++            return
++        heads_per_group = self.n_local_heads // groups
++        real_heads = real_groups * heads_per_group
++        q_rows = real_heads * self.head_dim
++        wo_rows = real_groups * self.o_lora_rank
++        from vllm.models.deepseek_v4_1.tilelang.gemm import unpack_weight_tiles
++        from vllm.models.deepseek_v4_1.tilelang.linear import _block32_scale_words
++
++        if getattr(self.wq_b, "tilelang_weight_packed", False):
++            w_q = unpack_weight_tiles(
++                self.wq_b.tilelang_weight, *self.wq_b.weight.shape
++            )
++            self.wq_b.tilelang_weight_packed = False
++        else:
++            w_q = self.wq_b.weight
++        self.wq_b.weight = nn.Parameter(w_q[:q_rows].contiguous(), requires_grad=False)
++        self.wq_b.weight_scale_inv = nn.Parameter(
++            self.wq_b.weight_scale_inv[: q_rows // 32].contiguous(),
++            requires_grad=False,
++        )
++        self.wq_b.output_size_per_partition = q_rows
++        if hasattr(self.wq_b, "tilelang_weight_sf"):
++            _block32_scale_words(self.wq_b)
++
++        self.attn_sink = nn.Parameter(
++            self.attn_sink[:real_heads].contiguous(), requires_grad=False
++        )
++        self.wo_a.weight = nn.Parameter(
++            self.wo_a.weight[:wo_rows].contiguous(), requires_grad=False
++        )
++        self.wo_a.weight_scale_inv = nn.Parameter(
++            self.wo_a.weight_scale_inv[: wo_rows // 32].contiguous(),
++            requires_grad=False,
++        )
++        self.wo_a.bmm_batch_size = real_groups
++        self.wo_a.output_size_per_partition = wo_rows
++
++        self.wo_b.weight = nn.Parameter(
++            self.wo_b.weight[:, :wo_rows].contiguous(), requires_grad=False
++        )
++        self.wo_b.weight_scale_inv = nn.Parameter(
++            self.wo_b.weight_scale_inv[:, : wo_rows // 32].contiguous(),
++            requires_grad=False,
++        )
++        self.wo_b.input_size_per_partition = wo_rows
++
++        self.n_local_groups = real_groups
++        self.n_local_heads = real_heads
++
+     def setup_wo_projection(self):
++        self._trim_padded_groups()
+         groups = self.n_local_groups
+         heads_per_group = self.n_local_heads // groups
+         group_width = heads_per_group * self.head_dim
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 4925cb2..ea66007 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1222,12 +1222,18 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+ # into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
+ # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
+ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
++    (12288, 1280),
+     (8192, 1280),
+     (4096, 1280),
+ }
+ 
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+-    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
++    # TP3 and TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
++    (12288, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=64, block_K=128, num_stages=3),
++    },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
+@@ -1243,7 +1249,12 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         32: dict(block_N=64, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+-    # TP4 shared expert: gate/up and down.
++    # TP3 and TP4 shared expert: gate/up and down.
++    (1536, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
+     (1152, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
+@@ -1254,13 +1265,24 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         32: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+-    # TP4 attention output: the grouped WO-A (2 groups) and WO-B (window 3's WO
+-    # sweep, ranked against the default tile; WO-B keeps it from 32 rows).
++    # TP3 and TP4 attention output: the grouped WO-A (3 or 2 groups) and WO-B
++    # (window 3's WO sweep, ranked against the default tile; WO-B keeps it from
++    # 32 rows).
++    (1024, 4096, 3): {
++        16: dict(block_N=64, block_K=256, num_stages=3),
++        32: dict(block_N=64, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
+     (1024, 4096, 2): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
++    (5120, 3072): {
++        16: dict(block_N=128, block_K=256, num_stages=2),
++        64: dict(block_N=128, block_K=128, num_stages=2),
++        96: dict(block_N=64, block_K=128, num_stages=2),
++    },
+     (5120, 2048): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
+@@ -1268,6 +1290,12 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+     },
++    # TP3 DSpark context combiner projection.
++    (1728, 15360): {
++        16: dict(block_N=64, block_K=256, num_stages=3),
++        32: dict(block_N=64, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
+     # TP4 DSpark main projection.
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+@@ -1347,8 +1375,11 @@ def split_row_tile(rows: int) -> int:
+ # projection run faster on their prefill tiles.
+ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+     (1792, 5120): {96: 32, 128: 64},
++    (1536, 5120): {128: 64},
+     (1152, 5120): {128: 64},
++    (5120, 768): {96: 32},
+     (5120, 576): {96: 32},
++    (5120, 3072): {96: 96},
+     (5120, 2048): {96: 96},
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
