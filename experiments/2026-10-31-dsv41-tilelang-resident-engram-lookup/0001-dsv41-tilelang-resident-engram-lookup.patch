@@ -1,0 +1,626 @@
+From ca8c190efc873c414680ab6d6fd66b8f09d83f73 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:38:13 +0100
+Subject: [PATCH] feat(deepseek_v4_1): port resident Engram table lookup and
+ geometry to TileLang
+
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  |  62 +++++++
+ tests/models/test_deepseek_v4_1_engram.py     |  31 +---
+ vllm/models/deepseek_v4_1/common/engram.py    | 137 ++++----------
+ .../deepseek_v4_1/tilelang/engram_hash.py     | 169 +++++++++++++++++-
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  79 ++++++++
+ 5 files changed, 350 insertions(+), 128 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4e358c4e8..49c8ead38 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -525,3 +525,65 @@ def test_timeline_is_off_by_default():
+     torch.cuda.synchronize()
+     assert not rows.timeline_enabled and rows.timeline() == []
+     rows.close()
++
++
++@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
++@pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000)])
++def test_resident_lookup_matches_reference_bits(shard, columns):
++    """TileLang resident lookup dequantizes in-shard rows, zeroes out-of-shard/dead/tail
++    rows, and handles E8M0 scale edge cases (0 -> 2^-127, 255 -> NaN) identically to
++    the reference and disk gather."""
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++        engram_resident_lookup,
++        resident_lookup_calls,
++    )
++
++    codes, scales, _ = _write_table(_table_dir(), seed=31)
++    start, end = shard
++    shard_rows = end - start
++    weight_shard = codes[start:end].cuda().view(torch.float8_e4m3fn)
++    scale_shard = scales[start:end].cuda()
++
++    calls = resident_lookup_calls(shard_rows, start, end, columns)
++    assert len(calls) == 1
++
++    gen = torch.Generator().manual_seed(32)
++    ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
++    if start == 0:
++        ids[0, :3] = torch.tensor([1, 2, 3])  # scale edge cases: 0, 255, 254
++    ids[5, 4] = -1  # dead lookup
++    ids[6, 7] = TABLE_ROWS + 5  # past global table_rows
++    ids_gpu = ids.cuda()
++    num_tokens = torch.tensor([13], dtype=torch.int32, device="cuda")
++    width = bin(columns).count("1") * 256
++    out = torch.full((16, width), 7, dtype=torch.bfloat16, device="cuda")
++    engram_resident_lookup(
++        ids_gpu, num_tokens, weight_shard, scale_shard, out, start, end, columns
++    )
++    expected = _reference(codes, scales, ids, 13, start, end, columns)
++    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++    assert torch.count_nonzero(out[13:]) == 0
++
++
++def test_tilelang_engram_geometry_matches_prime_and_pcg64_contract():
++    from vllm.models.deepseek_v4_1.tilelang.engram_hash import (
++        Caps,
++        build_geometry,
++    )
++
++    geom = build_geometry(layer_ids=(1, 14), base_table_size=19, compressed_vocab_size=32)
++    assert geom.layer_ids == (1, 14)
++    assert len(geom.primes) == 2 and all(len(p) == HEADS for p in geom.primes)
++    assert len(set(p for row in geom.primes for p in row)) == 2 * HEADS
++    caps = Caps(
++        device="cuda",
++        max_tokens=8,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=4,
++        tp_rank=1,
++    )
++    assert caps.device.type == "cuda" and caps.tp_rank == 1
++
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 75c02de7e..3adc7abe5 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -14,7 +14,6 @@ import pytest
+ import torch
+ from b12x._lib.runtime_control import kernel_resolution_guard
+ from b12x.preparation import PreparationSession
+-from b12x.sequence import engram as native
+ from safetensors.torch import save_file
+ from torch import nn
+ 
+@@ -28,6 +27,8 @@ from vllm.models.deepseek_v4_1.common.engram import (
+     NgramHashState,
+     ParallelEngramEmbedding,
+ )
++from vllm.models.deepseek_v4_1.tilelang import engram_hash as native
++from vllm.models.deepseek_v4_1.tilelang import engram_rows as engram_rows_module
+ from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
+ from vllm.models.deepseek_v4_1.nvidia.model import (
+     DeepseekV4Model,
+@@ -101,21 +102,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+         )
+         layout = SimpleNamespace(
+             caps=local_caps,
+-            lookup_plans=tuple(
+-                None
+-                if memory == "disk"
+-                else native.plan(
+-                    caps,
+-                    token_map=list(range(32)),
+-                    geometry=geometry,
+-                    invocation={
+-                        "operation": "lookup",
+-                        "compact_rows": False,
+-                        "resident_scales": False,
+-                    },
+-                )
+-                for caps in local_caps
+-            ),
++            lookup_plans=(None,) * len(local_caps),
+             layer_ids=geometry.layer_ids,
+             geometry=geometry,
+             token_map=list(range(32)),
+@@ -496,7 +483,9 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+             raise AssertionError("capture preparation/consumer performed table lookup")
+ 
+         with monkeypatch.context() as capture_guard:
+-            capture_guard.setattr(native, "run_lookup", forbid_lookup)
++            capture_guard.setattr(
++                engram_rows_module, "engram_resident_lookup", forbid_lookup
++            )
+             state.prepare_dummy_inputs(2, 4)
+             for _ in range(3):
+                 consume()
+@@ -823,15 +812,9 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+         tp_size=1,
+         tp_rank=0,
+     )
+-    lookup = native.plan(
+-        caps,
+-        token_map=list(range(32)),
+-        geometry=geometry,
+-        invocation={"operation": "lookup", "compact_rows": False},
+-    )
+     layout = SimpleNamespace(
+         caps=(caps,),
+-        lookup_plans=(lookup,),
++        lookup_plans=(None,),
+         geometry=geometry,
+         table_memory="device",
+         projection_tp=False,
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 45ca741de..7ee760112 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -7,8 +7,6 @@ from functools import lru_cache
+ 
+ import torch
+ import torch.nn as nn
+-from b12x.preparation import PreparedCall
+-from b12x.sequence import engram as native
+ 
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+@@ -22,12 +20,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
+ from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows, MappedHostAllocation
+-from vllm.utils.b12x import (
+-    B12xPreparationUnit,
+-    B12xWorkload,
+-    PreparationResourceUnavailableError,
+-    set_b12x_preparation_provider,
+-)
++from vllm.models.deepseek_v4_1.tilelang import engram_hash as native
+ from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+ 
+ _FP8_BLOCK_ROWS = 32
+@@ -212,23 +205,8 @@ class EngramLayout:
+             )
+             for layer in self.layer_ids
+         )
+-        # Disk tables gather with the TileLang kernel; only resident tables use
+-        # the B12X lookup.
+-        self.lookup_plans = tuple(
+-            None
+-            if self.table_memory == "disk"
+-            else native.plan(
+-                caps,
+-                token_map=token_map,
+-                geometry=self.geometry,
+-                invocation={
+-                    "operation": "lookup",
+-                    "compact_rows": False,
+-                    "resident_scales": False,
+-                },
+-            )
+-            for caps in self.caps
+-        )
++        # Both disk and resident tables gather/lookup with TileLang kernels.
++        self.lookup_plans = (None,) * len(self.caps)
+ 
+     @classmethod
+     def from_config(cls, config):
+@@ -594,13 +572,23 @@ class ParallelEngramEmbedding(nn.Module):
+ 
+     def declare_kernels(self) -> None:
+         """Declare a disk table's TileLang row kernels (the wait, the gather of its
+-        reader's buffers and shard, and the release)."""
+-        if self.table_memory != "disk":
+-            return
++        reader's buffers and shard, and the release) or a resident table's TileLang
++        lookup kernel."""
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+-        from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
++        from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++            resident_lookup_calls,
++            row_kernel_calls,
++        )
+ 
+-        calls = row_kernel_calls(**self._disk_shard())
++        if self.table_memory == "disk":
++            calls = row_kernel_calls(**self._disk_shard())
++        else:
++            calls = resident_lookup_calls(
++                self.weight.shape[0],
++                min(self.shard_start, self.table_rows),
++                min(self.shard_end, self.table_rows),
++                self.column_mask,
++            )
+         prepare.declare(lambda: calls)
+ 
+     def open_disk_rows(self) -> None:
+@@ -655,24 +643,23 @@ class ParallelEngramEmbedding(nn.Module):
+         self.disk_rows.gather(out, self.hashes, self.num_tokens)
+ 
+     def lookup_native(self, indices, out):
+-        if self.plan.prepared is None:
+-            raise PreparationResourceUnavailableError(
+-                "Engram lookup plan must be prepared before forwarding"
+-            )
++        from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++            engram_resident_lookup,
++        )
++
+         self.hashes[: indices.shape[0]].copy_(indices)
+         self.num_tokens.fill_(indices.shape[0])
+-        binding = native.bind_lookup(
+-            self.plan,
+-            weight=self.weight,
+-            scales=self.weight_scale_inv,
+-            hash_ids=self.hashes,
+-            num_tokens=self.num_tokens,
+-            out=out,
++        retain_cuda_graph_capture_resource(self)
++        engram_resident_lookup(
++            self.hashes,
++            self.num_tokens,
++            self.weight,
++            self.weight_scale_inv,
++            out,
++            min(self.shard_start, self.table_rows),
++            min(self.shard_end, self.table_rows),
++            self.column_mask,
+         )
+-        retain_cuda_graph_capture_resource(binding)
+-        if self.mapped_host_nbytes:
+-            retain_cuda_graph_capture_resource(self)
+-        native.run_lookup(binding)
+ 
+     def lookup(self, indices, out):
+         self.lookup_native(indices, out)
+@@ -765,65 +752,9 @@ class Engram(nn.Module):
+             shared_staged_rows,
+             persistent=False,
+         )
+-        # A resident table's lookup is prepared through B12X (the lookup unit).
+-        set_b12x_preparation_provider(self, self)
+-
+-    def get_b12x_preparation_units(
+-        self, layer: torch.nn.Module, workload: B12xWorkload
+-    ) -> tuple[B12xPreparationUnit, ...]:
+-        if workload.max_tokens > self.embed_tokens.caps.max_tokens:
+-            return ()
+-
+-        def make_call(state):
+-            from b12x.sequence.engram._impl import _bind_lookup_state
+-
+-            embed = self.embed_tokens
+-            hash_ids = torch.full(
+-                (embed.caps.max_tokens, 24),
+-                -1,
+-                dtype=torch.int64,
+-                device=embed.caps.device,
+-            )
+-            prime_row = min(embed.shard_start + 1, embed.shard_end - 1)
+-            if prime_row <= 0:
+-                raise PreparationResourceUnavailableError(
+-                    "Engram shard has no nonzero local lookup row"
+-                )
+-            hash_ids[0, 0] = prime_row
+-            num_tokens = torch.ones((1,), dtype=torch.int32, device=embed.caps.device)
+-            out = torch.empty(
+-                (embed.caps.max_tokens, 6144),
+-                dtype=torch.bfloat16,
+-                device=embed.caps.device,
+-            )
+-            binding = _bind_lookup_state(
+-                state,
+-                weight=embed.weight,
+-                scales=embed.weight_scale_inv,
+-                hash_ids=hash_ids,
+-                num_tokens=num_tokens,
+-                out=out,
+-            )
+-            return PreparedCall(
+-                run=lambda: state.run_lookup(binding, 1, clear_tail=True),
+-                owners=(embed.weight, embed.weight_scale_inv),
+-            )
+ 
+-        if self.embed_tokens.table_memory == "disk":
+-            return ()
+-        request = self.embed_tokens.plan.request(
+-            name=f"{id(self)}/engram-lookup",
+-            prepare_call=make_call,
+-            benchmark_call=make_call,
+-        )
+-        return (
+-            B12xPreparationUnit(
+-                name="EngramLookup",
+-                key=(id(self), workload.max_tokens),
+-                requests=(request,),
+-                stage="weights",
+-            ),
+-        )
++    def get_b12x_preparation_units(self, layer=None, workload=None):
++        return ()
+ 
+     def declare_kernels(self) -> None:
+         """Declare the TileLang gate: on packed rows always, and on the column blocks
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+index d6f2bf22d..891b887f3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+@@ -23,6 +23,9 @@ first block also publishes the request and live token counts.
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+ # annotations eagerly, and the symbolic shape must resolve.
++from dataclasses import dataclass
++
++import numpy as np
+ import tilelang
+ import tilelang.language as T
+ import torch
+@@ -34,6 +37,162 @@ IMAGE_SENTINEL = 129264  # the history exclusion of vLLM's Engram metadata
+ PAD_TOKEN = 2
+ 
+ 
++def _device(value) -> torch.device:
++    d = torch.device(value)
++    if d.type == "cuda" and d.index is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    return d
++
++
++@dataclass(frozen=True, kw_only=True)
++class Caps:
++    device: torch.device | str
++    max_tokens: int
++    max_seqs: int
++    max_requests: int
++    vocab_size: int = 129280
++    layer_id: int = 1
++    tp_size: int = 8
++    tp_rank: int = 0
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "device", _device(self.device))
++        if self.device.type != "cuda" or any(
++            type(getattr(self, n)) is not int or getattr(self, n) <= 0
++            for n in ("max_tokens", "max_seqs", "max_requests", "vocab_size", "tp_size")
++        ):
++            raise ValueError("Engram requires positive CUDA capacities")
++        if (
++            not 0 <= self.tp_rank < self.tp_size
++            or self.max_tokens >= 2**31
++            or self.max_seqs >= 2**31
++        ):
++            raise ValueError("invalid Engram rank or int32 capacity")
++
++
++@dataclass(frozen=True)
++class Geometry:
++    """Host-only immutable geometry; all device geometry uses signed int64."""
++
++    layer_ids: tuple[int, ...]
++    primes: tuple[tuple[int, ...], ...]
++    offsets: tuple[tuple[int, ...], ...]
++    multipliers: tuple[tuple[int, ...], ...]
++    num_embeddings: tuple[int, ...]
++    compressed_vocab_size: int
++
++
++def _is_prime_64(n: int) -> bool:
++    """Deterministic Miller-Rabin primality test for 0 <= n < 2**64."""
++    if n < 2:
++        return False
++    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if n % p == 0:
++            return n == p
++    d = n - 1
++    r = 0
++    while d % 2 == 0:
++        d //= 2
++        r += 1
++    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if a >= n:
++            continue
++        x = pow(a, d, n)
++        if x in (1, n - 1):
++            continue
++        for _ in range(r - 1):
++            x = (x * x) % n
++            if x == n - 1:
++                break
++        else:
++            return False
++    return True
++
++
++def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
++    """Use raw backend decoding, retaining malformed UTF-8 token spellings."""
++    from tokenizers import Regex, normalizers
++
++    sentinel = "\ue000"
++    normalizer = normalizers.Sequence(
++        [
++            normalizers.NFKC(),
++            normalizers.NFD(),
++            normalizers.StripAccents(),
++            normalizers.Lowercase(),
++            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
++            normalizers.Replace(Regex(r"^ $"), sentinel),
++            normalizers.Strip(),
++            normalizers.Replace(sentinel, " "),
++        ]
++    )
++    backend = tokenizer.backend_tokenizer
++    keys: dict[str, int] = {}
++    lookup = []
++    for token_id in range(len(tokenizer)):
++        text = backend.decode([token_id], skip_special_tokens=False)
++        key = (
++            backend.id_to_token(token_id)
++            if "\ufffd" in text
++            else normalizer.normalize_str(text) or text
++        )
++        if key not in keys:
++            keys[key] = len(keys)
++        lookup.append(keys[key])
++    return lookup, len(keys)
++
++
++def build_geometry(
++    *,
++    layer_ids=(1, 14),
++    base_table_size=16_000_000,
++    compressed_vocab_size=99_092,
++) -> Geometry:
++    """Generate 2/3/4-gram, eight-head geometry with globally unreused primes."""
++    layer_ids = tuple(layer_ids)
++    if (
++        not layer_ids
++        or len(set(layer_ids)) != len(layer_ids)
++        or any(i < 0 for i in layer_ids)
++    ):
++        raise ValueError("layer_ids must be unique nonnegative actual layer IDs")
++    if base_table_size < 2 or not 0 < compressed_vocab_size < (1 << 62):
++        raise ValueError("invalid table or compressed vocabulary size")
++    seen: set[int] = set()
++    primes, offsets, multipliers, totals = [], [], [], []
++    bound = max(1, (((1 << 63) - 1) // compressed_vocab_size) // 2)
++    for layer in layer_ids:
++        sizes = []
++        for _ in range(3):
++            current = base_table_size - 1
++            for _ in range(8):
++                current += 1
++                while current in seen or not _is_prime_64(current):
++                    current += 1
++                seen.add(current)
++                sizes.append(current)
++        cumulative, total = [], 0
++        for size in sizes:
++            cumulative.append(total)
++            total += size
++        if total * 256 > (1 << 63) - 1:
++            raise ValueError("table extent exceeds signed int64 indexing")
++        rng = np.random.Generator(np.random.PCG64(10007 * layer))
++        values = rng.integers(0, bound, size=4, dtype=np.int64) * 2 + 1
++        primes.append(tuple(sizes))
++        offsets.append(tuple(cumulative))
++        multipliers.append(tuple(int(v) for v in values))
++        totals.append(total)
++    return Geometry(
++        layer_ids,
++        tuple(primes),
++        tuple(offsets),
++        tuple(multipliers),
++        tuple(totals),
++        compressed_vocab_size,
++    )
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def engram_hash_kernel(
+     layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
+@@ -160,4 +319,12 @@ def geometry_tensors(geometry, device) -> tuple[torch.Tensor, ...]:
+     )
+ 
+ 
+-__all__ = ["engram_hash", "engram_hash_kernel", "geometry_tensors"]
++__all__ = [
++    "Caps",
++    "Geometry",
++    "build_compressed_token_map",
++    "build_geometry",
++    "engram_hash",
++    "engram_hash_kernel",
++    "geometry_tensors",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 8edf00d69..8b5fb23af 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -254,3 +254,82 @@ def engram_rows_gather(
+         )
+         kernel(ids[:tokens], num_tokens, rows, scales, out)
+     engram_rows_release_kernel()(control)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_resident_lookup_kernel(
++    shard_rows: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    threads: int = 64,
++    vec: int = 4,
++):
++    assert threads * vec == ROW and 32 % vec == 0
++    first, step, count = column_span(columns)
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_resident_lookup(
++        ids: T.Tensor((tokens, HEADS), T.int64),
++        num_tokens: T.Tensor((1,), T.int32),
++        weight: T.Tensor((shard_rows, ROW), T.float8_e4m3fn),
++        scales: T.Tensor((shard_rows, SCALES), T.uint8),
++        out: T.Tensor((tokens, count * ROW), T.bfloat16),
++    ):
++        with T.Kernel(count, tokens, threads=threads) as (column, t):
++            tx = T.get_thread_binding()
++            head = first + column * step
++            row = ids[t, head]
++            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
++            if owned:
++                local_row = row - T.int64(shard_start)
++                exponent = T.cast(scales[local_row, tx * vec // 32], T.uint32)
++                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
++                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + tx * vec + i] = T.cast(
++                        T.cast(weight[local_row, tx * vec + i], T.float32) * scale,
++                        T.bfloat16,
++                    )
++            else:
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
++
++    return engram_resident_lookup
++
++
++def resident_lookup_calls(
++    shard_rows: int, shard_start: int, shard_end: int, columns: int = (1 << HEADS) - 1
++) -> list[prepare.TileLangCall]:
++    """The kernel call ``engram_resident_lookup`` makes for a resident shard of
++    ``shard_rows`` rows covering ``[shard_start, shard_end)`` and the hash columns
++    in the mask ``columns``."""
++    return [
++        prepare.call(
++            engram_resident_lookup_kernel, shard_rows, shard_start, shard_end, columns
++        ),
++    ]
++
++
++def engram_resident_lookup(
++    ids: torch.Tensor,
++    num_tokens: torch.Tensor,
++    weight: torch.Tensor,
++    scales: torch.Tensor,
++    out: torch.Tensor,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++) -> None:
++    """Dequantize the first ``num_tokens`` tokens' resident Engram rows from ``weight``
++    and ``scales`` into ``out`` ([tokens, columns * 256] BF16) and zero any trailing
++    rows up to ``out.shape[0]``."""
++    tokens = out.shape[0]
++    if tokens:
++        kernel = engram_resident_lookup_kernel(
++            weight.shape[0], shard_start, shard_end, columns
++        )
++        kernel(ids[:tokens], num_tokens, weight, scales.view(torch.uint8), out)
++
+-- 
+2.54.0 (Apple Git-157)
+
