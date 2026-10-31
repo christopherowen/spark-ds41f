@@ -1450,9 +1450,18 @@ def split_findings(findings: list[str]) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
-LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "install 64kb page kernel",
+        "sudo apt-get install "
+        "linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 "
+        "linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 "
+        "linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 "
+        "linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 "
+        "linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k && "
+        'uuid=$(findmnt -n -o UUID /) && echo "GRUB_DEFAULT=\\"gnulinux-advanced-$uuid>'
+        'gnulinux-7.0.0-1019-nvidia-64k-advanced-$uuid\\"" | '
+        "sudo tee /etc/default/grub.d/zz-spark-kernel-trial.cfg && sudo update-grub",
         (
             "64 KiB package versions differ",
             "missing or empty /boot/",
@@ -1478,6 +1487,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "install memory-saver",
+        "bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh",
         (
             "memory-saver",
             "uvm_leaf_packing",
@@ -1485,6 +1495,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "configure swap",
+        "sudo bash experiments/2026-10-02-kernel-64k/install-boot-support.sh",
         (
             "64 KiB swap",
             "64 KiB THP/reserve policy",
@@ -1493,6 +1504,13 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "configure nvme sleep settings",
+        "echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms && "
+        "echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms && "
+        'for c in /sys/class/nvme/nvme*; do t=$(cat "$c/power/pm_qos_latency_tolerance_us"); '
+        'echo $((t - 1)) | sudo tee "$c/power/pm_qos_latency_tolerance_us" >/dev/null; '
+        'echo "$t" | sudo tee "$c/power/pm_qos_latency_tolerance_us" >/dev/null; done && '
+        'echo "options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000" '
+        "| sudo tee /etc/modprobe.d/nvme-apst.conf && sudo update-initramfs -u",
         (
             "sleeps in PS",
             "NVMe APST",
@@ -1500,6 +1518,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "disable nvme interrupt coalescing",
+        NVME_COALESCING_FIX,
         (
             "NVMe interrupt coalescing",
             "nvidia-nvme-interrupt-coalescing.service",
@@ -1507,6 +1526,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "management port off wireless",
+        "sudo nmcli radio wifi off",
         (
             "Wi-Fi radio is enabled",
             "wireless",
@@ -1514,6 +1534,10 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "install fan-control",
+        f"git clone --branch v{FAN_CONTROL_VERSION} "
+        "https://github.com/christopherowen/dgx-spark-fan-control.git && "
+        "cd dgx-spark-fan-control && sudo ./install.sh && "
+        "sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k",
         (
             "dgx-spark-fan-control",
             "fan-control DKMS",
@@ -1524,12 +1548,14 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "set cpu governor to performance",
+        "sudo systemctl restart nv-cpu-governor.service",
         (
             "CPU governors differ from performance",
         ),
     ),
     (
         "disable idle desktop services and boot splash",
+        "scripts/host-recovery apply",
         (
             "enabled or running, though unused on a headless inference node",
             "boots to graphical.target",
@@ -1539,6 +1565,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "enable nvidia-drm modeset",
+        "sudo apt-get purge -y nvidia-drm-options-modeset0 && sudo update-initramfs -u -k all",
         (
             "nvidia-drm modeset",
             "nvidia-drm fbdev",
@@ -1547,6 +1574,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "put installed OS first in UEFI boot order",
+        "efibootmgr && sudo efibootmgr --bootorder <ubuntu-entry>,<remaining-entries>",
         (
             "UEFI boots",
             "UEFI boot order",
@@ -1554,6 +1582,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "defragment model weight shards",
+        "bin/spark doctor --fragmentation-commands",
         (
             "weight shards are not at ext4's best extent count",
             "weight fragmentation:",
@@ -1563,8 +1592,8 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 def summarize_live_warnings(warnings: list[str]) -> list[str]:
-    """Group low-level live warnings into concise user recommendations."""
-    grouped: dict[str, dict[str, None]] = {label: {} for label, _ in LIVE_RECOMMENDATION_RULES}
+    """Group low-level live warnings into concise user recommendations with commands."""
+    grouped: dict[str, dict[str, None]] = {label: {} for label, _, _ in LIVE_RECOMMENDATION_RULES}
     matched_labels: dict[str, None] = {}
     passthrough: list[str] = []
     for warning in warnings:
@@ -1573,7 +1602,7 @@ def summarize_live_warnings(warnings: list[str]) -> list[str]:
         node, separator, detail = warning.partition(": ")
         text = detail if separator else warning
         matched = False
-        for label, patterns in LIVE_RECOMMENDATION_RULES:
+        for label, _, patterns in LIVE_RECOMMENDATION_RULES:
             if any(pattern in warning or pattern in text for pattern in patterns):
                 matched_labels[label] = None
                 if separator and node != "weight fragmentation":
@@ -1583,12 +1612,12 @@ def summarize_live_warnings(warnings: list[str]) -> list[str]:
         if not matched:
             passthrough.append(Warn(warning))
     summary: list[str] = []
-    for label, _ in LIVE_RECOMMENDATION_RULES:
+    for label, command, _ in LIVE_RECOMMENDATION_RULES:
         if label not in matched_labels:
             continue
         nodes = list(grouped[label])
         suffix = f" ({', '.join(nodes)})" if nodes else ""
-        summary.append(Warn(f"recommend: {label}{suffix}"))
+        summary.append(Warn(f"recommend: {label}{suffix} -> run: {command}"))
     summary.extend(passthrough)
     return summary
 
