@@ -7,12 +7,13 @@ the vLLM container.
 The policy has five deliberately narrow responsibilities:
 
 1. arm the Spark's existing SBSA hardware watchdog through systemd;
-2. preserve a small amount of reclaim protection for SSH and Tailscale;
+2. preserve a small amount of reclaim protection for SSH (and Tailscale when
+   installed);
 3. prevent a handful of stuck pre-authentication SSH children from exhausting
    the listener;
-4. check the local SSH listener and Tailscale control socket once per minute,
-   restarting only the affected management service when it is unresponsive;
-   and
+4. check the local SSH listener (and Tailscale control socket when enabled) once
+   per minute, restarting only the affected management service when it is
+   unresponsive; and
 5. bound Plymouth's multi-user boot gate so a missing display-manager quit event
    cannot leave an otherwise healthy host indefinitely stuck in `starting`.
 

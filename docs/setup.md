@@ -113,8 +113,9 @@ It installs a narrow management-plane policy ([host/recovery](../host/recovery/R
 
 - systemd feeds the SBSA hardware watchdog, which reboots only after a real
   system stall;
-- SSH and Tailscale get a little reclaim protection and strongly negative OOM
-  scores, and a once-a-minute timer restarts either if it stops answering;
+- SSH (and Tailscale, when installed) get a little reclaim protection and
+  strongly negative OOM scores, and a once-a-minute timer restarts either if it
+  stops answering;
 - Plymouth's boot gate is bounded, and `splash` is removed from the kernel
   command line, so an attached display shows a text console;
 - the display manager (`gdm3`) and unused desktop services are disabled
