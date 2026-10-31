@@ -1390,14 +1390,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
             profile_warnings = kernel_readiness.profile_problems(
                 node["name"], inventory, kernel_profile, trial
             )
-            swap_warnings = (
-                [f"{node['name']}: 64 KiB swap or boot memory service is not active"]
-                if inventory.get("swap_64k_ready") is False
-                else []
-            )
             problems.extend(
                 Warn(warning)
-                for warning in dict.fromkeys([*warnings, *profile_warnings, *swap_warnings])
+                for warning in dict.fromkeys([*warnings, *profile_warnings])
             )
             corrections.extend(fixes)
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
