@@ -1,0 +1,473 @@
+From 7d420a660207bfba4f08cf712a121a49a669515e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:12:24 +0100
+Subject: [PATCH] [DSv4.1] Fuse shared-expert SwiGLU MXFP8 cast and reuse
+ q_cast in indexer.wq_b
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  37 ++++++
+ .../test_deepseek_v41_tilelang_activation.py  |  24 ++++
+ vllm/models/deepseek_v4/nvidia/model.py       |   5 +
+ vllm/models/deepseek_v4_1/attention.py        |  38 +++++-
+ vllm/models/deepseek_v4_1/kernels.py          |  13 ++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   8 +-
+ .../deepseek_v4_1/tilelang/activation.py      | 108 ++++++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  22 ++++
+ 8 files changed, 236 insertions(+), 19 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 7a5aa4ce4..44bc43264 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -350,6 +350,43 @@ def test_block32_split_cannot_read_a_producers_cast(default_vllm_config):
+         narrow.declare_kernels()
+ 
+ 
++def test_slice_mxfp8_feeds_row_range(default_vllm_config, n=4096, k=1280):
++    """``slice_mxfp8`` hands a row sub-range of ``q_cast`` to ``indexer.wq_b``
++    without re-running ``per_token_cast``, matching a fresh cast bit for bit."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangBlock32Rows,
++        cast_mxfp8,
++        provide_mxfp8,
++        slice_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, _ = _block32_weight(n, k, 11)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    casting = TileLangBlock32Rows(layer, 0)
++    casting.declare_kernels()
++    fed = TileLangBlock32Rows(layer, 0)
++    fed.tilelang_mxfp8_input = True
++    fed.declare_kernels()
++    x = torch.randn((300, k), generator=_gen(12), device=DEVICE).bfloat16()
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for total, first, last in (
++            (6, 0, 6),
++            (64, 16, 48),
++            (120, 96, 120),
++            (300, 75, 150),
++        ):
++            full_cast = cast_mxfp8(x[:total])
++            sub = x[first:last]
++            expected = casting(sub)
++            with provide_mxfp8(slice_mxfp8(full_cast, first, last)):
++                assert torch.equal(fed(sub), expected), (total, first, last)
++
++
+ # The router splits K eight ways; (100, 200) cannot split.
+ @pytest.mark.parametrize("n, k", [(384, 5120), (100, 200)])
+ @pytest.mark.parametrize("rows", [7, 65])
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_activation.py b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+index 80b5cd735..012895ab7 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_activation.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+@@ -24,6 +24,7 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.activation import (  # noqa: E402
+     SiluAndMulClampFP32,
+ )
++from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8  # noqa: E402
+ 
+ 
+ def _reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+@@ -76,3 +77,26 @@ def test_nonfinite_like_the_reference():
+     ref = _reference(gate_up, limit)
+     assert_same_nonfinite(out, ref)
+     assert_finite_equal(out, ref)
++
++
++@pytest.mark.parametrize("rows", [1, 6, 96, 2024])
++@pytest.mark.parametrize("n", [512, 576])
++def test_forward_with_cast_matches_separate_cast(rows, n):
++    """Fusing the MXFP8 cast into ``SiluAndMulClampFP32`` produces the exact BF16
++    output and ``per_token_cast`` E4M3/UE8M0 bytes of the separate path."""
++    limit = 10.0
++    generator = torch.Generator(device="cuda").manual_seed(100 + rows + n)
++    gate_up = (
++        torch.randn(rows, 2 * n, generator=generator, device="cuda") * 6
++    ).bfloat16()
++    act = SiluAndMulClampFP32(limit, width=n, cast=True)
++    out, out_q = act.forward_with_cast(gate_up)
++    ref_out = _reference(gate_up, limit)
++    ref_q = cast_mxfp8(ref_out)
++    assert torch.equal(out, ref_out)
++    assert out_q.values.shape == ref_q.values.shape
++    assert out_q.scales.shape == ref_q.scales.shape
++    assert torch.equal(out_q.values[:rows].view(torch.uint8), ref_q.values[:rows].view(torch.uint8))
++    assert torch.equal(
++        out_q.scales[:rows, : n // 32], ref_q.scales[:rows, : n // 32]
++    )
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index a5a36f12a..327481848 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -160,6 +160,11 @@ class DeepseekV4MLP(nn.Module):
+ 
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
++        if getattr(self.down_proj, "tilelang_mxfp8_input", False):
++            x, x_q = self.act_fn.forward_with_cast(gate_up)
++            with self.act_fn.provide_cast(x_q):
++                x, _ = self.down_proj(x)
++            return x
+         x = self.act_fn(gate_up)
+         x, _ = self.down_proj(x)
+         return x
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d127ae810..2a99b2aee 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -170,6 +170,7 @@ class DeepseekV4Indexer(nn.Module):
+             prefix=f"{prefix}.wq_b",
+         )
+         _native_linear(self.wq_b)
++        self.wq_b.tilelang_mxfp8_input = True
+         self.weights_proj = ReplicatedLinear(
+             hf.hidden_size,
+             hf.index_n_heads,
+@@ -896,24 +897,53 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 first = split.start if split is not None else 0
+                 last = first + split.real_rows if split is not None else rows
+                 query = self._index_query(
+-                    qr, positions, hidden_states, index_weights, first, last, swa
++                    qr,
++                    positions,
++                    hidden_states,
++                    index_weights,
++                    first,
++                    last,
++                    swa,
++                    q_cast=q_cast,
+                 )
+                 reference = None
+                 if split is not None and _INDEX_SPLIT_CHECK:
+                     reference = self._index_query(
+-                        qr, positions, hidden_states, index_weights, 0, rows, swa
++                        qr,
++                        positions,
++                        hidden_states,
++                        index_weights,
++                        0,
++                        rows,
++                        swa,
++                        q_cast=q_cast,
+                     )
+                 index_query = (*query, split, reference)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
+     def _index_query(
+-        self, qr, positions, hidden_states, index_weights, first, last, swa
++        self,
++        qr,
++        positions,
++        hidden_states,
++        index_weights,
++        first,
++        last,
++        swa,
++        q_cast=None,
+     ):
+         """MXFP4 index queries and scaled head weights for rows [first, last)."""
+         rows = last - first
+         h = self.indexer.heads
+-        iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
++        qr_slice = qr[first:last]
++        cast_slice = (
++            kernels.slice_mxfp8(q_cast, first, last)
++            if q_cast is not None
++            else kernels.cast_mxfp8(qr_slice)
++        )
++        with kernels.mxfp8_inputs(cast_slice):
++            iq = self.indexer.wq_b(qr_slice).view(rows, h, 128)
+         iq = self._rope(iq, positions[first:last], "index_query")
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 9ccc93676..4874d69a7 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -40,7 +40,9 @@ def moe_output_dtype() -> torch.dtype:
+     return torch.float32
+ 
+ 
+-def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
++def shared_expert_activation(
++    act_fn: nn.Module, width: int, *, cast: bool = False
++) -> nn.Module:
+     """The shared expert's clamped SwiGLU on ``width``-wide gate and up halves,
+     at the reference's FP32 product (one BF16 rounding) where vLLM's rounds
+     ``silu(gate)`` first."""
+@@ -49,7 +51,7 @@ def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
+     if isinstance(act_fn, SiluAndMulWithClamp):
+         from .tilelang.activation import SiluAndMulClampFP32
+ 
+-        return SiluAndMulClampFP32(act_fn.swiglu_limit, width)
++        return SiluAndMulClampFP32(act_fn.swiglu_limit, width, cast=cast)
+     return act_fn
+ 
+ 
+@@ -75,6 +77,13 @@ def cast_mxfp8(rows: torch.Tensor):
+     return cast_mxfp8(rows)
+ 
+ 
++def slice_mxfp8(cast, first: int, last: int):
++    """Rows ``[first:last]`` of a producer's ``MXFP8Rows`` without re-casting."""
++    from .tilelang.linear import slice_mxfp8
++
++    return slice_mxfp8(cast, first, last)
++
++
+ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+     """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
+     from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..5e0088db0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -159,13 +159,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+         shared = getattr(self.ffn, "shared_experts", None)
+         if shared is not None:
+             shared.act_fn = kernels.shared_expert_activation(
+-                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
++                shared.act_fn,
++                shared.gate_up_proj.output_size_per_partition // 2,
++                cast=True,
+             )
+         # The mHC entries write these projections' MXFP8 input (the routed
+-        # experts' too): ``forward`` hands it over and they cast nothing.
++        # experts' too), and the shared expert's SwiGLU writes down_proj's:
++        # ``forward`` hands them over and the projections cast nothing.
+         self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
+         if shared is not None:
+             shared.gate_up_proj.tilelang_mxfp8_input = True
++            shared.down_proj.tilelang_mxfp8_input = True
+ 
+         # A CED decoder layer routes the compact decoder rows, whose padding
+         # mask differs from the step's. Tag its router by layer, never by the
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index ceaa5f88b..3589b521d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -19,24 +19,77 @@ import torch
+ from torch import nn
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.gemm import (
++    SF_BLOCK,
++    cast_block_mxfp8,
++    scale_words,
++)
++from vllm.models.deepseek_v4_1.tilelang.linear import (
++    MXFP8Rows,
++    empty_mxfp8,
++    provide_mxfp8,
++)
+ 
+ _VEC = 8
++_PASS_CONFIGS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ 
+ 
+-@tilelang.jit
+-def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def swiglu_clamp_kernel(
++    n: int, limit: float, threads: int = 128, *, cast: bool = False
++):
+     """``Y[m, j] = bf16(silu(min(G, limit)) * clamp(U, -limit, limit))`` in FP32, for
+     ``X = [G | U]`` of shape ``[M, 2n]`` (BF16). The clamps compare and select, as
+     ``torch.clamp`` does, so a NaN passes through; ``min``/``max`` (``fminf``,
+-    ``fmaxf``) would return the limit and hide it."""
++    ``fmaxf``) would return the limit and hide it.
++
++    With ``cast=True``, also writes ``Y``'s MXFP8 cast (``Yq``, ``Ysf``) in the same
++    pass for ``shared_experts.down_proj``.
++    """
+     assert n % _VEC == 0
+     M = T.dynamic("M")
+     per_block = threads * _VEC
+ 
++    if not cast:
++
++        @T.prim_func
++        def activation_swiglu_clamp(
++            X: T.Tensor((M, 2 * n), T.bfloat16),
++            Y: T.Tensor((M, n), T.bfloat16),
++        ):
++            with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
++                pdl.chain()
++                col = (bx * threads + T.get_thread_binding()) * _VEC
++                gate = T.alloc_local((_VEC,), T.bfloat16)
++                up = T.alloc_local((_VEC,), T.bfloat16)
++                out = T.alloc_local((_VEC,), T.bfloat16)
++                if col < n:
++                    for v in T.vectorized(_VEC):
++                        gate[v] = X[by, col + v]
++                    for v in T.vectorized(_VEC):
++                        up[v] = X[by, n + col + v]
++                    for v in T.unroll(_VEC):
++                        g = T.alloc_var(T.float32, init=T.Cast(T.float32, gate[v]))
++                        u = T.alloc_var(T.float32, init=T.Cast(T.float32, up[v]))
++                        g = T.if_then_else(g > limit, T.float32(limit), g)
++                        u = T.if_then_else(u > limit, T.float32(limit), u)
++                        u = T.if_then_else(u < -limit, T.float32(-limit), u)
++                        out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
++                    for v in T.vectorized(_VEC):
++                        Y[by, col + v] = out[v]
++
++        return activation_swiglu_clamp
++
++    assert n % SF_BLOCK == 0
++    sf_width = 4 * scale_words(n)
++    Mq = T.dynamic("Mq")
++
+     @T.prim_func
+     def activation_swiglu_clamp(
+         X: T.Tensor((M, 2 * n), T.bfloat16),
+         Y: T.Tensor((M, n), T.bfloat16),
++        Yq: T.Tensor((Mq, n), T.float8_e4m3fn),
++        Ysf: T.Tensor((Mq, sf_width), T.uint8),
+     ):
+         with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
+             pdl.chain()
+@@ -44,6 +97,10 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+             gate = T.alloc_local((_VEC,), T.bfloat16)
+             up = T.alloc_local((_VEC,), T.bfloat16)
+             out = T.alloc_local((_VEC,), T.bfloat16)
++            xf = T.alloc_local((_VEC,), T.float32)
++            xq = T.alloc_local((_VEC,), T.float8_e4m3fn)
++            amax = T.alloc_local((1,), T.float32)
++            amax[0] = T.float32(0)
+             if col < n:
+                 for v in T.vectorized(_VEC):
+                     gate[v] = X[by, col + v]
+@@ -56,15 +113,21 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+                     u = T.if_then_else(u > limit, T.float32(limit), u)
+                     u = T.if_then_else(u < -limit, T.float32(-limit), u)
+                     out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
++                    xf[v] = T.Cast(T.float32, out[v])
++                    amax[0] = T.max(amax[0], T.abs(xf[v]))
+                 for v in T.vectorized(_VEC):
+                     Y[by, col + v] = out[v]
++            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
++            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
++            if col < n:
++                cast_block_mxfp8(xf, xq, _VEC, amax[0], Yq, Ysf, by, col)
+ 
+     return activation_swiglu_clamp
+ 
+ 
+ @cache
+-def _kernel(n: int, limit: float):
+-    return swiglu_clamp_kernel(n, limit)
++def _kernel(n: int, limit: float, cast: bool = False):
++    return swiglu_clamp_kernel(n, limit, cast=cast)
+ 
+ 
+ class SiluAndMulClampFP32(nn.Module):
+@@ -72,30 +135,53 @@ class SiluAndMulClampFP32(nn.Module):
+ 
+     ``width`` is the gate (and up) width its owner runs it on, ``[M, 2 * width]``
+     inputs; the module declares that kernel. Without it (kernel tests) nothing is
+-    declared.
++    declared. With ``cast=True``, ``forward_with_cast`` also writes the output's
++    MXFP8 cast for ``down_proj`` in the same kernel launch.
+     """
+ 
+-    def __init__(self, swiglu_limit: float, width: int | None = None):
++    provide_cast = staticmethod(provide_mxfp8)
++
++    def __init__(
++        self,
++        swiglu_limit: float,
++        width: int | None = None,
++        *,
++        cast: bool = False,
++    ):
+         super().__init__()
+         self.limit = float(swiglu_limit)
+         self.width = width
++        self.cast = cast
+ 
+     def declare_kernels(self) -> None:
+         """Declare the kernel of the owner's width, and keep it in ``_kernel``."""
+         if self.width is None:
+             return
+-        width, limit = self.width, self.limit
++        width, limit, cast = self.width, self.limit, self.cast
+         prepare.declare(
+-            lambda: [prepare.call(swiglu_clamp_kernel, width, limit)],
+-            bind=lambda: _kernel(width, limit),
++            lambda: [prepare.call(swiglu_clamp_kernel, width, limit, cast=cast)],
++            bind=lambda: _kernel(width, limit, cast),
+         )
+ 
++    def forward_with_cast(
++        self, gate_up: torch.Tensor
++    ) -> tuple[torch.Tensor, MXFP8Rows]:
++        n = gate_up.shape[-1] // 2
++        x = gate_up.reshape(-1, 2 * n).contiguous()
++        out = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
++        out_q = empty_mxfp8(out)
++        if x.shape[0]:
++            _kernel(n, self.limit, True)(x, out, out_q.values, out_q.scales)
++        return out.view(*gate_up.shape[:-1], n), out_q
++
+     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
++        if self.cast:
++            return self.forward_with_cast(gate_up)[0]
+         n = gate_up.shape[-1] // 2
+         x = gate_up.reshape(-1, 2 * n).contiguous()
+         out = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
+         if x.shape[0]:
+-            _kernel(n, self.limit)(x, out)
++            _kernel(n, self.limit, False)(x, out)
+         return out.view(*gate_up.shape[:-1], n)
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 071f67d7a..2ee53f5ef 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -143,6 +143,27 @@ def cast_mxfp8(rows: torch.Tensor) -> MXFP8Rows:
+     return out
+ 
+ 
++def slice_mxfp8(cast: MXFP8Rows, first: int, last: int) -> MXFP8Rows:
++    """Rows ``[first:last]`` of ``cast``, padded to ``mxfp8_rows(last - first)``
++    without re-running ``per_token_cast``."""
++    if first == 0 and last == cast.rows.shape[0]:
++        return cast
++    rows = cast.rows[first:last]
++    m = rows.shape[0]
++    padded = mxfp8_rows(m)
++    if first + padded <= cast.values.shape[0]:
++        return MXFP8Rows(
++            rows,
++            cast.values[first : first + padded],
++            cast.scales[first : first + padded],
++        )
++    out = empty_mxfp8(rows)
++    if m:
++        out.values[:m].copy_(cast.values[first:last])
++        out.scales[:m].copy_(cast.scales[first:last])
++    return out
++
++
+ # The MXFP8 rows handed to the projections of the calls in progress, innermost last.
+ _PROVIDED: list[MXFP8Rows] = []
+ 
+@@ -802,4 +823,5 @@ __all__ = [
+     "project_parts",
+     "provide_mxfp8",
+     "provided_mxfp8",
++    "slice_mxfp8",
+ ]
+-- 
+2.54.0 (Apple Git-157)
+
