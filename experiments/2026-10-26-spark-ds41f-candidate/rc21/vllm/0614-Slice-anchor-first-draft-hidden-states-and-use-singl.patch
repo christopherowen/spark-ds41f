@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:43:27 +0100
+Subject: [PATCH 614/615] Slice anchor-first draft hidden states and use
+ single-stage decode GEMM for Markov head
+
+In DSparkSpeculator._sample_sequential and _sample_sequential_topk, when
+sample_from_anchor is True (num_query_per_req == num_speculative_steps),
+each request's query block has no leading anchor row and
+head_hidden[:num_sample] is already contiguous in (req, step) order.
+Slicing head_hidden[:num_sample] directly (and skipping
+gather_hidden_rows_calls registration when sample_from_anchor is True)
+eliminates a redundant gather_hidden_rows kernel launch and up to 800 KB
+of HBM copy traffic per decode step.
+
+In addition, when a BF16 vocabulary head tile covers the entire K
+dimension in a single block (k <= block_K, such as DSpark's K=256
+markov_w2 projection at block_M=16 and block_M=32), compile it with
+bf16_gemm_decode (TL_DISABLE_WARP_SPECIALIZED=True) and num_stages=1.
+A 1-iteration K loop has no second pipeline stage to overlap; disabling
+warp specialization and 2-stage shared-memory double-buffering avoids
+producer/consumer mbarrier overhead and halves shared memory per CTA
+(40 KB vs 80 KB), doubling SM occupancy on GB10 from 1 CTA/SM to 2
+CTAs/SM while preserving bit-exact FP32 accumulation across all tiles.
+---
+ tests/v1/worker/test_dspark_greedy_markov.py  | 20 +++++++++----
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  9 ++++--
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  7 +++--
+ .../gpu/spec_decode/dspark/speculator.py      | 30 +++++++++++++------
+ 4 files changed, 47 insertions(+), 19 deletions(-)
+
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 8d6e9c358..1b248db97 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -14,17 +14,23 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+ )
+ 
+ 
++@pytest.mark.parametrize("sample_from_anchor", [False, True])
+ @pytest.mark.parametrize("needs_distribution", [False, True])
+ def test_sequential_sharded_sampling_preserves_each_token(
+-    needs_distribution, monkeypatch
++    sample_from_anchor, needs_distribution, monkeypatch
+ ):
+     from vllm.v1.worker.gpu import tilelang_inputs
+     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ 
++    gather_calls = 0
++
++    def gather(source, indices):
++        nonlocal gather_calls
++        gather_calls += 1
++        return source[indices]
++
+     # The heads' TileLang row gather (its own GPU test) as torch, on the host.
+-    monkeypatch.setattr(
+-        tilelang_inputs, "gather_hidden_rows", lambda source, indices: source[indices]
+-    )
++    monkeypatch.setattr(tilelang_inputs, "gather_hidden_rows", gather)
+ 
+     shared = torch.zeros(2, dtype=torch.int64)
+     seen_anchors = []
+@@ -49,6 +55,7 @@ def test_sequential_sharded_sampling_preserves_each_token(
+     spec = SimpleNamespace(
+         _draft_topk=None,
+         num_speculative_steps=2,
++        sample_from_anchor=sample_from_anchor,
+         model=model,
+         sample_indices=torch.arange(4),
+         sample_idx_mapping=torch.tensor([0, 0, 1, 1]),
+@@ -64,7 +71,10 @@ def test_sequential_sharded_sampling_preserves_each_token(
+     spec._vocab_parallel_greedy = MethodType(
+         DSparkSpeculator._vocab_parallel_greedy, spec
+     )
+-    DSparkSpeculator._sample_sequential(spec, 2, torch.zeros(4, 8))
++    hidden = torch.arange(48, dtype=torch.float32).reshape(6, 8)
++    DSparkSpeculator._sample_sequential(spec, 2, hidden)
++    assert gather_calls == (0 if sample_from_anchor else 1)
++    assert torch.equal(model.compute_local_draft_logits.call_args.args[0], hidden[:4])
+     assert spec.draft_tokens.tolist() == [[0, 1], [0, 1]]
+     assert [ids.tolist() for ids in seen_anchors] == [[5, 9], [0, 0]]
+     assert model.sample_local_draft_logits.call_count == (
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c6941b300..40f942203 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -554,8 +554,7 @@ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128
+     return gemm_splitk_reduce_cast
+ 
+ 
+-@tilelang.jit
+-def bf16_gemm(
++def _bf16_gemm(
+     N: int,
+     K: int,
+     block_M: int = 64,
+@@ -628,6 +627,12 @@ def bf16_gemm(
+     return gemm_bf16
+ 
+ 
++bf16_gemm = tilelang.jit(_bf16_gemm)
++bf16_gemm_decode = tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++)(_bf16_gemm)
++
++
+ # Not warp-specialized: a producer warp's scale stores would reach the consumers only
+ # through the copy barriers, which order the asynchronous copies alone (graph replays
+ # gave other bits).
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index ff773660e..c6a8ab9c0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -25,7 +25,7 @@ import torch
+ from torch import nn
+ 
+ from . import prepare
+-from .gemm import bf16_gemm
++from .gemm import bf16_gemm, bf16_gemm_decode
+ 
+ GROUP = 128  # columns per code group
+ HALF = GROUP // 2  # one code byte holds a column of each half
+@@ -566,12 +566,13 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+         config = dict(BF16_HEAD_CONFIGS[block_M])
+         if k % config["block_K"]:
+             config["block_K"] = 64
++        single_k_block = k <= config["block_K"]
+         kernels[block_M] = prepare.call(
+-            bf16_gemm,
++            bf16_gemm_decode if single_k_block else bf16_gemm,
+             n,
+             k,
+             block_M=block_M,
+-            num_stages=2,
++            num_stages=1 if single_k_block else 2,
+             out_dtype=_OUT[out_dtype],
+             **config,
+         )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index fd3604f33..bae921dbb 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -293,11 +293,12 @@ class DSparkSpeculator(DFlashSpeculator):
+                 output_stride=self.draft_tokens.stride(0),
+                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
+             )
+-        tilelang_inputs.declare(
+-            lambda: tilelang_inputs.gather_hidden_rows_calls(
+-                self.hidden_states.dtype, self.hidden_states.shape[1]
++        if not getattr(self, "sample_from_anchor", False):
++            tilelang_inputs.declare(
++                lambda: tilelang_inputs.gather_hidden_rows_calls(
++                    self.hidden_states.dtype, self.hidden_states.shape[1]
++                )
+             )
+-        )
+         table = self._markov_table()
+         if table is not None:
+             from vllm.v1.worker.gpu.sample import tilelang_sampling
+@@ -333,9 +334,16 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Sequential Markov sampling over the backbone's output hidden states.
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+-        # Per-(req, position) head hidden, ordered (req, step).
+-        sample_hidden = tilelang_inputs.gather_hidden_rows(
+-            head_hidden, self.sample_indices[:num_sample]
++        # Per-(req, position) head hidden, ordered (req, step). When
++        # sample_from_anchor is True, each request's query block has exactly
++        # n_spec rows and head_hidden[:num_sample] is already contiguous in
++        # (req, step) order.
++        sample_hidden = (
++            head_hidden[:num_sample]
++            if getattr(self, "sample_from_anchor", False)
++            else tilelang_inputs.gather_hidden_rows(
++                head_hidden, self.sample_indices[:num_sample]
++            )
+         )
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+@@ -468,8 +476,12 @@ class DSparkSpeculator(DFlashSpeculator):
+         assert self._draft_topk is not None
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+-        sample_hidden = tilelang_inputs.gather_hidden_rows(
+-            head_hidden, self.sample_indices[:num_sample]
++        sample_hidden = (
++            head_hidden[:num_sample]
++            if getattr(self, "sample_from_anchor", False)
++            else tilelang_inputs.gather_hidden_rows(
++                head_hidden, self.sample_indices[:num_sample]
++            )
+         )
+         base_logits = self.model.compute_draft_logits(sample_hidden)
+         base_logits = base_logits.view(num_reqs, n_spec, -1)
