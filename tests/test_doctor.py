@@ -1116,6 +1116,12 @@ class GLPTest(unittest.TestCase):
 
 class NewUserOnboardingTest(unittest.TestCase):
     def test_missing_node_map_prints_setup_guidance_for_each_shape(self) -> None:
+        general = spark.missing_nodes_message()
+        self.assertIn("no site node map is configured", general)
+        self.assertNotIn("is missing: run", general)
+        self.assertIn("cp config/examples/nodes-switched.json config/nodes-switched.local.json", general)
+        self.assertIn("cp config/examples/nodes-ring4.json config/nodes-ring4.local.json", general)
+        self.assertIn("cp config/nodes.example.json config/nodes.json", general)
         self.assertIn("cp config/nodes.example.json config/nodes.json",
                       spark.missing_nodes_message("config/nodes.json"))
         self.assertIn("cp config/examples/nodes-ring4.json config/nodes-ring4.local.json",
