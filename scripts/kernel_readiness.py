@@ -124,6 +124,10 @@ def collect(policy):
     data["min_free_kbytes"] = read("memory reserve", "cat", "/proc/sys/vm/min_free_kbytes")
     swaps = read("active swap", "cat", "/proc/swaps")
     data["active_swap"] = [line.split()[0] for line in swaps.splitlines()[1:] if line.split()]
+    data["swap_64k_ready"] = (
+        Path("/swap-64k.img").is_file()
+        and Path("/etc/systemd/system/spark-ds41f-kernel-memory.service").is_file()
+    )
     if data["page_size"] == 65536:
         unit = memory_policy_unit()
         data["memory_service"] = "active" if unit else ""
