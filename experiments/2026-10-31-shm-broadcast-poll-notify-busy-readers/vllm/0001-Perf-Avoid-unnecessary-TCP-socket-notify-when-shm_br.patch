@@ -1,0 +1,89 @@
+From ec467e80ea95cdfde9954a2d3f8f5dd644156adc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:17:43 +0100
+Subject: [PATCH] [Perf] Avoid unnecessary TCP socket notify when shm_broadcast
+ readers are already busy-polling (#61844)
+
+---
+ tests/distributed/test_shm_broadcast.py       | 27 +++++++++++++++++++
+ .../device_communicators/shm_broadcast.py     | 12 +++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/tests/distributed/test_shm_broadcast.py b/tests/distributed/test_shm_broadcast.py
+index ef7f523b7..6997849f7 100644
+--- a/tests/distributed/test_shm_broadcast.py
++++ b/tests/distributed/test_shm_broadcast.py
+@@ -602,6 +602,33 @@ def test_reader_rechecks_shm_after_idle_wait_timeout_without_notify():
+             socket.close(linger=0)
+ 
+ 
++def test_busy_reader_consumes_write_notifications():
++    """A reader that never goes idle must still service its notify socket,
++    otherwise libzmq queues a command per notification and memory grows with
++    every message read.
++    """
++    writer = MessageQueue(
++        n_reader=1,
++        n_local_reader=1,
++        max_chunk_bytes=1024,
++        max_chunks=1,
++    )
++    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
++    notify_socket = reader._spin_condition.local_notify_socket
++    try:
++        writer.wait_until_ready()
++        reader.wait_until_ready()
++
++        writer.enqueue("payload")
++        assert notify_socket.poll(timeout=5000)
++        with mock.patch.object(shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", 0):
++            assert reader.dequeue(timeout=5) == "payload"
++        assert not notify_socket.poll(timeout=0)
++    finally:
++        writer.shutdown()
++        reader.shutdown()
++
++
+ def test_acquire_read_releases_slot_when_reader_raises():
+     writer = MessageQueue(
+         n_reader=1,
+diff --git a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+index c930438da..78e848d6f 100644
+--- a/vllm/distributed/device_communicators/shm_broadcast.py
++++ b/vllm/distributed/device_communicators/shm_broadcast.py
+@@ -65,6 +65,10 @@ VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
+ # written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
+ # wakeup stays negligible (one flag check per reader every 5s).
+ SHM_READER_RECHECK_INTERVAL_MS = 5000
++# How often a busy reader polls its notify socket. CONFLATE keeps one message,
++# but libzmq still queues an internal command per notification until the socket
++# is polled, so a reader that never goes idle would grow without bound.
++SHM_NOTIFY_POLL_INTERVAL_S = 2.0
+ 
+ 
+ from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
+@@ -139,6 +143,8 @@ class SpinCondition:
+         if is_reader:
+             # Time of last shm buffer read
+             self.last_read = time.monotonic()
++            # Time a busy reader last polled the notify socket
++            self.last_notify_poll = self.last_read
+ 
+             # Time to keep busy-looping on the shm buffer before going idle
+             self.busy_loop_s = busy_loop_s
+@@ -181,6 +187,12 @@ class SpinCondition:
+ 
+     def record_read(self):
+         self.last_read = time.monotonic()
++        if self.last_read - self.last_notify_poll >= SHM_NOTIFY_POLL_INTERVAL_S:
++            self.last_notify_poll = self.last_read
++            # poll() makes libzmq process the queued commands; a bare recv()
++            # returns the pending message without doing so.
++            if self.local_notify_socket.poll(timeout=0):
++                self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
+ 
+     def cancel(self):
+         # Sends cancellation ping that will cause the reader to wake up.
+-- 
+2.54.0 (Apple Git-157)
+
