@@ -1,0 +1,20 @@
+# Fuse DSpark Context Joins/Casts and Markov Greedy Pairs with SWAR/PDL (`rc21`)
+
+## Overview
+Implements **Part 2, Items 7 & 8** of the TileLang kernel-fusion roadmap on `rc21` (`a89da720d`), combining DSpark context preparation fusion and Markov greedy bias+argmax fusion with the best vocabulary-head and PDL optimizations from PRs `#771`, `#773`, `#781`, `#784`, and `#812`:
+
+1. **DSpark Context Preparation Fusion (Part 2, Item 7 + Best of PR `#773`)**:
+   - **Fused Eager Join + MXFP8 Cast (`join_columns_and_cast_mxfp8`)**: In `vllm/models/deepseek_v4_1/tilelang/columns.py` and `DSparkDeepseekV4Model.combine_aux_hidden_states_into`, joins the 3 5,120-column BF16 target auxiliary hidden states side-by-side into `joined` while computing each 32-value block's UE8M0 scale and E4M3 codes in registers and emitting `MXFP8Rows(values, scales)` in the same launch.
+   - **Producer-Provided MXFP8 for `main_proj` (`optional_provided_mxfp8`)**: `vllm/models/deepseek_v4_1/tilelang/linear.py` consumes `joined_cast` in `_block32_linear`, avoiding the standalone `per_token_cast(15360)` launch and 15,360-column DRAM round-trip.
+   - **Fused `main_norm.forward_with_cast`**: `TileLangRMSNorm(with_cast=True)` (`vllm/models/deepseek_v4_1/tilelang/norm.py` + `pdl.norm_forward_and_per_token_cast`) emits both BF16 `main_x` and its `MXFP8Rows` (`_context_main_cast`) in one launch inside `combine_hidden_states` (used by both `DSparkContextCudaGraphs._forward` and eager `combine_aux_hidden_states_into`), eliminating `kernels.cast_mxfp8(main_x)` in `precompute_and_store_context_kv`.
+   - **PDL Chaining on DSpark Context & Column Kernels (PR `#773`)**: Adds `pdl.chain()` to `copy_columns_kernel`, `zero_packs_kernel`, `split_columns_kernel`, `join_columns_and_cast_mxfp8_kernel`, and `dspark_context.context_inputs_kernel`.
+
+2. **Fused DSpark Markov Greedy Bias + Argmax & Packed Vocab Optimizations (Part 2, Item 8 + Best of PRs `#771`, `#781`, `#784`, & `#812`)**:
+   - **Fused `bf16_vocab_markov_greedy_partials` + `vocab_greedy_finish_kernel` (`project_head_markov_greedy_pairs`)**: Computes `markov_embed @ W2.T` via `T.gemm`, adds `base_logits[:, i]` in registers, and reduces per-tile `(max_value, min_index)` partials in SMEM without materializing the `[num_reqs, shard_vocab]` BF16 `bias` tensor to DRAM. Wired into `DSparkSpeculator._sample_sequential` for both `vocab_parallel` (`TP > 1`) and single-rank (`TP == 1`).
+   - **SWAR Packed-BF16 Decode + Preloaded Exception Loop + `C_round` Fragment Rounding (PRs `#781` & `#812`)**: Replaces scalar 12-bit packed-BF16 bitfield unpacking with branchless `uint32` SWAR helpers (`vllm_vocab_decode_vec16`), preloads exception entries with predicated inner loops (`has_exceptions` compile-time specialization), and performs BF16 rounding in register fragments (`C_round`) before shared-memory partial reduction.
+   - **64-Row Tile `step_groups=2` & PDL Chaining (PR `#771`)**: Widens 64-row packed vocab projection to `step_groups=2` (`k_step=64`) and adds `pdl.chain()` to `bf16_vocab_markov_greedy_partials` and `vocab_greedy_finish_kernel`.
+   - **Zero-Allocation Workspace Scratch Borrowing (PR `#784`)**: Borrows `partial_values`, `partial_indices`, and `pairs` from `current_workspace_manager()` when available, with persistent layer scratch fallback outside workspace scope, and sets `scratch_pairs=tp_size > 1` so `TP == 1` allocates no pair scratch.
+
+## Verification
+Verified inside `spark-ds41f:19f2c20ed4d6-next-21` on `dgx4`:
+- `pytest --noconftest -p tests.kernels.deepseek_v41_pdl_sources -v tests/kernels/test_deepseek_v41_tilelang_columns.py tests/kernels/test_deepseek_v41_tilelang_dspark_context.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/v1/worker/test_dspark_greedy_markov.py tests/v1/worker/gpu/test_greedy_verification.py tests/v1/worker/test_prepare_kernels.py tests/models/test_deepseek_v4_1_sp_prefill.py` -> **208 passed, 0 PDL violations** (`93 kernels launched, 2 with PDL, 0 violations`).
