@@ -1,0 +1,2324 @@
+From c5e0e29bd0579967a4d6332369ef2ac1e975266e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:53:37 +0100
+Subject: [PATCH] Port per_token_cast, norm_forward, and moe_topk_gate_forward
+ to native TileLang
+
+---
+ .../kernels/test_deepseek_v41_tilelang_pdl.py |  58 +-
+ vllm/models/deepseek_v4_1/tilelang/front.py   |   2 +-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  11 +-
+ vllm/models/deepseek_v4_1/tilelang/norm.py    | 649 ++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/pdl.py     |  39 +-
+ .../deepseek_v4_1/tilelang/quant_common.py    | 911 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 498 +++++++++-
+ 7 files changed, 2119 insertions(+), 49 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/quant_common.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_pdl.py b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+index 898b4774a..4763126c9 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_pdl.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -210,10 +210,10 @@ def _chained(kernel: str) -> bool:
+ 
+ 
+ def test_tile_kernels_chained_through_pdl_only():
+-    """TileKernels' cast is chained when the deployment calls it through ``pdl``
++    """The native cast is chained when the deployment calls it through ``pdl``
+     (a programmatic edge from the torch kernel before it) and not when called
+-    directly; its switch is off again after the call."""
+-    import tile_kernels
++    directly with ``use_pdl=False``."""
++    from vllm.models.deepseek_v4_1.tilelang import quant_common
+ 
+     x = torch.randn((64, 5120), device=DEVICE)
+ 
+@@ -222,8 +222,8 @@ def test_tile_kernels_chained_through_pdl_only():
+         if through_pdl:
+             pdl.per_token_cast(y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True)
+         else:
+-            tile_kernels.quant.per_token_cast(
+-                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++            quant_common.per_token_cast(
++                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True, use_pdl=False
+             )
+ 
+     for through_pdl in (True, False):
+@@ -235,7 +235,53 @@ def test_tile_kernels_chained_through_pdl_only():
+         ]
+         assert len(edges) == 1 and edges[0][0] is not None, edges
+         assert (edges[0][1] == PROGRAMMATIC) == through_pdl, (through_pdl, edges)
+-        assert not tile_kernels.get_pdl()
++
++
++def test_native_cast_norm_gate_match_tile_kernels():
++    """Native TileLang per_token_cast, norm_forward, and moe_topk_gate_forward
++    match TileKernels bit for bit."""
++    import tile_kernels
++
++    gen = torch.Generator(device=DEVICE).manual_seed(42)
++    x = torch.randn((33, 5120), generator=gen, device=DEVICE).bfloat16()
++    weight = (torch.randn(5120, generator=gen, device=DEVICE) * 0.2 + 1.0).bfloat16()
++
++    xq_ours, sf_ours = pdl.per_token_cast(
++        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++    )
++    xq_ref, sf_ref = tile_kernels.quant.per_token_cast(
++        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++    )
++    assert torch.equal(xq_ours.view(torch.uint8), xq_ref.view(torch.uint8))
++    assert torch.equal(sf_ours, sf_ref)
++
++    norm_ours, rstd_ours, _ = pdl.norm_forward(x, weight, 1e-6)
++    norm_ref, rstd_ref, _ = tile_kernels.quant.norm_forward(x, weight, 1e-6)
++    assert torch.equal(norm_ours.view(torch.uint16), norm_ref.view(torch.uint16))
++    assert torch.equal(rstd_ours.view(torch.uint32), rstd_ref.view(torch.uint32))
++
++    logits = torch.randn((33, 384), generator=gen, device=DEVICE, dtype=torch.float32)
++    bias = torch.randn(384, generator=gen, device=DEVICE, dtype=torch.float32) * 0.1
++    ids_ours, w_ours = pdl.moe_topk_gate_forward(
++        logits,
++        6,
++        use_shared_as_routed=False,
++        num_shared_experts=0,
++        routed_scaling_factor=1.5,
++        ep_rank=0,
++        bias=bias,
++    )
++    ids_ref, w_ref = tile_kernels.moe.moe_topk_gate_forward(
++        logits,
++        6,
++        use_shared_as_routed=False,
++        num_shared_experts=0,
++        routed_scaling_factor=1.5,
++        ep_rank=0,
++        bias=bias,
++    )
++    assert torch.equal(ids_ours, ids_ref)
++    assert torch.equal(w_ours.view(torch.uint32), w_ref.view(torch.uint32))
+ 
+ 
+ @pytest.mark.parametrize("launch", ["graph", "eager"])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index 58bac0e86..7fcc59bd3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -89,7 +89,7 @@ def _row_split(hidden: int) -> dict:
+ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
+     """q CTAs (two rows each) then kv CTAs (eight rows each); see the module
+     docstring. ``qa_kv`` is the fused projection's output, q columns first."""
+-    from tile_kernels.quant.common import (
++    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
+         get_cast_output_config,
+         get_sf_and_inv,
+         get_sf_index,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index c8f776295..169ee6307 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1125,7 +1125,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+     expert at a time, about 22 us a call at any decode size (spark-ds41f
+     ``experiments/2026-10-14-moe-swiglu``).
+     """
+-    from tile_kernels.quant.common import (
++    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
+         get_best_vectorize_size,
+         get_cast_output_config,
+         get_sf_and_inv,
+@@ -1407,7 +1407,6 @@ class MoeExpertsV41Plan:
+             )
+             for dtype in self.idx_dtypes
+         }
+-        self.tk = _tile_kernels(block_M)
+ 
+     def _has_prefill_tiles(self) -> bool:
+         return (
+@@ -1626,11 +1625,3 @@ def _present(weights):
+     ``codes`` otherwise.
+     """
+     return tuple(w for w in weights if w is not None)
+-
+-
+-def _tile_kernels(block_M):
+-    import tile_kernels
+-
+-    # Expert segments in the dispatch layout start on block_M rows.
+-    tile_kernels.config.set_token_alignment(block_M)
+-    return tile_kernels
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 7832eb9c1..7a23d3d15 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -1,13 +1,649 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""TileLang RMSNorm for DeepSeek-V4.1, through TileKernels' ``norm_forward``."""
++"""Native TileLang RMSNorm and fused per-token cast for DeepSeek-V4.1."""
+ 
+ import functools
++import math
++from typing import Optional, Union
+ 
++import tilelang
+ import torch
++from tilelang.cuda import language as T
+ from torch import nn
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.quant_common import (
++    CastOutputConfig,
++    QuantTensor,
++    align,
++    alloc_scaling_factors,
++    cast_epilogue,
++    ceil_div,
++    get_cast_output_config,
++    get_packed_ue8m0_pack_factor,
++    get_packed_ue8m0_torch_dtype,
++    get_sf_and_inv,
++    get_sf_index,
++    get_sf_inv_dtype,
++    get_sf_shape,
++)
++
++
++@tilelang.jit
++def get_norm_forward_and_per_token_cast_kernel_cuda(
++    hidden: int,
++    with_weight: bool,
++    with_residual: bool,
++    eps: float,
++    out_scale: float,
++    x_dtype: T.dtype,
++    out_config: CastOutputConfig,
++    with_out_bf16: bool = False,
++    mega_moe_block_m: int = 0,
++    use_pdl: bool = False,
++):
++    assert 0 < hidden <= 8192
++    assert out_config.with_sf or out_config.dtype == x_dtype
++    assert not out_config.with_sf or out_config.sf_block == (1, 32)
++    assert not with_out_bf16 or out_config.with_sf
++
++    # A row is split into 16-byte vectors, thread `row_offset` of the row holds
++    # vectors `vi * row_threads + row_offset`.
++    num_threads = 128
++    num_elems_per_thread = 32
++    vec_size = math.gcd(16 // x_dtype.bytes, hidden)
++    num_vecs = hidden // vec_size
++    row_threads = min(
++        num_threads,
++        max(
++            min(8, tilelang.next_power_of_2(num_vecs)),
++            tilelang.next_power_of_2(ceil_div(hidden, num_elems_per_thread)),
++        ),
++    )
++
++    num_per_channels = out_config.sf_block[1]
++    group_lanes = num_per_channels // vec_size
++    num_sf_cols = ceil_div(hidden, num_per_channels)
++    packed_sf_pad = (
++        out_config.use_packed_ue8m0
++        and out_config.use_tma_aligned_col_major_sf
++        and num_sf_cols % 4 != 0
++    )
++    sf_inv_dtype = get_sf_inv_dtype(x_dtype, out_config)
++    if out_config.with_sf:
++        assert hidden % num_per_channels == 0
++    num_thread_vec = ceil_div(num_vecs, row_threads)
++    block_m = num_threads // row_threads
++    warp_threads = min(32, row_threads)
++    num_row_warps = row_threads // warp_threads
++    row_layout = T.Fragment(
++        (block_m, row_threads), forward_thread_fn=lambda i, j: i * row_threads + j
++    )
++    warp_layout = T.Fragment(
++        (block_m, num_row_warps),
++        forward_thread_fn=lambda i, w, rep: i * row_threads + w * warp_threads + rep,
++        replicate=warp_threads,
++    )
++    warp_reduce_layout = T.Fragment(
++        (block_m, num_row_warps, warp_threads),
++        forward_thread_fn=lambda i, w, j: i * row_threads + w * warp_threads + j,
++    )
++    row_reduce_layout = T.Fragment(
++        (block_m, row_threads, num_row_warps),
++        forward_thread_fn=lambda i, j, w: i * row_threads + j,
++    )
++
++    mega_sf_tile_rows = 128
++    mega_sf_lane_rows = 32
++    mega_sf_cols = mega_sf_tile_rows // mega_sf_lane_rows
++    if mega_moe_block_m > 0:
++        assert (
++            out_config.with_sf
++            and out_config.round_sf
++            and hidden % mega_sf_tile_rows == 0
++        )
++    mega_moe_aligned_block_m = align(mega_moe_block_m, mega_sf_tile_rows)
++
++    batch = T.dynamic("batch")
++    num_tokens = T.dynamic("num_tokens")
++    x_stride = T.dynamic("x_stride")
++    x_batch_stride = T.dynamic("x_batch_stride")
++    out_stride = T.dynamic("out_stride")
++    out_batch_stride = T.dynamic("out_batch_stride")
++    out_bf16_stride = T.dynamic("out_bf16_stride")
++    out_bf16_batch_stride = T.dynamic("out_bf16_batch_stride")
++    residual_stride = T.dynamic("residual_stride")
++    residual_batch_stride = T.dynamic("residual_batch_stride")
++    residual_out_stride = T.dynamic("residual_out_stride")
++    residual_out_batch_stride = T.dynamic("residual_out_batch_stride")
++    out_sf_stride = T.dynamic("out_sf_stride")
++    out_sf_batch_stride = T.dynamic("out_sf_batch_stride")
++    mega_moe_sf_rows = T.dynamic("mega_moe_sf_rows")
++    sf_shape = (
++        get_sf_shape((num_tokens, hidden), out_config) if out_config.with_sf else (1, 1)
++    )
++
++    @T.macro
++    def get_mega_moe_sf_row(token_id: int):
++        i = token_id % mega_moe_block_m
++        return (
++            token_id // mega_moe_block_m * mega_moe_aligned_block_m
++            + i // mega_sf_tile_rows * mega_sf_tile_rows
++            + i % mega_sf_lane_rows * mega_sf_cols
++            + i % mega_sf_tile_rows // mega_sf_lane_rows
++        )
++
++    @T.prim_func
++    def norm_forward_and_per_token_cast_kernel(
++        x: T.StridedTensor[
++            (batch, num_tokens, hidden), (x_batch_stride, x_stride, 1), x_dtype
++        ],
++        out: T.StridedTensor[
++            (batch, num_tokens, hidden),
++            (out_batch_stride, out_stride, 1),
++            out_config.dtype,
++        ],
++        out_sf: T.StridedTensor[
++            (batch, *sf_shape),
++            (out_sf_batch_stride, out_sf_stride, 1),
++            out_config.sf_dtype,
++        ],
++        out_bf16: T.StridedTensor[
++            (batch, num_tokens, hidden),
++            (out_bf16_batch_stride, out_bf16_stride, 1),
++            T.bfloat16,
++        ],
++        mega_moe_sf: T.StridedTensor[
++            (mega_moe_sf_rows, hidden // 128, 4),
++            (4, mega_moe_sf_rows * 4, 1),
++            T.uint8,
++        ],
++        weight: T.Tensor[(hidden,), x_dtype],
++        rstd: T.Tensor[(batch, num_tokens), T.float32],
++        residual: T.StridedTensor[
++            (batch, num_tokens, hidden),
++            (residual_batch_stride, residual_stride, 1),
++            x_dtype,
++        ],
++        residual_out: T.StridedTensor[
++            (batch, num_tokens, hidden),
++            (residual_out_batch_stride, residual_out_stride, 1),
++            x_dtype,
++        ],
++    ):
++        with T.Kernel(
++            T.ceildiv(num_tokens, block_m), batch, threads=num_threads
++        ) as (pid_token, batch_id):
++            T.assume(x_stride % 16 == 0)
++            T.assume(x_batch_stride % 16 == 0)
++            T.assume(out_stride % 16 == 0)
++            T.assume(out_batch_stride % 16 == 0)
++            if with_out_bf16:
++                T.assume(out_bf16_stride % 16 == 0)
++                T.assume(out_bf16_batch_stride % 16 == 0)
++            if with_residual:
++                T.assume(residual_stride % 16 == 0)
++                T.assume(residual_batch_stride % 16 == 0)
++                T.assume(residual_out_stride % 16 == 0)
++                T.assume(residual_out_batch_stride % 16 == 0)
++            T.annotate_min_blocks_per_sm(5)
++            if use_pdl:
++                T.pdl_sync()
++            tid = T.get_thread_binding()
++            row_id = tid // row_threads
++            row_offset = tid % row_threads
++            token_id = pid_token * block_m + row_id
++
++            sum_partial = T.alloc_fragment((block_m, row_threads), T.float32)
++            warp_reducer = T.alloc_reducer(
++                (block_m, num_row_warps), T.float32, op="sum"
++            )
++            warp_fragment = T.alloc_fragment((block_m, num_row_warps), T.float32)
++            sum_shared = T.alloc_shared((block_m, num_row_warps), T.float32)
++            row_partial = T.alloc_fragment(
++                (block_m, row_threads, num_row_warps), T.float32
++            )
++            sum_reducer = T.alloc_reducer((block_m, row_threads), T.float32, op="sum")
++            sum_fragment = T.alloc_fragment((block_m, row_threads), T.float32)
++            T.annotate_layout(
++                {
++                    sum_partial: row_layout,
++                    warp_fragment: warp_layout,
++                    row_partial: row_reduce_layout,
++                    sum_fragment: row_layout,
++                }
++            )
++            x_local = T.alloc_local((num_thread_vec, vec_size), x_dtype)
++            y_fp32_local = T.alloc_local((vec_size,), T.float32)
++            y_local = T.alloc_local((num_thread_vec, vec_size), x_dtype)
++            sum_local = T.alloc_local((2,), T.float32)
++            if with_residual:
++                residual_local = T.alloc_local((vec_size,), x_dtype)
++            if with_weight:
++                weight_local = T.alloc_local((vec_size,), x_dtype)
++            if out_config.with_sf:
++                sf_local = T.alloc_local((num_thread_vec,), out_config.sf_dtype)
++                amax_local = T.alloc_local((num_thread_vec,), T.float32)
++
++            T.clear(sum_local)
++            for vi in T.unroll(num_thread_vec):
++                token_offset = (vi * row_threads + row_offset) * vec_size
++                if token_id < num_tokens and token_offset < hidden:
++                    for j in T.vectorized(vec_size):
++                        x_local[vi, j] = x[batch_id, token_id, token_offset + j]
++                    if with_residual:
++                        for j in T.vectorized(vec_size):
++                            residual_local[j] = residual[
++                                batch_id, token_id, token_offset + j
++                            ]
++                        for j in T.vectorized(vec_size):
++                            x_local[vi, j] += residual_local[j]
++                        for j in T.vectorized(vec_size):
++                            residual_out[batch_id, token_id, token_offset + j] = (
++                                x_local[vi, j]
++                            )
++                else:
++                    T.clear(x_local[vi, :])
++                for j in T.vectorized(vec_size):
++                    sum_local[j % 2] += T.float32(x_local[vi, j]) * T.float32(
++                        x_local[vi, j]
++                    )
++
++            sum_partial[row_id, row_offset] = sum_local[0] + sum_local[1]
++            T.reducer_init(warp_reducer)
++            for i, w, j in T.Parallel(
++                block_m, num_row_warps, warp_threads, loop_layout=warp_reduce_layout
++            ):
++                T.reducer_update(
++                    warp_reducer[i, w], sum_partial[i, w * warp_threads + j]
++                )
++            T.finalize_reducer(warp_reducer, warp_fragment)
++            if row_offset % warp_threads == 0:
++                sum_shared[row_id, row_offset // warp_threads] = warp_fragment[
++                    row_id, row_offset // warp_threads
++                ]
++            T.sync_threads()
++            for i, j, w in T.Parallel(
++                block_m, row_threads, num_row_warps, loop_layout=row_reduce_layout
++            ):
++                row_partial[i, j, w] = sum_shared[i, w]
++            T.reducer_init(sum_reducer)
++            for i, j, w in T.Parallel(
++                block_m, row_threads, num_row_warps, loop_layout=row_reduce_layout
++            ):
++                T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
++            T.finalize_reducer(sum_reducer, sum_fragment)
++            rstd_value = T.alloc_var(
++                T.float32,
++                init=T.rsqrt(sum_fragment[row_id, row_offset] / hidden + eps),
++            )
++            if row_offset == 0 and token_id < num_tokens:
++                rstd[batch_id, token_id] = rstd_value
++
++            for vi in T.unroll(num_thread_vec):
++                token_offset = (vi * row_threads + row_offset) * vec_size
++                is_valid = token_id < num_tokens and token_offset < hidden
++                if with_weight:
++                    if token_offset < hidden:
++                        for j in T.vectorized(vec_size):
++                            weight_local[j] = weight[token_offset + j]
++                    for j in T.vectorized(vec_size):
++                        y_fp32_local[j] = (
++                            T.float32(x_local[vi, j])
++                            * rstd_value
++                            * (T.float32(weight_local[j]) * out_scale)
++                        )
++                else:
++                    for j in T.vectorized(vec_size):
++                        y_fp32_local[j] = (
++                            T.float32(x_local[vi, j]) * rstd_value * out_scale
++                        )
++                for j in T.vectorized(vec_size):
++                    y_local[vi, j] = y_fp32_local[j]
++                if not out_config.with_sf:
++                    if is_valid:
++                        for j in T.vectorized(vec_size):
++                            out[batch_id, token_id, token_offset + j] = y_local[vi, j]
++                else:
++                    if with_out_bf16 and is_valid:
++                        for j in T.vectorized(vec_size):
++                            out_bf16[batch_id, token_id, token_offset + j] = y_local[
++                                vi, j
++                            ]
++
++                    amax = T.alloc_var(T.float32, init=0.0)
++                    for j in T.unroll(vec_size):
++                        amax = T.max(amax, T.abs(y_fp32_local[j]))
++                    amax = T.float32(T.cast(amax, x_dtype))
++                    for i in T.unroll(int(math.log2(group_lanes))):
++                        amax = T.max(amax, T.shfl_xor(amax, 1 << i))
++                    amax_local[vi] = amax
++
++            if out_config.with_sf:
++                for vi in T.unroll(num_thread_vec):
++                    token_offset = (vi * row_threads + row_offset) * vec_size
++                    sf, sf_inv = get_sf_and_inv(amax_local[vi], out_config, sf_inv_dtype)
++                    sf_local[vi] = sf
++                    if token_id < num_tokens and token_offset < hidden:
++                        for j in T.vectorized(vec_size):
++                            out[batch_id, token_id, token_offset + j] = (
++                                y_local[vi, j] * sf_inv
++                            )
++
++            if out_config.with_sf:
++                if token_id < num_tokens and row_offset % group_lanes == 0:
++                    for vi in T.unroll(num_thread_vec):
++                        token_offset = (vi * row_threads + row_offset) * vec_size
++                        if token_offset < hidden:
++                            sf_col = token_offset // num_per_channels
++                            sf_row, sf_column = get_sf_index(
++                                token_id, sf_col, out_config
++                            )
++                            out_sf[batch_id, sf_row, sf_column] = sf_local[vi]
++                            if packed_sf_pad and sf_col == num_sf_cols - 1:
++                                for pad_col in T.unroll(
++                                    num_sf_cols, align(num_sf_cols, 4)
++                                ):
++                                    _, pad_column = get_sf_index(
++                                        token_id, pad_col, out_config
++                                    )
++                                    out_sf[batch_id, sf_row, pad_column] = 0
++                            if mega_moe_block_m > 0:
++                                exponent = (
++                                    sf_local[vi]
++                                    if out_config.use_packed_ue8m0
++                                    else T.cast(
++                                        T.reinterpret(sf_local[vi], T.uint32) >> 23,
++                                        T.uint8,
++                                    )
++                                )
++                                mega_moe_sf[
++                                    get_mega_moe_sf_row(token_id),
++                                    sf_col // 4,
++                                    sf_col % 4,
++                                ] = exponent
++
++            if use_pdl:
++                T.pdl_trigger()
++
++    return norm_forward_and_per_token_cast_kernel
++
++
++def norm_forward_and_per_token_cast_impl(
++    x: torch.Tensor,
++    weight: Optional[torch.Tensor],
++    eps: float,
++    fmt: str,
++    num_per_channels: Optional[int],
++    residual: Optional[torch.Tensor] = None,
++    out_scale: float = 1.0,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    with_out_bf16: bool = False,
++    out: Optional[torch.Tensor] = None,
++    out_sf: Optional[torch.Tensor] = None,
++    out_bf16: Optional[torch.Tensor] = None,
++    residual_out: Optional[torch.Tensor] = None,
++    mega_moe_sf: Optional[torch.Tensor] = None,
++    mega_moe_block_m: int = 0,
++    use_pdl: bool = False,
++) -> tuple[
++    Union[torch.Tensor, QuantTensor],
++    Optional[torch.Tensor],
++    torch.Tensor,
++    torch.Tensor,
++]:
++    assert (
++        x.ndim in (2, 3)
++        and x.dtype in (torch.bfloat16, torch.float32)
++        and x.stride(-1) == 1
++    )
++    num_tokens, hidden = x.shape[-2:]
++    batch = x.shape[0] if x.ndim == 3 else 1
++    assert hidden > 0
++    assert hidden % 16 == 0 and hidden <= 8192
++
++    def batched(tensor):
++        return tensor.unsqueeze(0) if tensor is not None and x.ndim == 2 else tensor
++
++    if weight is not None:
++        assert (
++            weight.shape == (hidden,)
++            and weight.dtype == x.dtype
++            and weight.device == x.device
++            and weight.is_contiguous()
++        )
++
++    assert (fmt, num_per_channels) in [("e4m3", 32), ("bf16", None), ("fp32", None)]
++    out_config = get_cast_output_config(
++        fmt,
++        (1, num_per_channels or 1),
++        use_tma_aligned_col_major_sf,
++        round_sf,
++        use_packed_ue8m0,
++    )
++    assert (
++        out_config.with_sf or out_config.torch_dtype == x.dtype
++    ), "the unquantized output must match the input dtype"
++    assert not out_config.with_sf or hidden % num_per_channels == 0
++    assert (
++        not with_out_bf16 or out_config.with_sf
++    ), "the extra output is only needed with casting"
++    assert (mega_moe_sf is None) == (mega_moe_block_m == 0)
++    if mega_moe_sf is not None:
++        assert x.ndim == 2 and mega_moe_block_m > 0
++        assert out_config.with_sf and round_sf and hidden % 128 == 0
++        assert mega_moe_sf.device == x.device
++        assert (
++            mega_moe_sf.dtype == torch.int32
++            and mega_moe_sf.shape == (num_tokens, hidden // 128)
++            and mega_moe_sf.stride(0) == 1
++        )
++        num_mega_moe_sf_rows = mega_moe_sf.stride(1)
++        assert (
++            ceil_div(num_tokens, mega_moe_block_m) * align(mega_moe_block_m, 128)
++            <= num_mega_moe_sf_rows
++        )
++
++    if out is None:
++        out = torch.empty(x.shape, dtype=out_config.torch_dtype, device=x.device)
++    if out_config.with_sf:
++        if out_sf is None:
++            alloc_shape = (num_tokens, hidden)
++            if x.ndim == 3:
++                if use_tma_aligned_col_major_sf:
++                    sf_pack = (
++                        get_packed_ue8m0_pack_factor() if use_packed_ue8m0 else 1
++                    )
++                    alloc_shape = (
++                        num_tokens,
++                        batch * align(hidden, num_per_channels * sf_pack),
++                    )
++                else:
++                    alloc_shape = (batch * num_tokens, hidden)
++            out_sf = alloc_scaling_factors(alloc_shape, out_config, x.device)
++            if x.ndim == 3:
++                sf_rows, sf_cols = get_sf_shape((num_tokens, hidden), out_config)
++                out_sf = out_sf.as_strided(
++                    (batch, sf_rows, sf_cols),
++                    (sf_rows * out_sf.stride(0), out_sf.stride(0), 1),
++                )
++        else:
++            assert not use_tma_aligned_col_major_sf
++            if use_packed_ue8m0:
++                assert out_sf.dtype == get_packed_ue8m0_torch_dtype()
++                out_sf = out_sf.view(torch.uint8)
++            expected_sf_shape = get_sf_shape((num_tokens, hidden), out_config)
++            assert (
++                out_sf.shape == (*x.shape[:-2], *expected_sf_shape)
++                and out_sf.stride(-1) == 1
++            )
++            assert (
++                out_sf.dtype == out_config.sf_torch_dtype
++                and out_sf.device == x.device
++            )
++    else:
++        assert out_sf is None
++    if with_out_bf16:
++        if out_bf16 is None:
++            out_bf16 = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
++    else:
++        assert out_bf16 is None
++    residual_out = (
++        torch.empty_like(x)
++        if residual is not None and residual_out is None
++        else residual_out
++    )
++    if out_bf16 is not None:
++        assert (
++            out_bf16.shape == x.shape
++            and out_bf16.dtype == torch.bfloat16
++            and out_bf16.device == x.device
++            and out_bf16.stride(-1) == 1
++        )
++    for tensor in (residual, residual_out):
++        if tensor is not None:
++            assert (
++                tensor.shape == x.shape
++                and tensor.dtype == x.dtype
++                and tensor.device == x.device
++                and tensor.stride(-1) == 1
++            )
++    assert (
++        out.shape == x.shape
++        and out.dtype == out_config.torch_dtype
++        and out.device == x.device
++        and out.stride(-1) == 1
++    )
++    rstd = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
++
++    kernel_kwargs = dict(
++        hidden=hidden,
++        with_weight=weight is not None,
++        with_residual=residual is not None,
++        eps=eps,
++        out_scale=out_scale,
++        x_dtype=T.dtype(x.dtype),
++        out_config=out_config,
++        with_out_bf16=with_out_bf16,
++        mega_moe_block_m=mega_moe_block_m,
++    )
++    if batch * num_tokens > 0:
++        for tensor in (x, out, out_bf16, residual, residual_out):
++            if tensor is not None:
++                assert all(stride % 16 == 0 for stride in tensor.stride()[:-1])
++        kernel = get_norm_forward_and_per_token_cast_kernel_cuda(
++            **kernel_kwargs, use_pdl=use_pdl
++        )
++        if mega_moe_sf is not None:
++            mega_moe_sf = (
++                mega_moe_sf.mT.view(torch.uint8).as_strided(
++                    (num_mega_moe_sf_rows, hidden // 128, 4),
++                    (4, num_mega_moe_sf_rows * 4, 1),
++                )
++            )
++        args = (
++            batched(x),
++            batched(out),
++            batched(out_sf),
++            batched(out_bf16),
++            mega_moe_sf,
++            weight,
++            batched(rstd),
++            batched(residual),
++            batched(residual_out),
++        )
++        kernel(*args)
++
++    norm_input = x if residual is None else residual_out
++    if out_config.with_sf:
++        if x.ndim == 3 and use_tma_aligned_col_major_sf:
++            sf_rows, sf_cols = out_sf.shape[-2:]
++            out_sf = out_sf.as_strided(
++                (batch * sf_rows, sf_cols), (out_sf.stride(1), 1)
++            )
++            out_sf = cast_epilogue(out_sf, out_config)
++            out_sf = out_sf.as_strided(
++                (batch, out_sf.shape[0], sf_rows),
++                (sf_rows * out_sf.stride(1), *out_sf.stride()),
++            )
++        else:
++            out_sf = cast_epilogue(out_sf, out_config)
++        return (out, out_sf), out_bf16, rstd, norm_input
++    return out, None, rstd, norm_input
++
++
++def norm_forward_and_per_token_cast(
++    x: torch.Tensor,
++    weight: Optional[torch.Tensor],
++    eps: float,
++    fmt: str,
++    num_per_channels: int,
++    residual: Optional[torch.Tensor] = None,
++    out_scale: float = 1.0,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    with_out_bf16: bool = False,
++    out: Optional[QuantTensor] = None,
++    out_bf16: Optional[torch.Tensor] = None,
++    residual_out: Optional[torch.Tensor] = None,
++    mega_moe_sf: Optional[torch.Tensor] = None,
++    mega_moe_block_m: int = 0,
++    *,
++    use_pdl: bool = False,
++) -> tuple[QuantTensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
++    """RMSNorm with optional residual addition, cast to FP8 with per-token scales."""
++    out_x, out_sf = (None, None) if out is None else out
++    return norm_forward_and_per_token_cast_impl(
++        x,
++        weight,
++        eps,
++        fmt,
++        num_per_channels,
++        residual,
++        out_scale,
++        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
++        round_sf=round_sf,
++        use_packed_ue8m0=use_packed_ue8m0,
++        with_out_bf16=with_out_bf16,
++        out=out_x,
++        out_sf=out_sf,
++        out_bf16=out_bf16,
++        residual_out=residual_out,
++        mega_moe_sf=mega_moe_sf,
++        mega_moe_block_m=mega_moe_block_m,
++        use_pdl=use_pdl,
++    )
++
++
++def norm_forward(
++    x: torch.Tensor,
++    weight: Optional[torch.Tensor],
++    eps: float,
++    residual: Optional[torch.Tensor] = None,
++    out_scale: float = 1.0,
++    out: Optional[torch.Tensor] = None,
++    residual_out: Optional[torch.Tensor] = None,
++    *,
++    use_pdl: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """RMSNorm with optional input-dtype residual addition."""
++    assert x.dtype in (torch.bfloat16, torch.float32)
++    out, _, rstd, norm_input = norm_forward_and_per_token_cast_impl(
++        x,
++        weight,
++        eps,
++        "bf16" if x.dtype == torch.bfloat16 else "fp32",
++        None,
++        residual,
++        out_scale,
++        out=out,
++        residual_out=residual_out,
++        use_pdl=use_pdl,
++    )
++    return out, rstd, norm_input
+ 
+ 
+ def _rmsnorm(
+@@ -18,9 +654,9 @@ def _rmsnorm(
+ 
+ @functools.cache
+ def _warm(hidden: int, eps: float, dtype: torch.dtype) -> None:
+-    """TileKernels' RMSNorm of one zero row of ``hidden`` (``dtype`` input and weight),
+-    so its kernel (keyed by the width, eps and dtype, not the rows) is compiled
+-    before the cache freezes."""
++    """Native TileLang RMSNorm of one zero row of ``hidden`` (``dtype`` input and
++    weight), so its kernel (keyed by the width, eps and dtype, not the rows) is
++    compiled before the cache freezes."""
+     x = torch.zeros((1, hidden), dtype=dtype, device="cuda")
+     weight = torch.ones(hidden, dtype=dtype, device="cuda")
+     _rmsnorm(x, weight, torch.empty_like(x), eps)
+@@ -37,7 +673,7 @@ class TileLangRMSNorm(nn.Module):
+         self.variance_epsilon = eps
+ 
+     def declare_kernels(self) -> None:
+-        """TileKernels' norm of this width; its input has the weight's dtype."""
++        """Native TileLang norm of this width; its input has the weight's dtype."""
+         hidden, eps, dtype = (
+             self.weight.shape[0],
+             self.variance_epsilon,
+@@ -47,9 +683,6 @@ class TileLangRMSNorm(nn.Module):
+ 
+     def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         """The normalized rows, into ``out`` (contiguous, ``x``'s rows) when given."""
+-        # TileKernels reads each row by its stride (a contiguous last dimension, rows
+-        # 16 elements apart): the q and kv halves of the fused projection's output are
+-        # normalized where they lie, with no copy.
+         if x.ndim == 2 and (out is None or out.ndim == 2):
+             if out is None:
+                 out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/pdl.py b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+index 5fa01b18a..73353c1c0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/pdl.py
++++ b/vllm/models/deepseek_v4_1/tilelang/pdl.py
+@@ -69,33 +69,26 @@ def trigger():
+     T.pdl_trigger()
+ 
+ 
+-@contextlib.contextmanager
+-def _tile_kernels():
+-    """TileKernels with its PDL switch on inside the block (each call compiles and
+-    launches with it; the kernel cache keys on the switch)."""
+-    import tile_kernels
+-
+-    previous = tile_kernels.get_pdl()
+-    tile_kernels.set_pdl(True)
+-    try:
+-        yield tile_kernels
+-    finally:
+-        tile_kernels.set_pdl(previous)
+-
+-
+ def per_token_cast(*args, **kwargs):
+-    """TileKernels' ``quant.per_token_cast``, chained."""
+-    with _tile_kernels() as tk:
+-        return tk.quant.per_token_cast(*args, **kwargs)
++    """Native TileLang ``quant_common.per_token_cast``, chained."""
++    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
++        per_token_cast as _per_token_cast,
++    )
++
++    return _per_token_cast(*args, **kwargs, use_pdl=True)
+ 
+ 
+ def norm_forward(*args, **kwargs):
+-    """TileKernels' ``quant.norm_forward``, chained."""
+-    with _tile_kernels() as tk:
+-        return tk.quant.norm_forward(*args, **kwargs)
++    """Native TileLang ``norm.norm_forward``, chained."""
++    from vllm.models.deepseek_v4_1.tilelang.norm import norm_forward as _norm_forward
++
++    return _norm_forward(*args, **kwargs, use_pdl=True)
+ 
+ 
+ def moe_topk_gate_forward(*args, **kwargs):
+-    """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
+-    with _tile_kernels() as tk:
+-        return tk.moe.moe_topk_gate_forward(*args, **kwargs)
++    """Native TileLang ``router.moe_topk_gate_forward``, chained."""
++    from vllm.models.deepseek_v4_1.tilelang.router import (
++        moe_topk_gate_forward as _moe_topk_gate_forward,
++    )
++
++    return _moe_topk_gate_forward(*args, **kwargs, use_pdl=True)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/quant_common.py b/vllm/models/deepseek_v4_1/tilelang/quant_common.py
+new file mode 100644
+index 000000000..ce1a535f6
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/quant_common.py
+@@ -0,0 +1,911 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Native TileLang quantization helpers and per-token cast kernels for DeepSeek-V4.1."""
++
++import functools
++import math
++from dataclasses import dataclass
++from typing import Optional, Union
++
++import tilelang
++import torch
++from tilelang import language as T
++
++QuantTensor = tuple[torch.Tensor, torch.Tensor]
++
++SMALL_BATCH_THRESHOLD = 4096
++
++_DTYPE_TO_STR = {
++    torch.float32: "fp32",
++    torch.bfloat16: "bf16",
++    torch.float8_e4m3fn: "e4m3",
++    torch.int8: "e2m1",
++}
++_STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
++
++_DEFAULT_CLAMP_MIN_VALUES = {
++    ("e4m3", False): 1e-4,
++    ("e4m3", True): float(T.max_value(T.float8_e4m3fn)) * (2**-9),
++    ("e2m1", False): float(T.max_value(T.float4_e2m1fn) * (2**-126)),
++    ("e2m1", True): float(T.max_value(T.float4_e2m1fn)) * (2**-9),
++}
++_clamp_min_values = _DEFAULT_CLAMP_MIN_VALUES.copy()
++
++
++def ceil_div(x: int, y: int) -> int:
++    return (x + y - 1) // y
++
++
++def align(x: int, y: int) -> int:
++    return ceil_div(x, y) * y
++
++
++def is_power_of_two(x: int) -> bool:
++    return x > 0 and (x & (x - 1)) == 0
++
++
++def next_power_of_two(x: int) -> int:
++    return 1 << (x - 1).bit_length()
++
++
++def dtype_to_str(dtype: torch.dtype) -> str:
++    if dtype not in _DTYPE_TO_STR:
++        raise ValueError(
++            f"Unsupported dtype: {dtype}. Supported: {list(_DTYPE_TO_STR.keys())}"
++        )
++    return _DTYPE_TO_STR[dtype]
++
++
++def str_to_dtype(fmt: str) -> torch.dtype:
++    if fmt not in _STR_TO_DTYPE:
++        raise ValueError(
++            f"Unsupported format: {fmt}. Supported: {list(_STR_TO_DTYPE.keys())}"
++        )
++    return _STR_TO_DTYPE[fmt]
++
++
++def _validate_quant_fmt(fmt: str) -> None:
++    if fmt not in ("e4m3", "e2m1"):
++        raise ValueError(f"Unsupported quant fmt {fmt}")
++
++
++def set_amax_clamp_for_quant(
++    fmt: str, use_e4m3_sf: bool, clamp_min_value: float
++) -> None:
++    _validate_quant_fmt(fmt)
++    _clamp_min_values[(fmt, use_e4m3_sf)] = clamp_min_value
++
++
++def get_amax_clamp_for_quant(fmt: str, use_e4m3_sf: bool) -> float:
++    _validate_quant_fmt(fmt)
++    return _clamp_min_values[(fmt, use_e4m3_sf)]
++
++
++@functools.lru_cache(maxsize=8)
++def get_best_vectorize_size(dtype: T.dtype) -> int:
++    major, _ = torch.cuda.get_device_capability()
++    return (16 if major < 10 else 32) // dtype.bytes
++
++
++@dataclass(frozen=True)
++class BaseCastConfig:
++    torch_dtype: torch.dtype = torch.float8_e4m3fn
++    sf_block: tuple[int, int] = (1, 1)
++    use_tma_aligned_col_major_sf: bool = False
++    use_packed_ue8m0: bool = False
++    use_e4m3_sf: bool = False
++
++    @property
++    def with_sf(self) -> bool:
++        return self.torch_dtype in [torch.float8_e4m3fn, torch.int8, torch.uint32]
++
++    @property
++    def dtype(self) -> T.dtype:
++        return (
++            T.dtype(self.torch_dtype)
++            if self.torch_dtype != torch.int8
++            else T.float4_e2m1fn
++        )
++
++    @property
++    def sf_torch_dtype(self) -> torch.dtype:
++        if self.use_packed_ue8m0:
++            return torch.uint8
++        elif self.use_e4m3_sf:
++            return torch.float8_e4m3fn
++        else:
++            return torch.float32
++
++    @property
++    def sf_dtype(self) -> T.dtype:
++        return T.dtype(self.sf_torch_dtype)
++
++    @property
++    def sf_col_pack(self) -> bool:
++        return self.use_packed_ue8m0 and self.sf_block[1] == 1
++
++
++@dataclass(frozen=True)
++class CastInputConfig(BaseCastConfig):
++    pass
++
++
++@dataclass(frozen=True)
++class CastOutputConfig(BaseCastConfig):
++    round_sf: bool = False
++    clamp_min_value: Optional[float] = None
++
++
++def get_sf_inv_dtype(value_dtype: T.dtype, out_config: CastOutputConfig) -> T.dtype:
++    if value_dtype == T.bfloat16 and out_config.round_sf:
++        return T.bfloat16
++    return T.float32
++
++
++def get_packed_ue8m0_pack_factor() -> int:
++    return 4
++
++
++def get_packed_ue8m0_torch_dtype() -> torch.dtype:
++    return torch.int32
++
++
++@functools.lru_cache
++def get_cast_input_config_impl(
++    dtype: torch.dtype,
++    sf_block: Optional[tuple[int, int]] = None,
++    use_tma_aligned_col_major_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++) -> CastInputConfig:
++    if sf_block is None:
++        assert dtype in (torch.bfloat16, torch.float32)
++        return CastInputConfig(dtype)
++    else:
++        assert dtype in (torch.float8_e4m3fn, torch.int8, torch.uint8)
++        return CastInputConfig(
++            dtype,
++            sf_block,
++            use_tma_aligned_col_major_sf,
++            use_packed_ue8m0,
++            use_e4m3_sf,
++        )
++
++
++def get_cast_input_and_config(
++    x: Union[torch.Tensor, QuantTensor],
++    sf_block: Optional[tuple[int, int]],
++) -> tuple[torch.Tensor, Optional[torch.Tensor], CastInputConfig]:
++    if isinstance(x, tuple):
++        x, x_sf = x
++        assert (
++            isinstance(sf_block, tuple)
++            and isinstance(x, torch.Tensor)
++            and isinstance(x_sf, torch.Tensor)
++        )
++        assert x_sf.dtype in (
++            torch.float32,
++            torch.float8_e4m3fn,
++            get_packed_ue8m0_torch_dtype(),
++        )
++
++        use_tma_aligned_col_major_sf = False
++        use_packed_ue8m0 = False
++        use_e4m3_sf = False
++        if x_sf.stride(0) == 1 and x_sf.stride(1) != 1:
++            use_tma_aligned_col_major_sf = True
++            x_sf = x_sf.T
++        else:
++            assert x_sf.stride(1) == 1
++        if x_sf.dtype == get_packed_ue8m0_torch_dtype():
++            use_packed_ue8m0 = True
++            x_sf = x_sf.view(torch.uint8)
++        elif x_sf.dtype == torch.float8_e4m3fn:
++            use_e4m3_sf = True
++
++        config = get_cast_input_config_impl(
++            x.dtype,
++            sf_block,
++            use_tma_aligned_col_major_sf,
++            use_packed_ue8m0,
++            use_e4m3_sf,
++        )
++        return x, x_sf, config
++    else:
++        assert sf_block is None and isinstance(x, torch.Tensor)
++        config = get_cast_input_config_impl(x.dtype)
++        return x, None, config
++
++
++@functools.lru_cache
++def get_cast_output_config_impl(
++    fmt: str,
++    sf_block: tuple[int, int],
++    use_tma_aligned_col_major_sf: bool,
++    round_sf: bool,
++    use_packed_ue8m0: bool,
++    use_e4m3_sf: bool,
++    clamp_min_value: Optional[float],
++) -> CastOutputConfig:
++    assert fmt in ("fp32", "bf16", "e4m3", "e2m1")
++    assert not use_packed_ue8m0 or round_sf
++    assert not (round_sf and use_e4m3_sf)
++    return CastOutputConfig(
++        torch_dtype=str_to_dtype(fmt),
++        sf_block=sf_block,
++        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
++        round_sf=round_sf,
++        use_packed_ue8m0=use_packed_ue8m0,
++        use_e4m3_sf=use_e4m3_sf,
++        clamp_min_value=clamp_min_value,
++    )
++
++
++def get_cast_output_config(
++    fmt: str,
++    sf_block: tuple[int, int],
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++) -> CastOutputConfig:
++    if fmt in ("e4m3", "e2m1"):
++        clamp_min_value = get_amax_clamp_for_quant(fmt, use_e4m3_sf)
++    else:
++        clamp_min_value = None
++    return get_cast_output_config_impl(
++        fmt,
++        sf_block,
++        use_tma_aligned_col_major_sf,
++        round_sf,
++        use_packed_ue8m0,
++        use_e4m3_sf,
++        clamp_min_value,
++    )
++
++
++def get_logical_hidden(hidden: int, dtype: torch.dtype) -> int:
++    """Compute hidden size when ``torch.int8`` is used for packing FP4."""
++    return hidden if dtype != torch.int8 else hidden * 2
++
++
++def get_physical_hidden(hidden: int, dtype: torch.dtype) -> int:
++    """Compute hidden size when ``torch.int8`` is used for packing FP4."""
++    return hidden if dtype != torch.int8 else hidden // 2
++
++
++def get_sf_shape(shape: tuple[int, int], config: BaseCastConfig) -> tuple[int, int]:
++    num_block_m = ceil_div(shape[0], config.sf_block[0])
++    num_block_k = ceil_div(shape[1], config.sf_block[1])
++
++    if not config.sf_col_pack:
++        if config.use_packed_ue8m0:
++            num_block_k = ceil_div(num_block_k, get_packed_ue8m0_pack_factor())
++        if config.use_tma_aligned_col_major_sf:
++            num_block_m, num_block_k = num_block_k, num_block_m
++        if config.use_packed_ue8m0:
++            num_block_k *= get_packed_ue8m0_pack_factor()
++    else:
++        num_block_m = ceil_div(num_block_m, get_packed_ue8m0_pack_factor())
++        num_block_k *= get_packed_ue8m0_pack_factor()
++
++    return num_block_m, num_block_k
++
++
++def alloc_scaling_factors(
++    shape: tuple[int, int],
++    out_config: BaseCastConfig,
++    device: torch.device | str = "cuda",
++) -> torch.Tensor:
++    """Allocate scaling factors for quantization."""
++    sf_shape = get_sf_shape(shape, out_config)
++    if out_config.use_tma_aligned_col_major_sf:
++        aligned_sf_shape_1 = align(sf_shape[1], 16 // out_config.sf_dtype.bytes)
++        scaling_factor = torch.empty(
++            size=(sf_shape[0], aligned_sf_shape_1),
++            dtype=out_config.sf_torch_dtype,
++            device=device,
++        )
++        if aligned_sf_shape_1 == 0:
++            scaling_factor.as_strided_(
++                scaling_factor.shape, (aligned_sf_shape_1, 1)
++            )
++        return scaling_factor[:, : sf_shape[1]]
++    else:
++        return torch.empty(
++            size=sf_shape,
++            dtype=out_config.sf_torch_dtype,
++            device=device,
++        )
++
++
++def cast_epilogue(out_sf: torch.Tensor, config: BaseCastConfig) -> torch.Tensor:
++    """Post-process the sf-factor tensor after a cast kernel launch."""
++    if config.use_packed_ue8m0:
++        out_sf = out_sf.view(dtype=get_packed_ue8m0_torch_dtype())
++    return out_sf.T if config.use_tma_aligned_col_major_sf else out_sf
++
++
++@T.macro
++def get_sf_and_inv(
++    amax: float, out_config: CastOutputConfig, sf_inv_dtype: T.dtype = T.float32
++):
++    clamped_amax = T.max(amax, out_config.clamp_min_value)
++
++    max_value = T.max_value(out_config.dtype)
++    sf = T.alloc_var(T.float32)
++    if out_config.round_sf:
++        sf = clamped_amax * (T.float32(1) / max_value)
++    else:
++        sf = clamped_amax / max_value
++        if out_config.use_e4m3_sf:
++            sf_fp8 = T.cast(sf, T.float8_e4m3fn)
++            return sf_fp8, 1 / T.cast(sf_fp8, T.float32)
++        else:
++            return sf, max_value / clamped_amax
++
++    bits = T.reinterpret(sf, T.uint32)
++    exp_sf = ((bits - 1) >> 23) + 1 - 127
++    if sf_inv_dtype == T.bfloat16:
++        sf_inv = T.reinterpret(T.uint16(127 - exp_sf) << 7, T.bfloat16)
++    else:
++        sf_inv = T.reinterpret((127 - exp_sf) << 23, T.float32)
++    if out_config.use_packed_ue8m0:
++        return T.uint8(exp_sf + 127), sf_inv
++    else:
++        return T.reinterpret((127 + exp_sf) << 23, T.float32), sf_inv
++
++
++@T.macro
++def get_sf_index(m_idx: int, k_idx: int, config: BaseCastConfig):
++    pack_factor = get_packed_ue8m0_pack_factor()
++    if config.sf_col_pack:
++        return m_idx // pack_factor, k_idx * pack_factor + m_idx % pack_factor
++    if config.use_packed_ue8m0 and config.use_tma_aligned_col_major_sf:
++        return k_idx // pack_factor, m_idx * pack_factor + k_idx % pack_factor
++    if config.use_tma_aligned_col_major_sf:
++        return k_idx, m_idx
++    return m_idx, k_idx
++
++
++@T.macro
++def load_sf(tensor: T.Tensor, m_idx: int, k_idx: int, config: BaseCastConfig):
++    row, col = get_sf_index(m_idx, k_idx, config)
++    return tensor[row, col]
++
++
++@T.macro
++def transform_sf(
++    sf: Union[T.float32, T.float8_e4m3fn, T.uint8], config: BaseCastConfig
++) -> T.float32:
++    if config.use_packed_ue8m0:
++        return T.reinterpret(T.uint32(sf) << 23, T.float32)
++    elif config.use_e4m3_sf:
++        return T.cast(sf, T.float32)
++    else:
++        return sf
++
++
++@T.macro
++def store_sf(
++    tensor: T.Tensor,
++    sf: Union[T.float32, T.float8_e4m3fn, T.uint8],
++    m_idx: int,
++    k_idx: int,
++    config: BaseCastConfig,
++):
++    row, col = get_sf_index(m_idx, k_idx, config)
++    tensor[row, col] = sf
++
++
++def unpack_from_e2m1fn_x2(
++    x: torch.Tensor, out_dtype: torch.dtype = torch.float32
++) -> torch.Tensor:
++    """Decode a uint8/int8 tensor of packed fp4 values to ``out_dtype``."""
++    assert x.dtype == torch.int8 or x.dtype == torch.uint8
++
++    if x.ndim == 0:
++        raise ValueError("x must have at least 1 dimension so the last dim can be doubled")
++
++    lo = (x & 0x0F).to(torch.int16)
++    hi = ((x >> 4) & 0x0F).to(torch.int16)
++
++    def decode_fp4_e2m1(n: torch.Tensor) -> torch.Tensor:
++        s = (n >> 3) & 0x1
++        e = (n >> 1) & 0x3
++        m = n & 0x1
++
++        sign = torch.where(
++            s == 1,
++            torch.tensor(-1.0, device=n.device),
++            torch.tensor(1.0, device=n.device),
++        )
++        bias = 1
++        sub = (m.to(torch.float32) * 0.5) * (2.0 ** (1 - bias))
++        norm = (1.0 + m.to(torch.float32) * 0.5) * torch.pow(
++            torch.tensor(2.0, device=n.device),
++            (e - bias).to(torch.float32),
++        )
++        val = torch.where(e == 0, sub, norm)
++        return (val * sign).to(out_dtype)
++
++    flo = decode_fp4_e2m1(lo)
++    fhi = decode_fp4_e2m1(hi)
++    return torch.stack([flo, fhi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
++
++
++@T.macro
++def rbits_hash(values, quad_idx):
++    h = T.alloc_var(T.uint32)
++    h = (
++        T.reinterpret(values[0], T.uint32) * T.uint32(0x5671D42B)
++        + T.reinterpret(values[1], T.uint32) * T.uint32(0x9995E499)
++        + T.reinterpret(values[2], T.uint32) * T.uint32(0xACE1B8A5)
++        + T.reinterpret(values[3], T.uint32) * T.uint32(0xE153538D)
++        + T.cast(quad_idx, T.uint32)
++    )
++    h = h ^ (h >> 23)
++    h = h * T.uint32(0x7FEB352D)
++    h = h ^ (h >> 16)
++    h = h * T.uint32(0x846CA68B)
++    h = h ^ (h >> 11)
++    return h
++
++
++@tilelang.jit(
++    target="cuda",
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: True,
++    },
++)
++def get_per_token_cast_kernel_cuda(
++    hidden: int,
++    token_stride: int,
++    in_config: CastInputConfig,
++    out_config: CastOutputConfig,
++    sf_only: bool = False,
++    cast_only: bool = False,
++    small_batch: bool = False,
++    stochastic_cast: bool = False,
++    use_pdl: bool = False,
++):
++    if small_batch:
++        num_threads, num_elems_per_thread = 64, 32
++    else:
++        num_threads, num_elems_per_thread = 32, 64
++
++    num_elems_per_block = num_threads * num_elems_per_thread
++    num_per_channels = out_config.sf_block[1]
++
++    if is_power_of_two(num_per_channels):
++        block_k = max(num_per_channels, math.gcd(num_elems_per_block, hidden))
++    elif hidden == num_per_channels:
++        assert not in_config.with_sf and not cast_only and not sf_only
++        block_k = align(
++            hidden, num_threads * (2 if out_config.dtype == T.float4_e2m1fn else 1)
++        )
++        num_per_channels = block_k
++    else:
++        raise ValueError("Cast granularity must be equal to hidden or be power of two")
++
++    assert block_k % num_per_channels == 0
++    block_m = 1 if num_elems_per_block % block_k != 0 else num_elems_per_block // block_k
++    num_groups = block_k // num_per_channels
++
++    num_vectorize = min(
++        get_best_vectorize_size(in_config.dtype),
++        math.gcd(block_m * block_k // num_threads, 32),
++    )
++    sf_value_dtype = T.float32 if in_config.with_sf else in_config.dtype
++    sf_inv_dtype = get_sf_inv_dtype(sf_value_dtype, out_config)
++    if stochastic_cast:
++        assert (
++            num_vectorize >= 4
++        ), f"stochastic_cast requires vectorize width >= 4, got {num_vectorize}"
++
++    if in_config.with_sf:
++        assert not cast_only and not sf_only
++        assert block_k % num_vectorize == 0
++        assert num_per_channels >= num_vectorize, (
++            f"num_per_channels ({num_per_channels}) must be >= num_vectorize "
++            f"({num_vectorize}); on sm>=10 with float8, num_vectorize=32, so "
++            "num_per_channels=16 would cause a zero-dimension reshape"
++        )
++        assert (
++            block_m % in_config.sf_block[0] == 0
++            or in_config.sf_block[0] % block_m == 0
++        )
++        assert (
++            block_k % in_config.sf_block[1] == 0
++            or in_config.sf_block[1] % block_k == 0
++        )
++
++    num_tokens = T.dynamic("num_tokens")
++    in_sf_stride = T.dynamic("in_sf_stride")
++    out_sf_stride = T.dynamic("out_sf_stride")
++    x_sf_shape = get_sf_shape((num_tokens, hidden), in_config)
++    sf_shape = get_sf_shape((num_tokens, hidden), out_config)
++
++    def x_layout_fn(i: int, j: int):
++        idx = i * block_k + j
++        return (
++            idx // num_vectorize % num_threads,
++            idx // (num_vectorize * num_threads) * num_vectorize + idx % num_vectorize,
++        )
++
++    blocks_per_token = T.ceildiv(hidden, block_k)
++
++    @T.prim_func
++    def per_token_cast_kernel(
++        x: T.StridedTensor[(num_tokens, hidden), (token_stride, 1), in_config.dtype],
++        x_sf: T.StridedTensor[x_sf_shape, (in_sf_stride, 1), in_config.sf_dtype],
++        out: T.Tensor[(num_tokens, hidden), out_config.dtype],
++        out_sf: T.StridedTensor[sf_shape, (out_sf_stride, 1), out_config.sf_dtype],
++    ):
++        T.assume(num_tokens > 0)
++        with T.Kernel(
++            T.ceildiv(num_tokens, block_m) * blocks_per_token, threads=num_threads
++        ) as pid:
++            pid_token = pid // blocks_per_token
++            pid_hidden = pid % blocks_per_token
++            if use_pdl:
++                T.pdl_sync()
++            x_fragment = T.alloc_fragment((block_m, block_k), in_config.dtype)
++            sf_inv_fragment = T.alloc_fragment((block_m, num_groups), sf_inv_dtype)
++            if stochastic_cast or in_config.with_sf:
++                out_fragment_or_shared = T.alloc_shared(
++                    (block_m, block_k), out_config.dtype
++                )
++            else:
++                out_fragment_or_shared = T.alloc_fragment(
++                    (block_m, block_k), out_config.dtype
++                )
++
++            T.annotate_layout(
++                {
++                    x_fragment: T.Fragment(
++                        (block_m, block_k),
++                        forward_fn=x_layout_fn,
++                    )
++                }
++            )
++
++            T.copy(
++                x[pid_token * block_m, pid_hidden * block_k],
++                x_fragment,
++                disable_tma=True,
++            )
++
++            if in_config.with_sf:
++                num_sf_rows_per_block = T.ceildiv(block_m, in_config.sf_block[0])
++                num_sf_cols_per_block = T.ceildiv(block_k, in_config.sf_block[1])
++                x_sf_fragment = T.alloc_fragment(
++                    (num_sf_rows_per_block, num_sf_cols_per_block), T.float32
++                )
++                for i, j in T.Parallel(num_sf_rows_per_block, num_sf_cols_per_block):
++                    m_idx = pid_token * block_m // in_config.sf_block[0] + i
++                    k_idx = pid_hidden * block_k // in_config.sf_block[1] + j
++                    x_sf_fragment[i, j] = transform_sf(
++                        load_sf(x_sf, m_idx, k_idx, in_config), in_config
++                    )
++
++                stage1_amax_fragment = T.alloc_fragment(
++                    (block_m, block_k // num_vectorize), T.float16
++                )
++                x_stage1_fragment_reshaped = T.reshape(
++                    x_fragment, [block_m, block_k // num_vectorize, num_vectorize]
++                )
++                T.reduce_absmax(
++                    x_stage1_fragment_reshaped, stage1_amax_fragment, dim=-1
++                )
++
++                stage2_amax_fragment = T.alloc_fragment(
++                    (block_m, block_k // num_vectorize), T.float32
++                )
++                T.clear(stage2_amax_fragment)
++                for i, j in T.Parallel(block_m, block_k // num_vectorize):
++                    stage2_amax_fragment[i, j] = (
++                        T.float32(stage1_amax_fragment[i, j])
++                        * x_sf_fragment[
++                            i // in_config.sf_block[0],
++                            j * num_vectorize // in_config.sf_block[1],
++                        ]
++                    )
++
++                stage2_amax_fragment_reshaped = T.reshape(
++                    stage2_amax_fragment,
++                    [block_m, num_groups, block_k // num_vectorize // num_groups],
++                )
++                T.reduce_max(stage2_amax_fragment_reshaped, sf_inv_fragment, dim=-1)
++
++                for i, j in T.Parallel(block_m, num_groups):
++                    sf, sf_inv = get_sf_and_inv(
++                        sf_inv_fragment[i, j], out_config, sf_inv_dtype
++                    )
++                    m_idx = pid_token * block_m + i
++                    k_idx = pid_hidden * num_groups + j
++                    store_sf(out_sf, sf, m_idx, k_idx, out_config)
++                    sf_inv_fragment[i, j] = sf_inv
++
++                if not sf_only:
++                    if stochastic_cast:
++                        x_fp32_local = T.alloc_local((4,), T.float32)
++                        for i, j in T.Parallel(block_m, block_k // 4):
++                            for k in T.vectorized(4):
++                                factor = (
++                                    x_sf_fragment[
++                                        i // in_config.sf_block[0],
++                                        (j * 4 + k) // in_config.sf_block[1],
++                                    ]
++                                    * sf_inv_fragment[
++                                        i, (j * 4 + k) // num_per_channels
++                                    ]
++                                )
++                                x_fp32_local[k] = (
++                                    T.float32(x_fragment[i, j * 4 + k]) * factor
++                                )
++                            rbits = rbits_hash(
++                                x_fp32_local, pid_hidden * (block_k // 4) + j
++                            )
++                            for k in T.vectorized(4):
++                                out_fragment_or_shared[i, j * 4 + k] = T.cast(
++                                    x_fp32_local[k],
++                                    out_config.dtype,
++                                    round="rs",
++                                    rbits=rbits,
++                                )
++                    else:
++                        for i, j in T.Parallel(block_m, block_k):
++                            factor = (
++                                x_sf_fragment[
++                                    i // in_config.sf_block[0],
++                                    j // in_config.sf_block[1],
++                                ]
++                                * sf_inv_fragment[i, j // num_per_channels]
++                            )
++                            out_fragment_or_shared[i, j] = (
++                                T.float32(x_fragment[i, j]) * factor
++                            )
++
++            else:
++                if cast_only:
++                    for i, j in T.Parallel(block_m, num_groups):
++                        sf = transform_sf(
++                            load_sf(
++                                out_sf,
++                                pid_token * block_m + i,
++                                pid_hidden * num_groups + j,
++                                out_config,
++                            ),
++                            out_config,
++                        )
++                        sf_inv_fragment[i, j] = 1 / sf
++                else:
++                    amax_fragment = T.alloc_fragment(
++                        (block_m, num_groups), in_config.dtype
++                    )
++                    x_fragment_reshaped = T.reshape(
++                        x_fragment, [block_m, num_groups, num_per_channels]
++                    )
++                    T.reduce_absmax(x_fragment_reshaped, amax_fragment, dim=2)
++                    for i, j in T.Parallel(block_m, num_groups):
++                        amax = T.cast(amax_fragment[i, j], T.float32)
++                        sf, sf_inv = get_sf_and_inv(amax, out_config, sf_inv_dtype)
++
++                        m_idx = pid_token * block_m + i
++                        k_idx = pid_hidden * num_groups + j
++                        store_sf(out_sf, sf, m_idx, k_idx, out_config)
++                        sf_inv_fragment[i, j] = sf_inv
++
++                if not sf_only:
++                    if stochastic_cast:
++                        x_fp32_local = T.alloc_local((4,), T.float32)
++                        for i, j in T.Parallel(block_m, block_k // 4):
++                            for k in T.vectorized(4):
++                                x_fp32_local[k] = (
++                                    x_fragment[i, j * 4 + k]
++                                    * sf_inv_fragment[
++                                        i, (j * 4 + k) // num_per_channels
++                                    ]
++                                )
++                            rbits = rbits_hash(
++                                x_fp32_local, pid_hidden * (block_k // 4) + j
++                            )
++                            for k in T.vectorized(4):
++                                out_fragment_or_shared[i, j * 4 + k] = T.cast(
++                                    x_fp32_local[k],
++                                    out_config.dtype,
++                                    round="rs",
++                                    rbits=rbits,
++                                )
++                    else:
++                        for i, j in T.Parallel(block_m, block_k):
++                            out_fragment_or_shared[i, j] = (
++                                x_fragment[i, j]
++                                * sf_inv_fragment[i, j // num_per_channels]
++                            )
++
++            if not sf_only:
++                T.copy(
++                    out_fragment_or_shared,
++                    out[pid_token * block_m, pid_hidden * block_k],
++                    disable_tma=True,
++                )
++
++            if use_pdl:
++                T.pdl_trigger()
++
++    return per_token_cast_kernel
++
++
++def per_token_cast_impl(
++    x: Union[torch.Tensor, QuantTensor],
++    fmt: str,
++    num_per_channels: int,
++    x_block_size: Optional[tuple[int, int]] = None,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++    sf_only: bool = False,
++    stochastic_cast: bool = False,
++    sf: Optional[torch.Tensor] = None,
++    out_x: Optional[torch.Tensor] = None,
++    out_sf: Optional[torch.Tensor] = None,
++    use_pdl: bool = False,
++) -> Union[torch.Tensor, QuantTensor]:
++    assert fmt in ("e4m3", "e2m1")
++
++    x, x_sf, in_config = get_cast_input_and_config(x, x_block_size)
++    out_config = get_cast_output_config(
++        fmt,
++        (1, num_per_channels),
++        use_tma_aligned_col_major_sf,
++        round_sf,
++        use_packed_ue8m0,
++        use_e4m3_sf,
++    )
++
++    num_tokens, hidden = x.shape
++    hidden = get_logical_hidden(hidden, x.dtype)
++    assert num_per_channels in (16, 32, 64, 128) and hidden % 64 == 0
++    assert sf is None or out_sf is None
++    assert sf is None or (
++        not use_tma_aligned_col_major_sf and not use_packed_ue8m0
++    ), "Cast-only mode only supports row-major, non-packed SF"
++
++    kernel = get_per_token_cast_kernel_cuda(
++        hidden=hidden,
++        token_stride=get_logical_hidden(x.stride(0), x.dtype),
++        in_config=in_config,
++        out_config=out_config,
++        sf_only=sf_only,
++        cast_only=(sf is not None),
++        small_batch=num_tokens <= SMALL_BATCH_THRESHOLD,
++        stochastic_cast=stochastic_cast,
++        use_pdl=use_pdl,
++    )
++
++    if out_x is None:
++        out_x = torch.empty(
++            (num_tokens, get_physical_hidden(hidden, out_config.torch_dtype)),
++            dtype=out_config.torch_dtype,
++            device=x.device,
++        )
++    if out_sf is None:
++        out_sf = (
++            sf
++            if sf is not None
++            else alloc_scaling_factors(
++                (num_tokens, hidden),
++                out_config=out_config,
++                device=x.device,
++            )
++        )
++    else:
++        sf_shape = get_sf_shape((num_tokens, hidden), out_config)
++        assert not use_tma_aligned_col_major_sf, "Not supported yet"
++        if use_packed_ue8m0:
++            out_sf = out_sf.view(dtype=torch.uint8)
++        assert out_sf.shape == sf_shape
++
++    if num_tokens > 0:
++        kernel(x, x_sf, out_x, out_sf)
++
++    out_sf = cast_epilogue(out_sf, out_config)
++
++    if sf_only:
++        return out_sf
++
++    if sf is not None:
++        return out_x
++
++    return out_x, out_sf
++
++
++def per_token_cast(
++    x: Union[torch.Tensor, QuantTensor],
++    fmt: str,
++    num_per_channels: int,
++    x_block_size: Optional[tuple[int, int]] = None,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++    stochastic_cast: bool = False,
++    out: Optional[QuantTensor] = None,
++    *,
++    use_pdl: bool = False,
++) -> QuantTensor:
++    """Cast a matrix to FP8/FP4 with per-token (row-wise) scaling factors."""
++    out_x, out_sf = (None, None) if out is None else out
++    return per_token_cast_impl(
++        x,
++        fmt,
++        num_per_channels,
++        x_block_size,
++        use_tma_aligned_col_major_sf,
++        round_sf,
++        use_packed_ue8m0,
++        use_e4m3_sf,
++        stochastic_cast=stochastic_cast,
++        out_x=out_x,
++        out_sf=out_sf,
++        use_pdl=use_pdl,
++    )
++
++
++def per_token_cast_with_sf_only(
++    x: torch.Tensor,
++    fmt: str,
++    num_per_channels: int,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++    out_sf: Optional[torch.Tensor] = None,
++    *,
++    use_pdl: bool = False,
++) -> torch.Tensor:
++    """Cast a matrix to FP8/FP4 with per-token scaling, returning only the sf factors."""
++    return per_token_cast_impl(
++        x,
++        fmt,
++        num_per_channels,
++        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
++        round_sf=round_sf,
++        use_packed_ue8m0=use_packed_ue8m0,
++        use_e4m3_sf=use_e4m3_sf,
++        sf_only=True,
++        out_sf=out_sf,
++        use_pdl=use_pdl,
++    )
++
++
++def per_token_cast_with_precomputed_sf(
++    x: torch.Tensor,
++    fmt: str,
++    num_per_channels: int,
++    sf: torch.Tensor,
++    use_tma_aligned_col_major_sf: bool = False,
++    round_sf: bool = False,
++    use_packed_ue8m0: bool = False,
++    use_e4m3_sf: bool = False,
++    out: Optional[torch.Tensor] = None,
++    *,
++    use_pdl: bool = False,
++) -> torch.Tensor:
++    """Cast a matrix to FP8/FP4 with per-token scaling using precomputed sf factors."""
++    return per_token_cast_impl(
++        x,
++        fmt,
++        num_per_channels,
++        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
++        round_sf=round_sf,
++        use_packed_ue8m0=use_packed_ue8m0,
++        use_e4m3_sf=use_e4m3_sf,
++        sf=sf,
++        out_x=out,
++        use_pdl=use_pdl,
++    )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index a07a285b6..6c7755dba 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -265,6 +265,502 @@ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
+     return (False, True)
+ 
+ 
++def _topk_gate_align(x: int, y: int) -> int:
++    return ((x + y - 1) // y) * y
++
++
++@T.macro
++def sqrt_softplus_forward_cuda(x: T.Ref):
++    return T.sqrt(T.Select(x > 20.0, x, T.log1p(T.exp(x))))
++
++
++@T.macro
++def warp_reduce_sum(x: T.Ref):
++    for i in T.unroll(0, 5):
++        x += T.shfl_xor(x, 1 << (4 - i))
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++    },
++)
++def get_moe_topk_gate_forward_kernel_cuda(
++    num_topk: int,
++    num_routed_experts: int,
++    mask_exists: bool,
++    fix_routing_mask_exists: bool,
++    unmapped_topk_idx_exists: bool,
++    to_physical_map_exists: bool,
++    bias_exists: bool,
++    image_token_mask_exists: bool,
++    force_random_exists: bool,
++    scores_exists: bool,
++    use_pdl: bool = False,
++):
++    warp_size = 32
++    num_warps = 2
++    num_threads = warp_size * num_warps
++    assert (
++        num_topk <= warp_size
++    ), f"num_topk must be less than or equal to {warp_size}"
++
++    num_tokens_per_block = num_threads // warp_size
++
++    large_prime_number = 23333
++    num_vectorize = 4
++    assert num_routed_experts % num_vectorize == 0, (
++        f"`num_routed_experts` must be divisible by {num_vectorize}, "
++        f"but got {num_routed_experts}"
++    )
++
++    num_tokens = T.dynamic("num_tokens")
++    unmapped_topk_idx_stride = T.dynamic("unmapped_topk_idx_stride")
++    num_physical_topk = T.dynamic("num_physical_topk")
++    num_logical_experts = T.dynamic("num_logical_experts")
++    num_duplicate_experts = T.dynamic("num_duplicate_experts")
++
++    num_routed_experts_per_thread = _topk_gate_align(
++        (num_routed_experts + warp_size - 1) // warp_size, num_vectorize
++    )
++    assert num_routed_experts_per_thread % num_vectorize == 0
++
++    @T.prim_func
++    def moe_topk_gate_forward_kernel(
++        logits: T.Tensor[(num_tokens, num_routed_experts), T.float32],
++        bias: T.Tensor[(num_routed_experts), T.float32],
++        image_bias: T.Tensor[(num_routed_experts), T.float32],
++        image_token_mask: T.Tensor[(num_tokens,), T.bool],
++        mask: T.Tensor[(num_tokens,), T.bool],
++        fix_routing_mask: T.Tensor[(num_tokens,), T.bool],
++        to_physical_map: T.Tensor[
++            (num_logical_experts, num_duplicate_experts), T.int32
++        ],
++        logical_count: T.Tensor[(num_logical_experts), T.int32],
++        topk_idx: T.Tensor[(num_tokens, num_physical_topk), T.int64],
++        unmapped_topk_idx: T.StridedTensor[
++            (num_tokens, num_topk), (unmapped_topk_idx_stride, 1), T.int64
++        ],
++        topk_weights: T.Tensor[(num_tokens, num_physical_topk), T.float32],
++        scores: T.Tensor[(num_tokens, num_routed_experts), T.float32],
++        force_random: T.Tensor[(num_tokens,), T.bool],
++        num_shared_experts: T.int32,
++        routed_scaling_factor: T.float32,
++        ep_rank: T.int32,
++    ):
++        with T.Kernel(
++            T.ceildiv(num_tokens, num_tokens_per_block), threads=num_threads
++        ) as pid:
++            if use_pdl:
++                T.pdl_sync()
++
++            thread_idx = T.get_thread_binding()
++            token_idx = thread_idx // 32
++            global_token_idx = token_idx + pid * num_tokens_per_block
++            lane_idx = thread_idx % 32
++
++            if global_token_idx >= num_tokens:
++                if use_pdl:
++                    T.pdl_trigger()
++                T.thread_return()
++
++            scores_wo_bias_shared = T.alloc_shared(
++                (num_tokens_per_block, num_routed_experts), dtype=T.float32
++            )
++
++            bias_local = T.alloc_local(
++                (num_routed_experts_per_thread,), dtype=T.float32
++            )
++            scores_local = T.alloc_local(
++                (num_routed_experts_per_thread,), dtype=T.float32
++            )
++            idx_local = T.alloc_local(
++                (num_routed_experts_per_thread,), dtype=T.int32
++            )
++            winner_score = T.alloc_var(dtype=T.float32)
++            winner_idx = T.alloc_var(dtype=T.int32, init=-1)
++            previous_winner_idx = T.alloc_var(dtype=T.int32, init=-1)
++
++            is_image_token = T.alloc_var(dtype=T.bool)
++            other_idx = T.alloc_var(dtype=T.int32)
++            topk_score_var = T.alloc_var(dtype=T.float32)
++            topk_idx_var = T.alloc_var(dtype=T.int64)
++            topk_sum_var = T.alloc_var(dtype=T.float32)
++
++            is_masked_token = mask_exists and not mask[global_token_idx]
++            if is_masked_token:
++                if lane_idx < num_topk and unmapped_topk_idx_exists:
++                    unmapped_topk_idx[global_token_idx, lane_idx] = -1
++                if lane_idx < num_physical_topk:
++                    topk_idx[global_token_idx, lane_idx] = -1
++                    topk_weights[global_token_idx, lane_idx] = 0.0
++                if scores_exists:
++                    for i in T.serial(lane_idx, num_routed_experts, warp_size):
++                        scores[global_token_idx, i] = 0.0
++                if use_pdl:
++                    T.pdl_trigger()
++                T.thread_return()
++
++            is_image_token = (
++                image_token_mask[global_token_idx]
++                if image_token_mask_exists
++                else False
++            )
++
++            T.fill(idx_local, -1)
++            T.fill(scores_local, -T.infinity(T.float32))
++            T.fill(bias_local, 0.0)
++
++            T.device_assert(num_physical_topk <= warp_size)
++
++            is_force_random_token = (
++                force_random_exists and force_random[global_token_idx]
++            )
++            if is_force_random_token:
++                rand_topk_idx_var = T.alloc_var(T.int32)
++                rand_topk_idx_tmp_var = T.alloc_var(T.int32)
++                rand_topk_weight_var = T.alloc_var(T.float32)
++                min_lane_idx = T.alloc_var(T.int32)
++
++                seed = ep_rank
++                seq_offset = global_token_idx
++                num_physical_experts = T.alloc_var(T.int32, init=0)
++                if to_physical_map_exists:
++                    for i in T.serial(lane_idx, num_logical_experts, warp_size):
++                        num_physical_experts += logical_count[i]
++                    num_physical_experts = T.warp_reduce_sum(num_physical_experts)
++                else:
++                    num_physical_experts = num_routed_experts + num_shared_experts
++
++                T.rng_init(seed, seq_offset * warp_size + lane_idx, 0)
++                rand_topk_weight_var = T.rng_rand_float()
++
++                if lane_idx < num_physical_topk:
++                    rand_topk_idx_tmp_var = T.rng_rand() % (
++                        num_physical_experts - lane_idx
++                    )
++                    rand_topk_idx_var = -1
++                else:
++                    rand_topk_idx_tmp_var = T.max_value(T.int32)
++                    rand_topk_idx_var = T.max_value(T.int32)
++                for _ in T.serial(num_physical_topk):
++                    min_topk_idx = T.warp_reduce_min(rand_topk_idx_tmp_var)
++                    min_lane_idx = T.Select(
++                        min_topk_idx == rand_topk_idx_tmp_var,
++                        lane_idx,
++                        T.max_value(T.int32),
++                    )
++                    min_lane_idx = T.warp_reduce_min(min_lane_idx)
++                    if rand_topk_idx_var == -1:
++                        if (
++                            rand_topk_idx_tmp_var >= min_topk_idx
++                            and min_lane_idx < lane_idx
++                        ):
++                            rand_topk_idx_tmp_var += 1
++                        elif min_lane_idx == lane_idx:
++                            rand_topk_idx_var = rand_topk_idx_tmp_var
++                            rand_topk_idx_tmp_var = T.max_value(T.int32)
++
++                T.device_assert(
++                    lane_idx >= num_physical_topk
++                    or T.match_any_sync(rand_topk_idx_var) ^ (1 << lane_idx) == 0
++                )
++
++                if lane_idx < num_physical_topk:
++                    topk_idx[global_token_idx, lane_idx] = rand_topk_idx_var
++                    topk_weights[global_token_idx, lane_idx] = rand_topk_weight_var
++                    if unmapped_topk_idx_exists and lane_idx < num_topk:
++                        unmapped_topk_idx[global_token_idx, lane_idx] = -1
++                if scores_exists:
++                    for i in T.serial(lane_idx, num_routed_experts, warp_size):
++                        scores[global_token_idx, i] = 0.0
++                if use_pdl:
++                    T.pdl_trigger()
++                T.thread_return()
++
++            for i in T.unroll(0, num_routed_experts_per_thread // num_vectorize):
++                start_expert_idx = (
++                    i * num_vectorize * warp_size + lane_idx * num_vectorize
++                )
++                if start_expert_idx < num_routed_experts:
++                    for j in T.vectorized(num_vectorize):
++                        expert_idx = start_expert_idx + j
++                        scores_local[i * num_vectorize + j] = logits[
++                            global_token_idx, expert_idx
++                        ]
++                        bias_local[i * num_vectorize + j] = (
++                            image_bias[expert_idx]
++                            if (image_token_mask_exists and is_image_token)
++                            else bias[expert_idx]
++                            if bias_exists
++                            else 0
++                        )
++
++                    for j in T.unroll(num_vectorize):
++                        is_finite = T.isfinite(scores_local[i * num_vectorize + j])
++                        T.device_assert(
++                            is_finite,
++                            msg="moe_topk_gate_forward input contains nan or inf!",
++                        )
++
++            for i in T.unroll(
++                0, T.ceildiv(num_routed_experts, num_vectorize * warp_size)
++            ):
++                start_expert_idx = (
++                    i * num_vectorize * warp_size + lane_idx * num_vectorize
++                )
++                if start_expert_idx < num_routed_experts:
++                    for j in T.unroll(num_vectorize):
++                        local_idx = i * num_vectorize + j
++                        scores_local[local_idx] = sqrt_softplus_forward_cuda(
++                            scores_local[local_idx]
++                        )
++
++                    for j in T.vectorized(num_vectorize):
++                        expert_idx = start_expert_idx + j
++                        local_idx = i * num_vectorize + j
++                        scores_wo_bias_shared[token_idx, expert_idx] = scores_local[
++                            local_idx
++                        ]
++                        if scores_exists:
++                            scores[global_token_idx, expert_idx] = scores_local[
++                                local_idx
++                            ]
++                        scores_local[local_idx] += bias_local[local_idx]
++                        idx_local[local_idx] = expert_idx
++
++            T.sync_warp()
++
++            if not fix_routing_mask_exists or not fix_routing_mask[global_token_idx]:
++                for k in T.unroll(num_topk):
++                    winner_score = -T.infinity(T.float32)
++                    winner_idx = -1
++                    for i in T.unroll(0, num_routed_experts_per_thread):
++                        if k != 0 and previous_winner_idx == idx_local[i]:
++                            scores_local[i] = -T.infinity(T.float32)
++                        elif scores_local[i] > winner_score:
++                            winner_score = scores_local[i]
++                            winner_idx = idx_local[i]
++
++                    for i in T.unroll(5):
++                        other_score = T.shfl_xor(winner_score, 1 << i)
++                        other_idx = T.shfl_xor(winner_idx, 1 << i)
++                        if other_score > winner_score or (
++                            other_score == winner_score and other_idx < winner_idx
++                        ):
++                            winner_score = other_score
++                            winner_idx = other_idx
++
++                    previous_winner_idx = winner_idx
++                    if lane_idx == k:
++                        topk_idx_var = winner_idx
++
++                topk_score_var = 0.0
++                if lane_idx < num_topk:
++                    topk_score_var = scores_wo_bias_shared[token_idx, topk_idx_var]
++
++            else:
++                topk_score_var = 0.0
++                if lane_idx < num_topk:
++                    topk_idx_var = unmapped_topk_idx[global_token_idx, lane_idx]
++                    topk_score_var = scores_wo_bias_shared[token_idx, topk_idx_var]
++
++            topk_sum_var = topk_score_var
++            warp_reduce_sum(topk_sum_var)
++            topk_sum_var += 1e-20
++
++            if lane_idx < num_topk:
++                T.device_assert(topk_idx_var >= 0)
++                topk_score_var = (
++                    topk_score_var / topk_sum_var * routed_scaling_factor
++                )
++                if unmapped_topk_idx_exists:
++                    unmapped_topk_idx[global_token_idx, lane_idx] = topk_idx_var
++            elif lane_idx < num_physical_topk:
++                topk_score_var = 1.0
++                topk_idx_var = lane_idx + (num_routed_experts - num_topk)
++
++            if to_physical_map_exists and lane_idx < num_physical_topk:
++                logical_expert_idx = topk_idx_var
++                num_duplicates = logical_count[logical_expert_idx]
++                duplicate_idx = (
++                    ep_rank + global_token_idx * large_prime_number
++                ) % num_duplicates
++                topk_idx_var = to_physical_map[logical_expert_idx, duplicate_idx]
++
++            if lane_idx < num_physical_topk:
++                topk_idx[global_token_idx, lane_idx] = topk_idx_var
++                topk_weights[global_token_idx, lane_idx] = topk_score_var
++
++            if use_pdl:
++                T.pdl_trigger()
++
++    return moe_topk_gate_forward_kernel
++
++
++def moe_topk_gate_forward(
++    logits: torch.Tensor,
++    num_topk: int,
++    use_shared_as_routed: bool,
++    num_shared_experts: int,
++    routed_scaling_factor: float,
++    ep_rank: int,
++    scoring_func: str = "sqrtsoftplus",
++    mask: torch.Tensor | None = None,
++    bias: torch.Tensor | None = None,
++    image_bias: torch.Tensor | None = None,
++    image_token_mask: torch.Tensor | None = None,
++    fix_routing_mask: torch.Tensor | None = None,
++    to_physical_map: torch.Tensor | None = None,
++    logical_count: torch.Tensor | None = None,
++    unmapped_topk_idx: torch.Tensor | None = None,
++    force_random: torch.Tensor | None = None,
++    out: tuple[torch.Tensor, torch.Tensor] | None = None,
++    scores: torch.Tensor | None = None,
++    *,
++    use_pdl: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Compute top-k expert routing for Mixture of Experts (MoE) models."""
++    assert (
++        scoring_func == "sqrtsoftplus"
++    ), f"moe_topk_gate_forward only supports sqrtsoftplus scoring, got {scoring_func!r}"
++    assert logits.dim() == 2 and logits.is_contiguous() and logits.dtype == torch.float32
++    bias_exists = bias is not None
++    if bias_exists:
++        assert bias.dim() == 1 and bias.is_contiguous() and bias.dtype == torch.float32
++        assert logits.size(1) == bias.size(0)
++
++    image_token_mask_exists = image_token_mask is not None
++    assert image_token_mask_exists == (
++        image_bias is not None
++    ), "image_bias and image_token_mask must be both provided or both None"
++    if image_token_mask_exists:
++        assert (
++            image_bias.dim() == 1
++            and image_bias.is_contiguous()
++            and image_bias.dtype == torch.float32
++        )
++        assert (
++            image_token_mask.dim() == 1
++            and image_token_mask.is_contiguous()
++            and image_token_mask.dtype == torch.bool
++        )
++        assert logits.size(1) == image_bias.size(0)
++        assert logits.size(0) == image_token_mask.size(0)
++
++    if mask is not None:
++        assert mask.numel() == logits.size(0) and mask.dtype == torch.bool
++    assert (to_physical_map is None) == (logical_count is None)
++
++    num_tokens = logits.size(0)
++    num_routed_experts = logits.size(1)
++    assert num_topk <= num_routed_experts, (
++        f"num_topk ({num_topk}) must be less than or equal to "
++        f"num_routed_experts ({num_routed_experts})."
++    )
++
++    if not use_shared_as_routed:
++        num_shared_experts = 0
++
++    assert num_shared_experts in {1, 2} or (
++        num_shared_experts == 0 and not use_shared_as_routed
++    )
++
++    if out is None:
++        topk_idx = torch.empty(
++            num_tokens,
++            num_topk + num_shared_experts,
++            dtype=torch.int64,
++            layout=logits.layout,
++            device=logits.device,
++        )
++        topk_weights = torch.empty(
++            num_tokens,
++            num_topk + num_shared_experts,
++            dtype=torch.float32,
++            layout=logits.layout,
++            device=logits.device,
++        )
++    else:
++        topk_idx, topk_weights = out
++        assert (
++            topk_idx.size() == (num_tokens, num_topk + num_shared_experts)
++            and topk_idx.dtype == torch.int64
++        )
++        assert (
++            topk_weights.size() == (num_tokens, num_topk + num_shared_experts)
++            and topk_weights.dtype == torch.float32
++        )
++
++    if scores is not None:
++        assert scores.size() == logits.size() and scores.dtype == torch.float32
++        assert scores.is_contiguous() and scores.device == logits.device
++    if num_tokens == 0:
++        return topk_idx, topk_weights
++
++    num_logical_experts = num_shared_experts + num_routed_experts
++    if to_physical_map is not None:
++        assert to_physical_map.is_contiguous()
++        assert to_physical_map.dim() == 2 and to_physical_map.dtype == torch.int32
++        assert to_physical_map.size(0) == num_logical_experts
++        assert logical_count is not None and logical_count.is_contiguous()
++        assert logical_count.dim() == 1 and logical_count.dtype == torch.int32
++        assert logical_count.size(0) == num_logical_experts
++
++    if unmapped_topk_idx is not None:
++        assert (
++            unmapped_topk_idx.dim() == 2 and unmapped_topk_idx.dtype == torch.int64
++        )
++        assert (
++            unmapped_topk_idx.size(0) == num_tokens
++            and unmapped_topk_idx.size(1) == num_topk
++        )
++        assert unmapped_topk_idx.stride(1) == 1
++
++    if fix_routing_mask is not None:
++        assert unmapped_topk_idx is not None
++        assert fix_routing_mask.is_contiguous()
++        assert fix_routing_mask.dtype == torch.bool
++        assert fix_routing_mask.dim() == 1 and fix_routing_mask.size(0) == num_tokens
++
++    kernel = get_moe_topk_gate_forward_kernel_cuda(
++        num_topk,
++        num_routed_experts,
++        mask is not None,
++        fix_routing_mask is not None,
++        unmapped_topk_idx is not None,
++        to_physical_map is not None,
++        bias_exists,
++        image_token_mask_exists,
++        force_random is not None,
++        scores is not None,
++        use_pdl=use_pdl,
++    )
++
++    kernel(
++        logits,
++        bias,
++        image_bias,
++        image_token_mask,
++        mask,
++        fix_routing_mask,
++        to_physical_map,
++        logical_count,
++        topk_idx,
++        unmapped_topk_idx,
++        topk_weights,
++        scores,
++        force_random,
++        num_shared_experts,
++        routed_scaling_factor,
++        ep_rank,
++    )
++
++    return topk_idx, topk_weights
++
++
+ def _topk_gate(
+     logits: torch.Tensor,
+     num_topk: int,
+@@ -274,7 +770,7 @@ def _topk_gate(
+     image_bias: torch.Tensor | None,
+     image_token_mask: torch.Tensor | None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
++    """Native TileLang top-k gate as V4.1 routes: sqrtsoftplus with a correction
+     bias and no shared experts."""
+     return pdl.moe_topk_gate_forward(
+         logits,
+-- 
+2.54.0 (Apple Git-157)
+
