@@ -158,26 +158,10 @@ def memory_policy_unit() -> str:
     return ""
 
 
-def stock_4k_profile(profile):
-    """A serving profile that runs on a stock 4 KiB kernel without out-of-tree modules."""
-    return bool(profile) and profile.get("page_size") == 4096 and not profile.get("memory_saver_required", True)
-
-
-def findings(name, data, policy, profile=None):
+def findings(name, data, policy):
     """Warnings plus separate corrective commands; never execute corrections."""
     issues = []
     fixes = []
-    if stock_4k_profile(profile):
-        if data.get("errors"):
-            issues.append(f"{name}: incomplete kernel inventory: " + "; ".join(data["errors"]))
-        if data.get("governors") != ["performance"]:
-            issues.append(f"{name}: CPU governors differ from performance: {data.get('governors')!r}")
-            fixes.append(f"{name}: after installing matching linux-tools, sudo systemctl restart nv-cpu-governor.service")
-        grub = data.get("grub", {})
-        if grub.get("next_entry") or grub.get("initrdfail") or grub.get("prev_entry"):
-            issues.append(f"{name}: a GRUB next-boot/recovery override is armed; kernel is not merely staged")
-            fixes.append(f"{name}: inspect sudo grub-editenv list; cancel an unintended one-shot with sudo grub-editenv unset next_entry (review recovery state separately)")
-        return issues, fixes
     target = policy["candidate"]
     running = data.get("kernel")
     expected_page = 65536 if running == target else 4096 if running == policy["fallback"] else None
@@ -285,15 +269,13 @@ def memory_saver_problems(name, data, policy):
 
 
 def profile_problems(name, data, profile, policy):
-    """Hard launch requirements for a memory budget tied to a particular kernel."""
+    """Recommendations for a memory budget tied to a particular kernel."""
     if not profile:
         return []
     issues = []
     release = profile.get("release")
-    release_mismatch = bool(release) and not stock_4k_profile(profile) and data.get("kernel") != release
-    if release_mismatch or not data.get("kernel") or data.get("page_size") != profile["page_size"]:
-        wanted_release = release or "a stock 4 KiB kernel"
-        issues.append(f"{name}: serving profile requires {wanted_release} / {profile['page_size']}-byte pages; "
+    if (release and data.get("kernel") != release) or data.get("page_size") != profile["page_size"]:
+        issues.append(f"{name}: serving profile requires {release} / {profile['page_size']}-byte pages; "
                       f"running {data.get('kernel')!r} / {data.get('page_size')!r}")
     if policy.get("rm_build_note") and data.get("rm_build_note") != policy["rm_build_note"]:
         issues.append(f"{name}: serving profile requires the qualified NVIDIA RM build")

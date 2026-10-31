@@ -102,13 +102,13 @@ These compare each node with the kernel policy in
 | A GRUB entry for the 64 KiB kernel, normal boot pinned to the policy's default, and no pending one-shot or recovery override | warn |
 | On 64 KiB: THP `never`, `vm.min_free_kbytes=45166`, `/swap-64k.img` active and `spark-ds41f-kernel-memory.service` active (`spark3-kernel-memory.service` counts as the same policy, with a rename warning) | warn |
 | Memory-saver DKMS installed for the 64 KiB kernel and selected for UVM; with Secure Boot, signed; on 64 KiB, loaded with leaf-table packing on | warn |
-| **The selected profile's kernel requirements**: the running kernel and page size equal the profile's `host.kernel`; for a profile with `memory_saver_required`, the memory saver is loaded with packing on and the driver is 580.178.04 | error |
+| **The selected profile's kernel recommendations**: the running kernel and page size equal the profile's `host.kernel`; for a profile with `memory_saver_required`, the memory saver is loaded with packing on and the driver is 580.178.04 | warn |
 | All nodes agree on kernel, page size, driver, loaded NVIDIA module sources, packing, THP, free-memory reserve, Secure Boot state and CPU governors | error |
 
-A 4 KiB profile (`tp3-triangle-4k`, or an arm with `page_size: 4096` and
-`memory_saver_required: false`) requires only a running 4 KiB kernel (and that
-all nodes run the same release), and skips the 64 KiB candidate and memory-saver
-checks.
+The 64 KiB kernel and memory saver are recommended for the 1M-context profiles,
+so `doctor --live` and `cluster start` warn when a node runs a 4 KiB kernel or
+lacks the memory saver, while still requiring all nodes in the cluster to agree
+with one another.
 
 ### Fabric
 

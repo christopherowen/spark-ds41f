@@ -181,16 +181,6 @@ class ReadinessTest(unittest.TestCase):
         profile = {"release": OLD, "page_size": 4096, "memory_saver_required": False}
         self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
 
-    def test_stock_4k_profile_suppresses_64k_warnings_and_accepts_newer_stock_kernel(self):
-        profile = {"release": OLD, "page_size": 4096, "memory_saver_required": False}
-        data = {"kernel": "7.0.0-1024-nvidia", "page_size": 4096, "driver": "580.142",
-                "errors": [], "packages": {}, "files": {}, "headers": False, "config_64k": False,
-                "cpu_tools": False, "governors": ["performance"], "modules": {}, "fan_dkms": "",
-                "memory_saver_dkms": "", "memory_saver_disk": {"srcversion": ""},
-                "grub": {"entries": {}, "default": "0", "next_entry": "", "recordfail": "", "initrdfail": ""}}
-        self.assertEqual(kernel.findings("dgx1", data, POLICY, profile), ([], []))
-        self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
-
     def test_large_profile_refuses_stock_kernel_even_with_installed_module(self):
         profile = {"release": NEW, "page_size": 65536, "memory_saver_required": True}
         self.assertTrue(kernel.profile_problems("dgx1", ready(), profile, POLICY))
