@@ -1,0 +1,103 @@
+From 2051574eccd1c7e33459ca173095995329560068 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:49:33 +0100
+Subject: [PATCH] perf(deepseek_v4_1): add TP4 and TP3 DSpark main_proj decode
+ tile configs
+
+---
+ .../test_deepseek_v41_block_scale_words.py    | 20 +++++++++++++++++--
+ .../test_deepseek_v41_tilelang_linear.py      | 11 +++++++++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 12 ++++++++++-
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+index 59c5666f3..23c43841b 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
++++ b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+@@ -111,7 +111,23 @@ def _serving_tiles():
+                 tiles.add((k, block_k))
+     # Shapes with no sweep entry take pick_block_K: 128, else the widest
+     # multiple of 64 up to 192 that divides K. 576 is the straddle.
+-    for k in (64, 192, 256, 384, 512, 576, 640, 768, 1024, 1280, 2048, 4096, 5120, 6144):
++    for k in (
++        64,
++        192,
++        256,
++        384,
++        512,
++        576,
++        640,
++        768,
++        1024,
++        1280,
++        2048,
++        4096,
++        5120,
++        6144,
++        15360,
++    ):
+         for block_k in (128, *range(192, 0, -64)):
+             if k % block_k == 0:
+                 tiles.add((k, block_k))
+@@ -130,7 +146,7 @@ def test_every_serving_k_tile_loads_the_scale_words_it_consumes():
+     tiles = _serving_tiles()
+     # These are sweep entries, not the default 128-wide tile. A walker that
+     # misses ``dict(block_K=...)`` would drop them.
+-    assert {(576, 64), (576, 192), (1280, 256), (5120, 256)} <= tiles
++    assert {(576, 64), (576, 192), (1280, 256), (5120, 256), (15360, 256)} <= tiles
+     short = []
+     for k, block_k in sorted(tiles):
+         assert k % block_k == 0, (k, block_k)
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 7a5aa4ce4..3ecb5c826 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -73,7 +73,16 @@ def _mxfp8(x):
+ 
+ # K blocks of 128 and, for TP4's 576-wide shared expert rows, 192 and 64.
+ @pytest.mark.parametrize(
+-    "n, k", [(256, 512), (1536, 1024), (224, 384), (320, 576), (1152, 576)]
++    "n, k",
++    [
++        (256, 512),
++        (1536, 1024),
++        (224, 384),
++        (320, 576),
++        (1152, 576),
++        (1280, 15360),
++        (1728, 15360),
++    ],
+ )
+ def test_mxfp8_gemm(n, k):
+     weight, exps, weight_values = _block32_weight(n, k, 1)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 4a0c886fa..1f1b38380 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1185,12 +1185,22 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+     },
+-    # TP4 DSpark main projection.
++    # DSpark main projection (replicated, TP4 shard, and TP3 padded shard).
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
++    (1280, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++    },
++    (1728, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++    },
+ }
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
