@@ -1,0 +1,986 @@
+=== output /c/iket/hot-20261026T011326Z
+=== IKET mode tests
+.......F.                                                                [100%]
+=================================== FAILURES ===================================
+_________________ test_on_matches_off_and_keeps_its_own_cache __________________
+
+tmp_path = PosixPath('/c/iket/hot-20261026T011326Z/pytest/test_on_matches_off_and_keeps_0')
+
+    @GPU
+    def test_on_matches_off_and_keeps_its_own_cache(tmp_path):
+>       off = _run(tmp_path, "off")
+              ^^^^^^^^^^^^^^^^^^^^^
+
+tests/kernels/test_deepseek_v41_tilelang_iket.py:232: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/c/iket/hot-20261026T011326Z/pytest/test_on_matches_off_and_keeps_0')
+args = ('off',)
+
+    def _run(tmp_path, *args):
+        env = dict(os.environ, TILELANG_CACHE_DIR=str(tmp_path / "deployment-cache"))
+        process = subprocess.run(
+            [sys.executable, _script(tmp_path, KERNEL_SCRIPT), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+>       assert process.returncode == 0, process.stderr[-4000:]
+E       AssertionError: Traceback (most recent call last):
+E           File "/c/iket/hot-20261026T011326Z/pytest/test_on_matches_off_and_keeps_0/script_0.py", line 42, in <module>
+E             "cache_enabled": tilelang.env.env.is_cache_enabled(),
+E                              ^^^^^^^^^^^^^^^^
+E         AttributeError: 'Environment' object has no attribute 'env'
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/usr/bin/python3', '/c/iket/hot-20261026T011326Z/pytest/test_on_matches_off_and_keeps_0/script..._enabled(),\n                     ^^^^^^^^^^^^^^^^\nAttributeError: \'Environment\' object has no attribute \'env\'\n').returncode
+
+tests/kernels/test_deepseek_v41_tilelang_iket.py:226: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/kernels/test_deepseek_v41_tilelang_iket.py::test_on_matches_off_and_keeps_its_own_cache
+1 failed, 8 passed, 14 warnings in 17.74s
+=== IKET mode tests: exit 1 in 19 s
+=== off
+moe: prepared in 2.9 s
+mla: prepared in 0.7 s
+mhc: prepared in 0.3 s
+allreduce: prepared in 0.1 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1103.65}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 45.12}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 12.61}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 148.34}
+{"mode": "off", "rows": 8, "iters": 200, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1103.65}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 45.12}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 12.61}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 148.34}}, "modules": {"tilelang.tools.cuda.iket": false, "vllm.models.deepseek_v4_1.tilelang.iket": false}, "postproc_callback": false}
+=== off: exit 0 in 10 s
+=== on, outside the profiler
+[01:14:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:04  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `per_token_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `per_token_cast_kernel`
+moe: prepared in 5.1 s
+[01:14:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+mla: prepared in 4.1 s
+2026-10-26 01:14:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_finalize` with `out_idx=None`
+2026-10-26 01:14:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_project_streams` with `out_idx=None`
+2026-10-26 01:14:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_finalize`
+2026-10-26 01:14:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_project_streams`
+mhc: prepared in 2.0 s
+2026-10-26 01:14:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:14:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.6 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1107.46}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 51.11}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 14.37}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 124.38}
+{"mode": "on", "rows": 8, "iters": 200, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1107.46}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 51.11}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 14.37}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 124.38}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+=== on, outside the profiler: exit 0 in 19 s
+=== on, under run-iket
+[run-iket] ============= Dry run application first to collect some info... =============
+[01:14:22] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:22] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:22] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:22] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:23  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:24  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `per_token_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `per_token_cast_kernel`
+moe: prepared in 5.5 s
+[01:14:27] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:27] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:27] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+mla: prepared in 4.2 s
+2026-10-26 01:14:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_finalize` with `out_idx=None`
+2026-10-26 01:14:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_project_streams` with `out_idx=None`
+2026-10-26 01:14:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_finalize`
+2026-10-26 01:14:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_project_streams`
+mhc: prepared in 2.0 s
+2026-10-26 01:14:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:14:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.6 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 3158.54}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 474.49}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 351.63}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 325.32}
+{"mode": "on", "rows": 8, "iters": 3, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 3158.54}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 474.49}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 351.63}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 325.32}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+[run-iket] Auto-computed context buffer size: 0.22 GB (240,984,799 bytes)
+[run-iket] ============= Run application for real profiling... =============
+[01:14:42] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:42] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:42] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:42] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:14:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:14:44  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `per_token_cast_kernel` with `out_idx=None`
+2026-10-26 01:14:44  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `per_token_cast_kernel`
+moe: prepared in 5.3 s
+[01:14:46] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:47] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:14:47] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:14:45  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:45  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:45  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:14:48  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:48  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:14:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+mla: prepared in 4.3 s
+2026-10-26 01:14:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_project_streams` with `out_idx=None`
+2026-10-26 01:14:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_finalize` with `out_idx=None`
+2026-10-26 01:14:50  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_finalize`
+2026-10-26 01:14:51  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_project_streams`
+mhc: prepared in 2.0 s
+2026-10-26 01:14:51  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:14:51  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.6 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 2674.33}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 563.2}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 460.6}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 396.53}
+{"mode": "on", "rows": 8, "iters": 3, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 2674.33}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 563.2}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 460.6}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 396.53}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+[run-iket] Dumped perfetto trace to /c/iket/hot-20261026T011326Z/trace/iket_pid_0x653.pftrace
+[run-iket] Dumped json trace to /c/iket/hot-20261026T011326Z/trace/iket_pid_0x653.trace.json
+[run-iket] Dumped compressed trace to /c/iket/hot-20261026T011326Z/trace/iket_pid_0x653.pftrace.gz
+[run-iket] Dumped perfetto HTML viewer to /c/iket/hot-20261026T011326Z/trace/iket_pid_0x653.html
+[run-iket] To view: cd /c/iket/hot-20261026T011326Z/trace && python3 -m http.server 8080 , then open http://localhost:8080/iket_pid_0x653.html
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace/tracker
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace/gen-config
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace/iket
+=== on, under run-iket: exit 0 in 135 s
+=== all-reduce, peers 20 us late, under run-iket
+[run-iket] ============= Dry run application first to collect some info... =============
+2026-10-26 01:16:34  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:16:35  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.8 s
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 346.4}
+{"mode": "on", "rows": 8, "iters": 3, "families": {"allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 346.4}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+[run-iket] Auto-computed context buffer size: 0.00 GB (105,983 bytes)
+[run-iket] ============= Run application for real profiling... =============
+2026-10-26 01:16:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:16:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.8 s
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 504.33}
+{"mode": "on", "rows": 8, "iters": 3, "families": {"allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 504.33}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+[run-iket] Dumped perfetto trace to /c/iket/hot-20261026T011326Z/trace-late/iket_pid_0x905.pftrace
+[run-iket] Dumped json trace to /c/iket/hot-20261026T011326Z/trace-late/iket_pid_0x905.trace.json
+[run-iket] Dumped compressed trace to /c/iket/hot-20261026T011326Z/trace-late/iket_pid_0x905.pftrace.gz
+[run-iket] Dumped perfetto HTML viewer to /c/iket/hot-20261026T011326Z/trace-late/iket_pid_0x905.html
+[run-iket] To view: cd /c/iket/hot-20261026T011326Z/trace-late && python3 -m http.server 8080 , then open http://localhost:8080/iket_pid_0x905.html
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace-late/tracker
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace-late/gen-config
+[run-iket] Removing intermediate output directory: /c/iket/hot-20261026T011326Z/trace-late/iket
+=== all-reduce, peers 20 us late, under run-iket: exit 0 in 14 s
+=== nsys, off
+2026-10-26 01:16:51  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+moe: prepared in 3.1 s
+mla: prepared in 0.4 s
+mhc: prepared in 0.3 s
+allreduce: prepared in 0.1 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1099.86}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 45.35}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 14.57}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 90.14}
+{"mode": "off", "rows": 8, "iters": 50, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1099.86}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 45.35}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 14.57}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 90.14}}, "modules": {"tilelang.tools.cuda.iket": false, "vllm.models.deepseek_v4_1.tilelang.iket": false}, "postproc_callback": false}
+Collecting data...
+Generating '/tmp/nsys-report-1f65.qdstrm'
+
+[1/2] [0%                          ] nsys-off.nsys-rep
+[1/2] [0%                          ] nsys-off.nsys-rep
+[1/2] [===================80%      ] nsys-off.nsys-rep
+[1/2] [========================100%] nsys-off.nsys-rep
+[1/2] [========================100%] nsys-off.nsys-rep
+
+[2/2] [0%                          ] nsys-off.sqlite
+[2/2] [1%                          ] nsys-off.sqlite
+[2/2] [2%                          ] nsys-off.sqlite
+[2/2] [3%                          ] nsys-off.sqlite
+[2/2] [4%                          ] nsys-off.sqlite
+[2/2] [5%                          ] nsys-off.sqlite
+[2/2] [6%                          ] nsys-off.sqlite
+[2/2] [7%                          ] nsys-off.sqlite
+[2/2] [8%                          ] nsys-off.sqlite
+[2/2] [9%                          ] nsys-off.sqlite
+[2/2] [10%                         ] nsys-off.sqlite
+[2/2] [11%                         ] nsys-off.sqlite
+[2/2] [12%                         ] nsys-off.sqlite
+[2/2] [13%                         ] nsys-off.sqlite
+[2/2] [14%                         ] nsys-off.sqlite
+[2/2] [=15%                        ] nsys-off.sqlite
+[2/2] [=16%                        ] nsys-off.sqlite
+[2/2] [=17%                        ] nsys-off.sqlite
+[2/2] [==18%                       ] nsys-off.sqlite
+[2/2] [==19%                       ] nsys-off.sqlite
+[2/2] [==20%                       ] nsys-off.sqlite
+[2/2] [==21%                       ] nsys-off.sqlite
+[2/2] [===22%                      ] nsys-off.sqlite
+[2/2] [===23%                      ] nsys-off.sqlite
+[2/2] [===24%                      ] nsys-off.sqlite
+[2/2] [====25%                     ] nsys-off.sqlite
+[2/2] [====26%                     ] nsys-off.sqlite
+[2/2] [====27%                     ] nsys-off.sqlite
+[2/2] [====28%                     ] nsys-off.sqlite
+[2/2] [=====29%                    ] nsys-off.sqlite
+[2/2] [=====30%                    ] nsys-off.sqlite
+[2/2] [=====31%                    ] nsys-off.sqlite
+[2/2] [=====32%                    ] nsys-off.sqlite
+[2/2] [======33%                   ] nsys-off.sqlite
+[2/2] [======34%                   ] nsys-off.sqlite
+[2/2] [======35%                   ] nsys-off.sqlite
+[2/2] [=======36%                  ] nsys-off.sqlite
+[2/2] [=======37%                  ] nsys-off.sqlite
+[2/2] [=======38%                  ] nsys-off.sqlite
+[2/2] [=======39%                  ] nsys-off.sqlite
+[2/2] [========40%                 ] nsys-off.sqlite
+[2/2] [========41%                 ] nsys-off.sqlite
+[2/2] [========42%                 ] nsys-off.sqlite
+[2/2] [=========43%                ] nsys-off.sqlite
+[2/2] [=========44%                ] nsys-off.sqlite
+[2/2] [=========45%                ] nsys-off.sqlite
+[2/2] [=========46%                ] nsys-off.sqlite
+[2/2] [==========47%               ] nsys-off.sqlite
+[2/2] [==========48%               ] nsys-off.sqlite
+[2/2] [==========49%               ] nsys-off.sqlite
+[2/2] [===========50%              ] nsys-off.sqlite
+[2/2] [===========51%              ] nsys-off.sqlite
+[2/2] [===========52%              ] nsys-off.sqlite
+[2/2] [===========53%              ] nsys-off.sqlite
+[2/2] [============54%             ] nsys-off.sqlite
+[2/2] [============55%             ] nsys-off.sqlite
+[2/2] [============56%             ] nsys-off.sqlite
+[2/2] [============57%             ] nsys-off.sqlite
+[2/2] [=============58%            ] nsys-off.sqlite
+[2/2] [=============59%            ] nsys-off.sqlite
+[2/2] [=============60%            ] nsys-off.sqlite
+[2/2] [==============61%           ] nsys-off.sqlite
+[2/2] [==============62%           ] nsys-off.sqlite
+[2/2] [==============63%           ] nsys-off.sqlite
+[2/2] [==============64%           ] nsys-off.sqlite
+[2/2] [===============65%          ] nsys-off.sqlite
+[2/2] [===============66%          ] nsys-off.sqlite
+[2/2] [===============67%          ] nsys-off.sqlite
+[2/2] [================68%         ] nsys-off.sqlite
+[2/2] [================69%         ] nsys-off.sqlite
+[2/2] [================70%         ] nsys-off.sqlite
+[2/2] [================71%         ] nsys-off.sqlite
+[2/2] [=================72%        ] nsys-off.sqlite
+[2/2] [=================73%        ] nsys-off.sqlite
+[2/2] [=================74%        ] nsys-off.sqlite
+[2/2] [==================75%       ] nsys-off.sqlite
+[2/2] [==================76%       ] nsys-off.sqlite
+[2/2] [==================77%       ] nsys-off.sqlite
+[2/2] [==================78%       ] nsys-off.sqlite
+[2/2] [===================79%      ] nsys-off.sqlite
+[2/2] [===================80%      ] nsys-off.sqlite
+[2/2] [===================81%      ] nsys-off.sqlite
+[2/2] [===================82%      ] nsys-off.sqlite
+[2/2] [====================83%     ] nsys-off.sqlite
+[2/2] [====================84%     ] nsys-off.sqlite
+[2/2] [====================85%     ] nsys-off.sqlite
+[2/2] [=====================86%    ] nsys-off.sqlite
+[2/2] [=====================87%    ] nsys-off.sqlite
+[2/2] [=====================88%    ] nsys-off.sqlite
+[2/2] [=====================89%    ] nsys-off.sqlite
+[2/2] [======================90%   ] nsys-off.sqlite
+[2/2] [======================91%   ] nsys-off.sqlite
+[2/2] [======================92%   ] nsys-off.sqlite
+[2/2] [=======================93%  ] nsys-off.sqlite
+[2/2] [=======================94%  ] nsys-off.sqlite
+[2/2] [=======================95%  ] nsys-off.sqlite
+[2/2] [=======================96%  ] nsys-off.sqlite
+[2/2] [========================97% ] nsys-off.sqlite
+[2/2] [========================98% ] nsys-off.sqlite
+[2/2] [========================99% ] nsys-off.sqlite
+[2/2] [========================100%] nsys-off.sqlite
+[2/2] [========================100%] nsys-off.sqlite
+Generated:
+	/c/iket/hot-20261026T011326Z/nsys-off.nsys-rep
+	/c/iket/hot-20261026T011326Z/nsys-off.sqlite
+=== nsys, off: exit 0 in 11 s
+=== nsys, on
+[01:17:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:17:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:17:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:17:02] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_combine` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_dispatch` with `out_idx=None`
+2026-10-26 01:17:02  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_combine`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-10-26 01:17:03  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_dispatch`
+2026-10-26 01:17:04  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `per_token_cast_kernel` with `out_idx=None`
+2026-10-26 01:17:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `per_token_cast_kernel`
+moe: prepared in 5.3 s
+[01:17:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:17:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[01:17:07] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 8 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+2026-10-26 01:17:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:17:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:17:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `sparse_mla` with `out_idx=None`
+2026-10-26 01:17:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:17:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+2026-10-26 01:17:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `sparse_mla`
+mla: prepared in 4.0 s
+2026-10-26 01:17:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_project_streams` with `out_idx=None`
+2026-10-26 01:17:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `mhc_finalize` with `out_idx=None`
+2026-10-26 01:17:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_finalize`
+2026-10-26 01:17:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `mhc_project_streams`
+mhc: prepared in 2.0 s
+2026-10-26 01:17:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `oneshot_allreduce` with `out_idx=None`
+2026-10-26 01:17:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `oneshot_allreduce`
+allreduce: prepared in 0.6 s
+moe {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1119.13}
+mla {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 51.52}
+mhc {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 15.14}
+allreduce {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 205.15}
+{"mode": "on", "rows": 8, "iters": 50, "families": {"moe": {"sha256": "d6d36c7c8f0aa233a25663160169be5b55883e95b6e8d982b5122579847981ef", "us_per_call": 1119.13}, "mla": {"sha256": "334507a1af70c092e0376a180d88e6bc6d52686d100295dd6f92045e7395f98e", "us_per_call": 51.52}, "mhc": {"sha256": "f41f71d3e0a6ce75ef833ee22a766f60b2cad6b3a45fc6048d3448d39b8acddf", "us_per_call": 15.14}, "allreduce": {"sha256": "9b90023b7fa2cf05bac9ca6ffa53ffda9e04b1eb68bfe8129857501b512c70b6", "rank_order_sum_equal": true, "us_per_call": 205.15}}, "modules": {"tilelang.tools.cuda.iket": true, "vllm.models.deepseek_v4_1.tilelang.iket": true}, "postproc_callback": true}
+Collecting data...
+Generating '/tmp/nsys-report-5ba6.qdstrm'
+
+[1/2] [0%                          ] nsys-on.nsys-rep
+[1/2] [0%                          ] nsys-on.nsys-rep
+[1/2] [5%                          ] nsys-on.nsys-rep
+[1/2] [6%                          ] nsys-on.nsys-rep
+[1/2] [7%                          ] nsys-on.nsys-rep
+[1/2] [8%                          ] nsys-on.nsys-rep
+[1/2] [9%                          ] nsys-on.nsys-rep
+[1/2] [10%                         ] nsys-on.nsys-rep
+[1/2] [===================80%      ] nsys-on.nsys-rep
+[1/2] [===================81%      ] nsys-on.nsys-rep
+[1/2] [========================100%] nsys-on.nsys-rep
+[1/2] [========================100%] nsys-on.nsys-rep
+
+[2/2] [0%                          ] nsys-on.sqlite
+[2/2] [1%                          ] nsys-on.sqlite
+[2/2] [2%                          ] nsys-on.sqlite
+[2/2] [3%                          ] nsys-on.sqlite
+[2/2] [4%                          ] nsys-on.sqlite
+[2/2] [5%                          ] nsys-on.sqlite
+[2/2] [6%                          ] nsys-on.sqlite
+[2/2] [7%                          ] nsys-on.sqlite
+[2/2] [8%                          ] nsys-on.sqlite
+[2/2] [9%                          ] nsys-on.sqlite
+[2/2] [10%                         ] nsys-on.sqlite
+[2/2] [11%                         ] nsys-on.sqlite
+[2/2] [12%                         ] nsys-on.sqlite
+[2/2] [13%                         ] nsys-on.sqlite
+[2/2] [14%                         ] nsys-on.sqlite
+[2/2] [=15%                        ] nsys-on.sqlite
+[2/2] [=16%                        ] nsys-on.sqlite
+[2/2] [=17%                        ] nsys-on.sqlite
+[2/2] [==18%                       ] nsys-on.sqlite
+[2/2] [==19%                       ] nsys-on.sqlite
+[2/2] [==20%                       ] nsys-on.sqlite
+[2/2] [==21%                       ] nsys-on.sqlite
+[2/2] [===22%                      ] nsys-on.sqlite
+[2/2] [===23%                      ] nsys-on.sqlite
+[2/2] [===24%                      ] nsys-on.sqlite
+[2/2] [====25%                     ] nsys-on.sqlite
+[2/2] [====26%                     ] nsys-on.sqlite
+[2/2] [====27%                     ] nsys-on.sqlite
+[2/2] [====28%                     ] nsys-on.sqlite
+[2/2] [=====29%                    ] nsys-on.sqlite
+[2/2] [=====30%                    ] nsys-on.sqlite
+[2/2] [=====31%                    ] nsys-on.sqlite
+[2/2] [=====32%                    ] nsys-on.sqlite
+[2/2] [======33%                   ] nsys-on.sqlite
+[2/2] [======34%                   ] nsys-on.sqlite
+[2/2] [======35%                   ] nsys-on.sqlite
+[2/2] [=======36%                  ] nsys-on.sqlite
+[2/2] [=======37%                  ] nsys-on.sqlite
+[2/2] [=======38%                  ] nsys-on.sqlite
+[2/2] [=======39%                  ] nsys-on.sqlite
+[2/2] [========40%                 ] nsys-on.sqlite
+[2/2] [========41%                 ] nsys-on.sqlite
+[2/2] [========42%                 ] nsys-on.sqlite
+[2/2] [=========43%                ] nsys-on.sqlite
+[2/2] [=========44%                ] nsys-on.sqlite
+[2/2] [=========45%                ] nsys-on.sqlite
+[2/2] [=========46%                ] nsys-on.sqlite
+[2/2] [==========47%               ] nsys-on.sqlite
+[2/2] [==========48%               ] nsys-on.sqlite
+[2/2] [==========49%               ] nsys-on.sqlite
+[2/2] [===========50%              ] nsys-on.sqlite
+[2/2] [===========51%              ] nsys-on.sqlite
+[2/2] [===========52%              ] nsys-on.sqlite
+[2/2] [===========53%              ] nsys-on.sqlite
+[2/2] [============54%             ] nsys-on.sqlite
+[2/2] [============55%             ] nsys-on.sqlite
+[2/2] [============56%             ] nsys-on.sqlite
+[2/2] [============57%             ] nsys-on.sqlite
+[2/2] [=============58%            ] nsys-on.sqlite
+[2/2] [=============59%            ] nsys-on.sqlite
+[2/2] [=============60%            ] nsys-on.sqlite
+[2/2] [==============61%           ] nsys-on.sqlite
+[2/2] [==============62%           ] nsys-on.sqlite
+[2/2] [==============63%           ] nsys-on.sqlite
+[2/2] [==============64%           ] nsys-on.sqlite
+[2/2] [===============65%          ] nsys-on.sqlite
+[2/2] [===============66%          ] nsys-on.sqlite
+[2/2] [===============67%          ] nsys-on.sqlite
+[2/2] [================68%         ] nsys-on.sqlite
+[2/2] [================69%         ] nsys-on.sqlite
+[2/2] [================70%         ] nsys-on.sqlite
+[2/2] [================71%         ] nsys-on.sqlite
+[2/2] [=================72%        ] nsys-on.sqlite
+[2/2] [=================73%        ] nsys-on.sqlite
+[2/2] [=================74%        ] nsys-on.sqlite
+[2/2] [==================75%       ] nsys-on.sqlite
+[2/2] [==================76%       ] nsys-on.sqlite
+[2/2] [==================77%       ] nsys-on.sqlite
+[2/2] [==================78%       ] nsys-on.sqlite
+[2/2] [===================79%      ] nsys-on.sqlite
+[2/2] [===================80%      ] nsys-on.sqlite
+[2/2] [===================81%      ] nsys-on.sqlite
+[2/2] [===================82%      ] nsys-on.sqlite
+[2/2] [====================83%     ] nsys-on.sqlite
+[2/2] [====================84%     ] nsys-on.sqlite
+[2/2] [====================85%     ] nsys-on.sqlite
+[2/2] [=====================86%    ] nsys-on.sqlite
+[2/2] [=====================87%    ] nsys-on.sqlite
+[2/2] [=====================88%    ] nsys-on.sqlite
+[2/2] [=====================89%    ] nsys-on.sqlite
+[2/2] [======================90%   ] nsys-on.sqlite
+[2/2] [======================91%   ] nsys-on.sqlite
+[2/2] [======================92%   ] nsys-on.sqlite
+[2/2] [=======================93%  ] nsys-on.sqlite
+[2/2] [=======================94%  ] nsys-on.sqlite
+[2/2] [=======================95%  ] nsys-on.sqlite
+[2/2] [=======================96%  ] nsys-on.sqlite
+[2/2] [========================97% ] nsys-on.sqlite
+[2/2] [========================98% ] nsys-on.sqlite
+[2/2] [========================99% ] nsys-on.sqlite
+[2/2] [========================100%] nsys-on.sqlite
+[2/2] [========================100%] nsys-on.sqlite
+Generated:
+	/c/iket/hot-20261026T011326Z/nsys-on.nsys-rep
+	/c/iket/hot-20261026T011326Z/nsys-on.sqlite
+=== nsys, on: exit 0 in 21 s
+=== per-phase table
+
+### moe_grouped_fp8_fp4_gemm_kernel grid (12, 48, 1) block (128, 1, 1)
+
+5 launches, 576 CTAs, 2304 warps; span 909.92 us, warp 73.92 us, nsys off 713.97 us, nsys on 716.11 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| wait | 39.73 | 53.7% | 32.16 | 53.7% |
+| unattributed | 18.80 | 25.4% | 7.54 | 12.6% |
+| compute | 9.71 | 13.1% | 10.91 | 18.2% |
+| load | 5.42 | 7.3% | 8.87 | 14.8% |
+| store | 0.27 | 0.4% | 0.36 | 0.6% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| wait.mbarrier | 34.58 | 46.8% | 35.8 | 63.84 | `loaded[(ko % 3)].wait((ko / 3));` |
+| compute.mma | 9.71 | 13.1% | 35.8 | 12.61 | `{` |
+| wait.cp_async | 4.08 | 5.5% | 35.8 | 46.94 | `tl::cp_async_wait<2>();` |
+| load#2 | 3.36 | 4.5% | 35.8 | 8.13 | `if (ko < 4)` |
+| load.global#3 | 1.71 | 2.3% | 0.9 | 7.46 | `if (((expert < 384) && (0 <= expert)))` |
+| wait.sync#4 | 0.46 | 0.6% | 35.8 | 0.83 | `__syncthreads();` |
+| wait.sync#5 | 0.28 | 0.4% | 35.8 | 0.93 | `__syncthreads();` |
+| wait.sync#6 | 0.28 | 0.4% | 35.8 | 0.61 | `__syncthreads();` |
+| store.global | 0.27 | 0.4% | 0.9 | 0.42 | `for (int i_4 = 0; i_4 < 32; ++i_4)` |
+| load.global#2 | 0.19 | 0.3% | 0.9 | 5.70 | `if (((int)threadIdx.x) < 64)` |
+| load | 0.13 | 0.2% | 0.9 | 0.26 | `for (int s = 0; s < 2; ++s)` |
+| load.global | 0.03 | 0.0% | 1.0 | 0.10 | `int expert = TileExpert[((int64_t)((int)blockIdx.y))];` |
+| wait.sync | 0.02 | 0.0% | 1.0 | 0.06 | `__syncthreads();` |
+| wait.sync#2 | 0.01 | 0.0% | 0.9 | 0.03 | `__syncthreads();` |
+| wait.sync#3 | 0.01 | 0.0% | 0.9 | 0.03 | `__syncthreads();` |
+
+### moe_grouped_fp8_fp4_gemm_kernel grid (40, 48, 1) block (128, 1, 1)
+
+5 launches, 1920 CTAs, 7680 warps; span 467.49 us, warp 11.32 us, nsys off 345.90 us, nsys on 349.81 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 3.96 | 35.0% | 2.04 | 19.5% |
+| wait | 3.18 | 28.1% | 3.33 | 31.8% |
+| load | 2.34 | 20.7% | 2.98 | 28.4% |
+| compute | 1.57 | 13.8% | 1.77 | 16.9% |
+| store | 0.27 | 2.4% | 0.36 | 3.5% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| wait.mbarrier | 2.10 | 18.5% | 5.4 | 10.27 | `loaded[(ko % 3)].wait((ko / 3));` |
+| load.global#3 | 1.58 | 13.9% | 0.9 | 8.70 | `if (((expert < 384) && (0 <= expert)))` |
+| compute.mma | 1.57 | 13.8% | 5.4 | 5.06 | `{` |
+| wait.cp_async | 0.85 | 7.5% | 5.4 | 17.18 | `tl::cp_async_wait<2>();` |
+| load#2 | 0.35 | 3.1% | 5.4 | 5.22 | `if (ko < 4)` |
+| store.global | 0.27 | 2.4% | 0.9 | 1.66 | `for (int i_4 = 0; i_4 < 32; ++i_4)` |
+| load.global#2 | 0.15 | 1.3% | 0.9 | 7.36 | `if (((int)threadIdx.x) < 64)` |
+| load.global | 0.13 | 1.2% | 1.0 | 4.70 | `int expert = TileExpert[((int64_t)((int)blockIdx.y))];` |
+| load | 0.13 | 1.1% | 0.9 | 0.26 | `for (int s = 0; s < 2; ++s)` |
+| wait.sync#4 | 0.11 | 1.0% | 5.4 | 0.19 | `__syncthreads();` |
+| wait.sync#5 | 0.04 | 0.4% | 5.4 | 2.02 | `__syncthreads();` |
+| wait.sync#6 | 0.04 | 0.4% | 5.4 | 0.19 | `__syncthreads();` |
+| wait.sync | 0.02 | 0.2% | 1.0 | 0.03 | `__syncthreads();` |
+| wait.sync#3 | 0.01 | 0.1% | 0.9 | 0.03 | `__syncthreads();` |
+| wait.sync#2 | 0.01 | 0.1% | 0.9 | 0.03 | `__syncthreads();` |
+
+### sparse_mla_kernel grid (5, 2, 8) block (128, 1, 1)
+
+5 launches, 80 CTAs, 320 warps; span 24.03 us, warp 11.80 us, nsys off 20.61 us, nsys on 23.94 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 5.48 | 46.5% | 3.58 | 30.6% |
+| compute | 3.95 | 33.5% | 3.92 | 33.6% |
+| load | 1.42 | 12.0% | 2.53 | 21.7% |
+| wait | 0.49 | 4.2% | 1.06 | 9.0% |
+| store | 0.46 | 3.9% | 0.59 | 5.0% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| compute.mma | 2.53 | 21.5% | 8.0 | 2.66 | `for (int ki = 0; ki < 32; ++ki) \| for (int ki_1 = 0; ki_1 < 2; ++ki_1)` |
+| compute.reduce | 1.42 | 12.0% | 16.0 | 1.54 | `m_g[i_5] = tl::AllReduce<tl::MaxOp, 256, 64, 0, tl::NamedBarrier<256>>::run(m_g[i_5], (&((` |
+| load.global | 0.88 | 7.5% | 2.0 | 1.76 | `for (int c = 0; c < 4; ++c) \| for (int i = 0; i < 8; ++i)` |
+| load.cp_async | 0.53 | 4.5% | 4.0 | 1.60 | `for (int k_1 = 0; k_1 < 5; ++k_1) \| for (int k_3 = 0; k_3 < 3; ++k_3) \| for (int k_5 = 0; ` |
+| store.global | 0.46 | 3.9% | 1.0 | 0.99 | `for (int i_11 = 0; i_11 < 32; ++i_11)` |
+| wait.sync | 0.38 | 3.2% | 42.0 | 0.70 | `__syncthreads();` |
+| wait.cp_async | 0.11 | 0.9% | 4.0 | 0.13 | `tl::cp_async_wait<0>();` |
+
+### sparse_mla_kernel grid (5, 1, 8) block (256, 1, 1)
+
+5 launches, 40 CTAs, 320 warps; span 17.38 us, warp 15.53 us, nsys off 13.12 us, nsys on 14.98 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| compute | 6.22 | 40.0% | 6.28 | 36.2% |
+| unattributed | 6.00 | 38.6% | 5.67 | 32.7% |
+| load | 1.63 | 10.5% | 2.94 | 16.9% |
+| store | 1.10 | 7.1% | 1.84 | 10.6% |
+| wait | 0.59 | 3.8% | 0.61 | 3.5% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| compute.mma | 4.58 | 29.5% | 8.0 | 4.74 | `for (int ki = 0; ki < 32; ++ki) \| for (int ki_1 = 0; ki_1 < 2; ++ki_1)` |
+| compute.reduce | 1.64 | 10.5% | 16.0 | 1.86 | `m_g[i_5] = tl::AllReduce<tl::MaxOp, 256, 64, 0, tl::NamedBarrier<256>>::run(m_g[i_5], (&((` |
+| load.global | 1.14 | 7.4% | 2.0 | 4.19 | `for (int c = 0; c < 4; ++c) \| for (int i = 0; i < 8; ++i)` |
+| store.global | 1.10 | 7.1% | 1.0 | 1.60 | `for (int i_11 = 0; i_11 < 32; ++i_11)` |
+| load.cp_async | 0.48 | 3.1% | 4.0 | 1.12 | `for (int k_1 = 0; k_1 < 5; ++k_1) \| for (int k_3 = 0; k_3 < 3; ++k_3) \| for (int k_5 = 0; ` |
+| wait.sync | 0.47 | 3.0% | 42.0 | 0.80 | `__syncthreads();` |
+| wait.cp_async | 0.12 | 0.8% | 4.0 | 0.16 | `tl::cp_async_wait<0>();` |
+
+### sparse_mla_kernel_1 grid (24, 8, 1) block (128, 1, 1)
+
+10 launches, 192 CTAs, 768 warps; span 7.84 us, warp 5.89 us, nsys off 2.27 us, nsys on 2.27 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| load | 5.27 | 89.5% | 7.64 | 97.9% |
+| unattributed | 0.52 | 8.9% | 0.08 | 1.0% |
+| compute | 0.05 | 0.9% | 0.04 | 0.6% |
+| store | 0.02 | 0.4% | 0.03 | 0.4% |
+| wait | 0.02 | 0.4% | 0.01 | 0.2% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| load.global | 5.27 | 89.5% | 2.0 | 7.54 | `M = __fmul_rn(Sinks[((int)blockIdx.x)], 0x1.7154764ee6c2fp+0f/*1.442695e+00*/); \| if (((in` |
+| compute.reduce | 0.05 | 0.9% | 1.0 | 0.10 | `amax[0] = tl::AllReduce<tl::MaxOp, 8, 1, 0, tl::NamedBarrier<128>>::run(amax[0]);` |
+| store.global | 0.02 | 0.4% | 1.0 | 0.06 | `*(uint2*)(Output + (((((int64_t)((int)blockIdx.y)) * (int64_t)12288) + (((int64_t)((int)bl` |
+| wait.sync | 0.02 | 0.4% | 2.0 | 0.06 | `__syncthreads();` |
+
+### moe_swiglu_cast_kernel_kernel grid (16, 48, 1) block (96, 1, 1)
+
+5 launches, 768 CTAs, 2304 warps; span 13.50 us, warp 4.86 us, nsys off 3.39 us, nsys on 3.55 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| load | 3.16 | 65.1% | 6.80 | 73.5% |
+| unattributed | 1.07 | 22.0% | 0.76 | 8.2% |
+| compute | 0.50 | 10.2% | 1.52 | 16.5% |
+| store | 0.13 | 2.7% | 0.17 | 1.8% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| load.global | 3.16 | 65.1% | 1.0 | 7.52 | `for (int r = 0; r < 2; ++r)` |
+| compute.reduce | 0.50 | 10.2% | 1.8 | 4.80 | `if (0 <= orders[r_2])` |
+| store.global | 0.13 | 2.7% | 1.8 | 3.71 | `if (0 <= orders[r_2])` |
+
+### oneshot_allreduce_kernel grid (8, 1, 1) block (512, 1, 1)
+
+5 launches, 8 CTAs, 128 warps; span 8.90 us, warp 7.91 us, nsys off 7.26 us, nsys on 6.78 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 5.26 | 66.6% | 0.00 | 0.0% |
+| compute | 1.14 | 14.4% | 1.71 | 19.2% |
+| wait | 0.68 | 8.6% | 6.25 | 70.3% |
+| store | 0.53 | 6.7% | 1.80 | 20.2% |
+| signal | 0.22 | 2.8% | 2.16 | 24.3% |
+| load | 0.07 | 0.9% | 0.06 | 0.7% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| compute.reduce | 1.14 | 14.4% | 1.0 | 2.37 | `for (int i_1 = 0; i_1 < count; ++i_1)` |
+| store.stage | 0.53 | 6.7% | 1.0 | 1.34 | `for (int i = 0; i < count; ++i)` |
+| wait.fence | 0.33 | 4.2% | 1.0 | 0.45 | `roce_fence_sc_gpu();` |
+| wait.sync#2 | 0.23 | 2.9% | 1.1 | 3.52 | `__syncthreads();` |
+| signal.proxy | 0.10 | 1.2% | 1.0 | 1.34 | `if (((int)threadIdx.x) == 0)` |
+| wait.flags | 0.10 | 1.2% | 1.0 | 0.93 | `roce_wait_peers(((int)blockIdx.x), ((int)threadIdx.x), roce_ptr((region_base + ((int64_t)f` |
+| signal.proxy#2 | 0.09 | 1.1% | 1.0 | 0.83 | `if (((int)blockIdx.x) == 0)` |
+| load.global | 0.07 | 0.9% | 1.0 | 0.10 | `epoch = roce_ld_relaxed_gpu_u32((&(counters[0])));` |
+| signal.proxy#3 | 0.04 | 0.5% | 1.0 | 0.54 | `if (((int)threadIdx.x) == 0)` |
+| wait.sync | 0.01 | 0.2% | 1.0 | 0.51 | `__syncthreads();` |
+| wait.sync#3 | 0.01 | 0.2% | 1.0 | 0.03 | `__syncthreads();` |
+
+### mhc_project_streams_kernel grid (40, 1, 1) block (128, 1, 1)
+
+5 launches, 40 CTAs, 160 warps; span 5.92 us, warp 5.67 us, nsys off 5.47 us, nsys on 6.30 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| compute | 2.64 | 46.6% | 2.66 | 45.2% |
+| load | 1.86 | 32.7% | 5.54 | 94.1% |
+| unattributed | 0.99 | 17.5% | 0.00 | 0.0% |
+| store | 0.12 | 2.1% | 0.14 | 2.4% |
+| wait | 0.06 | 1.1% | 0.07 | 1.2% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| compute.mma | 2.55 | 45.0% | 4.0 | 2.59 | `{` |
+| load.global#2 | 1.76 | 31.0% | 4.0 | 2.05 | `for (int i_1 = 0; i_1 < 6; ++i_1)` |
+| load.global | 0.10 | 1.7% | 1.0 | 0.13 | `for (int k = 0; k < 4; ++k)` |
+| store.global#3 | 0.05 | 0.9% | 1.0 | 0.06 | `if (((((int)threadIdx.x) % 8) == 0) && (((((int)blockIdx.y) * 16) + (((int)threadIdx.x) >>` |
+| compute.reduce | 0.05 | 0.8% | 1.0 | 0.06 | `red[0] = (red[0] + __shfl_xor_sync((uint)4294967295, red[0], 4, 32));` |
+| compute.reduce#2 | 0.04 | 0.8% | 1.0 | 0.06 | `red[0] = (red[0] + __shfl_xor_sync((uint)4294967295, red[0], 4, 32));` |
+| store.global | 0.04 | 0.7% | 1.0 | 0.06 | `if (((((int)blockIdx.y) * 16) + (((int)threadIdx.x) >> 3)) < M)` |
+| wait.sync | 0.03 | 0.6% | 4.0 | 0.10 | `__syncthreads();` |
+| wait.sync#2 | 0.03 | 0.6% | 4.0 | 0.10 | `__syncthreads();` |
+| store.global#2 | 0.03 | 0.5% | 1.0 | 0.03 | `if (((((int)threadIdx.x) % 8) == 0) && (((((int)blockIdx.y) * 16) + (((int)threadIdx.x) >>` |
+
+### moe_dispatch_kernel grid (1, 1, 1) block (512, 1, 1)
+
+5 launches, 1 CTAs, 16 warps; span 5.15 us, warp 4.73 us, nsys off 4.93 us, nsys on 5.57 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 2.58 | 54.4% | 1.72 | 33.3% |
+| store | 1.78 | 37.6% | 2.96 | 57.4% |
+| wait | 0.33 | 7.1% | 0.42 | 8.2% |
+| load | 0.04 | 0.9% | 0.06 | 1.1% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| store.global | 1.70 | 36.0% | 1.0 | 2.27 | `if (((int)threadIdx.x) < 384)` |
+| wait.sync#6 | 0.15 | 3.3% | 9.0 | 0.22 | `__syncthreads();` |
+| store.global#2 | 0.07 | 1.6% | 1.0 | 0.48 | `if (((int)threadIdx.x) < (rows * 6))` |
+| wait.sync#7 | 0.06 | 1.4% | 9.0 | 0.13 | `__syncthreads();` |
+| load.global | 0.04 | 0.9% | 1.0 | 0.10 | `if ((((int)threadIdx.x) < (rows * 6)))` |
+| wait.sync | 0.03 | 0.6% | 1.0 | 0.06 | `__syncthreads();` |
+| wait.sync#5 | 0.02 | 0.5% | 1.0 | 0.03 | `__syncthreads();` |
+| wait.sync#8 | 0.02 | 0.4% | 1.0 | 0.06 | `__syncthreads();` |
+| wait.sync#9 | 0.02 | 0.3% | 1.0 | 0.03 | `__syncthreads();` |
+| wait.sync#3 | 0.01 | 0.3% | 1.0 | 0.03 | `__syncthreads();` |
+| wait.sync#2 | 0.01 | 0.2% | 1.0 | 0.03 | `__syncthreads();` |
+| wait.sync#4 | 0.01 | 0.2% | 1.0 | 0.03 | `__syncthreads();` |
+
+### moe_combine_kernel grid (5, 8, 1) block (128, 1, 1)
+
+5 launches, 40 CTAs, 160 warps; span 3.97 us, warp 3.05 us, nsys off 3.94 us, nsys on 3.92 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| load | 2.93 | 96.1% | 4.97 | 125.3% |
+| unattributed | 0.10 | 3.4% | 0.00 | 0.0% |
+| store | 0.02 | 0.5% | 0.01 | 0.3% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| load.global | 2.93 | 96.1% | 1.0 | 3.84 | `if ((((int)blockIdx.y) < shared_rows))` |
+| store.global | 0.02 | 0.5% | 1.0 | 0.03 | `{` |
+
+### mhc_finalize_kernel grid (8, 1, 1) block (128, 1, 1)
+
+5 launches, 8 CTAs, 32 warps; span 3.81 us, warp 3.63 us, nsys off 4.19 us, nsys on 4.32 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 1.88 | 51.9% | 2.50 | 66.1% |
+| compute | 0.73 | 20.1% | 0.25 | 6.6% |
+| load | 0.63 | 17.4% | 0.63 | 16.8% |
+| store | 0.37 | 10.2% | 0.38 | 10.0% |
+| wait | 0.01 | 0.3% | 0.02 | 0.5% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| compute.reduce | 0.56 | 15.5% | 0.2 | 2.27 | `row_max[0] = tl::AllReduce<tl::MaxOp, 4, 1, 0, tl::NamedBarrier<32>>::run(row_max[0]);` |
+| load.global#3 | 0.26 | 7.3% | 0.8 | 0.38 | `for (int i_split_2 = 0; i_split_2 < 40; ++i_split_2)` |
+| load.global | 0.24 | 6.5% | 1.0 | 0.80 | `if (((int)threadIdx.x) < 32)` |
+| compute.reduce#2 | 0.17 | 4.6% | 5.0 | 0.32 | `amax[0] = max(amax[0], __shfl_xor_sync((uint)4294967295, amax[0], 1, 32));` |
+| store.global#4 | 0.17 | 4.6% | 5.0 | 0.29 | `if ((((int)threadIdx.x) % 4) == 0)` |
+| store.global#3 | 0.11 | 3.1% | 5.0 | 0.22 | `*(uint4*)(y + ((((((int64_t)((int)blockIdx.x)) * (int64_t)5120) + (((int64_t)step) * (int6` |
+| load.global#4 | 0.10 | 2.6% | 5.0 | 0.19 | `*(uint4*)(yv + 0) = *(uint4*)(C + ((((((int64_t)((int)blockIdx.x)) * (int64_t)5120) + (((i` |
+| store.global | 0.08 | 2.3% | 0.2 | 0.35 | `if (((int)threadIdx.x) < 4)` |
+| load.global#2 | 0.04 | 1.0% | 0.2 | 0.16 | `cm[0] = ((mixes_shared[((((int)threadIdx.x) & 15) + 8)] * scale[2]) + base[((((int)threadI` |
+| wait.sync | 0.01 | 0.3% | 1.0 | 0.03 | `__syncthreads();` |
+| store.global#2 | 0.01 | 0.2% | 0.2 | 0.03 | `if ((((int)threadIdx.x) >> 4) == 0)` |
+
+### per_token_cast_kernel_kernel grid (20, 1, 1) block (64, 1, 1)
+
+1 launches, 20 CTAs, 40 warps; span 2.18 us, warp 1.87 us, nsys off 2.30 us, nsys on 2.40 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| load | 1.38 | 73.9% | 1.34 | 61.8% |
+| unattributed | 0.29 | 15.6% | 0.64 | 29.4% |
+| store | 0.16 | 8.4% | 0.13 | 5.9% |
+| compute | 0.04 | 2.1% | 0.06 | 2.9% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| load.global | 1.36 | 72.7% | 1.0 | 1.44 | `for (int i = 0; i < 2; ++i)` |
+| store.global#2 | 0.09 | 4.8% | 1.0 | 0.10 | `for (int i_3 = 0; i_3 < 4; ++i_3)` |
+| store.global | 0.04 | 2.3% | 2.0 | 0.06 | `out_sf[((((((int64_t)((int)blockIdx.x)) % (int64_t)5) * (int64_t)32) + (((int64_t)((int)th` |
+| compute.reduce | 0.04 | 2.1% | 2.0 | 0.06 | `amax_fragment[i_1] = tl::AllReduce<tl::MaxOp, 2, 1, 0, tl::NamedBarrier<64>>::run(amax_fra` |
+| store.global#3 | 0.02 | 1.2% | 2.0 | 0.06 | `*(fp8_e4_16_t*)(out + (((((((int64_t)((int)blockIdx.x)) / (int64_t)5) * (int64_t)10240) + ` |
+| load.global#2 | 0.02 | 1.2% | 2.0 | 0.06 | `amax_fragment[i_1] = cutlass::bfloat16_t(__hmax((bfloat16_t(((nv_bfloat162*)(&(amax_fragme` |
+=== per-phase table: exit 0 in 11 s
+=== per-phase table, peers 20 us late
+
+### oneshot_allreduce_kernel grid (8, 1, 1) block (512, 1, 1)
+
+5 launches, 8 CTAs, 128 warps; span 29.02 us, warp 28.02 us
+
+| phase | us a warp | share | last warp us | last warp share |
+|---|---:|---:|---:|---:|
+| unattributed | 24.22 | 86.4% | 0.00 | 0.0% |
+| wait | 1.91 | 6.8% | 25.78 | 88.8% |
+| compute | 1.09 | 3.9% | 1.45 | 5.0% |
+| store | 0.51 | 1.8% | 1.91 | 6.6% |
+| signal | 0.22 | 0.8% | 1.93 | 6.7% |
+| load | 0.07 | 0.2% | 0.08 | 0.3% |
+
+| range | us a warp | share | entries | longest warp us | first statement |
+|---|---:|---:|---:|---:|---|
+| wait.sync#2 | 1.49 | 5.3% | 1.1 | 23.68 | `__syncthreads();` |
+| compute.reduce | 1.09 | 3.9% | 1.0 | 2.27 | `for (int i_1 = 0; i_1 < count; ++i_1)` |
+| store.stage | 0.51 | 1.8% | 1.0 | 1.31 | `for (int i = 0; i < count; ++i)` |
+| wait.fence | 0.29 | 1.0% | 1.0 | 0.42 | `roce_fence_sc_gpu();` |
+| wait.flags | 0.10 | 0.4% | 1.0 | 0.80 | `roce_wait_peers(((int)blockIdx.x), ((int)threadIdx.x), roce_ptr((region_base + ((int64_t)f` |
+| signal.proxy | 0.10 | 0.4% | 1.0 | 1.31 | `if (((int)threadIdx.x) == 0)` |
+| signal.proxy#2 | 0.09 | 0.3% | 1.0 | 0.83 | `if (((int)blockIdx.x) == 0)` |
+| load.global | 0.07 | 0.2% | 1.0 | 0.10 | `epoch = roce_ld_relaxed_gpu_u32((&(counters[0])));` |
+| signal.proxy#3 | 0.04 | 0.1% | 1.0 | 0.51 | `if (((int)threadIdx.x) == 0)` |
+| wait.sync | 0.02 | 0.1% | 1.0 | 0.51 | `__syncthreads();` |
+| wait.sync#3 | 0.01 | 0.0% | 1.0 | 0.03 | `__syncthreads();` |
+=== per-phase table, peers 20 us late: exit 0 in 0 s
+{"output": "/c/iket/hot-20261026T011326Z", "steps": [["IKET mode tests", 1], ["off", 0], ["on, outside the profiler", 0], ["on, under run-iket", 0], ["all-reduce, peers 20 us late, under run-iket", 0], ["nsys, off", 0], ["nsys, on", 0], ["per-phase table", 0], ["per-phase table, peers 20 us late", 0]]}

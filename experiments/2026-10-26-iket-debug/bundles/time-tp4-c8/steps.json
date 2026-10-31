@@ -1,0 +1,65 @@
+[
+ [
+  "decode steps, nsys, off, graphs",
+  [
+   "/opt/nsys/bin/nsys",
+   "profile",
+   "--trace=cuda",
+   "--sample=none",
+   "--cpuctxsw=none",
+   "--export=sqlite",
+   "--force-overwrite=true",
+   "--output",
+   "{out}/nsys-graphs",
+   "--cuda-graph-trace=node",
+   "{python}",
+   "/b/iket_step.py",
+   "off",
+   "--tp-shape",
+   "4",
+   "--requests",
+   "8",
+   "--tokens",
+   "32",
+   "--grid",
+   "8",
+   "--grid-rows",
+   "2",
+   "--max-num-seqs",
+   "16",
+   "--max-model-len",
+   "1048576",
+   "--kv-bytes",
+   "6442450944",
+   "--prefix-caching",
+   "--capture-ladder",
+   "--out",
+   "{out}/nsys-graphs-run"
+  ],
+  5400
+ ],
+ [
+  "nsys timeline",
+  [
+   "{python}",
+   "/b/nsys_window.py",
+   "{out}/nsys-graphs.sqlite",
+   "--gap-us",
+   "200"
+  ],
+  600
+ ],
+ [
+  "decode steps against the grid's step",
+  [
+   "{python}",
+   "/b/step_diff.py",
+   "{out}/nsys-graphs.sqlite",
+   "--grid-runs",
+   "9",
+   "--json",
+   "{out}/step-diff.json"
+  ],
+  600
+ ]
+]
