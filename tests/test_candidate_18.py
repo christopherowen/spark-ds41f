@@ -69,7 +69,7 @@ class TestCandidate18(unittest.TestCase):
             inputs = spark.build_inputs(upstreams)
             self.assertEqual(
                 inputs["vllm"]["patch_head"],
-                "68fe7a9070422c4c5fe68bb820f6a8defd72e408",
+                "f8e2ba615d50c8e6c92d368ceda60416ac42d50b",
             )
             self.assertEqual(
                 inputs["vllm"]["expected_tree"],
