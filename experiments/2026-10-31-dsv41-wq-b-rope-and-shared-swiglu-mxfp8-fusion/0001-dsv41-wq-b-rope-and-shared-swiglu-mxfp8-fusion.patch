@@ -1,0 +1,839 @@
+From 3bbbadb5d93f910b319370d9109b2b11cebed373 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:00:07 +0100
+Subject: [PATCH] dsv4.1 tilelang: fuse wq_b RoPE epilogue and shared expert
+ SwiGLU+MXFP8 cast
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |  4 +-
+ .../test_deepseek_v41_tilelang_linear.py      | 61 ++++++++++++
+ .../test_deepseek_v41_tilelang_activation.py  | 79 ++++++++++++++++
+ .../kernels/test_deepseek_v41_tilelang_pdl.py | 33 +++++++
+ vllm/models/deepseek_v4/nvidia/model.py       | 10 ++
+ vllm/models/deepseek_v4_1/attention.py        | 14 ++-
+ vllm/models/deepseek_v4_1/kernels.py          | 14 ++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  9 +-
+ .../deepseek_v4_1/tilelang/activation.py      | 92 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 90 ++++++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 67 ++++++++++++--
+ 11 files changed, 443 insertions(+), 30 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab846..0a9b484ae 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -24,10 +24,12 @@ import re
+ 
+ CHAIN = {
+     "activation_swiglu_clamp",
++    "activation_swiglu_clamp_cast",
+     "attention_front",
+     "cache_writer",
+     "compress",
+     "compress_gather_partial_state",
++    "gemm_bf16_partials",
+     "gemm_bf16_splitk",
+     "gemm_fp8w_bf16",
+     "gemm_fp8w_bf16_cast",
+@@ -61,7 +63,7 @@ CHAIN = {
+     "routing_masks",
+     "sparse_mla",
+ }
+-WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
++WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
+ WAIT = "cudaGridDependencySynchronize()"
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index eebb0758a..3e44af60a 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -551,3 +551,64 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+         for rows in ROWS:
+             out = method.apply(layer, x[:rows])
+             assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
++
++
++def test_wq_b_fused_rope_matches_separate_rope(default_vllm_config):
++    """``wq_b`` (8192 x 1280, ``head_dim=512``, ``rope_dim=64``) with fused Query RoPE
++    in its epilogue matches ``wq_b`` followed by ``rope_`` bit for bit across all
++    decode tile heights and prefill."""
++    from types import SimpleNamespace
++    from torch import nn
++
++    from tests.kernels.deepseek_v41_contracts import rope_table
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangFP8LinearMethod,
++        cast_mxfp8,
++        provide_mxfp8,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.rope import rope_
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    n, k, head_dim = 8192, 1280, 512
++    heads = n // head_dim
++    weight, exps, _ = _block32_weight(n, k, 31)
++    cos_sin = rope_table(positions=4096, rope_dim=64)
++    qcfg = SimpleNamespace(weight_block_size=[32, 32])
++
++    plain = nn.Module()
++    plain.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    plain.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
++    plain.tilelang_mxfp8_input = True
++    plain_method = TileLangFP8LinearMethod(qcfg)
++    plain_method.process_weights_after_loading(plain)
++    plain_method.declare_layer_kernels(plain)
++
++    fused = nn.Module()
++    fused.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    fused.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
++    fused.tilelang_mxfp8_input = True
++    fused.tilelang_rope_head_dim = head_dim
++    fused.tilelang_cos_sin = cos_sin
++    fused_method = TileLangFP8LinearMethod(qcfg)
++    fused_method.process_weights_after_loading(fused)
++    fused_method.declare_layer_kernels(fused)
++
++    x = torch.randn((max(ROWS), k), generator=_gen(37), device=DEVICE).bfloat16()
++    positions = torch.randint(
++        0, 4096, (max(ROWS),), generator=_gen(41), device=DEVICE, dtype=torch.int64
++    )
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        full_cast = cast_mxfp8(x)
++        with provide_mxfp8(full_cast):
++            full_ref = plain_method.apply(plain, x).view(max(ROWS), heads, head_dim)
++        rope_(full_ref, positions, cos_sin, ratio=1, inverse=False)
++        for rows in ROWS:
++            sub = x[:rows]
++            sub_pos = positions[:rows]
++            sub_cast = cast_mxfp8(sub)
++            with provide_mxfp8(sub_cast, positions=sub_pos):
++                got = fused_method.apply(fused, sub).view(rows, heads, head_dim)
++            assert torch.equal(got, full_ref[:rows]), f"rows={rows}"
++            with provide_mxfp8(sub_cast), pytest.raises(RuntimeError):
++                fused_method.apply(fused, sub)
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_activation.py b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+index 80b5cd735..2e50e9602 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_activation.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+@@ -76,3 +76,82 @@ def test_nonfinite_like_the_reference():
+     ref = _reference(gate_up, limit)
+     assert_same_nonfinite(out, ref)
+     assert_finite_equal(out, ref)
++
++
++@pytest.mark.parametrize("rows", [1, 6, 33, 96, 2024])
++@pytest.mark.parametrize("n", [512, 576, 768])
++def test_swiglu_clamp_cast_matches_separate_cast(rows, n):
++    """``SiluAndMulClampFP32.forward_mxfp8`` (``swiglu_clamp_cast_kernel``) writes
++    the exact E4M3 values and UE8M0 scale bytes of ``swiglu_clamp_kernel`` followed
++    by ``cast_mxfp8``."""
++    from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
++
++    limit = 10.0
++    generator = torch.Generator(device="cuda").manual_seed(100 + rows + n)
++    gate_up = (
++        torch.randn(rows, 2 * n, generator=generator, device="cuda") * 6
++    ).bfloat16()
++    act = SiluAndMulClampFP32(limit, n, mxfp8_output=True)
++    got = act.forward_mxfp8(gate_up)
++    want = cast_mxfp8(_reference(gate_up, limit))
++    assert got.values.shape == want.values.shape
++    assert got.scales.shape == want.scales.shape
++    assert torch.equal(
++        got.values[:rows].view(torch.uint8), want.values[:rows].view(torch.uint8)
++    )
++    assert torch.equal(got.scales[:rows, : n // 32], want.scales[:rows, : n // 32])
++
++
++def test_swiglu_clamp_cast_feeds_block32_down_proj(default_vllm_config):
++    """Fused ``swiglu_clamp_cast_kernel`` + ``provide_mxfp8`` into ``down_proj``
++    (5120 x 576) produces the exact bits of ``swiglu_clamp_kernel`` followed by
++    ``down_proj``'s own cast."""
++    from types import SimpleNamespace
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.gemm import pack_scale_words
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangFP8LinearMethod,
++        provide_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    limit, hidden, shared_n = 10.0, 5120, 576
++    gen = torch.Generator(device="cuda").manual_seed(77)
++    weight = (torch.randn((hidden, shared_n), generator=gen, device="cuda") * 2).to(
++        torch.float8_e4m3fn
++    )
++    exps = torch.randint(
++        120, 125, (hidden // 32, shared_n // 32), generator=gen, device="cuda"
++    ).to(torch.uint8)
++    qcfg = SimpleNamespace(weight_block_size=[32, 32])
++
++    plain_down = nn.Module()
++    plain_down.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    plain_down.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
++    plain_method = TileLangFP8LinearMethod(qcfg)
++    plain_method.process_weights_after_loading(plain_down)
++    plain_method.declare_layer_kernels(plain_down)
++
++    fused_down = nn.Module()
++    fused_down.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    fused_down.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
++    fused_down.tilelang_mxfp8_input = True
++    fused_method = TileLangFP8LinearMethod(qcfg)
++    fused_method.process_weights_after_loading(fused_down)
++    fused_method.declare_layer_kernels(fused_down)
++    assert fused_method.get_workspace_size(fused_down, 64) == 0
++    assert torch.equal(plain_down.tilelang_weight_sf, pack_scale_words(exps))
++
++    plain_act = SiluAndMulClampFP32(limit, shared_n)
++    fused_act = SiluAndMulClampFP32(limit, shared_n, mxfp8_output=True)
++    gate_up = (torch.randn(200, 2 * shared_n, generator=gen, device="cuda") * 6).bfloat16()
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
++    with use_preallocated_workspace(scratch):
++        for rows in (1, 6, 16, 17, 32, 64, 96, 200):
++            gu = gate_up[:rows]
++            expected = plain_method.apply(plain_down, plain_act(gu))
++            act_q = fused_act.forward_mxfp8(gu)
++            with provide_mxfp8(act_q):
++                got = fused_method.apply(fused_down, act_q.rows)
++            assert torch.equal(got, expected), f"rows={rows}"
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_pdl.py b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+index 898b4774a..74ae90672 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_pdl.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -341,3 +341,36 @@ def test_layer_chain_edges_are_programmatic():
+           f"ordinary edges at joins: {joins}")  # fmt: skip
+     assert programmatic > 0
+     assert not plain, f"chain kernels with an ordinary edge from their kernel: {plain}"
++
++
++@pytest.mark.parametrize("n, k", [(384, 5120), (32, 5120)])
++def test_bf16_partials_edges_are_programmatic(n, k):
++    """Split-K BF16 partials (router and indexer weights_proj) wait on their
++    predecessor and trigger their consumer programmatically."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import (
++        bf16_gemm_partials,
++        bf16_shards,
++        splitk_reduce,
++    )
++
++    rows = 6
++    shards = bf16_shards(n, k)
++    x = torch.randn((rows, k), dtype=torch.bfloat16, device=DEVICE)
++    w = torch.randn((n, k), dtype=torch.bfloat16, device=DEVICE)
++    partials = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
++    out = torch.empty((rows, n), dtype=torch.float32, device=DEVICE)
++    part_k = bf16_gemm_partials(n, k, shards, block_M=16)
++    red_k = splitk_reduce(n, shards, out_dtype="float32")
++    copy = slow_copy(rows)
++    src = torch.ones((rows,), dtype=torch.float32, device=DEVICE)
++    dst = torch.empty_like(src)
++
++    def run():
++        copy(src, dst)
++        part_k(x, w, partials)
++        red_k(partials, out)
++
++    edges = _edges(_graph(run, keep=True))
++    assert len(edges) == 2, edges
++    for s, d, kind in edges:
++        assert kind == PROGRAMMATIC, (s, d, kind)
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index a5a36f12a..2a62025e9 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -160,6 +160,16 @@ class DeepseekV4MLP(nn.Module):
+ 
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
++        forward_mxfp8 = getattr(self.act_fn, "forward_mxfp8", None)
++        if forward_mxfp8 is not None and getattr(
++            self.down_proj, "tilelang_mxfp8_input", False
++        ):
++            from vllm.models.deepseek_v4_1.tilelang.linear import provide_mxfp8
++
++            act_q = forward_mxfp8(gate_up)
++            with provide_mxfp8(act_q):
++                out, _ = self.down_proj(act_q.rows)
++            return out.view(*gate_up.shape[:-1], out.shape[-1])
+         x = self.act_fn(gate_up)
+         x, _ = self.down_proj(x)
+         return x
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 16ac898ab..bbc125443 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -377,6 +377,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             max_position_embeddings=hf.max_position_embeddings,
+             compress_ratio=self.compress_ratio,
+         )
++        if kernels.is_native_linear_method(self.wq_b.quant_method):
++            self.wq_b.tilelang_rope_head_dim = self.head_dim
++            self.wq_b.tilelang_cos_sin = self.rotary_emb.cos_sin_cache
+         self.swa_cache_layer = _Cache(
+             vllm_config,
+             f"{prefix}.swa_cache",
+@@ -609,12 +612,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 tilelang_builder_kernels(cache.get_kv_cache_spec(self.config), requests)
+             )
+         # _rope (heads, columns, ratio) by role (WO's input is rotated back in the
+-        # attention kernels' output store).
++        # attention kernels' output store; q is rotated in wq_b's epilogue when
++        # wq_b uses the native block-32 linear method).
+         table_width = self.rotary_emb.cos_sin_cache.shape[1]
+         roles = [
+-            (self.n_local_heads, self.head_dim, 1, False),  # q
+             (1, 512, 1, False),  # kv
+         ]
++        if not getattr(self.wq_b, "tilelang_rope_head_dim", 0):
++            roles.insert(0, (self.n_local_heads, self.head_dim, 1, False))  # q
+         calls.extend(
+             rope_call(heads, dim, table_width, ratio, inverse)
+             for heads, dim, ratio, inverse in roles
+@@ -898,12 +903,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr, kv, q_cast = front
+             front = None
+             front_wrote_kv = True
+-        with kernels.mxfp8_inputs(q_cast):
++        with kernels.mxfp8_inputs(q_cast, positions=positions):
+             q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         if self.indexer is None:
+             del q_cast
+         self._issue_wo_prefetch(rows, after="q-b")
+-        q = self._rope(q, positions, "q")
++        if not getattr(self.wq_b, "tilelang_rope_head_dim", 0):
++            q = self._rope(q, positions, "q")
+         metadata = cast(
+             dict[str, DeepseekV41B12xMetadata] | None,
+             get_forward_context().attn_metadata,
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 5d1e9a52d..eee31d68e 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -40,7 +40,9 @@ def moe_output_dtype() -> torch.dtype:
+     return torch.float32
+ 
+ 
+-def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
++def shared_expert_activation(
++    act_fn: nn.Module, width: int, *, mxfp8_output: bool = False
++) -> nn.Module:
+     """The shared expert's clamped SwiGLU on ``width``-wide gate and up halves,
+     at the reference's FP32 product (one BF16 rounding) where vLLM's rounds
+     ``silu(gate)`` first."""
+@@ -49,7 +51,9 @@ def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
+     if isinstance(act_fn, SiluAndMulWithClamp):
+         from .tilelang.activation import SiluAndMulClampFP32
+ 
+-        return SiluAndMulClampFP32(act_fn.swiglu_limit, width)
++        return SiluAndMulClampFP32(
++            act_fn.swiglu_limit, width, mxfp8_output=mxfp8_output
++        )
+     return act_fn
+ 
+ 
+@@ -84,7 +88,9 @@ def slice_mxfp8(rows, first: int, last: int):
+     return slice_mxfp8(rows, first, last)
+ 
+ 
+-def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
++def mxfp8_inputs(
++    rows, *, positions: torch.Tensor | None = None
++) -> contextlib.AbstractContextManager:
+     """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
+     from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
+     (the model tests' mHC stand-ins return no cast)."""
+@@ -92,7 +98,7 @@ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+         return contextlib.nullcontext()
+     from .tilelang.linear import provide_mxfp8
+ 
+-    return provide_mxfp8(rows)
++    return provide_mxfp8(rows, positions=positions)
+ 
+ 
+ @contextlib.contextmanager
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index d0d95d809..13ae2677c 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -144,15 +144,22 @@ class DeepseekV4DecoderLayer(nn.Module):
+         )
+ 
+         shared = getattr(self.ffn, "shared_experts", None)
++        shared_mxfp8 = False
+         if shared is not None:
++            shared_width = shared.gate_up_proj.output_size_per_partition // 2
++            shared_mxfp8 = (
++                shared_width % 32 == 0
++                and kernels.is_native_linear_method(shared.down_proj.quant_method)
++            )
+             shared.act_fn = kernels.shared_expert_activation(
+-                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
++                shared.act_fn, shared_width, mxfp8_output=shared_mxfp8
+             )
+         # The mHC entries write these projections' MXFP8 input (the routed
+         # experts' too): ``forward`` hands it over and they cast nothing.
+         self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
+         if shared is not None:
+             shared.gate_up_proj.tilelang_mxfp8_input = True
++            shared.down_proj.tilelang_mxfp8_input = shared_mxfp8
+ 
+         # A CED decoder layer routes the compact decoder rows, whose padding
+         # mask differs from the step's. Tag its router by layer, never by the
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index ceaa5f88b..41ff8d164 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -19,6 +19,7 @@ import torch
+ from torch import nn
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
+ 
+ _VEC = 8
+ 
+@@ -62,34 +63,115 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+     return activation_swiglu_clamp
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def swiglu_clamp_cast_kernel(n: int, limit: float, threads: int = 128):
++    """``swiglu_clamp_kernel`` fused with the reference MXFP8 activation cast
++    (``cast_block_mxfp8``): each 4-lane group (32 columns) reduces the BF16 SwiGLU
++    output's absmax across its four 8-element vectors and writes E4M3 ``Yq`` and
++    UE8M0 ``Ysf`` directly from registers, matching ``swiglu_clamp_kernel`` followed
++    by ``per_token_cast`` bit for bit without writing or re-reading the BF16
++    intermediate."""
++    assert n % 32 == 0 and threads % 4 == 0
++    M, Mq = T.dynamic("M, Mq")
++    per_block = threads * _VEC
++    sf_width = 4 * scale_words(n)
++
++    @T.prim_func
++    def activation_swiglu_clamp_cast(
++        X: T.Tensor((M, 2 * n), T.bfloat16),
++        Yq: T.Tensor((Mq, n), T.float8_e4m3fn),
++        Ysf: T.Tensor((Mq, sf_width), T.uint8),
++    ):
++        with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
++            pdl.chain()
++            col = (bx * threads + T.get_thread_binding()) * _VEC
++            gate = T.alloc_local((_VEC,), T.bfloat16)
++            up = T.alloc_local((_VEC,), T.bfloat16)
++            out = T.alloc_local((_VEC,), T.bfloat16)
++            xf = T.alloc_local((_VEC,), T.float32)
++            xq = T.alloc_local((_VEC,), T.float8_e4m3fn)
++            amax = T.alloc_local((1,), T.float32)
++            if col < n:
++                for v in T.vectorized(_VEC):
++                    gate[v] = X[by, col + v]
++                for v in T.vectorized(_VEC):
++                    up[v] = X[by, n + col + v]
++                amax[0] = T.float32(0)
++                for v in T.unroll(_VEC):
++                    g = T.alloc_var(T.float32, init=T.Cast(T.float32, gate[v]))
++                    u = T.alloc_var(T.float32, init=T.Cast(T.float32, up[v]))
++                    g = T.if_then_else(g > limit, T.float32(limit), g)
++                    u = T.if_then_else(u > limit, T.float32(limit), u)
++                    u = T.if_then_else(u < -limit, T.float32(-limit), u)
++                    out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
++                    xf[v] = T.Cast(T.float32, out[v])
++                    amax[0] = T.max(amax[0], T.abs(xf[v]))
++                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
++                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
++                cast_block_mxfp8(xf, xq, _VEC, amax[0], Yq, Ysf, by, col)
++
++    return activation_swiglu_clamp_cast
++
++
+ @cache
+ def _kernel(n: int, limit: float):
+     return swiglu_clamp_kernel(n, limit)
+ 
+ 
++@cache
++def _cast_kernel(n: int, limit: float):
++    return swiglu_clamp_cast_kernel(n, limit)
++
++
+ class SiluAndMulClampFP32(nn.Module):
+     """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product.
+ 
+     ``width`` is the gate (and up) width its owner runs it on, ``[M, 2 * width]``
+     inputs; the module declares that kernel. Without it (kernel tests) nothing is
+-    declared.
++    declared. With ``mxfp8_output=True``, ``declare_kernels`` declares
++    ``swiglu_clamp_cast_kernel`` and ``forward_mxfp8`` returns ``MXFP8Rows`` directly.
+     """
+ 
+-    def __init__(self, swiglu_limit: float, width: int | None = None):
++    def __init__(
++        self,
++        swiglu_limit: float,
++        width: int | None = None,
++        *,
++        mxfp8_output: bool = False,
++    ):
+         super().__init__()
+         self.limit = float(swiglu_limit)
+         self.width = width
++        self.mxfp8_output = mxfp8_output
+ 
+     def declare_kernels(self) -> None:
+         """Declare the kernel of the owner's width, and keep it in ``_kernel``."""
+         if self.width is None:
+             return
+         width, limit = self.width, self.limit
++        if self.mxfp8_output:
++            prepare.declare(
++                lambda: [prepare.call(swiglu_clamp_cast_kernel, width, limit)],
++                bind=lambda: _cast_kernel(width, limit),
++            )
++            return
+         prepare.declare(
+             lambda: [prepare.call(swiglu_clamp_kernel, width, limit)],
+             bind=lambda: _kernel(width, limit),
+         )
+ 
++    def forward_mxfp8(self, gate_up: torch.Tensor):
++        """Clamped SwiGLU in FP32 and its MXFP8 cast in one launch, as ``MXFP8Rows``."""
++        from .linear import empty_mxfp8
++
++        n = gate_up.shape[-1] // 2
++        x = gate_up.reshape(-1, 2 * n).contiguous()
++        rows = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
++        out = empty_mxfp8(rows)
++        if x.shape[0]:
++            _cast_kernel(n, self.limit)(x, out.values, out.scales)
++        return out
++
+     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+         n = gate_up.shape[-1] // 2
+         x = gate_up.reshape(-1, 2 * n).contiguous()
+@@ -99,4 +181,8 @@ class SiluAndMulClampFP32(nn.Module):
+         return out.view(*gate_up.shape[:-1], n)
+ 
+ 
+-__all__ = ["SiluAndMulClampFP32", "swiglu_clamp_kernel"]
++__all__ = [
++    "SiluAndMulClampFP32",
++    "swiglu_clamp_cast_kernel",
++    "swiglu_clamp_kernel",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 40f942203..e217e7176 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -110,6 +110,8 @@ def _mxfp8_gemm(
+     shards: int = 1,
+     pdl_chain: bool = False,
+     tile_contiguous: bool = False,
++    rope_head_dim: int = 0,
++    rope_dim: int = 64,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -170,20 +172,22 @@ def _mxfp8_gemm(
+     if tile_contiguous:
+         assert total_N % TILE_WEIGHT_N == 0 and K % TILE_WEIGHT_K == 0
+         assert TILE_WEIGHT_N % block_N == 0 and block_K % TILE_WEIGHT_K == 0
++    if rope_head_dim > 0:
++        assert rope_dim > 0 and rope_dim % 2 == 0
++        assert total_N % rope_head_dim == 0
++        assert rope_head_dim % block_N == 0 and block_N >= rope_dim
++        assert out_dtype == T.bfloat16
++    rope_half = rope_dim // 2
++    rope_col0 = block_N - rope_dim
++    positions_max = T.dynamic("positions_max") if rope_head_dim > 0 else 1
+     k_tiles = K // TILE_WEIGHT_K
+     sub_tiles_k = block_K // TILE_WEIGHT_K
+     b_shape = (
+         (total_N * k_tiles, TILE_WEIGHT_K) if tile_contiguous else (total_N, K)
+     )
+ 
+-    @T.prim_func
+-    def gemm_mxfp8(
+-        A: T.Tensor((Mp, groups * K), in_dtype),
+-        B: T.Tensor(b_shape, in_dtype),
+-        SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
+-        SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
+-        C: T.Tensor((M, total_N), out_dtype),
+-    ):
++    @T.macro
++    def _body(A, B, SFA, SFB, C, positions, cos_sin):
+         with T.Kernel(
+             T.ceildiv(total_N, block_N), T.ceildiv(M, block_M), threads=threads
+         ) as (bx, by):
+@@ -199,6 +203,8 @@ def _mxfp8_gemm(
+             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
+             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+             SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
++            if rope_head_dim > 0:
++                C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+             C_total = T.alloc_fragment(
+                 (block_M, block_N) if shards > 1 else (1, 1), accum_dtype
+@@ -272,11 +278,70 @@ def _mxfp8_gemm(
+                                 C_total[i, j] + C_local[i, j],
+                             )
+                         T.clear(C_local)
+-            if shards > 1:
++            if rope_head_dim > 0:
++                if (bx * block_N) % rope_head_dim == rope_head_dim - block_N:
++                    if shards > 1:
++                        T.copy(C_total, C_shared)
++                    else:
++                        T.copy(C_local, C_shared)
++                    for i, d in T.Parallel(block_M, rope_half):
++                        pos = positions[T.min(by * block_M + i, M - 1)]
++                        col0 = rope_col0 + 2 * d
++                        first = T.alloc_var(
++                            T.float32, init=T.Cast(T.float32, C_shared[i, col0])
++                        )
++                        second = T.alloc_var(
++                            T.float32, init=T.Cast(T.float32, C_shared[i, col0 + 1])
++                        )
++                        cosine = T.alloc_var(T.float32, init=cos_sin[pos, d])
++                        sine = T.alloc_var(
++                            T.float32, init=cos_sin[pos, rope_half + d]
++                        )
++                        C_shared[i, col0] = T.Cast(
++                            T.bfloat16,
++                            T.ieee_fmaf(first, cosine, -(second * sine)),
++                        )
++                        C_shared[i, col0 + 1] = T.Cast(
++                            T.bfloat16,
++                            T.ieee_fmaf(first, sine, second * cosine),
++                        )
++                    T.copy(C_shared, C[by * block_M, bx * block_N])
++                else:
++                    if shards > 1:
++                        T.copy(C_total, C[by * block_M, bx * block_N])
++                    else:
++                        T.copy(C_local, C[by * block_M, bx * block_N])
++            elif shards > 1:
+                 T.copy(C_total, C[by * block_M, bx * block_N])
+             else:
+                 T.copy(C_local, C[by * block_M, bx * block_N])
+ 
++    if rope_head_dim > 0:
++
++        @T.prim_func
++        def gemm_mxfp8(
++            A: T.Tensor((Mp, groups * K), in_dtype),
++            B: T.Tensor(b_shape, in_dtype),
++            SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
++            SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
++            C: T.Tensor((M, total_N), out_dtype),
++            positions: T.Tensor((M,), T.int64),
++            cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
++        ):
++            _body(A, B, SFA, SFB, C, positions, cos_sin)
++
++    else:
++
++        @T.prim_func
++        def gemm_mxfp8(
++            A: T.Tensor((Mp, groups * K), in_dtype),
++            B: T.Tensor(b_shape, in_dtype),
++            SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
++            SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
++            C: T.Tensor((M, total_N), out_dtype),
++        ):
++            _body(A, B, SFA, SFB, C, None, None)
++
+     return gemm_mxfp8
+ 
+ 
+@@ -374,6 +439,8 @@ def _mxfp8_gemm_decode(
+     groups: int = 1,
+     shards: int = 1,
+     tile_contiguous: bool = False,
++    rope_head_dim: int = 0,
++    rope_dim: int = 64,
+ ):
+     """``_mxfp8_gemm``'s decode tiles: no warp specialization, on the PDL chain."""
+     return _mxfp8_gemm(
+@@ -391,6 +458,8 @@ def _mxfp8_gemm_decode(
+         shards,
+         pdl_chain=True,
+         tile_contiguous=tile_contiguous,
++        rope_head_dim=rope_head_dim,
++        rope_dim=rope_dim,
+     )
+ 
+ 
+@@ -993,7 +1062,7 @@ def bf16_gemm_two(
+     return gemm_bf16_two
+ 
+ 
+-@tilelang.jit
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def bf16_gemm_partials(
+     N: int,
+     K: int,
+@@ -1020,6 +1089,7 @@ def bf16_gemm_partials(
+         with T.Kernel(
+             T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
+         ) as (bx, s, by):
++            pdl.chain()
+             A_shared = T.alloc_shared((block_M, block_K), dtype)
+             B_shared = T.alloc_shared((block_N, block_K), dtype)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 95b007fc4..c90144343 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -165,16 +165,19 @@ def slice_mxfp8(rows: MXFP8Rows, first: int, last: int) -> MXFP8Rows:
+ 
+ # The MXFP8 rows handed to the projections of the calls in progress, innermost last.
+ _PROVIDED: list[MXFP8Rows] = []
++_PROVIDED_POSITIONS: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+ 
+ 
+ @contextlib.contextmanager
+-def provide_mxfp8(rows: MXFP8Rows):
++def provide_mxfp8(rows: MXFP8Rows, *, positions: torch.Tensor | None = None):
+     """Hand ``rows`` to the projections that read their input's cast from its producer
+     (``tilelang_mxfp8_input``) for the calls inside: the sublayer the rows feed."""
+     _PROVIDED.append(rows)
++    _PROVIDED_POSITIONS.append((rows.rows, positions))
+     try:
+         yield
+     finally:
++        _PROVIDED_POSITIONS.pop()
+         _PROVIDED.pop()
+ 
+ 
+@@ -191,6 +194,21 @@ def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+     )
+ 
+ 
++def provided_positions(x: torch.Tensor) -> torch.Tensor:
++    """The handed-over ``positions`` of ``x`` for a projection that fuses RoPE."""
++    for rows, positions in reversed(_PROVIDED_POSITIONS):
++        if (
++            positions is not None
++            and rows.data_ptr() == x.data_ptr()
++            and rows.shape == x.shape
++        ):
++            return positions
++    raise RuntimeError(
++        f"no positions were handed over for these {tuple(x.shape)} rows: "
++        "the projection fuses RoPE in its epilogue (provide_mxfp8(..., positions=...))"
++    )
++
++
+ # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+ # row in twice the time of a 16-row tile; every height gives the same
+ # partials bit for bit, so each row count takes the smallest tile that fits.
+@@ -255,6 +273,11 @@ def _block32_linear(
+         x = x.reshape(-1, k)
+         out = out.view(x.shape[0], n)
+     rows = x.shape[0]
++    positions = (
++        provided_positions(x)
++        if getattr(layer, "tilelang_rope_head_dim", 0) > 0
++        else None
++    )
+     if layer.tilelang_mxfp8_input:
+         provided = provided_mxfp8(x)
+         if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+@@ -263,7 +286,12 @@ def _block32_linear(
+             )
+         else:
+             _block32_gemm(
+-                layer, provided.values, provided.scales, out.view(rows, n), rows
++                layer,
++                provided.values,
++                provided.scales,
++                out.view(rows, n),
++                rows,
++                positions=positions,
+             )
+         return
+     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+@@ -278,10 +306,17 @@ def _block32_linear(
+         use_packed_ue8m0=True,
+         out=(xq[:rows], sf[:rows]),
+     )
+-    _block32_gemm(layer, xq, sf, out, rows)
++    _block32_gemm(layer, xq, sf, out, rows, positions=positions)
+ 
+ 
+-def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
++def _block32_gemm(
++    layer,
++    xq,
++    sf,
++    out,
++    rows: int,
++    positions: torch.Tensor | None = None,
++) -> None:
+     """The GEMM of a block-32 projection without split-K on its MXFP8 activations
+     (``_activation_specs`` buffers or a producer's ``MXFP8Rows``, the first ``rows``
+     rows live)."""
+@@ -292,7 +327,19 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+     else:
+         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+     weight = getattr(layer, "tilelang_weight", layer.weight)
+-    gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
++    if getattr(layer, "tilelang_rope_head_dim", 0) > 0:
++        assert positions is not None
++        gemm(
++            xq,
++            weight,
++            sf.view(torch.uint32),
++            layer.tilelang_weight_sf,
++            out,
++            positions[:rows],
++            layer.tilelang_cos_sin,
++        )
++    else:
++        gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+ 
+ 
+ def _split_specs(layer, rows: int):
+@@ -362,7 +409,9 @@ def _bf16_linear(
+         layer.tilelang_gemm(x, layer.weight, out)
+ 
+ 
+-def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
++def _block32_kernels(
++    n: int, k: int, groups: int = 1, rope_head_dim: int = 0
++) -> dict:
+     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+     calls ``_bind_block32`` makes.
+ 
+@@ -395,6 +444,8 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+         if groups == 1 and (n, k) in TILE_CONTIGUOUS_FP8
+         else {}
+     )
++    if rope_head_dim > 0:
++        tile_kw = {**tile_kw, "rope_head_dim": rope_head_dim}
+     return {
+         "decode": {
+             block_M: prepare.call(
+@@ -483,7 +534,8 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
+     producer (``provide_mxfp8``) and casts nothing either."""
+     n, k = layer.weight.shape
+-    kernels = _block32_kernels(n, k, groups)
++    rope_head_dim = getattr(layer, "tilelang_rope_head_dim", 0)
++    kernels = _block32_kernels(n, k, groups, rope_head_dim=rope_head_dim)
+     layer.tilelang_groups = groups
+     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
+@@ -821,5 +873,6 @@ __all__ = [
+     "project_parts",
+     "provide_mxfp8",
+     "provided_mxfp8",
++    "provided_positions",
+     "slice_mxfp8",
+ ]
+-- 
+2.54.0 (Apple Git-157)
+
