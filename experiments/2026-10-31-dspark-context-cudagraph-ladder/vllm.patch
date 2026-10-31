@@ -1,0 +1,113 @@
+From a5ef891257892dc1073e5e91836e6307a8fa095c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:28:11 +0100
+Subject: [PATCH] perf(deepseek_v4_1): align DSparkContextCudaGraphs capture
+ ladder with decode shapes
+
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 37 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 36 +++++++++++++-----
+ 2 files changed, 64 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 59e83276e..fe403ade6 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -154,3 +154,40 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+     assert torch.equal(
+         hidden_states[capacity:].view(torch.int16), before[capacity:].view(torch.int16)
+     )
++
++
++def test_context_cudagraph_capacities_cover_decode_ladder():
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1.nvidia.dspark import _context_cudagraph_capacities
++
++    vllm_config = SimpleNamespace(
++        num_speculative_tokens=5,
++        compilation_config=SimpleNamespace(
++            cudagraph_capture_sizes=[1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36]
++        ),
++    )
++    assert _context_cudagraph_capacities(vllm_config, 0) == []
++    capacities = _context_cudagraph_capacities(vllm_config, 36)
++    assert capacities == [
++        1,
++        2,
++        3,
++        4,
++        5,
++        6,
++        7,
++        8,
++        9,
++        10,
++        11,
++        12,
++        16,
++        18,
++        20,
++        24,
++        28,
++        30,
++        32,
++        36,
++    ]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9c645e313..1764ff58a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -82,6 +82,32 @@ def _context_kv_projection(attn: nn.Module):
+     return TileLangBlock32Rows(attn.fused_wqa_wkv, attn.q_lora_rank)
+ 
+ 
++def _context_cudagraph_capacities(vllm_config: VllmConfig, limit: int) -> list[int]:
++    """Capture capacities for DSpark context preparation up to ``limit``.
++
++    Includes exact single- and two-request decode row counts, uniform
++    speculative-decode batch multiples, configured ``cudagraph_capture_sizes``,
++    and power-of-two fallback capacities so decode batches avoid row padding.
++    """
++    if limit <= 0:
++        return []
++    capacities: set[int] = {limit}
++    capacity = 1
++    while capacity < limit:
++        capacities.add(capacity)
++        capacity *= 2
++    for size in getattr(
++        vllm_config.compilation_config, "cudagraph_capture_sizes", None
++    ) or ():
++        if 0 < int(size) <= limit:
++            capacities.add(int(size))
++    spec_tokens = int(getattr(vllm_config, "num_speculative_tokens", 0) or 0)
++    decode_query_len = 1 + max(spec_tokens, 0)
++    capacities.update(range(1, min(limit, 2 * decode_query_len) + 1))
++    capacities.update(range(decode_query_len, limit + 1, decode_query_len))
++    return sorted(capacities)
++
++
+ class DSparkContextCudaGraphs:
+     """Serial, draft-workspace-lane owner for auxiliary projection and KV prep.
+ 
+@@ -112,15 +138,7 @@ class DSparkContextCudaGraphs:
+             hidden_states.shape[0],
+             vllm_config.compilation_config.max_cudagraph_capture_size,
+         )
+-        # Powers of two bound padding to less than 2x, independent of live rows.
+-        capacities = []
+-        capacity = 1
+-
+-        while capacity < limit:
+-            capacities.append(capacity)
+-            capacity *= 2
+-        if limit > 0:
+-            capacities.append(limit)
++        capacities = _context_cudagraph_capacities(vllm_config, limit)
+         self.aux = torch.zeros(
+             (limit, self.width * self.num_aux),
+             dtype=hidden_states.dtype,
+-- 
+2.54.0 (Apple Git-157)
+
