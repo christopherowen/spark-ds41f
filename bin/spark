@@ -1609,7 +1609,7 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "build and distribute runtime image",
-        "bin/spark image build --apply && bin/spark image distribute --apply",
+        "bin/spark build prepare && bin/spark --cluster-config <profile> build image --apply && bin/spark --cluster-config <profile> build distribute --apply",
         (
             "runtime image",
         ),
@@ -1624,7 +1624,10 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
-def summarize_live_warnings(warnings: list[str]) -> list[str]:
+def summarize_live_warnings(
+    warnings: list[str],
+    cluster_config: str = DEFAULT_CLUSTER_CONFIG,
+) -> list[str]:
     """Group low-level live warnings into concise user recommendations with commands."""
     grouped: dict[str, dict[str, None]] = {label: {} for label, _, _ in LIVE_RECOMMENDATION_RULES}
     matched_labels: dict[str, None] = {}
@@ -1650,7 +1653,8 @@ def summarize_live_warnings(warnings: list[str]) -> list[str]:
             continue
         nodes = list(grouped[label])
         suffix = f" ({', '.join(nodes)})" if nodes else ""
-        summary.append(Warn(f"recommend: {label}{suffix} -> run: {command}"))
+        rendered_command = command.replace("<profile>", cluster_config)
+        summary.append(Warn(f"recommend: {label}{suffix} -> run: {rendered_command}"))
     summary.extend(passthrough)
     return summary
 
@@ -1671,6 +1675,7 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 
 
 def command_doctor(args: argparse.Namespace) -> int:
+    _, canonical = cluster_config_path(args)
     cluster, nodes, upstreams = configuration(args)
     if getattr(args, "fragmentation_commands", False):
         for finding in weight_fragmentation_findings(cluster, nodes, commands=True):
@@ -1682,7 +1687,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         findings.extend(weight_fragmentation_findings(cluster, nodes))
     problems, warnings = split_findings(findings)
     if args.live and not getattr(args, "verbose", False):
-        warnings = summarize_live_warnings(warnings)
+        warnings = summarize_live_warnings(warnings, canonical)
     return report_doctor(problems, warnings, args.live)
 
 
@@ -3708,6 +3713,58 @@ def command_build_image(args: argparse.Namespace) -> int:
 def command_build_smoke(args: argparse.Namespace) -> int:
     cluster, _, upstreams = configuration(args)
     smoke_image(cluster, args.image or cluster["container"]["image"], smoke_script(upstreams))
+    return 0
+
+
+def command_build_distribute(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, _ = configuration(args)
+    tag = getattr(args, "tag", None) or cluster["container"]["image"]
+    if not args.apply:
+        for node in nodes["nodes"]:
+            if not node.get("head"):
+                target = transfer_target(nodes, node)
+                print(f"docker save {shlex.quote(tag)} | ssh {shlex.quote(target)} docker load")
+        print("plan only; pass --apply to distribute the image")
+        return 0
+    local_inspect = subprocess.run(
+        ["docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if local_inspect.returncode != 0:
+        raise SystemExit(f"{tag} is not present on this host; build it first")
+    expected_layers = local_inspect.stdout.strip()
+    for node in nodes["nodes"]:
+        remote_inspect = run_ssh(
+            nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"
+        )
+        if remote_inspect.returncode == 0 and remote_inspect.stdout.strip() == expected_layers:
+            print(f"{node['name']}: {tag} is already present", flush=True)
+            continue
+        target = transfer_target(nodes, node)
+        pipeline = (
+            f"docker save {shlex.quote(tag)} | "
+            f"ssh {shlex.join(ssh_options())} {shlex.quote(target)} docker load"
+        )
+        result = subprocess.run(
+            ["bash", "-o", "pipefail", "-c", pipeline],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise SystemExit(f"{node['name']}: failed to load {tag}: {detail}")
+        verify = run_ssh(
+            nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"
+        )
+        if verify.returncode != 0 or verify.stdout.strip() != expected_layers:
+            raise SystemExit(f"{node['name']}: image layers for {tag} do not match after load")
+        print(f"{node['name']}: loaded {tag}", flush=True)
     return 0
 
 
@@ -6457,6 +6514,16 @@ def parser() -> argparse.ArgumentParser:
         "--image", help="image to test (default: container.image from the cluster config)"
     )
     build_smoke.set_defaults(func=command_build_smoke)
+    build_distribute = build_commands.add_parser(
+        "distribute", help="copy the built image to every node in the configured node map"
+    )
+    build_distribute.add_argument(
+        "--tag", help="image tag (default: container.image from the cluster config)"
+    )
+    build_distribute.add_argument(
+        "--apply", action="store_true", help="perform the image copy and layer verification"
+    )
+    build_distribute.set_defaults(func=command_build_distribute)
     bench = commands.add_parser(
         "bench", help="benchmark the live service and compare it with a reference run"
     )
