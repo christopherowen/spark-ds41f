@@ -334,6 +334,11 @@ def collect_manifest_data() -> dict[str, Any]:
         kv = kv_rows[shape_name]
         bench_ref = entry.get("benchmark_reference")
         ref_suite = suites_by_path.get(bench_ref) if bench_ref else None
+        qualified_release = (
+            ref_suite["release"]
+            if ref_suite
+            else (_short_release_name(Path(bench_ref).stem.rsplit("-", 1)[0]) if bench_ref else None)
+        )
         shapes_info.append(
             {
                 "name": shape_name,
@@ -355,7 +360,7 @@ def collect_manifest_data() -> dict[str, Any]:
                 "prefix_cache_retention_interval": int(entry["sizing"]["prefix_cache_retention_interval"]),
                 "kv_capacity": kv,
                 "benchmark_reference": bench_ref,
-                "qualified_release": ref_suite["release"] if ref_suite else None,
+                "qualified_release": qualified_release,
             }
         )
 
@@ -440,16 +445,11 @@ def collect_manifest_data() -> dict[str, Any]:
 
 
 def render_readme_current_baseline(data: dict[str, Any]) -> str:
-    shapes = {s["name"]: s for s in data["shapes"]}
-    tp4 = shapes["tp4-ring"]
-    tp3 = shapes["tp3-triangle"]
-    tp3_4k = shapes["tp3-triangle-4k"]
-
     lines = [
         f"| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Full contexts held (startup line) | Qualified reference |",
         f"| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-    for s in (tp4, tp3, tp3_4k):
+    for s in data["shapes"]:
         kv = s["kv_capacity"]
         ctx_label = f"{s['max_model_len']:,}"
         seq_label = f"{s['max_num_seqs']} (up to {kv['every_sequence_tokens']:,} tok each)"
@@ -459,7 +459,12 @@ def render_readme_current_baseline(data: dict[str, Any]) -> str:
             f"{kv['full_contexts']} ({kv['contexts']:.2f}x; startup `{startup_tok:,}` / `{startup_ctx:.2f}x`)"
         )
         if s["benchmark_reference"]:
-            ref_link = f"[`{s['qualified_release']}`]({s['benchmark_reference']}/)"
+            ref_target = (
+                s["benchmark_reference"]
+                if s["benchmark_reference"].endswith(".json")
+                else f"{s['benchmark_reference']}/"
+            )
+            ref_link = f"[`{s['qualified_release']}`]({ref_target})"
         else:
             ref_link = "unqualified (`--unqualified-shape`)"
         default_badge = " **(default)**" if s["default"] else ""

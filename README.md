@@ -201,6 +201,7 @@ See [docs/current-state.md](docs/current-state.md) and the manifest-driven dashb
 | Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Full contexts held (startup line) | Qualified reference |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) |
+| `tp4-switched` | TP4 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched.json) |
 | `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) |
 | `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | 8 (8.80x; startup `1,348,708` / `5.14x`) | unqualified (`--unqualified-shape`) |
 <!-- END GENERATED: current-baseline-summary -->
