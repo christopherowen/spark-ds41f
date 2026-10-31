@@ -1,0 +1,154 @@
+From 42764620629b2ca57a1769dcb879e20abe576239 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:14:06 +0100
+Subject: [PATCH] [DS4.1] MoE: 2D CTA panel swizzle for prefill grouped GEMMs
+
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 32 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 30 +++++++++++++----
+ 2 files changed, 55 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 56f8ef92a..7a9b07448 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -581,6 +581,38 @@ def test_prefill_tiles_give_the_decode_tiles_bits(
+     assert torch.equal(outs[64].view(torch.int16), outs[32].view(torch.int16))
+ 
+ 
++@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
++@pytest.mark.parametrize("rows", [171, 400, 1000])
++def test_prefill_swizzle_gives_the_unswizzled_bits(
++    rows, hidden, intermediate, num_experts=32, topk=6
++):
++    """Swizzling the prefill grouped GEMMs' CTA grid across ``prefill_swizzle_panel``
++    consecutive M-tiles changes only CTA launch order, never a tile's K-loop sum:
++    every output bit equals the unswizzled prefill plan's."""
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 15)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 16)
++    x = (
++        torch.randn((rows, hidden), generator=_gen(17), device=DEVICE) * 0.5
++    ).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 18, torch.int32)
++    tokens = cast_mxfp8(x)
++    outs = {}
++    for swizzle_panel in (0, 3):
++        plan = _plan(
++            num_experts,
++            topk,
++            hidden,
++            intermediate,
++            swiglu_limit=LIMIT,
++            prefill_swizzle_panel=swizzle_panel,
++        )
++        assert plan.tile_height(rows) == 64
++        weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++        outs[swizzle_panel] = torch.empty_like(x)
++        plan.run(tokens, ids, route_weights, weights, outs[swizzle_panel])
++    assert torch.equal(outs[3].view(torch.int16), outs[0].view(torch.int16))
++
++
+ @pytest.mark.parametrize("intermediate", [576, 768])
+ @pytest.mark.parametrize("rows", [2048, 4096])
+ def test_moe_swiglu_cast_prefill_tiles_equal_tile_kernels(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 7f5fab1a3..aaf9afa0e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -610,6 +610,7 @@ def grouped_fp8_fp4_gemm(
+     coded_scales: bool = False,
+     narrow_codes: bool = False,
+     trigger_after_loop: bool = False,
++    swizzle_panel: int = 0,
+ ):
+     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
+ 
+@@ -637,6 +638,13 @@ def grouped_fp8_fp4_gemm(
+     With ``trigger_after_loop`` the kernel begins with ``pdl.wait()`` and triggers its
+     dependent's launch after its K loop (``pdl.trigger()``) instead of at its start, so
+     the dependent launches near its end (see ``pdl``).
++
++    With ``swizzle_panel > 0``, ``T.use_swizzle(panel_size=swizzle_panel)``
++    rasterizes the ``(N / block_N, tiles)`` grid in panels of ``swizzle_panel``
++    consecutive M-tiles, stepping M-tiles first within each column block ``bx``
++    and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
++    expert share each ``bx`` weight slab in L2 while keeping unused padding
++    tiles (``t >= used_tiles``) at the tail of the grid.
+     """
+     block_K = FP4_TMA_K
+     tail = K % block_K
+@@ -767,6 +775,8 @@ def grouped_fp8_fp4_gemm(
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
++            if swizzle_panel:
++                T.use_swizzle(panel_size=swizzle_panel)
+             if trigger_after_loop:
+                 pdl.wait()
+             else:
+@@ -1303,6 +1313,7 @@ class MoeExpertsV41Plan:
+         swiglu_limit=None,
+         block_M=32,
+         prefill_block_M=64,
++        prefill_swizzle_panel=3,
+         block_N=128,
+         num_stages=3,
+         out_dtype=torch.bfloat16,
+@@ -1318,6 +1329,7 @@ class MoeExpertsV41Plan:
+             prefill_block_M,
+             block_N,
+         )
++        self.prefill_swizzle_panel = prefill_swizzle_panel
+         self.num_stages = num_stages
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+@@ -1338,7 +1350,8 @@ class MoeExpertsV41Plan:
+         ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``; at the same
+         height ``late_gate_up`` and ``late_down``, which trigger after their K loop
+         (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a ``prefill_`` prefix
+-        at ``prefill_block_M``, whose GEMMs trigger late too."""
++        at ``prefill_block_M``, whose GEMMs trigger late and swizzle their CTA grid across
++        ``prefill_swizzle_panel`` consecutive M-tiles."""
+         config = dict(
+             block_N=self.block_N,
+             num_stages=self.num_stages,
+@@ -1352,11 +1365,14 @@ class MoeExpertsV41Plan:
+             self.intermediate,
+         )
+         kernels = {}
+-        for prefix, block_M, late in (
+-            ("", self.block_M, False),
+-            ("late_", self.block_M, True),
+-            ("prefill_", self.prefill_block_M, True),
++        for prefix, block_M, late, swizzle in (
++            ("", self.block_M, False, 0),
++            ("late_", self.block_M, True, 0),
++            ("prefill_", self.prefill_block_M, True, self.prefill_swizzle_panel),
+         ):
++            gemm_config = (
++                {**config, "swizzle_panel": swizzle} if swizzle else config
++            )
+             kernels[f"{prefix}gate_up"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+@@ -1365,7 +1381,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 True,
+                 block_M,
+-                **config,
++                **gemm_config,
+                 trigger_after_loop=late,
+             )
+             kernels[f"{prefix}down"] = prepare.call(
+@@ -1376,7 +1392,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 False,
+                 block_M,
+-                **config,
++                **gemm_config,
+                 trigger_after_loop=late,
+             )
+             if prefix != "late_":  # the SwiGLU is the same at either trigger
+-- 
+2.54.0 (Apple Git-157)
+
