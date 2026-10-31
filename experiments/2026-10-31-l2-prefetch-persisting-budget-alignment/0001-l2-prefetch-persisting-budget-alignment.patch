@@ -1,0 +1,181 @@
+From 27724e105b692a4b147163de795cf53f43f061ec Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:24:04 +0100
+Subject: [PATCH] Configure GB10 persisting-L2 set-aside and clamp V4.1
+ prefetch window budgets
+
+---
+ .../models/test_deepseek_v4_1_l2_schedule.py  | 69 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/l2_prefetch.py      | 53 +++++++++++++-
+ 2 files changed, 121 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index 5284b965e..030628ccc 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -178,3 +178,72 @@ def test_engram_layer_moves_next_after_its_projection(segments, issued):
+     other.ffn.experts._l2_prefetch_pre_reduce_hook(6)
+     (plan, _), *rest = issued
+     assert not rest and plan[-2:] == ("indexer.wq_b", "indexer.weights_proj")
++
++
++def test_persist_env_request_defaults_to_16_8_on_sm121(monkeypatch):
++    monkeypatch.delenv("VLLM_DS41_L2_PREFETCH_PERSIST_MB", raising=False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (12, 1))
++    assert l2_prefetch._persist_env_request() == "16.8"
++
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (12, 0))
++    assert l2_prefetch._persist_env_request() == "0"
++
++    monkeypatch.setenv("VLLM_DS41_L2_PREFETCH_PERSIST_MB", "12.5")
++    assert l2_prefetch._persist_env_request() == "12.5"
++
++
++def test_effective_budget_clamps_to_persisting_l2_set_aside(monkeypatch):
++    monkeypatch.setattr(l2_prefetch, "CLAMP_TO_PERSIST", True)
++    monkeypatch.setattr(
++        l2_prefetch, "configure_persisting_l2", lambda device, request=None: 16_777_216
++    )
++    cuda_dev = torch.device("cuda", 0)
++    assert l2_prefetch.effective_budget(20_000_000, cuda_dev) == 16_777_216
++    assert l2_prefetch.effective_budget(12_000_000, cuda_dev) == 12_000_000
++    assert l2_prefetch.effective_budget(20_000_000, torch.device("cpu")) == 20_000_000
++
++    monkeypatch.setattr(l2_prefetch, "CLAMP_TO_PERSIST", False)
++    assert l2_prefetch.effective_budget(20_000_000, cuda_dev) == 20_000_000
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
++def test_make_plan_sizes_persisting_l2_and_clamps_overbudget_tail(monkeypatch):
++    from cuda.bindings import driver as cu
++
++    device = torch.device("cuda", 0)
++    torch.empty(1, device=device)
++    err, dev = cu.cuDeviceGet(0)
++    assert err == cu.CUresult.CUDA_SUCCESS
++    err, max_bytes = cu.cuDeviceGetAttribute(
++        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev
++    )
++    assert err == cu.CUresult.CUDA_SUCCESS
++    if max_bytes <= 0:
++        pytest.skip("device has no persisting L2 set-aside")
++
++    err, before = cu.cuCtxGetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE)
++    assert err == cu.CUresult.CUDA_SUCCESS
++    monkeypatch.setattr(l2_prefetch, "_ds41_persisting_l2_applied", {})
++    monkeypatch.setattr(l2_prefetch._l2pf, "_persisting_l2_applied", {})
++    monkeypatch.setattr(l2_prefetch, "PERSIST_L2", "16.8")
++    monkeypatch.setattr(l2_prefetch, "CLAMP_TO_PERSIST", True)
++    try:
++        t1 = torch.empty(14 * 1024 * 1024, dtype=torch.uint8, device=device)
++        t2 = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=device)
++        segs = [
++            s
++            for s in (
++                l2_prefetch._l2pf.tensor_segment("t1", t1),
++                l2_prefetch._l2pf.tensor_segment("t2", t2),
++            )
++            if s is not None
++        ]
++        plan = l2_prefetch.make_plan(segs, 20_000_000, device)
++        err, applied = cu.cuCtxGetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE)
++        assert err == cu.CUresult.CUDA_SUCCESS
++        assert applied > 0
++        assert plan is not None
++        assert plan.total_bytes <= applied
++    finally:
++        cu.cuCtxSetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE, int(before))
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index 6c1ae0030..3a86957cd 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -44,6 +44,10 @@ spin kernels standing in for the attention core and all-reduces
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+   VLLM_DS41_L2_PREFETCH_{WO,FFN,NEXT}_MB   per-window fill budgets
++  VLLM_DS41_L2_PREFETCH_PERSIST_MB    persisting-L2 set-aside per rank on SM121
++                                      ("16.8" default on SM121, "max", MB, or "0")
++  VLLM_DS41_L2_PREFETCH_CLAMP_TO_PERSIST=0/1  clamp each window's plan budget to
++                                      the active persisting-L2 set-aside (default 1)
+ """
+ 
+ from __future__ import annotations
+@@ -69,11 +73,57 @@ def _enabled() -> bool:
+     return torch.cuda.get_device_capability() == (12, 1)
+ 
+ 
++def _persist_env_request() -> str:
++    raw = os.getenv("VLLM_DS41_L2_PREFETCH_PERSIST_MB")
++    if raw is not None:
++        return raw
++    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1):
++        return "16.8"
++    return "0"
++
++
+ ENABLED = _enabled()
++PERSIST_L2 = _persist_env_request()
++CLAMP_TO_PERSIST = os.getenv("VLLM_DS41_L2_PREFETCH_CLAMP_TO_PERSIST", "1") != "0"
+ BUDGET_WO = _l2pf._mb("VLLM_DS41_L2_PREFETCH_WO_MB", "20")
+ BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
+ 
++_ds41_persisting_l2_applied: dict[int, int] = {}
++
++
++def configure_persisting_l2(
++    device: torch.device, request: str | None = None
++) -> int:
++    """Size the persisting-L2 set-aside of ``device``'s primary context for V4.1."""
++    if device.type != "cuda":
++        return 0
++    idx = (
++        device.index
++        if device.index is not None
++        else torch.accelerator.current_device_index()
++    )
++    if request is None and idx in _ds41_persisting_l2_applied:
++        return _ds41_persisting_l2_applied[idx]
++    req = PERSIST_L2 if request is None else request
++    applied = _l2pf.configure_persisting_l2(device, request=req)
++    if request is None:
++        _ds41_persisting_l2_applied[idx] = applied
++        _l2pf._persisting_l2_applied[idx] = applied
++    return applied
++
++
++def effective_budget(budget: int, device: torch.device) -> int:
++    """Clamp ``budget`` to ``device``'s active persisting-L2 set-aside when enabled
++    so trailing segments of an ``evict_last`` window do not evict its leading
++    segments before the first consumer kernel executes."""
++    if not CLAMP_TO_PERSIST or device.type != "cuda":
++        return budget
++    persist_bytes = configure_persisting_l2(device)
++    if persist_bytes > 0:
++        return min(budget, persist_bytes)
++    return budget
++
+ 
+ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+     """Bytes read by a V4.1 linear: its weight, and its scale words."""
+@@ -110,7 +160,7 @@ def make_plan(segments: list[Segment], budget: int, device: torch.device):
+         if segment[1] not in seen:
+             seen.add(segment[1])
+             unique.append(segment)
+-    plan, _ = _l2pf.make_plan(unique, budget, device)
++    plan, _ = _l2pf.make_plan(unique, effective_budget(budget, device), device)
+     return plan
+ 
+ 
+@@ -133,6 +183,7 @@ def kernel_calls() -> list:
+ 
+ def issue(plan: _l2pf.L2PrefetchPlan | None, num_tokens: int) -> None:
+     if ENABLED and plan is not None and plan.segs is not None:
++        configure_persisting_l2(plan.segs.device)
+         _l2pf.L2Prefetcher.get(plan.segs.device).issue(plan, num_tokens)
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
