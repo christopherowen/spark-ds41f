@@ -1,0 +1,818 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 2b524521d..c267f0727 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -49,6 +49,10 @@ CHAIN = {
+     "mhc_collapse_column",
+     "mhc_finalize",
+     "mhc_post",
++    "mhc_post_collapse",
++    "mhc_post_collapse_column",
++    "mhc_post_collapse_dual",
++    "mhc_post_collapse_dual_column",
+     "mhc_project_streams",
+     "moe_combine",
+     "moe_dispatch",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 57cf6ec67..9cee3ee47 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -42,6 +42,7 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
+     MIXES,
+     TileKernelsMHC,
+     collapse_streams,
++    post_collapse_streams,
+     post_streams,
+     project_streams,
+ )
+@@ -162,6 +163,7 @@ def _check(actual, expected, tokens):
+     # so an ulp of difference there can become two in y.
+     _close_bf16(a_y, y, ulps=2)
+     _assert_cast(a_cast, a_y)
++    assert bool((a_cast.scales[tokens:] == 0).all())
+ 
+ 
+ @pytest.mark.parametrize("tokens", [1, 7, 16, 33, 64, 200])
+@@ -629,6 +631,44 @@ def test_no_tokens_launch_nothing(mhc):
+     x, residual, post, comb = _post_inputs(0, seed=0)
+     assert mhc.post(x, residual, post, comb).shape == (0, 4, HIDDEN)
+     assert mhc.collapse(residual).shape == (0, HIDDEN)
++    assert mhc.post_collapse(x, residual, post, comb).shape == (0, HIDDEN)
++    out, aux = mhc.post_collapse_dual(x, residual, post, comb, _pre_mix(0, seed=0))
++    assert out.shape == (0, HIDDEN) and aux.shape == (0, HIDDEN)
++
++
++@pytest.mark.parametrize("tokens", SERVING_TOKENS)
++def test_post_collapse_bits_match_post_then_collapse(mhc, tokens):
++    """Fused ``post_collapse`` and ``post_collapse_dual`` match standalone ``post``
++    followed by ``collapse`` bit for bit, including sink-column extraction."""
++    x, residual, post, comb = _post_inputs(tokens, seed=850 + tokens)
++    mix = _pre_mix(tokens, seed=860 + tokens)
++    state = mhc.post(x, residual, post, comb)
++    expected_mean = mhc.collapse(state)
++    expected_mix = mhc.collapse(state, mix)
++    _assert_bits_equal(
++        mhc.post_collapse(x, residual, post, comb), expected_mean, "mean: "
++    )
++    _assert_bits_equal(
++        mhc.post_collapse(x, residual, post, comb, mix), expected_mix, "mix: "
++    )
++    dual_mix, dual_mean = mhc.post_collapse_dual(x, residual, post, comb, mix)
++    _assert_bits_equal(dual_mix, expected_mix, "dual mix: ")
++    _assert_bits_equal(dual_mean, expected_mean, "dual mean: ")
++    if tokens <= 2048:
++        col = 1029
++        cols1 = torch.full((tokens, 4), -7.0, device=DEVICE)
++        cols2 = torch.full((tokens, 4), -7.0, device=DEVICE)
++        out1 = mhc.post_collapse(
++            x, residual, post, comb, mix, columns=cols1, column=col
++        )
++        out2, aux2 = mhc.post_collapse_dual(
++            x, residual, post, comb, mix, columns=cols2, column=col
++        )
++        _assert_bits_equal(out1, expected_mix, "col mix: ")
++        _assert_bits_equal(out2, expected_mix, "dual col mix: ")
++        _assert_bits_equal(aux2, expected_mean, "dual col mean: ")
++        _assert_bits_equal(cols1, state[:, :, col].float(), "cols1: ")
++        _assert_bits_equal(cols2, state[:, :, col].float(), "cols2: ")
+ 
+ 
+ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+@@ -639,18 +679,23 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+         mhc.declare_kernels()
+     declared = prepare.declared_calls(registry)
+     assert prepare.warm_declared(registry) == 0
+-    factories = (post_streams, collapse_streams)
++    factories = (post_streams, collapse_streams, post_collapse_streams)
+     ours = [call for call in declared if call[0] in factories]
+-    assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
++    assert ours == [
++        (post_streams, (HIDDEN,), {}),
++        (collapse_streams, (HIDDEN,), {}),
++        (post_collapse_streams, (HIDDEN,), {}),
++        (post_collapse_streams, (HIDDEN,), {"dual_out": True}),
++    ]
+ 
+     def by_factory(call):
+         # TileLang's JIT objects have no __name__; order by the factory itself.
+         found = (i for i, factory in enumerate(factories) if factory is call[0])
+-        return next(found, len(factories))
++        return (next(found, len(factories)), sorted(call[2].items()))
+ 
+     # The forward's calls, recorded as its cached lookups make them.
+     launched = []
+-    for name in ("post_streams", "collapse_streams"):
++    for name in ("post_streams", "collapse_streams", "post_collapse_streams"):
+         factory = getattr(mhc_module, name)
+ 
+         def record(*args, _factory=factory, **kwargs):
+@@ -658,12 +703,15 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+             return _factory(*args, **kwargs)
+ 
+         monkeypatch.setattr(mhc_module, name, record)
+-    for name in ("_post", "_collapse"):
++    for name in ("_post", "_collapse", "_post_collapse"):
+         lookup = getattr(mhc_module, name)
+         monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
+     x, residual, post, comb = _post_inputs(6, seed=71)
++    mix = _pre_mix(6, seed=72)
+     mhc.post(x, residual, post, comb)
+     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
+-    mhc.collapse(residual, _pre_mix(6, seed=72))
++    mhc.collapse(residual, mix)
+     mhc.collapse(residual)
+-    assert sorted(launched, key=by_factory) == ours
++    mhc.post_collapse(x, residual, post, comb)
++    mhc.post_collapse_dual(x, residual, post, comb, mix)
++    assert sorted(launched, key=by_factory) == sorted(ours, key=by_factory)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9c645e313..a8ac92e7d 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -426,16 +426,16 @@ class DSparkDeepseekV4Model(nn.Module):
+                 residual,
+             )
+         l2_prefetch.join()
+-        hidden_states = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+-        if self.use_sequence_parallel:
+-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+-            pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference forward_head applies (hc_pre with the
+         # last block's ffn pre-mix). Return the PRE-norm head hidden;
+         # compute_logits applies self.norm.
+         assert pre_mix is not None
+-        hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
++        hidden_states = layer.mhc.post_collapse(
++            hidden_states, residual, post_mix, res_mix, pre_mix
++        )
++        if self.use_sequence_parallel:
++            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+         return hidden_states
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index f41eb34bb..fe34cf77f 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -883,9 +883,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 self.glp.steer(
+                     idx, hidden_states, residual, post_mix, res_mix, steer_rows
+                 )
+-            if idx + 1 in self.aux_hidden_state_layers:
++            if idx + 1 in self.aux_hidden_state_layers and (
++                idx + 1 != self.end_layer or not get_pp_group().is_last_rank
++            ):
+                 # Reconstruct the aux hidden state for draft models
+-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                 aux_out = (
+                     self._graph_out(len(aux_hidden_states), full_num_tokens)
+                     if sp is None
+@@ -893,11 +894,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     and not self.use_sequence_parallel
+                     else None
+                 )
+-                aux_hidden_state = (
+-                    layer.mhc.collapse(aux_recon)
+-                    if aux_out is None
+-                    else layer.mhc.collapse(aux_recon, out=aux_out)
+-                )
++                if idx + 1 == self.end_layer:
++                    aux_recon = layer.mhc.post(
++                        hidden_states, residual, post_mix, res_mix
++                    )
++                    aux_hidden_state = (
++                        layer.mhc.collapse(aux_recon)
++                        if aux_out is None
++                        else layer.mhc.collapse(aux_recon, out=aux_out)
++                    )
++                    final_aux_recon = aux_recon
++                else:
++                    aux_hidden_state = layer.mhc.post_collapse(
++                        hidden_states, residual, post_mix, res_mix, out=aux_out
++                    )
+                 if self.use_sequence_parallel:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                 elif sp is not None:
+@@ -907,18 +917,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
+-                final_aux_recon = aux_recon
+         l2_prefetch.join()
+-        if layer is not None:
+-            # Reuse if the last layer was captured as an aux hidden state
+-            if self.end_layer in self.aux_hidden_state_layers:
+-                hidden_states = final_aux_recon
+-            else:
+-                hidden_states = layer.mhc.post(
+-                    hidden_states, residual, post_mix, res_mix
+-                )
+ 
+         if not get_pp_group().is_last_rank:
++            if layer is not None:
++                if self.end_layer in self.aux_hidden_state_layers:
++                    hidden_states = final_aux_recon
++                else:
++                    hidden_states = layer.mhc.post(
++                        hidden_states, residual, post_mix, res_mix
++                    )
+             if decoder_compacted:
+                 hidden_states = scatter_rows(
+                     hidden_states, ced_indices, full_num_tokens
+@@ -946,13 +954,49 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference applies via
+         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+-        hidden_states = (
+-            layer.mhc.collapse(hidden_states, pre_mix)
+-            if columns is None
+-            else layer.mhc.collapse(
+-                hidden_states, pre_mix, columns=columns, column=self._sink_column
++        if layer is not None and self.end_layer in self.aux_hidden_state_layers:
++            aux_out = (
++                self._graph_out(len(aux_hidden_states), full_num_tokens)
++                if rows_here and not self.use_sequence_parallel
++                else None
++            )
++            hidden_states, aux_hidden_state = layer.mhc.post_collapse_dual(
++                hidden_states,
++                residual,
++                post_mix,
++                res_mix,
++                pre_mix,
++                aux_out=aux_out,
++                columns=columns,
++                column=self._sink_column,
++            )
++            if self.use_sequence_parallel:
++                aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
++            elif sp is not None:
++                aux_hidden_state = sp.gather(aux_hidden_state)
++            if decoder_compacted:
++                aux_hidden_state = scatter_rows(
++                    aux_hidden_state, ced_indices, full_num_tokens
++                )
++            aux_hidden_states.append(aux_hidden_state)
++        elif layer is not None:
++            hidden_states = layer.mhc.post_collapse(
++                hidden_states,
++                residual,
++                post_mix,
++                res_mix,
++                pre_mix,
++                columns=columns,
++                column=self._sink_column,
++            )
++        else:
++            hidden_states = (
++                layer.mhc.collapse(hidden_states, pre_mix)
++                if columns is None
++                else layer.mhc.collapse(
++                    hidden_states, pre_mix, columns=columns, column=self._sink_column
++                )
+             )
+-        )
+         if columns is not None and not (rows_here and not self.use_sequence_parallel):
+             # A gather of hc_mult values per token under sequence parallelism.
+             if self.use_sequence_parallel:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index f8b36da99..4d4fd7aee 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -436,6 +436,11 @@ def finalize(
+                         cast_block_mxfp8(
+                             xf, xq, VEC, amax[0], yq, ysf, pid, chunk * VEC
+                         )
++            if pid == 0:
++                for idx in T.serial(T.ceildiv((Mq - M) * sf_width, threads)):
++                    flat = idx * threads + tx
++                    if flat < (Mq - M) * sf_width:
++                        ysf[M + flat // sf_width, flat % sf_width] = T.uint8(0)
+ 
+     return mhc_finalize
+ 
+@@ -627,6 +632,247 @@ def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
+     return mhc_collapse_column
+ 
+ 
++@T.macro
++def _post_collapse_rows(
++    x,
++    residual,
++    post,
++    comb,
++    mix,
++    out,
++    ov,
++    token,
++    col,
++    tx,
++    reserve,
++):
++    """Fold ``x`` into ``residual`` in registers (``post_streams``' arithmetic) and
++    collapse those updated streams with ``mix`` into ``out`` (``collapse_streams``'
++    arithmetic). Leaves the updated BF16 streams in ``ov``."""
++    xv = T.alloc_local((VEC,), T.bfloat16)
++    rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++    out_v = T.alloc_local((VEC,), T.bfloat16)
++    pm = T.alloc_local((MULT,), T.float32)
++    cm = T.alloc_local((MULT * MULT,), T.float32)
++    mv = T.alloc_local((MULT,), T.float32)
++    acc = T.alloc_var(T.float32)
++    if tx == 0:
++        reserve[0] = T.float32(0)
++    for n in T.vectorized(MULT):
++        pm[n] = post[token, n]
++    for m in T.unroll(MULT):
++        for n in T.vectorized(MULT):
++            cm[m * MULT + n] = comb[token, m, n]
++    for m in T.vectorized(MULT):
++        mv[m] = mix[token, m]
++    for v in T.vectorized(VEC):
++        xv[v] = x[token, col + v]
++    for m in T.unroll(MULT):
++        for v in T.vectorized(VEC):
++            rv[m * VEC + v] = residual[token, m, col + v]
++    for n in T.unroll(MULT):
++        for v in T.unroll(VEC):
++            acc = cm[n] * T.Cast(T.float32, rv[v])
++            acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++            for m in T.unroll(1, MULT):
++                acc = T.fma(
++                    cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                )
++            ov[n * VEC + v] = T.Cast(T.bfloat16, acc)
++    for v in T.unroll(VEC):
++        acc = T.float32(0)
++        for m in T.unroll(MULT):
++            acc = T.fma(mv[m], T.Cast(T.float32, ov[m * VEC + v]), acc)
++        out_v[v] = T.Cast(T.bfloat16, acc)
++    for v in T.vectorized(VEC):
++        out[token, col + v] = out_v[v]
++
++
++@T.macro
++def _collapse_mean_from_local(ov, aux_out, token, col):
++    """Collapse the register streams ``ov`` with the uniform 1/4 mean into
++    ``aux_out``, matching ``collapse_streams`` with ``_constant_mixes``' mean."""
++    aux_v = T.alloc_local((VEC,), T.bfloat16)
++    acc = T.alloc_var(T.float32)
++    for v in T.unroll(VEC):
++        acc = T.float32(0)
++        for m in T.unroll(MULT):
++            acc = T.fma(T.float32(0.25), T.Cast(T.float32, ov[m * VEC + v]), acc)
++        aux_v[v] = T.Cast(T.bfloat16, acc)
++    for v in T.vectorized(VEC):
++        aux_out[token, col + v] = aux_v[v]
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_collapse_streams(
++    hidden_size: int,
++    threads: int = 128,
++    column: int = -1,
++    dual_out: bool = False,
++):
++    """Fused ``post_streams`` followed by ``collapse_streams`` in one launch without
++    materializing the intermediate ``[M, MULT, hidden_size]`` stream tensor in HBM.
++
++    When ``dual_out`` is True, also writes the uniform-mean collapse into ``aux_out``
++    from the same register streams (for the final decoder layer when it is also an
++    auxiliary hidden state layer). With ``column >= 0``, also writes each reconstructed
++    stream's ``column`` as FP32 to ``columns``."""
++    assert hidden_size % (threads * VEC) == 0
++    assert column < hidden_size
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    if not dual_out and column < 0:
++
++        @T.prim_func
++        def mhc_post_collapse(
++            x: T.Tensor((M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
++                tx = T.get_thread_binding()
++                ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++                _post_collapse_rows(
++                    x,
++                    residual,
++                    post,
++                    comb,
++                    mix,
++                    out,
++                    ov,
++                    pid // blocks,
++                    (pid % blocks * threads + tx) * VEC,
++                    tx,
++                    reserve,
++                )
++
++        return mhc_post_collapse
++
++    if dual_out and column < 0:
++
++        @T.prim_func
++        def mhc_post_collapse_dual(
++            x: T.Tensor((M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++            aux_out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
++                tx = T.get_thread_binding()
++                ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++                token = pid // blocks
++                col = (pid % blocks * threads + tx) * VEC
++                _post_collapse_rows(
++                    x,
++                    residual,
++                    post,
++                    comb,
++                    mix,
++                    out,
++                    ov,
++                    token,
++                    col,
++                    tx,
++                    reserve,
++                )
++                _collapse_mean_from_local(ov, aux_out, token, col)
++
++        return mhc_post_collapse_dual
++
++    column_block = column // (threads * VEC)
++    column_thread = column % (threads * VEC) // VEC
++    column_element = column % VEC
++
++    if not dual_out:
++
++        @T.prim_func
++        def mhc_post_collapse_column(
++            x: T.Tensor((M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++            columns: T.Tensor((M, MULT), T.float32),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
++                tx = T.get_thread_binding()
++                ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++                _post_collapse_rows(
++                    x,
++                    residual,
++                    post,
++                    comb,
++                    mix,
++                    out,
++                    ov,
++                    pid // blocks,
++                    (pid % blocks * threads + tx) * VEC,
++                    tx,
++                    reserve,
++                )
++                if (pid % blocks == column_block) & (tx == column_thread):
++                    for m in T.unroll(MULT):
++                        columns[pid // blocks, m] = T.Cast(
++                            T.float32, ov[m * VEC + column_element]
++                        )
++
++        return mhc_post_collapse_column
++
++    @T.prim_func
++    def mhc_post_collapse_dual_column(
++        x: T.Tensor((M, hidden_size), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        mix: T.Tensor((M, MULT), T.float32),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++        aux_out: T.Tensor((M, hidden_size), T.bfloat16),
++        columns: T.Tensor((M, MULT), T.float32),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++            reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++            token = pid // blocks
++            col = (pid % blocks * threads + tx) * VEC
++            _post_collapse_rows(
++                x,
++                residual,
++                post,
++                comb,
++                mix,
++                out,
++                ov,
++                token,
++                col,
++                tx,
++                reserve,
++            )
++            _collapse_mean_from_local(ov, aux_out, token, col)
++            if (pid % blocks == column_block) & (tx == column_thread):
++                for m in T.unroll(MULT):
++                    columns[token, m] = T.Cast(
++                        T.float32, ov[m * VEC + column_element]
++                    )
++
++    return mhc_post_collapse_dual_column
++
++
+ def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
+     """The ``project_streams`` call of a sublayer entry."""
+     return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
+@@ -652,6 +898,19 @@ def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
+     return prepare.call(collapse_streams, hidden, column=column)
+ 
+ 
++def _post_collapse_call(
++    hidden: int, column: int = -1, dual_out: bool = False
++) -> prepare.TileLangCall:
++    """The fused ``post_collapse``'s call, and with ``column`` / ``dual_out`` its
++    sink-column and dual-output variants."""
++    kwargs: dict[str, int | bool] = {}
++    if column >= 0:
++        kwargs["column"] = column
++    if dual_out:
++        kwargs["dual_out"] = True
++    return prepare.call(post_collapse_streams, hidden, **kwargs)
++
++
+ def _make(call: prepare.TileLangCall):
+     function, args, kwargs = call
+     return function(*args, **kwargs)
+@@ -677,6 +936,11 @@ def _collapse(hidden: int, column: int = -1):
+     return _make(_collapse_call(hidden, column))
+ 
+ 
++@cache
++def _post_collapse(hidden: int, column: int = -1, dual_out: bool = False):
++    return _make(_post_collapse_call(hidden, column, dual_out))
++
++
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_mhc_pre",
+     mutates_args=("residual_out", "y", "y_q", "y_sf", "post", "comb", "pre_out"),
+@@ -843,6 +1107,133 @@ def _mhc_collapse_column_fake(state, mix, out, columns, column):
+     return None
+ 
+ 
++@torch.library.custom_op("vllm::dsv41_tilelang_mhc_post_collapse", mutates_args=("out",))
++def _mhc_post_collapse(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    _post_collapse(hidden)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++    )
++
++
++@_mhc_post_collapse.register_fake
++def _mhc_post_collapse_fake(x, residual, post, comb, mix, out):
++    return None
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_mhc_post_collapse_column", mutates_args=("out", "columns")
++)
++def _mhc_post_collapse_column(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++    columns: torch.Tensor,
++    column: int,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    _post_collapse(hidden, column)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++        columns.view(tokens, MULT),
++    )
++
++
++@_mhc_post_collapse_column.register_fake
++def _mhc_post_collapse_column_fake(x, residual, post, comb, mix, out, columns, column):
++    return None
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_mhc_post_collapse_dual", mutates_args=("out", "aux_out")
++)
++def _mhc_post_collapse_dual(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++    aux_out: torch.Tensor,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    _post_collapse(hidden, dual_out=True)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++        aux_out.view(tokens, hidden),
++    )
++
++
++@_mhc_post_collapse_dual.register_fake
++def _mhc_post_collapse_dual_fake(x, residual, post, comb, mix, out, aux_out):
++    return None
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_mhc_post_collapse_dual_column",
++    mutates_args=("out", "aux_out", "columns"),
++)
++def _mhc_post_collapse_dual_column(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++    aux_out: torch.Tensor,
++    columns: torch.Tensor,
++    column: int,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    _post_collapse(hidden, column, dual_out=True)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++        aux_out.view(tokens, hidden),
++        columns.view(tokens, MULT),
++    )
++
++
++@_mhc_post_collapse_dual_column.register_fake
++def _mhc_post_collapse_dual_column_fake(
++    x, residual, post, comb, mix, out, aux_out, columns, column
++):
++    return None
++
++
+ # Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's
+ # mean), and every earlier, shorter pair (a captured graph may still read one).
+ _MIXES: dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+@@ -906,6 +1297,8 @@ class TileKernelsMHC(nn.Module):
+                 *(_finalize_call(hidden, k, *mix) for k in widths),
+                 _post_call(hidden),
+                 _collapse_call(hidden),
++                _post_collapse_call(hidden),
++                _post_collapse_call(hidden, dual_out=True),
+             ]
+ 
+         def bind() -> None:
+@@ -916,6 +1309,8 @@ class TileKernelsMHC(nn.Module):
+                 _finalize(hidden, k, *mix)
+             _post(hidden)
+             _collapse(hidden)
++            _post_collapse(hidden)
++            _post_collapse(hidden, dual_out=True)
+             # The constant mixes for the batch limit, before any graph captures.
+             _constant_mixes(
+                 get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+@@ -1002,6 +1397,68 @@ class TileKernelsMHC(nn.Module):
+         _mhc_post(x, residual, post, comb, out)
+         return out
+ 
++    def post_collapse(
++        self,
++        x,
++        residual: torch.Tensor,
++        post: torch.Tensor,
++        comb: torch.Tensor,
++        pre: torch.Tensor | None = None,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Fold ``x`` into ``residual`` and collapse the resulting streams with ``pre``
++        (or their mean) in a single launch without materializing the intermediate
++        ``[tokens, MULT, hidden]`` tensor."""
++        if isinstance(x, RankOrderParts):
++            x = x.sum()
++        if pre is None:
++            pre = _constant_mixes(int(residual.shape[0]), residual.device)[1]
++        if out is None:
++            out = torch.empty(
++                (residual.shape[0], residual.shape[-1]),
++                dtype=residual.dtype,
++                device=residual.device,
++            )
++        if columns is None:
++            _mhc_post_collapse(x, residual, post, comb, pre, out)
++        else:
++            _mhc_post_collapse_column(
++                x, residual, post, comb, pre, out, columns, column
++            )
++        return out
++
++    def post_collapse_dual(
++        self,
++        x,
++        residual: torch.Tensor,
++        post: torch.Tensor,
++        comb: torch.Tensor,
++        pre: torch.Tensor,
++        *,
++        out: torch.Tensor | None = None,
++        aux_out: torch.Tensor | None = None,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Fold ``x`` into ``residual`` once and emit both the ``pre``-collapsed
++        output and the uniform-mean-collapsed auxiliary output in a single launch."""
++        if isinstance(x, RankOrderParts):
++            x = x.sum()
++        shape = (residual.shape[0], residual.shape[-1])
++        if out is None:
++            out = torch.empty(shape, dtype=residual.dtype, device=residual.device)
++        if aux_out is None:
++            aux_out = torch.empty(shape, dtype=residual.dtype, device=residual.device)
++        if columns is None:
++            _mhc_post_collapse_dual(x, residual, post, comb, pre, out, aux_out)
++        else:
++            _mhc_post_collapse_dual_column(
++                x, residual, post, comb, pre, out, aux_out, columns, column
++            )
++        return out, aux_out
++
+     @staticmethod
+     def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
+         """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
+@@ -1035,14 +1492,20 @@ class TileKernelsMHC(nn.Module):
+ 
+     @staticmethod
+     def collapse_column_calls(hidden: int, column: int) -> list:
+-        """The declared call of ``collapse`` with ``columns`` for ``column``."""
+-        return [_collapse_call(hidden, column)]
++        """The declared calls of ``collapse``, ``post_collapse`` and
++        ``post_collapse_dual`` with ``columns`` for ``column``."""
++        return [
++            _collapse_call(hidden, column),
++            _post_collapse_call(hidden, column),
++            _post_collapse_call(hidden, column, dual_out=True),
++        ]
+ 
+ 
+ __all__ = [
+     "TileKernelsMHC",
+     "collapse_streams",
+     "finalize",
++    "post_collapse_streams",
+     "post_streams",
+     "project_streams",
+ ]
