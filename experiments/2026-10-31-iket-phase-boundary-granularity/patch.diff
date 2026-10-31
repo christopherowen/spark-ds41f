@@ -1,0 +1,336 @@
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 41901baf6..2a466485a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -230,6 +230,75 @@ def test_preprocessor_conditional_skips_the_kernel():
+     ]
+ 
+ 
++def test_phase_granularity_merges_waits_and_internal_sync_blocks():
++    fine_out, fine_sites = iket.annotate(KERNEL, _token, ctas=1, iters=1)
++    phase_out, phase_sites = iket.annotate(
++        KERNEL, _token, ctas=1, iters=1, granularity="phase"
++    )
++    assert [s["range"] for s in fine_sites] == [
++        "load.global",
++        "wait.sync",
++        "load.cp_async",
++        "wait.cp_async*4",
++        "wait.sync#2*4",
++        "compute.mma*4",
++        "wait.sync#3",
++        "store.global",
++    ]
++    # In phase granularity:
++    # - wait.cp_async + wait.sync inside the ko loop coalesce into a single wait*4 range
++    # - wait.sync#3 inside if (threadIdx.x < 32) { __syncthreads(); acc[1] = 0.0f; }
++    #   stays a single wait.sync range without splitting store.global
++    assert [s["range"] for s in phase_sites] == [
++        "load.global",
++        "wait.sync",
++        "load.cp_async",
++        "wait*4",
++        "compute.mma*4",
++        "wait.sync#2",
++        "store.global",
++    ]
++    assert phase_sites[3]["kinds"] == ["cp_async", "sync"]
++    assert phase_sites[0]["events_per_warp_bound"] < fine_sites[0]["events_per_warp_bound"]
++
++    # A block that mixes a non-wait phase with only internal block syncs (e.g. an
++    # online-softmax reduction loop with __syncthreads() + tl::AllReduce, or two
++    # same-phase siblings separated only by __syncthreads()) coalesces into one range.
++    mla_like = (
++        'extern "C" __global__ void mla_kernel(const float* A, float* C) {\n'
++        "  float q = A[threadIdx.x];\n"
++        "  __syncthreads();\n"
++        "  __syncthreads();\n"
++        "  float k = A[threadIdx.x + 32];\n"
++        "  for (int c = 0; c < 4; ++c) {\n"
++        "    tl::cp_async_wait<0>();\n"
++        "    __syncthreads();\n"
++        "    tl::mma_sync(acc, a, b);\n"
++        "    for (int i = 0; i < 2; ++i) {\n"
++        "      __syncthreads();\n"
++        "      m[i] = tl::AllReduce<tl::MaxOp, 256, 64>::run(m[i], ws);\n"
++        "    }\n"
++        "    __syncthreads();\n"
++        "    tl::mma_sync(acc_o, p, v);\n"
++        "  }\n"
++        "  C[threadIdx.x] = acc_o[0];\n"
++        "}\n"
++    )
++    _, mla_fine = iket.annotate(mla_like, _token, ctas=1, iters=1, granularity="fine")
++    _, mla_phase = iket.annotate(mla_like, _token, ctas=1, iters=1, granularity="phase")
++    assert len(mla_fine) == 12
++    assert [s["range"] for s in mla_phase] == [
++        "load.global",
++        "wait*4",
++        "compute*4",
++        "store.global",
++    ]
++    assert mla_phase[0]["events_per_warp_bound"] == 8
++
++    with pytest.raises(ValueError, match="unknown IKET granularity"):
++        iket.annotate(KERNEL, _token, granularity="invalid")
++
++
+ # ---------------------------------------------------------------- the mode
+ 
+ GPU = pytest.mark.skipif(
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d651e1ce3..9ea17bd60 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -229,6 +229,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_IKET_CTAS: int = 0
+     VLLM_DS41_IKET_ITERS: int = 0
+     VLLM_DS41_IKET_SKIP: str = ""
++    VLLM_DS41_IKET_GRANULARITY: Literal["fine", "phase"] = "fine"
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+@@ -1934,6 +1935,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
+     # without ranges (run-iket still records their warps' lifetimes).
+     "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
++    # With VLLM_DS41_IKET: range granularity ("fine" default, or "phase" to coalesce
++    # consecutive waits and internal block barriers across same-phase siblings).
++    "VLLM_DS41_IKET_GRANULARITY": lambda: os.getenv(
++        "VLLM_DS41_IKET_GRANULARITY", "fine"
++    ),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+     # the served model name whose requests alone it steers (vllm/weightless.py),
+     # set together or not at all. Part of the compile key, as every variable here
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 41689ab11..3254ab277 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -120,6 +120,7 @@ _COMPILED = [
+ ]
+ _JUMP = re.compile(r"(?:return|break|continue|goto)\b")
+ _KEYWORDS = ("for", "while", "if", "switch", "do")
++_GRANULARITIES = ("fine", "phase")
+ _IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+ _ATTRIBUTE = re.compile(r"__\w+__\s*")
+ # A preprocessor line other than a pragma: a range could split its #if and #endif.
+@@ -279,7 +280,9 @@ def _assignment(text: str) -> int:
+     return -1
+ 
+ 
+-def _classify(node: _Node, params: frozenset[str]) -> None:
++def _classify(
++    node: _Node, params: frozenset[str], granularity: str = "fine"
++) -> None:
+     """Set ``node``'s phase, kinds and jumps, bottom up."""
+     if node.body is None:
+         node.jumps = bool(_JUMP.match(node.text))
+@@ -294,19 +297,32 @@ def _classify(node: _Node, params: frozenset[str]) -> None:
+             node.phase, node.kinds = "load", {"global"}
+         return
+     phases = set()
++    wait_kinds = set()
+     for child in node.body + (node.orelse or []):
+-        _classify(child, params)
++        _classify(child, params, granularity)
+         node.jumps |= child.jumps
+         if child.phase is not None:
+             phases.add(child.phase)
+             node.kinds |= child.kinds
++            if child.phase == "wait":
++                wait_kinds |= child.kinds
+     if set(_IDENTIFIER.findall(node.text)) & params:
+         if node.text.startswith("while"):
+             phases.add("wait")  # a spin on a global flag
+             node.kinds.add("spin")
++            wait_kinds.add("spin")
+         else:  # a condition or bound read from global memory
+             phases.add("load")
+             node.kinds.add("global")
++    if (
++        granularity == "phase"
++        and not node.jumps
++        and len(phases) == 2
++        and "wait" in phases
++        and wait_kinds <= {"sync"}
++    ):
++        phases.discard("wait")
++        node.kinds.discard("sync")
+     node.phase = None if not phases else phases.pop() if len(phases) == 1 else "mixed"
+ 
+ 
+@@ -322,13 +338,16 @@ class _Range:
+     name: str = ""
+ 
+ 
+-def _ranges(nodes: list[_Node], loops: tuple[str, ...] = ()) -> list[_Range]:
+-    """Ranges over a statement list: runs of one phase, each wait alone. A block
++def _ranges(
++    nodes: list[_Node], loops: tuple[str, ...] = (), granularity: str = "fine"
++) -> list[_Range]:
++    """Ranges over a statement list: runs of one phase (each wait alone in ``fine``
++    granularity, or coalesced across phase boundaries in ``phase`` granularity). A block
+     that mixes phases, jumps, shares a line or waits (other than a spin loop) is
+     entered instead."""
+     found: list[_Range] = []
+     run: _Range | None = None
+-    for node in nodes:
++    for idx, node in enumerate(nodes):
+         if node.phase is None and not node.jumps:
+             continue  # phaseless: joins a run that continues past it
+         # A wait is its statement alone; a block is a wait only as a spin loop.
+@@ -341,9 +360,38 @@ def _ranges(nodes: list[_Node], loops: tuple[str, ...] = ()) -> list[_Range]:
+             inner = (*loops, node.text) if looped else loops
+             for children in (node.body, node.orelse):
+                 if children and node.phase is not None:
+-                    found.extend(_ranges(children, inner))
++                    found.extend(_ranges(children, inner, granularity))
+             continue
+-        if node.phase == "wait":
++        if (
++            granularity == "phase"
++            and node.phase == "wait"
++            and node.kinds == {"sync"}
++            and run is not None
++            and run.phase != "wait"
++        ):
++            nxt = next(
++                (
++                    later
++                    for later in nodes[idx + 1 :]
++                    if (later.phase is not None or later.jumps)
++                    and not (
++                        later.phase == "wait"
++                        and later.kinds == {"sync"}
++                        and not later.jumps
++                        and later.alone
++                    )
++                ),
++                None,
++            )
++            if (
++                nxt is not None
++                and not nxt.jumps
++                and nxt.alone
++                and nxt.phase == run.phase
++            ):
++                run.last = node
++                continue
++        if granularity == "fine" and node.phase == "wait":
+             found.append(_Range("wait", set(node.kinds), node, node, loops))
+             run = None
+         elif run is not None and run.phase == node.phase:
+@@ -432,7 +480,11 @@ def _kernels(code: str) -> Iterator[tuple[str, frozenset[str], int, int]]:
+ 
+ 
+ def annotate(
+-    code: str, token: Callable[[str, int], str], ctas: int = 0, iters: int = 0
++    code: str,
++    token: Callable[[str, int], str],
++    ctas: int = 0,
++    iters: int = 0,
++    granularity: str = "fine",
+ ) -> tuple[str, list[dict]]:
+     """``code`` with each phase of each kernel in an IKET range, and its sites.
+ 
+@@ -444,9 +496,14 @@ def annotate(
+     at most that many of its iterations, evenly spread (a ``while`` loop has no
+     variable to sample: its site lists it, unsampled): run-iket reserves the run's
+     largest warp record for every warp of every instrumented launch, so one long
+-    kernel sizes the whole run's buffer. A module with
++    kernel sizes the whole run's buffer. With ``granularity="phase"``, consecutive
++    waits and same-phase siblings separated only by internal block barriers coalesce
++    into phase-level ranges so long kernels stay within a compact per-warp event
++    budget. A module with
+     no ``__global__`` definition comes back unchanged; a kernel with a
+     preprocessor conditional in its body is left as it is."""
++    if granularity not in _GRANULARITIES:
++        raise ValueError(f"unknown IKET granularity: {granularity!r}")
+     found: list[_Range] = []
+     sites: list[dict] = []
+     bodies: dict[str, int] = {}
+@@ -459,8 +516,8 @@ def annotate(
+         bodies[kernel] = start
+         nodes, _ = _Parser(code).block(start)
+         for node in nodes:
+-            _classify(node, params)
+-        for item in _ranges(nodes):
++            _classify(node, params, granularity)
++        for item in _ranges(nodes, granularity=granularity):
+             kind = next(iter(item.kinds)) if len(item.kinds) == 1 else ""
+             item.kernel, item.base = (
+                 kernel,
+@@ -579,8 +636,8 @@ def annotate(
+ 
+ _lock = threading.Lock()
+ _directory: Path | None = None
+-# (CTAs a launch, iterations a loop, kernels left as they are); 0 and "": all, none
+-_sampling: tuple[int, int, str] = (0, 0, "")
++# (CTAs a launch, iterations a loop, kernels left as they are, granularity)
++_sampling: tuple[int, int, str, str] = (0, 0, "", "fine")
+ 
+ 
+ def directory() -> Path | None:
+@@ -589,15 +646,22 @@ def directory() -> Path | None:
+ 
+ 
+ def enable(
+-    output: str | os.PathLike[str], ctas: int = 0, iters: int = 0, skip: str = ""
++    output: str | os.PathLike[str],
++    ctas: int = 0,
++    iters: int = 0,
++    skip: str = "",
++    granularity: str = "fine",
+ ) -> Path:
+     """Turn the IKET mode on for this process, before it compiles any TileLang
+     kernel; ``ctas`` and ``iters`` > 0 sample CTAs and loop iterations
+-    (``annotate``), and kernels whose name ``skip`` matches (a regex) compile
++    (``annotate``), ``granularity`` selects ``"fine"`` or ``"phase"`` range
++    merging, and kernels whose name ``skip`` matches (a regex) compile
+     uninstrumented. Idempotent for the same directory and settings."""
+     global _directory, _sampling
++    if granularity not in _GRANULARITIES:
++        raise ValueError(f"unknown IKET granularity: {granularity!r}")
+     root = Path(output).expanduser().resolve()
+-    sampling = (int(ctas), int(iters), skip or "")
++    sampling = (int(ctas), int(iters), skip or "", granularity)
+     if skip:
+         re.compile(skip)
+     with _lock:
+@@ -645,15 +709,21 @@ def _postproc(code: str, target) -> str:
+     from tilelang.tools.cuda.iket.codegen import inject_iket_cuda
+ 
+     digest = hashlib.sha256(code.encode()).hexdigest()[:12]
+-    ctas, iters, skip = _sampling
++    ctas, iters, skip, granularity = _sampling
+     kernel = next((name for name, *_ in _kernels(code)), "module")
+     if skip and re.search(skip, kernel):
+         return code  # run-iket still records its warps' lifetimes
+-    annotated, sites = annotate(code, _token, ctas, iters)
++    annotated, sites = annotate(code, _token, ctas, iters, granularity)
+     instrumented = inject_iket_cuda(annotated, target, runtime_payloads=False)
+     stem = f"{kernel}.{digest}"
+     (_directory / "sources" / f"{stem}.cu").write_text(instrumented)
+-    manifest = {"kernel": kernel, "ctas": ctas, "iters": iters, "sites": sites}
++    manifest = {
++        "kernel": kernel,
++        "ctas": ctas,
++        "iters": iters,
++        "granularity": granularity,
++        "sites": sites,
++    }
+     (_directory / "sources" / f"{stem}.json").write_text(
+         json.dumps(manifest, indent=1) + "\n"
+     )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1ae9fa14a..94708e48e 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -436,6 +436,7 @@ class Worker(WorkerBase):
+                 envs.VLLM_DS41_IKET_CTAS,
+                 envs.VLLM_DS41_IKET_ITERS,
+                 envs.VLLM_DS41_IKET_SKIP,
++                granularity=envs.VLLM_DS41_IKET_GRANULARITY,
+             )
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
