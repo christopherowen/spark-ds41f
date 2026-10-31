@@ -1,0 +1,56 @@
+commit c96442eba4eac22a10defc77846c209fdb9f2087
+Author: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date:   Sat Oct 31 12:38:16 2026 +0100
+
+    Align DSpark CPU adaptive verification budget with dead_rows_tau survival cut
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 110a956ff..e4969b183 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -551,3 +551,32 @@ def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
+     runs = []
+     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
++
++
++def test_dead_rows_tau_trims_cpu_budget_below_survival_cut():
++    """Draft slots whose survival falls below ``dead_rows_tau`` are truncated to ``-1``
++    placeholders on device and cannot commit tokens, so CPU budgeting excludes them
++    from the selected graph shape while keeping the periodic exploration probe."""
++    # Survival is [0.8, 0.4, 0.2, 0.1]. At row_cost=0.02 without dead_rows_tau,
++    # all 4 drafts would be admitted; with dead_rows_tau=0.25, only the first 2
++    # survive the cut.
++    manager = make_manager(
++        np.array([[0.8, 0.5, 0.5, 0.5]], dtype=np.float32), row_cost=0.02
++    )
++    manager.dead_rows_tau = 0.0
++    assert manager.get_num_tokens({"low": 5}, {"low": [1, 2, 3, 4]}) == 5
++    assert manager._batch_budget[2] == 4
++
++    manager.dead_rows_tau = 0.25
++    assert manager.get_num_tokens({"low": 5}, {"low": [1, 2, 3, 4]}) == 3
++    assert manager._batch_budget[2] == 2
++
++    # When all slots fall below dead_rows_tau, the periodic exploration probe still
++    # fires after EXPLORE_AFTER_IDLE_STEPS empty budgets.
++    manager.dead_rows_tau = 0.9
++    idle = getattr(adaptive_module, "EXPLORE_AFTER_IDLE_STEPS", 32)
++    budgets = []
++    for _ in range(idle):
++        manager.get_num_tokens({"low": 5}, {"low": [1, 2, 3, 4]})
++        budgets.append(manager._batch_budget[2])
++    assert budgets == [0] * (idle - 1) + [1]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index a5a5d7333..4a2e1b100 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -287,6 +287,8 @@ class AdaptiveVerificationManager:
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(self.num_speculative_steps)
+         valid = steps[None, :] < scheduled_drafts[:, None]
++        if getattr(self, "dead_rows_tau", 0.0) > 0.0:
++            valid &= survival_probability >= self.dead_rows_tau
+         scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+             int(scheduled_drafts.sum()),
