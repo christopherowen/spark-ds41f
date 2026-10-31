@@ -1,0 +1,289 @@
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 55678ff..b2d8e6c 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -263,3 +263,39 @@ def test_packed_head_greedy_pairs_match_greedy_shard_pair(n, k, out_dtype):
+             )
+             assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
+             assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
++
++
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
++def test_packed_head_greedy_pairs_multi_exception_and_zero_exception(out_dtype):
++    from vllm.v1.worker.gpu.spec_decode.greedy_verification import vocab_parallel_pairs
++
++    n, k = 1024, 512
++    weight = (torch.rand(n, k, device=DEVICE) * 0.5 + 0.5).bfloat16()
++    # Zero-exception layer first
++    zero_layer = _packed_layer(weight)
++    assert int(zero_layer.weight_row_offsets[-1].item()) == 0
++    prepare_packed_head(zero_layer, out_dtype)
++    x = (torch.randn(19, k, device=DEVICE) * 0.5).bfloat16()
++    for rows in (1, 6, 16, 19):
++        part = x[:rows].contiguous()
++        expected = vocab_parallel_pairs(
++            project_head(zero_layer, part), n, 0, tp_size=1
++        )
++        actual = project_head_greedy_pairs(zero_layer, part, vocab=n, vocab_start=0)
++        assert torch.equal(actual[:, :2], expected[:, :2]), rows
++
++    # Multiple exceptions per row and on tile boundaries (0, 31, 32, 63)
++    weight[0, [3, 17, 129, 400]] = 1.0e30
++    weight[31, [5, 200, 511]] = 1.2e30
++    weight[32, [0, 64, 128]] = -1.5e-7
++    weight[63, [11, 255]] = 1.1e30
++    exc_layer = _packed_layer(weight)
++    assert int(exc_layer.weight_row_offsets[-1].item()) >= 12
++    prepare_packed_head(exc_layer, out_dtype)
++    for rows in (1, 6, 16, 19):
++        part = x[:rows].contiguous()
++        expected = vocab_parallel_pairs(
++            project_head(exc_layer, part), n, 1000, tp_size=1
++        )
++        actual = project_head_greedy_pairs(exc_layer, part, vocab=n, vocab_start=1000)
++        assert torch.equal(actual[:, :2], expected[:, :2]), rows
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index ff77366..1c65f00 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -101,6 +101,59 @@ def _decode(low, code, base_minus_one):
+ _GREEDY_HEADER = r"""
+ #include <math_constants.h>
+ 
++template <int BASE_MINUS_ONE>
++__device__ __forceinline__ void vllm_vocab_decode_vec16(
++    const void* __restrict__ low_a_ptr,
++    const void* __restrict__ low_b_ptr,
++    const void* __restrict__ codes_ptr,
++    void* __restrict__ out_a_ptr,
++    void* __restrict__ out_b_ptr) {
++  const uint4 low_a4 = *reinterpret_cast<const uint4*>(low_a_ptr);
++  const uint4 low_b4 = *reinterpret_cast<const uint4*>(low_b_ptr);
++  const uint4 codes4 = *reinterpret_cast<const uint4*>(codes_ptr);
++  const unsigned int* la = reinterpret_cast<const unsigned int*>(&low_a4);
++  const unsigned int* lb = reinterpret_cast<const unsigned int*>(&low_b4);
++  const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
++  unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
++  unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
++  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
++
++  #pragma unroll
++  for (int w = 0; w < 4; ++w) {
++    const unsigned int c_word = cd[w];
++    const unsigned int la_word = la[w];
++    const unsigned int lb_word = lb[w];
++
++    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
++    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
++
++    const unsigned int ca01 = c01 & 0x000F000Fu;
++    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
++    const unsigned int ca23 = c23 & 0x000F000Fu;
++    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
++
++    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
++
++    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
++    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
++    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
++    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
++
++    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
++    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
++    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
++    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
++
++    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
++    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
++    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
++    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
++  }
++}
++
+ __device__ __forceinline__ int vllm_vocab_first_argmax_keep(
+     float av, int ai, float bv, int bi) {
+   const bool a_nan = av != av;
+@@ -257,6 +310,7 @@ def packed_vocab_projection(
+         with T.Kernel(
+             T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+         ) as (by, bx):
++            T.import_source(_GREEDY_HEADER)
+             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
+             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
+             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
+@@ -283,7 +337,7 @@ def packed_vocab_projection(
+                 # 16 of its high half, which share 16 code bytes.
+                 for step in T.serial(T.ceildiv(items, threads)):
+                     item = step * threads + tx
+-                    if item < items:
++                    if items % threads == 0 or item < items:
+                         j = item // (step_groups * slices)
+                         g = item // slices % step_groups
+                         c = item % slices * VEC
+@@ -293,9 +347,15 @@ def packed_vocab_projection(
+                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
+                         for v in T.vectorized(VEC):
+                             codes[v] = code_shared[j, g * HALF + c + v]
+-                        for v in T.unroll(VEC):
+-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
+-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + c + v] = out_a[v]
+                         for v in T.vectorized(VEC):
+@@ -308,21 +368,22 @@ def packed_vocab_projection(
+             first = bx * block_N
+             start = row_offsets[first]
+             end = row_offsets[T.min(first + block_N, N)]
+-            for index in T.serial(start, end):
+-                row = exception_rows[index] - first
+-                entry = exception_entries[index]
+-                value = T.Cast(
+-                    T.float32,
+-                    T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+-                )
+-                column = entry >> 16
+-                for i, j in T.Parallel(block_M, block_N):
+-                    token = T.min(by * block_M + i, M - 1)
+-                    C_local[i, j] = T.if_then_else(
+-                        j == row,
+-                        C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
+-                        C_local[i, j],
++            if start < end:
++                for index in T.serial(start, end):
++                    row = exception_rows[index] - first
++                    entry = exception_entries[index]
++                    value = T.Cast(
++                        T.float32,
++                        T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+                     )
++                    column = entry >> 16
++                    for i, j in T.Parallel(block_M, block_N):
++                        token = T.min(by * block_M + i, M - 1)
++                        C_local[i, j] = T.if_then_else(
++                            j == row,
++                            C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
++                            C_local[i, j],
++                        )
+             T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+     return vocab_packed_projection
+@@ -382,6 +443,7 @@ def packed_vocab_greedy_partials(
+             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
+             C_shared = T.alloc_shared((block_M, block_N), T.float32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_round = T.alloc_fragment((block_M, block_N), out_dtype)
+             low_a = T.alloc_local((VEC,), T.uint8)
+             low_b = T.alloc_local((VEC,), T.uint8)
+             codes = T.alloc_local((VEC,), T.uint8)
+@@ -399,7 +461,7 @@ def packed_vocab_greedy_partials(
+                 T.copy(W[bx * block_N, K + s * (STEP // 2)], code_shared)
+                 for step in T.serial(T.ceildiv(items, threads)):
+                     item = step * threads + tx
+-                    if item < items:
++                    if items % threads == 0 or item < items:
+                         j = item // (step_groups * slices)
+                         g = item // slices % step_groups
+                         c = item % slices * VEC
+@@ -409,9 +471,15 @@ def packed_vocab_greedy_partials(
+                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
+                         for v in T.vectorized(VEC):
+                             codes[v] = code_shared[j, g * HALF + c + v]
+-                        for v in T.unroll(VEC):
+-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
+-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + c + v] = out_a[v]
+                         for v in T.vectorized(VEC):
+@@ -420,26 +488,25 @@ def packed_vocab_greedy_partials(
+             first = bx * block_N
+             start = row_offsets[first]
+             end = row_offsets[T.min(first + block_N, N)]
+-            for index in T.serial(start, end):
+-                row = exception_rows[index] - first
+-                entry = exception_entries[index]
+-                value = T.Cast(
+-                    T.float32,
+-                    T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+-                )
+-                column = entry >> 16
+-                for i, j in T.Parallel(block_M, block_N):
+-                    token = T.min(by * block_M + i, M - 1)
+-                    C_local[i, j] = T.if_then_else(
+-                        j == row,
+-                        C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
+-                        C_local[i, j],
+-                    )
+-            if out_dtype == T.bfloat16:
+-                for i, j in T.Parallel(block_M, block_N):
+-                    C_local[i, j] = T.Cast(
+-                        T.float32, T.Cast(T.bfloat16, C_local[i, j])
++            if start < end:
++                for index in T.serial(start, end):
++                    row = exception_rows[index] - first
++                    entry = exception_entries[index]
++                    value = T.Cast(
++                        T.float32,
++                        T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+                     )
++                    column = entry >> 16
++                    for i, j in T.Parallel(block_M, block_N):
++                        token = T.min(by * block_M + i, M - 1)
++                        C_local[i, j] = T.if_then_else(
++                            j == row,
++                            C_local[i, j] + value * T.Cast(T.float32, A[token, column]),
++                            C_local[i, j],
++                        )
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
+             T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+@@ -676,9 +743,23 @@ def project_head_greedy_pairs(
+     partials_kernel, finish_kernel, num_tiles = layer.tilelang_vocab_greedy[
+         row_tile(rows)
+     ]
+-    partial_vals = torch.empty((rows, num_tiles), dtype=torch.float32, device=x.device)
+-    partial_idxs = torch.empty((rows, num_tiles), dtype=torch.int32, device=x.device)
+-    pairs = torch.empty((rows, pair_width), dtype=torch.float32, device=x.device)
++    scratch_map = getattr(layer, "_tilelang_vocab_greedy_scratch", None)
++    if scratch_map is None:
++        scratch_map = {}
++        layer._tilelang_vocab_greedy_scratch = scratch_map
++    key = (num_tiles, pair_width, x.device)
++    scratch = scratch_map.get(key)
++    if scratch is None or scratch[0].shape[0] < rows:
++        cap = max(rows, getattr(layer, "tilelang_max_rows", None) or rows)
++        scratch = (
++            torch.empty((cap, num_tiles), dtype=torch.float32, device=x.device),
++            torch.empty((cap, num_tiles), dtype=torch.int32, device=x.device),
++            torch.empty((cap, pair_width), dtype=torch.float32, device=x.device),
++        )
++        scratch_map[key] = scratch
++    partial_vals = scratch[0][:rows]
++    partial_idxs = scratch[1][:rows]
++    pairs = scratch[2][:rows]
+     partials_kernel(
+         x,
+         layer.weight,
