@@ -1,0 +1,111 @@
+From 50911d2ea0df4eb99c45e635ca2d6f0671a6fef5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:54:09 +0100
+Subject: [PATCH] [DeepSeek-V4.1][TileLang] Use 2-stage pipeline for decode MoE
+ down GEMM to double CTA occupancy
+
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 36 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 15 ++++++--
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 56f8ef92a..b021cc810 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -774,3 +774,39 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     assert torch.equal(
+         out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
+     )
++
++
++@pytest.mark.parametrize("intermediate", [576, 768])
++@pytest.mark.parametrize("rows", [1, 6, 12])
++def test_decode_down_two_stage_pipeline_gives_three_stage_bits(
++    rows, intermediate, hidden=384, num_experts=32, topk=6
++):
++    """Decode ``down`` defaults to a 2-stage pipeline (so two CTAs fit per SM on
++    SM120/SM121) while late/prefill GEMMs keep 3 stages, and produces identical bits
++    to the 3-stage pipeline across TP4 (576, with 64-wide tail) and TP3 (768)."""
++    plan2 = MoeExpertsV41Plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
++    calls = plan2.kernels()
++    assert calls["down"][2]["num_stages"] == 2
++    assert calls["gate_up"][2]["num_stages"] == 3
++    assert calls["late_down"][2]["num_stages"] == 3
++    assert calls["prefill_down"][2]["num_stages"] == 3
++
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 51)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 52)
++    x = (torch.randn((rows, hidden), generator=_gen(53), device=DEVICE) * 0.5).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 54, torch.int32)
++    outs = {}
++    for down_stages in (2, 3):
++        plan = _plan(
++            num_experts,
++            topk,
++            hidden,
++            intermediate,
++            swiglu_limit=LIMIT,
++            down_num_stages=down_stages,
++        )
++        weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++        outs[down_stages] = torch.empty_like(x)
++        plan.run(cast_mxfp8(x), ids, route_weights, weights, outs[down_stages])
++    assert torch.equal(outs[2].view(torch.int16), outs[3].view(torch.int16))
++
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 7f5fab1a3..1d567302e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1305,6 +1305,7 @@ class MoeExpertsV41Plan:
+         prefill_block_M=64,
+         block_N=128,
+         num_stages=3,
++        down_num_stages=2,
+         out_dtype=torch.bfloat16,
+     ):
+         self.num_experts, self.topk, self.hidden, self.intermediate = (
+@@ -1319,6 +1320,7 @@ class MoeExpertsV41Plan:
+             block_N,
+         )
+         self.num_stages = num_stages
++        self.down_num_stages = down_num_stages
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+@@ -1338,13 +1340,22 @@ class MoeExpertsV41Plan:
+         ``bind`` makes: ``gate_up``, ``down`` and ``swiglu`` at ``block_M``; at the same
+         height ``late_gate_up`` and ``late_down``, which trigger after their K loop
+         (calls of ``LATE_TRIGGER_ROWS`` rows or more); and with a ``prefill_`` prefix
+-        at ``prefill_block_M``, whose GEMMs trigger late too."""
++        at ``prefill_block_M``, whose GEMMs trigger late too.
++
++        Decode ``down`` runs only 5-6 K blocks (``K = 576`` at TP4, ``768`` at TP3)
++        across a ``40 x tiles`` grid where many tiles exit early; using
++        ``down_num_stages = 2`` cuts per-CTA shared memory from ~64.5 KiB to ~43 KiB so
++        two CTAs co-reside per SM on SM120/SM121 (99 KiB/SM)."""
+         config = dict(
+             block_N=self.block_N,
+             num_stages=self.num_stages,
+             coded_scales=True,
+             narrow_codes=True,
+         )
++        down_decode_config = {
++            **config,
++            "num_stages": self.down_num_stages,
++        }
+         num_experts, topk, hidden, inter = (
+             self.num_experts,
+             self.topk,
+@@ -1376,7 +1387,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 False,
+                 block_M,
+-                **config,
++                **(config if late else down_decode_config),
+                 trigger_after_loop=late,
+             )
+             if prefix != "late_":  # the SwiGLU is the same at either trigger
+-- 
+2.54.0 (Apple Git-157)
+
