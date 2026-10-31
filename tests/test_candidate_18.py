@@ -69,11 +69,11 @@ class TestCandidate18(unittest.TestCase):
             inputs = spark.build_inputs(upstreams)
             self.assertEqual(
                 inputs["vllm"]["patch_head"],
-                "1852410d2ae2a1ff5bc30d72c4fa661e0a67a6ad",
+                "68fe7a9070422c4c5fe68bb820f6a8defd72e408",
             )
             self.assertEqual(
                 inputs["vllm"]["expected_tree"],
-                "35835b0c4426b2eb39e0925445f16b7dd212c723",
+                "db68f75be55ca74a495a31fde706b07317013d6d",
             )
             self.assertEqual(
                 inputs["sparknet"]["patch_head"],

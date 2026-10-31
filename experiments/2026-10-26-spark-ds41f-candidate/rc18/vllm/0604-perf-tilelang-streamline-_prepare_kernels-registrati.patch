@@ -1,24 +1,24 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 05:30:29 +0100
-Subject: [PATCH 604/604] perf(tilelang): streamline _prepare_kernels
+Subject: [PATCH 604/614] perf(tilelang): streamline _prepare_kernels
  registration, warm_declared, and bind_declared
 
 ---
- tests/models/test_deepseek_v4_1_prepare.py    |  62 ++++++++++-
- vllm/model_executor/warmup/jit_warmup.py      |  43 +++++++-
+ tests/models/test_deepseek_v4_1_prepare.py    |  90 ++++++++++++-
+ vllm/model_executor/warmup/jit_warmup.py      |  43 ++++++-
  vllm/models/deepseek_v4_1/attention.py        |   3 +-
  vllm/models/deepseek_v4_1/nvidia/model.py     |   3 +-
  vllm/models/deepseek_v4_1/tilelang/linear.py  |   9 +-
- vllm/models/deepseek_v4_1/tilelang/prepare.py | 101 ++++++++++++++----
+ vllm/models/deepseek_v4_1/tilelang/prepare.py | 118 ++++++++++++++----
  vllm/models/deepseek_v4_1/tilelang/router.py  |  16 ++-
- 7 files changed, 197 insertions(+), 40 deletions(-)
+ 7 files changed, 235 insertions(+), 47 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v4_1_prepare.py b/tests/models/test_deepseek_v4_1_prepare.py
-index 704c16e78..d998c82e6 100644
+index 704c16e78..1bcdcc3ca 100644
 --- a/tests/models/test_deepseek_v4_1_prepare.py
 +++ b/tests/models/test_deepseek_v4_1_prepare.py
-@@ -63,19 +63,73 @@ def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
+@@ -63,19 +63,101 @@ def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
      assert prepared == [(_rope, (2, 64), {})] and bound == [1]
  
  
@@ -96,6 +96,34 @@ index 704c16e78..d998c82e6 100644
 +    assert invocations == 1
 +    assert len(bound) == 6
 +    assert all(k == ("kernel", 1024, 512, 32) for k in bound)
++
++
++def test_declare_modules_declares_child_linear_methods_before_parent_modules():
++    import torch.nn as nn
++
++    class _Method:
++        def declare_layer_kernels(self, layer: nn.Module) -> None:
++            layer.tilelang_shards = 4
++
++    class _Child(nn.Module):
++        def __init__(self) -> None:
++            super().__init__()
++            self.quant_method = _Method()
++
++    class _Parent(nn.Module):
++        def __init__(self) -> None:
++            super().__init__()
++            self.gate = _Child()
++            self.observed_shards = None
++
++        def declare_kernels(self) -> None:
++            self.observed_shards = self.gate.tilelang_shards
++
++    parent = _Parent()
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        prepare.declare_modules(parent)
++    assert parent.observed_shards == 4
 diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
 index 749e8ab3a..0f54c22e8 100644
 --- a/vllm/model_executor/warmup/jit_warmup.py
@@ -216,7 +244,7 @@ index 5a6418a9c..8106a463b 100644
      }
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
-index 9204be48e..3eaa54319 100644
+index 9204be48e..a1779c2d8 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
 @@ -21,6 +21,7 @@ processing transforms weights only.
@@ -257,7 +285,45 @@ index 9204be48e..3eaa54319 100644
      def compile(self, compile_key: _CallKey) -> None:
          self.compile_many([compile_key])
  
-@@ -189,12 +201,8 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
+@@ -134,13 +146,14 @@ def declare(
+ def declare_modules(*models: Any) -> None:
+     """Let the modules of ``models`` declare their kernels, after loading.
+ 
+-    Calls ``module.declare_kernels()`` on every module that defines it, and
+-    ``quant_method.declare_layer_kernels(module)`` on every module's linear method
+-    that does (methods are often attached after a layer is built, so construction
+-    is not where they can declare). Must run while the runner's JIT registry
++    Calls ``quant_method.declare_layer_kernels(module)`` on every module's linear
++    method that does (methods are often attached after a layer is built, so
++    construction is not where they can declare), then ``module.declare_kernels()``
++    on every module that defines it. Must run while the runner's JIT registry
+     collects.
+     """
+     seen: set[int] = set()
++    modules: list[Any] = []
+     for model in models:
+         if model is None:
+             continue
+@@ -148,13 +161,15 @@ def declare_modules(*models: Any) -> None:
+             if id(module) in seen:
+                 continue
+             seen.add(id(module))
++            modules.append(module)
+             method = getattr(module, "quant_method", None)
+             declare_layer = getattr(method, "declare_layer_kernels", None)
+             if declare_layer is not None:
+                 declare_layer(module)
+-            declare_own = getattr(module, "declare_kernels", None)
+-            if declare_own is not None:
+-                declare_own()
++    for module in modules:
++        declare_own = getattr(module, "declare_kernels", None)
++        if declare_own is not None:
++            declare_own()
+ 
+ 
+ class _Progress:
+@@ -189,12 +204,8 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
      for kernel, registrations in registry.registrations():
          if kernel is not TILELANG:
              continue
@@ -272,7 +338,7 @@ index 9204be48e..3eaa54319 100644
                  calls.setdefault(key, (key.function, key.args, key.kwargs))
      return list(calls.values())
  
-@@ -217,10 +225,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+@@ -217,10 +228,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
      PROGRESS.start(len(calls))
      tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
      for kernel, registrations in registry.registrations():
@@ -288,7 +354,7 @@ index 9204be48e..3eaa54319 100644
      return len(calls)
  
  
-@@ -234,21 +243,54 @@ def release_host_memory() -> None:
+@@ -234,21 +246,54 @@ def release_host_memory() -> None:
          ctypes.CDLL("libc.so.6").malloc_trim(0)
  
  
@@ -347,7 +413,7 @@ index 9204be48e..3eaa54319 100644
      for warm in callbacks:
          warm()
      return len(callbacks)
-@@ -261,8 +303,29 @@ def freeze(reason: str) -> None:
+@@ -261,8 +306,29 @@ def freeze(reason: str) -> None:
      freeze_cache(reason)
  
  
@@ -410,3 +476,6 @@ index 3acf4412e..a07a285b6 100644
          )
  
      def route_local(
+-- 
+2.54.0 (Apple Git-157)
+

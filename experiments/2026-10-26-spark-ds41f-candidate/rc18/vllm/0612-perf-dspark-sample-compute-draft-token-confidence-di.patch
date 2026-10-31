@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 05:51:15 +0100
-Subject: [PATCH 612/612] perf(dspark,sample): compute draft token confidence
+Subject: [PATCH 612/614] perf(dspark,sample): compute draft token confidence
  directly from TP-invariant local vocabulary shard
 
 Make confidence computation TP-invariant by keeping only the local vocabulary shard of confidence_head (slice [0, 32]) on every TP rank via VocabParallelEmbedding.keep_first_output_rows, writing directly into draft_token_confidence_probs via out=, and eliding the TP confidence broadcast when both tp_invariant_confidence and rank_order_reduce_scatter are enabled.
@@ -343,3 +343,6 @@ index af71df562..fd3604f33 100644
              )
  
      def _generate_draft(
+-- 
+2.54.0 (Apple Git-157)
+

@@ -133,3 +133,31 @@ def test_bind_declared_reuses_launched_kernels():
     assert invocations == 1
     assert len(bound) == 6
     assert all(k == ("kernel", 1024, 512, 32) for k in bound)
+
+
+def test_declare_modules_declares_child_linear_methods_before_parent_modules():
+    import torch.nn as nn
+
+    class _Method:
+        def declare_layer_kernels(self, layer: nn.Module) -> None:
+            layer.tilelang_shards = 4
+
+    class _Child(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quant_method = _Method()
+
+    class _Parent(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = _Child()
+            self.observed_shards = None
+
+        def declare_kernels(self) -> None:
+            self.observed_shards = self.gate.tilelang_shards
+
+    parent = _Parent()
+    registry = JitWarmupRegistry(vllm_config=None)
+    with registry.activate():
+        prepare.declare_modules(parent)
+    assert parent.observed_shards == 4

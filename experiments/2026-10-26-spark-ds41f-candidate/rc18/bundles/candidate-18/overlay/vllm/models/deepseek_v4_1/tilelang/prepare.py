@@ -146,13 +146,14 @@ def declare(
 def declare_modules(*models: Any) -> None:
     """Let the modules of ``models`` declare their kernels, after loading.
 
-    Calls ``module.declare_kernels()`` on every module that defines it, and
-    ``quant_method.declare_layer_kernels(module)`` on every module's linear method
-    that does (methods are often attached after a layer is built, so construction
-    is not where they can declare). Must run while the runner's JIT registry
+    Calls ``quant_method.declare_layer_kernels(module)`` on every module's linear
+    method that does (methods are often attached after a layer is built, so
+    construction is not where they can declare), then ``module.declare_kernels()``
+    on every module that defines it. Must run while the runner's JIT registry
     collects.
     """
     seen: set[int] = set()
+    modules: list[Any] = []
     for model in models:
         if model is None:
             continue
@@ -160,13 +161,15 @@ def declare_modules(*models: Any) -> None:
             if id(module) in seen:
                 continue
             seen.add(id(module))
+            modules.append(module)
             method = getattr(module, "quant_method", None)
             declare_layer = getattr(method, "declare_layer_kernels", None)
             if declare_layer is not None:
                 declare_layer(module)
-            declare_own = getattr(module, "declare_kernels", None)
-            if declare_own is not None:
-                declare_own()
+    for module in modules:
+        declare_own = getattr(module, "declare_kernels", None)
+        if declare_own is not None:
+            declare_own()
 
 
 class _Progress:
