@@ -114,6 +114,8 @@ class ModesetTest(unittest.TestCase):
 
     def test_unreadable_mode_setting_is_reported(self) -> None:
         problems = spark.modeset_problems("dgx1", facts(modeset=""))
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("modeset is unreadable", problems[0])
 
 
@@ -130,6 +132,8 @@ class ConsoleTest(unittest.TestCase):
 
     def test_unreadable_fbdev_is_reported(self) -> None:
         problems = spark.fbdev_problems("dgx3", facts(fbdev=""))
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("fbdev is unreadable", problems[0])
 
     def test_drm_master_holder_is_reported(self) -> None:
@@ -324,6 +328,9 @@ class SeverityTest(unittest.TestCase):
             spark.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
             spark.desktop_problems("dgx1", "graphical.target\ninactive\n"),
             spark.boot_order_problems("dgx1", ""),
+            spark.modeset_problems("dgx1", facts(modeset="")),
+            spark.fbdev_problems("dgx1", facts(fbdev="")),
+            spark.fan_control_problems("dgx1", facts(fan_dkms="")),
         ):
             self.assertEqual(len(problems), 1)
             self.assertIsInstance(problems[0], spark.Warn)
@@ -349,10 +356,10 @@ class FanControlTest(unittest.TestCase):
         problems = spark.fan_control_problems(
             "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0")
         )
-        self.assertEqual(
-            problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia; run "
-                "sudo dkms autoinstall -k 7.0.0-1019-nvidia"]
-        )
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
+        self.assertIn("DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia", problems[0])
+        self.assertIn("sudo dkms autoinstall -k 7.0.0-1019-nvidia", problems[0])
 
     def test_other_dkms_version_is_reported(self) -> None:
         problems = spark.fan_control_problems(
@@ -373,18 +380,18 @@ class FanControlTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
 
-    def test_missing_service_is_an_error(self) -> None:
-        # bench needs it; whether it runs while serving is not checked.
+    def test_missing_service_warns(self) -> None:
+        # bench needs it; serving does not, so doctor must not fail a live cluster.
         problems = spark.fan_control_problems("dgx2", facts(fan_service="absent"))
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("dgx-fan-control.service is not installed", problems[0])
         self.assertIn("sudo systemctl daemon-reload", problems[0])
 
     def test_missing_driver_layer_is_reported_before_the_service(self) -> None:
         problems = spark.fan_control_problems("dgx2", facts(fan_module="0", fan_service="absent"))
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIsInstance(problems[0], spark.Warn)
         self.assertIn("dgx_ec_fan_control is not loaded", problems[0])
 
 

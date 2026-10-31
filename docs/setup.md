@@ -65,7 +65,7 @@ Each node needs:
 | [NVMe interrupt coalescing off](#nvme-interrupt-coalescing) | optional | optional | `doctor --live` (warn) | unmask the service |
 | [NVMe sleeps only when idle](#nvme-power-states-apst) (APST timeouts 2 s / 60 s) | recommended | recommended | `doctor --live` (warn) | delete the modprobe file |
 | [UEFI boot order](#boot-order) | optional | optional | `doctor --live` (warn) | `efibootmgr --bootorder` |
-| [Fan-floor control](#fan-floor-control) | recommended | recommended | `doctor --live` (error until installed) | its [uninstall guide](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/maintenance.md#uninstall) |
+| [Fan-floor control](#fan-floor-control) | recommended | recommended | `doctor --live` (warn until installed) | its [uninstall guide](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/maintenance.md#uninstall) |
 | [64 KiB kernel, swap and memory policy](#2-kernel-64-kib-profiles) | — | required | `doctor --live`, launch | [boot the 4 KiB kernel](#revert-the-64-kib-kernel) |
 | [Memory saver](#2-kernel-64-kib-profiles) (signed DKMS UVM module) | — | required | `doctor --live`, launch | its [removal guide](https://github.com/christopherowen/dgx-spark-memory-saver/blob/main/docs/dkms.md#remove-and-restore-stock-uvm) |
 | [ConnectX-7 addressing](#3-fabric-cabling-and-addressing) (netplan) | required | required | `doctor --live`, launch | remove `40-cx7.yaml` |
@@ -234,15 +234,15 @@ the `sudo efibootmgr --bootorder …` that puts Ubuntu first.
 [dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)
 (version 0.1.4, which `doctor --live` checks) adds a fan floor the EC enforces on top of NVIDIA's curve
 ([installation](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/installation.md)). Serving does not use
-it, but `doctor --live` reports it as an error until it is installed.
+it; `doctor --live` warns until it is installed and does not fail the command.
 `bin/spark bench` and kernel-lab jobs use it to cool every node below 55 °C
 before measuring; without it they wait for the nodes to cool on NVIDIA's
 curve. With Secure Boot, its installation creates and enrolls a MOK signing
 key, and the memory saver's install script in [stage 2](#2-kernel-64-kib-profiles)
 signs with the same key.
 
-Install its `dgx-fan-control.service` as well; `doctor --live` reports an
-error until it is installed. `bin/spark bench` requires it: it starts the
+Install its `dgx-fan-control.service` as well; `doctor --live` warns until it
+is installed. `bin/spark bench` requires it: it starts the
 service's performance curve on every node while it measures, so every
 benchmark runs under the same fan policy, and stops it again where it started
 it. Whether it also runs while serving is your choice. The curve raises the fan floor from 50 °C, well before
@@ -302,7 +302,9 @@ yours to run, as root, with the service stopped:
    16 GiB `/swap-64k.img` with a 64 KiB header, marks the original
    `/swap.img` `noauto`, and enables `spark-ds41f-kernel-memory.service`, which at
    boot activates the swap file that matches the running page size and, on
-   64 KiB only, sets THP to `never` and `vm.min_free_kbytes=45166`
+   64 KiB only, sets THP to `never` and `vm.min_free_kbytes=45166`. Sites that
+   still run `spark3-kernel-memory.service` have the same policy; `doctor --live`
+   accepts that unit and warns to run this installer so the name matches.
    ([host/kernel-memory](../host/kernel-memory/README.md)). It does not
    reboot or touch the running system.
 3. **Memory saver.** Run `bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh`

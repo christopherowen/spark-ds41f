@@ -153,10 +153,23 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(any("64 KiB swap" in x for x in issues))
         # The service is spark-ds41f's since the release after spark-ds41f-1022 (host/kernel-memory).
         self.assertTrue(any("journalctl -u spark-ds41f-kernel-memory.service" in x for x in fixes))
-        data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active")
+        data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active",
+                    memory_service_unit="spark-ds41f-kernel-memory.service")
         data["uvm_leaf_packing"] = "Y"
         data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
         self.assertEqual(kernel.findings("dgx1", data, POLICY), ([], []))
+
+    def test_legacy_spark3_memory_service_is_the_same_policy(self):
+        data = ready()
+        data.update(kernel=NEW, page_size=65536, thp="always madvise [never]",
+                    active_swap=["/swap-64k.img"], memory_service="active",
+                    memory_service_unit="spark3-kernel-memory.service")
+        data["uvm_leaf_packing"] = "Y"
+        data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
+        issues, fixes = kernel.findings("dgx1", data, POLICY)
+        self.assertTrue(any("still spark3-kernel-memory.service" in x for x in issues))
+        self.assertFalse(any("is not active" in x for x in issues))
+        self.assertTrue(any("journalctl -u spark3-kernel-memory.service" in x for x in fixes))
 
     def test_missing_memory_saver_warns_even_on_stock_kernel(self):
         data = ready()

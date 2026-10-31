@@ -499,9 +499,10 @@ class Warn(str):
 
     Errors are what breaks serving, safety or a required capability now: the
     display carve-out and the kept text console (modeset, fbdev, DRM master,
-    console mode), fan control, RoCE GIDs, the GPU clock and any difference from
+    console mode), RoCE GIDs, the GPU clock and any difference from
     the promoted configuration. Warnings are latent (effective at the next
-    boot), cost a little, or could not be read.
+    boot), cost a little, could not be read, or only matter for bench
+    (fan-floor control).
     """
 
 
@@ -806,8 +807,16 @@ def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     value = facts.get("modeset", "")
     if value == "Y":
         return []
+    if not value:
+        return [
+            Warn(
+                f"{node_name}: nvidia-drm modeset is unreadable "
+                "(/sys/module/nvidia_drm/parameters/modeset); doctor needs "
+                "passwordless sudo -n to read it"
+            )
+        ]
     return [
-        f"{node_name}: nvidia-drm modeset is {value or 'unreadable'}, expected Y "
+        f"{node_name}: nvidia-drm modeset is {value}, expected Y "
         "(a display attached after boot stays dark and the display carve-out cannot "
         "be allocated); run sudo apt purge nvidia-drm-options-modeset0 and reboot "
         "with the service stopped"
@@ -824,8 +833,16 @@ def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     value = facts.get("fbdev", "")
     if value == "Y":
         return []
+    if not value:
+        return [
+            Warn(
+                f"{node_name}: nvidia-drm fbdev is unreadable "
+                "(/sys/module/nvidia_drm/parameters/fbdev); doctor needs "
+                "passwordless sudo -n to read it"
+            )
+        ]
     return [
-        f"{node_name}: nvidia-drm fbdev is {value or 'unreadable'}, expected Y "
+        f"{node_name}: nvidia-drm fbdev is {value}, expected Y "
         "(an attached display gets no text console); remove the nvidia-drm fbdev=0 "
         "option (grep -rn fbdev /etc/modprobe.d), run sudo update-initramfs -u, and "
         "reboot with the service stopped"
@@ -1082,34 +1099,45 @@ def fan_control_problems(node_name: str, facts: dict[str, str],
     kernel = facts.get("kernel") or "the running kernel"
     if "installed" not in facts.get("fan_dkms", ""):
         return [
-            f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}; run "
-            f"sudo dkms autoinstall -k {facts.get('kernel') or '$(uname -r)'}"
+            Warn(
+                f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}; "
+                "serving does not need it, bench does; run "
+                f"sudo dkms autoinstall -k {facts.get('kernel') or '$(uname -r)'}"
+            )
         ]
     installed = facts["fan_dkms"].split(",", 1)[0].rpartition("/")[2]
     if installed != FAN_CONTROL_VERSION:
         return [
-            f"{node_name}: DKMS dgx-spark-fan-control is {installed} for {kernel}, and this recipe "
-            f"uses {FAN_CONTROL_VERSION}; upgrade from a checkout at v{FAN_CONTROL_VERSION} "
-            f"({FAN_CONTROL_UPGRADE})"
+            Warn(
+                f"{node_name}: DKMS dgx-spark-fan-control is {installed} for {kernel}, and this recipe "
+                f"uses {FAN_CONTROL_VERSION}; upgrade from a checkout at v{FAN_CONTROL_VERSION} "
+                f"({FAN_CONTROL_UPGRADE})"
+            )
         ]
     if facts.get("fan_module") != "1":
         return [
-            f"{node_name}: dgx_ec_fan_control is not loaded; run sudo modprobe "
-            "dgx_ec_fan_control (if it is refused, check that the fleet signing key is "
-            "enrolled with mokutil --list-enrolled)"
+            Warn(
+                f"{node_name}: dgx_ec_fan_control is not loaded; serving does not need it, "
+                "bench does; run sudo modprobe dgx_ec_fan_control (if it is refused, check "
+                "that the fleet signing key is enrolled with mokutil --list-enrolled)"
+            )
         ]
     if facts.get("fan_cooling_device") != "1":
         return [
-            f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
-            "is missing (the driver refused it at probe; see dmesg)"
+            Warn(
+                f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
+                "is missing (the driver refused it at probe; see dmesg)"
+            )
         ]
     if facts.get("fan_service") == "absent":
         return [
-            f"{node_name}: dgx-fan-control.service is not installed, and bench runs its "
-            "performance curve while measuring; from a dgx-spark-fan-control checkout run "
-            "sudo install -D -m 0644 systemd/dgx-fan-control.service "
-            "/etc/systemd/system/dgx-fan-control.service && sudo systemctl daemon-reload "
-            "(enabling it for serving is optional)"
+            Warn(
+                f"{node_name}: dgx-fan-control.service is not installed, and bench runs its "
+                "performance curve while measuring; from a dgx-spark-fan-control checkout run "
+                "sudo install -D -m 0644 systemd/dgx-fan-control.service "
+                "/etc/systemd/system/dgx-fan-control.service && sudo systemctl daemon-reload "
+                "(enabling it for serving is optional)"
+            )
         ]
     return []
 

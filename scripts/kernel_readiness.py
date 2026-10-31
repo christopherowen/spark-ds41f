@@ -122,8 +122,37 @@ def collect(policy):
     swaps = read("active swap", "cat", "/proc/swaps")
     data["active_swap"] = [line.split()[0] for line in swaps.splitlines()[1:] if line.split()]
     if data["page_size"] == 65536:
-        data["memory_service"] = read("kernel memory service", "systemctl", "is-active", "spark-ds41f-kernel-memory.service")
+        unit = memory_policy_unit()
+        data["memory_service"] = "active" if unit else ""
+        data["memory_service_unit"] = unit
     return data
+
+
+MEMORY_POLICY_UNITS = (
+    "spark-ds41f-kernel-memory.service",
+    "spark3-kernel-memory.service",
+)
+
+
+def memory_policy_unit() -> str:
+    """The active boot-memory unit, if any.
+
+    Sites that installed before the release after spark-ds41f-1022 still run
+    ``spark3-kernel-memory.service``; the installer renames it. ``systemctl
+    is-active`` exits 3 when a unit is inactive, so this does not treat that
+    as an inventory error.
+    """
+    for unit in MEMORY_POLICY_UNITS:
+        result = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+        if result.stdout.strip() == "active":
+            return unit
+    return ""
 
 
 def findings(name, data, policy):
@@ -190,8 +219,18 @@ def findings(name, data, policy):
             issues.append(f"{name}: 64 KiB THP/reserve policy differs from never/45166 KiB")
         if data.get("active_swap") != ["/swap-64k.img"] or data.get("memory_service") != "active":
             issues.append(f"{name}: 64 KiB swap or boot memory service is not active")
-        if any("64 KiB THP" in x or "64 KiB swap" in x for x in issues):
-            fixes.append(f"{name}: inspect journalctl -u spark-ds41f-kernel-memory.service; after correcting its inputs, sudo systemctl restart spark-ds41f-kernel-memory.service")
+        elif data.get("memory_service_unit") == "spark3-kernel-memory.service":
+            issues.append(
+                f"{name}: boot memory service is still spark3-kernel-memory.service; "
+                "the policy is the same, rename it with "
+                "experiments/2026-10-02-kernel-64k/install-boot-support.sh"
+            )
+        if any("64 KiB THP" in x or "64 KiB swap" in x or "spark3-kernel-memory" in x for x in issues):
+            unit = data.get("memory_service_unit") or "spark-ds41f-kernel-memory.service"
+            fixes.append(
+                f"{name}: inspect journalctl -u {unit}; after correcting its inputs, "
+                f"sudo systemctl restart {unit}"
+            )
     saver_issues = memory_saver_problems(name, data, policy)
     issues.extend(saver_issues)
     if saver_issues:
