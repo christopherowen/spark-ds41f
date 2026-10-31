@@ -1,0 +1,833 @@
+From 048444efe37dd7d38f1e8f9934deb362fa1704bf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:49:47 +0100
+Subject: [PATCH] engram: bounded user-space 4-way row cache and pre-consumed
+ early read overlap
+
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 171 ++++++++++++-
+ vllm/models/deepseek_v4_1/common/engram.py    |   3 +
+ .../deepseek_v4_1/engram_rows/_reader.c       | 240 ++++++++++++++++--
+ .../deepseek_v4_1/engram_rows/_row_plan.h     | 118 ++++++++-
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  13 +-
+ 5 files changed, 509 insertions(+), 36 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4e358c4e8..174ba30a6 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -75,12 +75,12 @@ def _rows(paths, start=0, end=TABLE_ROWS, tokens=16, **kwargs):
+     return rows
+ 
+ 
+-def _step(rows, ids, live):
++def _step(rows, ids, live, early=None):
+     stream = torch.cuda.current_stream()
+     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
+     width = bin(rows.columns).count("1") * 256  # the rank's columns, side by side
+     out = torch.full((ids.shape[0], width), 7, dtype=torch.bfloat16, device="cuda")
+-    rows.stage(stream, ids, ids.numel())
++    rows.stage(stream, ids, ids.numel(), early)
+     rows.gather(out, ids, num_tokens)
+     return out, num_tokens
+ 
+@@ -525,3 +525,170 @@ def test_timeline_is_off_by_default():
+     torch.cuda.synchronize()
+     assert not rows.timeline_enabled and rows.timeline() == []
+     rows.close()
++
++
++def test_early_rows_complete_disk_reads_before_previous_gather_finishes():
++    """While the GPU is still busy before the previous step's gather, the worker reads
++    the next step's early IDs into its private early staging buffer (incrementing
++    early_prefetched_steps and read_calls) without touching the mapped weights/scales
++    until CTRL_CONSUMED_SEQ advances."""
++    codes, scales, paths = _write_table(_table_dir(), seed=33)
++    rows = _rows(paths, tokens=4)
++    stream = torch.cuda.current_stream()
++    first = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
++    second = torch.randint(0, TABLE_ROWS, (4, HEADS))
++    second_gpu = second.cuda()
++    num_tokens = torch.tensor([4], dtype=torch.int32, device="cuda")
++    out1 = torch.empty((4, HEADS * 256), dtype=torch.bfloat16, device="cuda")
++    out2 = torch.empty_like(out1)
++
++    rows.stage(stream, first, first.numel())
++    rows.gather(out1, first, num_tokens)
++    torch.cuda.synchronize()
++
++    rows.stage(stream, first, first.numel())
++    deadline = time.monotonic() + 30
++    while (
++        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
++        and time.monotonic() < deadline
++    ):
++        time.sleep(0.001)
++    held_weights = rows.weights.host.clone()
++    held_scales = rows.scales.host.clone()
++    calls_before = rows.stats()["read_calls"]
++
++    torch.cuda._sleep(int(1.5e9))
++    rows.gather(out1, first, num_tokens)
++    rows.stage(stream, second_gpu, second.numel(), second.numpy())
++
++    deadline = time.monotonic() + 30
++    while (
++        rows.stats()["early_prefetched_steps"] < 1
++        and time.monotonic() < deadline
++    ):
++        time.sleep(0.001)
++
++    # Disk reads for step 3 finished into early_weights/early_scales while the GPU is
++    # still sleeping before step 2's gather!
++    assert rows.stats()["early_prefetched_steps"] == 1
++    assert rows.stats()["read_calls"] > calls_before
++    assert int(rows._control[rows.native.CTRL_CONSUMED_SEQ]) < 2
++    assert torch.equal(rows.weights.host, held_weights)
++    assert torch.equal(rows.scales.host, held_scales)
++
++    rows.gather(out2, second_gpu, num_tokens)
++    torch.testing.assert_close(
++        out1.cpu(),
++        _reference(codes, scales, first, 4, 0, TABLE_ROWS),
++        rtol=0,
++        atol=0,
++        equal_nan=True,
++    )
++    torch.testing.assert_close(
++        out2.cpu(),
++        _reference(codes, scales, second, 4, 0, TABLE_ROWS),
++        rtol=0,
++        atol=0,
++        equal_nan=True,
++    )
++    rows.close()
++
++
++@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
++def test_user_space_row_cache_hits_evicts_and_matches_reference(columns):
++    """A 4-way set-associative row cache serves repeated rows from RAM with zero disk
++    reads and preserves bit-exact BF16 output under set conflicts and evictions."""
++    codes, scales, paths = _write_table(_table_dir(), seed=37)
++    rows = _rows(paths, tokens=16, columns=columns, cache_rows=64)
++    try:
++        gen = torch.Generator().manual_seed(38)
++        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
++        # Force >4 distinct row IDs into the same 16-set cache bucket (set 0) to test
++        # conflict handling within a single step and across steps.
++        same_set = []
++        for candidate in range(TABLE_ROWS):
++            h = (candidate * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
++            if ((h ^ (h >> 32)) & 15) == 0:
++                same_set.append(candidate)
++                if len(same_set) == 8:
++                    break
++        ids[0, :8] = torch.tensor(same_set, dtype=torch.int64)
++        ids_gpu = ids.cuda()
++
++        out1, _ = _step(rows, ids_gpu, 14)
++        expected = _reference(codes, scales, ids, 14, 0, TABLE_ROWS, columns)
++        torch.testing.assert_close(
++            out1.cpu(), expected, rtol=0, atol=0, equal_nan=True
++        )
++
++        # Now run a step whose unique rows fit entirely within the 64-row cache.
++        small_ids = torch.arange(24, dtype=torch.int64).unsqueeze(0).expand(16, -1).contiguous()
++        small_gpu = small_ids.cuda()
++        out_warm, _ = _step(rows, small_gpu, 16, early=small_ids.numpy())
++        expected_small = _reference(codes, scales, small_ids, 16, 0, TABLE_ROWS, columns)
++        torch.testing.assert_close(
++            out_warm.cpu(), expected_small, rtol=0, atol=0, equal_nan=True
++        )
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        stats_after_warm = rows.stats()
++
++        # Repeating small_ids must hit 100% in the row cache with 0 disk read_calls!
++        rows.weights.host.fill_(0x7F)
++        rows.scales.host.fill_(0xFF)
++        out_hit, _ = _step(rows, small_gpu, 16, early=small_ids.numpy())
++        torch.testing.assert_close(
++            out_hit.cpu(), expected_small, rtol=0, atol=0, equal_nan=True
++        )
++        torch.cuda.synchronize()
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        stats_after_hit = rows.stats()
++        owned_per_token = bin(columns).count("1")
++        assert stats_after_hit["read_calls"] == stats_after_warm["read_calls"]
++        assert (
++            stats_after_hit["cache_hits"] - stats_after_warm["cache_hits"]
++            == 16 * owned_per_token
++        )
++        assert stats_after_hit["cache_misses"] == stats_after_warm["cache_misses"]
++    finally:
++        rows.close()
++
++
++def test_background_prefetch_warms_row_cache_without_touching_step_buffers():
++    """rows.prefetch(ids) populates the user-space row cache on the worker thread without
++    modifying mapped weights/scales or control sequence words, so the subsequent step
++    hits 100% in cache with zero disk reads."""
++    codes, scales, paths = _write_table(_table_dir(), seed=43)
++    rows = _rows(paths, tokens=8, cache_rows=4096)
++    try:
++        rows.weights.host.fill_(0x5A)
++        rows.scales.host.fill_(0xA5)
++        held_weights = rows.weights.host.clone()
++        held_scales = rows.scales.host.clone()
++
++        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), dtype=torch.int64)
++        rows.prefetch(ids.numpy())
++        deadline = time.monotonic() + 10.0
++        while rows.stats()["prefetch_steps"] < 1 and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s_pref = rows.stats()
++        assert s_pref["prefetch_steps"] == 1
++        assert s_pref["read_calls"] > 0
++        assert int(rows._control[rows.native.CTRL_ROWS_SEQ]) == 0
++        assert torch.equal(rows.weights.host, held_weights)
++        assert torch.equal(rows.scales.host, held_scales)
++
++        out, _ = _step(rows, ids.cuda(), 8, early=ids.numpy())
++        expected = _reference(codes, scales, ids, 8, 0, TABLE_ROWS)
++        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        torch.cuda.synchronize()
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s_step = rows.stats()
++        assert s_step["read_calls"] == s_pref["read_calls"]
++        assert s_step["cache_hits"] >= 8 * HEADS
++    finally:
++        rows.close()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 45ca741de..c08e8490a 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -117,6 +117,8 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+ ENGRAM_TIMELINE_DIR = os.environ.get(
+     "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
+ )
++# Bounded user-space 4-way set-associative row cache per disk Engram table (0 = off).
++ENGRAM_ROW_CACHE_ROWS = int(os.environ.get("SPARK_DS41F_ENGRAM_ROW_CACHE_ROWS", "0"))
+ _timeline_tables: list = []
+ 
+ 
+@@ -620,6 +622,7 @@ class ParallelEngramEmbedding(nn.Module):
+             delay_s=ENGRAM_READ_DELAY_S,
+             check_early=ENGRAM_CHECK_EARLY_IDS,
+             timeline=ENGRAM_TIMELINE,
++            cache_rows=ENGRAM_ROW_CACHE_ROWS,
+         )
+         for path, offset, scale in self._disk_sources:
+             rows.add_source(path, offset, scale=scale)
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index 110d705d0..a75b68845 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -89,6 +89,7 @@ typedef struct {
+     uint32_t count;
+     int64_t *early;   /* the host's IDs (UNKNOWN_ID where only the GPU knows), or NULL */
+     bool has_unknown; /* some lookup needs the GPU's ID */
++    bool is_prefetch; /* warm the user-space row cache without publishing a GPU step */
+     uint64_t submitted; /* when the host queued the step (CLOCK_MONOTONIC ns) */
+ } step_t;
+ 
+@@ -115,6 +116,8 @@ typedef struct {
+     /* Mapped host buffers, owned by the Python wrapper for the reader's lifetime. */
+     const char *ids;
+     char *weights, *scales;
++    char *early_weights, *early_scales;
++    char *active_weights, *active_scales;
+     uint32_t *control;
+     int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
+     bool check_early; /* debug: an early ID must equal the GPU's */
+@@ -129,6 +132,8 @@ typedef struct {
+     uint64_t ids_timeout_ns, delay_ns;
+     failure_t failure; /* the first failure; no step is read after it */
+     uint64_t steps_done, lookups_done, early_lookups;
++    uint64_t early_prefetched_steps, prefetch_steps;
++    uint64_t total_read_calls, total_unique_blocks, total_read_bytes;
+     double ids_wait_seconds, read_seconds, consumed_wait_seconds, early_read_seconds;
+ } reader_t;
+ 
+@@ -155,10 +160,24 @@ static void ple_error(reader_t *reader, const char *operation, int error) {
+ /* Copy a completed job's fragments from its slot buffer to their lookup slots. */
+ static void ple_scatter(reader_t *reader, size_t index, const char *buffer) {
+     ple_job_t *job = &reader->plan.jobs[index];
++    char *dst_weights = reader->active_weights ? reader->active_weights : reader->weights;
++    char *dst_scales = reader->active_scales ? reader->active_scales : reader->scales;
+     for (size_t i = job->begin; i < job->end; i++) {
+         ple_fragment_t *fragment = &reader->plan.fragments[i];
+-        memcpy((fragment->scale ? reader->scales : reader->weights) + fragment->destination,
+-               buffer + (fragment->offset - job->offset), fragment->length);
++        const char *src = buffer + (fragment->offset - job->offset);
++        memcpy((fragment->scale ? dst_scales : dst_weights) + fragment->destination,
++               src, fragment->length);
++        if (reader->plan.cache_sets) {
++            size_t bytes = fragment->scale ? reader->plan.scale_bytes : reader->plan.weight_bytes;
++            size_t lookup = fragment->destination / bytes;
++            size_t row_off = fragment->destination % bytes;
++            uint8_t way = reader->plan.lookup_cache_way[lookup];
++            if (way != 0xFF) {
++                ple_cache_set_t *set = &reader->plan.cache[reader->plan.lookup_cache_set[lookup]];
++                memcpy((fragment->scale ? set->scales[way] : set->weights[way]) + row_off,
++                       src, fragment->length);
++            }
++        }
+     }
+ }
+ 
+@@ -310,9 +329,11 @@ static int ple_register_files(ple_plan_t *plan, void *owner) {
+     return error;
+ }
+ 
+-/* Read the rows of ``count`` lookups whose IDs are ``ids`` into their lookup slots; an
+- * ID outside this rank's shard (or -1, or UNKNOWN_ID) leaves its slot untouched. */
+-static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
++/* Read the rows of ``count`` lookups whose IDs are ``ids`` into ``dst_weights`` and
++ * ``dst_scales``; an ID outside this rank's shard (or -1, or UNKNOWN_ID) leaves its slot
++ * untouched. */
++static failure_t read_rows_into(reader_t *reader, const char *ids, uint32_t count,
++                                char *dst_weights, char *dst_scales) {
+     reader->plan.failure.message[0] = 0;
+     reader->plan.lookups = count;
+     reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
+@@ -322,13 +343,30 @@ static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
+                  "Engram reader is unusable after an io_uring submission or completion failure");
+         return reader->plan.failure;
+     }
++    reader->active_weights = dst_weights;
++    reader->active_scales = dst_scales;
+     uint64_t planning = now_ns();
+-    bool planned = ple_plan(&reader->plan, ids, count);
++    bool planned = ple_plan(&reader->plan, ids, count, dst_weights, dst_scales);
+     reader->step_plan_ns += now_ns() - planning;
+     if (planned && reader->plan.job_count) ple_uring_run(reader);
++    if (planned && !reader->plan.failure.message[0] && !reader->poisoned) {
++        for (size_t k = 0; k < reader->plan.pending_fill_count; k++) {
++            ple_cache_fill_t fill = reader->plan.pending_fills[k];
++            reader->plan.cache[fill.set_idx].ids[fill.way] = fill.id;
++        }
++    }
++    pthread_mutex_lock(&reader->mutex);
++    reader->total_read_calls += reader->plan.read_calls;
++    reader->total_unique_blocks += reader->plan.unique_blocks;
++    reader->total_read_bytes += reader->plan.read_bytes;
++    pthread_mutex_unlock(&reader->mutex);
+     return reader->plan.failure;
+ }
+ 
++static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
++    return read_rows_into(reader, ids, count, reader->weights, reader->scales);
++}
++
+ /* --- worker ------------------------------------------------------------------ */
+ 
+ /* Wait until the GPU has written ``target`` (or later) into control word ``word``: spin
+@@ -368,12 +406,28 @@ static void pause_for_delay(reader_t *reader) {
+     }
+ }
+ 
+-/* The step's early part: wait until the GPU has gathered the reader's previous step
+- * (its rows are in the same buffers), then read the lookups the host hashed. */
++/* The step's early part: plan and read the lookups the host hashed into the reader's
++ * private early staging buffers immediately (overlapping NVMe I/O with the previous
++ * step's GPU execution), then wait until the GPU has gathered the previous step before
++ * copying those rows into the mapped weight and scale buffers. */
+ static bool read_early(reader_t *reader, step_t step, failure_t *failure, double *consumed_wait,
+                        double *early_read, uint64_t *early_count) {
++    uint64_t read_start = now_ns();
++    pause_for_delay(reader);
++    control_store(reader, CTRL_PHASE, PHASE_READING);
++    *failure = read_rows_into(reader, (const char *)step.early, step.count,
++                              reader->early_weights, reader->early_scales);
++    uint64_t read_done = now_ns();
++    if (failure->message[0]) {
++        *early_read = (double)(read_done - read_start) * 1e-9;
++        return false;
++    }
++    pthread_mutex_lock(&reader->mutex);
++    reader->early_prefetched_steps++;
++    pthread_mutex_unlock(&reader->mutex);
++
+     control_store(reader, CTRL_PHASE, PHASE_WAITING_CONSUMED);
+-    uint64_t start = now_ns();
++    uint64_t wait_start = now_ns();
+     /* Sequences run 1, 2, ... 0xFFFFFFFF, 1: the step before 1 is 0xFFFFFFFF (or none,
+      * when the control block's 0 has reached it already). */
+     uint32_t previous = step.sequence == 1 ? 0xFFFFFFFFu : step.sequence - 1;
+@@ -382,13 +436,26 @@ static bool read_early(reader_t *reader, step_t step, failure_t *failure, double
+                       "the GPU never gathered the previous step's rows"))
+         return false;
+     uint64_t consumed_at = now_ns();
+-    pause_for_delay(reader);
+-    control_store(reader, CTRL_PHASE, PHASE_READING);
+-    *failure = read_rows(reader, (const char *)step.early, step.count);
+-    *consumed_wait = (double)(consumed_at - start) * 1e-9;
+-    *early_read = (double)(now_ns() - consumed_at) * 1e-9;
+-    for (uint32_t i = 0; i < step.count; i++) *early_count += step.early[i] != UNKNOWN_ID;
+-    return !failure->message[0];
++    *consumed_wait = (double)(consumed_at - wait_start) * 1e-9;
++
++    size_t w_bytes = reader->plan.weight_bytes;
++    size_t s_bytes = reader->plan.scale_bytes;
++    for (uint32_t i = 0; i < step.count; i++) {
++        int64_t id = step.early[i];
++        if (id == UNKNOWN_ID) continue;
++        (*early_count)++;
++        if (id < reader->plan.tp_start || id >= reader->plan.tp_end ||
++            !((reader->plan.columns >> (i % PLE_COLUMNS)) & 1u))
++            continue;
++        memcpy(reader->weights + (size_t)i * w_bytes,
++               reader->early_weights + (size_t)i * w_bytes, w_bytes);
++        if (s_bytes) {
++            memcpy(reader->scales + (size_t)i * s_bytes,
++                   reader->early_scales + (size_t)i * s_bytes, s_bytes);
++        }
++    }
++    *early_read = (double)((read_done - read_start) + (now_ns() - consumed_at)) * 1e-9;
++    return true;
+ }
+ 
+ /* The GPU's IDs: check the early ones (debug) and keep only those the host did not know. */
+@@ -414,6 +481,21 @@ static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
+ 
+ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
++    if (step.is_prefetch) {
++        if (step.early && reader->plan.cache_sets) {
++            failure = read_rows_into(reader, (const char *)step.early, step.count,
++                                     reader->early_weights, reader->early_scales);
++        }
++        pthread_mutex_lock(&reader->mutex);
++        if (failure.message[0]) {
++            if (!reader->failure.message[0]) reader->failure = failure;
++        } else {
++            reader->prefetch_steps++;
++        }
++        pthread_mutex_unlock(&reader->mutex);
++        if (failure.message[0]) control_store(reader, CTRL_PHASE, PHASE_FAILED);
++        return;
++    }
+     uint64_t started = now_ns();
+     uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
+     reader->step_plan_ns = 0;
+@@ -528,6 +610,8 @@ static void release(reader_t *reader) {
+     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
+     free(reader->iovecs);
+     free(reader->late);
++    free(reader->early_weights);
++    free(reader->early_scales);
+     free(reader->timeline);
+     free(reader->free_slots);
+     free(reader->registered_fds);
+@@ -567,12 +651,13 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     unsigned long long ids, weights, scales, control;
+     double ids_timeout, delay;
+     int check_early, timeline;
+-    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
++    long long cache_rows = 0;
++    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|L", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
+                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
+-                          &timeline))
++                          &timeline, &cache_rows))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+-        !columns || (columns & ~PLE_ALL_COLUMNS) ||
++        !columns || (columns & ~PLE_ALL_COLUMNS) || cache_rows < 0 ||
+         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
+         !weights || !scales || !control || !(ids_timeout > 0) || delay < 0)
+         return PyErr_Format(PyExc_ValueError, "invalid Engram reader geometry, buffers or times");
+@@ -581,7 +666,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     pthread_mutex_init(&reader->mutex, NULL);
+     /* One whole-table source per plane: shard 0 spans every row. */
+     int error = ple_plan_init(&reader->plan, table_rows, table_rows, shard_start, shard_end, columns, 256, 8,
+-                              max_lookups);
++                              max_lookups, cache_rows);
+     if (error) {
+         release(reader);
+         return error == ENOMEM ? PyErr_NoMemory()
+@@ -599,7 +684,9 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+         return PyErr_NoMemory();
+     }
+     reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
+-    if (!reader->late) {
++    reader->early_weights = malloc((size_t)max_lookups * 256);
++    reader->early_scales = malloc((size_t)max_lookups * 8);
++    if (!reader->late || !reader->early_weights || !reader->early_scales) {
+         release(reader);
+         return PyErr_NoMemory();
+     }
+@@ -740,7 +827,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+         }
+         if (!problem) {
+             __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
+-            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown, submitted}};
++            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown, false, submitted}};
+             early = NULL;
+             queue.tail++;
+             reader->pending++;
+@@ -755,13 +842,95 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+     Py_RETURN_NONE;
+ }
+ 
++/* prefetch(reader, ids, wait_s): queue a background cache warm-up for ``ids`` (contiguous
++ * int64 buffer) without advancing or touching the GPU step buffers or control block. */
++static PyObject *py_prefetch(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule, *ids_object;
++    double wait = 60.0;
++    uint64_t submitted = now_ns();
++    if (!PyArg_ParseTuple(args, "OO|d", &capsule, &ids_object, &wait)) return NULL;
++    reader_t *reader = get_reader(capsule);
++    if (!reader) return NULL;
++    Py_buffer view;
++    if (PyObject_GetBuffer(ids_object, &view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
++    if (view.len < 0 || view.len % (Py_ssize_t)sizeof(int64_t) != 0) {
++        PyBuffer_Release(&view);
++        return PyErr_Format(PyExc_ValueError, "Engram prefetch IDs must be int64 values");
++    }
++    size_t total = (size_t)view.len / sizeof(int64_t);
++    if (total == 0 || !reader->plan.cache_sets) {
++        PyBuffer_Release(&view);
++        Py_RETURN_NONE;
++    }
++    if (total > reader->plan.max_lookups) {
++        PyBuffer_Release(&view);
++        return PyErr_Format(PyExc_ValueError, "Engram prefetch of %zu lookups exceeds capacity", total);
++    }
++    int64_t *early = malloc(total * sizeof(*early));
++    if (!early) {
++        PyBuffer_Release(&view);
++        return PyErr_NoMemory();
++    }
++    memcpy(early, view.buf, total * sizeof(*early));
++    PyBuffer_Release(&view);
++
++    const char *problem = NULL;
++    failure_t failure = {{0}};
++    Py_BEGIN_ALLOW_THREADS
++    struct timespec deadline;
++    clock_gettime(CLOCK_MONOTONIC, &deadline);
++    deadline.tv_sec += (time_t)wait;
++    deadline.tv_nsec += (long)((wait - (double)(time_t)wait) * 1e9);
++    if (deadline.tv_nsec >= 1000000000L) {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000L;
++    }
++    pthread_mutex_lock(&queue.mutex);
++    for (;;) {
++        pthread_mutex_lock(&reader->mutex);
++        failure = reader->failure;
++        pthread_mutex_unlock(&reader->mutex);
++        if (failure.message[0] || queue.tail - queue.head < QUEUE) break;
++        if (pthread_cond_timedwait(&queue.space, &queue.mutex, &deadline) == ETIMEDOUT) break;
++    }
++    if (!failure.message[0]) {
++        if (queue.tail - queue.head >= QUEUE) {
++            problem = "Engram readers fell more than 64 steps behind";
++        } else if (!queue.started) {
++            pthread_t thread;
++            pthread_attr_t attr;
++            pthread_attr_init(&attr);
++            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++            if (pthread_create(&thread, &attr, worker_main, NULL)) problem = "Engram reader thread did not start";
++            else queue.started = true;
++            pthread_attr_destroy(&attr);
++        }
++        if (!problem) {
++            __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
++            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {0, (uint32_t)total, early, false, true, submitted}};
++            early = NULL;
++            queue.tail++;
++            reader->pending++;
++            pthread_cond_signal(&queue.wake);
++        }
++    }
++    pthread_mutex_unlock(&queue.mutex);
++    Py_END_ALLOW_THREADS
++    free(early);
++    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    if (problem) return PyErr_Format(PyExc_RuntimeError, "%s", problem);
++    Py_RETURN_NONE;
++}
++
+ /* status(reader): the first failure (or None) and the worker's counters. */
+ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     (void)self;
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+     failure_t failure;
+-    uint64_t steps, lookups, queued, early;
++    uint64_t steps, lookups, queued, early, early_prefetched, prefetches;
++    uint64_t cache_hits, cache_misses, read_calls, unique_blocks, read_bytes;
+     double ids_wait, read, consumed_wait, early_read;
+     Py_BEGIN_ALLOW_THREADS
+     pthread_mutex_lock(&queue.mutex);
+@@ -774,18 +943,32 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     ids_wait = reader->ids_wait_seconds;
+     read = reader->read_seconds;
+     early = reader->early_lookups;
++    early_prefetched = reader->early_prefetched_steps;
++    prefetches = reader->prefetch_steps;
++    cache_hits = reader->plan.cache_hits;
++    cache_misses = reader->plan.cache_misses;
++    read_calls = reader->total_read_calls;
++    unique_blocks = reader->total_unique_blocks;
++    read_bytes = reader->total_read_bytes;
+     consumed_wait = reader->consumed_wait_seconds;
+     early_read = reader->early_read_seconds;
+     pthread_mutex_unlock(&reader->mutex);
+     Py_END_ALLOW_THREADS
+     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
+     if (!message) return NULL;
+-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message, "steps",
+-                                     (unsigned long long)steps, "lookups", (unsigned long long)lookups,
+-                                     "early_lookups", (unsigned long long)early, "queued",
+-                                     (unsigned long long)queued, "ids_wait_seconds", ids_wait,
++    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
++                                     "failure", message, "steps", (unsigned long long)steps, "lookups",
++                                     (unsigned long long)lookups, "early_lookups", (unsigned long long)early,
++                                     "queued", (unsigned long long)queued, "ids_wait_seconds", ids_wait,
+                                      "read_seconds", read, "consumed_wait_seconds", consumed_wait,
+-                                     "early_read_seconds", early_read);
++                                     "early_read_seconds", early_read, "early_prefetched_steps",
++                                     (unsigned long long)early_prefetched, "prefetch_steps",
++                                     (unsigned long long)prefetches, "cache_hits",
++                                     (unsigned long long)cache_hits, "cache_misses",
++                                     (unsigned long long)cache_misses, "read_calls",
++                                     (unsigned long long)read_calls, "unique_blocks",
++                                     (unsigned long long)unique_blocks, "read_bytes",
++                                     (unsigned long long)read_bytes);
+     return result;
+ }
+ 
+@@ -832,6 +1015,7 @@ static PyMethodDef methods[] = {
+     {"reader", py_reader, METH_VARARGS, NULL},
+     {"add", py_add, METH_VARARGS, NULL},
+     {"submit", py_submit, METH_VARARGS, NULL},
++    {"prefetch", py_prefetch, METH_VARARGS, NULL},
+     {"status", py_status, METH_O, NULL},
+     {"timeline", py_timeline, METH_O, NULL},
+     {NULL, NULL, 0, NULL},
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 7e0f8a2eb..49ba6baed 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -13,6 +13,22 @@
+ #define PLE_READ_MAX 65536u
+ #define PLE_COLUMNS 24u
+ #define PLE_ALL_COLUMNS ((1u << PLE_COLUMNS) - 1u)
++#define PLE_CACHE_WAYS 4u
++
++typedef struct {
++    int64_t ids[PLE_CACHE_WAYS];
++    int64_t pending_ids[PLE_CACHE_WAYS];
++    uint32_t pending_epoch[PLE_CACHE_WAYS];
++    uint8_t clock;
++    char weights[PLE_CACHE_WAYS][256];
++    char scales[PLE_CACHE_WAYS][8];
++} ple_cache_set_t;
++
++typedef struct {
++    size_t set_idx;
++    uint8_t way;
++    int64_t id;
++} ple_cache_fill_t;
+ 
+ typedef struct {
+     int fd;
+@@ -56,6 +72,14 @@ typedef struct {
+     uint64_t lookups, requested_bytes, read_bytes, read_calls;
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
++    ple_cache_set_t *cache;
++    size_t cache_sets, cache_set_mask;
++    uint32_t plan_epoch;
++    size_t *lookup_cache_set;
++    uint8_t *lookup_cache_way;
++    ple_cache_fill_t *pending_fills;
++    size_t pending_fill_count;
++    uint64_t cache_hits, cache_misses;
+ } ple_plan_t;
+ 
+ static inline int ple_source_compare(const void *left, const void *right) {
+@@ -70,13 +94,18 @@ static inline void ple_plan_release(ple_plan_t *reader) {
+     free(reader->sources);
+     free(reader->fragments);
+     free(reader->jobs);
++    free(reader->cache);
++    free(reader->lookup_cache_set);
++    free(reader->lookup_cache_way);
++    free(reader->pending_fills);
+ }
+ 
+ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+         int64_t padded_rows, int64_t tp_start, int64_t tp_end, uint32_t columns,
+-        int64_t weight_bytes, int64_t scale_bytes, int64_t max_lookups) {
++        int64_t weight_bytes, int64_t scale_bytes, int64_t max_lookups,
++        int64_t cache_rows) {
+     if (shard_rows <= 0 || padded_rows <= 0 || tp_start < 0 || tp_end < tp_start ||
+-        !columns || (columns & ~PLE_ALL_COLUMNS) ||
++        !columns || (columns & ~PLE_ALL_COLUMNS) || cache_rows < 0 ||
+         tp_end > padded_rows || weight_bytes <= 0 || scale_bytes < 0 || max_lookups <= 0 ||
+         weight_bytes > PY_SSIZE_T_MAX / max_lookups ||
+         scale_bytes > PY_SSIZE_T_MAX / max_lookups || max_lookups > PY_SSIZE_T_MAX / 8)
+@@ -97,7 +126,31 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+     reader->capacity = (size_t)max_lookups * per_row;
+     reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
+     reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));
+-    return reader->fragments && reader->jobs ? 0 : ENOMEM;
++    if (!reader->fragments || !reader->jobs) return ENOMEM;
++    if (cache_rows > 0) {
++        size_t min_sets = ((size_t)cache_rows + PLE_CACHE_WAYS - 1) / PLE_CACHE_WAYS;
++        size_t sets = 1;
++        while (sets < min_sets) {
++            if (sets > SIZE_MAX / 2) return EOVERFLOW;
++            sets <<= 1;
++        }
++        reader->cache_sets = sets;
++        reader->cache_set_mask = sets - 1;
++        reader->cache = calloc(sets, sizeof(*reader->cache));
++        reader->lookup_cache_set = calloc((size_t)max_lookups, sizeof(*reader->lookup_cache_set));
++        reader->lookup_cache_way = malloc((size_t)max_lookups * sizeof(*reader->lookup_cache_way));
++        reader->pending_fills = calloc((size_t)max_lookups, sizeof(*reader->pending_fills));
++        if (!reader->cache || !reader->lookup_cache_set ||
++            !reader->lookup_cache_way || !reader->pending_fills)
++            return ENOMEM;
++        for (size_t s = 0; s < sets; s++) {
++            for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
++                reader->cache[s].ids[w] = -1;
++                reader->cache[s].pending_ids[w] = -1;
++            }
++        }
++    }
++    return 0;
+ }
+ 
+ static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *path,
+@@ -234,8 +287,17 @@ static inline void ple_sort(ple_plan_t *reader) {
+     if (source != items) memcpy(items, source, count * sizeof(*items));
+ }
+ 
+-static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
++static inline size_t ple_cache_set_index(int64_t id, size_t mask) {
++    uint64_t h = (uint64_t)id * 0x9E3779B97F4A7C15ULL;
++    return (size_t)((h ^ (h >> 32)) & mask);
++}
++
++static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
++        char *dst_weights, char *dst_scales) {
+     reader->fragment_count = reader->job_count = 0;
++    reader->pending_fill_count = 0;
++    uint32_t epoch = ++reader->plan_epoch;
++    if (epoch == 0) epoch = ++reader->plan_epoch;
+     for (size_t i = 0; i < count; i++) {
+         int64_t id;
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
+@@ -244,6 +306,54 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
+         if (id < reader->tp_start || id >= reader->tp_end ||
+             !((reader->columns >> (i % PLE_COLUMNS)) & 1u))
+             continue;
++        if (reader->cache_sets) {
++            size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
++            ple_cache_set_t *set = &reader->cache[set_idx];
++            int hit_way = -1;
++            for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
++                if (set->ids[w] == id) {
++                    hit_way = (int)w;
++                    break;
++                }
++            }
++            if (hit_way >= 0) {
++                memcpy(dst_weights + i * reader->weight_bytes,
++                       set->weights[hit_way], reader->weight_bytes);
++                if (reader->scale_bytes) {
++                    memcpy(dst_scales + i * reader->scale_bytes,
++                           set->scales[hit_way], reader->scale_bytes);
++                }
++                reader->cache_hits++;
++                reader->lookup_cache_way[i] = 0xFF;
++                continue;
++            }
++            reader->cache_misses++;
++            uint8_t assigned_way = 0xFF;
++            bool already_pending = false;
++            for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
++                if (set->pending_epoch[w] == epoch && set->pending_ids[w] == id) {
++                    already_pending = true;
++                    break;
++                }
++            }
++            if (!already_pending) {
++                for (unsigned attempt = 0; attempt < PLE_CACHE_WAYS; attempt++) {
++                    unsigned w = (set->clock + attempt) & (PLE_CACHE_WAYS - 1);
++                    if (set->pending_epoch[w] != epoch) {
++                        set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++                        set->ids[w] = -1;
++                        set->pending_ids[w] = id;
++                        set->pending_epoch[w] = epoch;
++                        assigned_way = (uint8_t)w;
++                        reader->pending_fills[reader->pending_fill_count++] =
++                            (ple_cache_fill_t){set_idx, assigned_way, id};
++                        break;
++                    }
++                }
++            }
++            reader->lookup_cache_set[i] = set_idx;
++            reader->lookup_cache_way[i] = assigned_way;
++        }
+         for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
+             ple_source_t key = {.shard = id / reader->shard_rows, .scale = plane != 0};
+             ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 89dcca295..bf23a513c 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -115,7 +115,8 @@ class EngramDiskRows:
+                  max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
+                  ids_timeout_s: float = 20.0,
+                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+-                 check_early: bool = False, timeline: bool = False):
++                 check_early: bool = False, timeline: bool = False,
++                 cache_rows: int = 0):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+@@ -125,6 +126,7 @@ class EngramDiskRows:
+         self.max_lookups = int(max_lookups)
+         self.check_early = bool(check_early)
+         self.timeline_enabled = bool(timeline)
++        self.cache_rows = int(cache_rows)
+         self._allocations = []
+         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+@@ -138,7 +140,7 @@ class EngramDiskRows:
+             table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+             float(ids_timeout_s), float(delay_s), self.check_early,
+-            self.timeline_enabled,
++            self.timeline_enabled, self.cache_rows,
+         )
+         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+         self._sequence = 0
+@@ -180,6 +182,13 @@ class EngramDiskRows:
+                "cuStreamWriteValue32")
+         self.native.submit(self._reader, self._sequence, count, 60.0, early)
+ 
++    def prefetch(self, ids: np.ndarray) -> None:
++        """Warm the reader's user-space row cache in the background for ``ids`` (int64
++        on the host) without advancing or modifying the GPU step buffers."""
++        self.raise_if_failed()
++        arr = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
++        self.native.prefetch(self._reader, arr, 60.0)
++
+     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
+         """Wait for the staged step's rows and dequantize the first ``num_tokens``
+         tokens' rows into ``out`` (``[tokens, columns * 256]`` BF16, this rank's hash
+-- 
+2.54.0 (Apple Git-157)
+
