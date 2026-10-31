@@ -1,0 +1,638 @@
+From c966cab3b7299bcd0099eae68c579338c2b7e5bb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:45:52 +0100
+Subject: [PATCH] [Spec Decode][MRV2] Skip drafting in steps where no request
+ can use the drafts (#62784)
+
+Port upstream vllm commit 856b98415b to skip drafting when every scheduled
+request on every DP rank is either a non-final prefill chunk or guaranteed
+to reach max_tokens on the current step (taking sink rejection draft_zero
+into account). DFlash/DSpark and AutoRegressive speculators keep their draft
+KV cache in sync on K=0 steps and skip the query pass, Markov sampling, and
+CopyDrafter.
+---
+ tests/v1/core/test_scheduler.py               | 69 ++++++++++++++++++
+ tests/v1/worker/test_gpu_dp_utils.py          | 71 +++++++++++++++++++
+ tests/v1/worker/test_gpu_ubatch_slicing.py    |  3 +-
+ vllm/v1/core/sched/output.py                  |  5 ++
+ vllm/v1/core/sched/scheduler.py               | 66 +++++++++++++++++
+ vllm/v1/worker/gpu/dp_utils.py                | 14 +++-
+ vllm/v1/worker/gpu/model_runner.py            | 61 ++++++++++++----
+ .../spec_decode/autoregressive/speculator.py  | 13 ++--
+ .../gpu/spec_decode/dflash/speculator.py      |  6 +-
+ 9 files changed, 288 insertions(+), 20 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_dp_utils.py
+
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 93e1d7d41..03e281716 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -6999,3 +6999,72 @@ def test_update_draft_token_ids_in_output_strips_padding():
+         -1,
+     ]
+     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
++
++
++def _skip_drafts_per_step(
++    num_requests: int, num_tokens: int, max_tokens: int, num_steps: int = 2
++) -> list[bool]:
++    """SchedulerOutput.skip_drafts for each step, with 64-token chunks."""
++    scheduler = create_scheduler(num_speculative_tokens=2, max_num_batched_tokens=64)
++    # As for a drafter on the V2 model runner (the ngram config reserves no
++    # lookahead slots, which disables the check).
++    scheduler.can_skip_drafts = True
++    for request in create_requests(num_requests, num_tokens, max_tokens=max_tokens):
++        scheduler.add_request(request)
++    skip_drafts = []
++    for _ in range(num_steps):
++        output = scheduler.schedule()
++        skip_drafts.append(output.skip_drafts)
++        req_ids = list(output.num_scheduled_tokens)
++        requests = [scheduler.requests[req_id] for req_id in req_ids]
++        model_runner_output = ModelRunnerOutput(
++            req_ids=req_ids,
++            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++            sampled_token_ids=[
++                [] if r.num_computed_tokens < r.num_tokens else [100] for r in requests
++            ],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        )
++        scheduler.update_from_output(output, model_runner_output)
++    return skip_drafts
++
++
++def test_skip_drafts_only_when_no_request_can_use_them():
++    # A non-final chunk drafts nothing; a final chunk that samples the last of
++    # max_tokens finishes the request.
++    assert _skip_drafts_per_step(1, num_tokens=100, max_tokens=1) == [True, True]
++    # The final chunk's drafts are verified by the next decode step.
++    assert _skip_drafts_per_step(1, num_tokens=100, max_tokens=2) == [True, False]
++    # One request finishes its prompt next to the other's non-final chunk.
++    assert _skip_drafts_per_step(2, num_tokens=40, max_tokens=2, num_steps=1) == [False]
++
++
++def test_drafts_unused_with_async_placeholders():
++    """The predicate must assume that all in-flight drafts are rejected."""
++    scheduler = create_scheduler(num_speculative_tokens=2)
++    (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=3)
++
++    # Non-final prefill chunk: no sample, drafts unusable.
++    assert scheduler._drafts_unused(request, 0, 8)
++    # Final prefill chunk with max_tokens=3: drafts usable.
++    assert not scheduler._drafts_unused(request, 0, 16)
++
++    # Sync decode: 2 of 3 output tokens verified; this step must finish.
++    request.append_output_token_ids(100)
++    request.append_output_token_ids(101)
++    assert scheduler._drafts_unused(request, 17, 1)
++    # Only 1 verified output: this step may or may not finish.
++    (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=3)
++    request.append_output_token_ids(100)
++    assert not scheduler._drafts_unused(request, 16, 1)
++
++    # Async decode, 1 verified output and one in-flight step (1 sample +
++    # 1 draft placeholder): worst case still reaches 3 = max_tokens.
++    request.num_output_placeholders = 2
++    assert scheduler._drafts_unused(request, 18, 3)
++    # 0 verified outputs: worst case gives only 2 tokens, not guaranteed.
++    (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=3)
++    request.num_output_placeholders = 2
++    assert not scheduler._drafts_unused(request, 17, 3)
+diff --git a/tests/v1/worker/test_gpu_dp_utils.py b/tests/v1/worker/test_gpu_dp_utils.py
+new file mode 100644
+index 000000000..1f061daf1
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_dp_utils.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for the DP batch-descriptor sync, in particular the AND-reduced
++allow_skip_drafts flag that lets speculators skip their draft phase
++uniformly across DP ranks."""
++
++from types import SimpleNamespace
++from unittest import mock
++
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu import dp_utils
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
++
++
++def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
++    """Run sync_cudagraph_and_dp_padding as dp rank 0 of 2, with rank 1's
++    all_reduce contribution simulated."""
++
++    def fake_all_reduce(tensor, group=None):
++        tensor[0][1] = 8  # rank 1 num_tokens
++        tensor[1][1] = CUDAGraphMode.NONE.value
++        tensor[2][1] = 0  # uniform_token_count (0 means None)
++        tensor[3][1] = -1  # max_query_len (-1 means None)
++        tensor[4][1] = 0  # allow_ubatching
++        tensor[5][1] = 2  # rank 1 num_reqs
++        tensor[6][1] = int(other_allow_skip)
++
++    desc = BatchExecutionDescriptor(
++        cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=2
++    )
++    with (
++        mock.patch.object(dp_utils.dist, "all_reduce", fake_all_reduce),
++        mock.patch.object(
++            dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
++        ),
++    ):
++        _, sync = dp_utils.sync_cudagraph_and_dp_padding(
++            cudagraph_manager=None,
++            desired_batch_desc=desc,
++            num_tokens=4,
++            num_reqs=2,
++            uniform_token_count=None,
++            dp_size=2,
++            dp_rank=0,
++            allow_skip_drafts=local_allow_skip,
++        )
++    assert sync is not None
++    return sync.skip_drafts
++
++
++def test_skip_drafts_requires_all_ranks():
++    assert _run_sync(True, True)
++    assert not _run_sync(True, False)
++    assert not _run_sync(False, True)
++    assert not _run_sync(False, False)
++
++
++def test_dispatch_dp1_returns_no_sync():
++    # With a single rank there is no agreement to make; callers fall back to
++    # their local allow_skip_drafts value.
++    _, sync = dp_utils.dispatch_cg_and_sync_dp(
++        cudagraph_manager=None,
++        num_reqs=2,
++        num_tokens=4,
++        uniform_token_count=None,
++        dp_size=1,
++        dp_rank=0,
++        need_eager=True,
++        allow_skip_drafts=True,
++    )
++    assert sync is None
+diff --git a/tests/v1/worker/test_gpu_ubatch_slicing.py b/tests/v1/worker/test_gpu_ubatch_slicing.py
+index e735953d8..3002cfae6 100644
+--- a/tests/v1/worker/test_gpu_ubatch_slicing.py
++++ b/tests/v1/worker/test_gpu_ubatch_slicing.py
+@@ -292,13 +292,14 @@ def _sync_dp(
+     """
+     dp_size = len(num_tokens_per_rank)
+     uniform_token_counts = uniform_token_count_per_rank or [0] * dp_size
+-    reduced = torch.zeros(6, dp_size, dtype=torch.int32)
++    reduced = torch.zeros(7, dp_size, dtype=torch.int32)
+     reduced[0] = torch.tensor(num_tokens_per_rank, dtype=torch.int32)
+     reduced[1] = CUDAGraphMode.NONE.value
+     reduced[2] = torch.tensor(uniform_token_counts, dtype=torch.int32)
+     reduced[3] = -1  # max_query_len, -1 means None
+     reduced[4] = int(allow_ubatching)
+     reduced[5] = 8  # num_reqs
++    reduced[6] = 0  # allow_skip_drafts
+ 
+     with (
+         patch.object(dp_utils.dist, "all_reduce", lambda t, group: t.copy_(reduced)),
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 412f1233d..d17d02593 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -317,6 +317,11 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int | None = None
+ 
++    # Whether no scheduled request can use the drafts proposed after this step
++    # (non-final prefill chunks, or requests sure to reach max_tokens), so the
++    # drafter can skip proposing them.
++    skip_drafts: bool = False
++
+     # Sink rejection (vllm.v1.sample.sink): the requests whose scheduled spec
+     # tokens start with draft zero, the provisional token their previous step
+     # sampled, ahead of the drafter's tokens. None with rejection off.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1e4891830..d6412653d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -369,6 +369,12 @@ class Scheduler(SchedulerInterface):
+         if self.scheduler_config.align_prefill_chunks:
+             self._check_aligned_prefill_chunks()
+         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
++        # The V2 model runner skips drafting in steps where no scheduled request
++        # can use the drafts. Only drafters with their own forward pass reserve
++        # lookahead slots.
++        self.can_skip_drafts = (
++            self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
++        )
+         self.dynamic_sd_lookup: list[int] | None = None
+         self.acceptance_length_controller: (
+             BatchSizeAcceptanceLengthController | None
+@@ -576,6 +582,55 @@ class Scheduler(SchedulerInterface):
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
++    def _drafts_unused(
++        self, request: Request, num_computed_tokens: int, num_new_tokens: int
++    ) -> bool:
++        """Whether the drafts proposed for `request` after this step are sure to
++        go unused.
++
++        Drafts proposed after a step are verified in the request's next decode
++        step. They go unused when no such step follows, in two cases:
++
++        1. This step is a non-final prefill chunk. It samples no token, and the
++           scheduler drops drafts proposed after a prefill chunk.
++        2. This step samples the request's last output token: even if every
++           draft is rejected, the request reaches `max_tokens` and finishes.
++
++        Stop tokens and stop strings also end requests, but they cannot be known
++        in advance. This returns True only when it is sure.
++
++        The model runner proposes no drafts (K=0) in a step where this is True
++        for every scheduled request on every DP rank.
++
++        Args:
++            request: A request scheduled in this step.
++            num_computed_tokens: Tokens computed before this step, including
++                prefix-cache and KV-connector hits for a newly admitted request.
++            num_new_tokens: Tokens scheduled for this step.
++
++        """
++        # Case 1: a non-final prefill chunk stops before the request's last
++        # known token, so this step samples nothing.
++        if num_computed_tokens + num_new_tokens < request.num_tokens:
++            return True
++
++        # Case 2: this step samples the request's last output token. Drafts may
++        # all be rejected, so count only the output tokens the request is sure
++        # to have once this step finishes: the verified ones, plus one from each
++        # step that samples. This step samples one.
++        if self.sink_rejection and (
++            request.sink_draft_zero or request.num_in_flight_tokens > 0
++        ):
++            # A decode step's draft zero may be rejected and resampled in place.
++            return False
++        min_num_output_tokens = request.num_output_tokens + 1
++        if request.num_output_placeholders > 0:
++            # Async scheduling: a step that samples is still in flight, and it
++            # adds one more.
++            min_num_output_tokens += 1
++        # Reaching max_tokens finishes the request, so no step verifies the drafts.
++        return min_num_output_tokens >= request.max_tokens
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -1040,6 +1095,9 @@ class Scheduler(SchedulerInterface):
+         encoder_compute_budget = self.max_num_encoder_input_tokens
+         # Spec decode-related.
+         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
++        # Whether a request scheduled this step can use the drafts proposed after
++        # it. Stays set if that request is preempted later in the step.
++        drafts_needed = not self.can_skip_drafts
+         # Whether the running batch contains any prefill requests.
+         prefill_scheduled = False
+         # Whether any scheduled request has a synchronous connector KV load.
+@@ -1207,6 +1265,7 @@ class Scheduler(SchedulerInterface):
+         ) -> None:
+             nonlocal copy_rows_left
+             nonlocal draft_input_budget
++            nonlocal drafts_needed
+             nonlocal encoder_compute_budget
+             nonlocal input_budget
+             nonlocal prefill_scheduled
+@@ -1522,6 +1581,9 @@ class Scheduler(SchedulerInterface):
+                 if enforce_lora_limit and request.lora_request:
+                     scheduled_loras.add(request.lora_request.lora_int_id)
+                 req_index += 1
++                drafts_needed = drafts_needed or not self._drafts_unused(
++                    request, request.num_computed_tokens, num_new_tokens
++                )
+ 
+                 # Speculative decode related.
+                 if request.spec_token_ids:
+@@ -2196,6 +2258,9 @@ class Scheduler(SchedulerInterface):
+                 draft_input_budget -= separate_draft_input_tokens
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
++                drafts_needed = drafts_needed or not self._drafts_unused(
++                    request, num_computed_tokens, num_new_tokens
++                )
+                 if pad_spec_decode:
+                     assert num_new_tokens == 1 + self.num_spec_tokens
+                     scheduled_spec_decode_tokens[request_id] = [
+@@ -2476,6 +2541,7 @@ class Scheduler(SchedulerInterface):
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
++            skip_drafts=not drafts_needed,
+             sink_draft_zero_req_ids=sink_draft_zero_req_ids,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+             compute_service_class=compute_service_class,
+diff --git a/vllm/v1/worker/gpu/dp_utils.py b/vllm/v1/worker/gpu/dp_utils.py
+index 80309bc00..0ea7a1b72 100644
+--- a/vllm/v1/worker/gpu/dp_utils.py
++++ b/vllm/v1/worker/gpu/dp_utils.py
+@@ -39,6 +39,9 @@ class DPSyncState:
+     # Agreed upper bound on any rank's request count. Holds the padded count when
+     # a FULL descriptor imposed one, else the most any rank scheduled.
+     num_reqs: int
++    # Whether every rank's scheduler found that none of its requests can use this
++    # step's drafts, so all ranks skip drafting together.
++    skip_drafts: bool = False
+ 
+ 
+ def sync_cudagraph_and_dp_padding(
+@@ -54,6 +57,7 @@ def sync_cudagraph_and_dp_padding(
+     parallel_config: ParallelConfig | None = None,
+     allow_ubatching: bool = False,
+     uniform_decode: bool = False,
++    allow_skip_drafts: bool = False,
+ ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+     """
+     Coordinates the batch descriptor and DP padding across all ranks.
+@@ -65,13 +69,14 @@ def sync_cudagraph_and_dp_padding(
+     """
+     assert dp_size > 1, "DP size must be greater than 1"
+     group = get_dp_group().cpu_group
+-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
++    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+     tensor[0][dp_rank] = num_tokens
+     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
+     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
+     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+     tensor[4][dp_rank] = int(allow_ubatching)
+     tensor[5][dp_rank] = num_reqs
++    tensor[6][dp_rank] = int(allow_skip_drafts)
+     if should_skip_dp_coordination():
+         tensor[:] = tensor[:, dp_rank, None].clone()
+     else:
+@@ -83,6 +88,8 @@ def sync_cudagraph_and_dp_padding(
+     max_query_lens_across_dp = tensor[3]
+     allow_ubatching_across_dp = tensor[4]
+     num_reqs_across_dp = tensor[5]
++    allow_skip_drafts_across_dp = tensor[6]
++    skip_drafts = bool(torch.all(allow_skip_drafts_across_dp == 1))
+ 
+     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
+     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
+@@ -151,6 +158,7 @@ def sync_cudagraph_and_dp_padding(
+                 uniform_token_count=synced_uniform_token_count,
+                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
+                 num_reqs=num_reqs,
++                skip_drafts=skip_drafts,
+             )
+ 
+     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
+@@ -169,6 +177,7 @@ def sync_cudagraph_and_dp_padding(
+                 uniform_token_count=synced_uniform_token_count,
+                 eager=True,
+                 num_reqs=int(num_reqs_across_dp.max()),
++                skip_drafts=skip_drafts,
+             ),
+         )
+ 
+@@ -208,6 +217,7 @@ def sync_cudagraph_and_dp_padding(
+             and synced_desc.num_reqs is not None
+             else int(num_reqs_across_dp.max())
+         ),
++        skip_drafts=skip_drafts,
+     )
+ 
+ 
+@@ -224,6 +234,7 @@ def dispatch_cg_and_sync_dp(
+     parallel_config: ParallelConfig | None = None,
+     allow_ubatching: bool = False,
+     uniform_decode: bool = False,
++    allow_skip_drafts: bool = False,
+     dp_sync: DPSyncState | None = None,
+ ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
+@@ -315,4 +326,5 @@ def dispatch_cg_and_sync_dp(
+         parallel_config=parallel_config,
+         allow_ubatching=allow_ubatching,
+         uniform_decode=uniform_decode,
++        allow_skip_drafts=allow_skip_drafts,
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fe7a1929c..3cf31676e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -197,6 +197,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+     maybe_create_adaptive_verification_manager,
+     resolve_adaptive_cudagraph_mode,
+ )
++from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
++    AutoRegressiveSpeculator,
++)
+ from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+@@ -2908,6 +2911,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
+             ),
+             uniform_decode=uniform_tok_count == self.uniform_decode_query_len,
++            allow_skip_drafts=getattr(scheduler_output, "skip_drafts", False),
+         )
+ 
+         if batch_desc.num_tokens == 0:
+@@ -2949,6 +2953,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # Connector metadata can carry stores for other requests even
+                 # when this request resumes without an attention forward.
+                 self.kv_connector.pre_forward(scheduler_output)
++                skip_drafts = (
++                    dp_sync.skip_drafts
++                    if dp_sync is not None
++                    else getattr(scheduler_output, "skip_drafts", False)
++                )
+                 self.execute_model_state = ExecuteModelState(
+                     input_batch=input_batch,
+                     attn_metadata=None,
+@@ -2960,8 +2969,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     ec_connector_output=None,
+                     routed_experts=None,
+                     cudagraph_stats=cudagraph_stats,
+-                    num_spec_tokens_to_schedule=scheduler_output.resolve_num_spec_tokens_to_schedule(
+-                        self.num_draft_steps
++                    num_spec_tokens_to_schedule=(
++                        0
++                        if skip_drafts
++                        else scheduler_output.resolve_num_spec_tokens_to_schedule(
++                            self.num_draft_steps
++                        )
+                     ),
+                     boundary_logits_only=True,
+                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
+@@ -3243,6 +3256,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
+ 
+         finished_req_ids = scheduler_output.finished_req_ids
++        # Propose no drafts (K=0) when no DP rank's scheduled requests can use them.
++        skip_drafts = (
++            dp_sync.skip_drafts
++            if dp_sync is not None
++            else getattr(scheduler_output, "skip_drafts", False)
++        )
+         self.execute_model_state = ExecuteModelState(
+             input_batch=input_batch,
+             attn_metadata=attn_metadata,
+@@ -3255,7 +3274,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             routed_experts=routed_experts,
+             cudagraph_stats=cudagraph_stats,
+             num_spec_tokens_to_schedule=(
+-                scheduler_output.resolve_num_spec_tokens_to_schedule(
++                0
++                if skip_drafts
++                else scheduler_output.resolve_num_spec_tokens_to_schedule(
+                     self.num_draft_steps
+                 )
+             ),
+@@ -3468,7 +3489,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 draft_tokens_for_next_step,
+                 self.req_states.draft_tokens,
+             )
+-        elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
++        elif self.speculator is not None and not boundary_logits_only and (
++            num_spec_tokens_to_schedule > 0
++            or isinstance(
++                self.speculator, (DFlashSpeculator, AutoRegressiveSpeculator)
++            )
++        ):
+             assert self.sampler is not None
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 observed_rejected = num_rejected
+@@ -3499,13 +3525,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Let the target override the hidden state fed to the drafter
+             # (_mtp_target_states).
+             spec_hidden_states = _mtp_target_states(self.model, draft_hidden_states)
+-            if isinstance(self.sampler, GPUWatermarkSampler):
++            if (
++                isinstance(self.sampler, GPUWatermarkSampler)
++                and num_spec_tokens_to_schedule > 0
++            ):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                 )
+             verified = None
+-            if self.copy_drafter is not None:
++            if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
+                 # Match the updated histories and publish next-step alloc and
+                 # slot draft limits before the drafter runs, so the async output
+                 # copy completes on output_copy_stream while DSpark executes.
+@@ -3572,14 +3601,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 )
+                 if boundary_state is not None:
+                     self.speculator.boundary_checkpoint_capture = None
+-                draft_tokens = limit_draft_tokens(
+-                    draft_tokens,
+-                    num_spec_tokens_to_schedule,
+-                    self.num_draft_steps,
+-                )
++                if num_spec_tokens_to_schedule > 0:
++                    draft_tokens = limit_draft_tokens(
++                        draft_tokens,
++                        num_spec_tokens_to_schedule,
++                        self.num_draft_steps,
++                    )
++                else:
++                    draft_tokens = draft_tokens[:, :0]
+             confidences = self.speculator.draft_token_confidence_probs
+             planned_confidences = None
+-            if self.copy_drafter is not None:
++            if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
+                 # A request whose context repeats its own earlier text takes the
+                 # copy in place of DSpark's drafts. Warmup runs without adaptive
+                 # verification (fixed draft counts); its rows verify none.
+@@ -3614,7 +3646,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     )
+             else:
+                 draft_tokens_for_next_step = draft_tokens
+-            if self.adaptive_verification is not None:
++            if (
++                self.adaptive_verification is not None
++                and num_spec_tokens_to_schedule > 0
++            ):
+                 self.adaptive_verification.record_confidences(
+                     confidences, input_batch, planned=planned_confidences
+                 )
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index d7202c83c..958e9c58b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -266,9 +266,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+     ) -> torch.Tensor:
+         if num_speculative_tokens is None:
+             num_speculative_tokens = self.num_speculative_steps
+-        if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
++        if not 0 <= num_speculative_tokens <= self.num_speculative_steps:
+             raise ValueError(
+-                "num_speculative_tokens must be between 1 and "
++                "num_speculative_tokens must be between 0 and "
+                 f"{self.num_speculative_steps}, got {num_speculative_tokens}."
+             )
+ 
+@@ -374,12 +374,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                 num_tokens_across_dp=num_tokens_across_dp,
+                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
+                 mm_inputs=mm_inputs,
++                skip_sample=num_speculative_tokens == 0,
+             )
+         self.on_prefill_end(num_reqs)
+ 
+-        if num_speculative_tokens == 1:
++        if num_speculative_tokens <= 1:
+             # Early exit.
+-            return self.draft_tokens[:num_reqs, :1]
++            return self.draft_tokens[:num_reqs, :num_speculative_tokens]
+ 
+         if self.pcp_manager is not None and not dummy_run:
+             self.block_tables.gather_block_tables(
+@@ -545,6 +546,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        skip_sample: bool = False,
+     ) -> None:
+         # Bind compact outputs to this graph's request capacity during capture.
+         self.on_prefill_begin(num_reqs)
+@@ -568,6 +570,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
+                 last_hidden_states, hidden_states
+             )
++        if skip_sample:
++            # No drafts are needed; this pass only keeps the drafter KV in sync.
++            return
+         if self.prefill_outputs_are_compact:
+             sample_hidden_states = last_hidden_states[:num_reqs]
+             feedback_hidden_states = hidden_states[:num_reqs]
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 3ef38d71f..d3b216abe 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -605,7 +605,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+         is_profile: bool = False,
+         context_kv_is_restored: bool = False,
+     ) -> torch.Tensor:
+-        del num_speculative_tokens
+         num_reqs = input_batch.num_reqs
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+@@ -779,6 +778,11 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 context_slots,
+             )
+ 
++        if num_speculative_tokens == 0:
++            # No drafts are needed: the context K/V has been stored above to
++            # keep the drafter in sync, so skip the query pass.
++            return self.draft_tokens[:num_reqs]
++
+         batch_sync, num_batch_tokens = (
+             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+             if dp_sync is not None
+-- 
+2.54.0 (Apple Git-157)
+
