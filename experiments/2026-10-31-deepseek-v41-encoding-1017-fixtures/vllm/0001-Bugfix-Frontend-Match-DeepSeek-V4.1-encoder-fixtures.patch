@@ -1,0 +1,470 @@
+From a319611e85f0f906799219b5ba2c70731eb5bc27 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:26:12 +0100
+Subject: [PATCH] [Bugfix][Frontend] Match DeepSeek-V4.1 encoder fixtures to
+ the 1017 reference encoding (#62199)
+
+---
+ .../fixtures/deepseek_v41/test_input_1.json   | 82 ++++++++++++++++
+ .../fixtures/deepseek_v41/test_input_2.json   | 24 +++++
+ .../fixtures/deepseek_v41/test_input_3.json   | 93 +++++++++++++++++++
+ .../fixtures/deepseek_v41/test_input_4.json   | 28 ++++++
+ .../fixtures/deepseek_v41/test_input_5.json   | 39 ++++++++
+ .../fixtures/deepseek_v41/test_output_1.txt   |  4 +-
+ .../fixtures/deepseek_v41/test_output_2.txt   |  4 +-
+ .../fixtures/deepseek_v41/test_output_3.txt   | 35 +++++++
+ .../fixtures/deepseek_v41/test_output_4.txt   |  2 +
+ .../fixtures/deepseek_v41/test_output_5.txt   | 11 +++
+ tests/tokenizers_/test_deepseek_v41.py        | 29 ++++--
+ 11 files changed, 340 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_input_1.json
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_input_2.json
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_input_3.json
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_input_4.json
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_input_5.json
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_output_3.txt
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_output_4.txt
+ create mode 100644 tests/tokenizers_/fixtures/deepseek_v41/test_output_5.txt
+
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_input_1.json b/tests/tokenizers_/fixtures/deepseek_v41/test_input_1.json
+new file mode 100644
+index 000000000..c7435727e
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_input_1.json
+@@ -0,0 +1,82 @@
++{
++    "thinking_mode": "thinking",
++    "tools": [
++        {
++            "type": "function",
++            "function": {
++                "name": "get_weather",
++                "description": "Get the weather for a specific location",
++                "parameters": {
++                    "type": "object",
++                    "properties": {
++                        "location": {
++                            "type": "string",
++                            "description": "The city name"
++                        },
++                        "unit": {
++                            "type": "string",
++                            "enum": ["celsius", "fahrenheit"],
++                            "description": "Temperature unit"
++                        }
++                    },
++                    "required": ["location"]
++                }
++            }
++        },
++        {
++            "type": "function",
++            "function": {
++                "name": "search",
++                "description": "Search the web for information",
++                "parameters": {
++                    "type": "object",
++                    "properties": {
++                        "query": {
++                            "type": "string",
++                            "description": "Search query"
++                        },
++                        "num_results": {
++                            "type": "integer",
++                            "description": "Number of results to return"
++                        }
++                    },
++                    "required": ["query"]
++                }
++            }
++        }
++    ],
++    "messages": [
++        {
++            "role": "system",
++            "content": "You are a helpful assistant."
++        },
++        {
++            "role": "user",
++            "content": "What's the weather like in Beijing?"
++        },
++        {
++            "role": "assistant",
++            "reasoning_content": "The user wants the weather in Beijing. I should call get_weather.",
++            "content": "",
++            "tool_calls": [
++                {
++                    "type": "function",
++                    "function": {
++                        "name": "get_weather",
++                        "arguments": "{\"location\": \"Beijing\", \"unit\": \"celsius\"}"
++                    }
++                }
++            ]
++        },
++        {
++            "role": "tool",
++            "tool_call_id": "call_0",
++            "content": "{\"temperature\": 22, \"condition\": \"sunny\", \"humidity\": 45}"
++        },
++        {
++            "role": "assistant",
++            "reasoning_content": "Got the weather data. Let me format a nice response.",
++            "content": "The weather in Beijing is currently sunny with a temperature of 22\u00b0C and 45% humidity."
++        }
++    ]
++}
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_input_2.json b/tests/tokenizers_/fixtures/deepseek_v41/test_input_2.json
+new file mode 100644
+index 000000000..132bb05a5
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_input_2.json
+@@ -0,0 +1,24 @@
++[
++  {
++    "role": "system",
++    "content": "You are a helpful assistant."
++  },
++  {
++    "role": "user",
++    "content": "Hello"
++  },
++  {
++    "role": "assistant",
++    "reasoning_content": "The user said hello, I should greet back.",
++    "content": "Hi there! How can I help you?"
++  },
++  {
++    "role": "user",
++    "content": "What is the capital of France?"
++  },
++  {
++    "role": "assistant",
++    "reasoning_content": "The user asks about the capital of France. It is Paris.",
++    "content": "The capital of France is Paris."
++  }
++]
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_input_3.json b/tests/tokenizers_/fixtures/deepseek_v41/test_input_3.json
+new file mode 100644
+index 000000000..6d2612113
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_input_3.json
+@@ -0,0 +1,93 @@
++[
++  {
++    "role": "system",
++    "content": "该助手为DeepSeek，由深度求索公司创造。"
++  },
++  {
++    "role": "latest_reminder",
++    "content": "2026-02-21,星期六,广州,App,中文"
++  },
++  {
++    "role": "system",
++    "content": "CITATION FORMAT: 【{cursor_id}†L{start_line_id}(-L{end_line_id})?】",
++    "tools": [
++      {
++        "type": "function",
++        "function": {
++          "name": "search",
++          "description": "Web search. Split multiple queries with '||'.",
++          "parameters": {
++            "type": "object",
++            "properties": {
++              "queries": {
++                "type": "string",
++                "description": "query1||query2"
++              }
++            },
++            "required": ["queries"],
++            "additionalProperties": false
++          }
++        }
++      },
++      {
++        "type": "function",
++        "function": {
++          "name": "open",
++          "description": "Batch open IDs (format 【{id}†...】) or URLs.",
++          "parameters": {
++            "type": "object",
++            "properties": {
++              "open_list": {
++                "type": "array",
++                "items": {
++                  "type": "object",
++                  "properties": {
++                    "id": {
++                      "description": "ID or URL",
++                      "anyOf": [{"type": "integer"}, {"type": "string"}],
++                      "default": -1
++                    },
++                    "loc": {"type": "integer", "description": "Start line", "default": -1},
++                    "num_lines": {"type": "integer", "description": "", "default": -1}
++                  },
++                  "additionalProperties": false
++                },
++                "description": ""
++              }
++            },
++            "required": ["open_list"],
++            "additionalProperties": false
++          }
++        }
++      }
++    ]
++  },
++  {
++    "role": "user",
++    "content": "小柴胡冲剂和布洛芬能一起吃吗？"
++  },
++  {
++    "role": "assistant",
++    "content": "",
++    "reasoning_content": "用户想知道小柴胡冲剂和布洛芬能否一起服用。",
++    "tool_calls": [
++      {
++        "type": "function",
++        "function": {
++          "name": "search",
++          "arguments": "{\"queries\": \"小柴胡冲剂 布洛芬 相互作用 一起吃\"}"
++        }
++      }
++    ]
++  },
++  {
++    "role": "tool",
++    "content": "[0]"
++  },
++  {
++    "role": "assistant",
++    "content": "请及时就医。",
++    "reasoning_content": "现在开始组织回答。",
++    "tool_calls": []
++  }
++]
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_input_4.json b/tests/tokenizers_/fixtures/deepseek_v41/test_input_4.json
+new file mode 100644
+index 000000000..86cd1f0a6
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_input_4.json
+@@ -0,0 +1,28 @@
++[
++  {
++    "role": "system",
++    "content": "该助手为DeepSeek-V3，由深度求索公司创造。\n今天是2025年10月17日，星期五。"
++  },
++  {
++    "role": "latest_reminder",
++    "content": "2024-11-15,上海市,App,中文"
++  },
++  {
++    "role": "user",
++    "content": "热海大滚锅是世界著名温泉吗"
++  },
++  {
++    "role": "assistant",
++    "content": "热海大滚锅在中国乃至全球的地热奇观中占有重要地位，但“世界著名”的称号更侧重于它作为独特的地质现象和旅游景点。",
++    "mask": 1
++  },
++  {
++    "role": "user",
++    "content": "世界著名温泉有哪些",
++    "task": "action"
++  },
++  {
++    "role": "assistant",
++    "content": "Search"
++  }
++]
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_input_5.json b/tests/tokenizers_/fixtures/deepseek_v41/test_input_5.json
+new file mode 100644
+index 000000000..2a2fa6a89
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_input_5.json
+@@ -0,0 +1,39 @@
++{
++    "thinking_mode": "thinking",
++    "reasoning_effort": "max",
++    "messages": [
++        {
++            "role": "system",
++            "content": "You are a helpful vision assistant."
++        },
++        {
++            "role": "user",
++            "content": [
++                {
++                    "type": "text",
++                    "text": "请按“第一张、第二张”的顺序回答：第一张图"
++                },
++                {
++                    "type": "image_url",
++                    "image_url": {
++                        "url": "examples/images/carrots.jpeg"
++                    }
++                },
++                {
++                    "type": "text",
++                    "text": "和第二张图"
++                },
++                {
++                    "type": "image_url",
++                    "image_url": {
++                        "url": "examples/images/corn.jpeg"
++                    }
++                },
++                {
++                    "type": "text",
++                    "text": "中分别是什么食材？它们通常食用的部位分别是什么？"
++                }
++            ]
++        }
++    ]
++}
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_output_1.txt b/tests/tokenizers_/fixtures/deepseek_v41/test_output_1.txt
+index 089708668..3dc9bfe93 100644
+--- a/tests/tokenizers_/fixtures/deepseek_v41/test_output_1.txt
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_output_1.txt
+@@ -1,4 +1,4 @@
+-<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)
++<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)
+ 
+ You are a helpful assistant.
+ 
+@@ -28,7 +28,7 @@ Otherwise, output directly after </think> with tool calls or final response.
+ {"name": "search", "description": "Search the web for information", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]}}
+ 
+ You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+-<｜User｜>What's the weather in Beijing?<｜Assistant｜><think>The user wants to know the weather in Beijing. I should use the get_weather tool.</think>
++<｜User｜>What's the weather like in Beijing?<｜Assistant｜><think>The user wants the weather in Beijing. I should call get_weather.</think>
+ 
+ <｜DSML｜ calls>
+ <｜DSML｜ invoke name="get_weather">
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_output_2.txt b/tests/tokenizers_/fixtures/deepseek_v41/test_output_2.txt
+index 4e93ce2cb..78eb6be5d 100644
+--- a/tests/tokenizers_/fixtures/deepseek_v41/test_output_2.txt
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_output_2.txt
+@@ -1,3 +1 @@
+-<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)
+-
+-You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜><think>The user asks about the capital of France. It is Paris.</think>The capital of France is Paris.<｜end▁of▁sentence｜>
+\ No newline at end of file
++<｜begin▁of▁sentence｜><｜System｜>You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜></think>The capital of France is Paris.<｜end▁of▁sentence｜>
+\ No newline at end of file
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_output_3.txt b/tests/tokenizers_/fixtures/deepseek_v41/test_output_3.txt
+new file mode 100644
+index 000000000..90b2b6b74
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_output_3.txt
+@@ -0,0 +1,35 @@
++<｜begin▁of▁sentence｜><｜System｜>该助手为DeepSeek，由深度求索公司创造。<｜latest_reminder｜>2026-02-21,星期六,广州,App,中文<｜System｜>CITATION FORMAT: 【{cursor_id}†L{start_line_id}(-L{end_line_id})?】
++
++## Tools
++
++You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
++
++<｜DSML｜ calls>
++<｜DSML｜ invoke name="$TOOL_NAME">
++<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
++...
++</｜DSML｜ invoke>
++<｜DSML｜ invoke name="$TOOL_NAME2">
++...
++</｜DSML｜ invoke>
++</｜DSML｜ calls>
++
++String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
++
++If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
++
++Otherwise, output directly after </think> with tool calls or final response.
++
++### Available Tool Schemas
++
++{"name": "search", "description": "Web search. Split multiple queries with '||'.", "parameters": {"type": "object", "properties": {"queries": {"type": "string", "description": "query1||query2"}}, "required": ["queries"], "additionalProperties": false}}
++{"name": "open", "description": "Batch open IDs (format 【{id}†...】) or URLs.", "parameters": {"type": "object", "properties": {"open_list": {"type": "array", "items": {"type": "object", "properties": {"id": {"description": "ID or URL", "anyOf": [{"type": "integer"}, {"type": "string"}], "default": -1}, "loc": {"type": "integer", "description": "Start line", "default": -1}, "num_lines": {"type": "integer", "description": "", "default": -1}}, "additionalProperties": false}, "description": ""}}, "required": ["open_list"], "additionalProperties": false}}
++
++You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
++<｜User｜>小柴胡冲剂和布洛芬能一起吃吗？<｜Assistant｜></think>
++
++<｜DSML｜ calls>
++<｜DSML｜ invoke name="search">
++<｜DSML｜ parameter name="queries" string="true">小柴胡冲剂 布洛芬 相互作用 一起吃</｜DSML｜ parameter>
++</｜DSML｜ invoke>
++</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>[0]</tool_result><｜Assistant｜></think>请及时就医。<｜end▁of▁sentence｜>
+\ No newline at end of file
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_output_4.txt b/tests/tokenizers_/fixtures/deepseek_v41/test_output_4.txt
+new file mode 100644
+index 000000000..efad296eb
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_output_4.txt
+@@ -0,0 +1,2 @@
++<｜begin▁of▁sentence｜><｜System｜>该助手为DeepSeek-V3，由深度求索公司创造。
++今天是2025年10月17日，星期五。<｜latest_reminder｜>2024-11-15,上海市,App,中文<｜User｜>热海大滚锅是世界著名温泉吗<｜Assistant｜></think>热海大滚锅在中国乃至全球的地热奇观中占有重要地位，但“世界著名”的称号更侧重于它作为独特的地质现象和旅游景点。<｜end▁of▁sentence｜><｜User｜>世界著名温泉有哪些<｜Assistant｜></think><｜action｜>Search<｜end▁of▁sentence｜>
+\ No newline at end of file
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/test_output_5.txt b/tests/tokenizers_/fixtures/deepseek_v41/test_output_5.txt
+new file mode 100644
+index 000000000..a130bcc2c
+--- /dev/null
++++ b/tests/tokenizers_/fixtures/deepseek_v41/test_output_5.txt
+@@ -0,0 +1,11 @@
++<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)
++
++You are a helpful vision assistant.<｜User｜>请按“第一张、第二张”的顺序回答：第一张图
++
++<｜deepseek_image｜>
++
++和第二张图
++
++<｜deepseek_image｜>
++
++中分别是什么食材？它们通常食用的部位分别是什么？<｜Assistant｜><think>
+\ No newline at end of file
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 94edf6fbd..8cb8ef757 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -26,16 +26,33 @@ def render(messages, **kwargs):
+     )
+ 
+ 
+-@pytest.mark.parametrize("case_id", [1, 2])
++@pytest.mark.parametrize("case_id", [1, 2, 3, 4, 5])
+ def test_reference_encoder_fixtures(case_id):
+-    # Expected prompts come from the DeepSeek V4.1 reference encoder.
++    # Copied from DeepSeek-V4.1-Flash-1017 encoding/tests.
+     data = json.loads(
+-        (FIXTURES / "deepseek_v4" / f"test_input_{case_id}.json").read_text()
++        (FIXTURES / "deepseek_v41" / f"test_input_{case_id}.json").read_text()
+     )
+-    messages = data["messages"] if isinstance(data, dict) else data
+-    tools = data.get("tools") if isinstance(data, dict) else None
++    case = data if isinstance(data, dict) else {"messages": data}
++    messages = case["messages"]
++    thinking_mode = case.get("thinking_mode") or "chat"
+     expected = (FIXTURES / "deepseek_v41" / f"test_output_{case_id}.txt").read_text()
+-    assert render(messages, tools=tools, reasoning_effort=50) == expected
++
++    if any(m["role"] == "latest_reminder" for m in messages):
++        # latest_reminder is not an API role.
++        assert case.get("tools") is None
++        prompt = encode_messages(
++            messages,
++            thinking_mode=thinking_mode,
++            reasoning_effort=case.get("reasoning_effort"),
++        )
++    else:
++        prompt = render(
++            messages,
++            tools=case.get("tools"),
++            thinking=thinking_mode == "thinking",
++            reasoning_effort=case.get("reasoning_effort"),
++        )
++    assert prompt == expected
+ 
+ 
+ @pytest.mark.parametrize(
+-- 
+2.54.0 (Apple Git-157)
+
