@@ -1224,7 +1224,6 @@ class TransferRouteTest(unittest.TestCase):
         nodes = {"ssh_user": "swank"}
         target = lab.spark.transfer_target
         self.assertEqual(target(nodes, {"name": "dgx3", "transfer_host": "dgx3-cx7"}), "swank@dgx3-cx7")
-        self.assertEqual(target(nodes, {"name": "dgx4", "ssh_host": "10.0.1.74"}), "swank@10.0.1.74")
         self.assertEqual(target(nodes, {"name": "dgx2"}), "swank@dgx2")
 
 

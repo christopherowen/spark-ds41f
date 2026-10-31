@@ -426,16 +426,16 @@ Two files describe your site and stay out of git:
   `config/nodes-switched.local.json` for a switched four-node deployment (start from
   [config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and see
   [switched-fabric.md](switched-fabric.md)).
-  It names each node, its rank (the head is rank 0), management IP,
-  `ssh_user`, and `roce_peer_hcas`: for each peer rank, the local RoCE
-  devices cabled to it (`rdma link` shows them). `sparknet topology discover`
-  writes it. Two optional fields per node change how the head reaches it:
-  `ssh_host` replaces the node name for every SSH call, and `transfer_host`
-  only for the lab's bulk copies (kernel bundles, their inputs, profiler
-  traces). Setting `transfer_host` to the node's name on a CX7 link cabled
-  to the head (the `dgxN-internal` names in `/etc/hosts`) keeps large copies
-  off a struggling LAN switch; the head's `known_hosts` must know that name.
-  A node the head is not cabled to keeps its LAN route.
+  It names each node (`name`, used both as its SSH host and in status messages),
+  its rank (the head is rank 0), management IP, `ssh_user`, and `roce_peer_hcas`:
+  for each peer rank, the local RoCE devices cabled to it (`rdma link` shows them).
+  `sparknet topology discover` writes it. An optional `transfer_host` field per
+  node overrides the host used only for bulk copies (image distribution and the
+  lab's kernel bundles, inputs and profiler traces). Setting `transfer_host` to
+  the node's name on a CX7 link cabled to the head (the `dgxN-internal` names in
+  `/etc/hosts`) keeps large copies off a struggling LAN switch; the head's
+  `known_hosts` must know that name. A node the head is not cabled to keeps its
+  LAN route.
 - **The shape.** Name your cabling once: `bin/spark site shape tp3-triangle
   --apply` (or `tp3-triangle-4k`, `tp4-ring`) writes the git-ignored
   `config/site.json`, which `cluster sync` copies to every node. Every command

@@ -132,6 +132,6 @@ Each step leaves serving unchanged, and is checked as such before the next.
   outside the recipe, or remove them.
 - **A second cable between the same pair** (`nccl_hcas`'s extra lanes): sparknet handles it with
   paths 3 and 4. Keep it as part of the convention, or reject it.
-- **`ssh_host`, `transfer_host` and `mesh_*` in the local ring map:** these concern SSH, bulk
+- **`transfer_host` and `mesh_*` in the local ring map:** these concern bulk
   copies and the one-shot proxy, not addressing. Each needs classifying as a convention, a
   derived value or a genuine site setting.

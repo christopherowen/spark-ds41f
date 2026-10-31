@@ -34,7 +34,7 @@ VLLM_RING_ENV = {
     "VLLM_DISABLE_PYNCCL": "0",
 }
 # Node-map fields for this repository's access to a node, not the fabric.
-SITE_FIELDS = ("ssh_host", "transfer_host")
+SITE_FIELDS = ("transfer_host",)
 
 
 def transport(cluster: dict) -> str | None:

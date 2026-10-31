@@ -141,8 +141,10 @@ class SwitchedTopologyTest(unittest.TestCase):
     def test_site_access_fields_stay_out_of_the_fabric(self):
         cluster, nodes = fixture()
         for node in nodes['nodes']:
-            node.update(ssh_host=f"{node['name']}.local", transfer_host=node['management_ip'])
+            node.update(transfer_host=node['management_ip'])
         self.assertEqual(topology.problems(cluster, nodes), [])
+        self.assertTrue(topology.problems(cluster, copy.deepcopy(nodes) | {
+            'nodes': [{**n, 'ssh_host': f"{n['name']}.local"} for n in nodes['nodes']]}))
         self.assertTrue(topology.problems(cluster, copy.deepcopy(nodes) | {
             'nodes': [{**n, 'unknown_field': 1} for n in nodes['nodes']]}))
 
