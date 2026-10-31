@@ -1,0 +1,205 @@
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4e358c4e8..19a352b80 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -525,3 +525,24 @@ def test_timeline_is_off_by_default():
+     torch.cuda.synchronize()
+     assert not rows.timeline_enabled and rows.timeline() == []
+     rows.close()
++
++
++def test_mlock_pinned_and_mapped_host_buffers():
++    from vllm.v1.utils import CpuGpuBuffer
++
++    buf = CpuGpuBuffer(256, dtype=torch.int32, device=torch.device("cuda"), pin_memory=True)
++    assert buf._mlocked is True
++    buf.np[:4] = [11, 22, 33, 44]
++    out = buf.copy_to_gpu(4)
++    assert out.tolist() == [11, 22, 33, 44]
++
++    _, _, paths = _write_table(_table_dir(), seed=30)
++    rows = _rows(paths, tokens=4)
++    assert rows._ids_mlocked is True
++    assert rows.weights._mlocked is True
++    assert rows.scales._mlocked is True
++    assert rows.control._mlocked is True
++    rows.close()
++    assert rows._ids_mlocked is False
++    assert rows.weights._mlocked is False
++
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 89dcca295..f5acc279b 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -26,6 +26,7 @@ import numpy as np
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.engram_rows._native import load
++from vllm.v1.utils import mlock_memory, munlock_memory
+ 
+ ROW_BYTES = 256  # E4M3 values of one row
+ SCALE_BYTES = 8  # E8M0 scales of one row, one per 32 values
+@@ -73,6 +74,7 @@ class MappedHostAllocation:
+             flags |= cudart.cudaHostAllocWriteCombined
+         self.device = device = _indexed(device)
+         self.nbytes = math.prod(shape) * dtype.itemsize
++        self._mlocked = False
+         with torch.cuda.device(device):
+             self.pointer = int(_check(cudart.cudaHostAlloc(self.nbytes, flags), "cudaHostAlloc"))
+             try:
+@@ -80,6 +82,7 @@ class MappedHostAllocation:
+                                         "cudaHostGetDevicePointer")
+                 self.host = _tensor_at(self.pointer, shape, dtype, torch.device("cpu"))
+                 self.device_view = _tensor_at(int(device_pointer), shape, dtype, device)
++                self._mlocked = mlock_memory(self.pointer, self.nbytes)
+             except Exception:
+                 cudart.cudaFreeHost(self.pointer)
+                 self.pointer = 0
+@@ -89,6 +92,9 @@ class MappedHostAllocation:
+         from cuda.bindings import runtime as cudart
+ 
+         if self.pointer:
++            if self._mlocked:
++                munlock_memory(self.pointer, self.nbytes)
++                self._mlocked = False
+             _check(cudart.cudaFreeHost(self.pointer), "cudaFreeHost")
+             self.pointer = 0
+ 
+@@ -127,6 +133,7 @@ class EngramDiskRows:
+         self.timeline_enabled = bool(timeline)
+         self._allocations = []
+         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
++        self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+         self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+         self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+@@ -237,6 +244,9 @@ class EngramDiskRows:
+         """Stop the reader, then free the buffers; the GPU must be done with them."""
+         self._reader = None
+         torch.cuda.synchronize(self.device)
++        if getattr(self, "_ids_mlocked", False):
++            munlock_memory(self.ids.data_ptr(), self.ids.nbytes)
++            self._ids_mlocked = False
+         for allocation in self._allocations:
+             allocation.close()
+         self._allocations = []
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index facafd286..570a7f20a 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -2,8 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import argparse
+ import contextlib
++import ctypes
+ import json
+ import multiprocessing
++import os
++import resource
+ import threading
+ import time
+ import weakref
+@@ -107,6 +110,75 @@ class ConstantList(Generic[T], Sequence):
+         return self._x.copy()
+ 
+ 
++_mlock_state_lock = threading.Lock()
++_mlock_fn: Any = None
++_munlock_fn: Any = None
++_mlock_warned: bool = False
++_MIN_MEMLOCK_LIMIT = 64 << 20  # reserve tight (<64 MiB) RLIMIT_MEMLOCK for io_uring
++
++
++def _ensure_mlock_fns() -> tuple[Any, Any]:
++    global _mlock_fn, _munlock_fn
++    if _mlock_fn is not None:
++        return _mlock_fn, _munlock_fn
++    with _mlock_state_lock:
++        if _mlock_fn is None:
++            with contextlib.suppress(ValueError, OSError):
++                resource.setrlimit(
++                    resource.RLIMIT_MEMLOCK,
++                    (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
++                )
++            with contextlib.suppress(ValueError, OSError):
++                soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
++                if soft != resource.RLIM_INFINITY and (
++                    hard == resource.RLIM_INFINITY or soft < hard
++                ):
++                    resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
++            libc = ctypes.CDLL(None, use_errno=True)
++            mlock = libc.mlock
++            mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++            mlock.restype = ctypes.c_int
++            munlock = libc.munlock
++            munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++            munlock.restype = ctypes.c_int
++            _munlock_fn = munlock
++            _mlock_fn = mlock
++    return _mlock_fn, _munlock_fn
++
++
++def mlock_memory(addr: int, nbytes: int) -> bool:
++    """Lock a host virtual address range into RAM via ``mlock(2)``."""
++    global _mlock_warned
++    if addr <= 0 or nbytes <= 0:
++        return False
++    mlock, _ = _ensure_mlock_fns()
++    with contextlib.suppress(ValueError, OSError):
++        soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
++        if soft != resource.RLIM_INFINITY and soft < _MIN_MEMLOCK_LIMIT:
++            return False
++    if mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
++        return True
++    if not _mlock_warned:
++        err = ctypes.get_errno()
++        _mlock_warned = True
++        logger.debug(
++            "mlock(%#x, %d) failed: %s (errno=%d)",
++            addr,
++            nbytes,
++            os.strerror(err),
++            err,
++        )
++    return False
++
++
++def munlock_memory(addr: int, nbytes: int) -> None:
++    """Unlock a host virtual address range previously locked with ``mlock_memory``."""
++    if addr <= 0 or nbytes <= 0:
++        return
++    _, munlock = _ensure_mlock_fns()
++    munlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes))
++
++
+ class CpuGpuBuffer:
+     """Buffer to easily copy tensors between CPU and GPU."""
+ 
+@@ -118,12 +190,18 @@ class CpuGpuBuffer:
+         pin_memory: bool = PIN_MEMORY,
+         with_numpy: bool = True,
+     ) -> None:
++        self.pin_memory = pin_memory
+         # these buffers are mutable runtime state, so allocate them as normal
+         with torch.inference_mode(False):
+             self.cpu = torch.zeros(
+                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
+             )
+             self.gpu = torch.zeros_like(self.cpu, device=device)
++        self._mlocked = (
++            mlock_memory(self.cpu.data_ptr(), self.cpu.nbytes)
++            if pin_memory and self.cpu.numel() > 0
++            else False
++        )
+         self.np: np.ndarray
+         # To keep type hints simple (avoiding generics and subclasses), we
+         # only conditionally create the numpy array attribute. This can cause
+@@ -140,7 +218,7 @@ class CpuGpuBuffer:
+         cpu, gpu = self.cpu, self.gpu
+         if n is not None:
+             cpu, gpu = cpu[:n], gpu[:n]
+-        return gpu.copy_(cpu.pin_memory() if PIN_MEMORY else cpu, non_blocking=True)
++        return gpu.copy_(cpu, non_blocking=True)
+ 
+     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+         """NOTE: Because this method is non-blocking, explicit synchronization
