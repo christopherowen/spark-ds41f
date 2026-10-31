@@ -226,7 +226,7 @@ def findings(name, data, policy):
             issues.append(
                 f"{name}: boot memory service is still spark3-kernel-memory.service; "
                 "the policy is the same, rename it with "
-                "experiments/2026-10-02-kernel-64k/install-boot-support.sh"
+                "sudo scripts/configure-swap"
             )
         if any("64 KiB THP" in x or "64 KiB swap" in x or "spark3-kernel-memory" in x for x in issues):
             unit = data.get("memory_service_unit") or "spark-ds41f-kernel-memory.service"

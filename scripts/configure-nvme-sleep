@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Configure NVMe APST sleep timeouts (2 s primary, 60 s secondary) now and across reboots.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo "$0" "$@"
+fi
+
+echo 2000 >/sys/module/nvme_core/parameters/apst_primary_timeout_ms
+echo 60000 >/sys/module/nvme_core/parameters/apst_secondary_timeout_ms
+for c in /sys/class/nvme/nvme*; do
+  [ -e "$c/power/pm_qos_latency_tolerance_us" ] || continue
+  t=$(cat "$c/power/pm_qos_latency_tolerance_us")
+  echo $((t - 1)) >"$c/power/pm_qos_latency_tolerance_us"
+  echo "$t" >"$c/power/pm_qos_latency_tolerance_us"
+done
+echo "options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000" \
+  >/etc/modprobe.d/nvme-apst.conf
+update-initramfs -u
+echo "Configured NVMe APST timeouts (2000 ms / 60000 ms)."
