@@ -1,0 +1,2038 @@
+diff --git a/sparknet/integration/vllm/roce_all_reduce.py b/sparknet/integration/vllm/roce_all_reduce.py
+index eceee36..5f7a58e 100644
+--- a/sparknet/integration/vllm/roce_all_reduce.py
++++ b/sparknet/integration/vllm/roce_all_reduce.py
+@@ -85,6 +85,9 @@ class SparknetOneShotAllReduce:
+         self._runtime = None
+         self._announced = False
+         self._announced_gather = False
++        self._announced_reduce_scatter = False
++        self._announced_exchange = False
++        self._announced_a2a = False
+         self.global_ranks = tuple(int(r) for r in (global_ranks if global_ranks is not None else range(self.world_size)))
+         if len(self.global_ranks) != self.world_size:
+             raise ValueError("RoCE global ranks must match the process group")
+@@ -199,7 +202,7 @@ class SparknetOneShotAllReduce:
+         return self._runtime.all_reduce(inp)
+ 
+     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
+-        return not self.disabled and self._runtime.should_all_gather(inp, dim)
++        return not self.disabled and self._runtime.should_all_gather(inp, dim, sliced=True)
+ 
+     def all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
+         if not self._announced_gather:
+@@ -207,7 +210,40 @@ class SparknetOneShotAllReduce:
+             log = logger.info if self.rank == 0 else logger.debug
+             log("one-shot all-gather is live: first routed shard is %s %s along dim %d; input shard dispatch limit=%d bytes.",
+                 tuple(inp.shape), str(inp.dtype).replace("torch.", ""), dim, self.all_gather_max_bytes)
+-        return self._runtime.all_gather(inp, dim=dim)
++        return self._runtime.all_gather(inp, dim=dim, sliced=True)
++
++    def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
++        return not self.disabled and self._runtime.should_reduce_scatter(inp, dim=dim)
++
++    def reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor:
++        if not self._announced_reduce_scatter:
++            self._announced_reduce_scatter = True
++            log = logger.info if self.rank == 0 else logger.debug
++            log("one-shot reduce-scatter is live: first routed input is %s %s along dim %d.",
++                tuple(inp.shape), str(inp.dtype).replace("torch.", ""), dim)
++        return self._runtime.reduce_scatter(inp, dim=dim)
++
++    def should_exchange(self, chunks: torch.Tensor, parts: torch.Tensor | None = None) -> bool:
++        return not self.disabled and self._runtime.should_exchange(chunks, parts)
++
++    def exchange_into(self, chunks: torch.Tensor, parts: torch.Tensor) -> torch.Tensor:
++        if not self._announced_exchange:
++            self._announced_exchange = True
++            log = logger.info if self.rank == 0 else logger.debug
++            log("one-shot exchange is live: first routed tensor is %s %s.",
++                tuple(chunks.shape), str(chunks.dtype).replace("torch.", ""))
++        return self._runtime.exchange(chunks, out=parts)
++
++    def should_all_to_all_rows(self, inp: torch.Tensor, rows: int) -> bool:
++        return not self.disabled and self._runtime.should_all_to_all_rows(inp, rows)
++
++    def all_to_all_rows(self, inp: torch.Tensor, rows: int) -> torch.Tensor:
++        if not self._announced_a2a:
++            self._announced_a2a = True
++            log = logger.info if self.rank == 0 else logger.debug
++            log("one-shot all-to-all rows is live: first routed tensor is %s %s (rows=%d).",
++                tuple(inp.shape), str(inp.dtype).replace("torch.", ""), rows)
++        return self._runtime.all_to_all_rows(inp, rows)
+ 
+     def supports_fused_add_rms_norm(self) -> bool:
+         return False
+diff --git a/sparknet/oneshot/_allgather_tilelang.py b/sparknet/oneshot/_allgather_tilelang.py
+index af0fd25..869298e 100644
+--- a/sparknet/oneshot/_allgather_tilelang.py
++++ b/sparknet/oneshot/_allgather_tilelang.py
+@@ -48,6 +48,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+             shard_packs: T.int32,
+             nbytes: T.int32,
+             row_packs: T.int32,
++            dst_stride_packs: T.int32,
+             recv_off: T.int32,
+             flag_off: T.int32,
+             send_off: T.int32,
+@@ -81,7 +82,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                 for i in T.serial(count):
+                     T.call_extern("roce_stage_gather_pack", T.address_of(inp[0]),
+                                   T.call_extern("roce_ptr", region_base + T.cast(send_slot, T.int64), dtype="handle"),
+-                                  index + i * stride, row_packs, T.address_of(out[0]), dtype="handle")
++                                  index + i * stride, row_packs, T.address_of(out[0]), dst_stride_packs, dtype="handle")
+                 T.sync_threads()
+                 # 2. the last block to finish staging rings the proxy doorbell
+                 if tx == 0:
+@@ -102,7 +103,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                 for i in T.serial(count):
+                     T.call_extern("roce_gather_pack", T.call_extern("roce_ptr", region_base + T.cast(recv_off, T.int64), dtype="handle"),
+                                   T.cast(slot_bytes, T.int64), seq, index + i * stride, row_packs,
+-                                  T.address_of(out[0]), dtype="handle")
++                                  T.address_of(out[0]), dst_stride_packs, dtype="handle")
+                 # 5. the last block to finish publishes the next epoch
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+@@ -152,9 +153,11 @@ def get_launcher(
+ 
+     def run(launch: Launch) -> None:
+         """Launch the compiled kernel on the current stream (bound through the tensor arguments)."""
++        dst_stride = int(launch.dst_peer_packs) if launch.dst_peer_packs else int(launch.row_packs)
+         kernel(
+             launch.input, launch.output, launch.counters, int(launch.region.data_ptr()),
+-            int(launch.size_packs), int(launch.nbytes), int(launch.row_packs), int(launch.recv_off), int(launch.flag_off),
++            int(launch.size_packs), int(launch.nbytes), int(launch.row_packs), dst_stride,
++            int(launch.recv_off), int(launch.flag_off),
+             int(launch.send_off), int(launch.ctrl_off), int(launch.slot_bytes), int(launch.stage_index),
+             int(launch.tail_index), int(launch.rung_index), int(launch.arrival_index), int(launch.grid_x),
+         )
+diff --git a/sparknet/oneshot/_device.py b/sparknet/oneshot/_device.py
+index 2d7b434..7ec8ec3 100644
+--- a/sparknet/oneshot/_device.py
++++ b/sparknet/oneshot/_device.py
+@@ -37,6 +37,7 @@ FUNCTIONS = (
+     "roce_ptr",
+     "roce_copy_pack",
+     "roce_doorbell",
++    "roce_doorbell_exchange",
+     "roce_wait_flags",
+     "roce_wait_device_eq",
+     "roce_wait_peers",
+@@ -47,6 +48,9 @@ FUNCTIONS = (
+     "roce_gather_dest",
+     "roce_stage_gather_pack",
+     "roce_gather_pack",
++    "roce_stage_scatter_pack",
++    "roce_stage_exchange_pack",
++    "roce_exchange_pack",
+     "roce_globaltimer",
+     "roce_trace_record",
+     "roce_trace_store",
+@@ -62,6 +66,7 @@ _HEADER = r"""
+ // functions take pointers; the TileLang kernels pass T.address_of of their
+ // buffer arguments.
+ #define ROCE_PACK_BYTES 16
++#define ROCE_MODE_EXCHANGE 0x80000000u
+ 
+ typedef unsigned int roce_u32;
+ typedef unsigned char roce_byte;
+@@ -243,6 +248,14 @@ __device__ __forceinline__ roce_u32 roce_doorbell(void *stage_counter, roce_u32
+     return 0u;
+ }
+ 
++// Phase 2 (reduce-scatter / exchange): publish per-peer chunk_bytes with the
++// exchange mode bit set so the proxy sends each peer p its own slice at
++// send[slot] + p * chunk_bytes.
++__device__ __forceinline__ roce_u32 roce_doorbell_exchange(void *stage_counter, roce_u32 grid, roce_byte *ctrl,
++                                                           roce_u32 chunk_bytes, roce_u32 seq) {
++    return roce_doorbell(stage_counter, grid, ctrl, chunk_bytes | ROCE_MODE_EXCHANGE, seq);
++}
++
+ // Phase 3: one thread per (peer, flag lane) waits for that lane's flag. A
+ // timeout writes the missing peer, its lane and the time waited, then the
+ // failed sequence, into the control record (the proxy stops relaying when it
+@@ -430,22 +443,25 @@ __device__ __forceinline__ void roce_reduce_pack_bf16(const void *input, const v
+ 
+ // The output pack of source ``source`` for gather pack ``copy_index``: shard s
+ // occupies column block s of every output row (row_packs == shard_packs for a
+-// dim-0 concatenation).
+-__device__ __forceinline__ roce_byte *roce_gather_dest(void *output, int copy_index, int row_packs, int source) {
++// dim-0 concatenation; dst_stride_packs overrides the per-rank stride when a
++// dim-0 gather is pipelined in row slices).
++__device__ __forceinline__ roce_byte *roce_gather_dest(void *output, int copy_index, int row_packs, int source,
++                                                       int dst_stride_packs = 0) {
++    int stride = dst_stride_packs ? dst_stride_packs : row_packs;
+     int row = copy_index / row_packs;
+     int col = copy_index - row * row_packs;
+-    return (roce_byte *)output + (((long long)row * ROCE_WORLD + source) * row_packs + col) * ROCE_PACK_BYTES;
++    return (roce_byte *)output + (((long long)row * ROCE_WORLD + source) * stride + col) * ROCE_PACK_BYTES;
+ }
+ 
+ // Phase 1 (all-gather): stage one pack of the local shard into the send slot
+ // and write it to this rank's column block of the output, so the data phase
+ // reads only the peers.
+ __device__ __forceinline__ void roce_stage_gather_pack(const void *input, void *send, int copy_index, int row_packs,
+-                                                       void *output) {
++                                                       void *output, int dst_stride_packs = 0) {
+     long long offset = (long long)copy_index * ROCE_PACK_BYTES;
+     roce_pack p = roce_ld_global_pack((const roce_byte *)input + offset);
+     roce_st_global_pack((roce_byte *)send + offset, p);
+-    roce_st_global_pack(roce_gather_dest(output, copy_index, row_packs, ROCE_RANK), p);
++    roce_st_global_pack(roce_gather_dest(output, copy_index, row_packs, ROCE_RANK, dst_stride_packs), p);
+ }
+ 
+ // Phase 4 (all-gather): copy pack copy_index of every peer's shard to its
+@@ -455,7 +471,106 @@ __device__ __forceinline__ void roce_stage_gather_pack(const void *input, void *
+ // of four bound the registers.
+ #define ROCE_GATHER_GROUP 4
+ __device__ __forceinline__ void roce_gather_pack(const void *recv, long long slot_bytes, roce_u32 seq, int copy_index,
+-                                                 int row_packs, void *output) {
++                                                 int row_packs, void *output, int dst_stride_packs = 0) {
++    long long offset = (long long)copy_index * ROCE_PACK_BYTES;
++    long long slot = (long long)(seq & 1u);
++#pragma unroll
++    for (int first = 0; first < ROCE_WORLD - 1; first += ROCE_GATHER_GROUP) {
++        roce_pack p[ROCE_GATHER_GROUP];
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            if (first + k < ROCE_WORLD - 1) {
++                p[k] = roce_ld_relaxed_sys_pack((const roce_byte *)recv + ((long long)peer * ROCE_SLOTS + slot) * slot_bytes + offset);
++            }
++        }
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            if (first + k < ROCE_WORLD - 1) {
++                roce_st_global_pack(roce_gather_dest(output, copy_index, row_packs, peer, dst_stride_packs), p[k]);
++            }
++        }
++    }
++}
++
++// Phase 1 (reduce-scatter): stage pack copy_index of each peer's chunk (stride
++// src_peer_packs in input) into its contiguous chunk_packs slice of the pinned
++// send slot; this rank's own chunk stays in device memory and is read directly
++// by phase 4's fixed-order reduction.
++__device__ __forceinline__ void roce_stage_scatter_pack(const void *input, void *send, int copy_index,
++                                                        int chunk_packs, int src_peer_packs) {
++    long long pack_off = (long long)copy_index * ROCE_PACK_BYTES;
++    long long chunk_bytes = (long long)chunk_packs * ROCE_PACK_BYTES;
++#pragma unroll
++    for (int first = 0; first < ROCE_WORLD - 1; first += ROCE_GATHER_GROUP) {
++        roce_pack p[ROCE_GATHER_GROUP];
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            if (first + k < ROCE_WORLD - 1) {
++                p[k] = roce_ld_global_pack((const roce_byte *)input + ((long long)peer * src_peer_packs + copy_index) * ROCE_PACK_BYTES);
++            }
++        }
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            if (first + k < ROCE_WORLD - 1) {
++                roce_st_global_pack((roce_byte *)send + (long long)peer * chunk_bytes + pack_off, p[k]);
++            }
++        }
++    }
++}
++
++// Phase 1 (exchange / all-to-all): stage pack copy_index of each peer's chunk
++// (stride src_peer_packs in input, bounded by total_src_packs) into its
++// contiguous chunk_packs slice of the pinned send slot. When copy_self is
++// non-zero and copy_index < valid_out_packs, also copy this rank's own pack to
++// its output slice.
++__device__ __forceinline__ void roce_stage_exchange_pack(const void *input, void *send, int copy_index,
++                                                         int chunk_packs, int src_peer_packs, int dst_peer_packs,
++                                                         int total_src_packs, int valid_out_packs, int copy_self,
++                                                         void *output) {
++    long long pack_off = (long long)copy_index * ROCE_PACK_BYTES;
++    long long chunk_bytes = (long long)chunk_packs * ROCE_PACK_BYTES;
++    if (copy_self && copy_index < valid_out_packs) {
++        int self_pack = ROCE_RANK * src_peer_packs + copy_index;
++        if (self_pack < total_src_packs) {
++            roce_copy_pack((const roce_byte *)input + (long long)self_pack * ROCE_PACK_BYTES,
++                           (roce_byte *)output + ((long long)ROCE_RANK * dst_peer_packs + copy_index) * ROCE_PACK_BYTES);
++        }
++    }
++#pragma unroll
++    for (int first = 0; first < ROCE_WORLD - 1; first += ROCE_GATHER_GROUP) {
++        roce_pack p[ROCE_GATHER_GROUP];
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            int src_pack = peer * src_peer_packs + copy_index;
++            if (first + k < ROCE_WORLD - 1 && src_pack < total_src_packs) {
++                p[k] = roce_ld_global_pack((const roce_byte *)input + (long long)src_pack * ROCE_PACK_BYTES);
++            }
++        }
++#pragma unroll
++        for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
++            int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
++            int src_pack = peer * src_peer_packs + copy_index;
++            if (first + k < ROCE_WORLD - 1 && src_pack < total_src_packs) {
++                roce_st_global_pack((roce_byte *)send + (long long)peer * chunk_bytes + pack_off, p[k]);
++            }
++        }
++    }
++}
++
++// Phase 4 (exchange / all-to-all): copy pack copy_index of each peer's received
++// chunk from its pinned receive slot into that peer's output slice (stride
++// dst_peer_packs, bounded by valid_out_packs).
++__device__ __forceinline__ void roce_exchange_pack(const void *recv, long long slot_bytes, roce_u32 seq,
++                                                   int copy_index, int dst_peer_packs, int valid_out_packs,
++                                                   void *output) {
++    if (copy_index >= valid_out_packs) {
++        return;
++    }
+     long long offset = (long long)copy_index * ROCE_PACK_BYTES;
+     long long slot = (long long)(seq & 1u);
+ #pragma unroll
+@@ -472,7 +587,7 @@ __device__ __forceinline__ void roce_gather_pack(const void *recv, long long slo
+         for (int k = 0; k < ROCE_GATHER_GROUP; k++) {
+             int peer = (ROCE_RANK + 1 + first + k) % ROCE_WORLD;
+             if (first + k < ROCE_WORLD - 1) {
+-                roce_st_global_pack(roce_gather_dest(output, copy_index, row_packs, peer), p[k]);
++                roce_st_global_pack((roce_byte *)output + ((long long)peer * dst_peer_packs + copy_index) * ROCE_PACK_BYTES, p[k]);
+             }
+         }
+     }
+diff --git a/sparknet/oneshot/_exchange_tilelang.py b/sparknet/oneshot/_exchange_tilelang.py
+new file mode 100644
+index 0000000..cc21259
+--- /dev/null
++++ b/sparknet/oneshot/_exchange_tilelang.py
+@@ -0,0 +1,306 @@
++"""TileLang kernel for the RoCE one-shot all-to-all exchange.
++
++Stages each peer p's chunk (p != rank) into send[slot] + p * chunk_bytes (and
++optionally copies rank's own chunk into out[rank]), rings the proxy doorbell in
++exchange mode (ROCE_MODE_EXCHANGE), waits for every peer's stripe flags, and
++copies each peer's received chunk into out[p].
++"""
++
++# No postponed annotations: TileLang evaluates the prim_func's annotations
++# when the function is defined, and the symbolic shapes must be visible then.
++
++import functools
++import logging
++import time
++from typing import Callable
++
++from ._device import PACK_BYTES, render_source
++from ._freeze import raise_if_kernel_resolution_frozen
++from ._kernels import Launch
++from ._oneshot_tilelang import _lanes, _pass_configs, _resident_blocks
++
++logger = logging.getLogger(__name__)
++
++_PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
++
++
++def _build(
++    world_size: int,
++    rank: int,
++    threads: int,
++    slots: int,
++    flag_stride: int,
++    hca_count: int,
++    ring4: bool,
++):
++    import tilelang
++    import tilelang.language as T
++
++    lanes, neighbor_lanes = _lanes(hca_count, ring4)
++    source = render_source(
++        world_size=world_size,
++        rank=rank,
++        slots=slots,
++        flag_stride=flag_stride,
++        hca_count=lanes,
++        neighbor_lanes=neighbor_lanes,
++    )
++    resident = _resident_blocks(threads)
++
++    @tilelang.jit(pass_configs=_pass_configs())
++    def program():
++        n_in, n_out, n_counters = T.dynamic("n_in, n_out, n_counters")
++
++        @T.prim_func
++        def oneshot_exchange(
++            inp: T.Tensor((n_in,), T.int32),
++            out: T.Tensor((n_out,), T.int32),
++            counters: T.Tensor((n_counters,), T.int32),
++            region_base: T.int64,
++            chunk_packs: T.int32,
++            chunk_bytes: T.int32,
++            src_peer_packs: T.int32,
++            dst_peer_packs: T.int32,
++            total_src_packs: T.int32,
++            valid_out_packs: T.int32,
++            copy_self: T.int32,
++            recv_off: T.int32,
++            flag_off: T.int32,
++            send_off: T.int32,
++            ctrl_off: T.int32,
++            slot_bytes: T.int32,
++            stage_index: T.int32,
++            tail_index: T.int32,
++            rung_index: T.int32,
++            arrival_index: T.int32,
++            grid_x: T.int32,
++        ):
++            with T.Kernel(grid_x, threads=threads) as bx:
++                T.annotate_min_blocks_per_sm(resident)
++                T.import_source(source)
++                tx = T.get_thread_binding()
++                epoch = T.alloc_var(T.uint32)
++                epoch = T.call_extern(
++                    "roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32
++                )
++                seq = T.alloc_var(T.uint32)
++                seq = epoch + T.uint32(1)
++                slot = T.alloc_var(T.int32)
++                slot = T.cast(seq & T.uint32(1), T.int32)
++                send_slot = T.alloc_var(T.int32)
++                send_slot = send_off + slot * slot_bytes
++                index = T.alloc_var(T.int32)
++                index = bx * threads + tx
++                stride = T.alloc_var(T.int32)
++                stride = grid_x * threads
++                # 1. stage each peer's chunk into its slice of the pinned send slot
++                count = T.alloc_var(T.int32)
++                count = T.max(0, (chunk_packs - index + stride - 1) // stride)
++                for i in T.serial(count):
++                    T.call_extern(
++                        "roce_stage_exchange_pack",
++                        T.address_of(inp[0]),
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(send_slot, T.int64),
++                            dtype="handle",
++                        ),
++                        index + i * stride,
++                        chunk_packs,
++                        src_peer_packs,
++                        dst_peer_packs,
++                        total_src_packs,
++                        valid_out_packs,
++                        copy_self,
++                        T.address_of(out[0]),
++                        dtype="handle",
++                    )
++                T.sync_threads()
++                # 2. the last block to finish staging rings the proxy doorbell in exchange mode
++                if tx == 0:
++                    rang = T.alloc_var(T.uint32)
++                    rang = T.call_extern(
++                        "roce_doorbell_exchange",
++                        T.address_of(counters[stage_index]),
++                        T.cast(grid_x, T.uint32),
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(ctrl_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.cast(chunk_bytes, T.uint32),
++                        seq,
++                        dtype=T.uint32,
++                    )
++                    if rang != T.uint32(0):
++                        T.call_extern(
++                            "roce_st_release_gpu_u32",
++                            T.address_of(counters[rung_index]),
++                            seq,
++                            dtype="handle",
++                        )
++                # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
++                T.call_extern(
++                    "roce_wait_peers",
++                    bx,
++                    tx,
++                    T.call_extern(
++                        "roce_ptr",
++                        region_base + T.cast(flag_off, T.int64),
++                        dtype="handle",
++                    ),
++                    seq,
++                    T.call_extern(
++                        "roce_ptr",
++                        region_base + T.cast(ctrl_off, T.int64),
++                        dtype="handle",
++                    ),
++                    T.address_of(counters[rung_index]),
++                    T.address_of(counters[arrival_index]),
++                    dtype="handle",
++                )
++                T.sync_threads()
++                if bx == 0:
++                    if tx == 0:
++                        T.call_extern(
++                            "roce_st_release_gpu_u32",
++                            T.address_of(counters[arrival_index]),
++                            seq,
++                            dtype="handle",
++                        )
++                # 4. copy each peer's received chunk into its slice of out
++                for i in T.serial(count):
++                    T.call_extern(
++                        "roce_exchange_pack",
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(recv_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.cast(slot_bytes, T.int64),
++                        seq,
++                        index + i * stride,
++                        dst_peer_packs,
++                        valid_out_packs,
++                        T.address_of(out[0]),
++                        dtype="handle",
++                    )
++                # 5. the last block to finish publishes the next epoch
++                T.call_extern("roce_fence_sc_gpu", dtype="handle")
++                T.sync_threads()
++                if tx == 0:
++                    T.call_extern(
++                        "roce_tail",
++                        T.address_of(counters[tail_index]),
++                        T.cast(grid_x, T.uint32),
++                        T.address_of(counters[0]),
++                        seq,
++                        dtype="handle",
++                    )
++
++        return oneshot_exchange
++
++    return program
++
++
++def _process_key(
++    world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4=False
++):
++    return (
++        int(world_size),
++        int(rank),
++        int(threads),
++        int(slots),
++        int(flag_stride),
++        int(hca_count),
++        int(device_index),
++        bool(ring4),
++    )
++
++
++def is_launcher_prepared(*key) -> bool:
++    """True when the launcher for ``key`` is already compiled."""
++    return _process_key(*key) in _PREPARED_LAUNCHERS
++
++
++@functools.cache
++def get_launcher(
++    world_size: int,
++    rank: int,
++    threads: int,
++    slots: int,
++    flag_stride: int,
++    hca_count: int,
++    device_index: int,
++    ring4: bool = False,
++) -> Callable[[Launch], None]:
++    """Compile the launcher for the key once and return it."""
++    lanes, _ = _lanes(hca_count, ring4)
++    if int(threads) < int(world_size) * lanes:
++        raise ValueError(
++            "RoCE kernels need threads >= world_size * hca_count (one thread per stripe flag), "
++            f"got threads={threads} world_size={world_size} hca_count={lanes}"
++        )
++    process_key = _process_key(
++        world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4
++    )
++    cache_key = process_key[:-2] + (bool(ring4),)
++    raise_if_kernel_resolution_frozen(
++        "tilelang.jit", target="oneshot_exchange", cache_key=cache_key
++    )
++    started = time.monotonic()
++    kernel = _build(world_size, rank, threads, slots, flag_stride, hca_count, ring4)()
++    logger.info(
++        "compiled tilelang oneshot.exchange %s in %.1f s",
++        cache_key,
++        time.monotonic() - started,
++    )
++
++    def run(launch: Launch) -> None:
++        """Launch the compiled kernel on the current stream (bound through the tensor arguments)."""
++        chunk_packs = int(launch.size_packs)
++        src_stride = (
++            int(launch.src_peer_packs) if launch.src_peer_packs else chunk_packs
++        )
++        dst_stride = (
++            int(launch.dst_peer_packs) if launch.dst_peer_packs else chunk_packs
++        )
++        total_src = (
++            int(launch.total_src_packs)
++            if launch.total_src_packs
++            else int(world_size) * src_stride
++        )
++        valid_out = (
++            int(launch.valid_out_packs)
++            if launch.valid_out_packs >= 0
++            else chunk_packs
++        )
++        kernel(
++            launch.input,
++            launch.output,
++            launch.counters,
++            int(launch.region.data_ptr()),
++            chunk_packs,
++            int(launch.nbytes),
++            src_stride,
++            dst_stride,
++            total_src,
++            valid_out,
++            int(launch.copy_self),
++            int(launch.recv_off),
++            int(launch.flag_off),
++            int(launch.send_off),
++            int(launch.ctrl_off),
++            int(launch.slot_bytes),
++            int(launch.stage_index),
++            int(launch.tail_index),
++            int(launch.rung_index),
++            int(launch.arrival_index),
++            int(launch.grid_x),
++        )
++
++    _PREPARED_LAUNCHERS.add(process_key)
++    return run
++
++
++__all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]
+diff --git a/sparknet/oneshot/_kernels.py b/sparknet/oneshot/_kernels.py
+index ac7fabc..ad8e04e 100644
+--- a/sparknet/oneshot/_kernels.py
++++ b/sparknet/oneshot/_kernels.py
+@@ -46,6 +46,11 @@ class Launch:
+     grid_x: int
+     row_packs: int = 0  # all-gather only: packs per row of the shard (dim-0 gathers: the shard's packs)
+     trace_base: int = 0  # all-reduce trace file address (pinned, device-visible), 0 when untraced
++    src_peer_packs: int = 0  # reduce-scatter / exchange: pack stride between peer blocks in input
++    dst_peer_packs: int = 0  # all-gather / exchange: pack stride between peer blocks in output
++    total_src_packs: int = 0  # exchange / all-to-all: valid pack count in input
++    valid_out_packs: int = -1  # exchange / all-to-all: valid pack count per peer in output (-1 = size_packs)
++    copy_self: int = 0  # exchange / all-to-all: copy this rank's own block into output
+ 
+ 
+ def kernel_setting_problems(environ: Mapping[str, str]) -> list[str]:
+@@ -70,5 +75,27 @@ def gather_launcher(*key) -> Callable[..., None]:
+     return get_launcher(*key)
+ 
+ 
+-__all__ = ["Launch", "PACK_BYTES", "REMOVED_KERNEL_SETTING", "gather_launcher", "kernel_setting_problems",
+-           "reduce_launcher"]
++def reducescatter_launcher(*key) -> Callable[..., None]:
++    """The compiled reduce-scatter launcher for ``key`` (dtype, world, rank, geometry)."""
++    from ._reducescatter_tilelang import get_launcher
++
++    return get_launcher(*key)
++
++
++def exchange_launcher(*key) -> Callable[..., None]:
++    """The compiled all-to-all exchange launcher for ``key`` (world, rank, geometry)."""
++    from ._exchange_tilelang import get_launcher
++
++    return get_launcher(*key)
++
++
++__all__ = [
++    "Launch",
++    "PACK_BYTES",
++    "REMOVED_KERNEL_SETTING",
++    "exchange_launcher",
++    "gather_launcher",
++    "kernel_setting_problems",
++    "reduce_launcher",
++    "reducescatter_launcher",
++]
+diff --git a/sparknet/oneshot/_reducescatter_tilelang.py b/sparknet/oneshot/_reducescatter_tilelang.py
+new file mode 100644
+index 0000000..78d6ca8
+--- /dev/null
++++ b/sparknet/oneshot/_reducescatter_tilelang.py
+@@ -0,0 +1,312 @@
++"""TileLang kernel for the RoCE one-shot reduce-scatter.
++
++Stages each peer p's chunk (p != rank) into send[slot] + p * chunk_bytes, rings
++the proxy doorbell in exchange mode (ROCE_MODE_EXCHANGE), waits for every peer's
++stripe flags, and reduces the local chunk and every peer's received chunk in
++fixed rank order with float32 accumulation into out.
++"""
++
++# No postponed annotations: TileLang evaluates the prim_func's annotations
++# when the function is defined, and the symbolic shapes must be visible then.
++
++import functools
++import logging
++import time
++from typing import Callable
++
++from ._device import PACK_BYTES, render_source
++from ._freeze import raise_if_kernel_resolution_frozen
++from ._kernels import Launch
++from ._oneshot_tilelang import (
++    _DTYPE_PACK_ELEMS,
++    _REDUCE_FUNCTION,
++    _lanes,
++    _pass_configs,
++    _resident_blocks,
++)
++
++logger = logging.getLogger(__name__)
++
++_PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
++
++
++def _build(
++    dtype_name: str,
++    world_size: int,
++    rank: int,
++    threads: int,
++    slots: int,
++    flag_stride: int,
++    hca_count: int,
++    ring4: bool,
++):
++    import tilelang
++    import tilelang.language as T
++
++    lanes, neighbor_lanes = _lanes(hca_count, ring4)
++    source = render_source(
++        world_size=world_size,
++        rank=rank,
++        slots=slots,
++        flag_stride=flag_stride,
++        hca_count=lanes,
++        neighbor_lanes=neighbor_lanes,
++    )
++    reduce_pack = _REDUCE_FUNCTION[dtype_name]
++    resident = _resident_blocks(threads)
++    pack_words = PACK_BYTES // 4
++
++    @tilelang.jit(pass_configs=_pass_configs())
++    def program():
++        n_in, n_out, n_counters = T.dynamic("n_in, n_out, n_counters")
++
++        @T.prim_func
++        def oneshot_reducescatter(
++            inp: T.Tensor((n_in,), T.int32),
++            out: T.Tensor((n_out,), T.int32),
++            counters: T.Tensor((n_counters,), T.int32),
++            region_base: T.int64,
++            chunk_packs: T.int32,
++            chunk_bytes: T.int32,
++            src_peer_packs: T.int32,
++            recv_off: T.int32,
++            flag_off: T.int32,
++            send_off: T.int32,
++            ctrl_off: T.int32,
++            slot_bytes: T.int32,
++            stage_index: T.int32,
++            tail_index: T.int32,
++            rung_index: T.int32,
++            arrival_index: T.int32,
++            grid_x: T.int32,
++        ):
++            with T.Kernel(grid_x, threads=threads) as bx:
++                T.annotate_min_blocks_per_sm(resident)
++                T.import_source(source)
++                tx = T.get_thread_binding()
++                epoch = T.alloc_var(T.uint32)
++                epoch = T.call_extern(
++                    "roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32
++                )
++                seq = T.alloc_var(T.uint32)
++                seq = epoch + T.uint32(1)
++                slot = T.alloc_var(T.int32)
++                slot = T.cast(seq & T.uint32(1), T.int32)
++                send_slot = T.alloc_var(T.int32)
++                send_slot = send_off + slot * slot_bytes
++                index = T.alloc_var(T.int32)
++                index = bx * threads + tx
++                stride = T.alloc_var(T.int32)
++                stride = grid_x * threads
++                # 1. stage each peer's chunk into its slice of the pinned send slot
++                count = T.alloc_var(T.int32)
++                count = T.max(0, (chunk_packs - index + stride - 1) // stride)
++                for i in T.serial(count):
++                    T.call_extern(
++                        "roce_stage_scatter_pack",
++                        T.address_of(inp[0]),
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(send_slot, T.int64),
++                            dtype="handle",
++                        ),
++                        index + i * stride,
++                        chunk_packs,
++                        src_peer_packs,
++                        dtype="handle",
++                    )
++                T.sync_threads()
++                # 2. the last block to finish staging rings the proxy doorbell in exchange mode
++                if tx == 0:
++                    rang = T.alloc_var(T.uint32)
++                    rang = T.call_extern(
++                        "roce_doorbell_exchange",
++                        T.address_of(counters[stage_index]),
++                        T.cast(grid_x, T.uint32),
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(ctrl_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.cast(chunk_bytes, T.uint32),
++                        seq,
++                        dtype=T.uint32,
++                    )
++                    if rang != T.uint32(0):
++                        T.call_extern(
++                            "roce_st_release_gpu_u32",
++                            T.address_of(counters[rung_index]),
++                            seq,
++                            dtype="handle",
++                        )
++                # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
++                T.call_extern(
++                    "roce_wait_peers",
++                    bx,
++                    tx,
++                    T.call_extern(
++                        "roce_ptr",
++                        region_base + T.cast(flag_off, T.int64),
++                        dtype="handle",
++                    ),
++                    seq,
++                    T.call_extern(
++                        "roce_ptr",
++                        region_base + T.cast(ctrl_off, T.int64),
++                        dtype="handle",
++                    ),
++                    T.address_of(counters[rung_index]),
++                    T.address_of(counters[arrival_index]),
++                    dtype="handle",
++                )
++                T.sync_threads()
++                if bx == 0:
++                    if tx == 0:
++                        T.call_extern(
++                            "roce_st_release_gpu_u32",
++                            T.address_of(counters[arrival_index]),
++                            seq,
++                            dtype="handle",
++                        )
++                # 4. reduce this rank's chunk (from inp) and the peers' chunks in fixed rank order
++                for i in T.serial(count):
++                    pack = index + i * stride
++                    T.call_extern(
++                        reduce_pack,
++                        T.address_of(inp[rank * src_peer_packs * pack_words]),
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(recv_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.cast(slot_bytes, T.int64),
++                        seq,
++                        T.address_of(out[0]),
++                        T.cast(pack, T.int64) * PACK_BYTES,
++                        dtype="handle",
++                    )
++                # 5. the last block to finish reduction publishes the next epoch
++                T.call_extern("roce_fence_sc_gpu", dtype="handle")
++                T.sync_threads()
++                if tx == 0:
++                    T.call_extern(
++                        "roce_tail",
++                        T.address_of(counters[tail_index]),
++                        T.cast(grid_x, T.uint32),
++                        T.address_of(counters[0]),
++                        seq,
++                        dtype="handle",
++                    )
++
++        return oneshot_reducescatter
++
++    return program
++
++
++def _process_key(
++    dtype_name,
++    world_size,
++    rank,
++    threads,
++    slots,
++    flag_stride,
++    hca_count,
++    device_index,
++    ring4=False,
++):
++    return (
++        str(dtype_name),
++        int(world_size),
++        int(rank),
++        int(threads),
++        int(slots),
++        int(flag_stride),
++        int(hca_count),
++        int(device_index),
++        bool(ring4),
++    )
++
++
++def is_launcher_prepared(*key) -> bool:
++    """True when the launcher for ``key`` is already compiled."""
++    return _process_key(*key) in _PREPARED_LAUNCHERS
++
++
++@functools.cache
++def get_launcher(
++    dtype_name: str,
++    world_size: int,
++    rank: int,
++    threads: int,
++    slots: int,
++    flag_stride: int,
++    hca_count: int,
++    device_index: int,
++    ring4: bool = False,
++) -> Callable[[Launch], None]:
++    """Compile the launcher for the key once and return it."""
++    if dtype_name not in _DTYPE_PACK_ELEMS:
++        raise ValueError(f"unsupported RoCE reduce-scatter dtype {dtype_name!r}")
++    lanes, _ = _lanes(hca_count, ring4)
++    if int(threads) < int(world_size) * lanes:
++        raise ValueError(
++            "RoCE kernels need threads >= world_size * hca_count (one thread per stripe flag), "
++            f"got threads={threads} world_size={world_size} hca_count={lanes}"
++        )
++    process_key = _process_key(
++        dtype_name,
++        world_size,
++        rank,
++        threads,
++        slots,
++        flag_stride,
++        hca_count,
++        device_index,
++        ring4,
++    )
++    cache_key = process_key[:7] + process_key[8:]
++    raise_if_kernel_resolution_frozen(
++        "tilelang.jit", target="oneshot_reducescatter", cache_key=cache_key
++    )
++    started = time.monotonic()
++    kernel = _build(
++        dtype_name, world_size, rank, threads, slots, flag_stride, hca_count, ring4
++    )()
++    logger.info(
++        "compiled tilelang oneshot.reducescatter %s in %.1f s",
++        cache_key,
++        time.monotonic() - started,
++    )
++
++    def run(launch: Launch) -> None:
++        """Launch the compiled kernel on the current stream (bound through the tensor arguments)."""
++        src_stride = (
++            int(launch.src_peer_packs)
++            if launch.src_peer_packs
++            else int(launch.size_packs)
++        )
++        kernel(
++            launch.input,
++            launch.output,
++            launch.counters,
++            int(launch.region.data_ptr()),
++            int(launch.size_packs),
++            int(launch.nbytes),
++            src_stride,
++            int(launch.recv_off),
++            int(launch.flag_off),
++            int(launch.send_off),
++            int(launch.ctrl_off),
++            int(launch.slot_bytes),
++            int(launch.stage_index),
++            int(launch.tail_index),
++            int(launch.rung_index),
++            int(launch.arrival_index),
++            int(launch.grid_x),
++        )
++
++    _PREPARED_LAUNCHERS.add(process_key)
++    return run
++
++
++__all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]
+diff --git a/sparknet/oneshot/_roce_proxy.c b/sparknet/oneshot/_roce_proxy.c
+index 5200d4d..c76621c 100644
+--- a/sparknet/oneshot/_roce_proxy.c
++++ b/sparknet/oneshot/_roce_proxy.c
+@@ -60,6 +60,13 @@
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+ #define ROCE_ABI_VERSION 10
++// High bit of the doorbell byte count: each peer p receives its own chunk
++// staged at send[slot] + p * chunk_bytes (reduce-scatter and all-to-all
++// exchange). In ring4 relay mode the opposite rank's two stripe halves are
++// staged into the two neighbours' unused self-receive slots (recv[m][slot] and
++// flag[m][slot][fragment]) on hop 1 and forwarded into opp's recv[rank][slot]
++// on hop 2, so the GPU flag wait is unchanged.
++#define ROCE_MODE_EXCHANGE 0x80000000u
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+@@ -781,7 +788,7 @@ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+     return 0;
+ }
+ 
+-static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
++static int relay_both_directions_mode(roce_ctx_t *c, uint32_t seq, uint32_t nbytes, int exchange) {
+     struct timespec start, now;
+     clock_gettime(CLOCK_MONOTONIC, &start);
+     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+@@ -810,8 +817,10 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             int next = (c->rank + 1) % c->world;
+             int origin = direction == 0 ? prev : next;
+             int destination = direction == 0 ? next : prev;
++            int stage_slot = exchange ? c->rank : origin;
++            int stage_lane = exchange ? fragment : lane;
+             uint32_t *flag = (uint32_t *)(c->region + c->flag_off +
+-                (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * flag_lanes(c) + lane) * ROCE_FLAG_STRIDE);
++                (((size_t)stage_slot * ROCE_SLOTS + (seq & 1u)) * flag_lanes(c) + stage_lane) * ROCE_FLAG_STRIDE);
+             uint32_t observed = __atomic_load_n(flag, __ATOMIC_ACQUIRE);
+             if ((int32_t)(observed - seq) > 0) {
+                 snprintf(c->err, sizeof(c->err), "relay slot overwritten: rank %d seq %u saw %u", origin, seq, observed);
+@@ -835,7 +844,7 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             if (direction == 0) packs = first;
+             else { offset += first; packs -= first; }
+             uint8_t *received = c->region + c->recv_off +
+-                ((size_t)origin * ROCE_SLOTS + (seq & 1u)) * c->slot_bytes;
++                ((size_t)stage_slot * ROCE_SLOTS + (seq & 1u)) * c->slot_bytes;
+             // Preserve the original source's slot. Its N+2 cannot begin until
+             // the opposite GPU has consumed BOTH fragments of N. Zero-length
+             // fragments still publish a flag, including the 16-byte case.
+@@ -860,8 +869,15 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     }
+ }
+ 
+-static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+-    if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
++static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
++    return relay_both_directions_mode(c, seq, nbytes, 0);
++}
++
++static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t raw_nbytes) {
++    int exchange = (raw_nbytes & ROCE_MODE_EXCHANGE) != 0;
++    uint32_t nbytes = raw_nbytes & ~ROCE_MODE_EXCHANGE;
++    size_t required = exchange ? (size_t)c->world * (size_t)nbytes : (size_t)nbytes;
++    if (nbytes == 0 || nbytes % 16 != 0 || required > c->slot_bytes) {
+         snprintf(c->err, sizeof(c->err), "invalid RoCE payload size %u (slot %zu)", nbytes, c->slot_bytes);
+         return -1;
+     }
+@@ -878,21 +894,44 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+                 int h = (first + offset) % c->n_hca;
+                 for (int p = 0; p < c->world; p++) {
+                     if (p == c->rank || ((p == opposite) != want_opposite)) continue;
++                    uint8_t *peer_send = send + (exchange ? (size_t)p * nbytes : 0);
+                     for (int lane = 0; lane < peer_width(c->world, c->rank, p, c->n_stripes); lane++)
+                         if (c->route_hca[p][lane] == h &&
+-                            post_path(c, seq, nbytes, c->rank, p, send, lane) != 0) return -1;
++                            post_path(c, seq, nbytes, c->rank, p, peer_send, lane) != 0) return -1;
+                 }
+             }
+         }
+     } else {
+-    for (int p = 0; p < c->world; p++) {
+-        if (adjacent(c->world, c->rank, p, c->ring4) &&
+-            post_peer(c, seq, nbytes, c->rank, p, send) != 0) return -1;
+-    }
++        if (c->ring4 == 1 && exchange) {
++            // Post the opposite rank's two disjoint halves first so the
++            // neighbours can relay hop 2 while the direct neighbour payloads
++            // traverse hop 1 on the same QPs.
++            int next = (c->rank + 1) % c->world;
++            int prev = (c->rank + c->world - 1) % c->world;
++            int opp = (c->rank + 2) % c->world;
++            uint8_t *opp_send = send + (size_t)opp * nbytes;
++            for (int lane = 0; lane < c->n_stripes; lane++) {
++                uint32_t offset, packs;
++                stripe_range(nbytes, c->n_stripes, lane, &offset, &packs);
++                uint32_t first = (packs + ((seq + (uint32_t)lane) & 1u)) / 2;
++                if (post_fragment(c, seq, next, next, opp_send, lane,
++                                  (uint64_t)offset * 16, first * 16, 2 * lane) != 0)
++                    return -1;
++                if (post_fragment(c, seq, prev, prev, opp_send, lane,
++                                  (uint64_t)(offset + first) * 16, (packs - first) * 16, 2 * lane + 1) != 0)
++                    return -1;
++            }
++        }
++        for (int p = 0; p < c->world; p++) {
++            if (adjacent(c->world, c->rank, p, c->ring4)) {
++                uint8_t *peer_send = send + (exchange ? (size_t)p * nbytes : 0);
++                if (post_peer(c, seq, nbytes, c->rank, p, peer_send) != 0) return -1;
++            }
++        }
+     }
+     trace_mark(c, seq, TRACE_POSTED);
+     if (c->ring4 == 1) {
+-        if (relay_both_directions(c, seq, nbytes) != 0) return -1;
++        if (relay_both_directions_mode(c, seq, nbytes, exchange) != 0) return -1;
+         trace_mark(c, seq, TRACE_RELAYED);
+     }
+     c->ops_posted += 1;
+diff --git a/sparknet/oneshot/runtime.py b/sparknet/oneshot/runtime.py
+index c98b577..617e236 100644
+--- a/sparknet/oneshot/runtime.py
++++ b/sparknet/oneshot/runtime.py
+@@ -38,7 +38,15 @@ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+ 
+ from . import trace as _trace
+-from ._kernels import PACK_BYTES, Launch, gather_launcher, kernel_setting_problems, reduce_launcher
++from ._kernels import (
++    PACK_BYTES,
++    Launch,
++    exchange_launcher,
++    gather_launcher,
++    kernel_setting_problems,
++    reduce_launcher,
++    reducescatter_launcher,
++)
+ from ._proxy import Layout, Proxy, load as _load_proxy_library
+ 
+ logger = logging.getLogger(__name__)
+@@ -401,7 +409,9 @@ class RoceOneshotAllReduce:
+         self._lock = threading.Lock()
+         self._proxy: Optional[Any] = None
+         self._launchers: dict[torch.dtype, Callable[..., None]] = {}
++        self._reducescatter_launchers: dict[torch.dtype, Callable[..., None]] = {}
+         self._gather_launcher: Optional[Callable[..., None]] = None
++        self._exchange_launcher: Optional[Callable[..., None]] = None
+         self._gather_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+         self._align_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+         self._stream_event = torch.cuda.Event()
+@@ -760,7 +770,7 @@ class RoceOneshotAllReduce:
+         )
+ 
+     def _gather_launcher_key(self) -> tuple[object, ...]:
+-        """Cache key of the all-gather launcher."""
++        """Cache key of the all-gather and exchange launchers."""
+         return (
+             self.world_size,
+             self.rank,
+@@ -772,6 +782,20 @@ class RoceOneshotAllReduce:
+             self.topology == "ring4",
+         )
+ 
++    def _reducescatter_launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
++        """Cache key of the reduce-scatter launcher for ``dtype``."""
++        return (
++            _DTYPE_NAMES[dtype],
++            self.world_size,
++            self.rank,
++            self._threads,
++            self._layout.slots,
++            self._layout.flag_stride,
++            self.stripe_count,
++            self.device.index,
++            self.topology == "ring4",
++        )
++
+     def _counter_indices(self, blocks: int) -> tuple[int, int]:
+         """Stage and tail counter indices (words of ``_counters``) for one power-of-two grid size."""
+         counter_class = int(blocks).bit_length() - 1
+@@ -782,17 +806,41 @@ class RoceOneshotAllReduce:
+         """A flat ``int32`` view of a contiguous, 16-byte-aligned tensor's bytes."""
+         return tensor.reshape(-1).view(torch.int32)
+ 
+-    def _launch(self, src: torch.Tensor, dst: torch.Tensor, nbytes: int, *, row_packs: int = 0) -> Launch:
++    def _span_words(self, tensor: torch.Tensor, peer_stride_elems: int, chunk_elems: int) -> torch.Tensor:
++        """A flat ``int32`` view spanning ``world_size`` peer blocks separated by ``peer_stride_elems``."""
++        if tensor.is_contiguous() and int(peer_stride_elems) == int(chunk_elems):
++            return tensor.reshape(-1).view(torch.int32)
++        span_elems = (self.world_size - 1) * int(peer_stride_elems) + int(chunk_elems)
++        return torch.as_strided(tensor, (span_elems,), (1,)).view(torch.int32)
++
++    def _launch(
++        self,
++        src: torch.Tensor,
++        dst: torch.Tensor,
++        nbytes: int,
++        *,
++        row_packs: int = 0,
++        src_peer_packs: int = 0,
++        dst_peer_packs: int = 0,
++        total_src_packs: int = 0,
++        valid_out_packs: int = -1,
++        copy_self: int = 0,
++        raw_words: bool = False,
++    ) -> Launch:
+         """The family-neutral description of one collective launch."""
+         grid_blocks = _grid_blocks(nbytes // PACK_BYTES, self._threads, self._blocks)
+         stage_index, tail_index = self._counter_indices(grid_blocks)
++        inp_words = src if raw_words else self._words(src)
++        out_words = dst if raw_words else self._words(dst)
+         return Launch(
+-            input=self._words(src), output=self._words(dst), size_packs=nbytes // PACK_BYTES, nbytes=nbytes,
++            input=inp_words, output=out_words, size_packs=nbytes // PACK_BYTES, nbytes=nbytes,
+             region=self._region, recv_off=self._layout.recv_off, flag_off=self._layout.flag_off,
+             send_off=self._layout.send_off, ctrl_off=self._layout.ctrl_off, slot_bytes=self._slot_bytes,
+             counters=self._counters, stage_index=stage_index, tail_index=tail_index,
+             rung_index=1 + 2 * self._counter_classes, arrival_index=2 + 2 * self._counter_classes,
+             grid_x=grid_blocks, row_packs=row_packs, trace_base=self._trace_base,
++            src_peer_packs=src_peer_packs, dst_peer_packs=dst_peer_packs,
++            total_src_packs=total_src_packs, valid_out_packs=valid_out_packs, copy_self=copy_self,
+         )
+ 
+     def prepare(
+@@ -815,7 +863,9 @@ class RoceOneshotAllReduce:
+         with torch.cuda.device(self.device):
+             for dtype in dtypes:
+                 self._reduce_launcher(dtype, capturing=False)
++                self._reducescatter_launcher(dtype, capturing=False)
+             self._resolve_gather_launcher(capturing=False)
++            self._resolve_exchange_launcher(capturing=False)
+             self._aligned_scratch(0, self._region[:PACK_BYTES])
+             if padded_gather:
+                 self._gather_scratch(PACK_BYTES)
+@@ -834,6 +884,20 @@ class RoceOneshotAllReduce:
+             self._launchers[dtype] = launcher
+         return launcher
+ 
++    def _reducescatter_launcher(self, dtype: torch.dtype, capturing: bool) -> Callable[..., None]:
++        """The compiled reduce-scatter launcher for ``dtype``; compiled on first eager use only."""
++        launcher = self._reducescatter_launchers.get(dtype)
++        if launcher is None:
++            if capturing:
++                raise RuntimeError(
++                    "RoCE reduce-scatter dtype was not prepared before CUDA graph capture; call prepare()"
++                )
++            if dtype not in SUPPORTED_DTYPES:
++                raise ValueError(f"unsupported RoCE reduce-scatter dtype {dtype}")
++            launcher = reducescatter_launcher(*self._reducescatter_launcher_key(dtype))
++            self._reducescatter_launchers[dtype] = launcher
++        return launcher
++
+     def _resolve_gather_launcher(self, capturing: bool) -> Callable[..., None]:
+         """The compiled all-gather launcher; compiled on first eager use only."""
+         if self._gather_launcher is None:
+@@ -844,6 +908,16 @@ class RoceOneshotAllReduce:
+             self._gather_launcher = gather_launcher(*self._gather_launcher_key())
+         return self._gather_launcher
+ 
++    def _resolve_exchange_launcher(self, capturing: bool) -> Callable[..., None]:
++        """The compiled all-to-all exchange launcher; compiled on first eager use only."""
++        if self._exchange_launcher is None:
++            if capturing:
++                raise RuntimeError(
++                    "RoCE exchange launcher was not prepared before CUDA graph capture; call prepare()"
++                )
++            self._exchange_launcher = exchange_launcher(*self._gather_launcher_key())
++        return self._exchange_launcher
++
+ 
+     # -- execution ----------------------------------------------------------------
+ 
+@@ -1027,12 +1101,16 @@ class RoceOneshotAllReduce:
+             dim += inp.dim()
+         return dim
+ 
+-    def should_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
++    def should_all_gather(
++        self, inp: torch.Tensor, dim: int = -1, *, sliced: bool = False
++    ) -> bool:
+         """Eligible: contiguous CUDA tensor of any dtype, concat along dim 0 or the last dim.
+ 
+         16-byte-aligned rows take the direct-layout kernel; anything else goes
+         through a padded contiguous gather plus a torch reshape, so shape never
+-        forces a fallback to another backend.
++        forces a fallback to another backend.  With ``sliced=True`` (eager
++        prefill only), 16-byte-aligned shards larger than ``max_gather_bytes``
++        are pipelined in row slices across the ping-pong slots.
+         """
+ 
+         if self._closed or self._proxy is None:
+@@ -1047,7 +1125,23 @@ class RoceOneshotAllReduce:
+         if dim not in (0, inp.dim() - 1):
+             return False
+         nbytes = inp.numel() * inp.element_size()
+-        return 0 < nbytes <= self.max_gather_bytes
++        if nbytes <= 0:
++            return False
++        if nbytes <= self.max_gather_bytes:
++            return True
++        if not sliced or torch.cuda.is_current_stream_capturing():
++            return False
++        if nbytes % PACK_BYTES != 0:
++            return False
++        row_bytes = (
++            (inp.numel() // inp.shape[0]) * inp.element_size()
++            if dim == 0
++            else inp.shape[-1] * inp.element_size()
++        )
++        return (
++            0 < row_bytes <= self._slot_bytes
++            and row_bytes % PACK_BYTES == 0
++        )
+ 
+     def _direct_gather_layout(self, inp: torch.Tensor, dim: int) -> bool:
+         """True when ``inp`` can be gathered straight into the concatenated layout (16-byte rows and pointer)."""
+@@ -1063,6 +1157,7 @@ class RoceOneshotAllReduce:
+         dim: int = -1,
+         out: Optional[torch.Tensor] = None,
+         stream: object = None,
++        sliced: bool = False,
+     ) -> torch.Tensor:
+         """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
+ 
+@@ -1073,7 +1168,7 @@ class RoceOneshotAllReduce:
+         """
+         with self._lock:
+             self.check_health()
+-            if not self.should_all_gather(inp, dim):
++            if not self.should_all_gather(inp, dim, sliced=sliced):
+                 raise ValueError("input is not eligible for the RoCE all-gather")
+             dim = self._normalize_dim(inp, dim)
+             shape = list(inp.shape)
+@@ -1092,6 +1187,52 @@ class RoceOneshotAllReduce:
+             )
+             with torch.cuda.device(self.device), context:
+                 capturing = torch.cuda.is_current_stream_capturing()
++                nbytes = inp.numel() * inp.element_size()
++                if nbytes > self.max_gather_bytes:
++                    if out is None:
++                        out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
++                    launcher = self._resolve_gather_launcher(capturing)
++                    self._order_stream(capturing)
++                    if dim == 0:
++                        local_rows = inp.shape[0]
++                        row_bytes = nbytes // local_rows
++                        max_rows = self._slot_bytes // row_bytes
++                        full_shard_packs = nbytes // PACK_BYTES
++                        for lo in range(0, local_rows, max_rows):
++                            hi = min(local_rows, lo + max_rows)
++                            slice_bytes = (hi - lo) * row_bytes
++                            slice_packs = slice_bytes // PACK_BYTES
++                            out_slice = out[
++                                lo : (self.world_size - 1) * local_rows + hi
++                            ]
++                            self._launch_gather(
++                                launcher,
++                                inp[lo:hi],
++                                out_slice,
++                                slice_bytes,
++                                slice_packs,
++                                dst_peer_packs=full_shard_packs,
++                            )
++                    else:
++                        width = inp.shape[-1]
++                        rows = inp.numel() // width
++                        row_bytes = width * inp.element_size()
++                        row_packs = row_bytes // PACK_BYTES
++                        max_rows = self._slot_bytes // row_bytes
++                        inp_2d = inp.view(rows, width)
++                        out_2d = out.view(rows, self.world_size * width)
++                        for lo in range(0, rows, max_rows):
++                            hi = min(rows, lo + max_rows)
++                            slice_bytes = (hi - lo) * row_bytes
++                            self._launch_gather(
++                                launcher,
++                                inp_2d[lo:hi],
++                                out_2d[lo:hi],
++                                slice_bytes,
++                                row_packs,
++                            )
++                    self._mark_stream(capturing)
++                    return out
+                 # Both paths stage the shard contiguously and only the reader is
+                 # strided, so ranks may take different paths for one collective.
+                 direct = self._direct_gather_layout(inp, dim) and (
+@@ -1100,7 +1241,6 @@ class RoceOneshotAllReduce:
+                 if direct:
+                     if out is None:
+                         out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+-                    nbytes = inp.numel() * inp.element_size()
+                     row_packs = (
+                         nbytes // PACK_BYTES
+                         if dim == 0
+@@ -1115,7 +1255,6 @@ class RoceOneshotAllReduce:
+                 # Padded path: pad each shard to a whole number of packs, gather
+                 # contiguously into fixed scratch, then let torch produce the
+                 # requested layout.
+-                nbytes = inp.numel() * inp.element_size()
+                 padded = _align_up(nbytes, PACK_BYTES)
+                 staged, gathered = self._gather_scratch(padded)
+                 staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
+@@ -1161,18 +1300,377 @@ class RoceOneshotAllReduce:
+         return staged[:padded], gathered[: self.world_size * padded]
+ 
+     def _launch_gather(
+-        self, launcher, source: torch.Tensor, destination: torch.Tensor, nbytes: int,
++        self,
++        launcher,
++        source: torch.Tensor,
++        destination: torch.Tensor,
++        nbytes: int,
+         row_packs: int,
++        *,
++        dst_peer_packs: int = 0,
+     ) -> None:
+         """Launch an already prepared all-gather kernel."""
+         # Same size-aware geometry as the all-reduce: a small shard (top-k
+         # values and ids, MTP logits) launches a few blocks instead of the
+         # full grid, and each power-of-two grid has its own arrival counters
+         # so gathers and reductions of any size may interleave in one graph.
+-        launcher(self._launch(source, destination, nbytes, row_packs=row_packs))
++        launcher(
++            self._launch(
++                source,
++                destination,
++                nbytes,
++                row_packs=row_packs,
++                dst_peer_packs=dst_peer_packs,
++            )
++        )
+         if not torch.cuda.is_current_stream_capturing():
+             self.check_health()
+ 
++    # -- reduce-scatter & exchange ------------------------------------------------
++
++    def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
++        """Eligible: contiguous CUDA tensor of a supported dtype divisible along ``dim`` by ``world_size``."""
++        if self._closed or self._proxy is None:
++            raise RuntimeError("RoCE runtime is closed")
++        if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda or inp.dim() == 0:
++            return False
++        if inp.device != self.device or not inp.is_contiguous():
++            return False
++        dim = self._normalize_dim(inp, dim)
++        if dim != 0 or inp.shape[0] % self.world_size != 0:
++            return False
++        nbytes = inp.numel() * inp.element_size()
++        chunk_bytes = nbytes // self.world_size
++        if chunk_bytes <= 0 or chunk_bytes % PACK_BYTES != 0:
++            return False
++        if nbytes <= self._slot_bytes:
++            return True
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        local_rows = inp.shape[0] // self.world_size
++        row_bytes = chunk_bytes // local_rows
++        return (
++            row_bytes % PACK_BYTES == 0
++            and 0 < self.world_size * row_bytes <= self._slot_bytes
++        )
++
++    def reduce_scatter(
++        self,
++        inp: torch.Tensor,
++        *,
++        dim: int = 0,
++        out: Optional[torch.Tensor] = None,
++        stream: object = None,
++    ) -> torch.Tensor:
++        """Reduce-scatter ``inp`` along ``dim`` (0) in fixed rank order with float32 accumulation."""
++        with self._lock:
++            self.check_health()
++            if not self.should_reduce_scatter(inp, dim):
++                raise ValueError("input is not eligible for the RoCE reduce-scatter")
++            dim = self._normalize_dim(inp, dim)
++            local_rows = inp.shape[0] // self.world_size
++            out_shape = (local_rows, *inp.shape[1:])
++            if out is not None and (
++                tuple(out.shape) != out_shape
++                or out.dtype != inp.dtype
++                or out.device != inp.device
++                or not out.is_contiguous()
++            ):
++                raise ValueError(
++                    "out must be a contiguous tensor on the input's device of the scattered shape"
++                )
++            nbytes = inp.numel() * inp.element_size()
++            chunk_bytes = nbytes // self.world_size
++            context = (
++                torch.cuda.stream(stream) if stream is not None else _nullcontext()
++            )
++            with torch.cuda.device(self.device), context:
++                capturing = torch.cuda.is_current_stream_capturing()
++                launcher = self._reducescatter_launcher(inp.dtype, capturing)
++                if out is None:
++                    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
++                if nbytes <= self._slot_bytes:
++                    src = inp
++                    if inp.data_ptr() % PACK_BYTES != 0:
++                        src = self._aligned_scratch(0, inp)
++                        src.copy_(inp)
++                    dst = (
++                        out
++                        if out.data_ptr() % PACK_BYTES == 0
++                        else self._aligned_scratch(1, out)
++                    )
++                    self._order_stream(capturing)
++                    launcher(self._launch(src, dst, chunk_bytes))
++                    if dst is not out:
++                        out.copy_(dst)
++                    self._mark_stream(capturing)
++                else:
++                    row_bytes = chunk_bytes // local_rows
++                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
++                    full_chunk_packs = chunk_bytes // PACK_BYTES
++                    self._order_stream(capturing)
++                    for lo in range(0, local_rows, max_rows):
++                        hi = min(local_rows, lo + max_rows)
++                        slice_chunk_bytes = (hi - lo) * row_bytes
++                        inp_slice = inp[
++                            lo : (self.world_size - 1) * local_rows + hi
++                        ]
++                        launcher(
++                            self._launch(
++                                inp_slice,
++                                out[lo:hi],
++                                slice_chunk_bytes,
++                                src_peer_packs=full_chunk_packs,
++                            )
++                        )
++                        if not capturing:
++                            self.check_health()
++                    self._mark_stream(capturing)
++        if not capturing:
++            self.check_health()
++        return out
++
++    def should_exchange(
++        self, chunks: torch.Tensor, parts: Optional[torch.Tensor] = None
++    ) -> bool:
++        """Eligible: ``(world_size, local_rows, ...)`` CUDA tensors with 16-byte-aligned peer slices."""
++        if self._closed or self._proxy is None:
++            raise RuntimeError("RoCE runtime is closed")
++        if not chunks.is_cuda or chunks.device != self.device or chunks.dim() < 2:
++            return False
++        if chunks.is_complex() or chunks.is_sparse or chunks.dtype == torch.bool:
++            return False
++        if chunks.shape[0] != self.world_size or not chunks[0].is_contiguous():
++            return False
++        elem_size = chunks.element_size()
++        chunk_bytes = chunks[0].numel() * elem_size
++        if chunk_bytes == 0:
++            return True
++        src_stride_bytes = int(chunks.stride(0)) * elem_size
++        if (
++            chunk_bytes % PACK_BYTES != 0
++            or src_stride_bytes % PACK_BYTES != 0
++            or chunks.data_ptr() % PACK_BYTES != 0
++        ):
++            return False
++        if parts is not None:
++            if (
++                not parts.is_cuda
++                or parts.device != self.device
++                or parts.shape != chunks.shape
++                or parts.dtype != chunks.dtype
++                or not parts[0].is_contiguous()
++            ):
++                return False
++            dst_stride_bytes = int(parts.stride(0)) * elem_size
++            if dst_stride_bytes % PACK_BYTES != 0 or parts.data_ptr() % PACK_BYTES != 0:
++                return False
++        if self.world_size * chunk_bytes <= self._slot_bytes:
++            return True
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        local_rows = chunks.shape[1]
++        row_bytes = chunk_bytes // local_rows
++        return (
++            row_bytes % PACK_BYTES == 0
++            and 0 < self.world_size * row_bytes <= self._slot_bytes
++        )
++
++    def exchange(
++        self,
++        chunks: torch.Tensor,
++        parts: Optional[torch.Tensor] = None,
++        *,
++        out: Optional[torch.Tensor] = None,
++        copy_self: bool = False,
++        stream: object = None,
++    ) -> torch.Tensor:
++        """Send ``chunks[p]`` to peer ``p`` and receive peer ``p``'s chunk into ``parts[p]``."""
++        if parts is None and out is not None:
++            parts = out
++        with self._lock:
++            self.check_health()
++            if not self.should_exchange(chunks, parts):
++                raise ValueError("input is not eligible for the RoCE exchange")
++            if parts is None:
++                parts = torch.empty(
++                    chunks.shape, dtype=chunks.dtype, device=chunks.device
++                )
++            elem_size = chunks.element_size()
++            chunk_bytes = chunks[0].numel() * elem_size
++            if chunk_bytes == 0:
++                return parts
++            src_peer_packs = (int(chunks.stride(0)) * elem_size) // PACK_BYTES
++            dst_peer_packs = (int(parts.stride(0)) * elem_size) // PACK_BYTES
++            context = (
++                torch.cuda.stream(stream) if stream is not None else _nullcontext()
++            )
++            with torch.cuda.device(self.device), context:
++                capturing = torch.cuda.is_current_stream_capturing()
++                launcher = self._resolve_exchange_launcher(capturing)
++                self._order_stream(capturing)
++                if self.world_size * chunk_bytes <= self._slot_bytes:
++                    src_words = self._span_words(
++                        chunks, int(chunks.stride(0)), chunks[0].numel()
++                    )
++                    dst_words = self._span_words(
++                        parts, int(parts.stride(0)), parts[0].numel()
++                    )
++                    launcher(
++                        self._launch(
++                            src_words,
++                            dst_words,
++                            chunk_bytes,
++                            src_peer_packs=src_peer_packs,
++                            dst_peer_packs=dst_peer_packs,
++                            copy_self=int(copy_self),
++                            raw_words=True,
++                        )
++                    )
++                else:
++                    local_rows = chunks.shape[1]
++                    row_bytes = chunk_bytes // local_rows
++                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
++                    for lo in range(0, local_rows, max_rows):
++                        hi = min(local_rows, lo + max_rows)
++                        c_slice = chunks[:, lo:hi]
++                        p_slice = parts[:, lo:hi]
++                        slice_chunk_bytes = (hi - lo) * row_bytes
++                        src_words = self._span_words(
++                            c_slice, int(c_slice.stride(0)), c_slice[0].numel()
++                        )
++                        dst_words = self._span_words(
++                            p_slice, int(p_slice.stride(0)), p_slice[0].numel()
++                        )
++                        launcher(
++                            self._launch(
++                                src_words,
++                                dst_words,
++                                slice_chunk_bytes,
++                                src_peer_packs=src_peer_packs,
++                                dst_peer_packs=dst_peer_packs,
++                                copy_self=int(copy_self),
++                                raw_words=True,
++                            )
++                        )
++                        if not capturing:
++                            self.check_health()
++                self._mark_stream(capturing)
++        if not capturing:
++            self.check_health()
++        return parts
++
++    def should_all_to_all_rows(self, inp: torch.Tensor, rows: int) -> bool:
++        """Eligible: contiguous CUDA tensor with 16-byte rows and ``0 < inp.shape[0] <= world_size * rows``."""
++        if self._closed or self._proxy is None:
++            raise RuntimeError("RoCE runtime is closed")
++        if not inp.is_cuda or inp.device != self.device or inp.dim() < 1 or not inp.is_contiguous():
++            return False
++        if inp.is_complex() or inp.is_sparse or inp.dtype == torch.bool:
++            return False
++        total = int(inp.shape[0])
++        rows = int(rows)
++        if rows <= 0 or total <= 0 or total > self.world_size * rows:
++            return False
++        if inp.data_ptr() % PACK_BYTES != 0:
++            return False
++        row_bytes = (inp.numel() // total) * inp.element_size()
++        if row_bytes <= 0 or row_bytes % PACK_BYTES != 0:
++            return False
++        if self.world_size * rows * row_bytes <= self._slot_bytes:
++            return True
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        return self.world_size * row_bytes <= self._slot_bytes
++
++    def all_to_all_rows(
++        self,
++        inp: torch.Tensor,
++        rows: int,
++        *,
++        out: Optional[torch.Tensor] = None,
++        stream: object = None,
++    ) -> torch.Tensor:
++        """Exchange ``rows``-row blocks of ``inp`` into ``(world_size, rows, *inp.shape[1:])``."""
++        with self._lock:
++            self.check_health()
++            if not self.should_all_to_all_rows(inp, rows):
++                raise ValueError("input is not eligible for the RoCE all_to_all_rows")
++            rows = int(rows)
++            total = int(inp.shape[0])
++            out_shape = (self.world_size, rows, *inp.shape[1:])
++            if out is not None and (
++                tuple(out.shape) != out_shape
++                or out.dtype != inp.dtype
++                or out.device != inp.device
++                or not out.is_contiguous()
++                or out.data_ptr() % PACK_BYTES != 0
++            ):
++                raise ValueError(
++                    "out must be a 16-byte-aligned contiguous tensor on the input's device of shape (world_size, rows, ...)"
++                )
++            row_bytes = (inp.numel() // total) * inp.element_size()
++            row_packs = row_bytes // PACK_BYTES
++            full_chunk_packs = rows * row_packs
++            chunk_bytes = rows * row_bytes
++            context = (
++                torch.cuda.stream(stream) if stream is not None else _nullcontext()
++            )
++            with torch.cuda.device(self.device), context:
++                capturing = torch.cuda.is_current_stream_capturing()
++                launcher = self._resolve_exchange_launcher(capturing)
++                if out is None:
++                    out = inp.new_empty(out_shape)
++                self._order_stream(capturing)
++                if self.world_size * chunk_bytes <= self._slot_bytes:
++                    own_rows = max(0, min(rows, total - self.rank * rows))
++                    launcher(
++                        self._launch(
++                            inp,
++                            out,
++                            chunk_bytes,
++                            src_peer_packs=full_chunk_packs,
++                            dst_peer_packs=full_chunk_packs,
++                            total_src_packs=total * row_packs,
++                            valid_out_packs=own_rows * row_packs,
++                            copy_self=1,
++                        )
++                    )
++                else:
++                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
++                    for lo in range(0, rows, max_rows):
++                        hi = min(rows, lo + max_rows)
++                        slice_rows = hi - lo
++                        slice_chunk_bytes = slice_rows * row_bytes
++                        inp_slice = inp[lo:] if lo < total else inp[:1]
++                        total_src_packs = max(0, total - lo) * row_packs
++                        own_slice_rows = max(
++                            0, min(slice_rows, total - (self.rank * rows + lo))
++                        )
++                        out_slice = out[:, lo:hi]
++                        dst_words = self._span_words(
++                            out_slice, int(out_slice.stride(0)), out_slice[0].numel()
++                        )
++                        launcher(
++                            self._launch(
++                                self._words(inp_slice),
++                                dst_words,
++                                slice_chunk_bytes,
++                                src_peer_packs=full_chunk_packs,
++                                dst_peer_packs=full_chunk_packs,
++                                total_src_packs=total_src_packs,
++                                valid_out_packs=own_slice_rows * row_packs,
++                                copy_self=1,
++                                raw_words=True,
++                            )
++                        )
++                        if not capturing:
++                            self.check_health()
++                self._mark_stream(capturing)
++        if not capturing:
++            self.check_health()
++        return out
++
+     @contextmanager
+     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
+         """Context manager for CUDA graph capture; the launchers must already be prepared.
+diff --git a/tests/gpu/test_oneshot_gpu.py b/tests/gpu/test_oneshot_gpu.py
+index 6d4b147..2b632bf 100644
+--- a/tests/gpu/test_oneshot_gpu.py
++++ b/tests/gpu/test_oneshot_gpu.py
+@@ -655,3 +655,93 @@ def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
+         )
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
++@pytest.mark.parametrize("rows_per_rank", [1, 16, 256, 768])
++def test_reduce_scatter_matches_reference(runtime, dtype, rows_per_rank):
++    """Reduce-scatter along dim 0 matches fixed-rank-order reduction of the rank's shard,
++    including multi-slice pipelining when rows_per_rank exceeds one transport slot."""
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    cols = 4096
++    torch.manual_seed(2026 + rank + rows_per_rank)
++    inp = torch.randn(rows_per_rank * world, cols, dtype=dtype, device=runtime.device)
++    assert runtime.should_reduce_scatter(inp, dim=0)
++    gathered_inputs = [torch.empty_like(inp) for _ in range(world)]
++    dist.all_gather(gathered_inputs, inp)
++    shard_slice = slice(rank * rows_per_rank, (rank + 1) * rows_per_rank)
++    acc = gathered_inputs[0][shard_slice].float()
++    for p in range(1, world):
++        acc = acc + gathered_inputs[p][shard_slice].float()
++    expected = acc.to(dtype)
++    out = runtime.reduce_scatter(inp, dim=0)
++    torch.cuda.synchronize()
++    runtime.check_health()
++    assert torch.equal(out, expected)
++
++
++@pytest.mark.parametrize("rows_per_rank", [1, 16, 256, 768])
++@pytest.mark.parametrize("copy_self", [False, True])
++def test_exchange_matches_all_to_all(runtime, rows_per_rank, copy_self):
++    """Peer-specific exchange matches all-to-all across single-slot and multi-slice inputs."""
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    cols = 4096
++    torch.manual_seed(3030 + rank + rows_per_rank)
++    chunks = torch.randn(world, rows_per_rank, cols, dtype=torch.bfloat16, device=runtime.device)
++    parts = torch.full_like(chunks, -7.0)
++    assert runtime.should_exchange(chunks, parts)
++    gathered = [torch.empty_like(chunks) for _ in range(world)]
++    dist.all_gather(gathered, chunks)
++    runtime.exchange(chunks, out=parts, copy_self=copy_self)
++    torch.cuda.synchronize()
++    runtime.check_health()
++    for p in range(world):
++        if p == rank and not copy_self:
++            assert torch.all(parts[p] == -7.0)
++        else:
++            assert torch.equal(parts[p], gathered[p][rank])
++
++
++@pytest.mark.parametrize("rows,total_delta", [(7, 0), (7, -3), (17, -10), (256, 0), (768, -100)])
++def test_all_to_all_rows_matches_reference(runtime, rows, total_delta):
++    """Active-row all-to-all exchanges ``rows``-row blocks of ``inp`` into ``(world, rows, ...)``."""
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    total = world * rows + total_delta
++    cols = 1024
++    torch.manual_seed(4040 + rank + rows)
++    inp = torch.randn(total, cols, dtype=torch.bfloat16, device=runtime.device)
++    assert runtime.should_all_to_all_rows(inp, rows)
++    gathered = [torch.empty_like(inp) for _ in range(world)]
++    dist.all_gather(gathered, inp)
++    out = runtime.all_to_all_rows(inp, rows)
++    torch.cuda.synchronize()
++    runtime.check_health()
++    assert out.shape == (world, rows, cols)
++    mine = max(0, min(rows, total - rank * rows))
++    for p in range(world):
++        assert torch.equal(out[p, :mine], gathered[p][rank * rows : rank * rows + mine])
++
++
++def test_sliced_all_gather_exceeding_slot_capacity(runtime):
++    """Pipelined all-gather (sliced=True) handles shards larger than max_gather_bytes."""
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    cols = 4096
++    rows = (runtime.max_gather_bytes // (cols * 2)) + 64
++    torch.manual_seed(5050 + rank)
++    inp = torch.randn(rows, cols, dtype=torch.bfloat16, device=runtime.device)
++    assert not runtime.should_all_gather(inp, 0, sliced=False)
++    assert runtime.should_all_gather(inp, 0, sliced=True)
++    assert runtime.should_all_gather(inp, -1, sliced=True)
++    gathered = [torch.empty_like(inp) for _ in range(world)]
++    dist.all_gather(gathered, inp)
++    for dim in (0, -1):
++        expected = torch.cat(gathered, dim=dim)
++        out = runtime.all_gather(inp, dim=dim, sliced=True)
++        torch.cuda.synchronize()
++        runtime.check_health()
++        assert torch.equal(out, expected)
++
++
++
+diff --git a/tests/oneshot_sim/simulate.c b/tests/oneshot_sim/simulate.c
+index 1513508..10a2068 100644
+--- a/tests/oneshot_sim/simulate.c
++++ b/tests/oneshot_sim/simulate.c
+@@ -18,11 +18,11 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+ static roce_ctx_t *ranks[4];
+ static uint32_t rng = 1;
+ static unsigned random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; return rng ^= rng << 5; }
+-static int world, ring4, stripes, rotate;
++static int world, ring4, stripes, rotate, exchange_mode;
+ static uint64_t messages;
+ static unsigned posted_in_round[4];
+ static uint32_t posted_seq[4];
+-static uint64_t direct_bytes[4][4], relay_bytes[4][4];
++static uint64_t direct_bytes[4][4], relay_bytes[4][4], stage_bytes[4][4];
+ static unsigned written_seq[4][4][4096 / 16];
+ static unsigned char written_valid[4][4][4096 / 16];
+ 
+@@ -72,6 +72,10 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr
+                 if (origin == qp->source) {
+                     assert(qp->dest == (origin + 1) % 4 || qp->dest == (origin + 3) % 4);
+                     direct_bytes[origin][qp->dest] += t->bytes;
++                } else if (origin == qp->dest) {
++                    assert(exchange_mode);
++                    assert(qp->dest == (qp->source + 1) % 4 || qp->dest == (qp->source + 3) % 4);
++                    stage_bytes[qp->source][qp->dest] += t->bytes;
+                 } else {
+                     assert(qp->dest == (origin + 2) % 4);
+                     relay_bytes[qp->source][qp->dest] += t->bytes;
+@@ -136,14 +140,17 @@ static int receive_lanes(int rank, int peer) {
+     return peer_width(world, rank, peer, stripes);
+ }
+ static uint8_t pattern(int source, uint32_t seq, size_t i) { return (uint8_t)(source * 53 + seq * 7 + i * 11); }
++static uint8_t pattern_ex(int source, int dest, uint32_t seq, size_t i) { return (uint8_t)(source * 53 + dest * 19 + seq * 7 + i * 11); }
+ static unsigned size_at(uint32_t seq) {
+     const unsigned sizes[] = {16, 32, 48, 4096, 128, 64, 4000};
+-    return sizes[seq % 7];
++    const unsigned ex_sizes[] = {16, 32, 48, 1024, 128, 64, 960};
++    return (exchange_mode ? ex_sizes : sizes)[seq % 7];
+ }
+ static void setup(uint32_t seed) {
+     memset(posted_in_round, 0, sizeof(posted_in_round));
+     memset(direct_bytes, 0, sizeof(direct_bytes));
+     memset(relay_bytes, 0, sizeof(relay_bytes));
++    memset(stage_bytes, 0, sizeof(stage_bytes));
+     memset(written_valid, 0, sizeof(written_valid));
+     uint64_t layout[7];
+     assert(!roce_layout(world, 4096, layout));
+@@ -223,9 +230,14 @@ static void run(unsigned count, uint32_t seed) {
+             uint32_t seq=next[r]; unsigned bytes=size_at(seq);
+             if(!active[r] && done[r]<count && random_u32()%5==0) {
+                 uint8_t *send=c->region+c->send_off+(seq&1)*c->slot_bytes;
+-                for(unsigned i=0;i<bytes;i++) send[i]=pattern(r,seq,i);
++                if (exchange_mode) {
++                    for(int p=0;p<world;p++) if(p!=r)
++                        for(unsigned i=0;i<bytes;i++) send[(size_t)p*bytes+i]=pattern_ex(r,p,seq,i);
++                } else {
++                    for(unsigned i=0;i<bytes;i++) send[i]=pattern(r,seq,i);
++                }
+                 uint32_t *ctrl=(uint32_t *)(c->region+c->ctrl_off);
+-                __atomic_store_n(&ctrl[4+(seq&1)],bytes,__ATOMIC_RELEASE);
++                __atomic_store_n(&ctrl[4+(seq&1)],exchange_mode?(bytes|ROCE_MODE_EXCHANGE):bytes,__ATOMIC_RELEASE);
+                 __atomic_store_n(ctrl,seq,__ATOMIC_RELEASE); active[r]=1;
+             }
+             if(active[r]) {
+@@ -235,7 +247,8 @@ static void run(unsigned count, uint32_t seed) {
+                 if(ready) {
+                     for(int p=0;p<world;p++) if(p!=r) {
+                         uint8_t *recv=c->region+c->recv_off+((size_t)p*2+(seq&1))*c->slot_bytes;
+-                        for(unsigned i=0;i<bytes;i++) assert(recv[i]==pattern(p,seq,i));
++                        for(unsigned i=0;i<bytes;i++)
++                            assert(recv[i]==(exchange_mode?pattern_ex(p,r,seq,i):pattern(p,seq,i)));
+                     }
+                     done[r]++; next[r]++; active[r]=0; remaining--;
+                 }
+@@ -256,6 +269,11 @@ static void run(unsigned count, uint32_t seed) {
+             uint64_t a=relay_bytes[r][next], b=relay_bytes[r][prev];
+             // At most one 16-byte remainder per lane and collective.
+             assert((a>b?a-b:b-a) <= (uint64_t)count*stripes*16);
++            if (exchange_mode) {
++                assert(stage_bytes[r][next] == relay_bytes[next][(r+2)%4]);
++                assert(stage_bytes[r][prev] == relay_bytes[prev][(r+2)%4]);
++                assert(stage_bytes[r][next] + stage_bytes[r][prev] == total);
++            }
+         }
+     }
+     cleanup();
+@@ -264,6 +282,7 @@ static void failures(void) {
+     setup(0); roce_ctx_t *c=ranks[0];
+     atomic_store(&c->running,1);
+     assert(post_op(c,1,4096+16)==-1);
++    assert(post_op(c,1,(1024+16)|ROCE_MODE_EXCHANGE)==-1);
+     atomic_store(&c->running,0);
+     assert(!roce_start(c));
+     uint32_t *ctrl=(uint32_t *)(c->region+c->ctrl_off);
+@@ -358,14 +377,19 @@ static void placement(void) {
+ int main(void) {
+     for(stripes=1;stripes<=2;stripes++) {
+         world=3;ring4=0;run(1000,0);
++        exchange_mode=1;run(500,0);exchange_mode=0;
+         world=4;ring4=1;run(3000,0);run(1000,UINT32_MAX-100);
++        exchange_mode=1;run(1000,0);run(500,UINT32_MAX-100);exchange_mode=0;
+         failures(); independent_directions();
+         world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
++        exchange_mode=1;run(500,0);exchange_mode=0;
+     }
+     stripes=4;world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+-    rotate=1;run(3000,0);run(1000,UINT32_MAX-100);rotate=0;
++    exchange_mode=1;run(500,0);exchange_mode=0;
++    rotate=1;run(3000,0);run(1000,UINT32_MAX-100);
++    exchange_mode=1;run(500,0);exchange_mode=0;rotate=0;
+     placement();
+-    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, 26000 collectives, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors, thread placement (%llu writes)\n", (unsigned long long)messages);
++    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, 31000 collectives, broadcast+exchange, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors, thread placement (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+diff --git a/tests/test_oneshot_cpu.py b/tests/test_oneshot_cpu.py
+index 3baae7a..8cc97f8 100644
+--- a/tests/test_oneshot_cpu.py
++++ b/tests/test_oneshot_cpu.py
+@@ -95,7 +95,7 @@ class KernelFamilyTest(unittest.TestCase):
+                     "cvt.f32.bf16", "cvt.f32.f16", "cvt.rn.bf16.f32", "cvt.rn.f16x2.f32"):
+             self.assertIn(ptx, source, ptx)
+         # Every extern the TileLang kernels name exists in the header.
+-        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py"):
++        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
+             text = (ROCE / module_name).read_text()
+             for name in sorted(set(re.findall(r'T\.call_extern\("(roce_[a-z0-9_]+)"', text))):
+                 self.assertIn(name, device.FUNCTIONS, (module_name, name))
+@@ -103,7 +103,7 @@ class KernelFamilyTest(unittest.TestCase):
+                 self.assertIn(name, device.FUNCTIONS, (module_name, name))
+ 
+     def test_tilelang_modules_import_without_a_gpu_stack(self):
+-        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_kernels.py", "_device.py", "_freeze.py"):
++        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py", "_kernels.py", "_device.py", "_freeze.py"):
+             tree = ast.parse((ROCE / module_name).read_text())
+             top_level = {alias.name.split(".")[0] for node in tree.body if isinstance(node, ast.Import) for alias in node.names}
+             top_level |= {(node.module or "").split(".")[0] for node in tree.body if isinstance(node, ast.ImportFrom) and node.level == 0}
+@@ -118,7 +118,7 @@ class KernelFamilyTest(unittest.TestCase):
+     def test_tilelang_kernels_declare_full_residency(self):
+         # Without a minimum blocks-per-SM bound nvcc spends 54 to 56 registers and the
+         # all-reduce loses ~15 us per launch in a decode step (2026-10-05 profiles).
+-        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py"):
++        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
+             text = (ROCE / module_name).read_text()
+             self.assertIn("T.annotate_min_blocks_per_sm(resident)", text, module_name)
+             self.assertIn("_resident_blocks(threads)", text, module_name)
+@@ -127,12 +127,16 @@ class KernelFamilyTest(unittest.TestCase):
+         runtime = (ROCE / "runtime.py").read_text()
+         self.assertIn("reduce_launcher(*self._launcher_key(dtype))", runtime)
+         self.assertIn("gather_launcher(*self._gather_launcher_key())", runtime)
++        self.assertIn("reducescatter_launcher(*self._reducescatter_launcher_key(dtype))", runtime)
++        self.assertIn("exchange_launcher(*self._gather_launcher_key())", runtime)
+         self.assertIn("kernel_setting_problems(os.environ)", runtime)
+         self.assertIn('if "kernels" in _ignored:', runtime)
+         self.assertNotIn("kernel_family", runtime)
+         kernels = (ROCE / "_kernels.py").read_text()
+         self.assertIn("from ._oneshot_tilelang import get_launcher", kernels)
+         self.assertIn("from ._allgather_tilelang import get_launcher", kernels)
++        self.assertIn("from ._reducescatter_tilelang import get_launcher", kernels)
++        self.assertIn("from ._exchange_tilelang import get_launcher", kernels)
+ 
+ 
+ class LaunchGeometryTest(unittest.TestCase):
+@@ -259,7 +263,7 @@ class LauncherGeometryTest(unittest.TestCase):
+         source = (ROCE / "runtime.py").read_text()
+         tree = ast.parse(source)
+         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RoceOneshotAllReduce")
+-        for name in ("_launcher_key", "_gather_launcher_key"):
++        for name in ("_launcher_key", "_gather_launcher_key", "_reducescatter_launcher_key"):
+             fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+             self.assertIn("self.topology == 'ring4'", ast.unparse(fn))
+         prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare")
+@@ -352,7 +356,7 @@ class FailStopTest(unittest.TestCase):
+                  "roce_fence_sc_sys()", "roce_trap()"]
+         positions = [branch.index(step, branch.index(order[i - 1]) + 1 if i else 0) for i, step in enumerate(order)]
+         self.assertEqual(positions, sorted(positions))
+-        for module in ("_oneshot_tilelang.py", "_allgather_tilelang.py"):
++        for module in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
+             source = (ROCE / module).read_text()
+             self.assertNotIn("poison", source, module)
+             self.assertNotIn("spin_limit", source, module)
