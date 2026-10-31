@@ -816,6 +816,7 @@ printf 'nvme_apst=%s\n' "$(for c in /dev/nvme[0-9]*; do
     /^ps +[0-9]+ :/ {for (f = 1; f <= NF; f++) if ($f ~ /^exlat:/) {sub("exlat:", "", $f); printf "%s:%s ", $2, $f}}')
   printf '%s|%s|%s\n' "${c#/dev/}" "$table" "$exits"
 done | paste -sd, -)"
+printf 'wifi_radio=%s\n' "$(nmcli radio wifi 2>/dev/null)"
 """
 
 
@@ -1129,6 +1130,18 @@ def nvme_coalescing_warnings(node_name: str, facts: dict[str, str]) -> list[str]
     return warnings
 
 
+def wireless_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Warnings when the onboard Wi-Fi radio is enabled on a cluster node."""
+    if facts.get("wifi_radio") != "enabled":
+        return []
+    return [
+        Warn(
+            f"{node_name}: Wi-Fi radio is enabled; run nmcli radio wifi off "
+            "to keep the management port off wireless"
+        )
+    ]
+
+
 FAN_CONTROL_VERSION = "0.1.4"
 FAN_CONTROL_UPGRADE = ("https://github.com/christopherowen/dgx-spark-fan-control/blob/"
                        f"v{FAN_CONTROL_VERSION}/docs/maintenance.md")
@@ -1334,9 +1347,14 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
             profile_warnings = kernel_readiness.profile_problems(
                 node["name"], inventory, kernel_profile, trial
             )
+            swap_warnings = (
+                [f"{node['name']}: 64 KiB swap or boot memory service is not active"]
+                if inventory.get("active_swap") != ["/swap-64k.img"] or inventory.get("memory_service") != "active"
+                else []
+            )
             problems.extend(
                 Warn(warning)
-                for warning in dict.fromkeys([*warnings, *profile_warnings])
+                for warning in dict.fromkeys([*warnings, *profile_warnings, *swap_warnings])
             )
             corrections.extend(fixes)
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
@@ -1353,6 +1371,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(idle_service_warnings(node["name"], facts))
         problems.extend(nvme_coalescing_warnings(node["name"], facts))
         problems.extend(nvme_apst_warnings(node["name"], facts))
+        problems.extend(wireless_warnings(node["name"], facts))
         problems.extend(fan_control_problems(
             node["name"], facts, fan_control=fan_control_enabled(cluster)))
         gid_index, hcas = roce_gid_setting(cluster, node)
@@ -1431,6 +1450,149 @@ def split_findings(findings: list[str]) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
+LIVE_RECOMMENDATION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "install 64kb page kernel",
+        (
+            "64 KiB package versions differ",
+            "missing or empty /boot/",
+            "candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+            "candidate cpupower tool is missing",
+            "nvidia is not prepared for",
+            "nvidia_uvm is not prepared for",
+            "nvidia_drm is not prepared for",
+            "mlx5_core is not prepared for",
+            "mlx5_ib is not prepared for",
+            "driver version differs from",
+            "loaded driver differs from",
+            "loaded NVIDIA RM build",
+            "candidate is missing from GRUB",
+            "normal boot is not explicitly pinned",
+            "GRUB next-boot/recovery override",
+            "running kernel/page size is outside the prepared pair",
+            "-byte pages; running",
+            "qualified NVIDIA RM build",
+            "NVIDIA system memory pool setting differs",
+            "serving profile recommends NVIDIA",
+        ),
+    ),
+    (
+        "install memory-saver",
+        (
+            "memory-saver",
+            "uvm_leaf_packing",
+        ),
+    ),
+    (
+        "configure swap",
+        (
+            "64 KiB swap",
+            "64 KiB THP/reserve policy",
+            "boot memory service",
+        ),
+    ),
+    (
+        "configure nvme sleep settings",
+        (
+            "sleeps in PS",
+            "NVMe APST",
+        ),
+    ),
+    (
+        "disable nvme interrupt coalescing",
+        (
+            "NVMe interrupt coalescing",
+            "nvidia-nvme-interrupt-coalescing.service",
+        ),
+    ),
+    (
+        "management port off wireless",
+        (
+            "Wi-Fi radio is enabled",
+            "wireless",
+        ),
+    ),
+    (
+        "install fan-control",
+        (
+            "dgx-spark-fan-control",
+            "fan-control DKMS",
+            "dgx_ec_fan_control",
+            "dgx-fan-control.service",
+            "candidate fan signature",
+        ),
+    ),
+    (
+        "set cpu governor to performance",
+        (
+            "CPU governors differ from performance",
+        ),
+    ),
+    (
+        "disable idle desktop services and boot splash",
+        (
+            "enabled or running, though unused on a headless inference node",
+            "boots to graphical.target",
+            "active console",
+            "splash",
+        ),
+    ),
+    (
+        "enable nvidia-drm modeset",
+        (
+            "nvidia-drm modeset",
+            "nvidia-drm fbdev",
+            "DRM clients",
+        ),
+    ),
+    (
+        "put installed OS first in UEFI boot order",
+        (
+            "UEFI boots",
+            "UEFI boot order",
+        ),
+    ),
+    (
+        "defragment model weight shards",
+        (
+            "weight shards are not at ext4's best extent count",
+            "weight fragmentation:",
+        ),
+    ),
+)
+
+
+def summarize_live_warnings(warnings: list[str]) -> list[str]:
+    """Group low-level live warnings into concise user recommendations."""
+    grouped: dict[str, dict[str, None]] = {label: {} for label, _ in LIVE_RECOMMENDATION_RULES}
+    matched_labels: dict[str, None] = {}
+    passthrough: list[str] = []
+    for warning in warnings:
+        if warning.startswith("Kernel corrections (not executed):"):
+            continue
+        node, separator, detail = warning.partition(": ")
+        text = detail if separator else warning
+        matched = False
+        for label, patterns in LIVE_RECOMMENDATION_RULES:
+            if any(pattern in warning or pattern in text for pattern in patterns):
+                matched_labels[label] = None
+                if separator and node != "weight fragmentation":
+                    grouped[label][node] = None
+                matched = True
+                break
+        if not matched:
+            passthrough.append(Warn(warning))
+    summary: list[str] = []
+    for label, _ in LIVE_RECOMMENDATION_RULES:
+        if label not in matched_labels:
+            continue
+        nodes = list(grouped[label])
+        suffix = f" ({', '.join(nodes)})" if nodes else ""
+        summary.append(Warn(f"recommend: {label}{suffix}"))
+    summary.extend(passthrough)
+    return summary
+
+
 def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
     """Print warnings and problems; only problems fail."""
     for warning in warnings:
@@ -1457,6 +1619,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         findings.extend(live_doctor(cluster, nodes))
         findings.extend(weight_fragmentation_findings(cluster, nodes))
     problems, warnings = split_findings(findings)
+    if args.live and not getattr(args, "verbose", False):
+        warnings = summarize_live_warnings(warnings)
     return report_doctor(problems, warnings, args.live)
 
 
@@ -6121,6 +6285,10 @@ def parser() -> argparse.ArgumentParser:
     site_shape.set_defaults(func=command_site_shape)
     doctor = commands.add_parser("doctor", help="validate repository and optional live state")
     doctor.add_argument("--live", action="store_true")
+    doctor.add_argument(
+        "--verbose", action="store_true",
+        help="show detailed per-node live diagnostic warnings and correction commands",
+    )
     doctor.add_argument(
         "--fragmentation-commands", action="store_true",
         help="check remote checkpoint fragmentation and print correction commands only; never execute them",

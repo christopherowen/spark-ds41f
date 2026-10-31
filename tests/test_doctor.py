@@ -1143,6 +1143,40 @@ class NewUserOnboardingTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(any("serving profile recommends" in w and "65536-byte pages" in w for w in warnings))
 
+    def test_summarize_live_warnings_groups_into_user_recommendations(self) -> None:
+        raw = [
+            "dgx1: 64 KiB package versions differ: linux-image-7.0.0-1019-nvidia-64k",
+            "dgx1: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+            "dgx2: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '6.17.0-1019-nvidia' / 4096",
+            "dgx1: memory-saver DKMS 0.1.3 is missing or not installed for 7.0.0-1019-nvidia-64k",
+            "dgx2: candidate UVM does not select the expected memory-saver DKMS module",
+            "dgx1: 64 KiB swap or boot memory service is not active",
+            "dgx1: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle",
+            "dgx1: NVMe interrupt coalescing is on (nvme0=0x00000107)",
+            *spark.wireless_warnings("dgx1", facts(wifi_radio="enabled")),
+            "dgx1: DKMS dgx-spark-fan-control is not installed for 6.17.0-1019-nvidia",
+            "dgx1: CPU governors differ from performance: ['schedutil']",
+            "dgx1: bluetooth.service enabled or running, though unused on a headless inference node",
+            "dgx1: nvidia-drm modeset is N, expected Y",
+            "Kernel corrections (not executed):\n  dgx1: sudo apt-get install ...",
+        ]
+        summary = spark.summarize_live_warnings(raw)
+        self.assertEqual(
+            summary,
+            [
+                "recommend: install 64kb page kernel (dgx1, dgx2)",
+                "recommend: install memory-saver (dgx1, dgx2)",
+                "recommend: configure swap (dgx1)",
+                "recommend: configure nvme sleep settings (dgx1)",
+                "recommend: disable nvme interrupt coalescing (dgx1)",
+                "recommend: management port off wireless (dgx1)",
+                "recommend: install fan-control (dgx1)",
+                "recommend: set cpu governor to performance (dgx1)",
+                "recommend: disable idle desktop services and boot splash (dgx1)",
+                "recommend: enable nvidia-drm modeset (dgx1)",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
