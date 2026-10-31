@@ -1,0 +1,621 @@
+From 7fe96c831311408fd17ea5dbe58c670e2ec59a49 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 19:13:13 +0100
+Subject: [PATCH] feat(ds41-tilelang): native TileLang 12-bit packed BF16 LM
+ head weight packer
+
+---
+ .../test_deepseek_v41_tilelang_vocab.py       |  59 ++-
+ .../layers/quantization/online/packed_bf16.py |  56 ++-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   | 379 ++++++++++++++++++
+ 3 files changed, 481 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 55678ff11..d45fe27db 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -16,10 +16,11 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ pytest.importorskip("tilelang")
+-packed_format = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
+ 
++from vllm.models.deepseek_v4_1.tilelang import vocab as packed_format  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
+     ROW_TILES,
++    pack_bf16_weight,
+     packed_vocab_projection,
+     prepare_bf16_head,
+     prepare_packed_head,
+@@ -27,6 +28,7 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
+     project_head_greedy_pairs,
+     row_tile,
+     tile_config,
++    unpack_bf16_weight,
+ )
+ 
+ DEVICE = "cuda"
+@@ -263,3 +265,58 @@ def test_packed_head_greedy_pairs_match_greedy_shard_pair(n, k, out_dtype):
+             )
+             assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab)
+             assert torch.equal(from_head[:, :2], expected[:, :2]), (rows, vocab)
++
++
++@pytest.mark.parametrize("n,k", [(512, 256), (2500, 512), (32320, 5120)])
++@pytest.mark.parametrize("in_place", [False, True])
++def test_tilelang_pack_bf16_weight_round_trips_and_matches_b12x(n, k, in_place):
++    weight = _head(n, k, seed=n + k + 41)
++    weight[0, :7] = torch.tensor(
++        [0.0, -0.0, 1e-30, 3.0, -2.5, 1e-7, 6e-39], dtype=torch.bfloat16, device=DEVICE
++    )
++    original = weight.clone()
++    packed = pack_bf16_weight(weight.clone() if in_place else weight, in_place=in_place)
++    assert packed.out_features == n and packed.in_features == k
++    assert packed.exceptions > 0
++    unpacked = unpack_bf16_weight(packed)
++    assert torch.equal(unpacked.view(torch.int16), original.view(torch.int16))
++
++    b12x_packed_mod = pytest.importorskip("b12x.gemm.packed_bf16_vocab_projection")
++    ref = b12x_packed_mod.pack(original.clone(), in_place=False)
++    assert packed.exponent_base == ref.exponent_base
++    assert packed.exceptions == ref.exceptions
++    assert torch.equal(packed.values, ref.values)
++    assert torch.equal(packed.row_offsets, ref.row_offsets)
++    assert torch.equal(packed.exception_rows, ref.exception_rows)
++    assert torch.equal(packed.exception_entries, ref.exception_entries)
++
++
++def test_packed_bf16_lm_head_method_tilelang_without_b12x(monkeypatch):
++    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
++    from vllm.model_executor.layers.quantization.online import packed_bf16 as pbf16_mod
++    from vllm.model_executor.layers.quantization.online.packed_bf16 import (
++        PackedBf16LmHeadMethod,
++        packed_bf16_supported,
++    )
++
++    config = VllmConfig(kernel_config=KernelConfig(linear_backend="tilelang"))
++    monkeypatch.setattr(
++        pbf16_mod, "get_b12x_packed_bf16_vocab_projection", lambda: None
++    )
++    with set_current_vllm_config(config):
++        assert packed_bf16_supported(512, torch.bfloat16)
++        method = PackedBf16LmHeadMethod()
++        assert method.tilelang
++        layer = torch.nn.Module()
++        with torch.device(DEVICE):
++            method.create_weights(layer, 512, [1000], 512, 1000, torch.bfloat16)
++        original = _head(1000, 512, seed=77)
++        layer.weight.data.copy_(original)
++        method.process_weights_after_loading(layer)
++        packed = method.packed_weight(layer)
++        assert torch.equal(
++            unpack_bf16_weight(packed).view(torch.int16), original.view(torch.int16)
++        )
++        method.declare_layer_kernels(layer)
++        x = (torch.randn(9, 512, device=DEVICE) * 0.5).bfloat16()
++        assert _close_to_fp32(project_head(layer, x), x, original)
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index 7157e4220..d968db77c 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -14,6 +14,8 @@ projection, which reads the packed bytes directly: B12X's prepared projection,
+ or TileLang's with the TileLang linear backend.
+ """
+ 
++import importlib.util
++
+ import torch
+ from torch.nn import Parameter
+ 
+@@ -21,21 +23,30 @@ from vllm.config import get_current_vllm_config
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
++from vllm.platforms import current_platform
+ from vllm.utils.b12x import get_b12x_packed_bf16_vocab_projection
+ 
+ logger = init_logger(__name__)
+ 
+ 
+-def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
+-    projection = get_b12x_packed_bf16_vocab_projection()
++def _tilelang_packed_bf16_supported() -> bool:
+     return (
+-        projection is not None
+-        and projection.is_supported()
+-        and params_dtype == torch.bfloat16
+-        and input_size % 128 == 0
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(120)
++        and importlib.util.find_spec("tilelang") is not None
+     )
+ 
+ 
++def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
++    if params_dtype != torch.bfloat16 or input_size <= 0 or input_size % 128 != 0:
++        return False
++    kernel_config = get_current_vllm_config().kernel_config
++    if kernel_config.linear_backend == "tilelang":
++        return _tilelang_packed_bf16_supported()
++    projection = get_b12x_packed_bf16_vocab_projection()
++    return projection is not None and projection.is_supported()
++
++
+ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     """A BF16 LM head served from its exact 12-bit packed form."""
+ 
+@@ -73,15 +84,24 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+-        projection = get_b12x_packed_bf16_vocab_projection()
+-        assert projection is not None
+         weight = layer.weight.data
+         in_features = int(weight.shape[1])
+         # In place: the packed rows take the first three quarters of the BF16
+         # head's own storage, so loading frees nothing the BF16 head would not.
+         # On GB10 freed memory stays charged to the process, so an extra
+         # allocation and free here would cost host memory for good.
+-        packed = projection.pack(weight, in_place=True)
++        if self.tilelang:
++            from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++            packed = pack_bf16_weight(weight, in_place=True)
++        else:
++            projection = get_b12x_packed_bf16_vocab_projection()
++            if projection is not None:
++                packed = projection.pack(weight, in_place=True)
++            else:
++                from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++                packed = pack_bf16_weight(weight, in_place=True)
+         del weight
+         replace_parameter(layer, "weight", packed.values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+@@ -119,9 +139,21 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+     @staticmethod
+     def packed_weight(layer: torch.nn.Module):
+         """The layer's current packed tensors (after any relocation)."""
+-        projection = get_b12x_packed_bf16_vocab_projection()
+-        assert projection is not None
+-        return projection.PackedBf16Weight(
++        tilelang_method = getattr(getattr(layer, "quant_method", None), "tilelang", False)
++        if not tilelang_method:
++            projection = get_b12x_packed_bf16_vocab_projection()
++            if projection is not None:
++                return projection.PackedBf16Weight(
++                    layer.weight,
++                    layer.packed_bf16_exponent_base,
++                    layer.weight_exception_rows,
++                    layer.weight_exception_entries,
++                    layer.weight_row_offsets,
++                    layer.packed_bf16_exceptions,
++                )
++        from vllm.models.deepseek_v4_1.tilelang.vocab import PackedBf16Weight
++
++        return PackedBf16Weight(
+             layer.weight,
+             layer.packed_bf16_exponent_base,
+             layer.weight_exception_rows,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index c6a8ab9c0..c4a38e84b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -19,6 +19,9 @@ BF16 GEMM with the same token tiles. Every head declares one kernel per token
+ tile; its owner declares it when the worker prepares kernels, after loading.
+ """
+ 
++from dataclasses import dataclass
++import functools
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+@@ -29,13 +32,379 @@ from .gemm import bf16_gemm, bf16_gemm_decode
+ 
+ GROUP = 128  # columns per code group
+ HALF = GROUP // 2  # one code byte holds a column of each half
++WINDOW = 15  # exponents encoded per tensor (codes 1..15; code 0 is exponent 0)
+ VEC = 16  # columns of each half one thread decodes at a time
++_PACK_BLOCK_ROWS = 1_024
+ # Token tiles: one decode row in a 16-row tile reads the weights once, like 64;
+ # 65-128 verification rows read the packed weight shard once in a 128-row tile.
+ ROW_TILES = (16, 32, 64, 128)
+ SHARED_MEMORY = 101_376  # dynamic shared memory per block on SM120 / SM121
+ 
+ 
++@dataclass(frozen=True)
++class PackedBf16Weight:
++    """A packed ``[out_features, in_features]`` BF16 weight."""
++
++    values: torch.Tensor
++    exponent_base: int
++    exception_rows: torch.Tensor
++    exception_entries: torch.Tensor
++    row_offsets: torch.Tensor
++    exceptions: int
++
++    @property
++    def out_features(self) -> int:
++        return int(self.values.shape[0])
++
++    @property
++    def in_features(self) -> int:
++        return int(self.values.shape[1]) * 2 // 3
++
++
++_PACK_HEADER = r"""
++template <int GROUP>
++__device__ __forceinline__ void vllm_packed_bf16_histogram(
++    const unsigned short* __restrict__ weight,
++    int* __restrict__ histogram,
++    int row, int K, int tx,
++    int* __restrict__ s_hist) {
++  s_hist[tx] = 0;
++  s_hist[tx + GROUP] = 0;
++  __syncthreads();
++  const unsigned short* row_ptr = weight + (long long)row * K;
++  for (int col = tx; col < K; col += GROUP) {
++    const int exp = ((int)row_ptr[col] >> 7) & 0xFF;
++    atomicAdd(&s_hist[exp], 1);
++  }
++  __syncthreads();
++  const int c0 = s_hist[tx];
++  const int c1 = s_hist[tx + GROUP];
++  if (c0 != 0) atomicAdd(&histogram[tx], c0);
++  if (c1 != 0) atomicAdd(&histogram[tx + GROUP], c1);
++}
++
++template <int GROUP, int WINDOW>
++__device__ __forceinline__ void vllm_packed_bf16_exception_count(
++    const unsigned short* __restrict__ weight,
++    int* __restrict__ counts,
++    int row, int K, int base, int tx,
++    int* __restrict__ s_count) {
++  if (tx == 0) s_count[0] = 0;
++  __syncthreads();
++  const unsigned short* row_ptr = weight + (long long)row * K;
++  int local_count = 0;
++  for (int col = tx; col < K; col += GROUP) {
++    const int exp = ((int)row_ptr[col] >> 7) & 0xFF;
++    if (exp != 0 && (exp < base || exp >= base + WINDOW)) {
++      local_count += 1;
++    }
++  }
++  if (local_count != 0) atomicAdd(&s_count[0], local_count);
++  __syncthreads();
++  if (tx == 0) counts[row] = s_count[0];
++}
++
++template <int GROUP, int WINDOW>
++__device__ __forceinline__ void vllm_packed_bf16_pack_row(
++    const unsigned short* __restrict__ weight,
++    unsigned char* __restrict__ values,
++    const int* __restrict__ offsets,
++    int* __restrict__ rows,
++    int* __restrict__ entries,
++    int* __restrict__ mismatches,
++    int prog_row, int row_start, int K, int base, int tx,
++    int* __restrict__ s_warp_counts) {
++  constexpr int HALF = GROUP / 2;
++  const int row_index = row_start + prog_row;
++  const unsigned short* source = weight + (long long)row_index * K;
++  unsigned char* out = values + (long long)prog_row * (K + K / 2);
++  int written = offsets[row_index];
++  int bad = 0;
++  const int warp_id = tx >> 5;
++  const int lane = tx & 31;
++  const unsigned int lane_mask = (1u << lane) - 1u;
++  for (int group = 0; group < K / GROUP; ++group) {
++    const int column = group * GROUP;
++    const int col_a = column + tx;
++    const int bits_a = (int)source[col_a] & 0xFFFF;
++    const int exp_a = (bits_a >> 7) & 0xFF;
++    const bool out_a = (exp_a != 0) && (exp_a < base || exp_a >= base + WINDOW);
++    const int code_a = (exp_a != 0 && !out_a) ? (exp_a - base + 1) : 0;
++    const int low_a = out_a ? 0 : (((bits_a >> 8) & 0x80) | (bits_a & 0x7F));
++    const int dec_a = ((low_a & 0x80) << 8) |
++                      (((code_a == 0) ? 0 : (code_a + base - 1)) << 7) |
++                      (low_a & 0x7F);
++    if (!out_a && dec_a != bits_a) bad += 1;
++    const unsigned int mask_a = __ballot_sync(0xffffffffu, out_a);
++    if (lane == 0) s_warp_counts[warp_id] = __popc(mask_a);
++    __syncthreads();
++    const int pos_a = written + (warp_id ? s_warp_counts[0] : 0) +
++                      __popc(mask_a & lane_mask);
++    if (out_a) {
++      rows[pos_a] = row_index;
++      entries[pos_a] = (col_a << 16) | bits_a;
++    }
++    written += s_warp_counts[0] + s_warp_counts[1];
++    __syncthreads();
++
++    const int col_b = column + HALF + tx;
++    const int bits_b = (int)source[col_b] & 0xFFFF;
++    const int exp_b = (bits_b >> 7) & 0xFF;
++    const bool out_b = (exp_b != 0) && (exp_b < base || exp_b >= base + WINDOW);
++    const int code_b = (exp_b != 0 && !out_b) ? (exp_b - base + 1) : 0;
++    const int low_b = out_b ? 0 : (((bits_b >> 8) & 0x80) | (bits_b & 0x7F));
++    const int dec_b = ((low_b & 0x80) << 8) |
++                      (((code_b == 0) ? 0 : (code_b + base - 1)) << 7) |
++                      (low_b & 0x7F);
++    if (!out_b && dec_b != bits_b) bad += 1;
++    const unsigned int mask_b = __ballot_sync(0xffffffffu, out_b);
++    if (lane == 0) s_warp_counts[warp_id] = __popc(mask_b);
++    __syncthreads();
++    const int pos_b = written + (warp_id ? s_warp_counts[0] : 0) +
++                      __popc(mask_b & lane_mask);
++    if (out_b) {
++      rows[pos_b] = row_index;
++      entries[pos_b] = (col_b << 16) | bits_b;
++    }
++    written += s_warp_counts[0] + s_warp_counts[1];
++    __syncthreads();
++
++    out[col_a] = (unsigned char)low_a;
++    out[col_b] = (unsigned char)low_b;
++    out[K + group * HALF + tx] = (unsigned char)(code_a | (code_b << 4));
++  }
++  if (tx == 0 && written != offsets[row_index + 1]) bad += 1;
++  if (bad != 0) atomicAdd(mismatches, bad);
++}
++"""
++
++
++@functools.lru_cache(maxsize=None)
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def packed_bf16_histogram(K: int):
++    """Per-tensor 256-bin exponent histogram over ``weight[M, K]``."""
++    assert K > 0 and K % GROUP == 0
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vocab_packed_histogram(
++        weight: T.Tensor((M, K), T.uint16),
++        histogram: T.Tensor((256,), T.int32),
++    ):
++        with T.Kernel(M, threads=GROUP) as (row,):
++            T.import_source(_PACK_HEADER)
++            s_hist = T.alloc_shared((256,), T.int32)
++            tx = T.get_thread_binding()
++            T.call_extern(
++                "handle",
++                f"vllm_packed_bf16_histogram<{GROUP}>",
++                T.address_of(weight[0, 0]),
++                T.address_of(histogram[0]),
++                row,
++                K,
++                tx,
++                T.address_of(s_hist[0]),
++            )
++
++    return vocab_packed_histogram
++
++
++@functools.lru_cache(maxsize=None)
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def packed_bf16_exception_count(K: int):
++    """Per-row count of nonzero exponents outside ``base..base + WINDOW - 1``."""
++    assert K > 0 and K % GROUP == 0
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vocab_packed_exception_count(
++        weight: T.Tensor((M, K), T.uint16),
++        counts: T.Tensor((M,), T.int32),
++        base: T.int32,
++    ):
++        with T.Kernel(M, threads=GROUP) as (row,):
++            T.import_source(_PACK_HEADER)
++            s_count = T.alloc_shared((1,), T.int32)
++            tx = T.get_thread_binding()
++            T.call_extern(
++                "handle",
++                f"vllm_packed_bf16_exception_count<{GROUP}, {WINDOW}>",
++                T.address_of(weight[0, 0]),
++                T.address_of(counts[0]),
++                row,
++                K,
++                base,
++                tx,
++                T.address_of(s_count[0]),
++            )
++
++    return vocab_packed_exception_count
++
++
++@functools.lru_cache(maxsize=None)
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def packed_bf16_pack_rows(K: int):
++    """Pack rows ``row_start .. row_start + M - 1`` of ``weight[N, K]`` into ``values[M, K + K // 2]``."""
++    assert K > 0 and K % GROUP == 0
++    row_bytes = K + K // 2
++    N = T.dynamic("N")
++    M = T.dynamic("M")
++    O = T.dynamic("O")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def vocab_packed_pack_rows(
++        weight: T.Tensor((N, K), T.uint16),
++        values: T.Tensor((M, row_bytes), T.uint8),
++        offsets: T.Tensor((O,), T.int32),
++        rows: T.Tensor((E,), T.int32),
++        entries: T.Tensor((E,), T.int32),
++        mismatches: T.Tensor((1,), T.int32),
++        base: T.int32,
++        row_start: T.int32,
++    ):
++        with T.Kernel(M, threads=HALF) as (prog_row,):
++            T.import_source(_PACK_HEADER)
++            s_warp_counts = T.alloc_shared((2,), T.int32)
++            tx = T.get_thread_binding()
++            T.call_extern(
++                "handle",
++                f"vllm_packed_bf16_pack_row<{GROUP}, {WINDOW}>",
++                T.address_of(weight[0, 0]),
++                T.address_of(values[0, 0]),
++                T.address_of(offsets[0]),
++                T.address_of(rows[0]),
++                T.address_of(entries[0]),
++                T.address_of(mismatches[0]),
++                prog_row,
++                row_start,
++                K,
++                base,
++                tx,
++                T.address_of(s_warp_counts[0]),
++            )
++
++    return vocab_packed_pack_rows
++
++
++def _check_pack_weight(weight: torch.Tensor) -> None:
++    if weight.ndim != 2 or weight.dtype != torch.bfloat16:
++        raise TypeError("packing needs a 2-D torch.bfloat16 weight")
++    if not weight.is_cuda or not weight.is_contiguous():
++        raise ValueError("packing needs a contiguous CUDA weight")
++    if weight.shape[0] == 0 or weight.shape[1] == 0 or weight.shape[1] % GROUP:
++        raise ValueError(
++            f"packing needs rows and K divisible by {GROUP}, got {tuple(weight.shape)}"
++        )
++
++
++def pack_bf16_weight(
++    weight: torch.Tensor, *, in_place: bool = False
++) -> PackedBf16Weight:
++    """Pack ``weight`` into exact 12-bit storage using TileLang; raise if any value
++    would not round-trip.
++
++    ``in_place=True`` writes the packed rows into the first three quarters of
++    ``weight``'s own storage using a 1,024-row staging buffer.
++    """
++    _check_pack_weight(weight)
++    out_features, in_features = map(int, weight.shape)
++    width = in_features + in_features // 2
++    device = weight.device
++    bits = weight.view(torch.uint16)
++    histogram = torch.zeros(256, dtype=torch.int32, device=device)
++    packed_bf16_histogram(in_features)(bits, histogram)
++    hist = histogram.to(torch.int64).cpu()
++    hist[0] = 0
++    windows = hist.unfold(0, WINDOW, 1).sum(1)
++    windows[0] = -1
++    base = int(windows.argmax())
++    row_offsets = torch.zeros(out_features + 1, dtype=torch.int32, device=device)
++    packed_bf16_exception_count(in_features)(bits, row_offsets[1:], base)
++    row_offsets[1:] = torch.cumsum(row_offsets[1:], 0, dtype=torch.int32)
++    exceptions = int(row_offsets[-1])
++    rows = torch.zeros(max(exceptions, 1), dtype=torch.int32, device=device)
++    entries = torch.zeros_like(rows)
++    mismatches = torch.zeros(1, dtype=torch.int32, device=device)
++    pack_kernel = packed_bf16_pack_rows(in_features)
++    if in_place:
++        values = (
++            weight.view(torch.uint8)
++            .view(-1)[: out_features * width]
++            .view(out_features, width)
++        )
++        staging = torch.empty(
++            (min(_PACK_BLOCK_ROWS, out_features), width),
++            dtype=torch.uint8,
++            device=device,
++        )
++        for start in range(0, out_features, _PACK_BLOCK_ROWS):
++            count = min(_PACK_BLOCK_ROWS, out_features - start)
++            pack_kernel(
++                bits,
++                staging[:count],
++                row_offsets,
++                rows,
++                entries,
++                mismatches,
++                base,
++                start,
++            )
++            values[start : start + count].copy_(staging[:count])
++        del staging
++    else:
++        values = torch.empty((out_features, width), dtype=torch.uint8, device=device)
++        pack_kernel(
++            bits,
++            values,
++            row_offsets,
++            rows,
++            entries,
++            mismatches,
++            base,
++            0,
++        )
++    if int(mismatches) != 0:
++        raise ValueError(
++            f"packed BF16 weight does not round-trip ({int(mismatches)} mismatches)"
++        )
++    return PackedBf16Weight(values, base, rows, entries, row_offsets, exceptions)
++
++
++def unpack_bf16_weight(packed: PackedBf16Weight) -> torch.Tensor:
++    """The exact BF16 weight that ``packed`` stores (for tests and inspection)."""
++    count, width = packed.values.shape
++    k = width * 2 // 3
++    low = packed.values[:, :k].to(torch.int32)
++    codes = packed.values[:, k:].to(torch.int32).view(count, k // GROUP, 1, GROUP // 2)
++    code = torch.cat((codes & 0xF, codes >> 4), dim=2).reshape(count, k)
++    exponent = torch.where(code == 0, 0, code + packed.exponent_base - 1)
++    bits = ((low & 0x80) << 8) | (exponent << 7) | (low & 0x7F)
++    if packed.exceptions:
++        entries = packed.exception_entries[: packed.exceptions]
++        bits[
++            packed.exception_rows[: packed.exceptions].long(),
++            (entries >> 16).long(),
++        ] = entries & 0xFFFF
++    return bits.to(torch.int16).view(torch.bfloat16)
++
++
++pack = pack_bf16_weight
++unpack = unpack_bf16_weight
++
++
+ def shared_memory_bytes(
+     block_M: int,
+     block_N: int,
+@@ -696,9 +1065,17 @@ def project_head_greedy_pairs(
+ 
+ __all__ = [
+     "BF16_HEAD_CONFIGS",
++    "GROUP",
++    "PackedBf16Weight",
+     "ROW_TILES",
+     "TILE_CONFIGS",
++    "WINDOW",
+     "finish_vocab_greedy_pairs",
++    "pack",
++    "pack_bf16_weight",
++    "packed_bf16_exception_count",
++    "packed_bf16_histogram",
++    "packed_bf16_pack_rows",
+     "packed_vocab_greedy_partials",
+     "packed_vocab_projection",
+     "prepare_bf16_head",
+@@ -708,4 +1085,6 @@ __all__ = [
+     "row_tile",
+     "shared_memory_bytes",
+     "tile_config",
++    "unpack",
++    "unpack_bf16_weight",
+ ]
+-- 
+2.54.0 (Apple Git-157)
+
