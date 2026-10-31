@@ -46,6 +46,7 @@ done
 | Pull request | Branch | Waiting for | Before opening |
 | --- | --- | --- | --- |
 | `[Example] DeepSeek-V4.1-Flash kernels for SM120/SM121` | the four example commits on `deepseek-v41-sm120`, squashed | [#3495](https://github.com/tile-ai/tilelang/pull/3495) | Reword comments and the README that mention our serving shapes. `pytest examples/deepseek_v41` passed on GB10 on 2026-10-05 (11 passed) |
+| `[IKET] Add START_END/MULTI_EVENT ranges, cross-warp scopes, 8-64b payloads, and ExtendedNativeDump` | `feat/iket-extended-ranges-and-payloads` (`e58f4575` in `christopherowen/tilelang`, exported as `patches/tilelang/0004-iket-extended-ranges-and-payloads.patch`) | Ready to open upstream against `tile-ai/tilelang` | Verified on GB10 (`dgx4`): `pytest testing/python/tools/test_tilelang_tools_cuda_iket.py` (39 passed) and end-to-end `iket.cli.main profile` trace verification |
 
 ## Planned issues
 
