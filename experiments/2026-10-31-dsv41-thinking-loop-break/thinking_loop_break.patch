@@ -1,5 +1,5 @@
 diff --git a/tests/v1/core/test_repetition_detection.py b/tests/v1/core/test_repetition_detection.py
-index aae6e3b..0ac1353 100644
+index aae6e3b..70e5697 100644
 --- a/tests/v1/core/test_repetition_detection.py
 +++ b/tests/v1/core/test_repetition_detection.py
 @@ -3,7 +3,11 @@
@@ -15,7 +15,7 @@ index aae6e3b..0ac1353 100644
  from vllm.v1.request import Request, RequestStatus
  
  pytestmark = pytest.mark.cpu_test
-@@ -288,3 +292,117 @@ class TestRepetitionDetectionIntegration:
+@@ -288,3 +292,246 @@ class TestRepetitionDetectionIntegration:
          )
          request.append_output_token_ids([10, 20, 10, 20, 10, 20])
          assert not check_stop(request, max_model_len=1024)
@@ -133,6 +133,135 @@ index aae6e3b..0ac1353 100644
 +        assert stopped
 +        assert request.status == RequestStatus.FINISHED_REPETITION
 +        assert request.stop_reason == "repetition_detected"
++
++    def test_thinking_off_skips_repetition_guard(self):
++        """Test that when thinking is disabled (via prompt ending in </think>,
++        thinking_token_budget=0, reasoning_ended=True, or reasoning_parser_kwargs),
++        the repetition guard does not run."""
++        start_ids = (128805,)
++        end_ids = (128806,)
++        let_me_do_it = [101, 102, 103, 104, 13, 198]
++        default_rep = RepetitionDetectionParams(
++            max_pattern_size=64, min_pattern_size=5, min_count=3
++        )
++
++        # 1. Prompt ends with </think> (DeepSeek-V4.1 thinking=False prompt)
++        req_prompt_off = Request(
++            request_id="think-off-prompt",
++            prompt_token_ids=[1, 2, 128804, 128806],
++            sampling_params=SamplingParams(
++                max_tokens=512, repetition_detection=default_rep
++            ),
++            pooling_params=None,
++        )
++        assert not req_prompt_off.thinking_disabled
++        for tok in let_me_do_it * 5:
++            prev_out = len(req_prompt_off._output_token_ids)
++            req_prompt_off.append_output_token_ids(tok)
++            req_prompt_off.update_reasoning_markers(
++                start_ids, end_ids, prev_num_output=prev_out
++            )
++            assert req_prompt_off.thinking_disabled
++            assert not check_stop(
++                req_prompt_off, max_model_len=2048, thinking_loop_break=True
++            )
++            assert not req_prompt_off.force_thinking_end
++
++        # 2. Explicit thinking-off flags at Request initialization
++        for init_kwargs in (
++            {"reasoning_ended": True},
++            {
++                "sampling_params": SamplingParams(
++                    max_tokens=512,
++                    thinking_token_budget=0,
++                    repetition_detection=default_rep,
++                )
++            },
++            {
++                "reasoning_parser_kwargs": {
++                    "chat_template_kwargs": {"thinking": False}
++                }
++            },
++            {
++                "reasoning_parser_kwargs": {
++                    "chat_template_kwargs": {"enable_thinking": False}
++                }
++            },
++            {"reasoning_parser_kwargs": {"reasoning_effort": "none"}},
++        ):
++            params = init_kwargs.get(
++                "sampling_params",
++                SamplingParams(max_tokens=512, repetition_detection=default_rep),
++            )
++            req = Request(
++                request_id="think-off-init",
++                prompt_token_ids=[1, 2, 128805, 198],
++                sampling_params=params,
++                pooling_params=None,
++                reasoning_ended=init_kwargs.get("reasoning_ended"),
++                reasoning_parser_kwargs=init_kwargs.get("reasoning_parser_kwargs"),
++            )
++            assert req.thinking_disabled
++            req.append_output_token_ids(let_me_do_it * 5)
++            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=0)
++            assert not check_stop(req, max_model_len=2048, thinking_loop_break=True)
++
++    def test_protocol_to_sampling_params_skips_default_repetition_when_thinking_off(
++        self,
++    ):
++        """Test that ChatCompletionRequest and ResponsesRequest do not apply
++        server-default repetition_detection when thinking is disabled."""
++        from vllm.entrypoints.openai.chat_completion.protocol import (
++            ChatCompletionRequest,
++        )
++        from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++        default_sampling_params = {
++            "repetition_detection": {
++                "max_pattern_size": 64,
++                "min_pattern_size": 5,
++                "min_count": 3,
++            }
++        }
++        msgs = [{"role": "user", "content": "hi"}]
++
++        # Thinking enabled by default -> inherits default repetition_detection
++        req_on = ChatCompletionRequest(messages=msgs)
++        sp_on = req_on.to_sampling_params(128, default_sampling_params)
++        assert sp_on.repetition_detection is not None
++
++        # Thinking disabled via each supported API switch -> skips default
++        for kwargs in (
++            {"thinking": {"type": "disabled"}},
++            {"chat_template_kwargs": {"thinking": False}},
++            {"chat_template_kwargs": {"enable_thinking": False}},
++            {"reasoning_effort": "none"},
++            {"thinking_token_budget": 0},
++        ):
++            req_off = ChatCompletionRequest(messages=msgs, **kwargs)
++            sp_off = req_off.to_sampling_params(128, default_sampling_params)
++            assert sp_off.repetition_detection is None
++
++        # ResponsesRequest with reasoning.effort="none" or enable_thinking=False
++        resp_on = ResponsesRequest(input="hi")
++        assert (
++            resp_on.to_sampling_params(
++                128, default_sampling_params
++            ).repetition_detection
++            is not None
++        )
++        for r_kwargs in (
++            {"reasoning": {"effort": "none"}},
++            {"chat_template_kwargs": {"enable_thinking": False}},
++            {"chat_template_kwargs": {"thinking": False}},
++        ):
++            resp_off = ResponsesRequest(input="hi", **r_kwargs)
++            assert (
++                resp_off.to_sampling_params(
++                    128, default_sampling_params
++                ).repetition_detection
++                is None
++            )
 diff --git a/tests/v1/worker/test_gpu_thinking_budget.py b/tests/v1/worker/test_gpu_thinking_budget.py
 index d98e8c0..ec33ff6 100644
 --- a/tests/v1/worker/test_gpu_thinking_budget.py
@@ -218,21 +347,46 @@ index 3d62d25..445e18b 100644
          if any(p in config for p in available_params):
              diff_sampling_param = {
 diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
-index d6c8284..eb2657e 100644
+index d6c8284..c961efd 100644
 --- a/vllm/entrypoints/openai/chat_completion/protocol.py
 +++ b/vllm/entrypoints/openai/chat_completion/protocol.py
-@@ -747,6 +747,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
+@@ -720,6 +720,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             self.response_format,
+         )
+ 
++    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
++        if thinking_token_budget is not None and thinking_token_budget == 0:
++            return True
++        user_kwargs = self.chat_template_kwargs or {}
++        if "thinking" in user_kwargs:
++            return not bool(user_kwargs["thinking"])
++        if "enable_thinking" in user_kwargs:
++            return not bool(user_kwargs["enable_thinking"])
++        if user_kwargs.get("thinking_mode") == "chat":
++            return True
++        if self.thinking is not None:
++            return self.thinking.type != "enabled"
++        if self.reasoning_effort is not None:
++            return self.reasoning_effort == "none"
++        return False
++
+     def to_sampling_params(
+         self,
+         max_tokens: int,
+@@ -747,6 +763,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
              min_p = default_sampling_params.get(
                  "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
              )
-+        if (repetition_detection := self.repetition_detection) is None:
-+            repetition_detection = default_sampling_params.get("repetition_detection")
 +        if (thinking_token_budget := self.thinking_token_budget) is None:
 +            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
++        if (repetition_detection := self.repetition_detection) is None and not (
++            self._is_thinking_disabled(thinking_token_budget)
++        ):
++            repetition_detection = default_sampling_params.get("repetition_detection")
  
          # Merge server-default stop_token_ids (e.g., model-specific tokens
          # like </call> for gpt-oss) with any request-specified ones
-@@ -804,11 +808,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
+@@ -804,11 +826,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
              structured_outputs=self.extract_structured_outputs(),
              logit_bias=self.logit_bias,
              bad_words=self.bad_words,
@@ -273,15 +427,50 @@ index bf0a94e..df090d2 100644
          )
  
 diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
-index 27c6096..8144bd1 100644
+index 27c6096..48ac711 100644
 --- a/vllm/entrypoints/openai/responses/protocol.py
 +++ b/vllm/entrypoints/openai/responses/protocol.py
-@@ -457,6 +457,8 @@ class ResponsesRequest(OpenAIBaseModel):
+@@ -392,6 +392,20 @@ class ResponsesRequest(OpenAIBaseModel):
+             )
+         return None
+ 
++    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
++        if thinking_token_budget is not None and thinking_token_budget == 0:
++            return True
++        user_kwargs = self.chat_template_kwargs or {}
++        if "thinking" in user_kwargs:
++            return not bool(user_kwargs["thinking"])
++        if "enable_thinking" in user_kwargs:
++            return not bool(user_kwargs["enable_thinking"])
++        if user_kwargs.get("thinking_mode") == "chat":
++            return True
++        if self.reasoning is not None and self.reasoning.effort is not None:
++            return self.reasoning.effort == "none"
++        return False
++
+     def to_sampling_params(
+         self,
+         default_max_tokens: int,
+@@ -435,6 +449,13 @@ class ResponsesRequest(OpenAIBaseModel):
+         if self.ec_transfer_params:
+             extra_args["ec_transfer_params"] = self.ec_transfer_params
+ 
++        thinking_token_budget = default_sampling_params.get("thinking_token_budget")
++        repetition_detection = (
++            None
++            if self._is_thinking_disabled(thinking_token_budget)
++            else default_sampling_params.get("repetition_detection")
++        )
++
+         return SamplingParams.from_optional(
+             temperature=temperature,
+             watermarking=self.watermarking,
+@@ -457,6 +478,8 @@ class ResponsesRequest(OpenAIBaseModel):
              skip_clone=True,  # Created fresh per request, safe to skip clone
              skip_special_tokens=self.skip_special_tokens,
              include_stop_str_in_output=self.include_stop_str_in_output,
-+            repetition_detection=default_sampling_params.get("repetition_detection"),
-+            thinking_token_budget=default_sampling_params.get("thinking_token_budget"),
++            repetition_detection=repetition_detection,
++            thinking_token_budget=thinking_token_budget,
          )
  
      def is_include_output_logprobs(self) -> bool:
@@ -349,7 +538,7 @@ index 412f123..74b1493 100644
      # None identifies a transfer-only or otherwise empty model step.
      compute_service_class: ComputeServiceClass | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 1e48918..b310496 100644
+index 1e48918..fcd0067 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -158,6 +158,9 @@ class Scheduler(SchedulerInterface):
@@ -427,7 +616,7 @@ index 1e48918..b310496 100644
          for num_new, output_token_id in enumerate(new_token_ids, 1):
 +            prev_num_output = len(request._output_token_ids)
              request.append_output_token_ids(output_token_id)
-+            if track_reasoning:
++            if track_reasoning and not request.thinking_disabled:
 +                request.update_reasoning_markers(
 +                    start_ids, end_ids, prev_num_output=prev_num_output
 +                )
@@ -452,7 +641,7 @@ index 1e48918..b310496 100644
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
 diff --git a/vllm/v1/core/sched/utils.py b/vllm/v1/core/sched/utils.py
-index dcad02a..5c19fe4 100644
+index dcad02a..ca5abbc 100644
 --- a/vllm/v1/core/sched/utils.py
 +++ b/vllm/v1/core/sched/utils.py
 @@ -25,14 +25,135 @@ def _has_repeating_pattern(
@@ -638,9 +827,13 @@ index dcad02a..5c19fe4 100644
      assert not request.pooling_params
  
      sampling_params = request.sampling_params
-@@ -137,11 +276,44 @@ def check_stop(request: Request, max_model_len: int) -> bool:
+@@ -136,12 +275,48 @@ def check_stop(request: Request, max_model_len: int) -> bool:
+     if request.num_output_tokens < sampling_params.min_tokens:
          return False
  
++    if request.thinking_disabled:
++        return False
++
      repetition_detection = sampling_params.repetition_detection
 -    if repetition_detection is not None and (
 -        check_sequence_repetition(
@@ -689,10 +882,10 @@ index dcad02a..5c19fe4 100644
          request.status = RequestStatus.FINISHED_REPETITION
          request.stop_reason = "repetition_detected"
 diff --git a/vllm/v1/request.py b/vllm/v1/request.py
-index 8a7a0cd..30c5d19 100644
+index 8a7a0cd..756a05e 100644
 --- a/vllm/v1/request.py
 +++ b/vllm/v1/request.py
-@@ -258,6 +258,19 @@ class Request:
+@@ -258,6 +258,26 @@ class Request:
          # none. The scheduler widens the request's draft placeholders to it.
          self.copy_draft_alloc = 0
  
@@ -703,25 +896,60 @@ index 8a7a0cd..30c5d19 100644
 +        # - thinking_output_start == -1: not currently inside <think>.
 +        # - thinking_end_output_idx: index in _output_token_ids immediately
 +        #   after the most recent </think> marker.
++        # - thinking_disabled: True when thinking is disabled for this request
++        #   so the repetition guard and marker tracking do not run.
++        self._reasoning_ended_init: bool | None = reasoning_ended
++        self._reasoning_parser_kwargs_init: dict[str, Any] | None = (
++            reasoning_parser_kwargs
++        )
 +        self.thinking_output_start: int = -1
 +        self.thinking_end_output_idx: int = 0
 +        self.force_thinking_end: bool = False
 +        self.thinking_loop_breaks: int = 0
 +        self._reasoning_markers_initialized: bool = False
++        self.thinking_disabled: bool = self._compute_thinking_disabled()
 +
          self.block_hashes: list[BlockHash] = []
          # Store the block hasher without binding self to avoid creating a
          # reference cycle (Request -> partial -> Request) that prevents
-@@ -323,6 +336,68 @@ class Request:
+@@ -323,6 +343,110 @@ class Request:
          if self._block_hasher is not None:
              self.block_hashes.extend(self._block_hasher(self))
  
++    def _compute_thinking_disabled(self) -> bool:
++        if self._reasoning_ended_init is True:
++            return True
++        if (
++            self.sampling_params is not None
++            and self.sampling_params.thinking_token_budget is not None
++            and self.sampling_params.thinking_token_budget == 0
++        ):
++            return True
++        if self._reasoning_parser_kwargs_init:
++            chat_kwargs = self._reasoning_parser_kwargs_init.get("chat_template_kwargs")
++            dicts = (
++                (chat_kwargs, self._reasoning_parser_kwargs_init)
++                if isinstance(chat_kwargs, dict)
++                else (self._reasoning_parser_kwargs_init,)
++            )
++            for kw in dicts:
++                if "thinking" in kw and not bool(kw["thinking"]):
++                    return True
++                if "enable_thinking" in kw and not bool(kw["enable_thinking"]):
++                    return True
++                if kw.get("thinking_mode") == "chat":
++                    return True
++                if kw.get("reasoning_effort") == "none":
++                    return True
++        return False
++
 +    def reset_reasoning_markers(self) -> None:
 +        self.thinking_output_start = -1
 +        self.thinking_end_output_idx = 0
 +        self.force_thinking_end = False
 +        self.thinking_loop_breaks = 0
 +        self._reasoning_markers_initialized = False
++        self.thinking_disabled = self._compute_thinking_disabled()
 +
 +    def update_reasoning_markers(
 +        self,
@@ -729,6 +957,8 @@ index 8a7a0cd..30c5d19 100644
 +        end_ids: tuple[int, ...],
 +        prev_num_output: int = 0,
 +    ) -> None:
++        if self.thinking_disabled:
++            return
 +        start_len = len(start_ids)
 +        end_len = len(end_ids)
 +        if start_len == 0 or end_len == 0:
@@ -739,11 +969,13 @@ index 8a7a0cd..30c5d19 100644
 +            self._reasoning_markers_initialized = True
 +            start_last = start_ids[-1]
 +            end_last = end_ids[-1]
++            closed_in_prompt = False
 +            for pos in range(num_prompt, 0, -1):
 +                tok = all_ids[pos - 1]
 +                if tok == end_last and pos >= end_len:
 +                    if end_len == 1 or tuple(all_ids[pos - end_len : pos]) == end_ids:
 +                        self.thinking_output_start = -1
++                        closed_in_prompt = True
 +                        break
 +                if tok == start_last and pos >= start_len:
 +                    if (
@@ -752,6 +984,9 @@ index 8a7a0cd..30c5d19 100644
 +                    ):
 +                        self.thinking_output_start = 0
 +                        break
++            if closed_in_prompt:
++                self.thinking_disabled = True
++                return
 +
 +        cur_num_output = len(self._output_token_ids)
 +        if cur_num_output <= prev_num_output:
@@ -777,6 +1012,13 @@ index 8a7a0cd..30c5d19 100644
 +                ):
 +                    self.thinking_output_start = out_pos
 +                    self.force_thinking_end = False
++
++        if (
++            self.thinking_output_start < 0
++            and self.thinking_end_output_idx == 0
++            and cur_num_output >= start_len
++        ):
++            self.thinking_disabled = True
 +
      @property
      def use_structured_output(self) -> bool:

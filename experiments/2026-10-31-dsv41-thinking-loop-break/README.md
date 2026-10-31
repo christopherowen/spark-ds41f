@@ -22,23 +22,26 @@ During multi-turn agentic coding workflows, DeepSeek-V4.1-Flash can enter a cycl
    - When `check_stop` detects a loop inside `<think>`, instead of aborting the request, it sets `request.force_thinking_end = True`, resets `request.copy_draft_alloc = 0`, and includes the request in `SchedulerOutput.force_thinking_end_req_ids`.
    - On the GPU worker (`GPUModelRunner.update_requests`), `Sampler.set_forced_thinking_end` dynamically activates `ThinkingBudgetState` (`budget = 0`) and resets `CopyDrafter` for that slot only until `</think>` (`128806`) is committed, then immediately restores `use_thinking_budget = False` and `needs_logits_processing = False`.
    - If a request still loops *after* `</think>` was forced, `check_stop` terminates it with `RequestStatus.FINISHED_REPETITION` (inspecting only tokens after `thinking_end_output_idx` so pre-`</think>` tokens never false-trigger).
-3. **`generation_config` / `default_sampling_params` Wiring**:
+3. **`generation_config` / `default_sampling_params` Wiring & Thinking-Off Bypass**:
    - Wires `repetition_detection` and `thinking_token_budget` through `ModelConfig.get_diff_sampling_param()`, `SamplingParams.__post_init__` (dict coercion), and OpenAI `chat_completion`, `completion`, and `responses` `to_sampling_params()`.
+   - **Inactive when thinking is off**: When thinking is disabled for a request (`thinking={"type": "disabled"}`, `chat_template_kwargs={"thinking": False}` / `{"enable_thinking": False}`, `reasoning_effort="none"`, `thinking_token_budget=0`, `reasoning_ended=True`, or a prompt ending with `</think>` / starting generation outside `<think>`), `request.thinking_disabled` is set to `True` and `to_sampling_params()` does not inherit server-default `repetition_detection`. Both `update_reasoning_markers` and the repetition guard in `check_stop` are completely bypassed (`0` overhead).
 
 ## Performance Impact
 
 - **Steady-state GPU overhead**: **`0.0 us` (`0.00%`)**. On normal decode steps, `use_thinking_budget` and `needs_logits_processing` remain `False`, preserving both the vocab-parallel `_verifies_greedily` fast path (`temperature=0.0`) and the raw-BF16 Gumbel sampling fast path (`temperature=1.0, top_p=1.0`).
-- **Steady-state CPU overhead**: **`~0.8 us/step`** on the Scheduler during `update_from_output`, hidden behind the `12–16 ms` GPU forward pass under `async_scheduling`.
+- **Steady-state CPU overhead**: **`0.0 us/step`** when thinking is disabled (`thinking_disabled = True`), and **`~0.8 us/step`** while inside `<think>` on the Scheduler during `update_from_output` (hidden behind the `12–16 ms` GPU forward pass under `async_scheduling`).
 
 ## Verification on `dgx4` (`spark-ds41f:19f2c20ed4d6-next-20`)
 
 ```text
-tests/v1/core/test_repetition_detection.py (13 passed)
+tests/v1/core/test_repetition_detection.py (24 passed)
   - test_sampling_params_dict_coercion PASSED
   - test_has_thinking_loop_contiguous_and_interspersed PASSED
   - test_thinking_loop_break_forces_end_then_recovers PASSED
-tests/v1/worker/test_gpu_thinking_budget.py (71 passed across triton + tilelang SM121)
+  - test_thinking_off_skips_repetition_guard PASSED
+  - test_protocol_to_sampling_params_skips_default_repetition_when_thinking_off PASSED
+tests/v1/worker/test_gpu_thinking_budget.py (62 passed across triton + tilelang SM121)
   - test_v2_forced_thinking_end_toggles_without_steady_state_overhead[triton] PASSED
   - test_v2_forced_thinking_end_toggles_without_steady_state_overhead[tilelang] PASSED
-======================= 84 passed, 15 warnings in 18.12s =======================
+======================= 86 passed, 16 warnings in 17.50s =======================
 ```
