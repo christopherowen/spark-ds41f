@@ -1154,6 +1154,7 @@ class NewUserOnboardingTest(unittest.TestCase):
             "dgx1: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle",
             "dgx1: NVMe interrupt coalescing is on (nvme0=0x00000107)",
             *spark.wireless_warnings("dgx1", facts(wifi_radio="enabled")),
+            "dgx1: cannot inspect spark-ds41f: permission denied at /var/run/docker.sock; add the SSH user to the docker group on dgx1 (sudo usermod -aG docker $USER) and reconnect",
             "dgx1: DKMS dgx-spark-fan-control is not installed for 6.17.0-1019-nvidia",
             "dgx1: CPU governors differ from performance: ['schedutil']",
             "dgx1: bluetooth.service enabled or running, though unused on a headless inference node",
@@ -1161,7 +1162,7 @@ class NewUserOnboardingTest(unittest.TestCase):
             "Kernel corrections (not executed):\n  dgx1: sudo apt-get install ...",
         ]
         summary = spark.summarize_live_warnings(raw)
-        self.assertEqual(len(summary), 10)
+        self.assertEqual(len(summary), 11)
         expected = [
             ("install 64kb page kernel (dgx1, dgx2)", "sudo scripts/install-64k-kernel"),
             ("install memory-saver (dgx1, dgx2)", "scripts/install-memory-saver"),
@@ -1169,6 +1170,7 @@ class NewUserOnboardingTest(unittest.TestCase):
             ("configure nvme sleep settings (dgx1)", "sudo scripts/configure-nvme-sleep"),
             ("disable nvme interrupt coalescing (dgx1)", "sudo scripts/disable-nvme-coalescing"),
             ("management port off wireless (dgx1)", "sudo nmcli radio wifi off"),
+            ("configure docker permissions (dgx1)", "sudo usermod -aG docker $USER"),
             ("install fan-control (dgx1)", "scripts/install-fan-control"),
             ("set cpu governor to performance (dgx1)", "sudo systemctl restart nv-cpu-governor.service"),
             ("disable idle desktop services and boot splash (dgx1)", "scripts/host-recovery apply"),

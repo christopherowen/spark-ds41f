@@ -1381,7 +1381,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(node_glp_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
-            problems.append(f"{node['name']}: cannot inspect {name}: {docker_error_detail(node['name'], result.stderr)}")
+            detail = docker_error_detail(node["name"], result.stderr)
+            finding = f"{node['name']}: cannot inspect {name}: {detail}"
+            problems.append(Warn(finding) if "sudo usermod -aG docker" in detail else finding)
             continue
         inspection = json.loads(result.stdout)[0]
         if not inspection["State"]["Running"]:
@@ -1516,6 +1518,14 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "Wi-Fi radio is enabled",
             "wireless",
+        ),
+    ),
+    (
+        "configure docker permissions",
+        "sudo usermod -aG docker $USER",
+        (
+            "sudo usermod -aG docker",
+            "docker.sock",
         ),
     ),
     (
