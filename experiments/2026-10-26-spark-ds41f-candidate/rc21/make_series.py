@@ -16,11 +16,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "rc20/vllm/series"
 BASE = "1f18be144"  # vLLM candidate-20 head
-HEAD = "eb29b4794"  # vLLM rc21 head
+HEAD = "6efba0add"  # vLLM rc21 head
 PATCHES = [
     ('d56b97b2d', 613),  # perf(deepseek_v4_1): add TP4 and TP3 DSpark main_proj decode tile configs (#741)
     ('e282cce4b', 614),  # Slice anchor-first draft hidden states and use single-stage decode GEMM for Markov head (#756)
-    ('eb29b4794', 615),  # Eliminate redundant host work during DSpark full CUDA graph replay (#763)
+    ('6efba0add', 615),  # Eliminate redundant host work during DSpark full CUDA graph replay (#763)
 ]
 
 
