@@ -929,3 +929,41 @@ patch `0001`** (`#735`), and **host `bin/spark` parallel startup** (`#726`, comm
   [rc18/bundles/candidate-18](rc18/bundles/candidate-18) ([rc18/verdict.json](rc18/verdict.json))
   and subsystem measurements in [rc18/results.json](rc18/results.json)
   ([rc18/measure_candidate_18.py](rc18/measure_candidate_18.py)).
+- **TP3 Qualification (`20261031T061558-release-tp3.json` + `20261031T061600-candidate-tp3.json`, `49/49` sessions passed, `exit 0`):**
+  - **Startup & Memory (`candidate-18`):** warm startup **`104.0 s` command (`+98.2 s` API ready)**
+    vs `119.1 s` on `1030` (**`-15.1 s` / `-12.7%` faster**), `init_engine_s = 22.22 s` vs `31.40 s`
+    (**`-9.18 s` / `-29.2%` faster**), `tilelang_prepare_s = 12.70 s` vs `15.10 s` (**`-15.9%`**),
+    `tilelang_calls = 270` vs `303` (**`-33` kernels**). Boot `min_available_gib`:
+    **`dgx1 = 9.349..9.740 GiB`** (`+1.40..+4.14 GiB` vs `1030`), **`dgx2 = 10.903..12.167 GiB`**,
+    **`dgx3 = 11.712..12.011 GiB`**. Steady serving `mem_snapshot.py`: **`dgx1 = 10.617 GiB`**
+    (`+2.49 GiB`), **`dgx2 = 12.900 GiB`** (`+4.75 GiB`), **`dgx3 = 13.066 GiB`** (`+4.35 GiB`).
+  - **Functional & Determinism (`21/21` probes):** 100% bit-identical SHA-256 digests vs `1030`
+    across all 15 probes on `candidate-18` and all 6 probes on `candidate-18-copy`.
+  - **`CopyDrafter` Rework #2 (`0614`, `candidate-18-copy` vs `candidate-18`):** beats non-copy
+    stock across general serving (`grid: -0.41% ±0.16%` `better`, `c8: +0.43%` paired decode tok/s,
+    `c4: +0.12%` tok/s, `c1: +0.27%` tok/s / `+0.19% ±0.16%` `better` paired decode, `sampled c8: +0.17%`
+    tok/s / `-2.89%` TPOT p99, `sampled c1: +0.28%` tok/s / `+0.23% ±0.06%` `better` paired decode)
+    and delivers **`3.91x` aggregate `tok/step` (`9.185` vs `2.350`)** on `copy_probe.py --prompts 12`
+    (`copy: 6.70x` / `16.029`, `edit: 5.99x` / `14.249`, `tool: 3.12x` / `6.709`, `prose: 2.265`).
+  - **Identified Regressions Isolated for Removal in `rc19`:**
+    1. `0611` (`#732` `aux_stream` fork/join in `attention.py`): breaks single-stream CUDA Graph
+       PDL edges across 12 fork/joins per step and contends for 48 GB10 SMs / 24 MB L2 during
+       `wq_b` + `WO` prefetch (`-0.86%` `grid` decode vs `rc17`'s `-1.90%`). Note: `#732`'s
+       legitimate single-stream fusions were already merged in `rc16`/`rc17` as `0576` (`#706`).
+    2. `0608` + `sparknet/0001` (`#735` `sparknet.oneshot` sliced SP collectives): launches ~1,900
+       sequential 64-CTA spin-wait kernels per 6,144-token prefill forward (`-4.03%..-5.75%` prefill
+       slowdown vs `1030` and `83 °C` thermal halt on `dgx3`).
+
+## Candidate 19 ([rc19/](rc19))
+
+Preserves `rc17` (`0568..0593`) plus the **19 proven `rc18` vLLM patches (`0594..0612`)** and host
+`bin/spark` parallel startup (`#726`), while dropping `vllm/0608` + `sparknet/0001` (`#735`) and
+`vllm/0611` (`#732`):
+
+- **Series:** [rc19/vllm/series](rc19/vllm/series) (`0001..0612`, 500 patches; `patchset_sha256`
+  `6d9ec456`, `patch_head` `529874a7`, `expected_tree` `4db2cf5c`) and un-patched `sparknet`
+  (`ed6af327`, `expected_tree` `f997a594`).
+- **Arms:** [rc19/rc-tp4.json](rc19/rc-tp4.json), [rc19/rc-tp3.json](rc19/rc-tp3.json),
+  [rc19/rc-tp3-copy.json](rc19/rc-tp3-copy.json), and [rc19/image-dgx4.json](rc19/image-dgx4.json)
+  on `spark-ds41f:19f2c20ed4d6-next-19` ([rc19/source.json](rc19/source.json),
+  [rc19/upstreams.lock.json](rc19/upstreams.lock.json)).

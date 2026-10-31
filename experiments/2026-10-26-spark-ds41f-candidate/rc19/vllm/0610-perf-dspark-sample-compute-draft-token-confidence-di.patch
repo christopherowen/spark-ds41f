@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:51:15 +0100
+Subject: [PATCH 610/612] perf(dspark,sample): compute draft token confidence
+ directly from TP-invariant local vocabulary shard
+
+Make confidence computation TP-invariant by keeping only the local vocabulary shard of confidence_head (slice [0, 32]) on every TP rank via VocabParallelEmbedding.keep_first_output_rows, writing directly into draft_token_confidence_probs via out=, and eliding the TP confidence broadcast when both tp_invariant_confidence and rank_order_reduce_scatter are enabled.
+---
+ .../test_deepseek_v41_tilelang_confidence.py  | 13 +++-
+ .../spec_decode/test_adaptive_verification.py | 69 +++++++++++++++++++
+ vllm/model_executor/models/qwen3_dspark.py    |  2 +
+ vllm/models/deepseek_v4/nvidia/dspark.py      |  9 ++-
+ vllm/models/deepseek_v41/amd/dspark.py        |  9 ++-
+ vllm/models/deepseek_v41/nvidia/dspark.py     |  9 ++-
+ .../deepseek_v4_1/tilelang/confidence.py      |  2 +
+ vllm/v1/worker/gpu/model_runner.py            |  3 +
+ .../gpu/spec_decode/adaptive_verification.py  | 19 ++++-
+ .../gpu/spec_decode/dspark/speculator.py      | 21 +++---
+ 10 files changed, 136 insertions(+), 20 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+index 6d1dd230f..05d1bec60 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_confidence.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+@@ -188,14 +188,21 @@ def test_refuses_other_layouts():
+ def test_the_head_runs_its_weight_row():
+     """``TileLangConfidenceHead.probability`` reads its projection's [1, H + R]
+     weight; its logit path is not available."""
++    from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead
++
+     head = confidence.TileLangConfidenceHead.__new__(confidence.TileLangConfidenceHead)
+     torch.nn.Module.__init__(head)
+     hidden, markov, weight = _inputs(5, seed=6)
+     head.proj = SimpleNamespace(weight=weight.view(1, -1))
+     head.hidden_size, head.markov_rank = HIDDEN, RANK
+-    assert torch.equal(
+-        head.probability(hidden, markov), _tilelang(hidden, markov, weight)
+-    )
++    assert head.tp_invariant is True
++    assert DSparkConfidenceHead.tp_invariant is False
++    want = _tilelang(hidden, markov, weight)
++    assert torch.equal(head.probability(hidden, markov), want)
++    out = torch.empty(5, dtype=torch.float32, device="cuda")
++    returned = head.probability(hidden, markov, out=out)
++    assert returned is out
++    assert torch.equal(out, want)
+     with pytest.raises(NotImplementedError):
+         head(hidden, markov)
+ 
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 8721968ab..75080c8b8 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -198,6 +198,75 @@ def test_planned_confidences_reach_the_budget_and_the_current_the_ranking(
+     assert (manager._confidence_buffer[:, 1] == 1).all()
+ 
+ 
++@pytest.mark.parametrize(
++    ("tp_invariant_confidence", "rank_order_reduce_scatter", "expected_broadcasts"),
++    [
++        (False, False, 1),
++        (False, True, 1),
++        (True, False, 1),
++        (True, True, 0),
++    ],
++)
++def test_tp_invariant_confidence_elides_broadcast_only_when_rank_ordered(
++    monkeypatch,
++    tp_invariant_confidence,
++    rank_order_reduce_scatter,
++    expected_broadcasts,
++):
++    local = torch.tensor([[0.75]], dtype=torch.float32)
++    manager = make_manager(local.numpy().copy(), row_cost=0.1)
++    manager.tp_invariant_confidence = tp_invariant_confidence
++    manager.req_states.device = torch.device("cpu")
++    manager._confidence_buffer = torch.zeros_like(local).unsqueeze(0)
++    manager._confidence_probs = manager._confidence_buffer[0]
++    manager._planned_probs = manager._confidence_buffer[-1]
++    manager._pending_resets = []
++    manager._stale_confidences = [
++        SimpleNamespace(
++            np=np.ones((1, 1), dtype=np.float32),
++            gpu=torch.empty_like(local),
++            copy_to_cpu=lambda: None,
++        )
++        for _ in range(2)
++    ]
++    manager._copy_events = [
++        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
++    ]
++    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
++    calls = []
++
++    def broadcast(tensor, src):
++        assert src == 0
++        calls.append(tensor)
++
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            world_size=2,
++            broadcast=broadcast,
++            device_communicator=SimpleNamespace(
++                rank_order_reduce_scatter=rank_order_reduce_scatter
++            ),
++        ),
++    )
++    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
++    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
++    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
++    monkeypatch.setattr(
++        adaptive_module.tilelang_inputs,
++        "scatter_rows",
++        lambda idx_mapping, source, state, gather=False: state.__setitem__(
++            (idx_mapping, slice(0, source.shape[1])), source
++        ),
++    )
++    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
++    manager.record_confidences(local, batch)
++    assert len(calls) == expected_broadcasts
++    torch.testing.assert_close(manager._confidence_probs, local, rtol=0, atol=0)
++
++
++
+ @pytest.mark.parametrize(
+     "target_support,varlen_decode,allowed",
+     [
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index a50f28cad..2c1c1863a 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -192,6 +192,8 @@ class DSparkMarkovHead(nn.Module):
+ class DSparkConfidenceHead(nn.Module):
+     """DSpark acceptance-confidence head."""
+ 
++    tp_invariant: bool = False
++
+     def __init__(
+         self,
+         input_dim: int,
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+index 6d68fced4..2ff486f21 100644
+--- a/vllm/models/deepseek_v4/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -399,11 +399,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(
++            head_hidden, markov_embed, out=out
++        )
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v41/amd/dspark.py b/vllm/models/deepseek_v41/amd/dspark.py
+index 78f07b6b1..84b30448d 100644
+--- a/vllm/models/deepseek_v41/amd/dspark.py
++++ b/vllm/models/deepseek_v41/amd/dspark.py
+@@ -374,11 +374,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(
++            head_hidden, markov_embed, out=out
++        )
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index 8b8f94955..8dc75872c 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -341,11 +341,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(
++            head_hidden, markov_embed, out=out
++        )
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+index bb2197dbb..a18988e3a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -184,6 +184,8 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+     """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
+     probability is the one-launch kernel."""
+ 
++    tp_invariant: bool = True
++
+     def __init__(self, hidden_size: int, markov_rank: int, prefix: str = ""):
+         super().__init__(hidden_size + markov_rank, prefix=prefix)
+         self.hidden_size = hidden_size
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b8fc6131a..682b140eb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -828,6 +828,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 if self.copy_drafter is not None
+                 else None
+             ),
++            tp_invariant_confidence=getattr(
++                self.speculator, "tp_invariant_confidence", False
++            ),
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index d96a9b586..e521970ef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -119,6 +119,8 @@ class AdaptiveVerificationManager:
+         planned_confidences: bool = False,
+         num_draft_steps: int | None = None,
+         slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
++        *,
++        tp_invariant_confidence: bool = False,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -137,6 +139,7 @@ class AdaptiveVerificationManager:
+         # cost: a recipe constant, so the budget is a rule of the inputs, the same
+         # on every build and boot, with nothing timed.
+         self.row_cost = row_cost
++        self.tp_invariant_confidence = tp_invariant_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+@@ -279,10 +282,18 @@ class AdaptiveVerificationManager:
+                 self._new_rows.extend(mid_prefill_slots)
+                 self.apply_staged_writes()
+         # Replicated projections may differ through unordered floating-point
+-        # reductions. Both CPU graph selection and GPU request compaction must
+-        # consume one TP-wide confidence snapshot to issue matching collectives.
++        # reductions unless both the TP group's reductions and the confidence
++        # head are rank-invariant. Both CPU graph selection and GPU request
++        # compaction must consume one TP-wide confidence snapshot.
+         tp_group = get_tp_group()
+-        if tp_group.world_size > 1:
++        if tp_group.world_size > 1 and not (
++            getattr(self, "tp_invariant_confidence", False)
++            and getattr(
++                getattr(tp_group, "device_communicator", None),
++                "rank_order_reduce_scatter",
++                False,
++            )
++        ):
+             tp_group.broadcast(self._confidence_buffer, src=0)
+         write_slot = self._stale_confidences[write_idx]
+         write_slot.gpu.copy_(self._planned_probs)
+@@ -537,6 +548,7 @@ def maybe_create_adaptive_verification_manager(
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+     planned_confidences: bool = False,
+     slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
++    tp_invariant_confidence: bool = False,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -612,4 +624,5 @@ def maybe_create_adaptive_verification_manager(
+         )
+         or None,
+         slot_draft_limits=slot_draft_limits,
++        tp_invariant_confidence=tp_invariant_confidence,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index af71df562..fd3604f33 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -185,6 +185,15 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.use_acceptance_estimator = False
+         return model
+ 
++    @property
++    def tp_invariant_confidence(self) -> bool:
++        """Whether every TP rank computes bitwise-identical draft confidences
++        when TP reductions are rank-ordered."""
++        if not self.use_confidence_head or self.acceptance_estimator is not None:
++            return False
++        head = getattr(getattr(self.model, "model", None), "confidence_head", None)
++        return bool(getattr(head, "tp_invariant", False))
++
+     def _sample_logits(
+         self,
+         logits: torch.Tensor,
+@@ -442,12 +451,10 @@ class DSparkSpeculator(DFlashSpeculator):
+                 out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+             )
+         elif self.use_confidence_head:
+-            confidence = self.model.compute_confidence(
++            self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-            )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+-                num_reqs, n_spec
++                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+             )
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+@@ -493,12 +500,10 @@ class DSparkSpeculator(DFlashSpeculator):
+             prev = draft_sampled_i
+ 
+         if self.use_confidence_head:
+-            confidence = self.model.compute_confidence(
++            self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-            )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+-                num_reqs, n_spec
++                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+             )
+ 
+     def _generate_draft(

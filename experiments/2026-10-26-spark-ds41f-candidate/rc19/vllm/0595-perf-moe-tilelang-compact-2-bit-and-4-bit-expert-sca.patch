@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:26:49 +0100
+Subject: [PATCH 595/612] perf(moe,tilelang): compact 2-bit and 4-bit expert
+ scale codes in one storage buffer
+
+---
+ .../test_deepseek_v41_expert_scale_codes.py   | 55 ++++++++++++------
+ .../layers/fused_moe/tilelang.py              |  7 +--
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 58 +++++++++++++------
+ .../deepseek_v4_1/tilelang/scale_codes.py     | 32 ++++++----
+ 4 files changed, 99 insertions(+), 53 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+index 3dd45ddee..3dbb46c4b 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
++++ b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+@@ -409,18 +409,20 @@ def test_the_mixed_launch_shapes_match_the_narrow_kernel(n, k):
+     assert wide_codes.shape == (rows, block_n) and wide_codes.dtype == torch.uint16
+     assert byte_codes.shape == (rows, block_n) and byte_codes.dtype == torch.uint8
+     codes, byte_codes = overlay_byte_codes(wide_codes, byte_codes, packed.narrow)
+-    assert codes.shape == (rows, block_n) and codes.dtype == torch.uint16
+-    assert byte_codes.shape == (rows, 2 * block_n) and byte_codes.dtype == torch.uint8
++    units = int((2 - packed.narrow.to(torch.int64)).sum().item())
++    code_rows = units * n_blocks * k_blocks
++    assert codes.shape == (code_rows, block_n // 2) and codes.dtype == torch.uint16
++    assert byte_codes.shape == (code_rows, block_n) and byte_codes.dtype == torch.uint8
+     assert packed.narrow.shape == (experts,) and packed.base.shape == (experts, n)
+ 
+ 
+ def test_one_buffer_holds_each_experts_one_form():
+-    """The 2-bit codes take no bytes beyond the 4-bit codes.
++    """Each expert keeps only its own code width in one compact buffer.
+ 
+-    ``overlay_byte_codes`` returns two views of one storage the size of the 4-bit
+-    tile codes. A wide expert's rows are its 4-bit codes. A narrow expert's row
+-    at ``bytes[row, :block_N]`` is its ``tile_byte_codes`` row and the rest is
+-    zero. K=576 has the padded fifth word.
++    ``overlay_byte_codes`` returns uint16 and uint8 views of one storage where a
++    narrow expert takes one ``[per, block_N]``-byte unit (its ``tile_byte_codes``
++    rows) and a wide expert takes two units (its ``tile_codes`` rows), starting
++    at unit ``2 * e - narrow[:e].sum()``. K=576 has the padded fifth word.
+     """
+     (tile_codes,) = _moe_functions("tile_codes")
+     gen = torch.Generator().manual_seed(5)
+@@ -432,23 +434,24 @@ def test_one_buffer_holds_each_experts_one_form():
+     wide = tile_codes(packed.codes, _BLOCK_N)
+     narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
+     codes, byte_codes = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
+-    assert codes.dtype == torch.uint16 and codes.shape == wide.shape
++    per = wide.shape[0] // 3
++    assert codes.dtype == torch.uint16 and codes.shape == (4 * per, _BLOCK_N // 2)
+     assert byte_codes.dtype == torch.uint8
+-    assert byte_codes.shape == (wide.shape[0], 2 * _BLOCK_N)
++    assert byte_codes.shape == (4 * per, _BLOCK_N)
+     assert byte_codes.data_ptr() == codes.data_ptr()
+-    assert codes.untyped_storage().nbytes() == wide.nbytes
+-    per = wide.shape[0] // 3
++    assert codes.untyped_storage().nbytes() == 4 * per * _BLOCK_N
+     for expert in range(3):
+-        rows = slice(expert * per, (expert + 1) * per)
++        src = slice(expert * per, (expert + 1) * per)
++        slot = 2 * expert - int(packed.narrow[:expert].sum().item())
+         if packed.narrow[expert]:
+-            assert torch.equal(byte_codes[rows, :_BLOCK_N], narrow[rows])
+-            assert not byte_codes[rows, _BLOCK_N:].any()
++            assert torch.equal(byte_codes[slot * per : (slot + 1) * per], narrow[src])
+         else:
+-            assert torch.equal(codes[rows], wide[rows])
++            got = codes[slot * per : (slot + 2) * per].view(per, _BLOCK_N)
++            assert torch.equal(got, wide[src])
+ 
+ 
+ def test_an_all_wide_tensor_keeps_its_4bit_codes():
+-    """With no narrow expert the overlay writes nothing."""
++    """With no narrow expert the overlay keeps all 4-bit codes without copying."""
+     (tile_codes,) = _moe_functions("tile_codes")
+     exps = torch.full((2, 128, 16), 100, dtype=torch.uint8)
+     exps[:, 0, 0] = 108
+@@ -457,16 +460,30 @@ def test_an_all_wide_tensor_keeps_its_4bit_codes():
+     wide = tile_codes(packed.codes, _BLOCK_N)
+     narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
+     codes, _ = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
+-    assert torch.equal(codes, wide)
++    assert torch.equal(codes.view_as(wide), wide)
++
++
++def test_an_all_narrow_tensor_uses_half_the_4bit_bytes():
++    """With every expert narrow the compact buffer takes half the 4-bit bytes."""
++    (tile_codes,) = _moe_functions("tile_codes")
++    gen = torch.Generator().manual_seed(9)
++    exps = torch.randint(90, 94, (4, 128, 18), generator=gen, dtype=torch.uint8)
++    packed = pack_expert_scale_codes(exps)
++    assert packed.narrow.tolist() == [1, 1, 1, 1]
++    wide = tile_codes(packed.codes, _BLOCK_N)
++    narrow = tile_byte_codes(packed.codes_2bit, _BLOCK_N)
++    codes, byte_codes = overlay_byte_codes(wide.clone(), narrow, packed.narrow)
++    assert codes.untyped_storage().nbytes() * 2 == wide.nbytes
++    assert torch.equal(byte_codes, narrow)
+ 
+ 
+ def test_the_narrow_kernel_reads_2bit_codes_as_double_width_rows():
+-    """The GEMM's 2-bit spec is the 4-bit codes' bytes: ``[rows, 2 * block_N]``."""
++    """The GEMM's 2-bit spec is the compact ``[code_rows, block_N]`` byte view."""
+     src = (
+         Path(__file__).resolve().parents[3]
+         / "vllm/models/deepseek_v4_1/tilelang/moe.py"
+     ).read_text()
+-    spec = "T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)"
++    spec = "T.Tensor((code_rows, block_N), T.uint8)"
+     assert f"sfb8_spec = {spec}" in src
+     assert "overlay_byte_codes(" in src
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 39c8402f8..7965bcc95 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -216,10 +216,9 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
+         # weights and scale codes are contiguous. A K that ends 64 past a multiple
+         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
+-        # ``codes`` is the 4-bit tile layout a wide expert loads. ``byte`` is the
+-        # same buffer as uint8, holding the narrow experts' 2-bit codes in their
+-        # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
+-        # the flag is 1.
++        # ``codes`` and ``byte`` are uint16 and uint8 views of one compact buffer
++        # where narrow experts (``narrow`` = 1) take one ``block_N``-byte unit a
++        # tile row (2-bit codes) and wide experts take two (4-bit codes).
+         t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
+             w13, layer.w13_weight_scale
+         )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 3103e9865..b6e732359 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -674,6 +674,9 @@ def grouped_fp8_fp4_gemm(
+     stages = num_stages
+     assert stages >= 2
+     n_blocks = N // block_N
++    code_rows = (
++        T.dynamic("code_rows") if narrow_codes else num_experts * n_blocks * k_blocks
++    )
+     b_shape = (num_experts * n_blocks * k_full, block_N, block_K)
+     bt_shape = (num_experts * n_blocks, block_N, tail // 2)
+     code_chunks = block_N * 2 // 16  # 16-byte copies of one stage's 4-bit codes
+@@ -686,7 +689,8 @@ def grouped_fp8_fp4_gemm(
+ 
+     @T.macro
+     def load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFB_shared,
+-             a_row, sfa_row, loaded, expert, bx, tx, ko, s, SFB8, SFC8, Narrow):  # fmt: skip
++             a_row, sfa_row, loaded, expert, bx, tx, ko, s, SFB8, SFC8, Narrow,
++             code_base=None):  # fmt: skip
+         """Stage s <- K block ko: weights, gathered activation rows, scale words."""
+         if ko < k_full:
+             tile = (expert * n_blocks + bx) * k_full + ko
+@@ -742,23 +746,30 @@ def grouped_fp8_fp4_gemm(
+             # SFB_shared is this stage's 4-bit codes; the words are expanded later.
+             # A narrow expert loads half as many bytes: one uint8 a row. The
+             # expert is one per CTA, so the branch is uniform across the block.
+-            row = (expert * n_blocks + bx) * k_blocks + ko
+             if narrow_codes:
+                 if Narrow[expert] != 0:
+                     if tx < code_chunks8:
+                         T.ptx_cp_async(
+                             T.access_ptr(SFC8[s, tx * 16], "w", 16),
+-                            T.access_ptr(SFB8[row, tx * 16], "r", 16),
++                            T.access_ptr(SFB8[code_base + ko, tx * 16], "r", 16),
+                             16,  # elements: sixteen 1-byte codes
+                         )
+                 else:
+                     if tx < code_chunks:
+                         T.ptx_cp_async(
+                             T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
+-                            T.access_ptr(SFB[row, tx * 8], "r", 8),
++                            T.access_ptr(
++                                SFB[
++                                    code_base + 2 * ko + tx // code_chunks8,
++                                    (tx % code_chunks8) * 8,
++                                ],
++                                "r",
++                                8,
++                            ),
+                             8,  # elements: eight 2-byte codes, one 16-byte copy
+                         )
+             else:
++                row = (expert * n_blocks + bx) * k_blocks + ko
+                 if tx < code_chunks:
+                     T.ptx_cp_async(
+                         T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
+@@ -806,6 +817,7 @@ def grouped_fp8_fp4_gemm(
+             base_words = (
+                 T.alloc_local((sfb_copies,), T.uint32) if coded_scales else None
+             )
++            code_base = T.alloc_var(T.int32) if narrow_codes else None
+             rows_shared = T.alloc_shared((block_M,), T.int32)
+             a_row = T.alloc_local((a_copies,), T.int32)
+             sfa_row = T.alloc_local((sfa_copies,), T.int32)
+@@ -836,6 +848,15 @@ def grouped_fp8_fp4_gemm(
+                         base_words[c] = T.cast(
+                             SFBase[expert, bx * block_N + j], T.uint32
+                         ) * T.uint32(0x01010101)
++                if narrow_codes:
++                    code_base = 2 * expert
++                    if tx < code_chunks:
++                        for e in T.serial(expert):
++                            code_base -= T.cast(Narrow[e], T.int32)
++                    code_base = (
++                        code_base * n_blocks
++                        + bx * (2 - T.cast(Narrow[expert], T.int32))
++                    ) * k_blocks
+             sf_dest = SFC_shared if coded_scales else SFB_shared
+ 
+             T.clear(C_local)
+@@ -844,7 +865,7 @@ def grouped_fp8_fp4_gemm(
+                     if narrow_codes:
+                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                             p, SFB8, SFC8, Narrow)  # fmt: skip
++                             p, SFB8, SFC8, Narrow, code_base)  # fmt: skip
+                     else:
+                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+@@ -859,7 +880,7 @@ def grouped_fp8_fp4_gemm(
+                     if narrow_codes:
+                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                             nxt % stages, SFB8, SFC8, Narrow)  # fmt: skip
++                             nxt % stages, SFB8, SFC8, Narrow, code_base)  # fmt: skip
+                     else:
+                         load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                              sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+@@ -936,14 +957,16 @@ def grouped_fp8_fp4_gemm(
+                     C[t * block_M + i, bx * block_N + j] = C_local[i, j]
+ 
+     sfb_spec = (
+-        T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint16)
++        T.Tensor((code_rows, block_N // 2), T.uint16)
++        if narrow_codes
++        else T.Tensor((num_experts * n_blocks * k_blocks, block_N), T.uint16)
+         if coded_scales
+         else T.Tensor((num_experts, N, sf_words), T.uint32)
+     )
+     base_spec = T.Tensor((num_experts, N), T.uint8)
+-    # SFB's bytes (``overlay_byte_codes``): a narrow expert's row holds its 2-bit
+-    # codes in the first block_N of its 2 * block_N bytes.
+-    sfb8_spec = T.Tensor((num_experts * n_blocks * k_blocks, 2 * block_N), T.uint8)
++    # SFB's bytes (``overlay_byte_codes``): a narrow expert takes one [k_blocks,
++    # block_N]-byte unit a tile; a wide expert takes two.
++    sfb8_spec = T.Tensor((code_rows, block_N), T.uint8)
+     narrow_spec = T.Tensor((num_experts,), T.uint8)
+ 
+     if tail and coded_scales and narrow_codes:
+@@ -1505,14 +1528,13 @@ class MoeExpertsV41Plan:
+         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.
+ 
+         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
+-        down projection of TP4's 576-wide expert rows). ``codes`` is
+-        ``pack_scale_codes`` in ``tile_codes`` layout for a wide expert. An
+-        expert whose every row has delta <= 3 is narrow (``narrow`` uint8 1, else
+-        0) and its rows of the same buffer hold 2-bit codes instead (four deltas a
+-        byte, low bits first, in each row's first ``block_N`` bytes);
+-        ``codes_2bit`` is that buffer as uint8 (``overlay_byte_codes``). A narrow
+-        expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
+-        expert holds both forms, so the codes take the 4-bit codes' bytes.
++        down projection of TP4's 576-wide expert rows). ``codes`` and
++        ``codes_2bit`` are ``overlay_byte_codes``' uint16 and uint8 views of one
++        compact buffer: an expert whose every row has delta <= 3 is narrow
++        (``narrow`` uint8 1, else 0) and takes one ``[n_blocks * k_blocks,
++        block_N]``-byte unit (four 2-bit deltas a byte, low bits first); a wide
++        expert takes two units (its ``tile_codes`` 4-bit codes). A narrow
++        expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``.
+         """
+         return (
+             self.prepare_weight(w13, w13_scale),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+index 7e8be9699..faf6083f1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+@@ -197,28 +197,36 @@ def tile_byte_codes(codes: torch.Tensor, block_N: int) -> torch.Tensor:
+ def overlay_byte_codes(
+     codes: torch.Tensor, byte_codes: torch.Tensor, narrow: torch.Tensor
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """One buffer for both code widths: ``(codes, bytes)`` over the same storage.
++    """One compact buffer for both widths: ``(codes, bytes)`` over the same storage.
+ 
+     ``codes`` is ``tile_codes``' uint16 ``[rows, block_N]``, ``byte_codes`` is
+     ``tile_byte_codes``' uint8 ``[rows, block_N]`` and ``narrow`` the per-expert
+-    flags; each expert's rows are contiguous in both. A narrow expert's rows of
+-    ``codes`` are rewritten in place: its 2-bit bytes in the first ``block_N``
+-    bytes of each row, zeros after. ``bytes`` is that storage as uint8
+-    ``[rows, 2 * block_N]``, so a narrow row's 2-bit codes are ``bytes[row,
+-    :block_N]``, still contiguous. A wide expert's rows keep their 4-bit codes,
+-    so no expert holds both forms.
++    flags; each expert's ``per = rows // experts`` rows are contiguous in both.
++    A narrow expert takes one ``[per, block_N]``-byte unit (its 2-bit codes); a
++    wide expert takes two units (its ``[per, block_N]`` uint16 4-bit codes as
++    ``[2 * per, block_N]`` bytes), starting at unit ``2 * e - narrow[:e].sum()``.
++    ``bytes`` is that storage as uint8 ``[units * per, block_N]`` and ``codes``
++    is ``bytes.view(torch.uint16)`` (``[units * per, block_N // 2]``), so narrow
++    experts take half the bytes of wide ones and no expert holds both forms.
+     """
+     if codes.dtype != torch.uint16 or byte_codes.dtype != torch.uint8:
+         raise TypeError("expected uint16 4-bit codes and uint8 2-bit codes")
+     if codes.shape != byte_codes.shape or not codes.is_contiguous():
+         raise ValueError("the two code layouts must be the same contiguous rows")
+     rows, block_N = codes.shape
++    if block_N % 2:
++        raise ValueError(f"block_N={block_N} must be even")
+     experts = narrow.numel()
+     if rows % experts:
+         raise ValueError(f"{rows} code rows do not split into {experts} experts")
+-    raw = codes.view(torch.uint8).view(experts, rows // experts, 2 * block_N)
+     mask = narrow.bool()
+-    if mask.any().item():
+-        raw[mask, :, :block_N] = byte_codes.view(experts, -1, block_N)[mask]
+-        raw[mask, :, block_N:] = 0
+-    return codes, codes.view(torch.uint8)
++    if not mask.any().item():
++        compact = codes.view(2 * rows, block_N // 2)
++        return compact, compact.view(torch.uint8)
++    per = rows // experts
++    units = codes.view(torch.uint8).view(experts, 2, per, block_N)
++    units[mask, 0] = byte_codes.view(experts, per, block_N)[mask]
++    keep = torch.ones((experts, 2), dtype=torch.bool, device=codes.device)
++    keep[mask, 1] = False
++    compact_bytes = units[keep].reshape(-1, block_N).contiguous()
++    return compact_bytes.view(torch.uint16), compact_bytes

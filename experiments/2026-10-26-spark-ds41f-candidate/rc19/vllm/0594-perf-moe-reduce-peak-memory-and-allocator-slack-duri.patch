@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:26:20 +0100
+Subject: [PATCH 594/612] perf(moe): reduce peak memory and allocator slack
+ during expert weight preparation
+
+---
+ .../test_deepseek_v41_expert_scale_codes.py   | 61 ++++++++++++++
+ .../layers/fused_moe/tilelang.py              | 25 +++---
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 35 ++++----
+ .../deepseek_v4_1/tilelang/scale_codes.py     | 80 ++++++++++---------
+ 4 files changed, 132 insertions(+), 69 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+index 0fcc1b5e4..3dd45ddee 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
++++ b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+@@ -567,3 +567,64 @@ def test_the_narrow_scale_store_is_inside_the_device_branch():
+         assert all("code8" in ast.unparse(store.value) for store in stores)
+         found = True
+     assert found
++
++
++def test_process_weights_replaces_w13_before_preparing_w2(monkeypatch):
++    """``TileLangExperts.process_weights_after_loading`` releases ``w13_weight``
++    and ``w13_weight_scale`` before preparing ``w2_weight`` so both raw and tiled
++    projections are never held live simultaneously."""
++    import weakref
++    from types import SimpleNamespace
++    from vllm.model_executor.layers.fused_moe import tilelang as tl_moe
++
++    refs = {}
++    w13 = torch.ones((2, 8, 4), dtype=torch.int8)
++    s13 = torch.ones((2, 8, 2), dtype=torch.uint8)
++    w2 = torch.ones((2, 4, 4), dtype=torch.int8)
++    s2 = torch.ones((2, 4, 2), dtype=torch.uint8)
++    refs["w13"] = weakref.ref(w13)
++    refs["s13"] = weakref.ref(s13)
++    calls = []
++
++    class _Plan:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def prepare_weight(self, w, scale):
++            calls.append(len(calls))
++            if len(calls) == 2:
++                # Raw w13_weight and w13_weight_scale must already be released
++                # before w2_weight is prepared.
++                assert refs["w13"]() is None
++                assert refs["s13"]() is None
++            return (
++                torch.zeros_like(w),
++                None,
++                torch.zeros((2, 2), dtype=torch.uint16),
++                torch.zeros((2, 4), dtype=torch.uint8),
++                torch.ones((2,), dtype=torch.uint8),
++                torch.zeros((2, 2), dtype=torch.uint8),
++            )
++
++    monkeypatch.setattr(tl_moe, "_kernels", lambda: SimpleNamespace(MoeExpertsV41Plan=_Plan))
++    monkeypatch.setattr(tl_moe, "replace_parameter", lambda layer, name, t: setattr(layer, name, t))
++    layer = SimpleNamespace(
++        apply_router_weight_on_input=False,
++        w13_weight=w13,
++        w13_weight_scale=s13,
++        w2_weight=w2,
++        w2_weight_scale=s2,
++    )
++    del w13, s13, w2, s2
++    experts = tl_moe.TileLangExperts.__new__(tl_moe.TileLangExperts)
++    experts.quant_config = SimpleNamespace(
++        gemm1_clamp_limit=None,
++        _w1=SimpleNamespace(scale=None),
++        _w2=SimpleNamespace(scale=None),
++    )
++    experts.moe_config = SimpleNamespace(
++        experts_per_token=2, swiglu_limit=7.0, in_dtype=torch.bfloat16
++    )
++    experts.fold_shared = True
++    experts.process_weights_after_loading(layer)
++    assert calls == [0, 1]
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 04445cd51..39c8402f8 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -220,19 +220,20 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         # same buffer as uint8, holding the narrow experts' 2-bit codes in their
+         # rows; ``narrow`` is 1 for those experts. The GEMM loads ``byte`` when
+         # the flag is 1.
+-        (
+-            (t13, tail13, codes13, byte13, narrow13, base13),
+-            (t2, tail2, codes2, byte2, narrow2, base2),
+-        ) = self._plan.prepare_weights(
+-            w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
++        t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
++            w13, layer.w13_weight_scale
+         )
+-        for name, tensor in (
+-            ("w13_weight", t13),
+-            ("w13_weight_scale", codes13),
+-            ("w2_weight", t2),
+-            ("w2_weight_scale", codes2),
+-        ):
+-            replace_parameter(layer, name, tensor)
++        del w13
++        replace_parameter(layer, "w13_weight", t13)
++        replace_parameter(layer, "w13_weight_scale", codes13)
++        del t13, codes13
++        t2, tail2, codes2, byte2, narrow2, base2 = self._plan.prepare_weight(
++            w2, layer.w2_weight_scale
++        )
++        del w2
++        replace_parameter(layer, "w2_weight", t2)
++        replace_parameter(layer, "w2_weight_scale", codes2)
++        del t2, codes2
+         self._tails = (tail13, tail2)
+         self._bases = (base13, base2)
+         self._codes_2bit = (byte13, byte2)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index bf1527579..3103e9865 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1488,6 +1488,19 @@ class MoeExpertsV41Plan:
+ 
+         prepare.declare(calls, bind=bind)
+ 
++    def prepare_weight(self, w, scale):
++        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``."""
++        packed = pack_expert_scale_codes(scale)
++        narrow, base = packed.narrow, packed.base
++        codes, codes_2bit = overlay_byte_codes(
++            tile_codes(packed.codes, self.block_N),
++            tile_byte_codes(packed.codes_2bit, self.block_N),
++            narrow,
++        )
++        del packed
++        tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
++        return tiles, tails, codes, codes_2bit, narrow, base
++
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.
+ 
+@@ -1501,24 +1514,10 @@ class MoeExpertsV41Plan:
+         expert's GEMM loads ``codes_2bit``; a wide expert loads ``codes``. No
+         expert holds both forms, so the codes take the 4-bit codes' bytes.
+         """
+-        prepared = []
+-        for w, scale in ((w13, w13_scale), (w2, w2_scale)):
+-            packed = pack_expert_scale_codes(scale)
+-            codes, codes_2bit = overlay_byte_codes(
+-                tile_codes(packed.codes, self.block_N),
+-                tile_byte_codes(packed.codes_2bit, self.block_N),
+-                packed.narrow,
+-            )
+-            prepared.append(
+-                (
+-                    *tile_expert_weights(w.view(torch.int8), self.block_N),
+-                    codes,
+-                    codes_2bit,
+-                    packed.narrow,
+-                    packed.base,
+-                )
+-            )
+-        return tuple(prepared)
++        return (
++            self.prepare_weight(w13, w13_scale),
++            self.prepare_weight(w2, w2_scale),
++        )
+ 
+     def workspace_specs(self, rows, idx_dtype=torch.int64):
+         """One call's scratch, laid out for the call's tile height (``tile_height``):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+index ece87f56a..7e8be9699 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+@@ -29,6 +29,37 @@ class ExpertScaleCodes(NamedTuple):
+     codes_2bit: torch.Tensor
+ 
+ 
++def _row_deltas(
++    exponents: torch.Tensor, max_delta: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``."""
++    e = exponents.view(torch.uint8)
++    base = e.amin(dim=-1).contiguous()
++    deltas = e - base.unsqueeze(-1)
++    span = int(deltas.max()) if deltas.numel() else 0
++    if span > max_delta:
++        bits = 2 if max_delta == 3 else 4
++        raise ValueError(
++            f"a row's scale exponents span {span + 1} values; {bits}-bit codes hold {max_delta + 1}"
++        )
++    pad = -e.shape[-1] % 4
++    if pad:
++        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
++    return deltas.view(*deltas.shape[:-1], -1, 4), base
++
++
++def _pack_nibbles(d: torch.Tensor) -> torch.Tensor:
++    lo = (d[..., 0] | (d[..., 1] << 4)).to(torch.int16)
++    hi = (d[..., 2] | (d[..., 3] << 4)).to(torch.int16)
++    return (lo | (hi << 8)).view(torch.uint16).contiguous()
++
++
++def _pack_crumbs(d: torch.Tensor) -> torch.Tensor:
++    return (
++        d[..., 0] | (d[..., 1] << 2) | (d[..., 2] << 4) | (d[..., 3] << 6)
++    ).contiguous()
++
++
+ def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     """``[..., K / 32]`` UE8M0 bytes as a base exponent per row and 4-bit codes.
+ 
+@@ -41,20 +72,8 @@ def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
+     in a row (DeepSeek-V4.1-Flash, both checkpoints sampled), so the codes are exact;
+     a row spanning more than 16 is refused rather than approximated.
+     """
+-    e = exponents.view(torch.uint8)
+-    base = e.amin(dim=-1)
+-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
+-    span = int(deltas.max()) if deltas.numel() else 0
+-    if span > 15:
+-        raise ValueError(
+-            f"a row's scale exponents span {span + 1} values; 4-bit codes hold 16"
+-        )
+-    pad = -e.shape[-1] % 4
+-    if pad:
+-        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
+-    d = deltas.view(*deltas.shape[:-1], -1, 4)
+-    codes = d[..., 0] | (d[..., 1] << 4) | (d[..., 2] << 8) | (d[..., 3] << 12)
+-    return codes.to(torch.int16).view(torch.uint16).contiguous(), base.contiguous()
++    d, base = _row_deltas(exponents, 15)
++    return _pack_nibbles(d), base
+ 
+ 
+ def expand_scale_codes(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+@@ -78,20 +97,8 @@ def pack_scale_codes_2bit(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.
+     A row whose delta exceeds 3 is refused, not clipped. Padding deltas (a count not
+     a multiple of four) are 0, so those bytes expand to ``base``.
+     """
+-    e = exponents.view(torch.uint8)
+-    base = e.amin(dim=-1)
+-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
+-    span = int(deltas.max()) if deltas.numel() else 0
+-    if span > 3:
+-        raise ValueError(
+-            f"a row's scale exponents span {span + 1} values; 2-bit codes hold 4"
+-        )
+-    pad = -e.shape[-1] % 4
+-    if pad:
+-        deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
+-    d = deltas.view(*deltas.shape[:-1], -1, 4)
+-    codes = d[..., 0] | (d[..., 1] << 2) | (d[..., 2] << 4) | (d[..., 3] << 6)
+-    return codes.to(torch.uint8).contiguous(), base.contiguous()
++    d, base = _row_deltas(exponents, 3)
++    return _pack_crumbs(d), base
+ 
+ 
+ def expand_scale_codes_2bit(codes: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+@@ -122,21 +129,16 @@ def pack_expert_scale_codes(exponents: torch.Tensor) -> ExpertScaleCodes:
+     e = exponents.view(torch.uint8)
+     if e.ndim < 2:
+         raise ValueError("scale exponents must be [experts, rows, K / 32]")
+-    codes, base = pack_scale_codes(e)
+-    deltas = e.to(torch.int32) - base.unsqueeze(-1).to(torch.int32)
+-    row_delta = deltas.amax(dim=-1)
+-    if row_delta.ndim == 1:
+-        expert_delta = row_delta
+-    else:
+-        expert_delta = row_delta.reshape(row_delta.shape[0], -1).amax(dim=1)
+-    narrow = (expert_delta <= 3).to(torch.uint8)
++    d, base = _row_deltas(e, 15)
++    expert_delta = d.reshape(d.shape[0], -1).amax(dim=1)
++    narrow = (expert_delta <= 3).to(torch.uint8).contiguous()
++    codes = _pack_nibbles(d)
+     codes_2bit = torch.zeros(codes.shape, dtype=torch.uint8, device=codes.device)
+     mask = narrow.bool()
+     if mask.any().item():
+-        packed, _packed_base = pack_scale_codes_2bit(e[mask])
+-        codes_2bit[mask] = packed
++        codes_2bit[mask] = _pack_crumbs(d[mask])
+     return ExpertScaleCodes(
+-        narrow.contiguous(),
++        narrow,
+         base,
+         codes,
+         codes_2bit.contiguous(),

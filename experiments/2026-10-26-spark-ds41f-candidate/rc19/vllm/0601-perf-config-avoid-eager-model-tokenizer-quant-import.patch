@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:29:26 +0100
+Subject: [PATCH 601/612] perf(config): avoid eager model/tokenizer/quant
+ imports during ModelConfig init
+
+---
+ tests/config/test_multimodal_config.py        |  28 +++
+ vllm/config/model.py                          |  29 +--
+ .../layers/quantization/__init__.py           | 189 ++++++++++--------
+ .../quantization/utils/humming_utils.py       |  63 +++---
+ vllm/models/deepseek_v41/quant_config.py      |  12 +-
+ vllm/models/deepseek_v4_1/quant_config.py     |  22 +-
+ 6 files changed, 210 insertions(+), 133 deletions(-)
+
+diff --git a/tests/config/test_multimodal_config.py b/tests/config/test_multimodal_config.py
+index 84cf092c2..e46ef08ab 100644
+--- a/tests/config/test_multimodal_config.py
++++ b/tests/config/test_multimodal_config.py
+@@ -178,6 +178,34 @@ def test_sticky_cache_survives_text_subconfig_regeneration():
+         assert text_config._supports_multimodal_for_mm_prefix() is False
+ 
+ 
++def test_get_model_arch_config_skips_registry_when_not_mm_prefix_lm():
++    """Models with is_mm_prefix_lm=False must not eagerly query the MM registry."""
++    model_config = _make_mm_prefix_model_config()
++    hf_config = PretrainedConfig(
++        model_type="deepseek_v4",
++        architectures=["DeepseekV41ForCausalLM"],
++        hidden_size=5120,
++        num_hidden_layers=42,
++        num_attention_heads=64,
++        num_key_value_heads=64,
++        vocab_size=129280,
++        head_dim=128,
++        kv_lora_rank=512,
++    )
++    model_config.hf_config = hf_config
++    model_config.hf_text_config = hf_config
++    model_config.revision = None
++    model_config.get_model_arch_config = ModelConfig.get_model_arch_config.__get__(
++        model_config, ModelConfig
++    )
++    with patch(
++        "vllm.multimodal.MULTIMODAL_REGISTRY.supports_multimodal_inputs",
++        side_effect=AssertionError("must not query registry when not mm_prefix_lm"),
++    ):
++        arch_config = model_config.get_model_arch_config()
++    assert arch_config.is_mm_prefix_lm is False
++
++
+ @pytest.mark.parametrize(
+     ("device", "expected"),
+     [
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index de5b345fa..3d62d25a0 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -856,7 +856,8 @@ class ModelConfig:
+ 
+             # Rebuild after multimodal_config exists so text-only mm_prefix
+             # clearing is applied (and cached for later with_hf_config calls).
+-            self.model_arch_config = self.get_model_arch_config()
++            if self.model_arch_config.is_mm_prefix_lm:
++                self.model_arch_config = self.get_model_arch_config()
+ 
+         if self.disable_sliding_window:
+             # Set after get_and_verify_max_len to ensure that max_model_len
+@@ -914,9 +915,10 @@ class ModelConfig:
+             self.hf_text_config,
+             revision=getattr(self, "revision", None),
+         )
+-        return convertor.convert(
+-            supports_multimodal=self._supports_multimodal_for_mm_prefix()
+-        )
++        arch_config = convertor.convert(supports_multimodal=True)
++        if arch_config.is_mm_prefix_lm and not self._supports_multimodal_for_mm_prefix():
++            return convertor.convert(supports_multimodal=False)
++        return arch_config
+ 
+     @field_validator("tokenizer", "max_model_len", mode="wrap")
+     @classmethod
+@@ -1270,6 +1272,8 @@ class ModelConfig:
+             # `override_quantization_method` method) must be checked in order
+             # of preference (this is particularly important for GPTQ).
+             overrides = [
++                "deepseek_v4_fp8",
++                "deepseek_v41_fp8",
+                 "auto_gptq",
+                 "gptq",
+                 "gptq_marlin",
+@@ -1284,26 +1288,25 @@ class ModelConfig:
+                 "modelopt_mxfp8",
+                 "mxfp8",
+                 "modelopt_mixed",
+-                "exl3",
+                 "mxfp4_csf",
+                 # Ensure heavy backends are probed last to avoid unnecessary
+                 # imports during override detection (e.g., MXFP4 imports Triton)
+                 "mxfp4",
+                 "gpt_oss_mxfp4",
+-                "deepseek_v4_fp8",
+-                "deepseek_v41_fp8",
+                 "humming",
+             ]
+             # if the user specifies humming, we should always use humming
+             if self.quantization == "humming":
+                 overrides = ["humming"] + overrides
+-            quantization_methods = [
+-                q for q in supported_quantization if q not in overrides
++            builtin_methods = set(get_args(me_quant.QuantizationMethods))
++            custom_overrides = [
++                q
++                for q in supported_quantization
++                if q not in builtin_methods and q not in overrides
+             ]
+-            # Any custom overrides will be in quantization_methods so we place
+-            # them at the start of the list so custom overrides have preference
+-            # over the built-in ones.
+-            quantization_methods = quantization_methods + overrides
++            # Any custom overrides are placed at the start of the list so
++            # custom overrides have preference over the built-in ones.
++            quantization_methods = custom_overrides + overrides
+ 
+             # Detect which checkpoint is it
+             for name in quantization_methods:
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index 89bb6b8cf..55101e55a 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -115,95 +115,116 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+     if quantization not in QUANTIZATION_METHODS:
+         raise ValueError(f"Invalid quantization method: {quantization}")
+ 
+-    # lazy import to avoid triggering `torch.compile` too early
+-    from vllm.config.quantization import _ONLINE_SHORTHANDS
+-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+-
+-    if current_platform.is_cuda() or current_platform.is_rocm():
+-        # The v4.1 class is the v4 one extended to accept model_type
+-        # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
+-        # platform-specific implementations for both CUDA and ROCm.
+-        from vllm.models.deepseek_v41.quant_config import (
+-            DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
++    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
++        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
++
++    # Lazy per-method imports avoid importing heavy native/Triton backends for
++    # unrelated quantization methods during ModelConfig verification.
++    if quantization in ("awq", "awq_marlin", "auto_awq"):
++        from .auto_awq import AutoAWQConfig
++
++        return AutoAWQConfig
++    if quantization in ("auto_gptq", "gptq", "gptq_marlin"):
++        from .auto_gptq import AutoGPTQConfig
++
++        return AutoGPTQConfig
++    if quantization == "fp8":
++        from .fp8 import Fp8Config
++
++        return Fp8Config
++    if quantization == "fbgemm_fp8":
++        from .fbgemm_fp8 import FBGEMMFp8Config
++
++        return FBGEMMFp8Config
++    if quantization == "fp_quant":
++        from .fp_quant import FPQuantConfig
++
++        return FPQuantConfig
++    if quantization == "modelopt":
++        from .modelopt import ModelOptFp8Config
++
++        return ModelOptFp8Config
++    if quantization == "modelopt_fp4":
++        from .modelopt import ModelOptNvFp4Config
++
++        return ModelOptNvFp4Config
++    if quantization in ("modelopt_mxfp8", "mxfp8"):
++        from .modelopt import ModelOptMxFp8Config
++
++        return ModelOptMxFp8Config
++    if quantization == "modelopt_mixed":
++        from .modelopt import ModelOptMixedPrecisionConfig
++
++        return ModelOptMixedPrecisionConfig
++    if quantization == "compressed-tensors":
++        from .compressed_tensors.compressed_tensors import (
++            CompressedTensorsConfig,
+         )
+ 
+-        deepseek_config: type[QuantizationConfig] = UpstreamDeepseekV41FP8Config
+-    else:
++        return CompressedTensorsConfig
++    if quantization == "experts_int8":
++        from .experts_int8 import ExpertsInt8Config
++
++        return ExpertsInt8Config
++    if quantization == "quark":
++        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
++
++        return QuarkConfig
++    if quantization == "moe_wna16":
++        from .moe_wna16 import MoeWNA16Config
++
++        return MoeWNA16Config
++    if quantization == "exl3":
++        from .exl3 import Exl3Config
++
++        return Exl3Config
++    if quantization == "torchao":
++        from .torchao import TorchAOConfig
++
++        return TorchAOConfig
++    if quantization == "inc":
++        from .inc import INCConfig
++
++        return INCConfig
++    if quantization == "mxfp4":
++        from .mxfp4 import Mxfp4Config
++
++        return Mxfp4Config
++    if quantization == "gpt_oss_mxfp4":
++        from .mxfp4 import GptOssMxfp4Config
++
++        return GptOssMxfp4Config
++    if quantization == "deepseek_v4_fp8":
++        if current_platform.is_cuda() or current_platform.is_rocm():
++            from vllm.models.deepseek_v41.quant_config import (
++                DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
++            )
++
++            return UpstreamDeepseekV41FP8Config
+         from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+ 
+-        deepseek_config = DeepseekV4FP8Config
+-
+-    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
+-
+-    from .auto_awq import AutoAWQConfig
+-    from .auto_gptq import AutoGPTQConfig
+-    from .compressed_tensors.compressed_tensors import (
+-        CompressedTensorsConfig,
+-    )
+-    from .exl3 import Exl3Config
+-    from .experts_int8 import ExpertsInt8Config
+-    from .fbgemm_fp8 import FBGEMMFp8Config
+-    from .fp8 import Fp8Config
+-    from .fp_quant import FPQuantConfig
+-    from .humming import HummingConfig
+-    from .inc import INCConfig
+-    from .modelopt import (
+-        ModelOptFp8Config,
+-        ModelOptMixedPrecisionConfig,
+-        ModelOptMxFp8Config,
+-        ModelOptNvFp4Config,
+-    )
+-    from .moe_wna16 import MoeWNA16Config
+-    from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+-    from .mxfp4_csf import Mxfp4CsfConfig
++        return DeepseekV4FP8Config
++    if quantization == "deepseek_v41_fp8":
++        from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
++
++        return DeepseekV41FP8Config
++    if quantization == "mxfp4_csf":
++        from .mxfp4_csf import Mxfp4CsfConfig
++
++        return Mxfp4CsfConfig
++    if quantization == "humming":
++        from .humming import HummingConfig
++
++        return HummingConfig
++
++    from vllm.config.quantization import _ONLINE_SHORTHANDS
++
+     from .online.base import OnlineQuantizationConfig
+-    from .torchao import TorchAOConfig
+-
+-    method_to_config: dict[str, type[QuantizationConfig]] = {
+-        "awq": AutoAWQConfig,
+-        "awq_marlin": AutoAWQConfig,
+-        "auto_awq": AutoAWQConfig,
+-        "fp8": Fp8Config,
+-        "fbgemm_fp8": FBGEMMFp8Config,
+-        "fp_quant": FPQuantConfig,
+-        "modelopt": ModelOptFp8Config,
+-        "modelopt_fp4": ModelOptNvFp4Config,
+-        "modelopt_mxfp8": ModelOptMxFp8Config,
+-        "modelopt_mixed": ModelOptMixedPrecisionConfig,
+-        "auto_gptq": AutoGPTQConfig,
+-        "gptq": AutoGPTQConfig,
+-        "gptq_marlin": AutoGPTQConfig,
+-        "compressed-tensors": CompressedTensorsConfig,
+-        "experts_int8": ExpertsInt8Config,
+-        "quark": QuarkConfig,
+-        "moe_wna16": MoeWNA16Config,
+-        "exl3": Exl3Config,
+-        "torchao": TorchAOConfig,
+-        "inc": INCConfig,
+-        "mxfp4": Mxfp4Config,
+-        "gpt_oss_mxfp4": GptOssMxfp4Config,
+-        "deepseek_v4_fp8": deepseek_config,
+-        "deepseek_v41_fp8": DeepseekV41FP8Config,
+-        "mxfp4_csf": Mxfp4CsfConfig,
+-        "humming": HummingConfig,
+-        "online": OnlineQuantizationConfig,
+-        # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
+-        # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
+-        # below only applies to the `--quantization mxfp8` CLI path.
+-        "mxfp8": ModelOptMxFp8Config,
+-    }
+-
+-    # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
+-    # setdefault so a shorthand that is also a checkpoint method (e.g. "mxfp8")
+-    # keeps its checkpoint config; the shorthand still works via the
+-    # `--quantization` CLI path in `resolve_quantization_config`.
+-    for shorthand in _ONLINE_SHORTHANDS:
+-        method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
+-
+-    # Update the `method_to_config` with customized quantization methods.
+-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+-
+-    return method_to_config[quantization]
++
++    if quantization == "online" or quantization in _ONLINE_SHORTHANDS:
++        return OnlineQuantizationConfig
++
++    raise ValueError(f"Invalid quantization method: {quantization}")
+ 
+ 
+ __all__ = [
+diff --git a/vllm/model_executor/layers/quantization/utils/humming_utils.py b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+index 2a3c1bd4f..d074fbf4f 100644
+--- a/vllm/model_executor/layers/quantization/utils/humming_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+@@ -61,30 +61,38 @@ class HummingMoEQuantConfig(FusedMoEQuantConfig):
+     w2_humming_config: "LayerConfig"
+ 
+ 
+-if has_humming():
+-    from vllm.utils.humming import dtypes as humming_dtypes
+-
+-    _HUMMING_TO_QUANT_DTYPE: dict[humming_dtypes.DataType, Any] = {
+-        humming_dtypes.float4e2m1: FP4_DTYPE,
+-        humming_dtypes.float8e4m3: FP8_DTYPE,
+-        humming_dtypes.float8e5m2: torch.float8_e5m2,
+-        humming_dtypes.int8: torch.int8,
+-        humming_dtypes.uint4: INT4_DTYPE,
+-        humming_dtypes.uint8: INT8_DTYPE,
+-        humming_dtypes.uint2: torch.uint8,
+-        humming_dtypes.uint3: torch.uint8,
+-        humming_dtypes.uint5: torch.uint8,
+-        humming_dtypes.uint6: torch.uint8,
+-        humming_dtypes.uint7: torch.uint8,
+-    }
+-
+-    _HUMMING_TO_SCALE_DTYPE: dict[humming_dtypes.DataType, torch.dtype] = {
+-        humming_dtypes.float8e8m0: MXFP_SCALE_DTYPE,
+-        humming_dtypes.float8e4m3: FP8_DTYPE,
+-        humming_dtypes.float16: torch.float16,
+-        humming_dtypes.bfloat16: torch.bfloat16,
+-        humming_dtypes.float32: torch.float32,
+-    }
++_HUMMING_TO_QUANT_DTYPE: dict[Any, Any] = {}
++_HUMMING_TO_SCALE_DTYPE: dict[Any, torch.dtype] = {}
++humming_dtypes: Any = None
++
++
++def _ensure_humming_dtypes() -> Any:
++    global humming_dtypes, _HUMMING_TO_QUANT_DTYPE, _HUMMING_TO_SCALE_DTYPE
++    if humming_dtypes is None and has_humming():
++        from vllm.utils.humming import dtypes as _dtypes
++
++        humming_dtypes = _dtypes
++        _HUMMING_TO_QUANT_DTYPE = {
++            _dtypes.float4e2m1: FP4_DTYPE,
++            _dtypes.float8e4m3: FP8_DTYPE,
++            _dtypes.float8e5m2: torch.float8_e5m2,
++            _dtypes.int8: torch.int8,
++            _dtypes.uint4: INT4_DTYPE,
++            _dtypes.uint8: INT8_DTYPE,
++            _dtypes.uint2: torch.uint8,
++            _dtypes.uint3: torch.uint8,
++            _dtypes.uint5: torch.uint8,
++            _dtypes.uint6: torch.uint8,
++            _dtypes.uint7: torch.uint8,
++        }
++        _HUMMING_TO_SCALE_DTYPE = {
++            _dtypes.float8e8m0: MXFP_SCALE_DTYPE,
++            _dtypes.float8e4m3: FP8_DTYPE,
++            _dtypes.float16: torch.float16,
++            _dtypes.bfloat16: torch.bfloat16,
++            _dtypes.float32: torch.float32,
++        }
++    return humming_dtypes
+ 
+ 
+ def _group_shape(group_size: int, group_size_n: int = 0) -> GroupShape:
+@@ -113,6 +121,7 @@ def _humming_weight_schema_to_quant_key(
+     from vllm.utils.humming import WeightScaleType
+ 
+     """Convert a HummingWeightSchema to a QuantKey."""
++    _ensure_humming_dtypes()
+     dtype = _HUMMING_TO_QUANT_DTYPE[schema.b_dtype]
+ 
+     if schema.bs_dtype is not None:
+@@ -191,6 +200,7 @@ def _compressed_tensors_weight_schema_to_quant_key(
+     elif "nvfp4" in fmt or "mxfp4" in fmt:
+         dtype = FP4_DTYPE
+     else:
++        _ensure_humming_dtypes()
+         dtype = _HUMMING_TO_QUANT_DTYPE[
+             humming_dtypes.DataType.from_str(f"uint{schema.num_bits}")
+         ]
+@@ -302,6 +312,7 @@ def _humming_input_schema_to_quant_key(
+     if schema.a_dtype is None or schema.a_dtype.num_bits >= 16:
+         return None
+ 
++    _ensure_humming_dtypes()
+     dtype = _HUMMING_TO_QUANT_DTYPE[schema.a_dtype]
+ 
+     gs = schema.input_scale_group_size
+@@ -335,6 +346,7 @@ def _resolve_input_quant_key(
+     from vllm.utils.humming import HummingInputSchema
+ 
+     """Resolve the actual activation QuantKey after platform fallback."""
++    _ensure_humming_dtypes()
+     a_dtype = HummingInputSchema().get_fallback_input_dtype(origin_a_dtype)
+     if a_dtype is None or a_dtype.num_bits >= 16:
+         return None
+@@ -351,6 +363,7 @@ def _resolve_input_quant_key(
+ def _compressed_tensors_input_schema_to_quant_key(
+     schema: "CompressedTensorsInputSchema",
+ ) -> QuantKey | None:
++    _ensure_humming_dtypes()
+     type_bits_to_dtype = {
+         ("float", 8): humming_dtypes.float8e4m3,
+         ("float", 4): humming_dtypes.float4e2m1,
+@@ -378,6 +391,7 @@ def input_schema_to_quant_key(
+ 
+     """Convert any BaseInputSchema to a QuantKey. Returns None if
+     the schema represents unquantized (bf16/fp16) inputs."""
++    _ensure_humming_dtypes()
+     if isinstance(schema, HummingInputSchema):
+         return _humming_input_schema_to_quant_key(schema)
+ 
+@@ -650,6 +664,7 @@ def get_humming_moe_quant_config(
+         and q_dtype.startswith("float8")
+         and input_scale_group_size == 128
+     ):
++        _ensure_humming_dtypes()
+         q_dtype = _HUMMING_TO_QUANT_DTYPE.get(input_schema.a_dtype, FP8_DTYPE)
+         activation_group_shape = GroupShape(row=1, col=input_scale_group_size)
+ 
+diff --git a/vllm/models/deepseek_v41/quant_config.py b/vllm/models/deepseek_v41/quant_config.py
+index c8361b2da..d5d162625 100644
+--- a/vllm/models/deepseek_v41/quant_config.py
++++ b/vllm/models/deepseek_v41/quant_config.py
+@@ -8,14 +8,9 @@ from typing import TYPE_CHECKING, cast
+ 
+ from vllm.config import get_current_vllm_config
+ from vllm.config.quantization import QuantSpec
+-from vllm.model_executor.layers.fused_moe import (
+-    RoutedExperts,
+-    UnquantizedFusedMoEMethod,
+-)
+ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     is_layer_skipped,
+     kMxfp8Dynamic,
+@@ -206,6 +201,11 @@ class DeepseekV4FP8Config(Fp8Config):
+                 QuantSpec(weight=kMxfp8Static, activation=kMxfp8Dynamic),
+                 CkptCtx(scale_block_size=(rows, cols)),
+             )
++        from vllm.model_executor.layers.fused_moe import (
++            RoutedExperts,
++            UnquantizedFusedMoEMethod,
++        )
++
+         if isinstance(layer, RoutedExperts):
+             if is_layer_skipped(
+                 prefix=prefix,
+@@ -223,6 +223,8 @@ class DeepseekV4FP8Config(Fp8Config):
+                         quant_config=self._get_nvfp4_config(),
+                         moe_config=layer.moe_config,
+                     )
++                from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
++
+                 return Mxfp4MoEMethod(layer.moe_config)
+             # expert_dtype == "fp8": fall through to Fp8Config which
+             # returns Fp8MoEMethod with block-wise float32 scales.
+diff --git a/vllm/models/deepseek_v4_1/quant_config.py b/vllm/models/deepseek_v4_1/quant_config.py
+index 9ac845642..10aaa4080 100644
+--- a/vllm/models/deepseek_v4_1/quant_config.py
++++ b/vllm/models/deepseek_v4_1/quant_config.py
+@@ -4,16 +4,13 @@
+ 
+ import torch
+ 
+-from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+     create_fp8_scale_parameter,
+     create_fp8_weight_parameter,
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from vllm.model_executor.parameter import BlockQuantScaleParameter
+ 
+ 
+@@ -71,14 +68,25 @@ class DeepseekV41FP8Config(Fp8Config):
+ 
+     @classmethod
+     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+-        if getattr(hf_config, "model_type", None) in (
+-            "deepseek_v41",
+-            "deepseek_v41_text",
+-        ) and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v41_fp8"):
++        quant_method = hf_quant_cfg.get("quant_method")
++        if quant_method == "deepseek_v41_fp8" or (
++            getattr(hf_config, "model_type", None)
++            in (
++                "deepseek_v41",
++                "deepseek_v41_text",
++            )
++            and quant_method == "fp8"
++        ):
+             return cls.get_name()
+         return None
+ 
+     def get_quant_method(self, layer, prefix):
++        from vllm.model_executor.layers.fused_moe import RoutedExperts
++        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
++        from vllm.model_executor.layers.vocab_parallel_embedding import (
++            VocabParallelEmbedding,
++        )
++
+         from . import kernels
+ 
+         if isinstance(layer, LinearBase):
