@@ -1,0 +1,342 @@
+From b156d94420dec52517c02404b3d17d2e910b2679 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 20:36:34 +0100
+Subject: [PATCH] Defer grouped_fp8_fp4_gemm barrier init past empty-CTA return
+ and use 2 stages for decode down GEMM
+
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  28 +++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 194 ++++++++++--------
+ 2 files changed, 131 insertions(+), 91 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 936103885..6d24fcf6a 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -775,3 +775,31 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     assert torch.equal(
+         out_plain[live].view(torch.int16), out_mixed[live].view(torch.int16)
+     )
++
++
++def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
++    """Empty CTAs return before barrier initialization, and decode down GEMMs use
++    two stages (2 CTAs/SM) with identical bits to three stages."""
++    plan = MoeExpertsV41Plan(384, 6, 5120, 576, swiglu_limit=LIMIT)
++    calls = plan.kernels()
++    assert calls["gate_up"][2]["num_stages"] == 3
++    assert calls["late_gate_up"][2]["num_stages"] == 3
++    assert calls["prefill_gate_up"][2]["num_stages"] == 3
++    assert calls["down"][2]["num_stages"] == 2
++    assert calls["late_down"][2]["num_stages"] == 2
++    assert calls["prefill_down"][2]["num_stages"] == 3
++
++    kernel = grouped_fp8_fp4_gemm(
++        32, 384, 576, 6, False, 32, 128, num_stages=2, coded_scales=True, narrow_codes=True
++    )
++    src = kernel.get_kernel_source()
++    early_return = src.index("if (expert < 0)")
++    rows_write = src.index("((int*)rows_shared)[")
++    barrier_init = src.index("loaded[0].init(")
++    fence_init = src.index("tl::fence_barrier_init()")
++    a_row_read = src.index("a_row[c] = ((int*)rows_shared)[")
++    assert "__syncthreads()" not in src[:early_return]
++    assert early_return < rows_write < barrier_init < fence_init < a_row_read
++    # Writing rows_shared and initializing loaded share a single __syncthreads().
++    assert src[rows_write:a_row_read].count("__syncthreads()") == 1
++
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index c8f776295..291cd759f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -827,7 +827,6 @@ def grouped_fp8_fp4_gemm(
+             rows_shared = T.alloc_shared((block_M,), T.int32)
+             a_row = T.alloc_local((a_copies,), T.int32)
+             sfa_row = T.alloc_local((sfa_copies,), T.int32)
+-            loaded = T.alloc_barrier([threads] * stages)
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+             tx = T.get_thread_binding()
+ 
+@@ -839,14 +838,6 @@ def grouped_fp8_fp4_gemm(
+                 rows_shared[i] = T.if_then_else(
+                     route >= 0, route // topk if gather else t * block_M + i, -1
+                 )
+-            T.sync_threads()
+-            # Each thread copies the same rows at every K block.
+-            for c in T.unroll(a_copies):
+-                a_row[c] = rows_shared[
+-                    T.min((c * threads + tx) // row_segments, block_M - 1)
+-                ]
+-            for c in T.unroll(sfa_copies):
+-                sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
+             if coded_scales:
+                 for c in T.unroll(sfb_copies):
+                     j = c * threads + tx
+@@ -861,56 +852,77 @@ def grouped_fp8_fp4_gemm(
+                         (narrow_entry >> 1) * n_blocks
+                         + bx * (2 - Narrow_flag)
+                     ) * k_blocks
+-            sf_dest = SFC_shared if coded_scales else SFB_shared
+-
+-            T.clear(C_local)
+-            for p in T.unroll(stages - 1):
+-                if p < k_blocks:
+-                    if narrow_codes:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                             p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++            # Allocating the stage barriers in a child block after the TileExpert
++            # early return keeps empty CTAs free of barrier initialization, cluster
++            # barrier fences, and block synchronization, while the barrier-init
++            # sync publishes rows_shared to the active CTA in one barrier.
++            with T.sblock("gemm"):
++                loaded = T.alloc_barrier([threads] * stages)
++                # Each thread copies the same rows at every K block.
++                for c in T.unroll(a_copies):
++                    a_row[c] = rows_shared[
++                        T.min((c * threads + tx) // row_segments, block_M - 1)
++                    ]
++                for c in T.unroll(sfa_copies):
++                    sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
++                sf_dest = SFC_shared if coded_scales else SFB_shared
++
++                T.clear(C_local)
++                for p in T.unroll(stages - 1):
++                    if p < k_blocks:
++                        if narrow_codes:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
++                                 p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++                        else:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
++                                 p, SFB, SFB_shared)  # fmt: skip
+                     else:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                             p, SFB, SFB_shared)  # fmt: skip
+-                else:
+-                    T.ptx_commit_group()
+-            for ko in T.serial(k_blocks):
+-                # The stage loaded next was last read by iteration ko - 1.
+-                T.sync_threads()
+-                nxt = ko + stages - 1
+-                if nxt < k_blocks:
+-                    if narrow_codes:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                             nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++                        T.ptx_commit_group()
++                for ko in T.serial(k_blocks):
++                    # The stage loaded next was last read by iteration ko - 1.
++                    T.sync_threads()
++                    nxt = ko + stages - 1
++                    if nxt < k_blocks:
++                        if narrow_codes:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
++                                 nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
++                        else:
++                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
++                                 nxt % stages, SFB, SFB_shared)  # fmt: skip
+                     else:
+-                        load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                             sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                             nxt % stages, SFB, SFB_shared)  # fmt: skip
+-                else:
+-                    T.ptx_commit_group()
+-                T.ptx_wait_group(stages - 1)
+-                T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
+-                s = ko % stages
+-                if coded_scales:
+-                    # Every thread expands its own rows: the stage's barrier
+-                    # waited for every thread's copies. A narrow expert's row
+-                    # is one byte of four 2-bit deltas; the expert is one per
+-                    # CTA, so the branch is uniform.
+-                    for c in T.unroll(sfb_copies):
+-                        j = c * threads + tx
+-                        if j < block_N:
+-                            if narrow_codes:
+-                                if Narrow_flag != 0:
+-                                    code8 = T.cast(SFC8[s, j], T.uint32)
+-                                    SFB_shared[s, j, 0] = (
+-                                        (code8 & T.uint32(0x3))
+-                                        | ((code8 >> 2) & T.uint32(0x3)) << 8
+-                                        | ((code8 >> 4) & T.uint32(0x3)) << 16
+-                                        | ((code8 >> 6) & T.uint32(0x3)) << 24
+-                                    ) + base_words[c]
++                        T.ptx_commit_group()
++                    T.ptx_wait_group(stages - 1)
++                    T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
++                    s = ko % stages
++                    if coded_scales:
++                        # Every thread expands its own rows: the stage's barrier
++                        # waited for every thread's copies. A narrow expert's row
++                        # is one byte of four 2-bit deltas; the expert is one per
++                        # CTA, so the branch is uniform.
++                        for c in T.unroll(sfb_copies):
++                            j = c * threads + tx
++                            if j < block_N:
++                                if narrow_codes:
++                                    if Narrow_flag != 0:
++                                        code8 = T.cast(SFC8[s, j], T.uint32)
++                                        SFB_shared[s, j, 0] = (
++                                            (code8 & T.uint32(0x3))
++                                            | ((code8 >> 2) & T.uint32(0x3)) << 8
++                                            | ((code8 >> 4) & T.uint32(0x3)) << 16
++                                            | ((code8 >> 6) & T.uint32(0x3)) << 24
++                                        ) + base_words[c]
++                                    else:
++                                        code = T.cast(SFC_shared[s, j], T.uint32)
++                                        SFB_shared[s, j, 0] = (
++                                            (code & T.uint32(0xF))
++                                            | ((code >> 4) & T.uint32(0xF)) << 8
++                                            | ((code >> 8) & T.uint32(0xF)) << 16
++                                            | ((code >> 12) & T.uint32(0xF)) << 24
++                                        ) + base_words[c]
+                                 else:
+                                     code = T.cast(SFC_shared[s, j], T.uint32)
+                                     SFB_shared[s, j, 0] = (
+@@ -919,32 +931,11 @@ def grouped_fp8_fp4_gemm(
+                                         | ((code >> 8) & T.uint32(0xF)) << 16
+                                         | ((code >> 12) & T.uint32(0xF)) << 24
+                                     ) + base_words[c]
+-                            else:
+-                                code = T.cast(SFC_shared[s, j], T.uint32)
+-                                SFB_shared[s, j, 0] = (
+-                                    (code & T.uint32(0xF))
+-                                    | ((code >> 4) & T.uint32(0xF)) << 8
+-                                    | ((code >> 8) & T.uint32(0xF)) << 16
+-                                    | ((code >> 12) & T.uint32(0xF)) << 24
+-                                ) + base_words[c]
+-                T.sync_threads()
+-                if ko < k_full:
+-                    T.mma_gemm_blockscaled(
+-                        A_shared[s, :, :],
+-                        B_shared[s, :, :],
+-                        C_local,
+-                        SFA_shared[s, :, :],
+-                        SFB_shared[s, :, :],
+-                        transpose_B=True,
+-                        k_start=0,
+-                        sf_a_granularity_k=SF_BLOCK,
+-                        sf_b_granularity_k=SF_BLOCK,
+-                    )
+-                if BT is not None:  # noqa: SIM102
+-                    if ko == k_full:
++                    T.sync_threads()
++                    if ko < k_full:
+                         T.mma_gemm_blockscaled(
+-                            A_shared[s, :, 0:tail],
+-                            B_shared[s, :, 0:tail],
++                            A_shared[s, :, :],
++                            B_shared[s, :, :],
+                             C_local,
+                             SFA_shared[s, :, :],
+                             SFB_shared[s, :, :],
+@@ -953,12 +944,25 @@ def grouped_fp8_fp4_gemm(
+                             sf_a_granularity_k=SF_BLOCK,
+                             sf_b_granularity_k=SF_BLOCK,
+                         )
+-            if trigger_after_loop:
+-                pdl.trigger()
+-            # Only real rows are stored; padding rows of the layout stay untouched.
+-            for i, j in T.Parallel(block_M, block_N):
+-                if rows_shared[i] >= 0:
+-                    C[t * block_M + i, bx * block_N + j] = C_local[i, j]
++                    if BT is not None:  # noqa: SIM102
++                        if ko == k_full:
++                            T.mma_gemm_blockscaled(
++                                A_shared[s, :, 0:tail],
++                                B_shared[s, :, 0:tail],
++                                C_local,
++                                SFA_shared[s, :, :],
++                                SFB_shared[s, :, :],
++                                transpose_B=True,
++                                k_start=0,
++                                sf_a_granularity_k=SF_BLOCK,
++                                sf_b_granularity_k=SF_BLOCK,
++                            )
++                if trigger_after_loop:
++                    pdl.trigger()
++                # Only real rows are stored; padding rows of the layout stay untouched.
++                for i, j in T.Parallel(block_M, block_N):
++                    if rows_shared[i] >= 0:
++                        C[t * block_M + i, bx * block_N + j] = C_local[i, j]
+ 
+     sfb_spec = (
+         T.Tensor((code_rows, block_N // 2), T.uint16)
+@@ -1224,7 +1228,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+                         cert_max_metric = T.alloc_var(T.uint32, init=0)
+                         for j in T.vectorized(2):
+                             cert_min_l[j] = T.float32(0)
+-                        for j in T.vectorized(vec):
++                        for j in T.unroll(vec):
+                             cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_f[j])
+                         cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
+                         for j in T.unroll(vec):
+@@ -1254,7 +1258,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+                                 x[j] = val
+                         for j in T.vectorized(2):
+                             amax[j] = 0
+-                        for j in T.vectorized(vec):
++                        for j in T.unroll(vec):
+                             amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
+                         amax[0] = T.max(amax[0], amax[1])
+                         for j in T.unroll(reduce_rounds):
+@@ -1348,6 +1352,7 @@ class MoeExpertsV41Plan:
+         prefill_block_M=64,
+         block_N=128,
+         num_stages=3,
++        down_num_stages=2,
+         out_dtype=torch.bfloat16,
+         idx_dtypes=(torch.int32, torch.int64),
+         max_rows: int | None = None,
+@@ -1364,6 +1369,7 @@ class MoeExpertsV41Plan:
+             block_N,
+         )
+         self.num_stages = num_stages
++        self.down_num_stages = down_num_stages
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+@@ -1428,7 +1434,6 @@ class MoeExpertsV41Plan:
+         ``prefill_`` prefix at ``prefill_block_M``, whose GEMMs trigger late too."""
+         config = dict(
+             block_N=self.block_N,
+-            num_stages=self.num_stages,
+             coded_scales=True,
+             narrow_codes=True,
+         )
+@@ -1445,6 +1450,11 @@ class MoeExpertsV41Plan:
+             tiers.append(("prefill_", self.prefill_block_M, True))
+         kernels = {}
+         for prefix, block_M, late in tiers:
++            down_stages = (
++                self.down_num_stages
++                if block_M == self.block_M
++                else self.num_stages
++            )
+             kernels[f"{prefix}gate_up"] = prepare.call(
+                 grouped_fp8_fp4_gemm,
+                 num_experts,
+@@ -1453,6 +1463,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 True,
+                 block_M,
++                num_stages=self.num_stages,
+                 **config,
+                 trigger_after_loop=late,
+             )
+@@ -1464,6 +1475,7 @@ class MoeExpertsV41Plan:
+                 topk,
+                 False,
+                 block_M,
++                num_stages=down_stages,
+                 **config,
+                 trigger_after_loop=late,
+             )
+-- 
+2.54.0 (Apple Git-157)
+
