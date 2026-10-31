@@ -87,7 +87,7 @@ def fabric(cluster: dict) -> ModuleType:
 
 
 def fabric_node(node: dict) -> dict:
-    return {key: value for key, value in node.items() if key not in SITE_FIELDS}
+    return {key: value for key, value in node.items() if key not in (*SITE_FIELDS, "ssh_host")}
 
 
 def fabric_map(nodes: dict) -> dict:
@@ -116,6 +116,12 @@ def hcas(cluster: dict, node: dict) -> list[str]:
 def problems(cluster: dict, nodes: dict) -> list[str]:
     errors = []
     entries = nodes.get("nodes", [])
+    for node in entries:
+        if "ssh_host" in node:
+            errors.append(
+                f"{node.get('name')}: ssh_host is no longer used because name is now the SSH "
+                "target; either rename the node to its SSH target or add an SSH Host alias"
+            )
     count = len(entries)
     if count not in (3, 4):
         errors.append(f"deployment requires 3 or 4 nodes, got {count}")

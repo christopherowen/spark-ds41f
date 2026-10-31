@@ -426,7 +426,10 @@ Two files describe your site and stay out of git:
   `config/nodes-switched.local.json` for a switched four-node deployment (start from
   [config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and see
   [switched-fabric.md](switched-fabric.md)).
-  It names each node (`name`, used both as its SSH host and in status messages),
+  It names each node (`name`, which is used both as the SSH target and in status
+  messages and must resolve via `~/.ssh/config` or DNS/hosts; if an earlier node
+  map set `ssh_host`, either rename nodes to their SSH targets or add SSH
+  aliases, because `name` is now the SSH target),
   its rank (the head is rank 0), management IP, `ssh_user`, and `roce_peer_hcas`:
   for each peer rank, the local RoCE devices cabled to it (`rdma link` shows them).
   `sparknet topology discover` writes it. An optional `transfer_host` field per

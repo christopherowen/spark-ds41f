@@ -1364,14 +1364,59 @@ def docker_error_detail(node_name: str, stderr: str) -> str:
     return detail
 
 
-def live_doctor(cluster: dict, nodes: dict) -> list[str]:
-    """Findings about the live cluster: errors, and Warn for the minor ones."""
+def ssh_resolution_problem(nodes: dict, node: dict) -> str | None:
+    """Return an error if the node's SSH target resolves via neither SSH config nor DNS."""
+    target = ssh_target(nodes, node)
+    host = node["name"]
+    proxy = False
+    config = subprocess.run(
+        ["ssh", "-G", target],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if config.returncode == 0:
+        for line in config.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            value = value.strip()
+            if key == "hostname" and value:
+                host = value
+            elif key in ("proxycommand", "proxyjump") and value and value != "none":
+                proxy = True
+    if proxy:
+        return None
+    try:
+        socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        ip = node.get("management_ip", "<management_ip>")
+        return (
+            f"{node['name']}: cannot resolve SSH target {target!r} via SSH config or DNS; "
+            f"add a Host {node['name']} entry (HostName {ip}) in ~/.ssh/config, add it to "
+            "DNS or /etc/hosts, or set the node's name to a resolvable hostname or IP"
+        )
+    return None
+
+
+def site_node_problems(cluster: dict, nodes: dict) -> list[str]:
     if any(str(node.get("management_ip", "")).startswith("192.0.2.") for node in nodes.get("nodes", [])):
         nodes_file = cluster.get("nodes_config", NODES_FILE)
         return [
             f"{nodes_file} still contains example placeholder addresses (192.0.2.x); "
             "edit it with your nodes' names, ssh_user, and management IPs"
         ]
+    return [
+        problem
+        for node in nodes.get("nodes", [])
+        if (problem := ssh_resolution_problem(nodes, node)) is not None
+    ]
+
+
+def live_doctor(cluster: dict, nodes: dict) -> list[str]:
+    """Findings about the live cluster: errors, and Warn for the minor ones."""
+    site_problems = site_node_problems(cluster, nodes)
+    if site_problems:
+        return site_problems
     problems: list[str] = []
     trial_path = kernel_policy_path(cluster)
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
@@ -1381,6 +1426,11 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     kernel_profile = cluster.get("host", {}).get("kernel")
     carveout = carveout_weights_enabled(cluster)
     for node in nodes["nodes"]:
+        desktop = remote_shell(nodes, node, DESKTOP_QUERY)
+        if desktop.returncode == 255:
+            detail = desktop.stderr.strip() or f"cannot connect to {ssh_target(nodes, node)}"
+            problems.append(f"{node['name']}: SSH failed ({detail})")
+            continue
         if trial:
             inventory = node_kernel_inventory(nodes, node, trial)
             kernel_inventories[node["name"]] = inventory
@@ -1395,7 +1445,6 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
                 for warning in dict.fromkeys([*warnings, *profile_warnings])
             )
             corrections.extend(fixes)
-        desktop = remote_shell(nodes, node, DESKTOP_QUERY)
         problems.extend(desktop_problems(node["name"], desktop.stdout))
         boot = run_ssh(nodes, node, "efibootmgr")
         problems.extend(boot_order_problems(node["name"], boot.stdout))
@@ -1722,6 +1771,8 @@ def command_doctor(args: argparse.Namespace) -> int:
             print(finding)
         return 0
     findings = local_doctor(cluster, nodes, upstreams)
+    if not split_findings(findings)[0]:
+        findings.extend(site_node_problems(cluster, nodes))
     if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
         if not split_findings(findings)[0]:
