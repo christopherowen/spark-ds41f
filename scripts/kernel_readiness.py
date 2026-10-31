@@ -93,6 +93,7 @@ def collect(policy):
             data["files"][path] = Path(path).is_file() and Path(path).stat().st_size > 0
     data["headers"] = Path(f"/lib/modules/{target}/build/Makefile").is_file()
     data["cpu_tools"] = Path(f"/usr/lib/linux-tools/{target}/cpupower").is_file()
+    data["running_cpu_tools"] = Path(f"/usr/lib/linux-tools/{data['kernel']}/cpupower").is_file()
     data["governors"] = sorted({p.read_text().strip() for p in Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_governor")})
     config = Path(f"/boot/config-{target}")
     data["config_64k"] = config.exists() and "CONFIG_ARM64_64K_PAGES=y" in config.read_text()
@@ -196,6 +197,8 @@ def findings(name, data, policy):
         issues.append(f"{name}: candidate headers or CONFIG_ARM64_64K_PAGES=y missing")
     if not data.get("cpu_tools"):
         issues.append(f"{name}: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel")
+    if data.get("running_cpu_tools") is False:
+        issues.append(f"{name}: running cpupower tool is missing for {running}; nv-cpu-governor.service cannot run")
     if data.get("governors") != ["performance"]:
         issues.append(f"{name}: CPU governors differ from performance: {data.get('governors')!r}")
         fixes.append(f"{name}: after installing matching linux-tools, sudo systemctl restart nv-cpu-governor.service")

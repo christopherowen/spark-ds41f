@@ -15,6 +15,9 @@ fi
 
 cd "$source_dir"
 sudo ./install.sh
-if [ -d /lib/modules/7.0.0-1019-nvidia-64k ]; then
-  sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k
-fi
+for mod_dir in /lib/modules/*; do
+  k=$(basename "$mod_dir")
+  if [ -d "$mod_dir/build" ]; then
+    sudo dkms autoinstall -k "$k"
+  fi
+done
