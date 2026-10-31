@@ -125,8 +125,11 @@ def configuration(
         shape = cluster_recipe.chosen_shape(cluster, ROOT, getattr(args, "shape", None))
         if not explicit_shape and not nodes_override and not (ROOT / "config/nodes-ring4.local.json").is_file():
             if (ROOT / "config/nodes-switched.local.json").is_file():
-                nodes_override = "config/nodes-switched.local.json"
-                auto_switched = True
+                if "tp4-switched" in cluster.get("shapes", {}):
+                    shape = "tp4-switched"
+                else:
+                    nodes_override = "config/nodes-switched.local.json"
+                    auto_switched = True
             elif (ROOT / NODES_FILE).is_file() and "tp3-triangle" in cluster.get("shapes", {}):
                 shape = "tp3-triangle"
             else:
@@ -4945,7 +4948,7 @@ def cool_nodes(
         began = time.monotonic()
         try:
             missing = [node["name"] for node, control in zip(targets, controls) if not control["floor"]]
-            if missing:
+            if missing and any(control["floor"] or control["service"] for control in controls):
                 raise RuntimeError(f"cannot select maximum fan floor on {', '.join(missing)}")
             while not all(value is not None and value < below_c for value in temperatures):
                 if time.monotonic() - began > timeout_s:
@@ -6204,8 +6207,11 @@ def bench_suite(args: argparse.Namespace, cluster: dict, nodes: dict, config_nam
         conditions["fan_curve"] = start_fan_curve(nodes, nodes["nodes"], fan_control=fan_control_enabled(cluster))
         missing_curve = fan_curve_problems(conditions["fan_curve"])
         if missing_curve:
-            print("ERROR: the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
-            return SUITE_REFUSED
+            if not args.allow_mismatch and not all(r["service"] == "absent" for r in conditions["fan_curve"]):
+                print("ERROR: the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
+                return SUITE_REFUSED
+            for problem in missing_curve:
+                print(f"WARN: {problem}", flush=True)
         try:
             memory.wait_ready()
         except BenchAbort as error:
@@ -6407,7 +6413,10 @@ def command_bench(args: argparse.Namespace) -> int:
         save()
         missing_curve = fan_curve_problems(report["fan_curve"])
         if missing_curve:
-            raise BenchAbort("the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
+            if not args.allow_mismatch and not all(r["service"] == "absent" for r in report["fan_curve"]):
+                raise BenchAbort("the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
+            for problem in missing_curve:
+                print(f"WARN: {problem}", flush=True)
         bench.memory.wait_ready()
         for suite in BENCH_SUITES:
             if suite not in suites:

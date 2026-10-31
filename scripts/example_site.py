@@ -23,6 +23,7 @@ NODES_FILE = "config/nodes.json"
 EXAMPLES = {
     NODES_FILE: "config/nodes.example.json",
     "config/nodes-ring4.local.json": "config/examples/nodes-ring4.json",
+    "config/nodes-switched.local.json": "config/examples/nodes-switched.json",
 }
 
 

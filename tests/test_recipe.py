@@ -438,6 +438,7 @@ class RecipeTest(unittest.TestCase):
 
         triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
         expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
+                    "tp4-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
                     "tp3-triangle": ("8", "48", triangle, "6096"),
                     "tp3-triangle-4k": ("8", "48", triangle, "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
@@ -528,8 +529,8 @@ class RecipeTest(unittest.TestCase):
         """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
         third of the model, so its headroom differs): changing one must not move another.
         The threshold is the budget less streams x (1 + drafts)."""
-        expected = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("6144", "6096"),
-                    "tp3-triangle-4k": ("4096", "4048")}
+        expected = {"tp4-ring": ("16384", "16288"), "tp4-switched": ("16384", "16288"),
+                    "tp3-triangle": ("6144", "6096"), "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
             values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, name))

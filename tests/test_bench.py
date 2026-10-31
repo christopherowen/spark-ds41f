@@ -623,7 +623,11 @@ class ReferenceShapeTest(unittest.TestCase):
 
     def profile(self, name: str, shape: str | None = None) -> tuple[dict, dict]:
         cluster = spark.read_cluster(name, shape)
-        return cluster, spark.read_json(self.EXAMPLE_NODES[spark.serve_arg(cluster, "--tensor-parallel-size")])
+        nodes_file = spark.NODE_MAP_EXAMPLES.get(
+            cluster.get("nodes_config"),
+            self.EXAMPLE_NODES[spark.serve_arg(cluster, "--tensor-parallel-size")],
+        )
+        return cluster, spark.read_json(nodes_file)
 
     def report(self, cluster: dict, nodes: dict) -> str:
         """A report with no suites, measured on the profile's shape."""

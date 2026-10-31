@@ -126,7 +126,8 @@ def shape_entry(recipe: dict, name: str) -> dict:
         raise SystemExit(f"shape {name}: {', '.join(sorted(unknown))} belong to every shape, not one")
     if "extends" not in entry:
         return copy.deepcopy(entry)
-    merged = shape_entry(recipe, entry["extends"])
+    base = shape_entry(recipe, entry["extends"])
+    merged = copy.deepcopy(base)
     for key, value in entry.items():
         if key == "extends":
             continue
@@ -134,6 +135,14 @@ def shape_entry(recipe: dict, name: str) -> dict:
             merged[key] = _merge(merged[key], value)
         else:
             merged[key] = copy.deepcopy(value)
+    if (merged.get("fabric", {}).get("topology") == "switched"
+            and base.get("fabric", {}).get("topology") != "switched"):
+        explicit_env = entry.get("environment", {})
+        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
+            if key not in explicit_env:
+                merged.get("environment", {}).pop(key, None)
     if "benchmark_reference" not in entry:
         # A variant is qualified by its own release benchmark, never through its base.
         merged.pop("benchmark_reference", None)
