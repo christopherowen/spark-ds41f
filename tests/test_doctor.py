@@ -1161,21 +1161,22 @@ class NewUserOnboardingTest(unittest.TestCase):
             "Kernel corrections (not executed):\n  dgx1: sudo apt-get install ...",
         ]
         summary = spark.summarize_live_warnings(raw)
-        self.assertEqual(
-            summary,
-            [
-                "recommend: install 64kb page kernel (dgx1, dgx2)",
-                "recommend: install memory-saver (dgx1, dgx2)",
-                "recommend: configure swap (dgx1)",
-                "recommend: configure nvme sleep settings (dgx1)",
-                "recommend: disable nvme interrupt coalescing (dgx1)",
-                "recommend: management port off wireless (dgx1)",
-                "recommend: install fan-control (dgx1)",
-                "recommend: set cpu governor to performance (dgx1)",
-                "recommend: disable idle desktop services and boot splash (dgx1)",
-                "recommend: enable nvidia-drm modeset (dgx1)",
-            ],
-        )
+        self.assertEqual(len(summary), 10)
+        expected = [
+            ("install 64kb page kernel (dgx1, dgx2)", "sudo apt-get install linux-image-7.0.0-1019-nvidia-64k"),
+            ("install memory-saver (dgx1, dgx2)", "bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh"),
+            ("configure swap (dgx1)", "sudo bash experiments/2026-10-02-kernel-64k/install-boot-support.sh"),
+            ("configure nvme sleep settings (dgx1)", "apst_primary_timeout_ms=2000"),
+            ("disable nvme interrupt coalescing (dgx1)", "nvidia-nvme-interrupt-coalescing.service"),
+            ("management port off wireless (dgx1)", "sudo nmcli radio wifi off"),
+            ("install fan-control (dgx1)", "dgx-spark-fan-control.git"),
+            ("set cpu governor to performance (dgx1)", "sudo systemctl restart nv-cpu-governor.service"),
+            ("disable idle desktop services and boot splash (dgx1)", "scripts/host-recovery apply"),
+            ("enable nvidia-drm modeset (dgx1)", "sudo apt-get purge -y nvidia-drm-options-modeset0"),
+        ]
+        for line, (label, command) in zip(summary, expected, strict=True):
+            self.assertIn(f"recommend: {label} -> run: ", line)
+            self.assertIn(command, line)
 
 
 if __name__ == "__main__":
