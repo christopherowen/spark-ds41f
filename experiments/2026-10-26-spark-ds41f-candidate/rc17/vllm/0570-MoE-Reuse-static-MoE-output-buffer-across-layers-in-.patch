@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:22:55 +0100
+Subject: [PATCH 570/570] [MoE] Reuse static MoE output buffer across layers in
+ forward context
+
+---
+ .../layers/fused_moe/modular_kernel.py        | 23 +++++-
+ vllm/v1/worker/workspace.py                   | 73 +++++++++++++++++++
+ 2 files changed, 93 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index db67ac48f..ad3f57379 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -10,6 +10,7 @@ from typing import final
+ import torch
+ 
+ import vllm.envs as envs
++from vllm.forward_context import is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.activation import (
+     ApplyMoEActivationConfig,
+@@ -41,7 +42,10 @@ from vllm.v1.worker.ubatching import (
+     dbo_register_recv_hook,
+     dbo_yield,
+ )
+-from vllm.v1.worker.workspace import current_workspace_manager
++from vllm.v1.worker.workspace import (
++    current_workspace_manager,
++    is_workspace_manager_initialized,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1568,8 +1572,21 @@ class FusedMoEKernelModularImpl:
+         # arena: the arena's views are valid only until its next lease, and the next
+         # consumer leases scratch from the same bytes (at TP1, where no all-reduce
+         # copies the output, the next decoder layer's mHC entry overwrote it as it
+-        # read it). The experts still write it directly (``output_alias``).
+-        output = torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
++        # read it). In a model forward pass, lease a dedicated MoE output buffer
++        # separate from ``get_simultaneous`` so sequential MoE layers reuse one
++        # buffer without ping-ponging two allocations.
++        if (
++            not current_platform.is_cpu()
++            and is_workspace_manager_initialized()
++            and is_forward_context_available()
++        ):
++            output = current_workspace_manager().get_moe_output_buffer(
++                tuple(hidden_states.shape), self.fused_experts.output_dtype
++            )
++        else:
++            output = torch.empty_like(
++                hidden_states, dtype=self.fused_experts.output_dtype
++            )
+ 
+         local_num_experts = w1.shape[0]
+         if global_num_experts == -1:
+diff --git a/vllm/v1/worker/workspace.py b/vllm/v1/worker/workspace.py
+index b44225340..30eeeb9d0 100644
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -131,6 +131,9 @@ class WorkspaceManager:
+         self._current_workspaces: list[torch.Tensor | None] = [None] * (
+             self._num_ubatches * self._num_lanes
+         )
++        self._moe_output_buffers: list[torch.Tensor | None] = [None] * (
++            self._num_ubatches * self._num_lanes
++        )
+         self._locked: bool = False
+ 
+     @staticmethod
+@@ -222,6 +225,53 @@ class WorkspaceManager:
+             for i in range(len(shapes_and_dtypes))
+         ]
+ 
++    def get_moe_output_buffer(
++        self, shape: tuple[int, ...], dtype: torch.dtype
++    ) -> torch.Tensor:
++        """Return a reusable MoE output tensor view for the active ``(ubatch, lane)``.
++
++        Unlike :meth:`get_simultaneous`, this buffer is separate from the scratch
++        workspace arena so consumers that run between two MoE layers (such as
++        ``mHC`` and attention) never overwrite the previous MoE layer's output.
++        """
++        ubatch_id = dbo_current_ubatch_id()
++        lane = _workspace_lane.get()
++        if lane >= self._num_lanes:
++            raise RuntimeError(
++                f"Workspace lane {lane} is not configured; manager has "
++                f"{self._num_lanes} lane(s)."
++            )
++        workspace_id = ubatch_id * self._num_lanes + lane
++        actual_bytes = _compute_bytes(shape, dtype)
++        buf = self._moe_output_buffers[workspace_id]
++        current_size = self._workspace_size_bytes(buf)
++        if current_size < actual_bytes:
++            if self._locked or (
++                self._device.type == "cuda" and torch.cuda.is_current_stream_capturing()
++            ):
++                return torch.empty(shape, dtype=dtype, device=self._device)
++            alloc_bytes = actual_bytes
++            from vllm.config import get_current_vllm_config_or_none
++
++            vllm_config = get_current_vllm_config_or_none()
++            sched_cfg = getattr(vllm_config, "scheduler_config", None)
++            max_tokens = getattr(sched_cfg, "max_num_batched_tokens", None)
++            if isinstance(max_tokens, int) and max_tokens > 0 and len(shape) >= 1:
++                alloc_rows = max(shape[0], max_tokens)
++                alloc_bytes = max(
++                    alloc_bytes,
++                    alloc_rows * prod(shape[1:]) * dtype.itemsize,
++                )
++            if self._device.type == "cuda" and buf is not None:
++                torch.accelerator.synchronize(self._device)
++            self._moe_output_buffers[workspace_id] = None
++            del buf
++            torch.accelerator.empty_cache()
++            buf = torch.empty((alloc_bytes,), dtype=torch.uint8, device=self._device)
++            self._moe_output_buffers[workspace_id] = buf
++        assert buf is not None
++        return buf[:actual_bytes].view(dtype).reshape(shape)
++
+     def reserve_all(
+         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+     ) -> None:
+@@ -269,6 +319,29 @@ class WorkspaceManager:
+         self._reserve_slots(
+             lane_bytes * self._num_ubatches, operation="reserve_by_lane"
+         )
++        moe_lane_bytes = [
++            max(
++                map(
++                    self._workspace_size_bytes,
++                    self._moe_output_buffers[lane :: self._num_lanes],
++                ),
++                default=0,
++            )
++            for lane in range(self._num_lanes)
++        ]
++        for workspace_id, required in enumerate(moe_lane_bytes * self._num_ubatches):
++            if (
++                not self._locked
++                and self._workspace_size_bytes(self._moe_output_buffers[workspace_id])
++                < required
++            ):
++                current_buf = self._moe_output_buffers[workspace_id]
++                self._moe_output_buffers[workspace_id] = None
++                del current_buf
++                torch.accelerator.empty_cache()
++                self._moe_output_buffers[workspace_id] = torch.empty(
++                    (required,), dtype=torch.uint8, device=self._device
++                )
+ 
+     def _reserve_slots(self, sizes: list[int], *, operation: str) -> None:
+         undersized = [
