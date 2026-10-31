@@ -1141,7 +1141,7 @@ class NewUserOnboardingTest(unittest.TestCase):
         findings = [spark.Warn(p) for p in spark.kernel_readiness.profile_problems("dgx1", data, profile, policy)]
         errors, warnings = spark.split_findings(findings)
         self.assertEqual(errors, [])
-        self.assertTrue(any("65536-byte pages" in w for w in warnings))
+        self.assertTrue(any("serving profile recommends" in w and "65536-byte pages" in w for w in warnings))
 
 
 if __name__ == "__main__":
