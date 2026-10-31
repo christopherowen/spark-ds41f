@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:32:15 +0100
+Subject: [PATCH 607/612] perf(gemm,linear): pack decode Q-B and indexer Q-B
+ FP8 weights into 128x128 contiguous tiles
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 62 +++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 91 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 31 ++++++-
+ 3 files changed, 177 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 7f87a3aca..125ee77f3 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -25,6 +25,7 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+     DECODE_ROWS,
+     DECODE_TILE_ROWS,
++    TILE_CONTIGUOUS_FP8,
+     bf16_gemm,
+     bf16_gemm_partials,
+     bf16_shards,
+@@ -33,7 +34,9 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+     mxfp8_gemm,
+     mxfp8_gemm_decode,
+     pack_scale_words,
++    pack_weight_tiles,
+     splitk_reduce,
++    unpack_weight_tiles,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm  # noqa: E402
+ 
+@@ -480,3 +483,62 @@ def test_rmsnorm_of_a_fused_projections_half(width, rows=33, eps=1e-6):
+     out = norm(half)
+     assert out.is_contiguous()
+     assert torch.equal(out.view(torch.int16), norm(half.contiguous()).view(torch.int16))
++
++
++@pytest.mark.parametrize("n, k", sorted(TILE_CONTIGUOUS_FP8))
++def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
++    """Tile-contiguous [N // 128, K // 128, 128, 128] weights for Q-B (8192 x 1280)
++    and indexer Q-B (4096 x 1280) match row-major [N, K] bit for bit across all decode
++    tile heights and prefill."""
++    from types import SimpleNamespace
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangFP8LinearMethod
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, _ = _block32_weight(n, k, 19)
++    packed = pack_weight_tiles(weight)
++    assert torch.equal(unpack_weight_tiles(packed, n, k), weight)
++
++    weight_sf = pack_scale_words(exps)
++    x = torch.randn((max(ROWS), k), generator=_gen(23), device=DEVICE).bfloat16()
++    xq, sf, _ = _mxfp8(x)
++    words = sf.contiguous().view(torch.uint32)
++
++    ref_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
++    tiled_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k), tile_contiguous=True)
++    full_ref = torch.empty((max(ROWS), n), dtype=torch.bfloat16, device=DEVICE)
++    full_tiled = torch.empty_like(full_ref)
++    ref_prefill(xq, weight, words, weight_sf, full_ref)
++    tiled_prefill(xq, packed, words, weight_sf, full_tiled)
++    assert torch.equal(full_tiled, full_ref)
++
++    for block_M in DECODE_TILE_ROWS:
++        cfg = fp8_decode_config(n, k, block_M)
++        k_ref = mxfp8_gemm_decode(n, k, **cfg, padded_rows=True)
++        k_tiled = mxfp8_gemm_decode(
++            n, k, **cfg, padded_rows=True, tile_contiguous=True
++        )
++        for rows in (1, 6, block_M):
++            out_ref = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
++            out_tiled = torch.empty_like(out_ref)
++            k_ref(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out_ref)
++            k_tiled(xq[:DECODE_ROWS], packed, words[:DECODE_ROWS], weight_sf, out_tiled)
++            assert torch.equal(out_tiled, out_ref), f"block_M={block_M} rows={rows}"
++            assert torch.equal(out_tiled, full_ref[:rows])
++
++    layer = nn.Module()
++    layer.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    layer.weight_scale_inv = nn.Parameter(exps.clone(), requires_grad=False)
++    method = TileLangFP8LinearMethod(SimpleNamespace(weight_block_size=[32, 32]))
++    method.process_weights_after_loading(layer)
++    method.declare_layer_kernels(layer)
++    assert getattr(layer, "tilelang_weight_packed", False) is True
++    assert layer.weight.shape == (n, k)
++    assert layer.tilelang_weight.shape == (n * (k // 128), 128)
++
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for rows in ROWS:
++            out = method.apply(layer, x[:rows])
++            assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index f577991f4..4925cb2f2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -33,6 +33,45 @@ from .scale_pack import pack_scale_words
+ 
+ SF_BLOCK = 32  # K elements per UE8M0 scale
+ SF_WORD_K = 4 * SF_BLOCK  # K elements per packed scale word
++TILE_WEIGHT_N = 128  # N rows per tile-contiguous FP8 weight block
++TILE_WEIGHT_K = 128  # K columns per tile-contiguous FP8 weight block
++
++
++def pack_weight_tiles(
++    weight: torch.Tensor,
++    tile_n: int = TILE_WEIGHT_N,
++    tile_k: int = TILE_WEIGHT_K,
++) -> torch.Tensor:
++    """Pack row-major ``[N, K]`` FP8 weight into ``[N // tile_n, K // tile_k, tile_n, tile_k]``
++    viewed as ``(N * (K // tile_k), tile_k)``, so each ``block_N x 128`` tile (for
++    ``block_N`` dividing ``tile_n``) is a single contiguous slab in DRAM."""
++    n, k = weight.shape
++    if n % tile_n or k % tile_k:
++        raise ValueError(
++            f"weight shape {(n, k)} must be divisible by tile {(tile_n, tile_k)}"
++        )
++    return (
++        weight.reshape(n // tile_n, tile_n, k // tile_k, tile_k)
++        .permute(0, 2, 1, 3)
++        .contiguous()
++        .view(n * (k // tile_k), tile_k)
++    )
++
++
++def unpack_weight_tiles(
++    packed: torch.Tensor,
++    n: int,
++    k: int,
++    tile_n: int = TILE_WEIGHT_N,
++    tile_k: int = TILE_WEIGHT_K,
++) -> torch.Tensor:
++    """Inverse of ``pack_weight_tiles``: restore row-major ``[N, K]`` FP8 weight."""
++    return (
++        packed.reshape(n // tile_n, k // tile_k, tile_n, tile_k)
++        .permute(0, 2, 1, 3)
++        .contiguous()
++        .view(n, k)
++    )
+ 
+ 
+ def scale_words(k: int) -> int:
+@@ -70,6 +109,7 @@ def _mxfp8_gemm(
+     groups: int = 1,
+     shards: int = 1,
+     pdl_chain: bool = False,
++    tile_contiguous: bool = False,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -127,11 +167,19 @@ def _mxfp8_gemm(
+     sf_words = scale_words(K)
+     block_words = block_scale_words(block_K)
+     total_N = groups * N
++    if tile_contiguous:
++        assert total_N % TILE_WEIGHT_N == 0 and K % TILE_WEIGHT_K == 0
++        assert TILE_WEIGHT_N % block_N == 0 and block_K % TILE_WEIGHT_K == 0
++    k_tiles = K // TILE_WEIGHT_K
++    sub_tiles_k = block_K // TILE_WEIGHT_K
++    b_shape = (
++        (total_N * k_tiles, TILE_WEIGHT_K) if tile_contiguous else (total_N, K)
++    )
+ 
+     @T.prim_func
+     def gemm_mxfp8(
+         A: T.Tensor((Mp, groups * K), in_dtype),
+-        B: T.Tensor((total_N, K), in_dtype),
++        B: T.Tensor(b_shape, in_dtype),
+         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
+         SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
+         C: T.Tensor((M, total_N), out_dtype),
+@@ -160,7 +208,32 @@ def _mxfp8_gemm(
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
+-                T.copy(B[bx * block_N, ko * block_K], B_shared)
++                if not tile_contiguous:
++                    T.copy(B[bx * block_N, ko * block_K], B_shared)
++                elif sub_tiles_k == 1:
++                    row0 = (
++                        ((bx * block_N // TILE_WEIGHT_N) * k_tiles + ko) * TILE_WEIGHT_N
++                        + (bx * block_N % TILE_WEIGHT_N)
++                    )
++                    T.copy(B[row0, 0], B_shared)
++                else:
++                    for sub_k in T.serial(sub_tiles_k):
++                        row0 = (
++                            (
++                                (bx * block_N // TILE_WEIGHT_N) * k_tiles
++                                + ko * sub_tiles_k
++                                + sub_k
++                            )
++                            * TILE_WEIGHT_N
++                            + (bx * block_N % TILE_WEIGHT_N)
++                        )
++                        T.copy(
++                            B[row0 : row0 + block_N, 0:TILE_WEIGHT_K],
++                            B_shared[
++                                0:block_N,
++                                sub_k * TILE_WEIGHT_K : (sub_k + 1) * TILE_WEIGHT_K,
++                            ],
++                        )
+                 # Edge tiles clamp their scale rows; those rows are never stored.
+                 # SFB is the packed block grid, so the clamped row is divided by
+                 # 32. That is the per-row broadcast's word, and it stays on the
+@@ -300,6 +373,7 @@ def _mxfp8_gemm_decode(
+     swizzle_panel: int = 0,
+     groups: int = 1,
+     shards: int = 1,
++    tile_contiguous: bool = False,
+ ):
+     """``_mxfp8_gemm``'s decode tiles: no warp specialization, on the PDL chain."""
+     return _mxfp8_gemm(
+@@ -316,6 +390,7 @@ def _mxfp8_gemm_decode(
+         groups,
+         shards,
+         pdl_chain=True,
++        tile_contiguous=tile_contiguous,
+     )
+ 
+ 
+@@ -1143,15 +1218,23 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+ # to B12X over the three is lowest. Every field only changes speed: each tile
+ # accumulates K in the same order, so a row's bits do not depend on the tile
+ # or on prefill.
++# Decode Q-B (8192 x 1280) and indexer Q-B (4096 x 1280) pack their [N, K] weights
++# into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
++# contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
++TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
++    (8192, 1280),
++    (4096, 1280),
++}
++
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=256, num_stages=2),
++        64: dict(block_N=64, block_K=128, num_stages=3),
+     },
+     (4096, 1280): {
+-        16: dict(block_N=64, block_K=256, num_stages=4),
++        16: dict(block_N=64, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
+         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
+     },
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 8106a463b..7c51fc4d5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -45,6 +45,7 @@ from .gemm import (
+     SPLIT_BF16,
+     SPLIT_DECODE_ROWS,
+     SPLIT_FP8,
++    TILE_CONTIGUOUS_FP8,
+     WIDE_DECODE,
+     bf16_gemm,
+     bf16_gemm_partials,
+@@ -58,6 +59,7 @@ from .gemm import (
+     mxfp8_gemm_decode,
+     mxfp8_gemm_partials,
+     pack_scale_words,
++    pack_weight_tiles,
+     scale_words,
+     split_bucket,
+     split_row_tile,
+@@ -294,7 +296,8 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+         xq, sf = xq[:rows], sf[:rows]
+     else:
+         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+-    gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
++    weight = getattr(layer, "tilelang_weight", layer.weight)
++    gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+ 
+ 
+ @_block32_linear.register_fake
+@@ -403,6 +406,11 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+     wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+     # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
+     heights = sorted({*DECODE_TILE_ROWS, *wide.values()})
++    tile_kw = (
++        {"tile_contiguous": True}
++        if groups == 1 and (n, k) in TILE_CONTIGUOUS_FP8
++        else {}
++    )
+     return {
+         "decode": {
+             block_M: prepare.call(
+@@ -412,11 +420,17 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+                 **fp8_decode_config(part, k, block_M, groups),
+                 padded_rows=True,
+                 groups=groups,
++                **tile_kw,
+             )
+             for block_M in heights
+         },
+         "prefill": prepare.call(
+-            mxfp8_gemm, part, k, **fp8_prefill_config(part, k, groups), groups=groups
++            mxfp8_gemm,
++            part,
++            k,
++            **fp8_prefill_config(part, k, groups),
++            groups=groups,
++            **tile_kw,
+         ),
+     }
+ 
+@@ -532,13 +546,24 @@ def _block32_scale_words(layer) -> None:
+     Grouped weights are stacked in N, so the same index is the broadcast's word.
+     """
+     scales = layer.weight_scale_inv.view(torch.uint8)
+-    rows = layer.weight.shape[0]
++    rows, cols = layer.weight.shape
+     if scales.shape[0] * 32 != rows:
+         raise ValueError(
+             f"block scales have {scales.shape[0]} rows for {rows} outputs; "
+             "the GEMM reads one scale row per 32 output rows"
+         )
+     layer.tilelang_weight_sf = pack_scale_words(scales)
++    if (
++        (rows, cols) in TILE_CONTIGUOUS_FP8
++        and getattr(layer, "tilelang_groups", 1) == 1
++        and not getattr(layer, "tilelang_weight_packed", False)
++    ):
++        packed = pack_weight_tiles(layer.weight)
++        layer.weight.data = packed.view(rows, cols)
++        layer.tilelang_weight = packed
++        layer.tilelang_weight_packed = True
++    elif not getattr(layer, "tilelang_weight_packed", False):
++        layer.tilelang_weight = layer.weight
+ 
+ 
+ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:

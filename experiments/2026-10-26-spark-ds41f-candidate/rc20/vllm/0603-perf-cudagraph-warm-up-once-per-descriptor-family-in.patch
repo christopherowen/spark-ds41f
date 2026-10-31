@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:29:26 +0100
+Subject: [PATCH 603/612] perf(cudagraph): warm up once per descriptor family
+ in CudaGraphManager.capture
+
+---
+ ...gpu_model_runner_v2_cudagraph_profiling.py | 20 +++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 36 +++++++++++++------
+ 2 files changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+index 1a6eb342f..1ac400282 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+@@ -1234,3 +1234,23 @@ def test_legacy_profile_samples_exclude_cached_blocks(monkeypatch):
+     first_graph = 256 * _MIB + _METADATA_BYTES + _GRAPH_EXEC_BYTES
+     per_graph = 100 * _MIB + _GRAPH_EXEC_BYTES
+     assert estimate == first_graph + 2 * per_graph
++
++
++def test_full_capture_warms_once_per_descriptor_family(monkeypatch):
++    device = _FakeDevice()
++    _patch_capture(monkeypatch, device)
++    manager = _CapturingGraphManager([128, 64, 32, 1])
++    calls: list[tuple[int, bool]] = []
++    base_create = device.create_forward_fn(retain_metadata=False)
++
++    def create_forward_fn(desc, warmup):
++        calls.append((desc.num_tokens, warmup))
++        return base_create(desc, warmup)
++
++    manager.capture(create_forward_fn)
++
++    warmup_tokens = [tokens for tokens, warmup in calls if warmup]
++    capture_tokens = [tokens for tokens, warmup in calls if not warmup]
++    assert warmup_tokens == [128]
++    assert capture_tokens == [128, 64, 32, 1]
++    assert len(manager.graphs) == 4
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 5072157e1..41d721c0c 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -707,18 +707,32 @@ class CudaGraphManager:
+                     descs = _profiling_full_descs(descs)
+                 if is_global_first_rank():
+                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
++                warmed_families: set[tuple[Any, ...]] = set()
+                 for desc in descs:
+-                    # Prepare inputs and get forward function
+-                    forward_fn = create_forward_fn(desc, warmup=True)
+-
+-                    # Warmup
+-                    forward_fn(CUDAGraphMode.NONE)
+-                    # A model forward may fork work onto auxiliary streams and
+-                    # join them with events queued on the compute stream.  CUDA
+-                    # graph capture must not begin while those warmup kernels
+-                    # are still executing, even though the queued event waits
+-                    # preserve normal stream ordering.
+-                    torch.accelerator.synchronize()
++                    family_key = (
++                        desc.cg_mode,
++                        desc.uniform_token_count,
++                        desc.max_query_len,
++                        desc.num_active_loras,
++                        desc.num_ubatches,
++                    )
++                    need_warmup = (
++                        desc.cg_mode == CUDAGraphMode.PIECEWISE
++                        and not self.use_breakable_cg
++                    ) or family_key not in warmed_families
++                    if need_warmup:
++                        # Prepare inputs and get forward function
++                        forward_fn = create_forward_fn(desc, warmup=True)
++
++                        # Warmup
++                        forward_fn(CUDAGraphMode.NONE)
++                        # A model forward may fork work onto auxiliary streams and
++                        # join them with events queued on the compute stream.  CUDA
++                        # graph capture must not begin while those warmup kernels
++                        # are still executing, even though the queued event waits
++                        # preserve normal stream ordering.
++                        torch.accelerator.synchronize()
++                        warmed_families.add(family_key)
+ 
+                     # Capture
+                     logger.debug(
