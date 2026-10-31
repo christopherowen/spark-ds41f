@@ -1124,6 +1124,14 @@ class NewUserOnboardingTest(unittest.TestCase):
                       spark.missing_nodes_message("config/nodes-switched.local.json"))
         self.assertIn("docs/setup.md", spark.missing_nodes_message("config/nodes.json"))
         self.assertNotIn("docs/replicate.md", spark.missing_nodes_message("config/nodes.json"))
+        self.assertNotIn("example_site.py", spark.missing_nodes_message("config/nodes.json"))
+
+    def test_live_doctor_rejects_unedited_example_ips(self) -> None:
+        cluster = {"nodes_config": "config/nodes-switched.local.json"}
+        nodes = {"nodes": [{"name": "dgx1", "management_ip": "192.0.2.1"}]}
+        findings = spark.live_doctor(cluster, nodes)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("example placeholder addresses (192.0.2.x)", findings[0])
 
     def test_docker_permission_denied_points_to_docker_group(self) -> None:
         stderr = (

@@ -79,12 +79,19 @@ NODE_MAP_EXAMPLES = {
 
 def missing_nodes_message(relative: str) -> str:
     example = NODE_MAP_EXAMPLES.get(relative)
-    hint = (
-        f"run `cp {example} {relative}` and edit it for your site, or run scripts/example_site.py "
-        if example
-        else "create the node map for your site "
-    )
-    return f"{relative} is missing: {hint}(docs/setup.md, Site configuration)"
+    if example:
+        lines = [
+            f"{relative} is missing: run `cp {example} {relative}` and edit it for your site (docs/setup.md, Site configuration).",
+        ]
+        if not any((ROOT / path).is_file() for path in NODE_MAP_EXAMPLES):
+            lines.extend([
+                "Available site templates:",
+                "  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json",
+                "  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json",
+                "  3-node triangle: cp config/nodes.example.json config/nodes.json",
+            ])
+        return "\n".join(lines)
+    return f"{relative} is missing: create the node map for your site (docs/setup.md, Site configuration)"
 
 
 def site_nodes() -> dict:
@@ -107,10 +114,20 @@ def configuration(
     except json.JSONDecodeError as error:
         raise SystemExit(f"invalid JSON in {canonical}: {error}") from error
     shape_nodes = None
+    is_recipe_config = cluster_recipe.is_recipe(cluster)
+    explicit_shape = getattr(args, "shape", None) or cluster_recipe.site_shape(ROOT)
+    nodes_override = getattr(args, "nodes_config", None)
+    auto_switched = False
     if cluster_recipe.is_overlay(cluster):
         cluster = read_cluster(canonical)
-    elif cluster_recipe.is_recipe(cluster):
+    elif is_recipe_config:
         shape = cluster_recipe.chosen_shape(cluster, ROOT, getattr(args, "shape", None))
+        if not explicit_shape and not nodes_override and not (ROOT / "config/nodes-ring4.local.json").is_file():
+            if (ROOT / "config/nodes-switched.local.json").is_file():
+                nodes_override = "config/nodes-switched.local.json"
+                auto_switched = True
+            elif (ROOT / NODES_FILE).is_file() and "tp3-triangle" in cluster.get("shapes", {}):
+                shape = "tp3-triangle"
         if shape is None:
             raise SystemExit(
                 f"{canonical} serves {', '.join(sorted(cluster['shapes']))}; name this site's cabling with "
@@ -118,7 +135,6 @@ def configuration(
             )
         shape_nodes = int(cluster_recipe.shape_entry(cluster, shape)["nodes"])
         cluster = cluster_recipe.resolve(cluster, shape)
-    nodes_override = getattr(args, "nodes_config", None)
     nodes_relative = nodes_override or cluster.get("nodes_config", NODES_FILE)
     nodes_path = repository_config_path(nodes_relative)
     upstreams_relative = cluster.get("upstreams_config", "upstreams.lock.json")
@@ -139,9 +155,18 @@ def configuration(
             f"shape {cluster['shape']} needs {shape_nodes} nodes and its node map "
             f"{cluster.get('nodes_config', NODES_FILE)} has {len(nodes['nodes'])}"
         )
+    if auto_switched:
+        try:
+            cluster = topology.candidate(cluster, nodes, "config/nodes-switched.local.json")
+        except (ValueError, StopIteration) as error:
+            raise SystemExit(f"invalid topology: {error}") from error
     ssh_user = nodes.get("ssh_user")
     if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         cluster["host"]["home"] = f"/home/{ssh_user}"
+    if is_recipe_config and cluster.get("distributed", {}).get("master_addr") == "10.0.1.71":
+        heads = [n for n in nodes.get("nodes", []) if n.get("head") and n.get("management_ip")]
+        if len(heads) == 1:
+            cluster["distributed"]["master_addr"] = heads[0]["management_ip"]
     return cluster, nodes, json.loads(upstreams_path.read_text(encoding="utf-8"))
 
 
@@ -1333,6 +1358,12 @@ def docker_error_detail(node_name: str, stderr: str) -> str:
 
 def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     """Findings about the live cluster: errors, and Warn for the minor ones."""
+    if any(str(node.get("management_ip", "")).startswith("192.0.2.") for node in nodes.get("nodes", [])):
+        nodes_file = cluster.get("nodes_config", NODES_FILE)
+        return [
+            f"{nodes_file} still contains example placeholder addresses (192.0.2.x); "
+            "edit it with your nodes' names, ssh_user, and management IPs"
+        ]
     problems: list[str] = []
     trial_path = kernel_policy_path(cluster)
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
@@ -1676,6 +1707,12 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 
 def command_doctor(args: argparse.Namespace) -> int:
     _, canonical = cluster_config_path(args)
+    if (
+        getattr(args, "cluster_config", None) is None
+        and not (ROOT / "config/nodes-ring4.local.json").is_file()
+        and (ROOT / "config/switched.local.json").is_file()
+    ):
+        canonical = "config/switched.local.json"
     cluster, nodes, upstreams = configuration(args)
     if getattr(args, "fragmentation_commands", False):
         for finding in weight_fragmentation_findings(cluster, nodes, commands=True):
