@@ -1,0 +1,165 @@
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 41901baf6..428ac6fa5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -103,15 +103,65 @@ def test_ranges_close_on_every_path():
+ 
+ 
+ def test_range_ends_wait_for_barriers():
+-    # A deferred-blocking barrier holds a warp only at its next memory access: each
+-    # range end loads shared memory before it reads the timer.
++    # A deferred-blocking barrier holds a warp only at its next memory access:
++    # only ranges containing a block barrier (a block sync or tl::AllReduce) load
++    # shared memory before reading the timer.
+     out, sites = _ranges(KERNEL)
+     lines = [line.strip() for line in out.splitlines()]
+     ends = [i for i, line in enumerate(lines) if line == "TL_IKET_EVENT(31);"]
+     assert len(ends) == len(sites)
+-    assert all(lines[i - 1] == "TL_IKET_SETTLE();" for i in ends)
++    settled_ranges = [name for name, site in sites.items() if site["settled"]]
++    assert settled_ranges == ["wait.sync", "wait.sync#2", "wait.sync#3"]
++    assert [lines[i - 1] == "TL_IKET_SETTLE();" for i in ends] == [
++        site["settled"] for site in sites.values()
++    ]
+     assert out.startswith("#define TL_IKET_SETTLE() asm volatile(")
+ 
++    # tl::AllReduce contains a block barrier in its C++ template, so its compute
++    # range is also settled, whereas warp-only shuffles and barrier-free kernels
++    # emit no settle macro at all.
++    allreduce_code = (
++        'extern "C" __global__ void ar_kernel(float* C) {\n'
++        "  float v = tl::AllReduce<tl::SumOp, 128, 1>::run(C[threadIdx.x], red_buf);\n"
++        "  C[threadIdx.x] = v;\n"
++        "}\n"
++    )
++    ar_out, ar_sites = _ranges(allreduce_code)
++    assert ar_sites["compute.reduce"]["settled"] is True
++    assert ar_sites["store.global"]["settled"] is False
++    assert ar_out.count("TL_IKET_SETTLE();") == 1
++
++    no_barrier_code = (
++        'extern "C" __global__ void copy_kernel(const float* A, float* C) {\n'
++        "  float x = A[threadIdx.x];\n"
++        "  C[threadIdx.x] = x;\n"
++        "}\n"
++    )
++    nb_out, nb_sites = _ranges(no_barrier_code)
++    assert not any(site["settled"] for site in nb_sites.values())
++    assert "TL_IKET_SETTLE" not in nb_out
++
++    # When a sampled loop ends with a block barrier, the first range after the loop
++    # also settles before opening so the loop's final unsampled iteration's barrier
++    # does not leak into the post-loop range's start timestamp.
++    loop_tail_sync_code = (
++        'extern "C" __global__ void tail_sync_kernel(const float* A, float* C) {\n'
++        "  for (int n = 0; n < 4; ++n) {\n"
++        "    tl::mma_sync(acc, a, b);\n"
++        "    __syncthreads();\n"
++        "  }\n"
++        "  C[threadIdx.x] = acc[0];\n"
++        "}\n"
++    )
++    lt_out, _ = iket.annotate(loop_tail_sync_code, _token, ctas=1, iters=1)
++    lt_lines = [line.strip() for line in lt_out.splitlines()]
++    store_start = next(
++        i
++        for i, line in enumerate(lt_lines)
++        if "__tl_iket_v1_store.global" in line
++    )
++    assert lt_lines[store_start - 1] == "if (__tl_iket_cta) TL_IKET_SETTLE();"
++
+ 
+ def test_pragma_stays_with_its_loop():
+     out, _ = _ranges(KERNEL)
+@@ -156,11 +206,11 @@ def test_sampled_iterations_guard_loop_ranges():
+     # The loop's trips scale its sampled iterations; a site outside it has none.
+     assert {s["loop_trips"] for s in sites if s["loops"]} == {4}
+     assert not any("loop_trips" in s for s in sites if not s["loops"])
+-    # Each in-loop range: its start and end events, and its settle.
++    # Each in-loop range: its start and end events, and its settle on barrier ranges.
+     events = [line for line in lines if line.startswith(f"TL_IKET_WHEN({stride}) ")]
+     assert len(events) == 2 * len(in_loop)
+     settles = [line for line in lines if line == f"if ({stride}) TL_IKET_SETTLE();"]
+-    assert len(settles) == len(in_loop)
++    assert len(settles) == sum(s["settled"] for s in sites if s["loops"]) == 1
+     # Ranges outside the loop, and the unrolled loop wrapped whole, have no condition;
+     # none depends on the lane.
+     assert 'TL_IKET_EVENT(1, "__tl_iket_v1_load.cp_async");' in lines
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 41689ab11..3d37eb44b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -119,6 +119,10 @@ _COMPILED = [
+     (phase, kind, re.compile("|".join(alts))) for phase, kind, alts in _PATTERNS
+ ]
+ _JUMP = re.compile(r"(?:return|break|continue|goto)\b")
++_BLOCK_BARRIER = re.compile(
++    r"\b__syncthreads\s*\(|\btl::__sync_thread_partial\s*\("
++    r"|\bbar\.sync\b|\bbarrier\.sync\b|\.sync\s*\(\s*\)|\btl::AllReduce\b"
++)
+ _KEYWORDS = ("for", "while", "if", "switch", "do")
+ _IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+ _ATTRIBUTE = re.compile(r"__\w+__\s*")
+@@ -500,6 +504,7 @@ def annotate(
+             )
+         if sample:
+             inserts.append((code.index("\n", bodies[kernel]) + 1, 0, sample))
++    prev_settled_loops: dict[str, tuple[str, ...]] = {}
+     for item in found:
+         # Each condition holds through a range: the CTA's and its loops' iterations (a
+         # loop variable does not change inside one iteration). Both are uniform in a
+@@ -515,6 +520,16 @@ def annotate(
+         condition = " && ".join(conditions)
+         guard = f"if ({condition}) " if conditions else ""
+         when = f"TL_IKET_WHEN({condition}) " if conditions else ""
++        settled = "sync" in item.kinds or bool(
++            _BLOCK_BARRIER.search(code, item.first.start, item.last.end)
++        )
++        prev_loops = prev_settled_loops.get(item.kernel, ())
++        settle_before = bool(
++            iters
++            and len(prev_loops) > len(item.loops)
++            and prev_loops[: len(item.loops)] == item.loops
++        )
++        prev_settled_loops[item.kernel] = item.loops if settled else ()
+         sites.append(
+             {
+                 "kernel": item.kernel,
+@@ -528,6 +543,7 @@ def annotate(
+                 # A trace holds the sampled iterations; these scale them to the loops.
+                 **({"loop_trips": _loop_trips(item.loops)} if item.loops else {}),
+                 **({"unsampled_loops": unsampled} if unsampled else {}),
++                "settled": settled,
+                 "traced": item.name in traced,
+             }
+         )
+@@ -535,19 +551,23 @@ def annotate(
+             continue
+         indent = re.match(r"[ \t]*", code[item.first.start :]).group(0)
+         range_id = zlib.crc32(item.name.encode()) & 0xFFFFFFFF or 1
++        # If the preceding range ended a sampled loop with a block barrier, its final
++        # unsampled iteration leaves BAR.SYNC.DEFER_BLOCKING pending into this range's
++        # start timer read unless settled before opening this range.
++        pre_settle = f"{indent}{guard}TL_IKET_SETTLE();\n" if settle_before else ""
+         inserts.append(
+             (
+                 item.first.start,
+                 1,
+-                f'{indent}{when}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
++                f'{pre_settle}{indent}{when}TL_IKET_EVENT(1, "{token(item.name, range_id)}");\n',
+             )
+         )
+         # Settled: a barrier inside the range (a block sync, TileLang's AllReduce)
+-        # holds the range's end, not the next statement's.
+-        end = (
+-            f"{indent}{guard}TL_IKET_SETTLE();\n"
+-            f"{indent}{when}TL_IKET_EVENT({RANGE_END});\n"
+-        )
++        # holds the range's end, not the next statement's. Ranges without a block
++        # barrier omit the shared-memory settle load so back-to-back non-barrier
++        # ranges do not pay a volatile shared load each.
++        settle = f"{indent}{guard}TL_IKET_SETTLE();\n" if settled else ""
++        end = f"{settle}{indent}{when}TL_IKET_EVENT({RANGE_END});\n"
+         inserts.append((item.last.end, 0, end))
+     # The events a warp can record, with the loops sampled: each range opens and closes
+     # in at most ``iters`` iterations of each loop around it, once for each group of
