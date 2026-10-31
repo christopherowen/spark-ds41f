@@ -1134,6 +1134,15 @@ class NewUserOnboardingTest(unittest.TestCase):
         detail = spark.docker_error_detail("dgx1", stderr)
         self.assertIn("sudo usermod -aG docker", detail)
 
+    def test_kernel_profile_mismatch_warns_instead_of_failing(self) -> None:
+        policy = spark.read_json("config/kernel-trial.json")
+        profile = {"release": policy["candidate"], "page_size": 65536, "memory_saver_required": True}
+        data = {"kernel": "7.0.0-1024-nvidia", "page_size": 4096, "driver": "580.142"}
+        findings = [spark.Warn(p) for p in spark.kernel_readiness.profile_problems("dgx1", data, profile, policy)]
+        errors, warnings = spark.split_findings(findings)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("65536-byte pages" in w for w in warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

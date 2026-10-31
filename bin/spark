@@ -1329,12 +1329,16 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
             inventory = node_kernel_inventory(nodes, node, trial)
             kernel_inventories[node["name"]] = inventory
             warnings, fixes = kernel_readiness.findings(
-                node["name"], inventory, trial, kernel_profile
+                node["name"], inventory, trial
             )
-            problems.extend(Warn(warning) for warning in warnings)
+            profile_warnings = kernel_readiness.profile_problems(
+                node["name"], inventory, kernel_profile, trial
+            )
+            problems.extend(
+                Warn(warning)
+                for warning in dict.fromkeys([*warnings, *profile_warnings])
+            )
             corrections.extend(fixes)
-            problems.extend(kernel_readiness.profile_problems(
-                node["name"], inventory, kernel_profile, trial))
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
         problems.extend(desktop_problems(node["name"], desktop.stdout))
         boot = run_ssh(nodes, node, "efibootmgr")
@@ -1769,8 +1773,12 @@ def node_runtime_problems(
     if cluster["host"].get("kernel"):
         policy = json.loads(kernel_policy_path(cluster).read_text())
         inventory = node_kernel_inventory(nodes, node, policy)
-        problems.extend(kernel_readiness.profile_problems(
-            node["name"], inventory, cluster["host"]["kernel"], policy))
+        problems.extend(
+            Warn(problem)
+            for problem in kernel_readiness.profile_problems(
+                node["name"], inventory, cluster["host"]["kernel"], policy
+            )
+        )
     gid_index, hcas = roce_gid_setting(cluster, node)
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
     problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
@@ -2382,13 +2390,17 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         return 1
 
     revision = require_local_deployment_state(cluster, nodes, upstreams)
-    problems = remote_runtime_problems(
-        cluster,
-        nodes,
-        revision,
-        allow_existing=args.replace,
-        cluster_config=config_relative,
+    problems, warnings = split_findings(
+        remote_runtime_problems(
+            cluster,
+            nodes,
+            revision,
+            allow_existing=args.replace,
+            cluster_config=config_relative,
+        )
     )
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
     if problems:
         for problem in problems:
             print(f"ERROR: {problem}", file=sys.stderr)
