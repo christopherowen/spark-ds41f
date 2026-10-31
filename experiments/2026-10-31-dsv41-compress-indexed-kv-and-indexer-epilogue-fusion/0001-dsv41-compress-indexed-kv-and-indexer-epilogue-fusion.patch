@@ -1,0 +1,1866 @@
+From 68dd60d722968f14fd3b8a8f79f1d3b7081d2b5c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:05:07 +0100
+Subject: [PATCH] Fuse compressor indexed KV write, indexer wk split-K & wq_b
+ RoPE+MXFP4 epilogues
+
+---
+ .../attention/test_deepseek_v41_tilelang.py   | 108 ++++++
+ tests/kernels/deepseek_v41_pdl_sources.py     |  23 +-
+ .../test_deepseek_v41_tilelang_compress.py    | 123 +++++++
+ tests/models/test_deepseek_v4_1_attention.py  | 124 +++++++
+ vllm/models/deepseek_v4_1/attention.py        | 137 ++++++--
+ vllm/models/deepseek_v4_1/compressor.py       |  78 ++++-
+ .../deepseek_v4_1/tilelang/attention.py       |  27 +-
+ .../models/deepseek_v4_1/tilelang/compress.py | 324 +++++++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 200 +++++++++++
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 122 +++++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  81 ++++-
+ .../models/deepseek_v4_1/tilelang/metadata.py |  32 +-
+ 12 files changed, 1242 insertions(+), 137 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 17ed2f1f4..77657c661 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -304,6 +304,114 @@ def test_norm_rope_write_index_keys(ratio, slot_dtype, page_size=64, pages=5):
+     assert bool((pool._base[:, [0, 2]] == 0xAB).all())
+ 
+ 
++@pytest.mark.parametrize("ratio", [1, 2])
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++def test_norm_rope_write_index_keys_fuses_splitk_shards(
++    ratio, slot_dtype, page_size=64, pages=3
++):
++    """Passing ``[4, rows, 128]`` FP32 split-K partials to
++    ``norm_rope_write_index_keys`` reduces the 4 shards in registers in shard order
++    and writes the exact same paged MXFP4 records as ``splitk_reduce`` followed by
++    2D ``norm_rope_write_index_keys``."""
++    n = 37
++    gen = _gen(19 + ratio)
++    partials = torch.randn(
++        (4, n, INDEX_DIM), generator=gen, device=DEVICE, dtype=torch.float32
++    )
++    reduced = (partials[0] + partials[1] + partials[2] + partials[3]).to(
++        torch.bfloat16
++    )
++    weight = torch.randn((INDEX_DIM,), generator=gen, device=DEVICE).bfloat16()
++    eps = 1e-6
++    positions = torch.randint(
++        0, 512, (n,), generator=gen, device=DEVICE, dtype=torch.int64
++    )
++    table = rope_table(512)
++    slots = torch.randperm(pages * page_size, generator=gen, device=DEVICE)[:n].to(
++        slot_dtype
++    )
++    slots[:2] = -1
++    pool_fused = _page_buffer(pages, page_bytes(page_size))
++    pool_sep = pool_fused.clone()
++
++    norm_rope_write_index_keys(
++        partials, weight, eps, positions, table, pool_fused, slots, page_size, ratio
++    )
++    norm_rope_write_index_keys(
++        reduced, weight, eps, positions, table, pool_sep, slots, page_size, ratio
++    )
++    assert torch.equal(pool_fused, pool_sep)
++
++
++@pytest.mark.parametrize("rows", [1, 6, 17, 64])
++def test_mxfp8_gemm_rope_mxfp4_decode_matches_separate_gemm_and_quantize(rows):
++    """Fused ``mxfp8_gemm_rope_mxfp4_decode`` produces bit-identical MXFP4 ``q`` and
++    ``scales`` to running ``mxfp8_gemm_decode`` followed by ``quantize_mxfp4`` with
++    RoPE."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import (
++        decode_tile_rows,
++        fp8_decode_config,
++        mxfp8_gemm_decode,
++        mxfp8_gemm_rope_mxfp4_decode,
++        pack_scale_words,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
++
++    gen = _gen(200 + rows)
++    n, k = INDEX_HEADS * INDEX_DIM, 1280
++    x = torch.randn((rows, k), generator=gen, device=DEVICE, dtype=torch.bfloat16)
++    cast_rows = cast_mxfp8(x)
++    weight = torch.randn((n, k), generator=gen, device=DEVICE).to(torch.float8_e4m3fn)
++    weight_sf = torch.randint(
++        120, 132, (n // 32, k // 32), generator=gen, device=DEVICE, dtype=torch.uint8
++    )
++    packed_sfb = pack_scale_words(weight_sf)
++    positions = torch.randint(
++        0, 512, (rows,), generator=gen, device=DEVICE, dtype=torch.int64
++    )
++    table = rope_table(512)
++
++    block_M = decode_tile_rows(rows)
++    cfg = fp8_decode_config(n, k, block_M)
++    gemm_sep = mxfp8_gemm_decode(n, k, **cfg, padded_rows=True)
++    gemm_fused = mxfp8_gemm_rope_mxfp4_decode(
++        n, k, **cfg, padded_rows=True, head_dim=INDEX_DIM, rope_dim=64
++    )
++
++    iq = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
++    gemm_sep(
++        cast_rows.values,
++        weight,
++        cast_rows.scales.view(torch.uint32),
++        packed_sfb,
++        iq,
++    )
++    ref_q = torch.empty((rows, INDEX_HEADS, 64), dtype=torch.uint8, device=DEVICE)
++    ref_s = torch.empty((rows, INDEX_HEADS, 4), dtype=torch.uint8, device=DEVICE)
++    quantize_mxfp4(
++        iq.view(rows, INDEX_HEADS, INDEX_DIM),
++        ref_q,
++        ref_s,
++        positions=positions,
++        cos_sin=table,
++    )
++
++    q_out = torch.empty_like(ref_q)
++    s_out = torch.empty_like(ref_s)
++    gemm_fused(
++        cast_rows.values,
++        weight,
++        cast_rows.scales.view(torch.uint32),
++        packed_sfb,
++        positions,
++        table,
++        q_out.view(rows, n // 2),
++        s_out.view(rows, n // 32),
++    )
++    assert torch.equal(s_out, ref_s)
++    assert torch.equal(q_out, ref_q)
++
++
+ def _ref_scores(inp, page_size, extent, positions_of):
+     """Staged BF16 score: BF16 dot, ReLU, BF16 weighted product, ordered head sum."""
+     rows = inp["q_values"].shape[0]
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab846..3d0f88c40 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -33,6 +33,7 @@ CHAIN = {
+     "gemm_fp8w_bf16_cast",
+     "gemm_fp8w_bf16_partials",
+     "gemm_mxfp8_partials",
++    "gemm_mxfp8_rope_mxfp4",
+     "gemm_splitk_reduce",
+     "gemm_splitk_reduce_cast",
+     "gemm_splitk_reduce_two",
+@@ -64,6 +65,22 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Static weights and host-prepared step metadata that have no producer dependency on
++# the immediately preceding kernel in the PDL chain and are preloaded in the overlap
++# window before ``cudaGridDependencySynchronize()``.
++EARLY_PARAMETERS = {
++    "compress": {
++        "counts",
++        "positions",
++        "slots",
++        "starts",
++        "state_slots",
++        "token_positions",
++        "weight",
++    },
++    "compress_gather_partial_state": {"counts", "positions", "starts", "table"},
++    "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +133,12 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed_early = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed_early
++            and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index cf0d36f09..832deef41 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -356,3 +356,126 @@ def test_a_short_ring_loses_a_wide_blocks_carry():
+         (value, _, _), (want_v, _, _) = _verify_block_then_resume(16, 8, accepted)
+         lost += not torch.equal(value, want_v)
+     assert lost > 0
++
++
++@pytest.mark.parametrize("ratio", [1, 2])
++@pytest.mark.parametrize("lengths", [[1], [6] * 8, [3, 0, 5, 1, 2, 6]])
++def test_compress_fuses_indexed_kv_cache_write(ratio, lengths):
++    """Fused ``compress(..., kv_cache=..., token_positions=..., cos_sin=...,
++    kv_page_size=...)`` writes the exact same pre-RoPE ``out`` (consumed by
++    ``indexer.wk``) AND the exact same 288-byte rotated ``indexed`` KV-cache records
++    as running ``compress`` followed by ``write_cache("indexed")``."""
++    from tests.kernels.deepseek_v41_contracts import rope_table
++    from vllm.models.deepseek_v4_1.tilelang.cache_writer import write_cache
++
++    step, rows, starts = _step(lengths, ratio, seed=500 + len(lengths) * 10 + ratio)
++    kv_pages, kv_page_size = 32, 16
++    gen = torch.Generator(device="cpu").manual_seed(700 + ratio)
++    unique_slots = torch.randperm(kv_pages * kv_page_size, generator=gen)[:rows].to(
++        dtype=torch.int64, device=DEVICE
++    )
++    step["slots"][:rows] = unique_slots
++    carry = _ring(step)
++    carry_fused = tuple(t.clone() for t in carry)
++    pool_sep = step["pool"].clone()
++    pool_fused = step["pool"].clone()
++
++    token_positions = torch.zeros(CAPACITY, dtype=torch.int64, device=DEVICE)
++    for r in range(len(starts) - 1):
++        for token in range(starts[r], starts[r + 1]):
++            token_positions[token] = int(step["positions"][r]) + token - starts[r]
++    cos_sin = rope_table(512)
++
++    kv_sep = torch.full(
++        (kv_pages, kv_page_size * 288 + 64), 0xAB, dtype=torch.uint8, device=DEVICE
++    )[:, : kv_page_size * 288]
++    kv_fused = kv_sep.clone()
++
++    out_sep = torch.full((CAPACITY, DIM), 5.0, dtype=torch.bfloat16, device=DEVICE)
++    emitted_sep = torch.ones(CAPACITY, dtype=torch.bool, device=DEVICE)
++    eslots_sep = torch.full((CAPACITY,), 77, dtype=torch.int64, device=DEVICE)
++    state_ids = carry[3] if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
++    kwargs_sep = (
++        dict(
++            pending_values=carry[0],
++            pending_gates=carry[1],
++            tags=carry[2],
++            pool=pool_sep,
++            state_slots=step["state_slots"],
++            page=PAGE,
++        )
++        if ratio == 2
++        else {}
++    )
++    compress(
++        rows,
++        ratio,
++        step["values"],
++        step["gates"] if ratio == 2 else None,
++        step["weight"],
++        step["starts"],
++        step["positions"],
++        state_ids,
++        step["slots"],
++        step["counts"],
++        out_sep,
++        emitted_sep,
++        eslots_sep,
++        **kwargs_sep,
++    )
++    write_cache(
++        out_sep[:rows].clone(),
++        kv_sep,
++        eslots_sep[:rows],
++        page_size=kv_page_size,
++        cache_kind="indexed",
++        positions=token_positions[:rows],
++        cos_sin=cos_sin,
++        ratio=ratio,
++    )
++
++    out_fused = torch.full((CAPACITY, DIM), 5.0, dtype=torch.bfloat16, device=DEVICE)
++    emitted_fused = torch.ones(CAPACITY, dtype=torch.bool, device=DEVICE)
++    eslots_fused = torch.full((CAPACITY,), 77, dtype=torch.int64, device=DEVICE)
++    state_ids_fused = (
++        carry_fused[3] if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
++    )
++    kwargs_fused = (
++        dict(
++            pending_values=carry_fused[0],
++            pending_gates=carry_fused[1],
++            tags=carry_fused[2],
++            pool=pool_fused,
++            state_slots=step["state_slots"],
++            page=PAGE,
++        )
++        if ratio == 2
++        else {}
++    )
++    compress(
++        rows,
++        ratio,
++        step["values"],
++        step["gates"] if ratio == 2 else None,
++        step["weight"],
++        step["starts"],
++        step["positions"],
++        state_ids_fused,
++        step["slots"],
++        step["counts"],
++        out_fused,
++        emitted_fused,
++        eslots_fused,
++        kv_cache=kv_fused,
++        token_positions=token_positions[:rows],
++        cos_sin=cos_sin,
++        kv_page_size=kv_page_size,
++        **kwargs_fused,
++    )
++
++    assert torch.equal(out_fused.view(torch.int16), out_sep.view(torch.int16))
++    assert torch.equal(emitted_fused, emitted_sep)
++    assert torch.equal(eslots_fused, eslots_sep)
++    assert torch.equal(kv_fused, kv_sep)
++    if ratio == 2:
++        assert torch.equal(pool_fused, pool_sep)
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 0dbdd99b6..8fd51c3cf 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -375,3 +375,127 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+     positions = torch.arange(4)
+     out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+     assert out.shape == (4, 32)
++
++
++def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypatch):
++    """When ``self.compressor`` is a ``DeepseekCompressor`` with a full-width
++    ``kv_cache`` and ``indexer.wk`` exposes ``tilelang_partials``,
++    ``_prepare_global_kv`` fuses the ``indexed`` KV write into ``compressor(...)``
++    and passes 3D split-K partials from ``project_bf16_partials`` to
++    ``_write_index_keys`` without launching ``_write_v41_cache``."""
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
++    from vllm.models.deepseek_v4_1.tilelang import linear as tl_linear
++
++    module = _tilelang_layer(layer_id=0)
++    module._ready = True
++    module._owner = lambda: module
++    module._main_page = 64
++    module.kv_cache = torch.empty(2, 64 * 288, dtype=torch.uint8)
++    latent = torch.zeros(4, 512, dtype=torch.bfloat16)
++    slots = torch.arange(4, dtype=torch.int64)
++    comp_calls = []
++
++    comp = DeepseekCompressor.__new__(DeepseekCompressor)
++    torch.nn.Module.__init__(comp)
++    comp.state_cache = None
++    monkeypatch.setattr(
++        DeepseekCompressor,
++        "forward",
++        lambda self, hidden, main, state=None, **kw: (
++            comp_calls.append(kw),
++            (latent, slots),
++        )[1],
++    )
++    module.compressor = comp
++
++    partials = torch.zeros(4, 4, 128, dtype=torch.float32)
++    monkeypatch.setattr(
++        tl_linear,
++        "project_bf16_partials",
++        lambda layer, x: partials,
++    )
++    wk = SimpleNamespace(tilelang_partials={16: object()})
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wk=wk,
++        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
++        k_cache=SimpleNamespace(
++            prefix="k_cache", kv_cache=torch.empty(2, 8, dtype=torch.uint8)
++        ),
++    )
++    idx_slots = torch.arange(10, 14, dtype=torch.int64)
++    metadata = {
++        module.prefix: SimpleNamespace(),
++        "k_cache": SimpleNamespace(slot_mapping=idx_slots),
++    }
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    key_writes = []
++    monkeypatch.setattr(
++        tl_attention,
++        "norm_rope_write_index_keys",
++        lambda *args: key_writes.append(args),
++    )
++    monkeypatch.setattr(
++        attention.DeepseekV4Attention,
++        "_write_v41_cache",
++        lambda *args, **kwargs: (_ for _ in ()).throw(
++            AssertionError("unexpected separate _write_v41_cache")
++        ),
++    )
++    positions = torch.arange(4, dtype=torch.int64)
++    module._prepare_global_kv(positions, torch.zeros(4, 5120, dtype=torch.bfloat16))
++    assert len(comp_calls) == 1
++    assert comp_calls[0]["kv_cache"] is module.kv_cache
++    assert comp_calls[0]["token_positions"] is positions
++    assert comp_calls[0]["kv_page_size"] == 64
++    assert len(key_writes) == 1
++    assert key_writes[0][0] is partials
++
++
++def test_index_query_fuses_decode_wq_b_rope_mxfp4(monkeypatch):
++    """At decode sizes when ``indexer.wq_b`` has ``tilelang_decode_mxfp4``,
++    ``_index_query`` calls ``project_block32_rope_mxfp4`` directly without allocating
++    an intermediate BF16 ``iq`` tensor or calling ``_quantize_index_query``."""
++    from vllm.models.deepseek_v4_1.tilelang import linear as tl_linear
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    module = _tilelang_layer(layer_id=3)
++    fused_calls = []
++    monkeypatch.setattr(
++        tl_linear,
++        "project_block32_rope_mxfp4",
++        lambda layer, cast_rows, pos, cos_sin, q_out, s_out: fused_calls.append(
++            (cast_rows.rows.shape, pos.tolist(), q_out.shape, s_out.shape)
++        ),
++    )
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wq_b=SimpleNamespace(
++            tilelang_decode_mxfp4={16: object()},
++            tilelang_decode_rows=64,
++        ),
++        weights_proj=lambda h: torch.ones((h.shape[0], 32), dtype=torch.bfloat16),
++    )
++    qr = torch.zeros((6, 1280), dtype=torch.bfloat16)
++    q_cast = MXFP8Rows(
++        qr,
++        torch.zeros((16, 1280), dtype=torch.float8_e4m3fn),
++        torch.zeros((16, 40), dtype=torch.uint8),
++    )
++    positions = torch.arange(200, 206, dtype=torch.int64)
++    hidden = torch.zeros((6, 5120), dtype=torch.bfloat16)
++    swa = SimpleNamespace(is_decode=True)
++    iq_data, iq_scale, weights = module._index_query(
++        qr, positions, hidden, None, 0, 6, swa, q_cast
++    )
++    assert fused_calls == [
++        ((6, 1280), [200, 201, 202, 203, 204, 205], (6, 32, 64), (6, 32, 4))
++    ]
++    assert iq_data.shape == (6, 32, 64) and iq_scale.shape == (6, 32, 4)
++    assert weights.shape == (6, 32)
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 16ac898ab..6d0f44b90 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -170,8 +170,10 @@ class DeepseekV4Indexer(nn.Module):
+             prefix=f"{prefix}.wq_b",
+         )
+         _native_linear(self.wq_b)
+-        # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
++        # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B,
++        # and fuses GPT-J RoPE + MXFP4 query quantization into its decode epilogue.
+         self.wq_b.tilelang_mxfp8_input = True
++        self.wq_b.tilelang_rope_mxfp4 = (128, hf.qk_rope_head_dim)
+         self.weights_proj = ReplicatedLinear(
+             hf.hidden_size,
+             hf.index_n_heads,
+@@ -771,21 +773,51 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.compressor.state_cache is not None
+             else None
+         )
+-        latent, slots = self.compressor(hidden_states, main, state)
++        fuse_kv_write = (
++            type(self.compressor) is DeepseekCompressor
++            and "_write_v41_cache" not in self.__dict__
++            and self.kv_cache.ndim == 2
++            and self.kv_cache.dtype == torch.uint8
++            and self.kv_cache.shape[1] >= self._main_page * 288
++        )
++        if fuse_kv_write:
++            latent, slots = self.compressor(
++                hidden_states,
++                main,
++                state,
++                kv_cache=self.kv_cache,
++                token_positions=positions,
++                cos_sin=self.rotary_emb.cos_sin_cache,
++                kv_page_size=self._main_page,
++            )
++        else:
++            latent, slots = self.compressor(hidden_states, main, state)
+         self._issue_wo_prefetch(rows, after="compressor")
+         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+-        # and the paged MXFP4 write run in one kernel.
+-        key = indexer.wk(latent)
++        # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
++        # split-K FP32 partials are reduced in registers inside _write_index_keys.
++        if (
++            hasattr(indexer.wk, "tilelang_partials")
++            and "_write_index_keys" not in self.__dict__
++        ):
++            from vllm.models.deepseek_v4_1.tilelang.linear import (
++                project_bf16_partials,
++            )
++
++            key = project_bf16_partials(indexer.wk, latent)
++        else:
++            key = indexer.wk(latent)
+         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
+         self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
+-        self._write_v41_cache(
+-            latent,
+-            self.kv_cache,
+-            slots,
+-            page_size=self._main_page,
+-            cache_kind="indexed",
+-            positions=positions,
+-        )
++        if not fuse_kv_write:
++            self._write_v41_cache(
++                latent,
++                self.kv_cache,
++                slots,
++                page_size=self._main_page,
++                cache_kind="indexed",
++                positions=positions,
++            )
+ 
+     def forward(self, positions, hidden_states, llama_4_scaling=None):
+         if hidden_states.shape[0] == 0:
+@@ -990,19 +1022,38 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if q_cast is None
+             else kernels.slice_mxfp8(q_cast, first, last)
+         )
+-        with kernels.mxfp8_inputs(cast_rows):
+-            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+-        del cast_rows, q_cast
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+-        self._quantize_index_query(
+-            "decode" if swa.is_decode else "prefill",
+-            iq,
+-            iq_data,
+-            iq_scale,
+-            positions=positions[first:last],
+-        )
+-        del iq
++        if (
++            hasattr(self.indexer.wq_b, "tilelang_decode_mxfp4")
++            and rows <= self.indexer.wq_b.tilelang_decode_rows
++            and "_quantize_index_query" not in self.__dict__
++        ):
++            from vllm.models.deepseek_v4_1.tilelang.linear import (
++                project_block32_rope_mxfp4,
++            )
++
++            project_block32_rope_mxfp4(
++                self.indexer.wq_b,
++                cast_rows,
++                positions[first:last],
++                self.rotary_emb.cos_sin_cache,
++                iq_data,
++                iq_scale,
++            )
++            del cast_rows, q_cast
++        else:
++            with kernels.mxfp8_inputs(cast_rows):
++                iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
++            del cast_rows, q_cast
++            self._quantize_index_query(
++                "decode" if swa.is_decode else "prefill",
++                iq,
++                iq_data,
++                iq_scale,
++                positions=positions[first:last],
++            )
++            del iq
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+@@ -1154,6 +1205,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 index_width = index_pages.shape[1]
+                 iq_data, iq_scale, iw = query
+                 index_rows = iq_data.shape[0]
++                index_context = get_forward_context()
++                shared_pages = index_context.__dict__.setdefault(
++                    "_ds41_index_pages", {}
++                )
+                 for offset in range(0, index_rows, chunk_rows):
+                     end = min(offset + chunk_rows, index_rows)
+                     count = end - offset
+@@ -1162,16 +1217,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         metadata as tl_metadata,
+                     )
+ 
+-                    tl_metadata.pages(
+-                        im.req_id_per_token,
+-                        im.cache_lengths,
+-                        im.block_table,
+-                        index_pages,
++                    pages_width = min(im.block_table.shape[1], index_width)
++                    page_key = (
++                        id(im),
+                         row,
+                         count,
+-                        min(im.block_table.shape[1], index_width),
+-                        page=self._index_page,
++                        index_width,
++                        pages_width,
++                        self._index_page,
+                     )
++                    cached_pages = shared_pages.get(page_key)
++                    if (
++                        cached_pages is not None
++                        and cached_pages[0] is im
++                        and index_rows <= chunk_rows
++                    ):
++                        chunk_page_table = cached_pages[1][:count]
++                    else:
++                        tl_metadata.pages(
++                            im.req_id_per_token,
++                            im.cache_lengths,
++                            im.block_table,
++                            index_pages,
++                            row,
++                            count,
++                            pages_width,
++                            page=self._index_page,
++                        )
++                        if index_rows <= chunk_rows:
++                            shared_pages[page_key] = (im, index_pages)
++                        chunk_page_table = index_pages[:count]
+                     candidate_args = {}
+                     if self.layer_id == self.candidate_source_layer:
+                         candidate_args = dict(
+@@ -1192,7 +1267,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         q_mxfp4=iq_data[offset:end],
+                         q_scales=iq_scale[offset:end],
+                         query_weights=iw[offset:end],
+-                        page_table=index_pages[:count],
++                        page_table=chunk_page_table,
+                         cache_lengths=im.cache_lengths[row:row_end],
+                         score_width=score_width,
+                         output_indices=selected[offset:end],
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 235116109..c86ca907f 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -107,6 +107,14 @@ class DeepseekCompressor(nn.Module):
+         self.prefix, self.compress_ratio = prefix, compress_ratio
+         self.capacity = vllm_config.scheduler_config.max_num_batched_tokens
+         self.requests = vllm_config.scheduler_config.max_num_seqs
++        cache_cfg = getattr(vllm_config, "cache_config", None)
++        block_size = (
++            getattr(cache_cfg, "block_size", 64) if cache_cfg is not None else 64
++        )
++        self._main_page = block_size // compress_ratio
++        model_cfg = getattr(vllm_config, "model_config", None)
++        hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
++        self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
+         self.fused_wkv_wgate = MergedColumnParallelLinear(
+             hidden_size,
+             [512] * compress_ratio,
+@@ -182,14 +190,36 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
++        main_page = getattr(self, "_main_page", 64 // self.compress_ratio)
++        rope_dim = getattr(self, "_rope_dim", 64)
+         if self.compress_ratio == 1:
+-            return [prepare.call(tl.compress_kernel, 1, self.requests, 1)]
++            return [
++                prepare.call(tl.compress_kernel, 1, self.requests, 1),
++                prepare.call(
++                    tl.compress_kernel,
++                    1,
++                    self.requests,
++                    1,
++                    write_kv=True,
++                    kv_page_size=main_page,
++                    rope_dim=rope_dim,
++                ),
++            ]
+         # The ring holds one state per token, so its metadata's page
+         # (``state_metadata.block_size``) is its block size.
+         page = self.state_cache.block_size
+         return [
+             prepare.call(tl.gather_partial_state_kernel, self.requests, page),
+             prepare.call(tl.compress_kernel, 2, self.requests, page),
++            prepare.call(
++                tl.compress_kernel,
++                2,
++                self.requests,
++                page,
++                write_kv=True,
++                kv_page_size=main_page,
++                rope_dim=rope_dim,
++            ),
+         ]
+ 
+     def declare_kernels(self) -> None:
+@@ -208,17 +238,35 @@ class DeepseekCompressor(nn.Module):
+ 
+         prepare.declare(self._tilelang_calls, bind=bind)
+ 
+-    def _forward_tilelang(self, rows, metadata, state_metadata):
++    def _forward_tilelang(
++        self,
++        rows,
++        metadata,
++        state_metadata,
++        *,
++        kv_cache=None,
++        token_positions=None,
++        cos_sin=None,
++        kv_page_size=None,
++    ):
+         """The TileLang compression: at ratio 2 the requests' carries from the state
+         ring, then one launch over the step's rows that also saves the ring."""
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+ 
++        kv_kwargs = {}
++        if kv_cache is not None and token_positions is not None and cos_sin is not None:
++            kv_kwargs = dict(
++                kv_cache=kv_cache,
++                token_positions=token_positions,
++                cos_sin=cos_sin,
++                kv_page_size=kv_page_size or self._main_page,
++            )
+         if self.compress_ratio == 1:
+             tl.compress(
+                 rows, 1, self._values, None, self.norm.weight,
+                 metadata.query_start_loc, metadata.request_positions, self._row_ids,
+                 metadata.slot_mapping, metadata.live_counts, self._latent,
+-                self._emitted, self._slots,
++                self._emitted, self._slots, **kv_kwargs,
+             )  # fmt: skip
+             return
+         if state_metadata is None:
+@@ -236,13 +284,31 @@ class DeepseekCompressor(nn.Module):
+             metadata.slot_mapping, metadata.live_counts, self._latent, self._emitted,
+             self._slots, pending_values=self._pending_values,
+             pending_gates=self._pending_gates, tags=self._pending_tags, pool=pool,
+-            state_slots=state_metadata.slot_mapping, page=page,
++            state_slots=state_metadata.slot_mapping, page=page, **kv_kwargs,
+         )  # fmt: skip
+ 
+-    def forward(self, hidden_states, metadata, state_metadata=None):
++    def forward(
++        self,
++        hidden_states,
++        metadata,
++        state_metadata=None,
++        *,
++        kv_cache=None,
++        token_positions=None,
++        cos_sin=None,
++        kv_page_size=None,
++    ):
+         rows = hidden_states.shape[0]
+         if self._values is None:
+             raise RuntimeError("compressor kernels must be bound before forwarding")
+         self._project(hidden_states)
+-        self._forward_tilelang(rows, metadata, state_metadata)
++        self._forward_tilelang(
++            rows,
++            metadata,
++            state_metadata,
++            kv_cache=kv_cache,
++            token_positions=token_positions,
++            cos_sin=cos_sin,
++            kv_page_size=kv_page_size,
++        )
+         return self._latent[:rows], self._slots[:rows]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 9dcc083ab..ea18104ce 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -148,14 +148,25 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 )
+             )  # _quantize_index_query
+         if self.compressor is not None:
+-            calls.append(
+-                norm_quantize_call(
+-                    self.indexer.k_norm.variance_epsilon,
+-                    self._index_page,
+-                    self.compress_ratio,
+-                    SLOT_DTYPE,
+-                )
+-            )  # _write_index_keys
++            from .gemm import bf16_shards
++
++            shards_set = {1}
++            if (
++                self.indexer is not None
++                and hasattr(self.indexer, "wk")
++                and hasattr(self.indexer.wk, "weight")
++            ):
++                shards_set.add(bf16_shards(*self.indexer.wk.weight.shape))
++            for shards in sorted(shards_set):
++                calls.append(
++                    norm_quantize_call(
++                        self.indexer.k_norm.variance_epsilon,
++                        self._index_page,
++                        self.compress_ratio,
++                        SLOT_DTYPE,
++                        shards=shards,
++                    )
++                )  # _write_index_keys
+         return calls
+ 
+     def _bind_plans(self) -> None:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index 66e19e712..3c44d0b71 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -33,6 +33,7 @@ import tilelang.language as T
+ import torch
+ 
+ from . import pdl
++from .cache_writer import _CVT_HEADER, _E4M3_MAX, RECORD_BYTES
+ 
+ DIM = 512
+ STATE = 2 * DIM  # a ring slot: the value, then the gate
+@@ -40,6 +41,8 @@ EPS = 1e-20
+ _VEC = 4  # FP32 per 16-byte access
+ _CHUNKS = DIM // (32 * _VEC)  # 16-byte accesses per lane
+ _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++_INDEXED_RECORD = RECORD_BYTES["indexed"]
++_INDEXED_PAYLOAD = DIM // 2
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -65,7 +68,6 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+         local_ids: T.Tensor((max_requests,), T.int64),
+     ):
+         with T.Kernel(max_requests, threads=128) as r:
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             buf = T.alloc_local((_VEC,), T.float32)
+             nt = counts[0]
+@@ -83,6 +85,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+             page_id = T.if_then_else(needed, T.Cast(T.int64, table[r, 0]), T.int64(0))
+             valid = needed & (page_id > 0)
+             base = ((pos - 1) % page) * STATE
++            pdl.chain()
+             for half in T.serial(2):
+                 for i in T.vectorized(_VEC):
+                     buf[i] = T.if_then_else(
+@@ -101,38 +104,60 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
++def compress_kernel(
++    ratio: int,
++    max_requests: int,
++    page: int,
++    warps: int = 4,
++    write_kv: bool = False,
++    kv_page_size: int = 64,
++    rope_dim: int = 64,
++):
+     """Rows ``[0, rows)`` of the step: latents, emitted flags and slots (zero, false
+-    and -1 past the live tokens), and at ratio 2 the live tokens' ring saves."""
++    and -1 past the live tokens), at ratio 2 the live tokens' ring saves, and with
++    ``write_kv`` the rotated 288-byte ``indexed`` KV-cache records in the same launch."""
+     assert ratio in (1, 2)
+     rows = T.dynamic("rows")
+     gate_rows = T.dynamic("gate_rows")  # rows at ratio 2; any buffer at ratio 1
+     blocks = T.dynamic("blocks")
+     width = T.dynamic("width")
+     pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
++    positions_max = T.dynamic("positions_max")
++    kv_pages = T.dynamic("kv_pages")
++    kv_page_bytes = T.dynamic("kv_page_bytes")
++    kv_page_stride = T.dynamic("kv_page_stride")
++    kv_page_words = T.dynamic("kv_page_words")
++    kv_word_stride = T.dynamic("kv_word_stride")
+     value_dtype = T.float32 if ratio == 2 else T.bfloat16
++    rope_start = DIM - rope_dim
++    rope_half = rope_dim // 2
+ 
+-    @T.prim_func
+-    def compress(
+-        values: T.Tensor((rows, DIM), value_dtype),
+-        gates: T.Tensor((gate_rows, DIM), T.float32),
+-        weight: T.Tensor((DIM,), T.float32),
+-        starts: T.Tensor((max_requests + 1,), T.int32),
+-        positions: T.Tensor((max_requests,), T.int64),
+-        state_ids: T.Tensor((max_requests,), T.int64),
+-        slots: T.Tensor((rows,), T.int64),
+-        state_slots: T.Tensor((rows,), T.int64),
+-        counts: T.Tensor((2,), T.int32),
+-        pending_values: T.Tensor((max_requests, DIM), T.float32),
+-        pending_gates: T.Tensor((max_requests, DIM), T.float32),
+-        tags: T.Tensor((max_requests,), T.int64),
+-        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+-        out: T.Tensor((rows, DIM), T.bfloat16),
+-        emitted: T.Tensor((rows,), T.bool),
+-        emitted_slots: T.Tensor((rows,), T.int64),
++    @T.macro
++    def body(
++        values,
++        gates,
++        weight,
++        starts,
++        positions,
++        state_ids,
++        slots,
++        state_slots,
++        counts,
++        pending_values,
++        pending_gates,
++        tags,
++        pool,
++        out,
++        emitted,
++        emitted_slots,
++        token_positions,
++        cos_sin,
++        kv_cache,
++        kv_words,
+     ):
+         with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
+-            pdl.chain()
++            if write_kv:
++                T.import_source(_CVT_HEADER)
+             tx = T.get_thread_binding()
+             token = bx * warps + tx // 32
+             lane = tx % 32
+@@ -141,12 +166,24 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+             g1 = T.alloc_local((_VEC,), T.float32)
+             v0 = T.alloc_local((_VEC,), T.float32)
+             g0 = T.alloc_local((_VEC,), T.float32)
+-            w = T.alloc_local((_VEC,), T.float32)
++            w = T.alloc_local((_CHUNKS * _VEC,), T.float32)
+             y = T.alloc_local((_VEC,), T.bfloat16)
+-            # request, first, position, valid, pending carry, request end
+-            info = T.alloc_local((6,), T.int64)
++            rv = T.alloc_local((_VEC,), T.float32)
++            # request, first, position, valid, pending carry, request end, nt
++            info = T.alloc_local((7,), T.int64)
++            slot_info = T.alloc_local((3,), T.int64)
+             ss = T.alloc_local((1,), T.float32)
++            amax = T.alloc_var(T.float32)
++            for c in T.unroll(_CHUNKS):
++                col = (c * 32 + lane) * _VEC
++                for i in T.vectorized(_VEC):
++                    w[c * _VEC + i] = weight[col + i]
+             if token < rows:
++                slot_info[0] = slots[token]
++                if ratio == 2:
++                    slot_info[1] = state_slots[token]
++                if write_kv:
++                    slot_info[2] = token_positions[token]
+                 nt = counts[0]
+                 nr = counts[1]
+                 info[0] = T.int64(-1)
+@@ -155,6 +192,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                 info[3] = T.int64(0)
+                 info[4] = T.int64(0)
+                 info[5] = T.int64(-1)
++                info[6] = T.Cast(T.int64, nt)
+                 if (nt >= 0) & (nr > 0) & (nr <= max_requests) & (token < nt):
+                     # The request whose rows contain the token: the first whose end
+                     # passes it (empty requests never match).
+@@ -165,7 +203,6 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                         q = info[0]
+                         first = T.Cast(T.int64, starts[q])
+                         end = T.Cast(T.int64, starts[q + 1])
+-                        sid = state_ids[q]
+                         start_pos = positions[q]
+                         info[5] = end
+                         if (
+@@ -173,21 +210,28 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                             & (first <= token)
+                             & (end <= nt)
+                             & (token < end)
+-                            & (sid >= 0)
+-                            & (sid < max_requests)
+                             & (start_pos >= 0)
+                         ):
+                             info[1] = first
+                             info[2] = start_pos + (token - first)
+                             info[3] = T.int64(1)
+-                            if ratio == 2:
+-                                if info[2] % 2 == 1:
+-                                    if token == first:
+-                                        info[4] = T.int64(1)
+-                                        if tags[sid] != info[2] - 1:
+-                                            info[3] = T.int64(0)
+-                                else:
+-                                    info[3] = T.int64(0)
++            pdl.chain()
++            if token < rows:
++                nt = T.Cast(T.int32, info[6])
++                if info[3] == 1:
++                    q = info[0]
++                    sid = state_ids[q]
++                    if (sid >= 0) & (sid < max_requests):
++                        if ratio == 2:
++                            if info[2] % 2 == 1:
++                                if token == info[1]:
++                                    info[4] = T.int64(1)
++                                    if tags[sid] != info[2] - 1:
++                                        info[3] = T.int64(0)
++                            else:
++                                info[3] = T.int64(0)
++                    else:
++                        info[3] = T.int64(0)
+                 valid = info[3] == 1
+                 ss[0] = T.float32(0)
+                 for c in T.serial(_CHUNKS):
+@@ -234,7 +278,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                         # metadata gives only a request's last ``page`` rows of the step
+                         # a ring slot (earlier rows would share slots); the kernel keeps
+                         # that bound itself as well.
+-                        slot = state_slots[token]
++                        slot = slot_info[1]
+                         if (token < nt) & (slot >= page) & (token >= info[5] - page):
+                             base = (slot % page) * STATE + col
+                             for i in T.vectorized(_VEC):
+@@ -243,19 +287,171 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+                                 pool[slot // page, base + DIM + i] = g1[i]
+                 total = T.warp_reduce_sum(ss[0])
+                 inverse = T.rsqrt(total / DIM + EPS)
+-                for c in T.serial(_CHUNKS):
++                kv_slot = T.if_then_else(valid, slot_info[0], T.int64(-1))
++                kv_page = kv_slot // kv_page_size
++                for c in T.unroll(_CHUNKS):
+                     col = (c * 32 + lane) * _VEC
+-                    for i in T.vectorized(_VEC):
+-                        w[i] = weight[col + i]
+                     for i in T.unroll(_VEC):
+-                        y[i] = T.Cast(T.bfloat16, x[c * _VEC + i] * inverse * w[i])
++                        y[i] = T.Cast(
++                            T.bfloat16, x[c * _VEC + i] * inverse * w[c * _VEC + i]
++                        )
+                     for i in T.vectorized(_VEC):
+                         out[token, col + i] = y[i]
++                    if write_kv:
++                        for i in T.unroll(_VEC):
++                            rv[i] = T.Cast(T.float32, y[i])
++                        if rope_dim > 0 and c == _CHUNKS - 1:
++                            if col >= rope_start:
++                                pos = (
++                                    slot_info[2] // ratio * ratio
++                                    if ratio > 1
++                                    else slot_info[2]
++                                )
++                                pair_base = (col - rope_start) // 2
++                                for p in T.unroll(_VEC // 2):
++                                    first = rv[2 * p]
++                                    second = rv[2 * p + 1]
++                                    cosine = cos_sin[pos, pair_base + p]
++                                    sine = cos_sin[pos, rope_half + pair_base + p]
++                                    rv[2 * p] = T.Cast(
++                                        T.float32,
++                                        T.Cast(
++                                            T.bfloat16,
++                                            T.ieee_fmaf(first, cosine, -(second * sine)),
++                                        ),
++                                    )
++                                    rv[2 * p + 1] = T.Cast(
++                                        T.float32,
++                                        T.Cast(
++                                            T.bfloat16,
++                                            T.ieee_fmaf(first, sine, second * cosine),
++                                        ),
++                                    )
++                        amax = 0.0
++                        for i in T.unroll(_VEC):
++                            amax = T.max(amax, T.abs(rv[i]))
++                        amax = T.max(amax, T.shfl_xor(amax, 1))
++                        amax = T.max(amax, T.shfl_xor(amax, 2))
++                        if (kv_slot >= 0) & (kv_page < kv_pages):
++                            kv_base = (kv_slot % kv_page_size) * _INDEXED_RECORD
++                            scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
++                            scale_code = T.cast(
++                                T.min(scale, _E4M3_MAX), T.float8_e4m3fn
++                            )
++                            decoded = T.cast(scale_code, T.float32)
++                            word = T.call_extern(
++                                "uint16",
++                                "dsv41_e2m1x4",
++                                rv[0] / decoded,
++                                rv[1] / decoded,
++                                rv[2] / decoded,
++                                rv[3] / decoded,
++                            )
++                            kv_words[kv_page, (kv_base + col // 2) // 2] = word
++                            if lane % 4 == 0:
++                                group = c * 8 + lane // 4
++                                kv_cache[
++                                    kv_page, kv_base + _INDEXED_PAYLOAD + group
++                                ] = T.reinterpret(scale_code, T.uint8)
+                 if lane == 0:
+                     emitted[token] = valid
+-                    emitted_slots[token] = T.if_then_else(
+-                        valid, slots[token], T.int64(-1)
+-                    )
++                    emitted_slots[token] = kv_slot
++
++    if write_kv:
++
++        @T.prim_func
++        def compress(
++            values: T.Tensor((rows, DIM), value_dtype),
++            gates: T.Tensor((gate_rows, DIM), T.float32),
++            weight: T.Tensor((DIM,), T.float32),
++            starts: T.Tensor((max_requests + 1,), T.int32),
++            positions: T.Tensor((max_requests,), T.int64),
++            state_ids: T.Tensor((max_requests,), T.int64),
++            slots: T.Tensor((rows,), T.int64),
++            state_slots: T.Tensor((rows,), T.int64),
++            counts: T.Tensor((2,), T.int32),
++            pending_values: T.Tensor((max_requests, DIM), T.float32),
++            pending_gates: T.Tensor((max_requests, DIM), T.float32),
++            tags: T.Tensor((max_requests,), T.int64),
++            pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
++            out: T.Tensor((rows, DIM), T.bfloat16),
++            emitted: T.Tensor((rows,), T.bool),
++            emitted_slots: T.Tensor((rows,), T.int64),
++            token_positions: T.Tensor((rows,), T.int64),
++            cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
++            kv_cache: T.StridedTensor(
++                (kv_pages, kv_page_bytes), (kv_page_stride, 1), T.uint8
++            ),
++            kv_words: T.StridedTensor(
++                (kv_pages, kv_page_words), (kv_word_stride, 1), T.uint16
++            ),
++        ):
++            body(
++                values,
++                gates,
++                weight,
++                starts,
++                positions,
++                state_ids,
++                slots,
++                state_slots,
++                counts,
++                pending_values,
++                pending_gates,
++                tags,
++                pool,
++                out,
++                emitted,
++                emitted_slots,
++                token_positions,
++                cos_sin,
++                kv_cache,
++                kv_words,
++            )
++
++        return compress
++
++    @T.prim_func
++    def compress(
++        values: T.Tensor((rows, DIM), value_dtype),
++        gates: T.Tensor((gate_rows, DIM), T.float32),
++        weight: T.Tensor((DIM,), T.float32),
++        starts: T.Tensor((max_requests + 1,), T.int32),
++        positions: T.Tensor((max_requests,), T.int64),
++        state_ids: T.Tensor((max_requests,), T.int64),
++        slots: T.Tensor((rows,), T.int64),
++        state_slots: T.Tensor((rows,), T.int64),
++        counts: T.Tensor((2,), T.int32),
++        pending_values: T.Tensor((max_requests, DIM), T.float32),
++        pending_gates: T.Tensor((max_requests, DIM), T.float32),
++        tags: T.Tensor((max_requests,), T.int64),
++        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
++        out: T.Tensor((rows, DIM), T.bfloat16),
++        emitted: T.Tensor((rows,), T.bool),
++        emitted_slots: T.Tensor((rows,), T.int64),
++    ):
++        body(
++            values,
++            gates,
++            weight,
++            starts,
++            positions,
++            state_ids,
++            slots,
++            state_slots,
++            counts,
++            pending_values,
++            pending_gates,
++            tags,
++            pool,
++            out,
++            emitted,
++            emitted_slots,
++            None,
++            None,
++            None,
++            None,
++        )
+ 
+     return compress
+ 
+@@ -276,9 +472,13 @@ def compress(
+     rows, ratio, values, gates, weight, starts, positions, state_ids, slots, counts,
+     out, emitted, emitted_slots, *, pending_values=None, pending_gates=None,
+     tags=None, pool=None, state_slots=None, page=1,
++    kv_cache=None, token_positions=None, cos_sin=None, kv_page_size=64,
+ ):  # fmt: skip
+     """Rows ``[0, rows)`` of one compression call (``out``, ``emitted`` and
+-    ``emitted_slots`` keep their contents past them)."""
++    ``emitted_slots`` keep their contents past them). When ``kv_cache``,
++    ``token_positions`` and ``cos_sin`` are provided, also rotates the trailing
++    ``cos_sin.shape[1]`` columns in registers and writes the 288-byte ``indexed``
++    KV-cache records at ``emitted_slots`` in the same launch."""
+     max_requests = positions.shape[0]
+     if ratio == 1:
+         # Ratio 1 reads no gates, ring or carry: a placeholder of the shapes.
+@@ -287,6 +487,40 @@ def compress(
+         tags, state_slots = state_ids, slots
+     else:
+         gates = gates[:rows]
++    if kv_cache is not None and token_positions is not None and cos_sin is not None:
++        pages = kv_cache.view(torch.uint8)
++        if pages.dim() > 2:
++            pages = pages.flatten(1)
++        compress_kernel(
++            ratio,
++            max_requests,
++            page,
++            write_kv=True,
++            kv_page_size=kv_page_size,
++            rope_dim=cos_sin.shape[1],
++        )(
++            values[:rows],
++            gates,
++            weight,
++            starts,
++            positions,
++            state_ids,
++            slots[:rows],
++            state_slots[:rows],
++            counts,
++            pending_values,
++            pending_gates,
++            tags,
++            pool,
++            out[:rows],
++            emitted[:rows],
++            emitted_slots[:rows],
++            token_positions[:rows],
++            cos_sin,
++            pages,
++            pages.view(torch.uint16),
++        )
++        return out[:rows], emitted_slots[:rows]
+     compress_kernel(ratio, max_requests, page)(
+         values[:rows], gates, weight, starts, positions, state_ids, slots[:rows],
+         state_slots[:rows], counts, pending_values, pending_gates, tags, pool,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 40f942203..e73c9ed98 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -403,6 +403,206 @@ mxfp8_gemm_partials = tilelang.jit(
+ )(_mxfp8_gemm_partials)
+ 
+ 
++def _e2m1_code_gemm(x):
++    """Nearest-even E2M1 code of FP32 ``x``, saturating at 6 (``cvt.rn.satfinite``)."""
++    m = T.abs(x)
++    code = (
++        T.cast(m > 0.25, T.int32)
++        + T.cast(m >= 0.75, T.int32)
++        + T.cast(m > 1.25, T.int32)
++        + T.cast(m >= 1.75, T.int32)
++        + T.cast(m > 2.5, T.int32)
++        + T.cast(m >= 3.5, T.int32)
++        + T.cast(m > 5.0, T.int32)
++    )
++    sign = T.cast(T.shift_right(T.reinterpret(x, T.uint32), 31), T.int32)
++    return code | (sign << 3)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def mxfp8_gemm_rope_mxfp4_decode(
++    N: int,
++    K: int,
++    block_M: int = 16,
++    block_N: int = 64,
++    block_K: int = 128,
++    num_stages: int = 3,
++    threads: int = 128,
++    padded_rows: bool = True,
++    swizzle_panel: int = 0,
++    groups: int = 1,
++    shards: int = 1,
++    tile_contiguous: bool = False,
++    head_dim: int = 128,
++    rope_dim: int = 64,
++    ratio: int = 1,
++):
++    """``mxfp8_gemm_decode`` whose epilogue rounds each ``[block_M, block_N]`` tile to
++    BF16, applies GPT-J interleaved RoPE to the trailing ``rope_dim`` columns of each
++    ``head_dim``-wide head, and quantizes each 32-column group to MXFP4 (packed E2M1
++    ``Q`` and UE8M0 ``S``), matching ``mxfp8_gemm_decode`` + ``mxfp4_quantize_v41``
++    bit for bit in one launch."""
++    assert K % block_K == 0 and block_K % 64 == 0
++    assert N % 32 == 0 and block_N % SF_BLOCK == 0
++    assert rope_dim % SF_BLOCK == 0 and head_dim % SF_BLOCK == 0
++    assert groups == 1 and shards == 1
++    k_blocks = K // block_K
++    M, positions_max = T.dynamic("M, positions_max")
++    Mp = T.dynamic("Mp") if padded_rows else M
++    in_dtype = T.float8_e4m3fn
++    accum_dtype = T.float32
++    sf_words = scale_words(K)
++    block_words = block_scale_words(block_K)
++    total_N = N
++    if tile_contiguous:
++        assert total_N % TILE_WEIGHT_N == 0 and K % TILE_WEIGHT_K == 0
++        assert TILE_WEIGHT_N % block_N == 0 and block_K % TILE_WEIGHT_K == 0
++    k_tiles = K // TILE_WEIGHT_K
++    sub_tiles_k = block_K // TILE_WEIGHT_K
++    b_shape = (
++        (total_N * k_tiles, TILE_WEIGHT_K) if tile_contiguous else (total_N, K)
++    )
++    groups_per_row = block_N // SF_BLOCK
++    total_groups = block_M * groups_per_row
++    groups_per_thread = tilelang.cdiv(total_groups, threads)
++    rope_half = rope_dim // 2
++
++    @T.prim_func
++    def gemm_mxfp8_rope_mxfp4(
++        A: T.Tensor((Mp, K), in_dtype),
++        B: T.Tensor(b_shape, in_dtype),
++        SFA: T.Tensor((Mp, sf_words), T.uint32),
++        SFB: T.Tensor((total_N // 32, sf_words), T.uint32),
++        Positions: T.Tensor((M,), T.int64),
++        CosSin: T.Tensor((positions_max, rope_dim), T.float32),
++        Q: T.Tensor((M, total_N // 2), T.uint8),
++        S: T.Tensor((M, total_N // SF_BLOCK), T.uint8),
++    ):
++        with T.Kernel(
++            T.ceildiv(total_N, block_N), T.ceildiv(M, block_M), threads=threads
++        ) as (bx, by):
++            if swizzle_panel:
++                T.use_swizzle(panel_size=swizzle_panel)
++            pdl.chain()
++            tx = T.get_thread_binding()
++            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
++            B_shared = T.alloc_shared((block_N, block_K), in_dtype)
++            SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
++            SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
++            C_shared = T.alloc_shared((block_M, block_N), T.bfloat16)
++            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            vals = T.alloc_local((SF_BLOCK,), T.bfloat16)
++            amax = T.alloc_var(T.float32)
++            T.clear(C_local)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                if not tile_contiguous:
++                    T.copy(B[bx * block_N, ko * block_K], B_shared)
++                elif sub_tiles_k == 1:
++                    row0 = (
++                        ((bx * block_N // TILE_WEIGHT_N) * k_tiles + ko) * TILE_WEIGHT_N
++                        + (bx * block_N % TILE_WEIGHT_N)
++                    )
++                    T.copy(B[row0, 0], B_shared)
++                else:
++                    for sub_k in T.serial(sub_tiles_k):
++                        row0 = (
++                            (
++                                (bx * block_N // TILE_WEIGHT_N) * k_tiles
++                                + ko * sub_tiles_k
++                                + sub_k
++                            )
++                            * TILE_WEIGHT_N
++                            + (bx * block_N % TILE_WEIGHT_N)
++                        )
++                        T.copy(
++                            B[row0 : row0 + block_N, 0:TILE_WEIGHT_K],
++                            B_shared[
++                                0:block_N,
++                                sub_k * TILE_WEIGHT_K : (sub_k + 1) * TILE_WEIGHT_K,
++                            ],
++                        )
++                word0 = ko * block_K // SF_WORD_K
++                for i, w in T.Parallel(block_M, block_words):
++                    SFA_shared[i, w] = SFA[
++                        T.min(by * block_M + i, Mp - 1),
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                for j, w in T.Parallel(block_N, block_words):
++                    row = T.min(bx * block_N + j, total_N - 1)
++                    SFB_shared[j, w] = SFB[
++                        row // 32,
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                T.mma_gemm_blockscaled(
++                    A_shared,
++                    B_shared,
++                    C_local,
++                    SFA_shared,
++                    SFB_shared,
++                    transpose_B=True,
++                    k_start=ko * block_K % SF_WORD_K,
++                    sf_a_granularity_k=SF_BLOCK,
++                    sf_b_granularity_k=SF_BLOCK,
++                )
++            T.copy(C_local, C_shared)
++            T.sync_threads()
++            for g_step in T.serial(groups_per_thread):
++                g_idx = g_step * threads + tx
++                if g_idx < total_groups:
++                    m_local = g_idx // groups_per_row
++                    k_local = g_idx % groups_per_row
++                    m = by * block_M + m_local
++                    col0 = bx * block_N + k_local * SF_BLOCK
++                    if m < M and col0 < total_N:
++                        for i in T.serial(SF_BLOCK):
++                            vals[i] = C_shared[m_local, k_local * SF_BLOCK + i]
++                        head_col = col0 % head_dim
++                        if head_col >= head_dim - rope_dim:
++                            pos = (
++                                Positions[m] // ratio * ratio
++                                if ratio > 1
++                                else Positions[m]
++                            )
++                            pair_base = (head_col - (head_dim - rope_dim)) // 2
++                            for i in T.unroll(SF_BLOCK // 2):
++                                first = T.cast(vals[2 * i], T.float32)
++                                second = T.cast(vals[2 * i + 1], T.float32)
++                                cosine = CosSin[pos, pair_base + i]
++                                sine = CosSin[pos, rope_half + pair_base + i]
++                                vals[2 * i] = T.cast(
++                                    T.ieee_fmaf(first, cosine, -(second * sine)),
++                                    T.bfloat16,
++                                )
++                                vals[2 * i + 1] = T.cast(
++                                    T.ieee_fmaf(first, sine, second * cosine),
++                                    T.bfloat16,
++                                )
++                        amax = 6.0 * 2.0**-126
++                        for i in T.serial(SF_BLOCK):
++                            amax = T.max(amax, T.abs(T.cast(vals[i], T.float32)))
++                        bits = T.reinterpret(
++                            T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32
++                        )
++                        sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
++                            (bits & 0x7FFFFF) != 0, T.int32
++                        )
++                        scale = T.reinterpret(
++                            T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
++                        )
++                        for i in T.serial(SF_BLOCK // 2):
++                            lo = _e2m1_code_gemm(
++                                T.fmul(T.cast(vals[2 * i], T.float32), scale)
++                            )
++                            hi = _e2m1_code_gemm(
++                                T.fmul(T.cast(vals[2 * i + 1], T.float32), scale)
++                            )
++                            Q[m, col0 // 2 + i] = T.cast(lo | (hi << 4), T.uint8)
++                        S[m, col0 // SF_BLOCK] = T.cast(sf, T.uint8)
++
++    return gemm_mxfp8_rope_mxfp4
++
++
+ @tilelang.jit
+ def splitk_reduce(
+     N: int,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index abd8927cd..af2d888b1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -91,16 +91,23 @@ def quantize_call(
+ 
+ 
+ def norm_quantize_call(
+-    eps: float, page_size: int, ratio: int = 1, slot_dtype: torch.dtype = torch.int64
++    eps: float,
++    page_size: int,
++    ratio: int = 1,
++    slot_dtype: torch.dtype = torch.int64,
++    *,
++    shards: int = 1,
+ ):
+     """The fused ``k_norm + rope + write_index_keys`` kernel ``norm_rope_write_index_keys``
+     launches, as a ``prepare.call``."""
++    kwargs = {"shards": shards} if shards > 1 else {}
+     return prepare.call(
+         mxfp4_norm_rope_quantize_v41,
+         eps,
+         page_size,
+         ratio,
+         str(slot_dtype).removeprefix("torch."),
++        **kwargs,
+     )
+ 
+ 
+@@ -609,10 +616,12 @@ def mxfp4_norm_rope_quantize_v41(
+     page_size: int = 64,
+     ratio: int = 1,
+     slot_dtype: str = "int64",
++    shards: int = 1,
+ ):
+-    """Fused 128-column RMSNorm (TileKernels' ``norm_forward`` reduction), trailing
+-    64-column GPT-J RoPE (``rope_kernel``) and paged MXFP4 key write
+-    (``mxfp4_quantize_v41(paged=True)``) in one launch, bit for bit."""
++    """Fused (optional split-K ``shards`` reduction +) 128-column RMSNorm
++    (TileKernels' ``norm_forward`` reduction), trailing 64-column GPT-J RoPE
++    (``rope_kernel``) and paged MXFP4 key write (``mxfp4_quantize_v41(paged=True)``)
++    in one launch, bit for bit."""
+     from .front import ROPE_DIM, _THREADS, _VEC, _row_split
+ 
+     k = _row_split(INDEX_DIM)
+@@ -629,19 +638,9 @@ def mxfp4_norm_rope_quantize_v41(
+     rows, positions_max = T.dynamic("rows, positions_max")
+     pool_pages, pool_stride = T.dynamic("pool_pages, pool_stride")
+ 
+-    @T.prim_func
+-    def indexer_mxfp4_quantize(
+-        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+-        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
+-        Positions: T.Tensor([rows], T.int64),
+-        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
+-        Slots: T.Tensor([rows], slot_dtype),
+-        Pool: T.StridedTensor(
+-            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
+-        ),
+-    ):
++    @T.macro
++    def body(X, Weight, Positions, CosSin, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
+-            pdl.chain()
+             tid = T.get_thread_binding()
+             k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
+             k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
+@@ -660,20 +659,49 @@ def mxfp4_norm_rope_quantize_v41(
+             )
+             k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            acc_local = T.alloc_local((_VEC,), T.float32)
+             y_fp32_local = T.alloc_local((_VEC,), T.float32)
+             sum_local = T.alloc_local((2,), T.float32)
+-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
++            weight_local = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+             cs = T.alloc_local((_VEC,), T.float32)
++            slot_local = T.alloc_local((1,), T.int64)
+ 
+             row_id = tid // kt
+             lane = tid % kt
+             token_id = bx * kb + row_id
++            for vi in T.unroll(k["num_thread_vec"]):
++                token_offset = (vi * kt + lane) * _VEC
++                for j in T.vectorized(_VEC):
++                    weight_local[vi, j] = Weight[token_offset + j]
++            if token_id < rows:
++                slot_local[0] = T.cast(Slots[token_id], T.int64)
++                pos = (
++                    Positions[token_id] // ratio * ratio
++                    if ratio > 1
++                    else Positions[token_id]
++                )
++                for i in T.vectorized(pairs):
++                    cs[i] = CosSin[pos, lane * pairs + i]
++                for i in T.vectorized(pairs):
++                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
++            else:
++                slot_local[0] = T.int64(-1)
++            pdl.chain()
+             T.clear(sum_local)
+             for vi in T.unroll(k["num_thread_vec"]):
+                 token_offset = (vi * kt + lane) * _VEC
+                 if token_id < rows:
+-                    for j in T.vectorized(_VEC):
+-                        k_x[vi, j] = X[token_id, token_offset + j]
++                    if shards > 1:
++                        for j in T.vectorized(_VEC):
++                            acc_local[j] = X[0, token_id, token_offset + j]
++                        for s in T.serial(1, shards):
++                            for j in T.vectorized(_VEC):
++                                acc_local[j] += X[s, token_id, token_offset + j]
++                        for j in T.unroll(_VEC):
++                            k_x[vi, j] = T.cast(acc_local[j], T.bfloat16)
++                    else:
++                        for j in T.vectorized(_VEC):
++                            k_x[vi, j] = X[token_id, token_offset + j]
+                 else:
+                     T.clear(k_x[vi, :])
+                 for j in T.vectorized(_VEC):
+@@ -700,28 +728,16 @@ def mxfp4_norm_rope_quantize_v41(
+                 init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
+             )
+             for vi in T.unroll(k["num_thread_vec"]):
+-                token_offset = (vi * kt + lane) * _VEC
+-                for j in T.vectorized(_VEC):
+-                    weight_local[j] = Weight[token_offset + j]
+                 for j in T.vectorized(_VEC):
+                     y_fp32_local[j] = (
+                         T.float32(k_x[vi, j])
+                         * rstd_value
+-                        * (T.float32(weight_local[j]) * out_scale)
++                        * (T.float32(weight_local[vi, j]) * out_scale)
+                     )
+                 for j in T.vectorized(_VEC):
+                     k_y[vi, j] = y_fp32_local[j]
+ 
+             if token_id < rows:
+-                pos = (
+-                    Positions[token_id] // ratio * ratio
+-                    if ratio > 1
+-                    else Positions[token_id]
+-                )
+-                for i in T.vectorized(pairs):
+-                    cs[i] = CosSin[pos, lane * pairs + i]
+-                for i in T.vectorized(pairs):
+-                    cs[pairs + i] = CosSin[pos, half + lane * pairs + i]
+                 for j in T.unroll(pairs):
+                     first = T.cast(k_y[1, 2 * j], T.float32)
+                     second = T.cast(k_y[1, 2 * j + 1], T.float32)
+@@ -743,7 +759,7 @@ def mxfp4_norm_rope_quantize_v41(
+                 amax = T.max(amax, T.shfl_xor(amax, 1))
+                 amax = T.max(amax, T.shfl_xor(amax, 2))
+                 if token_id < rows:
+-                    slot = T.cast(Slots[token_id], T.int64)
++                    slot = slot_local[0]
+                     page = slot // page_size
+                     tok = slot % page_size
+                     if (slot >= 0) & (page < pool_pages):
+@@ -776,16 +792,50 @@ def mxfp4_norm_rope_quantize_v41(
+                                 page_size * (INDEX_DIM // 2) + tok * 4 + group,
+                             ] = T.cast(sf, T.uint8)
+ 
++    if shards > 1:
++
++        @T.prim_func
++        def indexer_mxfp4_quantize(
++            P: T.Tensor([shards, rows, INDEX_DIM], T.float32),
++            Weight: T.Tensor([INDEX_DIM], T.bfloat16),
++            Positions: T.Tensor([rows], T.int64),
++            CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
++            Slots: T.Tensor([rows], slot_dtype),
++            Pool: T.StridedTensor(
++                [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
++            ),
++        ):
++            body(P, Weight, Positions, CosSin, Slots, Pool)
++
++        return indexer_mxfp4_quantize
++
++    @T.prim_func
++    def indexer_mxfp4_quantize(
++        X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
++        Weight: T.Tensor([INDEX_DIM], T.bfloat16),
++        Positions: T.Tensor([rows], T.int64),
++        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
++        Slots: T.Tensor([rows], slot_dtype),
++        Pool: T.StridedTensor(
++            [pool_pages, page_bytes(page_size)], [pool_stride, 1], T.uint8
++        ),
++    ):
++        body(X, Weight, Positions, CosSin, Slots, Pool)
++
+     return indexer_mxfp4_quantize
+ 
+ 
+ def norm_rope_write_index_keys(
+     raw_keys, weight, eps: float, positions, cos_sin, pool, slots, page_size: int, ratio: int = 1
+ ):
+-    """Fused RMSNorm + RoPE + paged MXFP4 quantize/write of ``[rows, 128]`` keys."""
+-    if raw_keys.shape[0] == 0:
++    """Fused (optional split-K reduction +) RMSNorm + RoPE + paged MXFP4 quantize/write
++    of ``[rows, 128]`` BF16 keys or ``[shards, rows, 128]`` FP32 split-K partials."""
++    if raw_keys.shape[-2] == 0:
+         return
+-    kernel = _make(norm_quantize_call(eps, page_size, ratio, slots.dtype))
++    shards = raw_keys.shape[0] if raw_keys.ndim == 3 else 1
++    kernel = _make(
++        norm_quantize_call(eps, page_size, ratio, slots.dtype, shards=shards)
++    )
+     kernel(
+         raw_keys,
+         weight,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 95b007fc4..aac3ef62e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -56,6 +56,7 @@ from .gemm import (
+     mxfp8_gemm,
+     mxfp8_gemm_decode,
+     mxfp8_gemm_partials,
++    mxfp8_gemm_rope_mxfp4_decode,
+     pack_scale_words,
+     pack_weight_tiles,
+     scale_words,
+@@ -362,7 +363,61 @@ def _bf16_linear(
+         layer.tilelang_gemm(x, layer.weight, out)
+ 
+ 
+-def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
++def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
++    """Project ``x`` through a BF16 layer, returning 3D FP32 split-K ``partials``
++    (``[shards, rows, N]``) at decode sizes so a fused consumer (``norm_rope_write_index_keys``)
++    reduces the shards in registers without launching ``splitk_reduce``."""
++    n, k = layer.weight.shape
++    rows = x.numel() // k if x.ndim != 2 else x.shape[0]
++    if x.ndim != 2:
++        x = x.reshape(rows, k)
++    scratch = current_preallocated_workspace()
++    specs = _partial_specs(layer, rows)
++    if specs:
++        (partials,) = _scratch(specs, scratch)
++        partials_kernel(layer, rows)(x, layer.weight, partials)
++        return partials
++    out = torch.empty(
++        (rows, n),
++        dtype=getattr(layer, "out_dtype", torch.bfloat16),
++        device=x.device,
++    )
++    layer.tilelang_gemm(x, layer.weight, out)
++    return out
++
++
++def project_block32_rope_mxfp4(
++    layer: nn.Module,
++    cast_rows: MXFP8Rows,
++    positions: torch.Tensor,
++    cos_sin: torch.Tensor,
++    q_out: torch.Tensor,
++    s_out: torch.Tensor,
++) -> None:
++    """Project decode ``cast_rows`` through ``layer``, rotate the trailing RoPE columns
++    of each head at ``positions``, and write MXFP4 ``q_out`` and ``s_out`` in one launch."""
++    rows = cast_rows.rows.shape[0]
++    n = layer.weight.shape[0]
++    gemm = layer.tilelang_decode_mxfp4[decode_tile_rows(rows, layer.tilelang_wide)]
++    weight = getattr(layer, "tilelang_weight", layer.weight)
++    gemm(
++        cast_rows.values,
++        weight,
++        cast_rows.scales.view(torch.uint32),
++        layer.tilelang_weight_sf,
++        positions,
++        cos_sin,
++        q_out.view(rows, n // 2),
++        s_out.view(rows, n // SF_BLOCK),
++    )
++
++
++def _block32_kernels(
++    n: int,
++    k: int,
++    groups: int = 1,
++    rope_mxfp4: tuple[int, int] | None = None,
++) -> dict:
+     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+     calls ``_bind_block32`` makes.
+ 
+@@ -395,7 +450,7 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+         if groups == 1 and (n, k) in TILE_CONTIGUOUS_FP8
+         else {}
+     )
+-    return {
++    out = {
+         "decode": {
+             block_M: prepare.call(
+                 mxfp8_gemm_decode,
+@@ -417,6 +472,23 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+             **tile_kw,
+         ),
+     }
++    if rope_mxfp4 is not None and groups == 1:
++        head_dim, rope_dim = rope_mxfp4
++        out["decode_mxfp4"] = {
++            block_M: prepare.call(
++                mxfp8_gemm_rope_mxfp4_decode,
++                part,
++                k,
++                **fp8_decode_config(part, k, block_M, groups),
++                padded_rows=True,
++                groups=groups,
++                head_dim=head_dim,
++                rope_dim=rope_dim,
++                **tile_kw,
++            )
++            for block_M in heights
++        }
++    return out
+ 
+ 
+ def _calls(kernels: dict) -> list[prepare.TileLangCall]:
+@@ -483,7 +555,8 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
+     producer (``provide_mxfp8``) and casts nothing either."""
+     n, k = layer.weight.shape
+-    kernels = _block32_kernels(n, k, groups)
++    rope_mxfp4 = getattr(layer, "tilelang_rope_mxfp4", None)
++    kernels = _block32_kernels(n, k, groups, rope_mxfp4=rope_mxfp4)
+     layer.tilelang_groups = groups
+     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
+@@ -818,6 +891,8 @@ __all__ = [
+     "cast_mxfp8",
+     "empty_mxfp8",
+     "mxfp8_rows",
++    "project_bf16_partials",
++    "project_block32_rope_mxfp4",
+     "project_parts",
+     "provide_mxfp8",
+     "provided_mxfp8",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 0b290a32a..a8cbac701 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -358,6 +358,7 @@ def pages_kernel(width: int, page: int):
+     table_rows = T.dynamic("table_rows")
+     table_cols = T.dynamic("table_cols")
+     table_stride = T.dynamic("table_stride")
++    groups = (width + _GROUP * _BLOCK - 1) // (_GROUP * _BLOCK)
+ 
+     @T.prim_func
+     def metadata_pages(
+@@ -368,16 +369,33 @@ def pages_kernel(width: int, page: int):
+         offset: T.int32,
+         read_width: T.int32,
+     ):
+-        with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
++        with T.Kernel(rows, threads=_BLOCK) as (row,):
+             pdl.chain()
+-            entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
+-            col = cb * _BLOCK + T.get_thread_binding()
++            tx = T.get_thread_binding()
++            live = T.alloc_var(T.int32)
++            entries = T.alloc_local((groups * _GROUP,), T.int32)
+             req = reqs[offset + row]
+             live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
+-            if (req >= 0) & (col < live):
+-                # vLLM reserves physical block zero; page tables use -1 for holes.
+-                entry = table[req, col]
+-                out[row, col] = T.if_then_else(entry > 0, entry, -1)
++            if req < 0:
++                live = 0
++            for g in T.unroll(groups):
++                if g * _GROUP * _BLOCK < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * _BLOCK + tx
++                        entries[g * _GROUP + k] = T.if_then_else(
++                            col < live, table[req, col], 0
++                        )
++            for g in T.unroll(groups):
++                if g * _GROUP * _BLOCK < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * _BLOCK + tx
++                        if col < live:
++                            # vLLM reserves physical block zero; page tables use -1 for holes.
++                            out[row, col] = T.if_then_else(
++                                entries[g * _GROUP + k] > 0,
++                                entries[g * _GROUP + k],
++                                -1,
++                            )
+ 
+     return metadata_pages
+ 
+-- 
+2.54.0 (Apple Git-157)
+
