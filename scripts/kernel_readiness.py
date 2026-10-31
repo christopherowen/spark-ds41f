@@ -275,19 +275,19 @@ def profile_problems(name, data, profile, policy):
     issues = []
     release = profile.get("release")
     if (release and data.get("kernel") != release) or data.get("page_size") != profile["page_size"]:
-        issues.append(f"{name}: serving profile requires {release} / {profile['page_size']}-byte pages; "
+        issues.append(f"{name}: serving profile recommends {release} / {profile['page_size']}-byte pages; "
                       f"running {data.get('kernel')!r} / {data.get('page_size')!r}")
     if policy.get("rm_build_note") and data.get("rm_build_note") != policy["rm_build_note"]:
-        issues.append(f"{name}: serving profile requires the qualified NVIDIA RM build")
+        issues.append(f"{name}: serving profile recommends the qualified NVIDIA RM build")
     if policy.get("rm_system_memory_pools") is not None and data.get("rm_system_memory_pools") != str(policy["rm_system_memory_pools"]):
         issues.append(f"{name}: NVIDIA system memory pool setting differs from the serving profile")
     if profile.get("memory_saver_required"):
         if not policy.get("memory_saver"):
-            issues.append(f"{name}: serving profile requires a pinned memory-saver policy")
+            issues.append(f"{name}: serving profile recommends a pinned memory-saver policy")
         else:
             issues.extend(memory_saver_problems(name, data, policy))
         if data.get("driver") != policy["driver"]:
-            issues.append(f"{name}: serving profile requires NVIDIA {policy['driver']}")
+            issues.append(f"{name}: serving profile recommends NVIDIA {policy['driver']}")
     return issues
 
 
