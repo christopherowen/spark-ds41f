@@ -1,0 +1,970 @@
+From 197c9d687e35681ff442901fd1166c568a52db44 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:38:09 +0100
+Subject: [PATCH] engram: single-plane 264-byte row-interleaved and
+ rank-compacted disk rows
+
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 138 +++++++++-
+ tests/models/test_deepseek_v4_1_engram.py     |  86 ++++++
+ vllm/models/deepseek_v4_1/common/engram.py    |  67 ++++-
+ .../deepseek_v4_1/engram_rows/__init__.py     |  16 +-
+ .../deepseek_v4_1/engram_rows/_reader.c       | 254 +++++++++++++++++-
+ .../deepseek_v4_1/engram_rows/_row_plan.h     |  64 ++++-
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  97 +++++++
+ 7 files changed, 697 insertions(+), 25 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4e358c4e8..29b455a01 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -12,10 +12,18 @@ import subprocess
+ import sys
+ import time
+ 
++import numpy as np
+ import pytest
+ import torch
+ 
+-from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows
++from vllm.models.deepseek_v4_1.engram_rows import (
++    PACKED_ROW_BYTES,
++    EngramDiskRows,
++    column_compaction_map,
++    host_hash,
++    pack_engram_columns,
++)
++from vllm.models.deepseek_v4_1.engram_rows.rows import ROW_BYTES
+ 
+ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ 
+@@ -75,12 +83,12 @@ def _rows(paths, start=0, end=TABLE_ROWS, tokens=16, **kwargs):
+     return rows
+ 
+ 
+-def _step(rows, ids, live):
++def _step(rows, ids, live, early=None):
+     stream = torch.cuda.current_stream()
+     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
+     width = bin(rows.columns).count("1") * 256  # the rank's columns, side by side
+     out = torch.full((ids.shape[0], width), 7, dtype=torch.bfloat16, device="cuda")
+-    rows.stage(stream, ids, ids.numel())
++    rows.stage(stream, ids, ids.numel(), early)
+     rows.gather(out, ids, num_tokens)
+     return out, num_tokens
+ 
+@@ -525,3 +533,127 @@ def test_timeline_is_off_by_default():
+     torch.cuda.synchronize()
+     assert not rows.timeline_enabled and rows.timeline() == []
+     rows.close()
++
++
++@pytest.mark.parametrize("offset", [0, 4093, 4096 - ROW_BYTES, 4096 - ROW_BYTES - 4])
++def test_packed_single_plane_rows_split_cleanly_across_page_boundaries(offset):
++    """A 264-byte row-interleaved source scatters weights [0..256) and scales [256..264)
++    identically to the two-plane reader even when 4 KiB page boundaries split a row
++    inside its weight bytes, at the weight/scale boundary, or inside its scale bytes."""
++    directory = _table_dir()
++    weights, scales, _ = _write_table(directory, seed=31)
++    packed = torch.cat([weights, scales], dim=1).contiguous()
++    assert packed.shape == (TABLE_ROWS, PACKED_ROW_BYTES)
++    packed_path = os.path.join(directory, f"packed-{offset}.bin")
++    with open(packed_path, "wb") as f:
++        f.write(b"\x5a" * offset)
++        f.write(packed.numpy().tobytes())
++
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16 * HEADS,
++    )
++    rows.add_packed_source(packed_path, offset)
++    try:
++        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), dtype=torch.int64)
++        ids[0, :6] = torch.tensor([0, 1, 15, 16, TABLE_ROWS - 2, TABLE_ROWS - 1])
++        ids[1, :4] = torch.tensor([-1, -99, TABLE_ROWS, TABLE_ROWS + 5])
++        actual, _ = _step(rows, ids.cuda(), 13)
++        expected = _reference(weights, scales, ids, 13, 0, TABLE_ROWS)
++        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++    finally:
++        rows.close()
++
++
++@pytest.mark.parametrize(
++    "tp_size,tp_rank",
++    [(3, 0), (3, 1), (3, 2), (4, 0), (4, 3)],
++)
++def test_pack_engram_columns_and_compacted_column_map_match_two_plane_reader(
++    tp_size, tp_rank
++):
++    """Packing a rank's interleaved hash columns into a compacted 264-byte file writes
++    only that rank's rows, cuts per-step disk read calls compared to two-plane storage,
++    and gathers the exact same BF16 values (both from GPU IDs and from early host IDs)."""
++    directory = _table_dir()
++    weights, scales, paths = _write_table(directory, seed=41 + tp_size * 10 + tp_rank)
++    widths = np.full(HEADS, TABLE_ROWS // HEADS, dtype=np.int64)
++    widths[: TABLE_ROWS % HEADS] += 1
++    offsets = np.zeros(HEADS, dtype=np.int64)
++    np.cumsum(widths[:-1], out=offsets[1:])
++
++    owned_cols = tuple(range(tp_rank, HEADS, tp_size))
++    col_mask = sum(1 << c for c in owned_cols)
++    col_start, col_end, col_delta, owned_starts, owned_rows = column_compaction_map(
++        offsets, TABLE_ROWS, owned_cols
++    )
++    packed_path = os.path.join(directory, f"rank-tp{tp_size}-r{tp_rank}.packed")
++    pack_engram_columns(
++        paths[0],
++        WEIGHT_OFFSET,
++        paths[1],
++        SCALE_OFFSET,
++        packed_path,
++        owned_starts,
++        owned_rows,
++    )
++    assert os.path.getsize(packed_path) == int(owned_rows.sum()) * PACKED_ROW_BYTES
++
++    two_plane = _rows(paths, tokens=32, columns=col_mask)
++    packed_rows = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        columns=col_mask,
++        max_lookups=32 * HEADS,
++        check_early=True,
++    )
++    packed_rows.add_packed_source(
++        packed_path,
++        0,
++        col_start=col_start,
++        col_end=col_end,
++        col_delta=col_delta,
++    )
++    try:
++        rng = np.random.default_rng(100 + tp_rank)
++        ids_np = np.empty((32, HEADS), dtype=np.int64)
++        for c in range(HEADS):
++            s = int(offsets[c])
++            e = int(offsets[c + 1]) if c + 1 < HEADS else TABLE_ROWS
++            ids_np[:, c] = rng.integers(s, e, size=32, dtype=np.int64)
++        ids_np[0, owned_cols[0]] = int(offsets[owned_cols[0]])
++        ids_np[1, owned_cols[-1]] = (
++            int(offsets[owned_cols[-1] + 1]) - 1
++            if owned_cols[-1] + 1 < HEADS
++            else TABLE_ROWS - 1
++        )
++        ids_np[2, ::3] = -1
++        ids = torch.from_numpy(ids_np)
++        early = ids_np.copy()
++        early[20:] = host_hash.UNKNOWN
++
++        out_two, _ = _step(two_plane, ids.cuda(), 29, early=early)
++        out_packed, _ = _step(packed_rows, ids.cuda(), 29, early=early)
++        expected = _reference(weights, scales, ids, 29, 0, TABLE_ROWS, col_mask)
++        torch.testing.assert_close(
++            out_packed.cpu(), expected, rtol=0, atol=0, equal_nan=True
++        )
++        torch.testing.assert_close(
++            out_packed.cpu(), out_two.cpu(), rtol=0, atol=0, equal_nan=True
++        )
++
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while (
++            two_plane.stats()["queued"] or packed_rows.stats()["queued"]
++        ) and time.monotonic() < deadline:
++            time.sleep(0.001)
++        assert packed_rows.stats()["read_calls"] < two_plane.stats()["read_calls"]
++    finally:
++        two_plane.close()
++        packed_rows.close()
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 75c02de7e..7f19b0ea1 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1180,3 +1180,89 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+     rows = engram_module.interleaved_rows(locals_[0])
+     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+     assert rows.data_ptr() == gathered[0].data_ptr()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("tp_rank", [0, 3])
++@torch.inference_mode()
++def test_disk_rows_pack_and_read_rank_compacted_files(
++    tmp_path, dist_init, monkeypatch, tp_rank
++):
++    """When ENGRAM_PACKED_DIR is set, open_disk_rows packs this rank's hash columns
++    into a single-plane 264-byte file on first open, reuses it on subsequent opens, and
++    gathers identical BF16 rows."""
++    import os
++
++    packed_dir = os.path.join(
++        os.environ.get("ENGRAM_ROWS_TEST_DIR", "/cache/engram-rows-test"),
++        f"packed-model-{os.getpid()}-r{tp_rank}",
++    )
++    monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", packed_dir)
++    device = torch.device("cuda", torch.cuda.current_device())
++    capacity = 7
++    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
++    caps = native.Caps(
++        device=device,
++        max_tokens=capacity,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=4,
++        tp_rank=tp_rank,
++    )
++    layout = SimpleNamespace(
++        caps=(caps,),
++        lookup_plans=(None,),
++        geometry=geometry,
++        table_memory="disk",
++        projection_tp=False,
++    )
++    config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
++    old_dtype = torch.get_default_dtype()
++    try:
++        torch.set_default_dtype(torch.bfloat16)
++        with torch.device(device):
++            module = Engram(config, None, layout, 0, False, "engram_packed_test")
++    finally:
++        torch.set_default_dtype(old_dtype)
++    embed = module.embed_tokens
++    row_values = torch.arange(embed.table_rows).remainder(7).add(1)
++    weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
++    scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
++    for name, tensor, offset, scale in (
++        ("weight.bin", weight, 4093, False),
++        ("scale.bin", scales, 123, True),
++    ):
++        path = os.path.join(packed_dir, name)
++        os.makedirs(packed_dir, exist_ok=True)
++        with open(path, "wb") as stream:
++            stream.write(bytes(offset))
++            stream.write(tensor.view(torch.uint8).numpy().tobytes())
++        embed._disk_sources.append((path, offset, scale))
++    embed.open_disk_rows()
++    packed_files = [f for f in os.listdir(packed_dir) if f.endswith(".packed")]
++    assert len(packed_files) == 1
++    offsets = np.asarray(geometry.offsets[0], dtype=np.int64)
++    ends = np.append(offsets[1:], embed.table_rows)
++    ids_np = np.empty((capacity, 24), dtype=np.int64)
++    for c in range(24):
++        ids_np[:, c] = offsets[c] + (np.arange(capacity) % (ends[c] - offsets[c]))
++    ids = torch.from_numpy(ids_np).to(device)
++    count = torch.tensor([capacity], device=device, dtype=torch.int32)
++    try:
++        output = module.staged_rows
++        embed.hashes[:capacity].copy_(ids)
++        embed.num_tokens.copy_(count)
++        module.stage_rows(capacity, torch.cuda.current_stream())
++        embed.gather_rows(output)
++        owned = [h for h in range(24) if embed.column_mask >> h & 1]
++        reference = weight.float()[ids.cpu()[:, owned]].flatten(1)
++        torch.testing.assert_close(
++            output.cpu(), reference.bfloat16(), rtol=0, atol=0
++        )
++    finally:
++        embed.close()
++        for f in os.listdir(packed_dir):
++            os.unlink(os.path.join(packed_dir, f))
++        os.rmdir(packed_dir)
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 45ca741de..34317df18 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -21,7 +21,13 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
+-from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows, MappedHostAllocation
++from vllm.models.deepseek_v4_1.engram_rows import (
++    PACKED_ROW_BYTES,
++    EngramDiskRows,
++    MappedHostAllocation,
++    column_compaction_map,
++    pack_engram_columns,
++)
+ from vllm.utils.b12x import (
+     B12xPreparationUnit,
+     B12xWorkload,
+@@ -117,6 +123,8 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+ ENGRAM_TIMELINE_DIR = os.environ.get(
+     "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
+ )
++# Optional directory for rank-compacted 264-byte row-interleaved disk Engram files.
++ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "")
+ _timeline_tables: list = []
+ 
+ 
+@@ -402,9 +410,9 @@ class ParallelEngramEmbedding(nn.Module):
+         super().__init__()
+         self.plan = plan
+         self.caps = caps
+-        self.table_rows = geometry.num_embeddings[
+-            geometry.layer_ids.index(caps.layer_id)
+-        ]
++        self.geometry = geometry
++        self.layer_index = geometry.layer_ids.index(caps.layer_id)
++        self.table_rows = geometry.num_embeddings[self.layer_index]
+         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
+         self.shard_start = caps.tp_rank * self.shard_rows
+         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
+@@ -621,8 +629,55 @@ class ParallelEngramEmbedding(nn.Module):
+             check_early=ENGRAM_CHECK_EARLY_IDS,
+             timeline=ENGRAM_TIMELINE,
+         )
+-        for path, offset, scale in self._disk_sources:
+-            rows.add_source(path, offset, scale=scale)
++        if ENGRAM_PACKED_DIR and self.columns is not None:
++            import hashlib
++
++            by_plane = {scale: (path, offset) for path, offset, scale in self._disk_sources}
++            w_path, w_offset = by_plane[False]
++            s_path, s_offset = by_plane[True]
++            col_start, col_end, col_delta, owned_starts, owned_rows = (
++                column_compaction_map(
++                    self.geometry.offsets[self.layer_index],
++                    self.table_rows,
++                    self.columns,
++                )
++            )
++            w_stat, s_stat = os.stat(w_path), os.stat(s_path)
++            digest = hashlib.sha256(
++                f"{w_path}:{w_offset}:{w_stat.st_size}:{w_stat.st_mtime_ns}:"
++                f"{s_path}:{s_offset}:{s_stat.st_size}:{s_stat.st_mtime_ns}:"
++                f"{self.table_rows}:{self.column_mask:#x}".encode()
++            ).hexdigest()[:16]
++            os.makedirs(ENGRAM_PACKED_DIR, exist_ok=True)
++            packed_path = os.path.join(
++                ENGRAM_PACKED_DIR,
++                f"engram-layer{self.caps.layer_id}-tp{self.caps.tp_size}"
++                f"-rank{self.caps.tp_rank}-{digest}.packed",
++            )
++            expected_bytes = int(owned_rows.sum()) * PACKED_ROW_BYTES
++            if (
++                not os.path.exists(packed_path)
++                or os.path.getsize(packed_path) != expected_bytes
++            ):
++                pack_engram_columns(
++                    w_path,
++                    w_offset,
++                    s_path,
++                    s_offset,
++                    packed_path,
++                    owned_starts,
++                    owned_rows,
++                )
++            rows.add_packed_source(
++                packed_path,
++                0,
++                col_start=col_start,
++                col_end=col_end,
++                col_delta=col_delta,
++            )
++        else:
++            for path, offset, scale in self._disk_sources:
++                rows.add_source(path, offset, scale=scale)
+         self.disk_rows = rows
+         if ENGRAM_TIMELINE:
+             _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/__init__.py b/vllm/models/deepseek_v4_1/engram_rows/__init__.py
+index 5920e3644..6c805aa15 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/__init__.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/__init__.py
+@@ -2,6 +2,18 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek-V4.1 Engram rows read from the checkpoint as steps ask (see ``rows``)."""
+ 
+-from vllm.models.deepseek_v4_1.engram_rows.rows import EngramDiskRows, MappedHostAllocation
++from vllm.models.deepseek_v4_1.engram_rows.rows import (
++    PACKED_ROW_BYTES,
++    EngramDiskRows,
++    MappedHostAllocation,
++    column_compaction_map,
++    pack_engram_columns,
++)
+ 
+-__all__ = ["EngramDiskRows", "MappedHostAllocation"]
++__all__ = [
++    "EngramDiskRows",
++    "MappedHostAllocation",
++    "PACKED_ROW_BYTES",
++    "column_compaction_map",
++    "pack_engram_columns",
++]
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index 110d705d0..62f96b204 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -129,6 +129,8 @@ typedef struct {
+     uint64_t ids_timeout_ns, delay_ns;
+     failure_t failure; /* the first failure; no step is read after it */
+     uint64_t steps_done, lookups_done, early_lookups;
++    uint64_t read_calls, unique_blocks, read_bytes;
++    uint64_t step_read_calls, step_unique_blocks, step_read_bytes;
+     double ids_wait_seconds, read_seconds, consumed_wait_seconds, early_read_seconds;
+ } reader_t;
+ 
+@@ -155,10 +157,30 @@ static void ple_error(reader_t *reader, const char *operation, int error) {
+ /* Copy a completed job's fragments from its slot buffer to their lookup slots. */
+ static void ple_scatter(reader_t *reader, size_t index, const char *buffer) {
+     ple_job_t *job = &reader->plan.jobs[index];
++    if (!reader->plan.packed) {
++        for (size_t i = job->begin; i < job->end; i++) {
++            ple_fragment_t *fragment = &reader->plan.fragments[i];
++            memcpy((fragment->scale ? reader->scales : reader->weights) + fragment->destination,
++                   buffer + (fragment->offset - job->offset), fragment->length);
++        }
++        return;
++    }
+     for (size_t i = job->begin; i < job->end; i++) {
+         ple_fragment_t *fragment = &reader->plan.fragments[i];
+-        memcpy((fragment->scale ? reader->scales : reader->weights) + fragment->destination,
+-               buffer + (fragment->offset - job->offset), fragment->length);
++        const char *src = buffer + (fragment->offset - job->offset);
++        size_t lookup = fragment->destination / 264u;
++        size_t in_row = fragment->destination % 264u;
++        size_t end_in_row = in_row + fragment->length;
++        if (in_row < 256u) {
++            size_t w_len = (end_in_row <= 256u ? end_in_row : 256u) - in_row;
++            memcpy(reader->weights + lookup * 256u + in_row, src, w_len);
++        }
++        if (end_in_row > 256u) {
++            size_t s_start = in_row > 256u ? in_row - 256u : 0u;
++            size_t s_len = (end_in_row - 256u) - s_start;
++            size_t src_off = in_row < 256u ? 256u - in_row : 0u;
++            memcpy(reader->scales + lookup * 8u + s_start, src + src_off, s_len);
++        }
+     }
+ }
+ 
+@@ -326,6 +348,9 @@ static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
+     bool planned = ple_plan(&reader->plan, ids, count);
+     reader->step_plan_ns += now_ns() - planning;
+     if (planned && reader->plan.job_count) ple_uring_run(reader);
++    reader->step_read_calls += reader->plan.read_calls;
++    reader->step_unique_blocks += reader->plan.unique_blocks;
++    reader->step_read_bytes += reader->plan.read_bytes;
+     return reader->plan.failure;
+ }
+ 
+@@ -417,6 +442,7 @@ static void serve(reader_t *reader, step_t step) {
+     uint64_t started = now_ns();
+     uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
+     reader->step_plan_ns = 0;
++    reader->step_read_calls = reader->step_unique_blocks = reader->step_read_bytes = 0;
+     if (reader->timeline) {
+         gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
+         gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
+@@ -446,6 +472,9 @@ static void serve(reader_t *reader, step_t step) {
+         reader->steps_done++;
+         reader->lookups_done += step.count;
+         reader->early_lookups += early_count;
++        reader->read_calls += reader->step_read_calls;
++        reader->unique_blocks += reader->step_unique_blocks;
++        reader->read_bytes += reader->step_read_bytes;
+         reader->consumed_wait_seconds += consumed_wait;
+         reader->early_read_seconds += early_read;
+         reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
+@@ -673,6 +702,212 @@ static PyObject *py_add(PyObject *self, PyObject *args) {
+     Py_RETURN_NONE;
+ }
+ 
++static bool extract_col_array(PyObject *obj, int64_t out[PLE_COLUMNS], bool *present) {
++    if (obj == Py_None) {
++        *present = false;
++        return true;
++    }
++    Py_buffer view;
++    if (PyObject_GetBuffer(obj, &view, PyBUF_C_CONTIGUOUS) < 0) return false;
++    if (view.len != (Py_ssize_t)(PLE_COLUMNS * sizeof(int64_t))) {
++        PyBuffer_Release(&view);
++        PyErr_Format(PyExc_ValueError, "Engram column map array must be %u int64 values", PLE_COLUMNS);
++        return false;
++    }
++    memcpy(out, view.buf, PLE_COLUMNS * sizeof(int64_t));
++    PyBuffer_Release(&view);
++    *present = true;
++    return true;
++}
++
++/* add_packed(reader, path, offset[, col_start, col_end, col_delta]): register a single-plane
++ * 264-byte row-interleaved source (optionally compacted to this rank's columns). */
++static PyObject *py_add_packed(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule, *start_obj = Py_None, *end_obj = Py_None, *delta_obj = Py_None;
++    const char *path;
++    long long offset;
++    if (!PyArg_ParseTuple(args, "OsL|OOO", &capsule, &path, &offset, &start_obj, &end_obj, &delta_obj))
++        return NULL;
++    reader_t *reader = get_reader(capsule);
++    if (!reader) return NULL;
++    int64_t col_start[PLE_COLUMNS] = {0}, col_end[PLE_COLUMNS] = {0}, col_delta[PLE_COLUMNS] = {0};
++    bool has_start = false, has_end = false, has_delta = false;
++    if (!extract_col_array(start_obj, col_start, &has_start) ||
++        !extract_col_array(end_obj, col_end, &has_end) ||
++        !extract_col_array(delta_obj, col_delta, &has_delta))
++        return NULL;
++    if (has_start != has_end || has_start != has_delta)
++        return PyErr_Format(PyExc_ValueError, "Engram column map requires col_start, col_end and col_delta together");
++    int error;
++    failure_t failure = {{0}};
++    Py_BEGIN_ALLOW_THREADS
++    pthread_mutex_lock(&reader->mutex);
++    if (__atomic_load_n(&reader->started, __ATOMIC_RELAXED)) {
++        error = EBUSY;
++    } else {
++        reader->plan.failure.message[0] = 0;
++        error = ple_add_packed_source(&reader->plan, 0, path, offset,
++                                      has_start ? col_start : NULL,
++                                      has_end ? col_end : NULL,
++                                      has_delta ? col_delta : NULL,
++                                      ple_register_files, reader);
++        failure = reader->plan.failure;
++    }
++    pthread_mutex_unlock(&reader->mutex);
++    Py_END_ALLOW_THREADS
++    if (error == EBUSY) return PyErr_Format(PyExc_RuntimeError, "Engram sources are fixed once steps run");
++    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    if (error) return PyErr_Format(PyExc_ValueError, "Engram packed source: %s", strerror(error));
++    Py_RETURN_NONE;
++}
++
++static bool pread_exact(int fd, char *buf, size_t len, off_t offset, failure_t *failure, const char *what) {
++    size_t done = 0;
++    while (done < len) {
++        ssize_t n = pread(fd, buf + done, len - done, offset + (off_t)done);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            system_error(failure, what);
++            return false;
++        }
++        if (n == 0) {
++            snprintf(failure->message, sizeof(failure->message), "%s: unexpected end of file", what);
++            return false;
++        }
++        done += (size_t)n;
++    }
++    return true;
++}
++
++static bool pwrite_exact(int fd, const char *buf, size_t len, off_t offset, failure_t *failure, const char *what) {
++    size_t done = 0;
++    while (done < len) {
++        ssize_t n = pwrite(fd, buf + done, len - done, offset + (off_t)done);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            system_error(failure, what);
++            return false;
++        }
++        done += (size_t)n;
++    }
++    return true;
++}
++
++/* pack_columns(weight_path, weight_offset, scale_path, scale_offset, out_path, col_starts, col_rows):
++ * stream the owned columns' 256-byte E4M3 weights and 8-byte E8M0 scales into a compact 264-byte/row
++ * file at out_path, dropping OS page-cache pages after each chunk so unified memory stays free. */
++static PyObject *py_pack_columns(PyObject *self, PyObject *args) {
++    (void)self;
++    const char *w_path, *s_path, *out_path;
++    long long w_offset, s_offset;
++    PyObject *starts_obj, *rows_obj;
++    if (!PyArg_ParseTuple(args, "sLsLsOO", &w_path, &w_offset, &s_path, &s_offset, &out_path,
++                          &starts_obj, &rows_obj))
++        return NULL;
++    if (w_offset < 0 || s_offset < 0)
++        return PyErr_Format(PyExc_ValueError, "Engram source offsets must be non-negative");
++    Py_buffer starts_view, rows_view;
++    if (PyObject_GetBuffer(starts_obj, &starts_view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
++    if (PyObject_GetBuffer(rows_obj, &rows_view, PyBUF_C_CONTIGUOUS) < 0) {
++        PyBuffer_Release(&starts_view);
++        return NULL;
++    }
++    if (starts_view.len <= 0 || starts_view.len != rows_view.len ||
++        starts_view.len % (Py_ssize_t)sizeof(int64_t) != 0) {
++        PyBuffer_Release(&starts_view);
++        PyBuffer_Release(&rows_view);
++        return PyErr_Format(PyExc_ValueError, "col_starts and col_rows must be equal-length non-empty int64 arrays");
++    }
++    size_t num_cols = (size_t)starts_view.len / sizeof(int64_t);
++    int64_t *col_starts = malloc(num_cols * sizeof(int64_t));
++    int64_t *col_rows = malloc(num_cols * sizeof(int64_t));
++    if (!col_starts || !col_rows) {
++        free(col_starts);
++        free(col_rows);
++        PyBuffer_Release(&starts_view);
++        PyBuffer_Release(&rows_view);
++        return PyErr_NoMemory();
++    }
++    memcpy(col_starts, starts_view.buf, num_cols * sizeof(int64_t));
++    memcpy(col_rows, rows_view.buf, num_cols * sizeof(int64_t));
++    PyBuffer_Release(&starts_view);
++    PyBuffer_Release(&rows_view);
++
++    size_t chunk_rows = 65536u;
++    char *w_buf = malloc(chunk_rows * 256u);
++    char *s_buf = malloc(chunk_rows * 8u);
++    char *p_buf = malloc(chunk_rows * 264u);
++    size_t tmp_len = strlen(out_path) + 32u;
++    char *tmp_path = malloc(tmp_len);
++    if (!w_buf || !s_buf || !p_buf || !tmp_path) {
++        free(col_starts);
++        free(col_rows);
++        free(w_buf);
++        free(s_buf);
++        free(p_buf);
++        free(tmp_path);
++        return PyErr_NoMemory();
++    }
++    snprintf(tmp_path, tmp_len, "%s.tmp.%d", out_path, (int)getpid());
++    failure_t failure = {{0}};
++    Py_BEGIN_ALLOW_THREADS
++    int w_fd = open(w_path, O_RDONLY | O_CLOEXEC);
++    int s_fd = open(s_path, O_RDONLY | O_CLOEXEC);
++    int out_fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++    if (w_fd < 0) system_error(&failure, "open weight source");
++    else if (s_fd < 0) system_error(&failure, "open scale source");
++    else if (out_fd < 0) system_error(&failure, "open packed output");
++    off_t out_off = 0;
++    for (size_t c = 0; c < num_cols && !failure.message[0]; c++) {
++        int64_t start = col_starts[c], rows = col_rows[c];
++        if (start < 0 || rows < 0) {
++            snprintf(failure.message, sizeof(failure.message), "negative column start or row count");
++            break;
++        }
++        int64_t done = 0;
++        while (done < rows && !failure.message[0]) {
++            size_t n = (size_t)(rows - done > (int64_t)chunk_rows ? (int64_t)chunk_rows : rows - done);
++            off_t w_off = (off_t)w_offset + (off_t)(start + done) * 256;
++            off_t s_off = (off_t)s_offset + (off_t)(start + done) * 8;
++            if (!pread_exact(w_fd, w_buf, n * 256u, w_off, &failure, "read weight column") ||
++                !pread_exact(s_fd, s_buf, n * 8u, s_off, &failure, "read scale column"))
++                break;
++            for (size_t r = 0; r < n; r++) {
++                memcpy(p_buf + r * 264u, w_buf + r * 256u, 256u);
++                memcpy(p_buf + r * 264u + 256u, s_buf + r * 8u, 8u);
++            }
++            if (!pwrite_exact(out_fd, p_buf, n * 264u, out_off, &failure, "write packed column"))
++                break;
++            (void)posix_fadvise(w_fd, w_off, (off_t)(n * 256u), POSIX_FADV_DONTNEED);
++            (void)posix_fadvise(s_fd, s_off, (off_t)(n * 8u), POSIX_FADV_DONTNEED);
++            (void)posix_fadvise(out_fd, out_off, (off_t)(n * 264u), POSIX_FADV_DONTNEED);
++            out_off += (off_t)(n * 264u);
++            done += (int64_t)n;
++        }
++    }
++    if (!failure.message[0]) {
++        if (fsync(out_fd) != 0) system_error(&failure, "fsync packed output");
++        else (void)posix_fadvise(out_fd, 0, 0, POSIX_FADV_DONTNEED);
++    }
++    if (w_fd >= 0) close(w_fd);
++    if (s_fd >= 0) close(s_fd);
++    if (out_fd >= 0) close(out_fd);
++    if (!failure.message[0]) {
++        if (rename(tmp_path, out_path) != 0) system_error(&failure, "rename packed output");
++    }
++    if (failure.message[0]) unlink(tmp_path);
++    Py_END_ALLOW_THREADS
++    free(col_starts);
++    free(col_rows);
++    free(w_buf);
++    free(s_buf);
++    free(p_buf);
++    free(tmp_path);
++    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    Py_RETURN_NONE;
++}
++
+ /* submit(reader, sequence, count, wait_s, early): queue one step behind every step
+  * already queued. ``early`` is None or ``count`` int64 IDs the host hashed
+  * (UNKNOWN_ID where only the GPU knows the ID), copied here. Returns at once unless
+@@ -761,7 +996,7 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+     failure_t failure;
+-    uint64_t steps, lookups, queued, early;
++    uint64_t steps, lookups, queued, early, read_calls, unique_blocks, read_bytes;
+     double ids_wait, read, consumed_wait, early_read;
+     Py_BEGIN_ALLOW_THREADS
+     pthread_mutex_lock(&queue.mutex);
+@@ -771,6 +1006,9 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     failure = reader->failure;
+     steps = reader->steps_done;
+     lookups = reader->lookups_done;
++    read_calls = reader->read_calls;
++    unique_blocks = reader->unique_blocks;
++    read_bytes = reader->read_bytes;
+     ids_wait = reader->ids_wait_seconds;
+     read = reader->read_seconds;
+     early = reader->early_lookups;
+@@ -780,10 +1018,12 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     Py_END_ALLOW_THREADS
+     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
+     if (!message) return NULL;
+-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message, "steps",
+-                                     (unsigned long long)steps, "lookups", (unsigned long long)lookups,
++    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message,
++                                     "steps", (unsigned long long)steps, "lookups", (unsigned long long)lookups,
+                                      "early_lookups", (unsigned long long)early, "queued",
+-                                     (unsigned long long)queued, "ids_wait_seconds", ids_wait,
++                                     (unsigned long long)queued, "read_calls", (unsigned long long)read_calls,
++                                     "unique_blocks", (unsigned long long)unique_blocks, "read_bytes",
++                                     (unsigned long long)read_bytes, "ids_wait_seconds", ids_wait,
+                                      "read_seconds", read, "consumed_wait_seconds", consumed_wait,
+                                      "early_read_seconds", early_read);
+     return result;
+@@ -831,6 +1071,8 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
+ static PyMethodDef methods[] = {
+     {"reader", py_reader, METH_VARARGS, NULL},
+     {"add", py_add, METH_VARARGS, NULL},
++    {"add_packed", py_add_packed, METH_VARARGS, NULL},
++    {"pack_columns", py_pack_columns, METH_VARARGS, NULL},
+     {"submit", py_submit, METH_VARARGS, NULL},
+     {"status", py_status, METH_O, NULL},
+     {"timeline", py_timeline, METH_O, NULL},
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 7e0f8a2eb..f70f4719f 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -45,6 +45,8 @@ typedef struct {
+ typedef struct {
+     int64_t shard_rows, padded_rows, tp_start, tp_end;
+     uint32_t columns;
++    bool packed, has_col_map;
++    int64_t col_start[PLE_COLUMNS], col_end[PLE_COLUMNS], col_delta[PLE_COLUMNS];
+     size_t weight_bytes, scale_bytes, max_lookups, capacity;
+     ple_fragment_t *fragments;
+     ple_job_t *jobs;
+@@ -100,16 +102,17 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+     return reader->fragments && reader->jobs ? 0 : ENOMEM;
+ }
+ 
+-static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *path,
+-        int64_t offset, bool scale, int (*register_files)(ple_plan_t *, void *), void *owner) {
++static inline int ple_add_source_rows(ple_plan_t *reader, int64_t shard, const char *path,
++        int64_t offset, bool scale, int64_t expected_rows,
++        int (*register_files)(ple_plan_t *, void *), void *owner) {
+     if (shard < 0 || shard > (reader->padded_rows - 1) / reader->shard_rows || offset < 0 ||
+         (scale && !reader->scale_bytes)) return EINVAL;
+     int64_t first = shard * reader->shard_rows;
+-    int64_t rows = reader->padded_rows - first;
+-    if (rows > reader->shard_rows) rows = reader->shard_rows;
++    int64_t rows = expected_rows >= 0 ? expected_rows : (reader->padded_rows - first);
++    if (expected_rows < 0 && rows > reader->shard_rows) rows = reader->shard_rows;
+     size_t row_bytes = scale ? reader->scale_bytes : reader->weight_bytes;
+     if (rows > (INT64_MAX - offset) / (int64_t)row_bytes) return EOVERFLOW;
+-    if (first >= reader->tp_end || first + rows <= reader->tp_start) return 0;
++    if (expected_rows < 0 && (first >= reader->tp_end || first + rows <= reader->tp_start)) return 0;
+     failure_t failure = {{0}};
+     ple_source_t key = {.shard = shard, .scale = scale};
+     if (reader->source_count && bsearch(&key, reader->sources, reader->source_count,
+@@ -160,6 +163,39 @@ static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *
+     return failure.message[0] ? EIO : 0;
+ }
+ 
++static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *path,
++        int64_t offset, bool scale, int (*register_files)(ple_plan_t *, void *), void *owner) {
++    if (reader->packed) return EINVAL;
++    return ple_add_source_rows(reader, shard, path, offset, scale, -1, register_files, owner);
++}
++
++static inline int ple_add_packed_source(ple_plan_t *reader, int64_t shard, const char *path,
++        int64_t offset, const int64_t *col_start, const int64_t *col_end, const int64_t *col_delta,
++        int (*register_files)(ple_plan_t *, void *), void *owner) {
++    if (reader->source_count && !reader->packed) return EINVAL;
++    int64_t expected_rows = -1;
++    if (col_start || col_end || col_delta) {
++        if (!col_start || !col_end || !col_delta || shard != 0) return EINVAL;
++        expected_rows = 0;
++        for (unsigned c = 0; c < PLE_COLUMNS; c++) {
++            if (!((reader->columns >> c) & 1u)) continue;
++            if (col_start[c] < 0 || col_end[c] < col_start[c] || col_end[c] > reader->padded_rows ||
++                col_start[c] < col_delta[c])
++                return EINVAL;
++            int64_t phys_end = col_end[c] - col_delta[c];
++            if (phys_end > expected_rows) expected_rows = phys_end;
++        }
++        memcpy(reader->col_start, col_start, sizeof(reader->col_start));
++        memcpy(reader->col_end, col_end, sizeof(reader->col_end));
++        memcpy(reader->col_delta, col_delta, sizeof(reader->col_delta));
++        reader->has_col_map = true;
++    }
++    reader->packed = true;
++    reader->weight_bytes = 264;
++    reader->scale_bytes = 0;
++    return ple_add_source_rows(reader, shard, path, offset, false, expected_rows, register_files, owner);
++}
++
+ static inline int ple_fragment_compare(const void *left, const void *right) {
+     const ple_fragment_t *a = left, *b = right;
+     if (a->file != b->file) return a->file < b->file ? -1 : 1;
+@@ -239,13 +275,25 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
+     for (size_t i = 0; i < count; i++) {
+         int64_t id;
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
++        unsigned col = (unsigned)(i % PLE_COLUMNS);
+         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
+          * zeros for it without loading the slot. */
+         if (id < reader->tp_start || id >= reader->tp_end ||
+-            !((reader->columns >> (i % PLE_COLUMNS)) & 1u))
++            !((reader->columns >> col) & 1u))
+             continue;
++        int64_t phys_id = id;
++        if (reader->has_col_map) {
++            if (id < reader->col_start[col] || id >= reader->col_end[col]) {
++                snprintf(reader->failure.message, sizeof(reader->failure.message),
++                         "Engram row %lld is outside hash column %u range [%lld, %lld)",
++                         (long long)id, col, (long long)reader->col_start[col],
++                         (long long)reader->col_end[col]);
++                return false;
++            }
++            phys_id = id - reader->col_delta[col];
++        }
+         for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
+-            ple_source_t key = {.shard = id / reader->shard_rows, .scale = plane != 0};
++            ple_source_t key = {.shard = phys_id / reader->shard_rows, .scale = plane != 0};
+             ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,
+                 reader->source_count, sizeof(key), ple_source_compare) : NULL;
+             if (!source) {
+@@ -255,7 +303,7 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
+             }
+             size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
+             size_t destination = i * bytes;
+-            int64_t offset = source->offset + (id % reader->shard_rows) * (int64_t)bytes;
++            int64_t offset = source->offset + (phys_id % reader->shard_rows) * (int64_t)bytes;
+             reader->requested_bytes += bytes;
+             while (bytes) {
+                 unsigned length = PLE_BLOCK - (uint64_t)offset % PLE_BLOCK;
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 89dcca295..d3a893fc9 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -29,6 +29,7 @@ from vllm.models.deepseek_v4_1.engram_rows._native import load
+ 
+ ROW_BYTES = 256  # E4M3 values of one row
+ SCALE_BYTES = 8  # E8M0 scales of one row, one per 32 values
++PACKED_ROW_BYTES = ROW_BYTES + SCALE_BYTES  # 264-byte row-interleaved storage
+ PHASES = {
+     0: "idle",
+     1: "waiting for the step's row IDs",
+@@ -101,6 +102,76 @@ class MappedHostAllocation:
+ ALL_COLUMNS = (1 << 24) - 1
+ 
+ 
++def column_compaction_map(
++    offsets,
++    table_rows: int,
++    columns: tuple[int, ...],
++) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """Build per-column compaction tables for ``columns`` (a subset of ``0..23``).
++
++    Returns ``(col_start, col_end, col_delta, owned_starts, owned_rows)`` as contiguous
++    ``int64`` arrays, where global row ``id`` of owned column ``c`` maps to physical
++    compacted row ``id - col_delta[c]`` in ``[0, owned_rows.sum())``.
++    """
++    starts = np.asarray(offsets, dtype=np.int64)
++    if starts.shape != (24,):
++        raise ValueError(f"Engram column offsets must have 24 entries, got {starts.shape}")
++    ends = np.empty(24, dtype=np.int64)
++    ends[:23] = starts[1:]
++    ends[23] = int(table_rows)
++
++    owned = sorted(int(c) for c in columns)
++    col_start = np.zeros(24, dtype=np.int64)
++    col_end = np.zeros(24, dtype=np.int64)
++    col_delta = np.zeros(24, dtype=np.int64)
++    owned_starts = np.empty(len(owned), dtype=np.int64)
++    owned_rows = np.empty(len(owned), dtype=np.int64)
++
++    phys_offset = 0
++    for idx, col in enumerate(owned):
++        if not 0 <= col < 24:
++            raise ValueError(f"Engram column index out of range: {col}")
++        s = int(starts[col])
++        e = int(ends[col])
++        r = e - s
++        if r < 0:
++            raise ValueError(f"Invalid column range [{s}, {e}) for column {col}")
++        col_start[col] = s
++        col_end[col] = e
++        col_delta[col] = s - phys_offset
++        owned_starts[idx] = s
++        owned_rows[idx] = r
++        phys_offset += r
++
++    return col_start, col_end, col_delta, owned_starts, owned_rows
++
++
++def pack_engram_columns(
++    weight_path: str,
++    weight_offset: int,
++    scale_path: str,
++    scale_offset: int,
++    out_path: str,
++    col_starts: np.ndarray,
++    col_rows: np.ndarray,
++) -> None:
++    """Stream ``(col_starts, col_rows)`` from ``weight_path`` and ``scale_path`` into a
++    single-plane 264-byte row-interleaved file at ``out_path`` without polluting the OS
++    page cache."""
++    starts = np.ascontiguousarray(col_starts, dtype=np.int64).reshape(-1)
++    rows = np.ascontiguousarray(col_rows, dtype=np.int64).reshape(-1)
++    load().pack_columns(
++        str(weight_path),
++        int(weight_offset),
++        str(scale_path),
++        int(scale_offset),
++        str(out_path),
++        starts,
++        rows,
++    )
++
++
++
+ class EngramDiskRows:
+     """Rows ``[shard_start, shard_end)`` of the hash columns in the 24-bit mask ``columns``
+     of one Engram table (lookup i of a step is column i % 24), ``max_lookups`` per step.
+@@ -153,6 +224,32 @@ class EngramDiskRows:
+         start at ``offset`` in the immutable file ``path``."""
+         self.native.add(self._reader, str(path), int(offset), bool(scale))
+ 
++    def add_packed_source(
++        self,
++        path: str,
++        offset: int = 0,
++        *,
++        col_start: np.ndarray | None = None,
++        col_end: np.ndarray | None = None,
++        col_delta: np.ndarray | None = None,
++    ) -> None:
++        """Register a single-plane 264-byte row-interleaved (256B E4M3 + 8B E8M0) source
++        at ``offset`` in ``path``, optionally compacted to this rank's hash columns via
++        ``(col_start, col_end, col_delta)``."""
++        if (col_start is None) != (col_end is None) or (col_start is None) != (
++            col_delta is None
++        ):
++            raise ValueError(
++                "col_start, col_end and col_delta must all be provided together or omitted"
++            )
++        if col_start is not None:
++            col_start = np.ascontiguousarray(col_start, dtype=np.int64).reshape(-1)
++            col_end = np.ascontiguousarray(col_end, dtype=np.int64).reshape(-1)
++            col_delta = np.ascontiguousarray(col_delta, dtype=np.int64).reshape(-1)
++        self.native.add_packed(
++            self._reader, str(path), int(offset), col_start, col_end, col_delta
++        )
++
+     def stage(
+         self,
+         stream: torch.cuda.Stream,
+-- 
+2.54.0 (Apple Git-157)
+
