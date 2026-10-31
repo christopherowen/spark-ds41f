@@ -704,6 +704,36 @@ class GLPTest(unittest.TestCase):
         self.assertIn([recipe.glp_file(base), "/glp/vector.gguf", "ro"], mounts["container"]["mounts"])
         self.assertEqual(recipe.overlay({"extends": {}}, base)["serve_args"], base["serve_args"])
 
+    def test_glp27_spec_v3_overlay_arms_resolve(self):
+        spark = load_spark()
+        for arm in (
+            "experiments/2026-10-31-glp-specv3-fold-steering/glp27-tp4.json",
+            "experiments/2026-10-31-glp-specv3-fold-steering/glp27-tp3.json",
+        ):
+            cluster = spark.read_cluster(arm)
+            self.assertEqual(
+                cluster["glp"]["repo"],
+                "msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5",
+            )
+            self.assertEqual(
+                cluster["glp"]["revision"],
+                "4d570926e9dd4fa7247d126072c34e249c89abd7",
+            )
+            self.assertEqual(
+                cluster["glp"]["file"],
+                "glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf",
+            )
+            self.assertEqual(
+                cluster["glp"]["sha256"],
+                "24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e",
+            )
+            self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_PATH"], "/glp/vector.gguf")
+            self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_MODEL"], self.STEERED)
+            self.assertIn(
+                [recipe.glp_file(cluster), "/glp/vector.gguf", "ro"],
+                cluster["container"]["mounts"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1015 @@
+From 8e0a04c78c96a67ce8720f0a47ee22b7de23f070 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sat, 31 Oct 2026 19:47:39 +0100
+Subject: [PATCH] feat(dsv41): native GLP Spec v3 (hc_fold_pre_engram) fold and
+ attention steering
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |   1 +
+ .../kernels/test_deepseek_v41_tilelang_glp.py | 101 ++++++++-
+ tests/models/test_deepseek_v4_1_glp.py        | 200 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/glp.py              | 182 ++++++++++++----
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  16 +-
+ vllm/models/deepseek_v4_1/tilelang/glp.py     | 188 ++++++++++++++--
+ 6 files changed, 621 insertions(+), 67 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab8..3fdf056 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -37,6 +37,7 @@ CHAIN = {
+     "gemm_splitk_reduce_cast",
+     "gemm_splitk_reduce_two",
+     "glp_steer",
++    "glp_steer_write",
+     "indexer_mxfp4_quantize",
+     "indexer_score",
+     "indexer_topk_merge",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_glp.py b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+index ff5ae29..d2dabc5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_glp.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+@@ -54,7 +54,17 @@ def _fold(parts, residual, post, comb) -> torch.Tensor:
+     return out
+ 
+ 
+-def _steer(parts, residual, post, comb, rows, direction, alpha: float):
++def _steer(
++    parts,
++    residual,
++    post,
++    comb,
++    rows,
++    direction,
++    alpha: float,
++    *,
++    mean_streams: bool = False,
++):
+     """The launch on copies: the steered residual, post and comb."""
+     residual, post, comb = residual.clone(), post.clone(), comb.clone()
+     glp.glp_steer(
+@@ -65,15 +75,33 @@ def _steer(parts, residual, post, comb, rows, direction, alpha: float):
+         rows,
+         direction,
+         torch.tensor([alpha], device="cuda"),
++        mean_streams,
+     )
+     return residual, post, comb
+ 
+ 
++def _steer_write(parts, rows, direction, alpha: float) -> torch.Tensor:
++    parts = parts.clone()
++    glp.glp_steer_write(
++        parts,
++        rows,
++        direction,
++        torch.tensor([alpha], device="cuda"),
++    )
++    return parts
++
++
+ def _fp64(streams, direction, alpha: float) -> torch.Tensor:
+     h, d = streams.double(), direction.double()
+     return h - (alpha * (h @ d)).unsqueeze(-1) * d
+ 
+ 
++def _fp64_mean(streams, direction, alpha: float) -> torch.Tensor:
++    h, d = streams.double(), direction.double()
++    dot = h.mean(dim=-2, keepdim=True) @ d
++    return h - (alpha * dot).unsqueeze(-1) * d
++
++
+ def _ulp(x: torch.Tensor) -> torch.Tensor:
+     """BF16's spacing at ``|x|`` (eight significant bits)."""
+     _, exponent = torch.frexp(x.abs().clamp_min(2.0**-126))
+@@ -177,6 +205,66 @@ def test_no_tokens_launch_nothing():
+     parts, residual, post, comb, direction = _inputs(0)
+     rows = torch.zeros(0, dtype=torch.int32, device="cuda")
+     _steer(parts, residual, post, comb, rows, direction, 0.75)
++    _steer(parts, residual, post, comb, rows, direction, 3.5, mean_streams=True)
++    _steer_write(parts, rows, direction, 3.5)
++
++
++@pytest.mark.parametrize("tokens", [1, 7, 96, 384])
++@pytest.mark.parametrize("alpha", [0.75, 1.0, 3.5])
++def test_a_marked_row_with_mean_streams_projects_by_the_stream_mean(tokens, alpha):
++    parts, residual, post, comb, direction = _inputs(tokens, seed=tokens + 100)
++    rows = torch.ones(tokens, dtype=torch.int32, device="cuda")
++    steered, _, _ = _steer(
++        parts, residual, post, comb, rows, direction, alpha, mean_streams=True
++    )
++    folded = _fold(parts, residual, post, comb)
++    exact = _fp64_mean(folded, direction, alpha)
++    assert ((steered.double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
++    assert not torch.allclose(exact, _fp64(folded, direction, alpha))
++
++
++@pytest.mark.parametrize("world", [1, 2, 3, 4])
++def test_mean_streams_next_fold_and_unmarked_rows(world):
++    parts, residual, post, comb, direction = _inputs(130, world=world, seed=world + 20)
++    rows = _marks(130, seed=world + 20)
++    steered, post2, comb2 = _steer(
++        parts, residual, post, comb, rows, direction, 3.5, mean_streams=True
++    )
++    marked = rows.bool()
++    eye = torch.eye(STREAMS, device="cuda").expand(int(marked.sum()), -1, -1)
++    assert torch.equal(comb2[marked], eye)
++    assert torch.equal(post2[marked], torch.zeros_like(post2[marked]))
++    assert torch.equal(_fold(parts, steered, post2, comb2)[marked], steered[marked])
++    kept = ~marked
++    for before, after in ((residual, steered), (post, post2), (comb, comb2)):
++        assert torch.equal(_bits(after)[kept], _bits(before)[kept])
++
++
++@pytest.mark.parametrize("tokens", [1, 7, 96, 384])
++@pytest.mark.parametrize("alpha", [0.75, 1.0, 3.5])
++def test_a_marked_write_is_projected_within_one_rounding(tokens, alpha):
++    parts, _, _, _, direction = _inputs(tokens, seed=tokens + 200)
++    rows = torch.ones(tokens, dtype=torch.int32, device="cuda")
++    steered = _steer_write(parts, rows, direction, alpha)
++    exact = _fp64(_write(parts), direction, alpha)
++    assert ((steered[0].double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
++
++
++@pytest.mark.parametrize("world", [1, 2, 3, 4])
++def test_unreduced_write_sums_in_rank_order_and_zeroes_other_parts(world):
++    parts, _, _, _, direction = _inputs(130, world=world, seed=world + 40)
++    rows = _marks(130, seed=world + 40)
++    steered = _steer_write(parts, rows, direction, 3.5)
++    marked = rows.bool()
++    exact = _fp64(_write(parts), direction, 3.5)[marked]
++    reduced = _write(steered)[marked]
++    assert ((reduced.double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
++    if world > 1:
++        assert torch.equal(
++            steered[1:, marked], torch.zeros_like(steered[1:, marked])
++        )
++    kept = ~marked
++    assert torch.equal(_bits(steered[:, kept]), _bits(parts[:, kept]))
+ 
+ 
+ def test_declared_as_the_forward_calls_it():
+@@ -189,6 +277,17 @@ def test_declared_as_the_forward_calls_it():
+         (glp.glp_steer_kernel, (STREAMS, HIDDEN, 4), {}),
+     ]
+ 
++    fold_registry = JitWarmupRegistry(vllm_config=None)
++    with fold_registry.activate():
++        glp.declare(STREAMS, HIDDEN, (1, 4), mean_streams=True)
++    fold_calls = list(prepare.declared_calls(fold_registry))
++    assert fold_calls == [
++        (glp.glp_steer_kernel, (STREAMS, HIDDEN, 1, True), {}),
++        (glp.glp_steer_kernel, (STREAMS, HIDDEN, 4, True), {}),
++        (glp.glp_steer_write_kernel, (HIDDEN, 1), {}),
++        (glp.glp_steer_write_kernel, (HIDDEN, 4), {}),
++    ]
++
+ 
+ # The step's row marks.
+ 
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index a965db4..4998245 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """GLP steering: the fail-closed reader, the projection, and the off state."""
+ 
++import hashlib
+ import math
+ import os
+ import struct
+@@ -151,12 +152,18 @@ def test_directions_land_on_their_own_layer_numbers(tmp_path):
+         ({"glp.mode": "add"}, None, "never adds"),
+         ({"glp.spec_version": None}, None, "spec_version"),
+         ({"glp.spec_version": 2}, None, "spec_version"),
++        ({"glp.spec_version": 1, "glp.hook_point": glp.FOLD_HOOK_POINT}, None, "requires glp.spec_version 3"),
++        ({"glp.spec_version": 3, "glp.hook_point": glp.HOOK_POINT}, None, "requires glp.spec_version 1"),
+         ({"glp.rank": 2}, None, "rank"),
++        ({"glp.dir_scales": 1.0}, None, "dir_scales"),
++        ({"glp.layer_scales": 1.0}, None, "layer_scales"),
+         ({"glp.hook_point": None}, None, "hook_point"),
+         ({"glp.hook_point": "ffn_out_pre_residual"}, None, "hook_point"),
+         ({"glp.alpha_default": math.nan}, None, "alpha_default"),
+         ({"glp.alpha_default": math.inf}, None, "alpha_default"),
+         ({"glp.layer_ids_zero_based": "1,2,6"}, None, "disagrees"),
++        ({"glp.content_sha256": "0" * 64}, None, "content_sha256"),
++        ({"glp.content_sha256": ""}, None, "content_sha256"),
+         ({}, {"direction.0": unit(0)}, "direction.0"),
+         ({}, {f"direction.{NUM_LAYERS}": unit(9)}, "outside layers"),
+         ({}, {"direction.1": unit(1, HIDDEN + 1)}, "width"),
+@@ -176,6 +183,29 @@ def test_reader_refuses_files_it_cannot_apply_exactly(
+         glp.read_glp(path, NUM_LAYERS, HIDDEN)
+ 
+ 
++def test_fold_hook_spec_v3_directions_and_content_sha256_are_read(tmp_path, monkeypatch):
++    digest = hashlib.sha256()
++    for layer in LAYERS:
++        digest.update(unit(layer).astype("<f4").tobytes())
++    path = glp_file(
++        tmp_path,
++        metadata={
++            "glp.spec_version": glp.FOLD_SPEC_VERSION,
++            "glp.hook_point": glp.FOLD_HOOK_POINT,
++            "glp.alpha_default": 3.5,
++            "glp.content_sha256": digest.hexdigest(),
++        },
++    )
++    directions, alpha = glp.read_glp(path, NUM_LAYERS, HIDDEN)
++    assert sorted(directions) == list(LAYERS)
++    assert alpha == pytest.approx(3.5)
++    steer(monkeypatch, path)
++    module = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    assert module.hook_point == glp.FOLD_HOOK_POINT
++    assert module.mean_streams is True
++    assert module.alpha.item() == pytest.approx(3.5)
++
++
+ def test_a_transferred_vector_is_read(tmp_path):
+     path = glp_file(tmp_path, metadata={"glp.derived_at": "ffn_out_pre_residual"})
+     directions, _ = glp.read_glp(path, NUM_LAYERS, HIDDEN)
+@@ -270,11 +300,18 @@ def test_a_step_reads_a_view_of_the_marks(tmp_path, monkeypatch):
+ WIDE = 5120
+ 
+ 
+-def steering(layers=LAYERS) -> glp.GLPSteering:
++def steering(layers=LAYERS, *, hook_point: str = glp.HOOK_POINT) -> glp.GLPSteering:
+     directions = torch.zeros(NUM_LAYERS, WIDE)
+     for layer in layers:
+         directions[layer] = torch.from_numpy(unit(layer, WIDE))
+-    return glp.GLPSteering(directions, 0.75, STREAMS, list(layers), MAX_TOKENS)
++    return glp.GLPSteering(
++        directions,
++        0.75,
++        STREAMS,
++        list(layers),
++        MAX_TOKENS,
++        hook_point=hook_point,
++    )
+ 
+ 
+ def _layer_outputs(tokens: int = 3):
+@@ -363,6 +400,158 @@ def test_the_steering_is_declared_for_the_writes_it_takes(
+     steering().declare_kernels()
+     assert declared == [(STREAMS, WIDE, worlds)]
+ 
++    declared_fold = []
++    monkeypatch.setattr(
++        glp.tilelang_glp,
++        "declare",
++        lambda *shape, **kwargs: declared_fold.append((shape, kwargs)),
++    )
++    steering(hook_point=glp.FOLD_HOOK_POINT).declare_kernels()
++    assert declared_fold == [((STREAMS, WIDE, worlds), {"mean_streams": True})]
++
++
++def test_fold_hook_steers_both_attention_write_and_stream_mean_fold(
++    monkeypatch, launches
++):
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++
++    write_calls = []
++    monkeypatch.setattr(
++        glp.tilelang_glp, "glp_steer_write", lambda *args: write_calls.append(args)
++    )
++    x, residual, post_mix, res_mix = _layer_outputs()
++    rows = torch.tensor([0, 1, 0], dtype=torch.int32)
++
++    # Spec v1 (residual_stream_post_layer) never steers the attention write.
++    steering().steer_attn(5, x, rows)
++    assert write_calls == []
++
++    # Spec v3 (hc_fold_pre_engram) steers both the attention write and the
++    # stream-mean fold on covered layers, and leaves uncovered layers alone.
++    fold_module = steering(hook_point=glp.FOLD_HOOK_POINT)
++    fold_module.steer_attn(3, x, rows)
++    assert write_calls == []
++
++    fold_module.steer_attn(5, x, rows)
++    ((parts, attn_rows, attn_dir, attn_alpha),) = write_calls
++    assert parts.shape == (1, 3, WIDE) and torch.equal(parts[0], x)
++    assert attn_rows is rows
++    assert torch.equal(attn_dir, fold_module.directions[5])
++    assert attn_alpha is fold_module.alpha
++
++    packed = torch.stack([x, x, x])
++    fold_module.steer_attn(1, RankOrderParts(packed), rows)
++    assert write_calls[-1][0] is packed
++
++    fold_module.steer(5, x, residual, post_mix, res_mix, rows)
++    assert launches[-1][-1] is True
++
++
++def test_steer_attn_validates_write_and_row_shapes(monkeypatch):
++    write_calls = []
++    monkeypatch.setattr(
++        glp.tilelang_glp, "glp_steer_write", lambda *args: write_calls.append(args)
++    )
++    fold_module = steering(hook_point=glp.FOLD_HOOK_POINT)
++    x, _, _, _ = _layer_outputs()
++    rows = torch.ones(3, dtype=torch.int32)
++    for bad_x, bad_rows in (
++        (x.float(), rows),
++        (x[:, :2], rows),
++        (x[:2], rows),
++        (x, rows[:2]),
++    ):
++        with pytest.raises(ValueError, match="BF16 writes"):
++            fold_module.steer_attn(1, bad_x, bad_rows)
++    assert write_calls == []
++
++
++def test_ced_compaction_aligns_steer_rows_for_attention_and_fold(monkeypatch):
++    from types import SimpleNamespace
++    from torch import nn
++    from tests.models import test_deepseek_v4_1_ced_model as ced_test
++    from vllm.models.deepseek_v4_1.nvidia import model as native
++
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(native, "gather_rows", ced_test._gather)
++    monkeypatch.setattr(native, "scatter_rows", ced_test._scatter)
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++
++    seen: list[tuple[str, int, int, int, list[int]]] = []
++    full_marks = torch.tensor([1, 0, 1, 0, 0, 1, 1, 0], dtype=torch.int32)
++
++    class _Tracker:
++        def step_rows(self, num_tokens: int) -> torch.Tensor:
++            return full_marks[:num_tokens]
++
++        def steer_attn(self, layer_idx: int, hidden_states, rows: torch.Tensor):
++            seen.append(
++                (
++                    "attn",
++                    layer_idx,
++                    hidden_states.shape[0],
++                    rows.shape[0],
++                    rows.tolist(),
++                )
++            )
++
++        def steer(
++            self,
++            layer_idx: int,
++            hidden_states,
++            residual,
++            post_mix,
++            res_mix,
++            rows: torch.Tensor,
++        ):
++            seen.append(
++                (
++                    "fold",
++                    layer_idx,
++                    residual.shape[0],
++                    rows.shape[0],
++                    rows.tolist(),
++                )
++            )
++
++    ids = torch.arange(8)
++    positions = torch.arange(100, 108)
++    inputs = torch.arange(16, dtype=torch.float32).reshape(8, 2) / 8
++    indices = torch.tensor([2, 3, 6, 7, -1, -1])
++    shared: dict[str, torch.Tensor | int] = {}
++    row_work: list[tuple[str, int, int]] = []
++    target = SimpleNamespace(
++        embed_input_ids=lambda _: inputs,
++        prefill_sp_min_rows=0,
++        disk_engram=False,
++        engram_hash=None,
++        start_layer=0,
++        end_layer=4,
++        ced_decoder_start=2,
++        layers=nn.ModuleList(ced_test._Layer(i, shared, row_work) for i in range(4)),
++        aux_hidden_state_layers=set(),
++        _sink_columns=None,
++        _graph_out=lambda index, rows: None,
++        glp=_Tracker(),
++        norm=lambda hidden: hidden,
++    )
++    native.DeepseekV4Model.forward(target, ids, positions, None, ced_indices=indices)
++    compacted_marks = [1, 0, 1, 0, 0, 0]
++    assert seen == [
++        ("attn", 0, 8, 8, full_marks.tolist()),
++        ("fold", 0, 8, 8, full_marks.tolist()),
++        ("attn", 1, 8, 8, full_marks.tolist()),
++        ("fold", 1, 8, 8, full_marks.tolist()),
++        ("attn", 2, 6, 6, compacted_marks),
++        ("fold", 2, 6, 6, compacted_marks),
++        ("attn", 3, 6, 6, compacted_marks),
++        ("fold", 3, 6, 6, compacted_marks),
++    ]
++
+ 
+ # A real GLP file, when one is named (it is not redistributed with the tests).
+ 
+@@ -378,7 +567,10 @@ def test_a_published_ds41_file_holds_only_unit_directions():
+     )
+     assert all(name.startswith("direction.") for name in tensors)
+     directions, alpha = glp.read_glp(REAL_FILE, 40, 5120)
+-    assert sorted(directions) == list(range(1, 40))
+-    assert alpha == pytest.approx(0.75)
++    expected_layers = glp._layer_list(
++        str(metadata["glp.layer_ids_zero_based"]), REAL_FILE
++    )
++    assert sorted(directions) == expected_layers
++    assert alpha == pytest.approx(float(metadata["glp.alpha_default"]))
+     for direction in directions.values():
+         assert np.linalg.norm(direction) == pytest.approx(1.0, abs=1e-5)
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+index 8d47b93..fee3bc5 100644
+--- a/vllm/models/deepseek_v4_1/glp.py
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -8,11 +8,17 @@ applies
+ 
+     h <- h - alpha * (h . d) d
+ 
+-at ``residual_stream_post_layer``: layer N's write folded into the
+-hyper-connection streams, before layer N + 1 reads Engram. Every stream is
+-projected, so their mean, the reduction the directions are derived on, is
+-projected too. The layer's write alone (``ffn_out_pre_residual``) is a different
+-site, and a file for it is refused.
++before layer N + 1 reads Engram:
++
++- ``residual_stream_post_layer`` (spec v1): layer N's write folded into the
++  hyper-connection streams, with every stream projected against its own dot
++  product with ``d``;
++- ``hc_fold_pre_engram`` (spec v3): layer N's folded streams projected by their
++  stream mean's dot product with ``d``, together with layer N's attention write
++  (``attn._o_proj`` output) before its fold.
++
++The layer's write alone (``ffn_out_pre_residual``) is a different site, and a
++file for it is refused.
+ 
+ Off unless WEIGHTLESS_STEER_PATH names a file and WEIGHTLESS_STEER_MODEL the
+ served model name it steers; one without the other stops the boot. Off, the
+@@ -21,15 +27,16 @@ fail-closed: a file this runtime cannot apply exactly stops the boot rather than
+ serving unsteered or steering at another site. The file's own layers and
+ ``glp.alpha_default`` are applied as they are.
+ 
+-On, steering is a property of rows. Each covered layer runs one TileLang launch
+-(``tilelang/glp.py``) that folds and projects the rows ``GLPSteering.rows`` marks,
+-in place, and leaves every other row untouched. Only the rows of requests made to
++On, steering is a property of rows. Each covered layer runs TileLang launches
++(``tilelang/glp.py``) that fold and project the rows ``GLPSteering.rows`` marks,
++in place, and leave every other row untouched. Only the rows of requests made to
+ the steered model name are marked (``vllm.weightless``): one engine serves the
+ model and its steered variant side by side, and a request to the other names
+ gets the same bits as with steering off.
+ """
+ 
+ import argparse
++import hashlib
+ import math
+ import re
+ import struct
+@@ -48,7 +55,13 @@ from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ logger = init_logger(__name__)
+ 
+ HOOK_POINT = "residual_stream_post_layer"
++FOLD_HOOK_POINT = "hc_fold_pre_engram"
+ SPEC_VERSION = 1
++FOLD_SPEC_VERSION = 3
++HOOK_VERSIONS = {
++    HOOK_POINT: SPEC_VERSION,
++    FOLD_HOOK_POINT: FOLD_SPEC_VERSION,
++}
+ # A direction's norm may differ from 1 by float32 export rounding, no more.
+ UNIT_NORM_TOLERANCE = 1e-3
+ 
+@@ -170,17 +183,9 @@ def _layer_list(text: str, what: str) -> list[int]:
+         raise ValueError(f"{what} is not a comma list of layer ids: {text!r}") from None
+ 
+ 
+-def read_glp(
++def _read_glp(
+     path: str, num_layers: int, hidden_size: int
+-) -> tuple[dict[int, np.ndarray], float | None]:
+-    """The file's unit directions by layer, and its ``glp.alpha_default``.
+-
+-    Refuses whatever this reader cannot apply exactly (spec, Reader
+-    conformance): another mode, spec version, rank or hook point; a direction
+-    for layer 0, outside the model, of another width, not finite or not unit
+-    norm; a tensor that is not a direction; a layer list that disagrees with the
+-    tensor names.
+-    """
++) -> tuple[dict[int, np.ndarray], float | None, str]:
+     metadata, tensors = read_gguf(path)
+     mode = metadata.get("glp.mode")
+     if mode != "project":
+@@ -189,19 +194,31 @@ def read_glp(
+             "and never adds a control vector (an absent mode means 'add')"
+         )
+     version = metadata.get("glp.spec_version")
+-    if type(version) is not int or version != SPEC_VERSION:
++    if type(version) is not int or version not in (SPEC_VERSION, FOLD_SPEC_VERSION):
+         raise ValueError(
+             f"{path}: glp.spec_version is {version!r}; this reader implements "
+-            f"version {SPEC_VERSION} (rank 1, no alpha scaling keys)"
++            f"versions {SPEC_VERSION} and {FOLD_SPEC_VERSION} (rank 1, no alpha "
++            "scaling keys)"
+         )
+     rank = metadata.get("glp.rank", 1)
+     if type(rank) is not int or rank != 1:
+         raise ValueError(f"{path}: glp.rank is {rank!r}; this reader applies rank 1")
++    for scale_key in ("glp.dir_scales", "glp.layer_scales"):
++        if scale_key in metadata:
++            raise ValueError(
++                f"{path}: {scale_key} is not supported; this reader applies unit "
++                "directions with scalar glp.alpha_default"
++            )
+     hook = metadata.get("glp.hook_point")
+-    if hook != HOOK_POINT:
++    if not isinstance(hook, str) or hook not in HOOK_VERSIONS:
+         raise ValueError(
+             f"{path}: glp.hook_point is {hook!r}; this runtime applies at "
+-            f"{HOOK_POINT} only"
++            f"{HOOK_POINT} or {FOLD_HOOK_POINT} only"
++        )
++    if HOOK_VERSIONS[hook] != version:
++        raise ValueError(
++            f"{path}: glp.hook_point {hook!r} requires glp.spec_version "
++            f"{HOOK_VERSIONS[hook]}, not {version!r}"
+         )
+     derived_at = metadata.get("glp.derived_at", hook)
+     if derived_at != hook:
+@@ -244,15 +261,44 @@ def read_glp(
+             f"{path}: glp.layer_ids_zero_based {declared!r} disagrees with the "
+             f"direction tensors {sorted(directions)}; re-export the file"
+         )
++    content_sha256 = metadata.get("glp.content_sha256")
++    if content_sha256 is not None:
++        if not isinstance(content_sha256, str) or not content_sha256:
++            raise ValueError(f"{path}: glp.content_sha256 is {content_sha256!r}")
++        digest = hashlib.sha256()
++        for layer in sorted(directions):
++            digest.update(tensors[f"direction.{layer}"].tobytes())
++        actual_sha256 = digest.hexdigest()
++        if actual_sha256 != content_sha256.lower():
++            raise ValueError(
++                f"{path}: glp.content_sha256 {content_sha256!r} disagrees with "
++                f"direction tensors ({actual_sha256})"
++            )
+     logger.info(
+-        "GLP file %s: %d directions, layers %s, alpha_default %s, base %s@%s",
++        "GLP file %s: %d directions, layers %s, hook %s, alpha_default %s, base %s@%s",
+         path,
+         len(directions),
+         sorted(directions),
++        hook,
+         alpha,
+         metadata.get("general.base_model.0.name"),
+         metadata.get("general.base_model.0.version"),
+     )
++    return directions, alpha, hook
++
++
++def read_glp(
++    path: str, num_layers: int, hidden_size: int
++) -> tuple[dict[int, np.ndarray], float | None]:
++    """The file's unit directions by layer, and its ``glp.alpha_default``.
++
++    Refuses whatever this reader cannot apply exactly (spec, Reader
++    conformance): another mode, spec version, rank or hook point; a direction
++    for layer 0, outside the model, of another width, not finite or not unit
++    norm; a tensor that is not a direction; a layer list or content digest that
++    disagrees with the tensors.
++    """
++    directions, alpha, _ = _read_glp(path, num_layers, hidden_size)
+     return directions, alpha
+ 
+ 
+@@ -266,10 +312,16 @@ class GLPSteering(nn.Module):
+         hc_mult: int,
+         layers: list[int],
+         max_tokens: int,
++        *,
++        hook_point: str = HOOK_POINT,
+     ):
+         super().__init__()
++        if hook_point not in HOOK_VERSIONS:
++            raise ValueError(f"Unsupported GLP hook_point {hook_point!r}")
+         self.hc_mult = hc_mult
+         self.layers = frozenset(layers)
++        self.hook_point = hook_point
++        self.mean_streams = hook_point == FOLD_HOOK_POINT
+         # One float32 row per model layer; unsteered layers are zero rows.
+         self.register_buffer("directions", directions, persistent=False)
+         # A tensor, not a Python float, which would be a graph constant.
+@@ -293,7 +345,17 @@ class GLPSteering(nn.Module):
+             world = get_tensor_model_parallel_world_size()
+             if world > 1:
+                 worlds.append(world)
+-        tilelang_glp.declare(self.hc_mult, self.directions.shape[1], tuple(worlds))
++        if self.mean_streams:
++            tilelang_glp.declare(
++                self.hc_mult,
++                self.directions.shape[1],
++                tuple(worlds),
++                mean_streams=True,
++            )
++        else:
++            tilelang_glp.declare(
++                self.hc_mult, self.directions.shape[1], tuple(worlds)
++            )
+ 
+     def step_rows(self, num_tokens: int) -> torch.Tensor:
+         """The marks of a step's ``num_tokens`` rows, a view of ``rows``."""
+@@ -304,6 +366,38 @@ class GLPSteering(nn.Module):
+             )
+         return self.rows[:num_tokens]
+ 
++    def steer_attn(
++        self,
++        layer: int,
++        hidden_states,
++        rows: torch.Tensor | None,
++    ) -> None:
++        """Steer layer ``layer``'s attention write in place when ``hook_point``
++        is ``hc_fold_pre_engram``."""
++        if not self.mean_streams or layer not in self.layers or rows is None:
++            return
++        parts = (
++            hidden_states.packed
++            if isinstance(hidden_states, RankOrderParts)
++            else hidden_states.unsqueeze(0)
++        )
++        tokens = rows.shape[0]
++        if (
++            parts.dtype != torch.bfloat16
++            or parts.shape[1:] != (tokens, self.directions.shape[1])
++        ):
++            raise ValueError(
++                f"GLP attention steering takes [world, T, {self.directions.shape[1]}] "
++                f"BF16 writes with a mark per row, not write {list(parts.shape)} "
++                f"{parts.dtype} and marks {list(rows.shape)}"
++            )
++        tilelang_glp.glp_steer_write(
++            parts,
++            rows,
++            self.directions[layer],
++            self.alpha,
++        )
++
+     def steer(
+         self,
+         layer: int,
+@@ -340,15 +434,27 @@ class GLPSteering(nn.Module):
+                 f"{list(residual.shape)} {residual.dtype}, write {list(parts.shape)} "
+                 f"and marks {list(rows.shape)}"
+             )
+-        tilelang_glp.glp_steer(
+-            parts,
+-            residual,
+-            post_mix,
+-            res_mix,
+-            rows,
+-            self.directions[layer],
+-            self.alpha,
+-        )
++        if self.mean_streams:
++            tilelang_glp.glp_steer(
++                parts,
++                residual,
++                post_mix,
++                res_mix,
++                rows,
++                self.directions[layer],
++                self.alpha,
++                True,
++            )
++        else:
++            tilelang_glp.glp_steer(
++                parts,
++                residual,
++                post_mix,
++                res_mix,
++                rows,
++                self.directions[layer],
++                self.alpha,
++            )
+ 
+ 
+ def glp_steering(
+@@ -365,7 +471,7 @@ def glp_steering(
+             "WEIGHTLESS_STEER_MODEL (the served model name it steers), not "
+             f"WEIGHTLESS_STEER_PATH={path!r} and WEIGHTLESS_STEER_MODEL={model!r}"
+         )
+-    directions, alpha = read_glp(path, num_layers, hidden_size)
++    directions, alpha, hook = _read_glp(path, num_layers, hidden_size)
+     if alpha is None:
+         raise ValueError(f"{path}: no glp.alpha_default")
+     layers = sorted(directions)
+@@ -373,9 +479,13 @@ def glp_steering(
+     for layer in layers:
+         stack[layer] = torch.from_numpy(directions[layer])
+     logger.info(
+-        "GLP steering on: alpha %s, layers %s, requests to %r", alpha, layers, model
++        "GLP steering on (%s): alpha %s, layers %s, requests to %r",
++        hook,
++        alpha,
++        layers,
++        model,
+     )
+-    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens)
++    return GLPSteering(stack, alpha, hc_mult, layers, max_tokens, hook_point=hook)
+ 
+ 
+ def main() -> None:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index d0d95d8..f408d39 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -317,6 +317,9 @@ class DeepseekV4DecoderLayer(nn.Module):
+         *,
+         ced_positions: torch.Tensor | None = None,
+         ced_input_ids: torch.Tensor | None = None,
++        glp=None,
++        layer_idx: int = 0,
++        steer_rows: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         if isinstance(x, list):
+             # Pop the caller's carry list in place so nn.Module.__call__'s *args
+@@ -394,6 +397,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+         del x_q
++        if glp is not None:
++            glp.steer_attn(layer_idx, x, steer_rows)
+         residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
+             x,
+             residual,
+@@ -894,6 +899,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 if boundary_indices is not None and input_ids is not None
+                 else None
+             )
++            if boundary_indices is not None and steer_rows is not None:
++                steer_rows = gather_rows(
++                    self.glp.step_rows(full_num_tokens), boundary_indices
++                )
+             carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
+             hidden_states = pre_mix = post_mix = res_mix = residual = None
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+@@ -910,15 +919,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 sp_rows=sp,
+                 ced_positions=ced_positions,
+                 ced_input_ids=ced_input_ids,
++                glp=self.glp,
++                layer_idx=idx,
++                steer_rows=steer_rows,
+             )
+             if boundary_indices is not None:
+                 assert ced_positions is not None
+                 positions = ced_positions
+                 input_ids = ced_input_ids
+-                if steer_rows is not None:
+-                    steer_rows = gather_rows(
+-                        self.glp.step_rows(full_num_tokens), ced_indices
+-                    )
+                 decoder_compacted = True
+             if self.glp is not None:
+                 self.glp.steer(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+index ee087c2..df97247 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/glp.py
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -41,7 +41,12 @@ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def glp_steer_kernel(
+-    hc_mult: int, hidden: int, world: int, threads: int = 320, vec: int = 8
++    hc_mult: int,
++    hidden: int,
++    world: int,
++    mean_streams: bool = False,
++    threads: int = 320,
++    vec: int = 8,
+ ):
+     assert hidden % (threads * vec) == 0 and threads % 32 == 0
+     assert 1 <= world <= 4
+@@ -113,18 +118,34 @@ def glp_steer_kernel(
+                         hs[n * span + c * vec + v] = T.Cast(
+                             T.float32, T.Cast(T.bfloat16, fold)
+                         )
+-            for n in T.unroll(hc_mult):
++            if mean_streams:
+                 for i in T.serial(span):
+-                    acc[n] += hs[n * span + i] * ds[i]
+-                acc[n] = T.warp_reduce_sum(acc[n])
++                    fold = hs[i]
++                    for n in T.unroll(1, hc_mult):
++                        fold = fold + hs[n * span + i]
++                    acc[0] += (fold / T.float32(hc_mult)) * ds[i]
++                acc[0] = T.warp_reduce_sum(acc[0])
+                 if tx % 32 == 0:
+-                    partial[n, tx // 32] = acc[n]
+-            T.sync_threads()
+-            if tx < hc_mult:
+-                total = T.float32(0)
+-                for w in T.serial(warps):
+-                    total += partial[tx, w]
+-                scale[tx] = alpha[0] * total
++                    partial[0, tx // 32] = acc[0]
++                T.sync_threads()
++                if tx < hc_mult:
++                    total = T.float32(0)
++                    for w in T.serial(warps):
++                        total += partial[0, w]
++                    scale[tx] = alpha[0] * total
++            else:
++                for n in T.unroll(hc_mult):
++                    for i in T.serial(span):
++                        acc[n] += hs[n * span + i] * ds[i]
++                    acc[n] = T.warp_reduce_sum(acc[n])
++                    if tx % 32 == 0:
++                        partial[n, tx // 32] = acc[n]
++                T.sync_threads()
++                if tx < hc_mult:
++                    total = T.float32(0)
++                    for w in T.serial(warps):
++                        total += partial[tx, w]
++                    scale[tx] = alpha[0] * total
+             T.sync_threads()
+             for c in T.serial(chunks):
+                 for n in T.unroll(hc_mult):
+@@ -143,9 +164,85 @@ def glp_steer_kernel(
+     return glp_steer
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def glp_steer_write_kernel(
++    hidden: int, world: int, threads: int = 320, vec: int = 8
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert 1 <= world <= 4
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    span = chunks * vec
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def glp_steer_write(
++        parts: T.Tensor((world, tokens, hidden), T.bfloat16),
++        rows: T.Tensor((tokens,), T.int32),
++        direction: T.Tensor((hidden,), T.float32),
++        alpha: T.Tensor((1,), T.float32),
++    ):
++        with T.Kernel(tokens, threads=threads) as t:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            # The whole block leaves an unmarked row, before any barrier.
++            if rows[t] == 0:
++                T.thread_return()
++            hs = T.alloc_local((span,), T.float32)
++            ds = T.alloc_local((span,), T.float32)
++            pv = T.alloc_local((world * vec,), T.bfloat16)
++            acc = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            scale = T.alloc_shared((1,), T.float32)
++            acc = T.float32(0)
++            for c in T.serial(chunks):
++                for r in T.unroll(world):
++                    for v in T.vectorized(vec):
++                        pv[r * vec + v] = parts[r, t, (c * threads + tx) * vec + v]
++                for v in T.vectorized(vec):
++                    ds[c * vec + v] = direction[(c * threads + tx) * vec + v]
++                # rank_order_sum: the first part as is, then the others in order.
++                for v in T.unroll(vec):
++                    total = T.Cast(T.float32, pv[v])
++                    for r in T.serial(world - 1):
++                        total = total + T.Cast(T.float32, pv[(r + 1) * vec + v])
++                    hs[c * vec + v] = T.Cast(
++                        T.float32, T.Cast(T.bfloat16, total)
++                    )
++            for i in T.serial(span):
++                acc += hs[i] * ds[i]
++            acc = T.warp_reduce_sum(acc)
++            if tx % 32 == 0:
++                partial[tx // 32] = acc
++            T.sync_threads()
++            if tx == 0:
++                total = T.float32(0)
++                for w in T.serial(warps):
++                    total += partial[w]
++                scale[0] = alpha[0] * total
++            T.sync_threads()
++            for c in T.serial(chunks):
++                for v in T.vectorized(vec):
++                    parts[0, t, (c * threads + tx) * vec + v] = T.Cast(
++                        T.bfloat16,
++                        hs[c * vec + v] - scale[0] * ds[c * vec + v],
++                    )
++                for r in T.unroll(1, world):
++                    for v in T.vectorized(vec):
++                        parts[r, t, (c * threads + tx) * vec + v] = T.bfloat16(0)
++
++    return glp_steer_write
++
++
++@cache
++def _kernel(hc_mult: int, hidden: int, world: int, mean_streams: bool = False):
++    return glp_steer_kernel(hc_mult, hidden, world, mean_streams)
++
++
+ @cache
+-def _kernel(hc_mult: int, hidden: int, world: int):
+-    return glp_steer_kernel(hc_mult, hidden, world)
++def _write_kernel(hidden: int, world: int):
++    return glp_steer_write_kernel(hidden, world)
+ 
+ 
+ def glp_steer(
+@@ -156,28 +253,75 @@ def glp_steer(
+     rows: torch.Tensor,
+     direction: torch.Tensor,
+     alpha: torch.Tensor,
++    mean_streams: bool = False,
+ ) -> None:
+     """Steer the rows ``rows`` (int32, [T]) marks: fold ``parts`` ([world, T, H],
+     BF16, the layer's write or the ranks' unreduced parts of it) into ``residual``
+     ([T, hc_mult, H], BF16) with ``post`` ([T, hc_mult]) and ``comb`` ([T, hc_mult,
+-    hc_mult]), project ``direction`` off every stream scaled by ``alpha`` ([1]),
+-    and leave the result as the row's ``residual`` with ``comb`` the identity and
+-    ``post`` zero. Unmarked rows are untouched."""
++    hc_mult]), project ``direction`` off every stream scaled by ``alpha`` ([1])
++    (each stream's own dot product, or the mean over streams when ``mean_streams``
++    is set for ``hc_fold_pre_engram``), and leave the result as the row's
++    ``residual`` with ``comb`` the identity and ``post`` zero. Unmarked rows are
++    untouched."""
+     world, tokens, hidden = parts.shape
+     if tokens == 0:
+         return
+-    _kernel(residual.shape[1], hidden, world)(
++    _kernel(residual.shape[1], hidden, world, mean_streams)(
+         parts, residual, post, comb, rows, direction, alpha
+     )
+ 
+ 
+-def declare(hc_mult: int, hidden: int, worlds: tuple[int, ...]) -> None:
++def glp_steer_write(
++    parts: torch.Tensor,
++    rows: torch.Tensor,
++    direction: torch.Tensor,
++    alpha: torch.Tensor,
++) -> None:
++    """Steer a sublayer write ``parts`` ([world, T, H], BF16) in the rows ``rows``
++    (int32, [T]) marks: sum the parts in rank order, project ``direction`` scaled
++    by ``alpha`` ([1]), and leave the result in ``parts[0]`` with any remaining
++    parts zeroed. Unmarked rows are untouched."""
++    world, tokens, hidden = parts.shape
++    if tokens == 0:
++        return
++    _write_kernel(hidden, world)(parts, rows, direction, alpha)
++
++
++def declare(
++    hc_mult: int,
++    hidden: int,
++    worlds: tuple[int, ...],
++    *,
++    mean_streams: bool = False,
++) -> None:
+     """Declare the steering of ``hc_mult`` streams of ``hidden`` for a write of
+-    each of ``worlds`` parts, and keep them."""
++    each of ``worlds`` parts (and, for ``hc_fold_pre_engram``, the companion
++    attention-write projection), and keep them."""
++    if not mean_streams:
++        prepare.declare(
++            lambda: [prepare.call(glp_steer_kernel, hc_mult, hidden, w) for w in worlds],
++            bind=lambda: [_kernel(hc_mult, hidden, w) for w in worlds],
++        )
++        return
+     prepare.declare(
+-        lambda: [prepare.call(glp_steer_kernel, hc_mult, hidden, w) for w in worlds],
+-        bind=lambda: [_kernel(hc_mult, hidden, w) for w in worlds],
++        lambda: [
++            *(
++                prepare.call(glp_steer_kernel, hc_mult, hidden, w, True)
++                for w in worlds
++            ),
++            *(prepare.call(glp_steer_write_kernel, hidden, w) for w in worlds),
++        ],
++        bind=lambda: [
++            *(_kernel(hc_mult, hidden, w, True) for w in worlds),
++            *(_write_kernel(hidden, w) for w in worlds),
++        ],
+     )
+ 
+ 
+-__all__ = ["declare", "glp_steer", "glp_steer_kernel"]
++__all__ = [
++    "declare",
++    "glp_steer",
++    "glp_steer_kernel",
++    "glp_steer_write",
++    "glp_steer_write_kernel",
++]
+-- 
+2.54.0 (Apple Git-157)
+
