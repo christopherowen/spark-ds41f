@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:32:15 +0100
+Subject: [PATCH 608/608] perf(distributed,deepseek_v4_1): route SP
+ reduce_scatter, exchange, all_to_all_rows, and large all_reduce to
+ sparknet.oneshot
+
+---
+ .../test_roce_policy_no_fallback.py           | 63 +++++++++++++++++++
+ .../test_deepseek_v41_tilelang_collectives.py | 58 +++++++++++++++++
+ ..._deepseek_v41_sp_project_reduce_scatter.py | 46 ++++++++++++++
+ .../device_communicators/cuda_communicator.py | 29 +++++++--
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 13 +++-
+ .../deepseek_v4_1/tilelang/collectives.py     | 46 +++++++++++---
+ 6 files changed, 241 insertions(+), 14 deletions(-)
+
+diff --git a/tests/distributed/test_roce_policy_no_fallback.py b/tests/distributed/test_roce_policy_no_fallback.py
+index e8d34cd54..923b19581 100644
+--- a/tests/distributed/test_roce_policy_no_fallback.py
++++ b/tests/distributed/test_roce_policy_no_fallback.py
+@@ -210,3 +210,66 @@ def test_group_broadcast_without_a_policy_keeps_the_process_group(monkeypatch):
+     group = _group(device_communicator=None)
+     group.broadcast(torch.zeros(4), src=1)
+     assert calls == [(1, group.device_group)]
++
++
++class _PrefillOneShotAdapter(_OneShot):
++    def __init__(self, world: int, rank: int, eligible: bool = True):
++        self.world = world
++        self.rank = rank
++        self.eligible = eligible
++        self.calls = []
++
++    def should_custom_ar(self, inp):
++        return False
++
++    def should_reduce_scatter(self, inp, dim=0):
++        return self.eligible and dim == 0
++
++    def reduce_scatter(self, inp, dim=0):
++        self.calls.append(("reduce_scatter", tuple(inp.shape), dim))
++        chunks = inp.view(self.world, -1, *inp.shape[1:])
++        return chunks[self.rank] * float(self.world)
++
++    def should_all_gather(self, inp, dim):
++        return self.eligible and dim == 0
++
++    def all_gather(self, inp, dim):
++        self.calls.append(("all_gather", tuple(inp.shape), dim))
++        return torch.cat([inp + 10.0 * r for r in range(self.world)], dim=0)
++
++    def should_all_to_all_rows(self, inp, rows):
++        return self.eligible
++
++    def all_to_all_rows(self, inp, rows):
++        self.calls.append(("all_to_all_rows", tuple(inp.shape), rows))
++        return torch.full((self.world, rows, *inp.shape[1:]), 42.0, dtype=inp.dtype)
++
++
++def test_roce_policy_routes_reduce_scatter_all_to_all_and_large_all_reduce():
++    pynccl = _PyNccl()
++    comm = _policy_communicator(pynccl)
++    comm.rank_in_group = 1
++    adapter = _PrefillOneShotAdapter(comm.world_size, comm.rank_in_group, eligible=True)
++    comm.b12x_ar_comm = adapter
++
++    rs_in = torch.ones(8, 16)
++    rs_out = comm.reduce_scatter(rs_in, dim=0)
++    assert rs_out.shape == (2, 16)
++    assert torch.all(rs_out == 4.0)
++
++    a2a_in = torch.ones(12, 16)
++    a2a_out = comm.all_to_all_rows(a2a_in, rows=4)
++    assert a2a_out.shape == (4, 4, 16)
++    assert torch.all(a2a_out == 42.0)
++
++    ar_in = torch.ones(8, 16)
++    ar_out = comm.all_reduce(ar_in)
++    assert ar_out.shape == (8, 16)
++
++    assert adapter.calls == [
++        ("reduce_scatter", (8, 16), 0),
++        ("all_to_all_rows", (12, 16), 4),
++        ("reduce_scatter", (8, 16), 0),
++        ("all_gather", (2, 16), 0),
++    ]
++    assert pynccl.calls == []
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 3ed7ba2f2..71a9c7e4b 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -353,3 +353,61 @@ def test_rank_shards_of_partial_packs_are_left_to_torch():
+ 
+     gathered = torch.zeros(8, 5, dtype=torch.bfloat16, device="cuda")
+     assert concat_rank_shards(gathered, 2, (4, 5)) is None
++
++
++def test_oneshot_adapter_hooks_for_exchange_reduce_scatter_and_all_reduce():
++    world, rank = 4, 2
++
++    class _Adapter:
++        disabled = False
++
++        def __init__(self):
++            self.ops = []
++
++        def should_exchange(self, chunks, parts=None):
++            return True
++
++        def exchange_into(self, chunks, parts):
++            self.ops.append(("exchange_into", tuple(chunks.shape)))
++            for p in range(world):
++                if p != rank:
++                    parts[p].copy_(chunks[p] + 100.0 * p)
++            return parts
++
++        def should_reduce_scatter(self, inp, dim=0):
++            return dim == 0
++
++        def reduce_scatter(self, inp, dim=0):
++            self.ops.append(("reduce_scatter", tuple(inp.shape), dim))
++            return inp.view(world, -1, *inp.shape[1:])[rank] * float(world)
++
++        def should_all_gather(self, inp, dim=0):
++            return dim == 0
++
++        def all_gather(self, inp, dim=0):
++            self.ops.append(("all_gather", tuple(inp.shape), dim))
++            return torch.cat([inp + float(r) for r in range(world)], dim=0)
++
++    adapter = _Adapter()
++    chunks = torch.ones(world, 3, 8, dtype=torch.bfloat16)
++    parts = torch.zeros_like(chunks)
++    exchange_into(adapter, chunks, parts, rank, world)
++    for p in range(world):
++        if p == rank:
++            assert torch.all(parts[p] == 0)
++        else:
++            assert torch.equal(parts[p], chunks[p] + 100.0 * p)
++
++    inp = torch.ones(12, 8, dtype=torch.bfloat16)
++    rs = reduce_scatter_rank_order(None, inp, rank, world, roce_comm=adapter)
++    assert rs.shape == (3, 8)
++    assert torch.all(rs == 4.0)
++
++    ar = all_reduce_rank_order(None, inp[:10], rank, world, roce_comm=adapter)
++    assert ar.shape == (10, 8)
++    assert adapter.ops == [
++        ("exchange_into", (4, 3, 8)),
++        ("reduce_scatter", (12, 8), 0),
++        ("reduce_scatter", (12, 8), 0),
++        ("all_gather", (3, 8), 0),
++    ]
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 1a2c9c424..09b69eced 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -392,3 +392,49 @@ def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+     if world == 4:
+         ring = {frozenset((r, (r + 1) % 4)) for r in range(4)}
+         assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
++
++
++def test_project_exchange_routes_to_oneshot_adapter_when_eligible(monkeypatch):
++    from types import SimpleNamespace
++
++    world, rank, tokens = 4, 1, 40
++    rows = sp_prefill.SPRows(
++        num_tokens=tokens, world_size=world, rank=rank, unreduced=True
++    )
++    local = rows.local_rows
++    source = torch.randn(tokens, 8, dtype=torch.bfloat16, device="cuda")
++    exchanged = []
++
++    class _RoceComm:
++        disabled = False
++
++        def should_exchange(self, chunks, parts=None):
++            return True
++
++        def exchange_into(self, chunks, parts):
++            exchanged.append(tuple(chunks.shape))
++            for peer in range(world):
++                if peer != rank:
++                    parts[peer].copy_(chunks[peer])
++            return parts
++
++    roce_comm = _RoceComm()
++    group = SimpleNamespace(
++        device_communicator=SimpleNamespace(
++            b12x_ar_comm=roce_comm, pynccl_comm="unused_pynccl"
++        )
++    )
++    monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
++
++    parts = rows.project_reduce_scatter(
++        lambda start, stop, out: out.copy_(source[start:stop]),
++        (8,),
++        source.dtype,
++        source.device,
++        slices=2,
++    )
++    torch.cuda.synchronize()
++    assert exchanged == [(4, local // 2, 8), (4, local - local // 2, 8)]
++    blocks = source.view(world, local, 8)
++    for peer in range(world):
++        assert torch.equal(parts[peer], blocks[peer])
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index c67e1cc70..4374b229d 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -512,7 +512,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             )
+ 
+             return all_reduce_rank_order(
+-                self.pynccl_comm, input_, self.rank_in_group, self.world_size
++                self.pynccl_comm,
++                input_,
++                self.rank_in_group,
++                self.world_size,
++                roce_comm=b12x_ar_comm,
+             )
+ 
+         fi_ar_comm = self.fi_ar_comm
+@@ -681,13 +685,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+     def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
+         """Row blocks of ``rows``: block r goes to rank r; the output's [s] holds
+-        rank s's block (rows past this rank's real rows unwritten). PyNCCL only
+-        (grouped send/recv)."""
++        rank s's block (rows past this rank's real rows unwritten). Uses the
++        one-shot RoCE adapter when eligible, otherwise PyNCCL grouped send/recv."""
+         self._require_roce_policy()
++        input_ = input_.contiguous()
++        b12x_ar_comm = self.b12x_ar_comm
++        should_a2a = getattr(b12x_ar_comm, "should_all_to_all_rows", None)
++        all_to_all_rows = getattr(b12x_ar_comm, "all_to_all_rows", None)
++        if (
++            b12x_ar_comm is not None
++            and not b12x_ar_comm.disabled
++            and should_a2a is not None
++            and should_a2a(input_, rows)
++        ):
++            assert all_to_all_rows is not None
++            return all_to_all_rows(input_, rows)
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is None or pynccl_comm.disabled:
+             raise RuntimeError("all_to_all_rows needs the PyNCCL communicator")
+-        input_ = input_.contiguous()
+         output = input_.new_empty((self.world_size, rows, *input_.shape[1:]))
+         pynccl_comm.all_to_all_rows(output, input_, rows)
+         return output
+@@ -718,7 +733,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             )
+ 
+             output = reduce_scatter_rank_order(
+-                pynccl_comm, input_tensor, self.rank_in_group, world_size
++                pynccl_comm,
++                input_tensor,
++                self.rank_in_group,
++                world_size,
++                roce_comm=self.b12x_ar_comm,
+             )
+         elif not self._roce_policy and should_nccl_symm_mem_ag_rs():
+             output = self._reduce_scatter_symm_mem(input_tensor)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 154327b66..a9b056528 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -399,7 +399,18 @@ class SPRows:
+         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+         send = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
+         parts = torch.empty_like(send)
+-        comm = get_tp_group().device_communicator.pynccl_comm
++        dev_comm = get_tp_group().device_communicator
++        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
++        should_exchange = (
++            getattr(roce_comm, "should_exchange", None)
++            if roce_comm is not None and not getattr(roce_comm, "disabled", True)
++            else None
++        )
++        comm = (
++            roce_comm
++            if should_exchange is not None and should_exchange(send, parts)
++            else dev_comm.pynccl_comm
++        )
+         slices = max(slices, 1)
+         if slices == 1 and not per_block:
+             flat = send.view(world * local, *row_shape)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 5ed772e5c..976f7e27e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -247,8 +247,18 @@ def exchange_into(
+     into ``parts[r]``; ``chunks[rank]`` and ``parts[rank]`` are not touched.
+ 
+     ``chunks`` and ``parts`` are ``(world, L, ...)``, each ``[r]`` contiguous (a
+-    row range of a larger buffer will do). ``comm`` is the group's PyNCCL
+-    communicator (``send``, ``recv``, ``group_start``, ``group_end``)."""
++    row range of a larger buffer will do). ``comm`` is the group's one-shot RoCE
++    adapter (``should_exchange``, ``exchange_into``) or PyNCCL communicator
++    (``send``, ``recv``, ``group_start``, ``group_end``)."""
++    should_exchange = getattr(comm, "should_exchange", None)
++    if (
++        not getattr(comm, "disabled", False)
++        and should_exchange is not None
++        and should_exchange(chunks, parts)
++    ):
++        exchange_fn = getattr(comm, "exchange_into", None) or getattr(comm, "exchange")
++        exchange_fn(chunks, parts)
++        return
+     if world == 4:
+         nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
+         half = -(-chunks.shape[1] // 2)
+@@ -314,16 +324,25 @@ class RankOrderParts:
+ 
+ 
+ def reduce_scatter_rank_order(
+-    comm, input_tensor: torch.Tensor, rank: int, world: int
++    comm, input_tensor: torch.Tensor, rank: int, world: int, *, roce_comm=None
+ ) -> torch.Tensor:
+     """Rows ``[rank * L, (rank + 1) * L)`` of the sum over ranks of ``input_tensor``
+     (contiguous, ``world * L`` rows), with the one-shot all-reduce's arithmetic: the
+-    unreduced exchange, then the rank-order sum (this rank's chunk read in place)."""
++    one-shot RDMA reduce-scatter when eligible, else the unreduced exchange and the
++    rank-order sum (this rank's chunk read in place)."""
++    fast_comm = roce_comm if roce_comm is not None else comm
++    should_rs = getattr(fast_comm, "should_reduce_scatter", None)
++    if (
++        not getattr(fast_comm, "disabled", False)
++        and should_rs is not None
++        and should_rs(input_tensor, 0)
++    ):
++        return fast_comm.reduce_scatter(input_tensor, 0)
+     return rank_order_sum(exchange_rank_order(comm, input_tensor, rank, world))
+ 
+ 
+ def all_reduce_rank_order(
+-    comm, input_tensor: torch.Tensor, rank: int, world: int
++    comm, input_tensor: torch.Tensor, rank: int, world: int, *, roce_comm=None
+ ) -> torch.Tensor:
+     """The sum over ranks of ``input_tensor`` at any size, with the one-shot
+     all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
+@@ -342,9 +361,20 @@ def all_reduce_rank_order(
+         columns.zero_(buffer[rows:])
+     else:
+         buffer = flat
+-    own = reduce_scatter_rank_order(comm, buffer, rank, world)
+-    gathered = torch.empty_like(buffer)
+-    comm.all_gather(gathered, own)
++    own = reduce_scatter_rank_order(
++        comm, buffer, rank, world, roce_comm=roce_comm
++    )
++    fast_comm = roce_comm if roce_comm is not None else comm
++    should_ag = getattr(fast_comm, "should_all_gather", None)
++    if (
++        not getattr(fast_comm, "disabled", False)
++        and should_ag is not None
++        and should_ag(own, 0)
++    ):
++        gathered = fast_comm.all_gather(own, 0)
++    else:
++        gathered = torch.empty_like(buffer)
++        comm.all_gather(gathered, own)
+     return gathered[:rows].view(input_tensor.shape)
+ 
+ 

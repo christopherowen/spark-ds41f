@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:29:25 +0100
+Subject: [PATCH 598/598] perf(engram): share disk staged_rows buffer and trim
+ transient hash/wkv buffers
+
+---
+ tests/models/test_deepseek_v4_1_engram.py  | 40 ++++++++++
+ vllm/models/deepseek_v4_1/common/engram.py | 87 ++++++++++++++++------
+ 2 files changed, 106 insertions(+), 21 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 2086536d1..fedea6882 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1017,6 +1017,46 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+     assert "prepared_engram_hashes" not in model.state_dict()
+ 
+ 
++def test_disk_engram_shares_staged_rows_and_skips_throwaway_hash_buffers(monkeypatch):
++    import vllm.models.deepseek_v4_1.common.engram as engram_module
++
++    monkeypatch.setattr(
++        engram_module,
++        "ReplicatedLinear",
++        lambda *args, **kwargs: nn.Identity(),
++    )
++    caps = SimpleNamespace(
++        max_tokens=8,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=1,
++        tp_rank=0,
++        device=torch.device("cpu"),
++    )
++    caps_next = SimpleNamespace(**{**vars(caps), "layer_id": 14})
++    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
++    config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
++    disk_layout = SimpleNamespace(
++        caps=(caps, caps_next),
++        lookup_plans=(None, None),
++        geometry=geometry,
++        table_memory="disk",
++        projection_tp=False,
++    )
++    first = Engram(config, None, disk_layout, 0, False, "engram_0")
++    second = Engram(config, None, disk_layout, 1, False, "engram_1")
++    assert first.staged_rows.data_ptr() == second.staged_rows.data_ptr()
++    assert first.embed_tokens._buffers["hashes"] is None
++    assert first.embed_tokens._buffers["num_tokens"] is None
++    shared_hashes = torch.full((8, 24), -1, dtype=torch.int64)
++    shared_num_tokens = torch.zeros((1,), dtype=torch.int32)
++    first.embed_tokens.share_hashes(shared_hashes, shared_num_tokens)
++    assert first.embed_tokens.hashes.data_ptr() == shared_hashes.data_ptr()
++    assert first.embed_tokens.num_tokens.data_ptr() == shared_num_tokens.data_ptr()
++
++
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ @pytest.mark.parametrize("tp_rank", [0, 3])
+ @torch.inference_mode()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 90debe723..a2ea529a1 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -506,18 +506,41 @@ class ParallelEngramEmbedding(nn.Module):
+                         "shard_start": self.shard_start,
+                     },
+                 )
+-        self.register_buffer(
+-            "hashes",
+-            torch.full(
+-                (caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device
+-            ),
+-            persistent=False,
+-        )
+-        self.register_buffer(
+-            "num_tokens",
+-            torch.empty((1,), dtype=torch.int32, device=caps.device),
+-            persistent=False,
+-        )
++        if table_memory == "disk":
++            self.register_buffer("hashes", None, persistent=False)
++            self.register_buffer("num_tokens", None, persistent=False)
++        else:
++            self.register_buffer(
++                "hashes",
++                torch.full(
++                    (caps.max_tokens, 24),
++                    DEAD_ID,
++                    dtype=torch.int64,
++                    device=caps.device,
++                ),
++                persistent=False,
++            )
++            self.register_buffer(
++                "num_tokens",
++                torch.empty((1,), dtype=torch.int32, device=caps.device),
++                persistent=False,
++            )
++
++    def __getattr__(self, name: str):
++        if name in ("hashes", "num_tokens"):
++            value = self._buffers.get(name)
++            if value is None:
++                self._buffers["hashes"] = torch.full(
++                    (self.caps.max_tokens, 24),
++                    DEAD_ID,
++                    dtype=torch.int64,
++                    device=self.caps.device,
++                )
++                self._buffers["num_tokens"] = torch.empty(
++                    (1,), dtype=torch.int32, device=self.caps.device
++                )
++                return self._buffers[name]
++        return super().__getattr__(name)
+ 
+     def close(self):
+         """Release file-backed staging only after graph consumers are gone."""
+@@ -608,7 +631,7 @@ class ParallelEngramEmbedding(nn.Module):
+         """Read each step's row IDs (``hashes`` [max_tokens, 24], contiguous) and live
+         token count from the model's buffers, which its hash writes in place, instead
+         of this table's own."""
+-        if hashes.shape != self.hashes.shape or not hashes.is_contiguous():
++        if hashes.shape != (self.caps.max_tokens, 24) or not hashes.is_contiguous():
+             raise ValueError("Engram row IDs must be a contiguous [max_tokens, 24]")
+         self.hashes = hashes
+         self.num_tokens = num_tokens
+@@ -712,16 +735,34 @@ class Engram(nn.Module):
+             persistent=False,
+         )
+         # Zeroed: a gather writes only its own step's rows. A disk table sharded on
+-        # hash columns gathers only its own columns, side by side.
++        # hash columns gathers only its own columns, side by side. Disk-backed layers
++        # gather and immediately project within their own forward, so they share one
++        # staged_rows buffer across layers on the layout.
+         columns = self.embed_tokens.columns
+-        self.register_buffer(
+-            "staged_rows",
+-            torch.zeros(
+-                caps.max_tokens,
+-                6144 if columns is None else len(columns) * 256,
++        staged_rows_shape = (
++            caps.max_tokens,
++            6144 if columns is None else len(columns) * 256,
++        )
++        shared_staged_rows = (
++            getattr(layout, "_shared_disk_staged_rows", None)
++            if layout.table_memory == "disk"
++            else None
++        )
++        if (
++            shared_staged_rows is None
++            or shared_staged_rows.shape != staged_rows_shape
++            or shared_staged_rows.device != torch.device(caps.device)
++        ):
++            shared_staged_rows = torch.zeros(
++                *staged_rows_shape,
+                 dtype=torch.bfloat16,
+                 device=caps.device,
+-            ),
++            )
++            if layout.table_memory == "disk":
++                layout._shared_disk_staged_rows = shared_staged_rows
++        self.register_buffer(
++            "staged_rows",
++            shared_staged_rows,
+             persistent=False,
+         )
+         # A resident table's lookup is prepared through B12X (the lookup unit).
+@@ -886,10 +927,14 @@ class Engram(nn.Module):
+             self.wkv, _PaddedColumnParallelLinear
+         )
+         if blocked:
+-            kv = sp_rows.exchange_rows(self.wkv.local_product(rows))
++            local_kv = self.wkv.local_product(rows)
++            del rows
++            kv = sp_rows.exchange_rows(local_kv)
++            del local_kv
+             kv_start = 0
+         else:
+             kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
++            del rows
+             kv_start = 0 if sp_rows is None else sp_rows.start
+         state = hidden_states.flatten(1)
+         out = torch.empty_like(state)

@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:48:45 +0100
+Subject: [PATCH 611/611] perf(attention): overlap indexer query/weights_proj
+ and global KV cache writes on aux_stream
+
+At decode row counts, overlap indexer.wq_b + _quantize_index_query against indexer.weights_proj in _index_query, and overlap _write_index_keys against _write_v41_cache in _prepare_global_kv using maybe_execute_in_parallel and aux_stream().
+---
+ tests/models/test_deepseek_v4_1_attention.py | 116 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       | 108 +++++++++++++----
+ 2 files changed, 199 insertions(+), 25 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 86d632101..94e229b1a 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -380,3 +380,119 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+     positions = torch.arange(4)
+     out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+     assert out.shape == (4, 32)
++
++
++def test_index_query_overlaps_weights_proj(monkeypatch):
++    """At decode row counts, ``_index_query`` hands ``q_cast`` to ``indexer.wq_b``
++    without re-casting ``qr`` and overlaps ``weights_proj`` via
++    ``maybe_execute_in_parallel``."""
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
++
++    module = _tilelang_layer(layer_id=3)
++    seen_casts = []
++
++    def fake_wq_b(x):
++        seen_casts.append(provided_mxfp8(x))
++        return torch.zeros(x.shape[0], 32 * 128, dtype=x.dtype, device=x.device)
++
++    fake_wq_b.tilelang_mxfp8_input = True
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wq_b=fake_wq_b,
++        weights_proj=lambda h: torch.ones(
++            h.shape[0], 32, dtype=h.dtype, device=h.device
++        ),
++    )
++    module._quantize_index_query = lambda mode, iq, data, scale, positions=None: (
++        data.fill_(7),
++        scale.fill_(3),
++    )
++
++    parallel_calls = []
++
++    def fake_parallel(fn0, fn1, ev0, ev1, stream=None):
++        parallel_calls.append(stream)
++        return fn0(), fn1()
++
++    monkeypatch.setattr(attention, "maybe_execute_in_parallel", fake_parallel)
++    monkeypatch.setattr(attention, "aux_stream", lambda: "aux")
++    monkeypatch.setattr(attention, "_aux_events", lambda: ("ev0", "ev1"))
++
++    qr = torch.zeros(4, 1280)
++    hidden = torch.zeros(4, 5120)
++    positions = torch.arange(4, dtype=torch.int64)
++    q_cast = MXFP8Rows(
++        qr,
++        torch.ones(64, 1280, dtype=torch.float8_e4m3fn),
++        torch.ones(64, 160, dtype=torch.uint8),
++    )
++    swa = SimpleNamespace(is_decode=True)
++
++    iq_data, iq_scale, weights = module._index_query(
++        qr, positions, hidden, None, 0, 4, swa, q_cast=q_cast
++    )
++    assert seen_casts == [q_cast]
++    assert iq_data.shape == (4, 32, 64) and torch.all(iq_data == 7)
++    assert iq_scale.shape == (4, 32, 4) and torch.all(iq_scale == 3)
++    assert weights.shape == (4, 32) and torch.all(weights == 1)
++    assert len(parallel_calls) == 1
++
++
++def test_prepare_global_kv_overlaps_index_key_and_latent_writes(monkeypatch):
++    """``_prepare_global_kv`` writes the index key and compressed latent cache
++    entries through ``maybe_execute_in_parallel`` after ``wk`` reads the
++    unrotated latent."""
++    from vllm.models.deepseek_v4_1 import attention
++
++    module = _tilelang_layer(layer_id=3)
++    module._ready = True
++    module._owner = lambda: SimpleNamespace(prefix="main")
++    module.kv_cache = torch.empty(2, 8, dtype=torch.uint8)
++    order = []
++
++    module.compressor = lambda hidden, main, state: (
++        order.append("compress") or torch.zeros(4, 512),
++        torch.arange(4, dtype=torch.int64),
++    )
++    module.compressor.state_cache = None
++    module.indexer = SimpleNamespace(
++        k_cache=SimpleNamespace(prefix="idx_k"),
++        wk=lambda latent: order.append("wk") or torch.zeros(4, 128),
++    )
++    module._write_index_keys = lambda key, slots, positions=None: order.append(
++        "write_index_keys"
++    )
++    module._write_v41_cache = lambda latent, cache, slots, **kw: order.append(
++        f"write_cache:{kw['cache_kind']}"
++    )
++
++    metadata = {
++        "main": SimpleNamespace(),
++        "idx_k": SimpleNamespace(slot_mapping=torch.arange(8, dtype=torch.int64)),
++    }
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    parallel_calls = []
++    monkeypatch.setattr(
++        attention,
++        "maybe_execute_in_parallel",
++        lambda fn0, fn1, ev0, ev1, stream=None: (
++            parallel_calls.append(stream),
++            fn0(),
++            fn1(),
++        )[1:],
++    )
++    module._prepare_global_kv(
++        torch.arange(4, dtype=torch.int64), torch.zeros(4, 5120)
++    )
++    assert order == [
++        "compress",
++        "wk",
++        "write_index_keys",
++        "write_cache:indexed",
++    ]
++    assert len(parallel_calls) == 1
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 96de50083..9066e52e7 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -43,6 +43,8 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import DECODE_ROWS
+ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS
+ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+ from vllm.utils.math_utils import cdiv
++from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
++from vllm.utils.torch_utils import aux_stream
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+@@ -54,6 +56,15 @@ logger = init_logger(__name__)
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+ _INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_INDEXER_SPLIT_CHECK") == "1"
++_AUX_EVENTS: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
++
++
++def _aux_events() -> tuple[torch.cuda.Event, torch.cuda.Event]:
++    """Reusable CUDA event pair for fork/join onto ``aux_stream()``."""
++    global _AUX_EVENTS
++    if _AUX_EVENTS is None:
++        _AUX_EVENTS = (torch.cuda.Event(), torch.cuda.Event())
++    return _AUX_EVENTS
+ 
+ 
+ def _source(prefix, layer):
+@@ -813,15 +824,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+         # and the paged MXFP4 write run in one kernel.
+         key = indexer.wk(latent)
+-        index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
+-        self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
+-        self._write_v41_cache(
+-            latent,
+-            self.kv_cache,
+-            slots,
+-            page_size=self._main_page,
+-            cache_kind="indexed",
+-            positions=positions,
++        index_slots = cast(
++            DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix]
++        ).slot_mapping[:rows]
++
++        def write_index_key():
++            self._write_index_keys(key, index_slots, positions=positions)
++
++        def write_latent_kv():
++            self._write_v41_cache(
++                latent,
++                self.kv_cache,
++                slots,
++                page_size=self._main_page,
++                cache_kind="indexed",
++                positions=positions,
++            )
++
++        stream = (
++            aux_stream()
++            if hidden_states.is_cuda and rows <= DECODE_ROWS
++            else None
++        )
++        if stream is not None and not torch.cuda.is_current_stream_capturing():
++            for tensor in (latent, positions, self.kv_cache, slots):
++                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
++                    tensor.record_stream(stream)
++        ev0, ev1 = _aux_events() if stream is not None else (None, None)
++        maybe_execute_in_parallel(
++            write_index_key,
++            write_latent_kv,
++            ev0,
++            ev1,
++            stream,
+         )
+ 
+     def forward(
+@@ -1029,28 +1064,51 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if q_cast is None
+             else kernels.slice_mxfp8(q_cast, first, last)
+         )
+-        with kernels.mxfp8_inputs(cast_rows):
+-            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+-        del cast_rows, q_cast
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+-        self._quantize_index_query(
+-            "decode" if swa.is_decode else "prefill",
+-            iq,
+-            iq_data,
+-            iq_scale,
+-            positions=positions[first:last],
+-        )
+-        del iq
++        mode = "decode" if swa.is_decode else "prefill"
++
++        def run_query():
++            nonlocal cast_rows, q_cast
++            with kernels.mxfp8_inputs(cast_rows):
++                iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
++            del cast_rows, q_cast
++            self._quantize_index_query(
++                mode,
++                iq,
++                iq_data,
++                iq_scale,
++                positions=positions[first:last],
++            )
++            del iq
++
++        if index_weights is not None:
++            run_query()
++            return iq_data, iq_scale, index_weights[first:last]
++
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+-        weights = (
+-            index_weights[first:last]
+-            if index_weights is not None
+-            else self.indexer.weights_proj(hidden_states)[first:last]
++        # At decode row counts, the query path uses no workspace when wq_b reads
++        # cast_rows, so weights_proj can run concurrently on the auxiliary stream.
++        stream = (
++            aux_stream()
++            if qr.is_cuda
++            and cast_rows is not None
++            and hidden_states.shape[0] <= DECODE_ROWS
++            else None
++        )
++        if stream is not None and not torch.cuda.is_current_stream_capturing():
++            hidden_states.record_stream(stream)
++        ev0, ev1 = _aux_events() if stream is not None else (None, None)
++        _, full_weights = maybe_execute_in_parallel(
++            run_query,
++            lambda: self.indexer.weights_proj(hidden_states),
++            ev0,
++            ev1,
++            stream,
+         )
+-        return iq_data, iq_scale, weights  # the projection applied the scale
++        return iq_data, iq_scale, full_weights[first:last]  # the projection applied the scale
+ 
+     @staticmethod
+     def _selection_spread(actual, expected):

@@ -1,0 +1,512 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:29:25 +0100
+Subject: [PATCH 600/600] perf(loader,ds41): speed up direct loader shard
+ routing, bounce copies, and expert lookup
+
+---
+ .../model_loader/test_direct_loader.py        | 18 +++-
+ .../model_loader/direct_io/_bounce.c          | 89 ++++++++++++------
+ .../model_loader/direct_io/_checkpoint.py     | 47 ++++++----
+ .../model_loader/direct_loader.py             | 75 +++++++++------
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 15 ++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 94 ++++++++++---------
+ 6 files changed, 218 insertions(+), 120 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
+index b17afcca4..6c378e977 100644
+--- a/tests/model_executor/model_loader/test_direct_loader.py
++++ b/tests/model_executor/model_loader/test_direct_loader.py
+@@ -527,7 +527,7 @@ ENGRAM = re.compile(r"layers\.\d+\.engram\.embed\.(?:weight|scale)")
+ 
+ 
+ def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
+-    tmp_path, session
++    tmp_path, session, monkeypatch
+ ):
+     """DS4.1's filter on a mixed shard, a table-only shard and a shard without tables:
+     tables become file-source descriptors, the rest routes through the session, all
+@@ -569,6 +569,16 @@ def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
+         return manifest(path)
+ 
+     session.manifest = recorded
++    file_sources_opened = []
++    real_file_sources = weight_utils.safetensors_file_sources
++
++    def recorded_file_sources(path):
++        file_sources_opened.append(os.path.basename(path))
++        return real_file_sources(path)
++
++    monkeypatch.setattr(
++        weight_utils, "safetensors_file_sources", recorded_file_sources
++    )
+     source = DefaultModelLoader.Source(
+         str(tmp_path),
+         revision=None,
+@@ -589,12 +599,16 @@ def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
+         "model.layers.1.stale.weight",
+     ]
+     assert opened == ["a.safetensors", "c.safetensors"]  # b holds only tables
++    assert file_sources_opened == [
++        "a.safetensors",
++        "b.safetensors",
++    ]  # c holds no tables
+     loaded = dict(loaded)
+     for name in (*mixed, *tables):
+         if ENGRAM.fullmatch(name) is None:
+             continue
+         path = tmp_path / ("a.safetensors" if name in mixed else "b.safetensors")
+-        expected = weight_utils.safetensors_file_sources(str(path))[name]
++        expected = real_file_sources(str(path))[name]
+         assert get_file_tensor_source(loaded[f"model.{name}"]) == expected
+         assert loaded[f"model.{name}"].device.type == "meta"
+     assert {entry.name for _, entry in session.sources.values()} == {
+diff --git a/vllm/model_executor/model_loader/direct_io/_bounce.c b/vllm/model_executor/model_loader/direct_io/_bounce.c
+index 6da3332ce..da9a24257 100644
+--- a/vllm/model_executor/model_loader/direct_io/_bounce.c
++++ b/vllm/model_executor/model_loader/direct_io/_bounce.c
+@@ -84,35 +84,50 @@ static void *bounce_copy_worker(void *opaque) {
+         while (!ring->ready_count && !ring->stopping)
+             pthread_cond_wait(&ring->ready, &ring->mutex);
+         if (!ring->ready_count) break;
+-        unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
+-        ring->ready_count--;
+-        bounce_slot_t slot = ring->slots[index];
++        unsigned batch_indices[BOUNCE_SLOTS];
++        bounce_slot_t batch_slots[BOUNCE_SLOTS];
++        unsigned batch_count = 0;
++        while (ring->ready_count && batch_count < BOUNCE_SLOTS) {
++            unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
++            ring->ready_count--;
++            batch_indices[batch_count] = index;
++            batch_slots[batch_count] = ring->slots[index];
++            batch_count++;
++        }
+         pthread_mutex_unlock(&ring->mutex);
+-        char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
+-        char *source = buffer + slot.delta;
+-        size_t width = slot.job.bytes;
+-        size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
+-        if (slot.job.expand_bf16) {
+-            for (int64_t row = 0; row < slot.job.rows; row++)
+-                memmove(buffer + row * width, source + row * pitch, width);
+-            expand_bf16_inplace(buffer, slot.job.rows * width);
+-            source = buffer;
+-            width *= 2;
+-            pitch = width;
++        uint64_t bounced = 0, strided = 0;
++        for (unsigned b = 0; b < batch_count; b++) {
++            unsigned index = batch_indices[b];
++            bounce_slot_t slot = batch_slots[b];
++            char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
++            char *source = buffer + slot.delta;
++            size_t width = slot.job.bytes;
++            size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
++            if (slot.job.expand_bf16) {
++                for (int64_t row = 0; row < slot.job.rows; row++)
++                    memmove(buffer + row * width, source + row * pitch, width);
++                expand_bf16_inplace(buffer, slot.job.rows * width);
++                source = buffer;
++                width *= 2;
++                pitch = width;
++            }
++            if (!failure.message[0])
++                cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
++                    slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
++                    source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
++                    ring->stream), "copy checkpoint ring to CUDA weights", &failure);
++            bounced += slot.job.rows * slot.job.bytes;
++            if (slot.job.rows > 1) strided += slot.job.rows * slot.job.bytes;
+         }
+-        if (!failure.message[0])
+-            cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
+-                slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
+-                source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
+-                ring->stream), "copy checkpoint ring to CUDA weights", &failure);
+-        /* Reads into other slots remain in flight while this slot is on the GPU. */
++        /* Reads into other slots remain in flight while this batch is on the GPU. */
+         cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint ring copy", &failure);
+         pthread_mutex_lock(&ring->mutex);
+         if (failure.message[0]) ring->copy_failure = failure;
+-        ring->bounced_bytes += slot.job.rows * slot.job.bytes;
+-        if (slot.job.rows > 1) ring->strided_bytes += slot.job.rows * slot.job.bytes;
+-        ring->free_slots[ring->free_count++] = index;
+-        ring->copying--;
++        ring->bounced_bytes += bounced;
++        ring->strided_bytes += strided;
++        for (unsigned b = 0; b < batch_count; b++)
++            ring->free_slots[ring->free_count++] = batch_indices[b];
++        ring->copying -= batch_count;
+         pthread_cond_signal(&ring->available);
+         if (!ring->copying) pthread_cond_signal(&ring->drained);
+     }
+@@ -165,10 +180,25 @@ static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
+         snprintf(failure->message, sizeof(failure->message), "io_uring bounce executor is unusable after a submission/completion failure");
+         return false;
+     }
+-    for (size_t i = 0; i < count; i++) {
++    for (size_t i = 0; i < count;) {
+         read_job_t *job = &jobs[i];
+-        if (!job->host_copy && !validate_direct_range(job->fd, job->offset,
+-                (job->rows - 1) * job->source_stride + job->bytes, failure)) return false;
++        if (job->host_copy) { i++; continue; }
++        int fd = job->fd;
++        int64_t max_end = 0;
++        size_t j = i;
++        while (j < count && (jobs[j].host_copy || jobs[j].fd == fd)) {
++            if (!jobs[j].host_copy) {
++                int64_t span = (jobs[j].rows - 1) * jobs[j].source_stride + jobs[j].bytes;
++                if (jobs[j].offset < 0 || span < 0 || jobs[j].offset > INT64_MAX - span) {
++                    if (!validate_direct_range(fd, jobs[j].offset, span, failure)) return false;
++                }
++                int64_t end = jobs[j].offset + span;
++                if (end > max_end) max_end = end;
++            }
++            j++;
++        }
++        if (!validate_direct_range(fd, 0, max_end, failure)) return false;
++        i = j;
+     }
+     size_t next = 0;
+     int64_t row = 0, within = 0;
+@@ -208,7 +238,10 @@ static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
+                 slot->job.bytes &= ~(int64_t)1;
+             }
+             slot->job.rows = 1;
+-            if (!within && job->bytes < IO_ALIGNMENT && job->source_stride >= job->bytes) {
++            if (!within && job->source_stride >= job->bytes &&
++                (job->bytes < IO_ALIGNMENT || job->source_stride - job->bytes < IO_ALIGNMENT) &&
++                job->bytes <= BOUNCE_SLOT_BYTES - (int64_t)slot->delta &&
++                (!job->expand_bf16 || job->bytes <= BOUNCE_SLOT_BYTES / 2)) {
+                 slot->job.rows += (BOUNCE_SLOT_BYTES - (int64_t)slot->delta - job->bytes) / job->source_stride;
+                 if (slot->job.rows > job->rows - row) slot->job.rows = job->rows - row;
+             }
+diff --git a/vllm/model_executor/model_loader/direct_io/_checkpoint.py b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+index f625ffe28..26886f326 100644
+--- a/vllm/model_executor/model_loader/direct_io/_checkpoint.py
++++ b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+@@ -379,9 +379,22 @@ class DirectWeightSession:
+         import torch
+ 
+         weight_map = None
+-        if index_path is not None and Path(index_path).is_file():
+-            weight_map = json.loads(Path(index_path).read_text())["weight_map"]
+         indexed_paths = {}
++        if index_path is not None:
++            index_file_path = Path(index_path)
++            if index_file_path.is_file():
++                resolved_index = index_file_path.resolve()
++                cached = getattr(self, "_index_cache", None)
++                if cached is not None and cached[0] == resolved_index:
++                    _, weight_map, indexed_paths = cached
++                else:
++                    weight_map = json.loads(index_file_path.read_text())["weight_map"]
++                    index_parent = index_file_path.parent
++                    for indexed_file in set(weight_map.values()):
++                        indexed_paths[indexed_file] = (
++                            index_parent / indexed_file
++                        ).resolve()
++                    self._index_cache = (resolved_index, weight_map, indexed_paths)
+         for path in files:
+             manifest = self.manifest(path)
+             resolved_path = Path(path).resolve()
+@@ -393,10 +406,6 @@ class DirectWeightSession:
+                     indexed_file = weight_map.get(entry.name)
+                     if indexed_file is None:
+                         continue
+-                    if indexed_file not in indexed_paths:
+-                        indexed_paths[indexed_file] = (
+-                            Path(index_path).parent / indexed_file
+-                        ).resolve()
+                     if indexed_paths[indexed_file] != resolved_path:
+                         continue
+                 if skip is not None and skip(entry.name):
+@@ -481,20 +490,18 @@ class DirectWeightSession:
+         )
+         if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
+             raise ValueError(f"destination exceeds tensor storage: {entry.name}")
+-        with torch.accelerator.device_index(destination.device.index):
+-            expand = (
+-                source.dtype == torch.bfloat16 and destination.dtype == torch.float32
+-            )
+-            byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
+-            if destination.dtype == source.dtype or expand or byte_cast:
+-                for record in view_records(entry, offset, source, destination, expand):
+-                    self.records.extend(record)
+-                self.destinations.append(destination)
+-                if expand:
+-                    self.bf16_expansion_bytes += source.nbytes
+-            else:
+-                if not source.is_contiguous() or not destination.is_contiguous():
+-                    raise NotImplementedError(f"strided dtype conversion: {entry.name}")
++        expand = source.dtype == torch.bfloat16 and destination.dtype == torch.float32
++        byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
++        if destination.dtype == source.dtype or expand or byte_cast:
++            for record in view_records(entry, offset, source, destination, expand):
++                self.records.extend(record)
++            self.destinations.append(destination)
++            if expand:
++                self.bf16_expansion_bytes += source.nbytes
++        else:
++            if not source.is_contiguous() or not destination.is_contiguous():
++                raise NotImplementedError(f"strided dtype conversion: {entry.name}")
++            with torch.accelerator.device_index(destination.device.index):
+                 self.flush()
+                 if self.transform_scratch is None:
+                     self.transform_scratch = torch.empty(
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index 610d5e47f..24ec1f48e 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -411,32 +411,56 @@ class DirectModelLoader(DefaultModelLoader):
+         session = self._session
+         if session is None:
+             raise RuntimeError("the direct loader reads weights only in load_model")
+-        weight_map = None
++        names_by_path = None
+         if index_path.is_file():
+             weight_map = json.loads(index_path.read_text())["weight_map"]
+-        indexed_paths = {}
++            indexed_paths = {}
++            names_by_path = {}
++            for name, indexed_file in weight_map.items():
++                resolved_indexed = indexed_paths.get(indexed_file)
++                if resolved_indexed is None:
++                    resolved_indexed = (index_path.parent / indexed_file).resolve()
++                    indexed_paths[indexed_file] = resolved_indexed
++                names_by_path.setdefault(resolved_indexed, []).append(name)
++        prefixes = source.weight_name_prefixes
++        local_expert_ids = self.local_expert_ids
++        file_filter = source.file_weight_filter
+         for path in files:
+-            sources = weight_utils.safetensors_file_sources(path)
+-            file_names = {name for name in sources if source.file_weight_filter(name)}
+             resolved_path = Path(path).resolve()
+-            selected = []
+-            for name in sorted(sources):
+-                if source.weight_name_prefixes and not name.startswith(
+-                    source.weight_name_prefixes
+-                ):
++            if names_by_path is not None:
++                indexed_names = names_by_path.get(resolved_path, ())
++                candidate_names = [
++                    name
++                    for name in indexed_names
++                    if (not prefixes or name.startswith(prefixes))
++                    and not should_skip_weight(name, local_expert_ids)
++                ]
++                if not candidate_names:
++                    continue
++                if not any(file_filter(name) for name in candidate_names):
++                    allowed_names = set(candidate_names)
++                    yield from session.weights(
++                        [path],
++                        prefix=source.prefix,
++                        needs_values=self._needs_values,
++                        skip=lambda name, allowed=allowed_names: name not in allowed,
++                    )
+                     continue
+-                if weight_map is not None:
+-                    indexed_file = weight_map.get(name)
+-                    if indexed_file is None:
+-                        continue
+-                    if indexed_file not in indexed_paths:
+-                        indexed_paths[indexed_file] = (
+-                            index_path.parent / indexed_file
+-                        ).resolve()
+-                    if indexed_paths[indexed_file] != resolved_path:
+-                        continue
+-                if not should_skip_weight(name, self.local_expert_ids):
+-                    selected.append(name)
++                allowed_indexed = set(candidate_names)
++            else:
++                allowed_indexed = None
++            sources = weight_utils.safetensors_file_sources(path)
++            if allowed_indexed is not None:
++                selected = [name for name in sorted(sources) if name in allowed_indexed]
++            else:
++                selected = [
++                    name
++                    for name in sorted(sources)
++                    if (not prefixes or name.startswith(prefixes))
++                    and not should_skip_weight(name, local_expert_ids)
++                ]
++            file_names = {name for name in selected if file_filter(name)}
++            ordinary_names = {name for name in selected if name not in file_names}
+             file_backed = (
+                 (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
+                 for name in selected
+@@ -447,16 +471,13 @@ class DirectModelLoader(DefaultModelLoader):
+             ordinary = (
+                 session.weights(
+                     [path],
+-                    prefixes=source.weight_name_prefixes,
+                     prefix=source.prefix,
+-                    index_path=index_path,
+                     needs_values=self._needs_values,
+-                    skip=lambda name, file_names=file_names: (
+-                        name in file_names
+-                        or should_skip_weight(name, self.local_expert_ids)
++                    skip=lambda name, ordinary_names=ordinary_names: (
++                        name not in ordinary_names
+                     ),
+                 )
+-                if any(name not in file_names for name in selected)
++                if ordinary_names
+                 else ()
+             )
+             yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 8d36eb7a9..2041a0ab3 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -679,6 +679,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+             ckpt_up_proj_name="w3",
+             num_experts=n_draft_experts,
+         )
++        expert_mapping_by_key: dict[str, list[tuple[str, str, int, str]]] = {}
++        for mapping in expert_mapping:
++            expert_mapping_by_key.setdefault(mapping[1], []).append(mapping)
+         expert_scale_suffix = (
+             ".weight_scale"
+             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+@@ -729,7 +732,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+                     and loaded_weight.dtype == torch.float8_e8m0fnu
+                 ):
+                     loaded_weight = loaded_weight.view(torch.uint8)
+-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
++                _, _, rest = name.partition(".experts.")
++                d1 = rest.find(".")
++                d2 = rest.find(".", d1 + 1) if d1 != -1 else -1
++                candidates = (
++                    expert_mapping_by_key.get(f"experts.{rest[: d2 + 1]}")
++                    if d2 != -1
++                    else None
++                )
++                for param_name, weight_name, expert_id, shard_id in (
++                    candidates if candidates is not None else expert_mapping
++                ):
+                     if weight_name not in name:
+                         continue
+                     name_mapped = name.replace(weight_name, param_name)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 7d458993e..670759f13 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -1030,8 +1030,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         head_rank_start = n_local_head * tp_rank
+         head_rank_end = n_local_head * (tp_rank + 1)
+ 
+-        # Pre-compute expert mapping ONCE.
++        # Pre-compute expert mapping ONCE and index by weight_name for O(1) lookup.
+         expert_mapping = self.get_expert_mapping()
++        expert_mapping_by_key: dict[str, list[tuple[str, str, int, str]]] = {}
++        for mapping in expert_mapping:
++            expert_mapping_by_key.setdefault(mapping[1], []).append(mapping)
+ 
+         for name, loaded_weight in weights:
+             if name.startswith(("vision.", "aligner.", "image_")):
+@@ -1048,10 +1051,54 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     for loaded in embedding.load_weights(((leaf, loaded_weight),))
+                 )
+                 continue
++            if ".experts." in name:
++                # E8M0 scales are stored as float8_e8m0fnu in
++                # checkpoints but the MoE param is uint8. copy_()
++                # would do a numeric conversion (e.g. 2^-7 → 0),
++                # destroying the raw exponent bytes.
++                if (
++                    "weight_scale" in name
++                    and loaded_weight.dtype == torch.float8_e8m0fnu
++                ):
++                    loaded_weight = loaded_weight.view(torch.uint8)
++                _, _, rest = name.partition(".experts.")
++                d1 = rest.find(".")
++                d2 = rest.find(".", d1 + 1) if d1 != -1 else -1
++                candidates = (
++                    expert_mapping_by_key.get(f"experts.{rest[: d2 + 1]}")
++                    if d2 != -1
++                    else None
++                )
++                for mapping in (
++                    candidates if candidates is not None else expert_mapping
++                ):
++                    param_name, weight_name, expert_id, expert_shard_id = mapping
++                    if weight_name not in name:
++                        continue
++                    name_mapped = name.replace(weight_name, param_name)
++                    if is_pp_missing_parameter(name_mapped, self):
++                        continue
++                    param = params_dict[name_mapped]
++                    # We should ask the weight loader to return success or not
++                    # here since otherwise we may skip experts with other
++                    # available replicas.
++                    weight_loader = typing.cast(
++                        Callable[..., bool], param.weight_loader
++                    )
++                    success = weight_loader(
++                        param,
++                        loaded_weight,
++                        name_mapped,
++                        shard_id=expert_shard_id,
++                        expert_id=expert_id,
++                        return_success=True,
++                    )
++                    if success:
++                        name = name_mapped
++                        break
++                loaded_params.add(name_mapped)
++                continue
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+-                # Skip non-stacked layers and experts (experts handled below).
+-                if ".experts." in name:
+-                    continue
+                 if weight_name not in name:
+                     continue
+                 name = name.replace(weight_name, param_name)
+@@ -1069,44 +1116,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 loaded_params.add(name)
+                 break
+             else:
+-                if ".experts." in name:
+-                    # E8M0 scales are stored as float8_e8m0fnu in
+-                    # checkpoints but the MoE param is uint8. copy_()
+-                    # would do a numeric conversion (e.g. 2^-7 → 0),
+-                    # destroying the raw exponent bytes.
+-                    if (
+-                        "weight_scale" in name
+-                        and loaded_weight.dtype == torch.float8_e8m0fnu
+-                    ):
+-                        loaded_weight = loaded_weight.view(torch.uint8)
+-                    for mapping in expert_mapping:
+-                        param_name, weight_name, expert_id, expert_shard_id = mapping
+-                        if weight_name not in name:
+-                            continue
+-                        name_mapped = name.replace(weight_name, param_name)
+-                        if is_pp_missing_parameter(name_mapped, self):
+-                            continue
+-                        param = params_dict[name_mapped]
+-                        # We should ask the weight loader to return success or not
+-                        # here since otherwise we may skip experts with other
+-                        # available replicas.
+-                        weight_loader = typing.cast(
+-                            Callable[..., bool], param.weight_loader
+-                        )
+-                        success = weight_loader(
+-                            param,
+-                            loaded_weight,
+-                            name_mapped,
+-                            shard_id=expert_shard_id,
+-                            expert_id=expert_id,
+-                            return_success=True,
+-                        )
+-                        if success:
+-                            name = name_mapped
+-                            break
+-                    loaded_params.add(name_mapped)
+-                    continue
+-                elif "attn_sink" in name:
++                if "attn_sink" in name:
+                     if is_pp_missing_parameter(name, self):
+                         continue
+                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]

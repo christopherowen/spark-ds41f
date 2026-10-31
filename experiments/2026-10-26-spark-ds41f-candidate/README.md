@@ -851,3 +851,81 @@ scheduler, memory/loader, L2 prefetch, SP prefill, and cold-boot kernel preparat
   [rc15/bundles/candidate-15](rc15/bundles/candidate-15) ([rc15/verdict.json](rc15/verdict.json))
   and subsystem measurements in [rc15/results.json](rc15/results.json)
   ([rc15/measure_candidate_15.py](rc15/measure_candidate_15.py)).
+
+## Candidate 16 ([rc16/](rc16))
+
+Refines `rc15` after initial TP3 qualification (`20261030T145218-release-tp3.json`), dropping the
+unhelpful speculative policy knobs (`#693`, `#694`, `#696`, `#697`, `#699`, `#700`, `#701`) and
+adding the attention/KV/DSpark/mHC fusions (`#706`, `#707`, `#708`, `#710`), dead-row acceptance
+estimator clamp (`#695`), prebuilt `io_uring` helpers and Vision TP3 tensor parallelism (`#688`),
+and `CopyDrafter` Rework #1 (`#687`).
+
+## Candidate 17 ([rc17/](rc17))
+
+Preserves `rc16` (`0568..0592`) and adds `0593` (`#686`: preserve initial unit confidence across
+mid-prefill chunks in adaptive verification), reproduced as `spark-ds41f:19f2c20ed4d6-next-17`
+(`patch_head` `37a0a07b`, `expected_tree` `1399ec84`).
+
+- **TP3 Qualification (`53/53` sessions passed, `exit 0`):**
+  - `20261031T004749-release-tp3.json` (28 sessions across `candidate-17` and `candidate-17-copy`):
+    - **Startup & Memory (`candidate-17`):** `ready_s = 116.10 s` (`-81.33 s` / `-41.2%` faster
+      than `1030` `197.43 s`; `113.00 s` / `-84.43 s` on `rc-tp3.json`), lowest `MemAvailable`
+      `dgx1 = 7.135..7.576 GiB` (`+0.165..+0.606 GiB`), `dgx2 = 9.048..9.275 GiB`,
+      `dgx3 = 9.146..9.460 GiB`.
+    - **Engine Grid (`4K..1016K`):** `15/15` decode shapes statistically `better` (`-1.90% ±0.14%`
+      geometric mean step-time reduction vs `1030`, `-2.27%` at `1016K`).
+    - **Prefill (`32K..1M`):** `5/5` context lengths statistically `better` vs `1030`
+      (`+1.51%..+2.14%` across `32K, 131K, 262K, 524K, 1M`; `4,371.4 tok/s` at `1M`).
+    - **Long-Prefill Stalls (`stall-3`, `stall-6`, `stall-7`):** decode step `p90` `-1.25%..-2.81%`
+      `better` and `131K` prefill under decode `+1.10%..+1.97%` `better` vs `1030`; short-request
+      TTFT max `-11.79%` `better` (`2.179 s` vs `2.470 s`).
+    - **Steady-State Serving (`c8`, `c4`, `poisson`, `c1`, `sampled: c16/c8/c1`):** all `same` or
+      `better` (`c8` TTFT p99 `-7.56%`, TPOT p99 `-1.14%`; `sampled: c1` paired TTFT
+      `-0.49% ±0.29%` `better`).
+  - `20261031T004751-candidate-tp3.json` (25 sessions: 19 on `candidate-17` + 6 on
+    `candidate-17-copy`): 100% bit-exact SHA-256 digests vs `spark-ds41f-1030` (including Vision
+    TP3 `4ca8b3e8...`), `259` vs `276` TileLang cold-boot calls (`0` JIT misses), and `6.29x–7.08x`
+    step compression on `edit`/`copy` (`14.249` / `16.029 tok/step`) and `2.99x` on `tool`
+    (`6.773 tok/step`) in `copy_probe.py`.
+
+## Candidate 18 ([rc18/](rc18))
+
+Builds on `rc17` (`0568..0593`) with **21 flag-free vLLM patches (`0594..0614`)**, **`sparknet`
+patch `0001`** (`#735`), and **host `bin/spark` parallel startup** (`#726`, commit `756d9bb5`):
+
+- **Series:** [rc18/vllm/series](rc18/vllm/series) (`0001..0614`, `patch_head` `1852410d`,
+  `expected_tree` `35835b0c`) and [rc18/sparknet/series](rc18/sparknet/series) (`0001`,
+  `patch_head` `fad37ed4`, `expected_tree` `104504a6`).
+
+  | Patch | PR | Change | Why |
+  | --- | --- | --- | --- |
+  | 0594 | #714 | MoE expert weight preparation peak memory & allocator slack reduction | `-1.92 GiB` peak GPU reserved memory during TP3 MoE weight prep |
+  | 0595 | #727 | Compact 2-bit and 4-bit expert scale codes in one storage buffer | `-1.29 GiB/rank` persistent GPU memory across 40 MoE layers |
+  | 0596 | #715 | Share transient capacity scratch buffers across compressor layers | `-127.6 MiB/rank` persistent GPU memory across 4 compressor layers |
+  | 0597 | #716 | Per-component GPU and host memory breakdown log at startup | Structured startup memory observability |
+  | 0598 | #718 | Share disk `staged_rows` buffer and trim transient Engram hash/wkv buffers | `-97.5 MiB/rank` persistent GPU memory across 4 Engram layers |
+  | 0599 | #719 | Specialize step kernel cold-boot declarations to aligned logit strides | Trims 12–13 unreachable TileLang sampling kernel compilations |
+  | 0600 | #720 | Direct loader `O(1)` expert routing, metadata cache, and batched `O_DIRECT` copies | Expert routing `3.56 s -> 52.5 ms`; `192k -> 96` `O_DIRECT` syscalls |
+  | 0601 | #721 | Lazy multimodal and quantization probing during `ModelConfig` init | `ModelConfig` init `4.90 s -> 2.18 s` (`-2.72 s`) |
+  | 0602 | #722 | Skip redundant non-graph warmup steps on post-capture pass | Eliminates duplicate block-zeroer, Gumbel, dead-row, and `max_num_batched_tokens` steps |
+  | 0603 | #723 | Single warmup per descriptor family in `CudaGraphManager.capture` | Eliminates ~45 redundant eager forward passes during CUDA graph capture |
+  | 0604 | #725 | Streamline `_prepare_kernels` registration, `warm_declared`, and `bind_declared` | `O(1)` warmup dedup and zero re-evaluation of ~1,200 module declarations |
+  | 0605 | #729 | 128-row packed vocab head tile and fused greedy epilogue argmax | `-134..-193 us/call` at 65..96 rows; eliminates `[M, 32320]` FP32 local logits DRAM round-trip |
+  | 0606 | #730 | Single-launch `project_and_finalize_streams` and barrier-free `mhc_finalize` | `-83 us/step` across 122 mHC entries at `M=1` |
+  | 0607 | #731 | Pack decode `Q-B` and `indexer.wq_b` FP8 weights into `128x128` contiguous tiles | `-1.4..-3.7 us/call` under cold L2 |
+  | 0608 | #735 | Route SP `reduce_scatter`, `exchange`, `all_to_all_rows`, and large `all_reduce` to `sparknet.oneshot` | One-shot RDMA collectives for SP prefill and TP all-reduce |
+  | 0609 | #717 | Inline single-rank headless worker and host heap trim (flag-free) | `+1.00 GiB` follower host `MemAvailable` on `dgx2..dgx4` |
+  | 0610 | #713 | Trim activation and MXFP8 cast lifetimes across attention and decoder layer | Frees transient forward activations immediately after last consumer |
+  | 0611 | #732 | Overlap `indexer.weights_proj` and global KV cache writes on `aux_stream` | Overlaps non-SM-saturating indexer/KV ops with main stream (`~-100 us/step`) |
+  | 0612 | #733 | TP-invariant local draft token confidence | Elides per-step ungraphed `tp_group.broadcast` of confidence buffer |
+  | 0613 | #736 | Remove 20 retired `torch.library.custom_op` wrappers | `1.77x–2.71x` lower eager CPU dispatch overhead |
+  | 0614 | #687/#619 | `CopyDrafter` Rework #2: non-blocking `sync_slot_draft_limits`, 3-slot ring, `-1` placeholder drafts, and `pending`-capped `live` drafts | Eliminates `--async-scheduling` event sync stall and per-step pinned host/event allocations while preserving `8 -> 16 -> 32 -> 64` cap doubling |
+
+- **Arms:** [rc18/rc-tp4.json](rc18/rc-tp4.json), [rc18/rc-tp3.json](rc18/rc-tp3.json),
+  [rc18/rc-tp3-copy.json](rc18/rc-tp3-copy.json), and [rc18/image-dgx4.json](rc18/image-dgx4.json)
+  on `spark-ds41f:19f2c20ed4d6-next-18` ([rc18/source.json](rc18/source.json),
+  [rc18/upstreams.lock.json](rc18/upstreams.lock.json)).
+- **Kernel & unit verification (`dgx4`, `spark-ds41f:1030`):**
+  [rc18/bundles/candidate-18](rc18/bundles/candidate-18) ([rc18/verdict.json](rc18/verdict.json))
+  and subsystem measurements in [rc18/results.json](rc18/results.json)
+  ([rc18/measure_candidate_18.py](rc18/measure_candidate_18.py)).

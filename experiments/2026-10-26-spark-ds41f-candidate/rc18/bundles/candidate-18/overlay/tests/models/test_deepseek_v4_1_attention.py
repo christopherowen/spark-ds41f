@@ -1,0 +1,493 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The TileLang attention layer's staging, binding and context KV writes."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+
+def _tilelang_layer(layer_id):
+    """A TileLang attention layer with the geometry its bind reads (no weights)."""
+    from vllm.models.deepseek_v4_1.tilelang.attention import (
+        DeepseekV41TileLangAttention,
+    )
+
+    module = DeepseekV41TileLangAttention.__new__(DeepseekV41TileLangAttention)
+    torch.nn.Module.__init__(module)
+    module.prefix = f"model.layers.{layer_id}.attn"
+    module.layer_id, module.candidate_source_layer = layer_id, 3
+    module.capacity, module.swa_width, module.compress_ratio = 300, 128, 1
+    module._main_page = module._index_page = 64
+    module._main_width = module._index_width = 16
+    module.is_ced_decoder, module.is_index_source = False, True
+    module.topk_indices_buffer = None
+    module.indexer = SimpleNamespace(heads=32)
+    module.compressor = None
+    module.config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=24),
+    )
+    module.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
+    module._ready = False
+    return module
+
+
+def test_attention_offers_b12x_preparation_nothing():
+    # B12X's preparation used to compile and launch helper plans for this layer
+    # while memory profiling; the layer declares TileLang kernels only.
+    module = _tilelang_layer(layer_id=3)
+    assert getattr(module, "b12x_preparation_provider", None) is None
+    assert not hasattr(module, "get_b12x_preparation_units")
+    assert not module._ready
+
+
+@pytest.mark.parametrize(
+    "layer_id,staging",
+    [
+        (2, ["topk_indices_buffer", "_index_pages", "_active", "_short_index_pages"]),
+        (
+            3,
+            [
+                "topk_indices_buffer",
+                "_index_pages",
+                "_active",
+                "_candidates",
+                "_candidate_lens",
+            ],
+        ),
+    ],
+)
+def test_tilelang_binding_prepares_the_attention_staging(
+    monkeypatch, layer_id, staging
+):
+    # The layer's kernel binding allocates the staging, before memory profiling.
+    module = _tilelang_layer(layer_id)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    module._build_tilelang_plans = lambda: "plans"
+    module._attention_geometry()  # declare_kernels() runs it before binding
+    with torch.inference_mode():  # the worker prepares kernels inside it
+        module._bind_plans()
+    assert module._ready and module._tilelang_plans == "plans"
+    assert [name for name, _, _ in module._staging_specs] == staging
+    for name, shape, dtype in module._staging_specs:
+        tensor = getattr(module, name)
+        assert tuple(tensor.shape) == shape and tensor.dtype == dtype
+        assert not tensor.is_inference()  # updated in place while serving
+    assert module._active.tolist() == [16 * 64]
+
+
+@pytest.mark.parametrize(
+    "num_verification_tokens,decode_capacity",
+    [
+        (5, 4 * 11),  # parallel drafting's two spans
+        (16, 4 * 17),  # copy drafts: every request at the reorder threshold
+    ],
+)
+def test_decode_arena_holds_every_request_at_the_reorder_threshold(
+    num_verification_tokens, decode_capacity
+):
+    # A step of short requests (16 of 13-14 tokens under copy drafts' threshold
+    # of 17) is all decode rows; its metadata must not be cut to fewer rows.
+    module = _tilelang_layer(layer_id=3)
+    module.config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=5,
+        parallel_drafting=True,
+        num_verification_tokens=num_verification_tokens,
+    )
+    module._attention_geometry()
+    assert module._decode_capacity == decode_capacity
+    swa_spec = module._attention_workspace_specs["decode"][0]
+    assert swa_spec == ((decode_capacity, module.swa_width), torch.int32)
+
+
+def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
+    from vllm.models.deepseek_v4_1.tilelang import cache_writer, rope
+
+    module = _tilelang_layer(layer_id=3)
+    writes = []
+    monkeypatch.setattr(rope, "rope_", lambda *args: None)
+    monkeypatch.setattr(
+        cache_writer, "write_cache", lambda *args, **kwargs: writes.append(kwargs)
+    )
+    module.swa_cache_layer = SimpleNamespace(
+        kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=64
+    )
+    module._ready = True
+    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+    slots = torch.zeros(1, dtype=torch.int64)
+    module.insert_context_kv(kv, slots, slots)
+    assert writes == [dict(page_size=64, cache_kind="swa")]
+
+
+def test_global_preparation_populates_caches_before_forward():
+    from vllm.models.deepseek_v4_1 import attention
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    source = torch.arange(16, dtype=torch.float32, device=device).view(4, 4)
+    positions = torch.arange(4, device=device, dtype=torch.int64)
+    backing = torch.zeros((8, 4), device=device)
+
+    class CacheConsumer(torch.nn.Module):
+        prepare_global_kv = attention.DeepseekV4Attention.prepare_global_kv
+        forward = attention.DeepseekV4Attention.forward
+
+        def __init__(self):
+            super().__init__()
+            self.prefix = "ced_cache_consumer"
+            self.compressor = SimpleNamespace(state_cache=None)
+            self.kv_cache = backing[:4]
+            self.indexer = SimpleNamespace(
+                k_cache=SimpleNamespace(kv_cache=backing[4:])
+            )
+
+        def _prepare_global_kv(self, positions, hidden):
+            self.kv_cache.copy_(hidden * 2)
+            self.indexer.k_cache.kv_cache.copy_(hidden * 3)
+
+        def _forward(self, positions, hidden):
+            return self.kv_cache + self.indexer.k_cache.kv_cache
+
+    layer = CacheConsumer()
+
+    def run(hidden):
+        layer.prepare_global_kv(positions, hidden)
+        return layer(positions, hidden)
+
+    for factor in (1, -2):
+        hidden = source * factor
+        output = run(hidden)
+        torch.testing.assert_close(output, hidden * 5)
+        torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
+
+
+def test_decode_front_is_one_kernel_at_decode_rows(monkeypatch):
+    """At decode rows with cache pages, the front after the fused projection is
+    ``attention_front``'s one launch, at the SWA slots and page size, and Q-B gets its
+    cast; sequence-parallel rows, rows past a decode tile and memory profiling (no
+    cache pages) run the separate kernels."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import front
+
+    module = _tilelang_layer(layer_id=3)
+    module.q_lora_rank = 1280
+    module.q_norm = SimpleNamespace(weight=torch.ones(1280), variance_epsilon=1e-6)
+    module.kv_norm = SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6)
+    module.swa_cache_layer = SimpleNamespace(
+        prefix="swa", kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=128
+    )
+    launches = []
+    monkeypatch.setattr(front, "attention_front", lambda *args: launches.append(args))
+    slots = torch.arange(100, dtype=torch.int64)
+    metadata = {"swa": SimpleNamespace(slot_mapping=slots)}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    positions = torch.zeros(6, dtype=torch.int64)
+    qr, kv, cast = module._front(torch.zeros(6, 1792), positions, None)
+    (args,) = launches
+    assert args[7].tolist() == list(range(6)) and args[8] == 128
+    assert args[9] is qr and args[12] is kv
+    assert cast.rows is qr and args[10] is cast.values and args[11] is cast.scales
+    assert qr.shape == (6, 1280) and kv.shape == (6, 512)
+    assert module._front(torch.zeros(6, 1792), positions, object()) is None
+    assert module._front(torch.zeros(65, 1792), positions, None) is None
+    metadata = None
+    assert module._front(torch.zeros(6, 1792), positions, None) is None
+    assert len(launches) == 1
+
+
+def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
+    """``_index_query`` feeds ``indexer.wq_b`` from ``q_cast`` (no second ``cast_mxfp8``)
+    and passes ``positions[first:last]`` straight into ``_quantize_index_query`` without
+    a separate ``_rope`` call."""
+    from vllm.models.deepseek_v4_1 import kernels
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    module = _tilelang_layer(layer_id=3)
+    seen_provided = []
+    quant_calls = []
+
+    def fake_wqb(x):
+        seen_provided.append(x.shape)
+        return torch.zeros((x.shape[0], 32 * 128), dtype=torch.bfloat16)
+
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wq_b=fake_wqb,
+        weights_proj=lambda h: torch.ones((h.shape[0], 32), dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "cast_mxfp8",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected cast_mxfp8")),
+    )
+    module._rope = lambda *args: (_ for _ in ()).throw(
+        AssertionError("unexpected separate _rope")
+    )
+    module._quantize_index_query = (
+        lambda mode, iq, data, scale, positions=None: quant_calls.append(
+            (mode, tuple(iq.shape), positions.tolist())
+        )
+    )
+    qr = torch.zeros((12, 1280), dtype=torch.bfloat16)
+    q_cast = MXFP8Rows(
+        qr,
+        torch.zeros((64, 1280), dtype=torch.float8_e4m3fn),
+        torch.zeros((64, 40), dtype=torch.uint8),
+    )
+    positions = torch.arange(100, 112, dtype=torch.int64)
+    hidden = torch.zeros((12, 5120), dtype=torch.bfloat16)
+    swa = SimpleNamespace(is_decode=False)
+    module._index_query(qr, positions, hidden, None, 4, 9, swa, q_cast)
+    assert seen_provided == [(5, 1280)]
+    assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
+
+
+def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+    from vllm.models.deepseek_v4_1.tilelang import cache_writer
+
+    module = _tilelang_layer(layer_id=0)
+    module._ready = True
+    module._owner = lambda: module
+    module.kv_cache = torch.empty(2, 8, dtype=torch.uint8)
+    latent = torch.zeros(4, 512, dtype=torch.bfloat16)
+    slots = torch.arange(4, dtype=torch.int64)
+    module.compressor = lambda hidden, main, state: (latent, slots)
+    module.compressor.state_cache = None
+    raw_key = torch.zeros(4, 128, dtype=torch.bfloat16)
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wk=lambda x: raw_key,
+        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
+        k_cache=SimpleNamespace(
+            prefix="k_cache", kv_cache=torch.empty(2, 8, dtype=torch.uint8)
+        ),
+    )
+    idx_slots = torch.arange(10, 14, dtype=torch.int64)
+    metadata = {
+        module.prefix: SimpleNamespace(),
+        "k_cache": SimpleNamespace(slot_mapping=idx_slots),
+    }
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    key_writes, cache_writes = [], []
+    monkeypatch.setattr(
+        tl_attention,
+        "norm_rope_write_index_keys",
+        lambda *args: key_writes.append(args),
+    )
+    monkeypatch.setattr(
+        cache_writer,
+        "write_cache",
+        lambda *args, **kwargs: cache_writes.append((args, kwargs)),
+    )
+    positions = torch.arange(4, dtype=torch.int64)
+    module._prepare_global_kv(positions, torch.zeros(4, 5120, dtype=torch.bfloat16))
+    assert len(key_writes) == 1
+    assert key_writes[0][0] is raw_key and key_writes[0][3] is positions
+    assert key_writes[0][6].tolist() == [10, 11, 12, 13]
+    assert len(cache_writes) == 1
+    assert cache_writes[0][0][0] is latent
+    assert cache_writes[0][1]["positions"] is positions
+    assert cache_writes[0][1]["cache_kind"] == "indexed"
+
+
+def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+    """``_forward`` releases ``qr_kv``, ``q_cast``, ``qr``, ``q``, ``kv`` and
+    ``_index_query``'s ``iq`` before ``_o_proj`` allocates the output projection."""
+    import weakref
+
+    from vllm.models.deepseek_v4_1 import attention, kernels
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+
+    module = _tilelang_layer(layer_id=3)
+    module._ready = True
+    module.q_lora_rank = 16
+    module.n_local_heads = 2
+    module._l2pf_wo = None
+    module._l2pf_comp = None
+    module.swa_cache_layer = SimpleNamespace(prefix="swa")
+    refs = {}
+
+    def track(name, tensor):
+        refs[name] = weakref.ref(tensor)
+        return tensor
+
+    module.fused_wqa_wkv = lambda h: (track("qr_kv", torch.ones(4, 528)), None)
+    module._front = lambda qr_kv, pos, sp: None
+    module.q_norm = lambda x: track("qr", x.clone())
+    module.kv_norm = lambda x: track("kv", x.clone())
+    monkeypatch.setattr(
+        kernels,
+        "cast_mxfp8",
+        lambda rows: MXFP8Rows(
+            rows,
+            track("q_cast", torch.ones(4, 16, dtype=torch.uint8)),
+            torch.ones(4, 4, dtype=torch.uint8),
+        ),
+    )
+    module.wq_b = lambda qr: track("q", torch.ones(4, 2 * 512))
+    module._rope = lambda x, pos, role: x
+    module._cache_context_kv = lambda kv, pos: None
+    module.indexer = SimpleNamespace(
+        heads=4,
+        wq_b=lambda qr: track("iq", torch.ones(4, 4 * 128)),
+        weights_proj=lambda h: (
+            # iq must already be released when weights_proj runs
+            assert_dead("iq"),
+            torch.ones(4, 4),
+        )[1],
+    )
+    module._quantize_index_query = (
+        lambda mode, iq, data, scale, positions=None: None
+    )
+
+    def assert_dead(*names):
+        for name in names:
+            assert refs[name]() is None, f"{name} is still alive"
+
+    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden")
+        output.zero_()
+
+    def check_o_proj(output, sp_rows=None):
+        assert_dead("qr_kv", "q_cast", "qr", "iq", "hidden", "q", "kv")
+        return torch.zeros(4, 32)
+
+    module.forward_mqa = check_forward_mqa
+    module._o_proj = check_o_proj
+    metadata = {"swa": SimpleNamespace(is_decode=False)}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    positions = torch.arange(4)
+    out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+    assert out.shape == (4, 32)
+
+
+def test_index_query_overlaps_weights_proj(monkeypatch):
+    """At decode row counts, ``_index_query`` hands ``q_cast`` to ``indexer.wq_b``
+    without re-casting ``qr`` and overlaps ``weights_proj`` via
+    ``maybe_execute_in_parallel``."""
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+
+    module = _tilelang_layer(layer_id=3)
+    seen_casts = []
+
+    def fake_wq_b(x):
+        seen_casts.append(provided_mxfp8(x))
+        return torch.zeros(x.shape[0], 32 * 128, dtype=x.dtype, device=x.device)
+
+    fake_wq_b.tilelang_mxfp8_input = True
+    module.indexer = SimpleNamespace(
+        heads=32,
+        wq_b=fake_wq_b,
+        weights_proj=lambda h: torch.ones(
+            h.shape[0], 32, dtype=h.dtype, device=h.device
+        ),
+    )
+    module._quantize_index_query = lambda mode, iq, data, scale, positions=None: (
+        data.fill_(7),
+        scale.fill_(3),
+    )
+
+    parallel_calls = []
+
+    def fake_parallel(fn0, fn1, ev0, ev1, stream=None):
+        parallel_calls.append(stream)
+        return fn0(), fn1()
+
+    monkeypatch.setattr(attention, "maybe_execute_in_parallel", fake_parallel)
+    monkeypatch.setattr(attention, "aux_stream", lambda: "aux")
+    monkeypatch.setattr(attention, "_aux_events", lambda: ("ev0", "ev1"))
+
+    qr = torch.zeros(4, 1280)
+    hidden = torch.zeros(4, 5120)
+    positions = torch.arange(4, dtype=torch.int64)
+    q_cast = MXFP8Rows(
+        qr,
+        torch.ones(64, 1280, dtype=torch.float8_e4m3fn),
+        torch.ones(64, 160, dtype=torch.uint8),
+    )
+    swa = SimpleNamespace(is_decode=True)
+
+    iq_data, iq_scale, weights = module._index_query(
+        qr, positions, hidden, None, 0, 4, swa, q_cast=q_cast
+    )
+    assert seen_casts == [q_cast]
+    assert iq_data.shape == (4, 32, 64) and torch.all(iq_data == 7)
+    assert iq_scale.shape == (4, 32, 4) and torch.all(iq_scale == 3)
+    assert weights.shape == (4, 32) and torch.all(weights == 1)
+    assert len(parallel_calls) == 1
+
+
+def test_prepare_global_kv_overlaps_index_key_and_latent_writes(monkeypatch):
+    """``_prepare_global_kv`` writes the index key and compressed latent cache
+    entries through ``maybe_execute_in_parallel`` after ``wk`` reads the
+    unrotated latent."""
+    from vllm.models.deepseek_v4_1 import attention
+
+    module = _tilelang_layer(layer_id=3)
+    module._ready = True
+    module._owner = lambda: SimpleNamespace(prefix="main")
+    module.kv_cache = torch.empty(2, 8, dtype=torch.uint8)
+    order = []
+
+    module.compressor = lambda hidden, main, state: (
+        order.append("compress") or torch.zeros(4, 512),
+        torch.arange(4, dtype=torch.int64),
+    )
+    module.compressor.state_cache = None
+    module.indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(prefix="idx_k"),
+        wk=lambda latent: order.append("wk") or torch.zeros(4, 128),
+    )
+    module._write_index_keys = lambda key, slots, positions=None: order.append(
+        "write_index_keys"
+    )
+    module._write_v41_cache = lambda latent, cache, slots, **kw: order.append(
+        f"write_cache:{kw['cache_kind']}"
+    )
+
+    metadata = {
+        "main": SimpleNamespace(),
+        "idx_k": SimpleNamespace(slot_mapping=torch.arange(8, dtype=torch.int64)),
+    }
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    parallel_calls = []
+    monkeypatch.setattr(
+        attention,
+        "maybe_execute_in_parallel",
+        lambda fn0, fn1, ev0, ev1, stream=None: (
+            parallel_calls.append(stream),
+            fn0(),
+            fn1(),
+        )[1:],
+    )
+    module._prepare_global_kv(
+        torch.arange(4, dtype=torch.int64), torch.zeros(4, 5120)
+    )
+    assert order == [
+        "compress",
+        "wk",
+        "write_index_keys",
+        "write_cache:indexed",
+    ]
+    assert len(parallel_calls) == 1

@@ -1,0 +1,1016 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 05:56:05 +0100
+Subject: [PATCH 613/613] perf(deepseek_v4_1): remove torch.library.custom_op
+ wrappers and compiler indirection
+
+Remove torch.library.custom_op wrappers, register_fake stubs, and _LAYER dictionary indirection across DeepSeek-V4.1 TileLang kernels, attention, CED, and Engram since DeepSeek-V4.1 executes eagerly with direct CUDA graph capture rather than torch.compile.
+---
+ tests/models/test_deepseek_v4_1_attention.py  |  15 +--
+ tests/models/test_deepseek_v4_1_ced_model.py  |  31 +-----
+ tests/models/test_deepseek_v4_1_engram.py     |  10 +-
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   2 +-
+ vllm/models/deepseek_v4_1/attention.py        |  45 +-------
+ vllm/models/deepseek_v4_1/ced.py              |  12 --
+ vllm/models/deepseek_v4_1/common/engram.py    |  11 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  11 +-
+ .../deepseek_v4_1/tilelang/confidence.py      |   8 --
+ .../deepseek_v4_1/tilelang/embedding.py       |  15 ---
+ vllm/models/deepseek_v4_1/tilelang/engram.py  |  14 ---
+ .../deepseek_v4_1/tilelang/engram_hash.py     |  19 ----
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  16 ---
+ vllm/models/deepseek_v4_1/tilelang/glp.py     |   8 --
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 103 ++++--------------
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  57 ----------
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  13 +--
+ vllm/models/deepseek_v4_1/tilelang/rope.py    |   6 -
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |   4 +-
+ 19 files changed, 53 insertions(+), 347 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 94e229b1a..99449db96 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -122,7 +122,7 @@ def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
+     assert writes == [dict(page_size=64, cache_kind="swa")]
+ 
+ 
+-def test_global_preparation_dependency_survives_functionalization(monkeypatch):
++def test_global_preparation_populates_caches_before_forward():
+     from vllm.models.deepseek_v4_1 import attention
+ 
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+@@ -136,7 +136,7 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
+ 
+         def __init__(self):
+             super().__init__()
+-            self.prefix = "functionalized_ced"
++            self.prefix = "ced_cache_consumer"
+             self.compressor = SimpleNamespace(state_cache=None)
+             self.kv_cache = backing[:4]
+             self.indexer = SimpleNamespace(
+@@ -151,20 +151,15 @@ def test_global_preparation_dependency_survives_functionalization(monkeypatch):
+             return self.kv_cache + self.indexer.k_cache.kv_cache
+ 
+     layer = CacheConsumer()
+-    context = SimpleNamespace(no_compile_layers={layer.prefix: layer})
+-    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+ 
+     def run(hidden):
+-        ready = layer.prepare_global_kv(positions, hidden)
+-        return layer(positions, hidden, global_kv_ready=ready)
++        layer.prepare_global_kv(positions, hidden)
++        return layer(positions, hidden)
+ 
+-    compiled = torch.compile(run, backend="aot_eager", fullgraph=True)
+     for factor in (1, -2):
+         hidden = source * factor
+-        output = compiled(hidden)
++        output = run(hidden)
+         torch.testing.assert_close(output, hidden * 5)
+-        # Preparation must remain visible to later consumers as well; mutable
+-        # alias-list functionalization used to copy stale clones back here.
+         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
+ 
+ 
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index eb00c98f1..35bd14e36 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -43,8 +43,8 @@ def test_piecewise_capture_refreshes_compacted_indices_after_metadata_staging():
+ 
+ @pytest.mark.parametrize("rows", [1, 8, 19])
+ @pytest.mark.parametrize("strided", [False, True])
+-def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, strided):
+-    """The opaque wrapper preserves result ownership and reads each live input."""
++def test_attention_returns_owned_projection_without_copy(rows, strided):
++    """The attention forward preserves result ownership and reads each live input."""
+     from vllm.models.deepseek_v4_1 import attention
+ 
+     results = []
+@@ -55,28 +55,18 @@ def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, stri
+         return output
+ 
+     layer = SimpleNamespace(prefix="owned_projection", _forward=project)
+-    monkeypatch.setattr(
+-        attention,
+-        "get_forward_context",
+-        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
+-    )
+     hidden = torch.arange(rows * 32, dtype=torch.bfloat16).reshape(rows, 32)
+     if strided:
+         hidden = hidden[:, ::2]
+     positions = torch.arange(rows, dtype=torch.int64)
+-    ready = torch.ones(1, dtype=torch.uint8)
+     saved_hidden = hidden.clone()
+-    first = attention.DeepseekV4Attention.forward(
+-        layer, positions, hidden, global_kv_ready=ready
+-    )
++    first = attention.DeepseekV4Attention.forward(layer, positions, hidden)
+     assert first.data_ptr() == results[-1].data_ptr()
+     assert first.data_ptr() != hidden.data_ptr()
+     torch.testing.assert_close(hidden, saved_hidden, rtol=0, atol=0)
+     saved_first = first.clone()
+     hidden.add_(4)
+-    second = attention.DeepseekV4Attention.forward(
+-        layer, positions, hidden, global_kv_ready=ready
+-    )
++    second = attention.DeepseekV4Attention.forward(layer, positions, hidden)
+     assert second.data_ptr() == results[-1].data_ptr()
+     assert second.data_ptr() != first.data_ptr()
+     torch.testing.assert_close(first, saved_first, rtol=0, atol=0)
+@@ -86,10 +76,6 @@ def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, stri
+         rtol=0,
+         atol=0,
+     )
+-    checks = torch.library.opcheck(
+-        attention._attention, (hidden, positions, layer.prefix, ready)
+-    )
+-    assert all(value == "SUCCESS" for value in checks.values()), checks
+ 
+ 
+ def test_attention_empty_batch_does_not_enter_cache_or_collectives():
+@@ -104,18 +90,13 @@ def test_attention_empty_batch_does_not_enter_cache_or_collectives():
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+-def test_attention_owned_output_graph_reads_live_inputs(monkeypatch):
++def test_attention_owned_output_graph_reads_live_inputs():
+     from vllm.models.deepseek_v4_1 import attention
+ 
+     def project(positions, hidden):
+         return (hidden.float() * 0.25 + positions[:, None] * 0.5).to(hidden.dtype)
+ 
+     layer = SimpleNamespace(prefix="graph_projection", _forward=project)
+-    monkeypatch.setattr(
+-        attention,
+-        "get_forward_context",
+-        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
+-    )
+     for rows in (1, 8, 19):
+         hidden = torch.arange(rows * 32, dtype=torch.bfloat16, device="cuda").reshape(
+             rows, 32
+@@ -214,7 +195,7 @@ class _Attention(nn.Module):
+         self.shared["global"] = hidden.mean(dim=0)
+         self.shared["global_rows"] = hidden.shape[0]
+ 
+-    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
++    def forward(self, positions, hidden, scaling):
+         if self.index == 2 and "global" not in self.shared:
+             self.prepare_global_kv(positions, hidden)
+         self.rows.append(("attention", self.index, hidden.shape[0]))
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index fedea6882..75c02de7e 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -488,7 +488,6 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+ 
+     with pytest.raises(RuntimeError, match="not prepared"):
+         consume()
+-    compiled_consume = torch.compile(consume, backend="eager", fullgraph=True)
+     stream = torch.cuda.Stream()
+     stream.wait_stream(torch.cuda.current_stream())
+     with torch.inference_mode(), torch.cuda.stream(stream):
+@@ -500,10 +499,10 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+             capture_guard.setattr(native, "run_lookup", forbid_lookup)
+             state.prepare_dummy_inputs(2, 4)
+             for _ in range(3):
+-                compiled_consume()
++                consume()
+             graph = torch.cuda.CUDAGraph()
+             with torch.cuda.graph(graph, stream=stream):
+-                actual = compiled_consume()
++                actual = consume()
+             graph.replay()
+             for output in actual:
+                 torch.testing.assert_close(output, hidden, rtol=0, atol=0)
+@@ -900,16 +899,15 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+         session.prepare(requests)
+         session.freeze()
+         module.prepare_embeddings(ids)
+-        launch = torch.compile(module.forward, fullgraph=True)
+         for rows in (1, capacity):
+             for with_images in (False, True):
+                 token_mask = mask[:rows] if with_images else None
+                 fill_ids(with_images)
+-                launch(residual[:rows], ids[:rows], token_ids[:rows])
++                module(residual[:rows], ids[:rows], token_ids[:rows])
+                 graph = torch.cuda.CUDAGraph()
+                 try:
+                     with session.capture(), torch.cuda.graph(graph):
+-                        actual = launch(residual[:rows], ids[:rows], token_ids[:rows])
++                        actual = module(residual[:rows], ids[:rows], token_ids[:rows])
+                     pointer = actual.data_ptr()
+                     allocated = torch.cuda.memory_allocated(device)
+                     residual.mul_(-0.5)
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index ed304b317..5e46a559e 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -848,7 +848,7 @@ class _Attention(nn.Module):
+         super().__init__()
+         self.index, self.world, self.local_rows = index, world, local_rows
+ 
+-    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
++    def forward(self, positions, hidden, scaling):
+         rows = sp_prefill.current()
+         if rows is not None:
+             self.local_rows.append(hidden.shape[0])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 9066e52e7..d7b202188 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -216,43 +216,6 @@ class DeepseekV4Indexer(nn.Module):
+         self.ratio = ratio
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_b12x_attention", mutates_args=())
+-def _attention(
+-    hidden: torch.Tensor,
+-    positions: torch.Tensor,
+-    prefix: str,
+-    global_kv_ready: torch.Tensor | None,
+-) -> torch.Tensor:
+-    context = get_forward_context()
+-    layer = context.no_compile_layers[prefix]
+-    # WO projection and TP reduction own this result; it cannot alias the
+-    # borrowed attention scratch or the operation's input tensors.
+-    return layer._forward(positions, hidden)
+-
+-
+-@_attention.register_fake
+-def _attention_fake(hidden, positions, prefix, global_kv_ready):
+-    return torch.empty_like(hidden, memory_format=torch.contiguous_format)
+-
+-
+-@torch.library.custom_op("vllm::dsv41_b12x_prepare_global_kv", mutates_args=())
+-def _prepare_global_kv(
+-    hidden: torch.Tensor,
+-    positions: torch.Tensor,
+-    prefix: str,
+-) -> torch.Tensor:
+-    context = get_forward_context()
+-    context.no_compile_layers[prefix]._prepare_global_kv(positions, hidden)
+-    # A small explicit data dependency orders the following opaque attention
+-    # call without asking functionalization to clone the aliased KV pool.
+-    return torch.empty(1, dtype=torch.uint8, device=hidden.device)
+-
+-
+-@_prepare_global_kv.register_fake
+-def _prepare_global_kv_fake(hidden, positions, prefix):
+-    return torch.empty(1, dtype=torch.uint8, device=hidden.device)
+-
+-
+ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     """The V4.1 attention layer: caches, metadata, projections and ownership. Its
+     kernels are the TileLang layer's (``DeepseekV41TileLangAttention``), which
+@@ -799,7 +762,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         """Build full-row global KV before the CED boundary gathers decoder rows."""
+         if self.compressor is None or hidden_states.shape[0] == 0:
+             return
+-        return _prepare_global_kv(hidden_states, positions, self.prefix)
++        self._prepare_global_kv(positions, hidden_states)
+ 
+     @eager_break_during_capture
+     def _prepare_global_kv(self, positions, hidden_states):
+@@ -859,12 +822,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             stream,
+         )
+ 
+-    def forward(
+-        self, positions, hidden_states, llama_4_scaling=None, *, global_kv_ready=None
+-    ):
++    def forward(self, positions, hidden_states, llama_4_scaling=None):
+         if hidden_states.shape[0] == 0:
+             return torch.empty_like(hidden_states)
+-        return _attention(hidden_states, positions, self.prefix, global_kv_ready)
++        return self._forward(positions, hidden_states)
+ 
+     def _gather_front(self, sp_rows, hidden_states, qr, kv):
+         """Sequence-parallel prefill's row-wise front of every row, as contiguous
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index aceb616a0..88db39de4 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -35,7 +35,6 @@ def ced_decoder_start(hf_config: Any) -> int | None:
+     return None
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_gather_rows", mutates_args=())
+ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+     """Gather first-axis rows, zeroing invalid indices (including graph padding)."""
+     output = source.new_empty((indices.numel(), *source.shape[1:]))
+@@ -44,12 +43,6 @@ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+     return output
+ 
+ 
+-@gather_rows.register_fake
+-def _gather_rows_fake(source, indices):
+-    return source.new_empty((indices.numel(), *source.shape[1:]))
+-
+-
+-@torch.library.custom_op("vllm::dsv41_scatter_rows", mutates_args=())
+ def scatter_rows(
+     source: torch.Tensor, indices: torch.Tensor, full_rows: int
+ ) -> torch.Tensor:
+@@ -60,11 +53,6 @@ def scatter_rows(
+     return output
+ 
+ 
+-@scatter_rows.register_fake
+-def _scatter_rows_fake(source, indices, full_rows):
+-    return source.new_empty((full_rows, *source.shape[1:]))
+-
+-
+ @dataclass(frozen=True)
+ class CEDPlan:
+     """CPU scheduling bounds; GPU starts remain authoritative for actual rows."""
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index a2ea529a1..45ca741de 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -642,7 +642,7 @@ class ParallelEngramEmbedding(nn.Module):
+         on ``stream``) and the IDs the host hashed (``early`` [tokens, 24] int64 on the
+         host, or None). Returns at once; the forward's ``gather_rows`` waits for the
+         rows."""
+-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
++        if torch.cuda.is_current_stream_capturing():
+             raise RuntimeError("Disk Engram staging must run outside compile/capture")
+         self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
+ 
+@@ -903,13 +903,8 @@ class Engram(nn.Module):
+         column-parallel projection each rank receives only its own rows of the
+         product (an all-to-all instead of an all-gather of every row).
+         """
+-        if (
+-            self.embed_tokens.table_memory == "disk"
+-            and not torch.compiler.is_compiling()
+-            and (
+-                not self._disk_prepared
+-                or self._disk_prepared_tokens < hash_ids.shape[0]
+-            )
++        if self.embed_tokens.table_memory == "disk" and (
++            not self._disk_prepared or self._disk_prepared_tokens < hash_ids.shape[0]
+         ):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 18b83d33b..d0d95d809 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -362,11 +362,10 @@ class DeepseekV4DecoderLayer(nn.Module):
+             previous_comb=res_mix if previous_output is not None else None,
+         )
+         del previous_output, pre_mix
+-        global_kv_ready = None
+         if ced_indices is not None:
+             # Decoder global KV needs every encoder row, but decoder queries,
+             # residual updates and experts only need the selected replay rows.
+-            global_kv_ready = self.attn.prepare_global_kv(positions, x)
++            self.attn.prepare_global_kv(positions, x)
+             del x_q
+             x = gather_rows(x, ced_indices)
+             x_q = self.mhc.cast_rows(x)
+@@ -387,11 +386,11 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 )
+         if sp_rows is None:
+             with kernels.mxfp8_inputs(x_q):
+-                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++                x = self.attn(positions, x, None)
+         else:
+             # SP: attention gathers every row and reduce-scatters its output.
+             with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
+-                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++                x = self.attn(positions, x, None)
+             if sp_rows.unreduced:
+                 x = sp_prefill.unreduced_parts(x)
+         del x_q
+@@ -655,7 +654,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         the host, or None) holds the row IDs the host hashed for the tokens it knows,
+         ``host_hash.UNKNOWN`` elsewhere: the reader reads those rows before the GPU
+         reaches the step."""
+-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
++        if torch.cuda.is_current_stream_capturing():
+             raise RuntimeError(
+                 "Disk Engram preparation must run outside compile/capture"
+             )
+@@ -684,7 +683,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             )
+ 
+     def prepare_dummy_engram(self, num_tokens):
+-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
++        if torch.cuda.is_current_stream_capturing():
+             raise RuntimeError(
+                 "Disk Engram preparation must run outside compile/capture"
+             )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+index a18988e3a..da2e03edb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -137,9 +137,6 @@ def declare(hidden: int, rank: int) -> None:
+     )
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_dspark_confidence", mutates_args=("out",)
+-)
+ def dspark_confidence(
+     hidden: torch.Tensor,
+     markov_embed: torch.Tensor,
+@@ -175,11 +172,6 @@ def dspark_confidence(
+     _kernel(width, rank)(hidden, markov_embed, weight, out)
+ 
+ 
+-@dspark_confidence.register_fake
+-def _dspark_confidence_fake(hidden, markov_embed, weight, out):
+-    return None
+-
+-
+ class TileLangConfidenceHead(DSparkConfidenceHead):
+     """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
+     probability is the one-launch kernel."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index 9c40c29bd..87a52713e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -173,7 +173,6 @@ def declare(words: int) -> None:
+     )
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_tilelang_vocab_embedding", mutates_args=("out",))
+ def vocab_embedding(
+     input_ids: torch.Tensor,
+     weight: torch.Tensor,
+@@ -228,20 +227,6 @@ def vocab_embedding(
+     )
+ 
+ 
+-@vocab_embedding.register_fake
+-def _vocab_embedding_fake(
+-    input_ids,
+-    weight,
+-    out,
+-    org_vocab_start_index,
+-    org_vocab_end_index,
+-    num_org_vocab_padding,
+-    added_vocab_start_index,
+-    added_vocab_end_index,
+-):
+-    return None
+-
+-
+ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+     """The unquantized embedding's sharded weights and ties, with the tensor-parallel
+     lookup in TileLang (``VocabParallelEmbedding``'s fused path)."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+index e2023cc72..e8035366a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -124,7 +124,6 @@ def _dtype(ids: torch.Tensor) -> str:
+     return str(ids.dtype).removeprefix("torch.")
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_tilelang_engram_gate", mutates_args=("out",))
+ def engram_gate(
+     x: torch.Tensor,
+     kv: torch.Tensor,
+@@ -152,11 +151,6 @@ def engram_gate(
+     )
+ 
+ 
+-@engram_gate.register_fake
+-def _engram_gate_fake(x, kv, weight, ids, out, eps, hc_mult):
+-    return None
+-
+-
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def engram_gate_blocked_kernel(
+     hc_mult: int,
+@@ -255,9 +249,6 @@ def engram_gate_blocked_kernel(
+     return engram_gate_blocked
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_engram_gate_blocked", mutates_args=("out",)
+-)
+ def engram_gate_blocked(
+     x: torch.Tensor,
+     kv: torch.Tensor,
+@@ -288,11 +279,6 @@ def engram_gate_blocked(
+     )
+ 
+ 
+-@engram_gate_blocked.register_fake
+-def _engram_gate_blocked_fake(x, kv, weight, ids, out, eps, hc_mult):
+-    return None
+-
+-
+ __all__ = [
+     "CLAMP",
+     "engram_gate",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+index a9b42dd97..d6f2bf22d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+@@ -112,9 +112,6 @@ def engram_hash_kernel(
+     return engram_hash
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_engram_hash", mutates_args=("out", "num_seqs", "num_tokens")
+-)
+ def engram_hash(
+     ids: torch.Tensor,
+     starts: torch.Tensor,
+@@ -154,22 +151,6 @@ def engram_hash(
+     )
+ 
+ 
+-@engram_hash.register_fake
+-def _engram_hash_fake(
+-    ids,
+-    starts,
+-    history,
+-    token_map,
+-    multipliers,
+-    primes,
+-    offsets,
+-    out,
+-    num_seqs,
+-    num_tokens,
+-):
+-    return None
+-
+-
+ def geometry_tensors(geometry, device) -> tuple[torch.Tensor, ...]:
+     """Multipliers [L, 4], primes [L, 24] and offsets [L, 24] of an Engram hash
+     geometry, as int64 device tensors in layer order."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 56b03a58f..8edf00d69 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -229,7 +229,6 @@ def row_kernel_calls(
+     ]
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_engram_rows_gather", mutates_args=("out",))
+ def engram_rows_gather(
+     ids: torch.Tensor,
+     num_tokens: torch.Tensor,
+@@ -255,18 +254,3 @@ def engram_rows_gather(
+         )
+         kernel(ids[:tokens], num_tokens, rows, scales, out)
+     engram_rows_release_kernel()(control)
+-
+-
+-@engram_rows_gather.register_fake
+-def _engram_rows_gather_fake(
+-    ids,
+-    num_tokens,
+-    rows,
+-    scales,
+-    control,
+-    out,
+-    shard_start,
+-    shard_end,
+-    columns=(1 << HEADS) - 1,
+-):
+-    return None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+index 8017fb645..ee087c2c4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/glp.py
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -148,9 +148,6 @@ def _kernel(hc_mult: int, hidden: int, world: int):
+     return glp_steer_kernel(hc_mult, hidden, world)
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_glp_steer", mutates_args=("residual", "post", "comb")
+-)
+ def glp_steer(
+     parts: torch.Tensor,
+     residual: torch.Tensor,
+@@ -174,11 +171,6 @@ def glp_steer(
+     )
+ 
+ 
+-@glp_steer.register_fake
+-def _glp_steer_fake(parts, residual, post, comb, rows, direction, alpha):
+-    return None
+-
+-
+ def declare(hc_mult: int, hidden: int, worlds: tuple[int, ...]) -> None:
+     """Declare the steering of ``hc_mult`` streams of ``hidden`` for a write of
+     each of ``worlds`` parts, and keep them."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 7c51fc4d5..95b007fc4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -10,8 +10,7 @@ projections with few output tiles (the router) split K over the SMs for
+ decode rows and reduce the FP32 partials in a fixed order. Every path keeps
+ each row's accumulation order fixed, so results do not depend on the batch.
+ 
+-The kernels run inside custom ops, which keeps them opaque to torch.compile,
+-and borrow activation scratch from vLLM's workspace.
++The kernels borrow activation scratch from vLLM's workspace.
+ 
+ A projection marked ``tilelang_mxfp8_input`` casts nothing: the kernel that
+ produced its input wrote the cast too (``MXFP8Rows``; the mHC entries do, for the
+@@ -23,7 +22,6 @@ import contextlib
+ import functools
+ import math
+ from typing import NamedTuple
+-from weakref import WeakValueDictionary
+ 
+ import torch
+ from torch import nn
+@@ -66,7 +64,6 @@ from .gemm import (
+     splitk_reduce,
+ )
+ 
+-_LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
+ _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+ 
+ 
+@@ -249,16 +246,14 @@ def _carve(scratch: torch.Tensor, specs):
+     return views
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_block32_linear", mutates_args=("out", "scratch")
+-)
+ def _block32_linear(
+-    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
++    layer, x: torch.Tensor, out: torch.Tensor, scratch: torch.Tensor | None
+ ) -> None:
+-    layer = _LAYERS[key]
+     n, k = layer.weight.shape
+     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
+-    x = x.reshape(-1, k)
++    if x.ndim != 2:
++        x = x.reshape(-1, k)
++        out = out.view(x.shape[0], n)
+     rows = x.shape[0]
+     if layer.tilelang_mxfp8_input:
+         provided = provided_mxfp8(x)
+@@ -272,7 +267,7 @@ def _block32_linear(
+             )
+         return
+     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+-        _block32_split(layer, x, out.view(rows, n), scratch)
++        _block32_split(layer, x, out, scratch)
+         return
+     xq, sf = _scratch(_activation_specs(rows, k, layer.tilelang_decode_rows), scratch)
+     pdl.per_token_cast(
+@@ -283,7 +278,7 @@ def _block32_linear(
+         use_packed_ue8m0=True,
+         out=(xq[:rows], sf[:rows]),
+     )
+-    _block32_gemm(layer, xq, sf, out.view(rows, n), rows)
++    _block32_gemm(layer, xq, sf, out, rows)
+ 
+ 
+ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+@@ -300,11 +295,6 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+     gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+ 
+ 
+-@_block32_linear.register_fake
+-def _block32_linear_fake(x, out, key, scratch):
+-    return None
+-
+-
+ def _split_specs(layer, rows: int):
+     """Split-K decode scratch: MXFP8 activations and scales padded to whole row
+     tiles, and the FP32 partials of the live rows."""
+@@ -354,16 +344,15 @@ def _block32_split_mxfp8(
+     layer.tilelang_reduce(partials, out)
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_bf16_linear", mutates_args=("out", "scratch")
+-)
+ def _bf16_linear(
+-    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
++    layer, x: torch.Tensor, out: torch.Tensor, scratch: torch.Tensor | None
+ ) -> None:
+-    layer = _LAYERS[key]
+     n, k = layer.weight.shape
+-    rows = x.numel() // k
+-    x, out = x.reshape(rows, k), out.view(rows, n)
++    if x.ndim != 2:
++        rows = x.numel() // k
++        x, out = x.reshape(rows, k), out.view(rows, n)
++    else:
++        rows = x.shape[0]
+     specs = _partial_specs(layer, rows)
+     if specs:
+         (partials,) = _scratch(specs, scratch)
+@@ -373,11 +362,6 @@ def _bf16_linear(
+         layer.tilelang_gemm(x, layer.weight, out)
+ 
+ 
+-@_bf16_linear.register_fake
+-def _bf16_linear_fake(x, out, key, scratch):
+-    return None
+-
+-
+ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+     calls ``_bind_block32`` makes.
+@@ -524,8 +508,6 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+                 f"the ({n}, {k}) projection cannot read a producer's MXFP8 rows"
+             )
+         cast = False
+-    layer.tilelang_key = id(layer)
+-    _LAYERS[layer.tilelang_key] = layer
+ 
+     def bind() -> None:
+         for name, kernel in _launch(kernels).items():
+@@ -572,10 +554,7 @@ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+         dtype=torch.bfloat16,
+         device=x.device,
+     )
+-    scratch = (
+-        None if torch.compiler.is_compiling() else current_preallocated_workspace()
+-    )
+-    _block32_linear(x, out, layer.tilelang_key, scratch)
++    _block32_linear(layer, x, out, current_preallocated_workspace())
+     return out
+ 
+ 
+@@ -664,8 +643,6 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         n, k = layer.weight.shape
+         layer.tilelang_shards = bf16_shards(n, k)
+         layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
+-        layer.tilelang_key = id(layer)
+-        _LAYERS[layer.tilelang_key] = layer
+ 
+         def bind() -> None:
+             for name, kernel in _launch(_bf16_kernels(layer)).items():
+@@ -686,10 +663,7 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+             dtype=getattr(layer, "out_dtype", torch.bfloat16),
+             device=x.device,
+         )
+-        scratch = (
+-            None if torch.compiler.is_compiling() else current_preallocated_workspace()
+-        )
+-        _bf16_linear(x, out, layer.tilelang_key, scratch)
++        _bf16_linear(layer, x, out, current_preallocated_workspace())
+         return out
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+@@ -783,8 +757,6 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+             raise ValueError(f"{n} rows do not split into {self.parts} parts")
+         layer.tilelang_parts = self.parts
+         layer.tilelang_shards = self._split(layer)["shards"]
+-        layer.tilelang_key = id(layer)
+-        _LAYERS[layer.tilelang_key] = layer
+ 
+         def bind() -> None:
+             for name, kernel in _launch(self._kernels(layer)).items():
+@@ -809,8 +781,7 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         return _spec_bytes((((layer.tilelang_shards, rows, n), torch.float32),))
+ 
+ 
+-def _split_bf16(x, outputs, key, scratch) -> None:
+-    layer = _LAYERS[key]
++def _split_bf16(layer, x, outputs, scratch) -> None:
+     n, k = layer.weight.shape
+     rows = x.shape[0]
+     if rows <= SPLIT_DECODE_ROWS:
+@@ -827,50 +798,14 @@ def _split_bf16(x, outputs, key, scratch) -> None:
+         layer.tilelang_gemm(x, layer.weight, *outputs)
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_split_linear_one", mutates_args=("out", "scratch")
+-)
+-def _split_linear_one(
+-    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
+-) -> None:
+-    _split_bf16(x, (out,), key, scratch)
+-
+-
+-@_split_linear_one.register_fake
+-def _split_linear_one_fake(x, out, key, scratch):
+-    return None
+-
+-
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_split_linear_two", mutates_args=("out0", "out1", "scratch")
+-)
+-def _split_linear_two(
+-    x: torch.Tensor,
+-    out0: torch.Tensor,
+-    out1: torch.Tensor,
+-    key: int,
+-    scratch: torch.Tensor | None,
+-) -> None:
+-    _split_bf16(x, (out0, out1), key, scratch)
+-
+-
+-@_split_linear_two.register_fake
+-def _split_linear_two_fake(x, out0, out1, key, scratch):
+-    return None
+-
+-
+ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None:
+     """Project ``x`` (rows x K) through a split layer: each row block into the
+     first ``rows`` rows of its output."""
+-    scratch = (
+-        None if torch.compiler.is_compiling() else current_preallocated_workspace()
+-    )
++    scratch = current_preallocated_workspace()
+     if layer.tilelang_parts == 2:
+-        _split_linear_two(
+-            x, outputs[0][:rows], outputs[1][:rows], layer.tilelang_key, scratch
+-        )
++        _split_bf16(layer, x, (outputs[0][:rows], outputs[1][:rows]), scratch)
+     else:
+-        _split_linear_one(x, outputs[0][:rows], layer.tilelang_key, scratch)
++        _split_bf16(layer, x, (outputs[0][:rows],), scratch)
+ 
+ 
+ __all__ = [
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index ba4edd03d..a388e7f5d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -1148,10 +1148,6 @@ def _counters(tiles: int, device: torch.device) -> torch.Tensor:
+     return built[-1][:tiles]
+ 
+ 
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_mhc_pre",
+-    mutates_args=("residual_out", "y", "y_q", "y_sf", "post", "comb", "pre_out"),
+-)
+ def _mhc_pre(
+     residual: torch.Tensor,
+     fn: torch.Tensor,
+@@ -1248,32 +1244,6 @@ def _mhc_pre(
+     )
+ 
+ 
+-@_mhc_pre.register_fake
+-def _mhc_pre_fake(
+-    residual,
+-    fn,
+-    scale,
+-    base,
+-    norm,
+-    pre,
+-    residual_out,
+-    y,
+-    y_q,
+-    y_sf,
+-    post,
+-    comb,
+-    pre_out,
+-    rms_eps,
+-    hc_eps,
+-    iterations,
+-    previous_output=None,
+-    previous_post=None,
+-    previous_comb=None,
+-):
+-    return None
+-
+-
+-@torch.library.custom_op("vllm::dsv41_tilelang_mhc_post", mutates_args=("out",))
+ def _mhc_post(
+     x: torch.Tensor,
+     residual: torch.Tensor,
+@@ -1293,14 +1263,6 @@ def _mhc_post(
+     )
+ 
+ 
+-@_mhc_post.register_fake
+-def _mhc_post_fake(x, residual, post, comb, out):
+-    return None
+-
+-
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_mhc_post_collapse", mutates_args=("out",)
+-)
+ def _mhc_post_collapse(
+     x: torch.Tensor,
+     residual: torch.Tensor,
+@@ -1322,12 +1284,6 @@ def _mhc_post_collapse(
+     )
+ 
+ 
+-@_mhc_post_collapse.register_fake
+-def _mhc_post_collapse_fake(x, residual, post, comb, mix, out):
+-    return None
+-
+-
+-@torch.library.custom_op("vllm::dsv41_tilelang_mhc_collapse", mutates_args=("out",))
+ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
+     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
+     if tokens == 0:
+@@ -1339,14 +1295,6 @@ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) ->
+     )
+ 
+ 
+-@_mhc_collapse.register_fake
+-def _mhc_collapse_fake(state, mix, out):
+-    return None
+-
+-
+-@torch.library.custom_op(
+-    "vllm::dsv41_tilelang_mhc_collapse_column", mutates_args=("out", "columns")
+-)
+ def _mhc_collapse_column(
+     state: torch.Tensor,
+     mix: torch.Tensor,
+@@ -1365,11 +1313,6 @@ def _mhc_collapse_column(
+     )
+ 
+ 
+-@_mhc_collapse_column.register_fake
+-def _mhc_collapse_column_fake(state, mix, out, columns, column):
+-    return None
+-
+-
+ # Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's
+ # mean), and every earlier, shorter pair (a captured graph may still read one).
+ _MIXES: dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index b1331a30e..7832eb9c1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -10,18 +10,12 @@ from torch import nn
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_tilelang_rmsnorm", mutates_args=("out",))
+ def _rmsnorm(
+     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
+ ) -> None:
+     pdl.norm_forward(x, weight, eps, out=out)
+ 
+ 
+-@_rmsnorm.register_fake
+-def _rmsnorm_fake(x, weight, out, eps):
+-    return None
+-
+-
+ @functools.cache
+ def _warm(hidden: int, eps: float, dtype: torch.dtype) -> None:
+     """TileKernels' RMSNorm of one zero row of ``hidden`` (``dtype`` input and weight),
+@@ -56,9 +50,14 @@ class TileLangRMSNorm(nn.Module):
+         # TileKernels reads each row by its stride (a contiguous last dimension, rows
+         # 16 elements apart): the q and kv halves of the fused projection's output are
+         # normalized where they lie, with no copy.
++        if x.ndim == 2 and (out is None or out.ndim == 2):
++            if out is None:
++                out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
++            pdl.norm_forward(x, self.weight, self.variance_epsilon, out=out)
++            return out
+         shape = x.shape
+         x = x.reshape(-1, shape[-1])
+         if out is None:
+             out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+-        _rmsnorm(x, self.weight, out.view(x.shape), self.variance_epsilon)
++        pdl.norm_forward(x, self.weight, self.variance_epsilon, out=out.view(x.shape))
+         return out.view(shape)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/rope.py b/vllm/models/deepseek_v4_1/tilelang/rope.py
+index 301d8feeb..160b95b5d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/rope.py
++++ b/vllm/models/deepseek_v4_1/tilelang/rope.py
+@@ -86,7 +86,6 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+     return rope
+ 
+ 
+-@torch.library.custom_op("vllm::dsv41_tilelang_rope", mutates_args=("x",))
+ def rope_(
+     x: torch.Tensor,
+     positions: torch.Tensor,
+@@ -109,11 +108,6 @@ def rope_(
+     kernel(x.view(rows, heads, x.shape[-1]), positions, cos_sin_cache)
+ 
+ 
+-@rope_.register_fake
+-def _rope_fake(x, positions, cos_sin_cache, ratio, inverse):
+-    return None
+-
+-
+ def rope_call(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
+     """The kernel ``rope_`` launches for ``heads`` heads of ``dim`` columns (one for
+     ``[T, D]`` rows) and a ``rope_dim``-wide table, as a ``prepare.call``."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 1a882242b..9a2bd9277 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -183,9 +183,7 @@ class TileLangWOProjection:
+         rows = o.shape[0]
+         if not rows:
+             return out
+-        scratch = (
+-            None if torch.compiler.is_compiling() else current_preallocated_workspace()
+-        )
++        scratch = current_preallocated_workspace()
+         # One borrow for everything live at once: WO-A's partials, then WO-B's MXFP8
+         # input in whole decode tiles.
+         partial_specs = self.a.partial_specs(rows)
