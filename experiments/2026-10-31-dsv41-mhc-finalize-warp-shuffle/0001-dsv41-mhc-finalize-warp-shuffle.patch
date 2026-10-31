@@ -1,0 +1,209 @@
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 1a5fab8..492671b 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -64,6 +64,10 @@ CHAIN = {
+ WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+ # test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+ EXEMPT = {"pdl_early_reader"}
++# Static weight parameters that may be pre-loaded before cudaGridDependencySynchronize().
++EARLY_PARAMETERS: dict[str, set[str]] = {
++    "mhc_finalize": {"base", "scale", "weight"},
++}
+ WAIT = "cudaGridDependencySynchronize()"
+ TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
+ _GLOBAL = re.compile(
+@@ -116,8 +120,11 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
+         if before.count("{") != before.count("}"):
+             out.append(f"{name}: waits inside a block, so some threads may not")
+         # A parameter, not a member such as threadIdx.x.
++        allowed = EARLY_PARAMETERS.get(base, set())
+         early = [
+-            p for p in pointers if re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
++            p
++            for p in pointers
++            if p not in allowed and re.search(rf"(?<![\w.]){re.escape(p)}\b", before)
+         ]
+         if early:
+             out.append(f"{name}: names {', '.join(early)} before the wait")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index a388e7f..2e2b2e7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -327,6 +327,7 @@ def finalize(
+     splits = hidden_size // block_H
+     chunks = hidden_size // VEC
+     workers = threads - 32
++    steps = (chunks + workers - 1) // workers
+     # Every warp's lanes take part in a step or none do, so the shuffles of a step's
+     # blocks are warp-uniform; a block's four lanes sit in one warp.
+     assert chunks % 32 == 0 and workers % 32 == 0
+@@ -350,93 +351,109 @@ def finalize(
+         ysf: T.Tensor((Mq, sf_width), T.uint8),
+     ):
+         with T.Kernel(M, threads=threads) as pid:
+-            pdl.chain()
+             tx = T.get_thread_binding()
+             xv = T.alloc_local((VEC,), T.bfloat16)
+-            wv = T.alloc_local((VEC,), T.bfloat16)
+-            yv = T.alloc_local((VEC,), T.bfloat16)
++            wv = T.alloc_local((steps * VEC,), T.bfloat16)
++            yv = T.alloc_local((steps * VEC,), T.bfloat16)
+             xf = T.alloc_local((VEC,), T.float32)
+             xq = T.alloc_local((VEC,), T.float8_e4m3fn)
+             total = T.alloc_local((1,), T.float32)
+             amax = T.alloc_local((1,), T.float32)
+-            mix_val = T.alloc_local((1,), T.float32)
+-            post_val = T.alloc_local((1,), T.float32)
+-            cm_val = T.alloc_local((1,), T.float32)
++            rms_l = T.alloc_local((1,), T.float32)
++            p_acc = T.alloc_local((1,), T.float32)
++            s_val = T.alloc_local((1,), T.float32)
++            b_val = T.alloc_local((1,), T.float32)
++            cm_l = T.alloc_local((1,), T.float32)
++            rmax_l = T.alloc_local((1,), T.float32)
++            rsum_l = T.alloc_local((1,), T.float32)
++            csum_l = T.alloc_local((1,), T.float32)
++
++            if tx < 24:
++                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
++                s_val[0] = scale[scale_idx]
++                b_val[0] = base[mix_idx]
++            else:
++                if tx >= 32:
++                    worker = tx - 32
++                    for step in T.unroll(steps):
++                        chunk = step * workers + worker
++                        if chunk < chunks:
++                            for v in T.vectorized(VEC):
++                                wv[step * VEC + v] = weight[chunk * VEC + v]
++
++            pdl.chain()
+ 
+             if tx < 32:
+                 # Reduce the split partials; RMS over the flattened streams.
+-                rms = T.alloc_fragment(1, T.float32)
+-                mixes = T.alloc_fragment(MIXES, T.float32)
+-                rms[0] = 0
+-                for i_split in T.serial(splits):
+-                    rms[0] += S[i_split, pid, 0]
+-                rms[0] = T.rsqrt(rms[0] / rms_group_size + rms_eps)
+-                for j in T.Parallel(MIXES):
+-                    mixes[j] = 0
+-                    for i_split in T.serial(splits):
+-                        mixes[j] += P[i_split, pid, 0, j]
+-                    mixes[j] *= rms[0]
+-                    mix_val[0] = mixes[j]
+-                post_val[0] = T.shfl_down(mix_val[0], MULT)
+-                cm_val[0] = T.shfl_down(mix_val[0], 2 * MULT)
++                rms_l[0] = 0.0
++                p_acc[0] = 0.0
++                cm_l[0] = 0.0
++                for i_split in T.unroll(splits):
++                    rms_l[0] += S[i_split, pid, 0]
++                    if tx < 24:
++                        mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                        p_acc[0] += P[i_split, pid, 0, mix_idx]
++                rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
+ 
+                 # The new pre-mix, the post-mix and the Sinkhorn combination.
+-                cm = T.alloc_fragment((MULT, MULT), T.float32)
+-                for j in T.Parallel(MULT):
+-                    pre_out[pid, j] = (
+-                        T.sigmoid(mix_val[0] * scale[0] + base[j]) + hc_eps
++                if tx < 16:
++                    cm_l[0] = p_acc[0] * rms_l[0] * s_val[0] + b_val[0]
++                elif tx < 20:
++                    pre_out[pid, tx - 16] = (
++                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) + hc_eps
+                     )
+-                    post[pid, j] = (
+-                        T.sigmoid(post_val[0] * scale[1] + base[j + MULT])
++                elif tx < 24:
++                    post[pid, tx - 20] = (
++                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0])
+                         * post_mult
+                     )
+-                for j, k in T.Parallel(MULT, MULT):
+-                    cm[j, k] = (
+-                        cm_val[0] * scale[2]
+-                        + base[j * MULT + k + MULT * 2]
+-                    )
+-                row_sum = T.alloc_fragment(MULT, T.float32)
+-                col_sum = T.alloc_fragment(MULT, T.float32)
+-                row_max = T.alloc_fragment(MULT, T.float32)
+-                T.reduce_max(cm, row_max, dim=1)
+-                for j, k in T.Parallel(MULT, MULT):
+-                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
+-                T.reduce_sum(cm, row_sum, dim=1)
+-                for j, k in T.Parallel(MULT, MULT):
+-                    cm[j, k] = cm[j, k] / row_sum[j] + hc_eps
+-                T.reduce_sum(cm, col_sum, dim=0)
+-                for j, k in T.Parallel(MULT, MULT):
+-                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_eps)
++
++                rmax_l[0] = cm_l[0]
++                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
++                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
++                cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
++                rsum_l[0] = cm_l[0]
++                rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++                rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++                cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
++                csum_l[0] = cm_l[0]
++                csum_l[0] += T.shfl_xor(csum_l[0], 8)
++                csum_l[0] += T.shfl_xor(csum_l[0], 4)
++                cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+                 for _ in T.serial(sinkhorn_repeat - 1):
+-                    T.reduce_sum(cm, row_sum, dim=1)
+-                    for j, k in T.Parallel(MULT, MULT):
+-                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_eps)
+-                    T.reduce_sum(cm, col_sum, dim=0)
+-                    for j, k in T.Parallel(MULT, MULT):
+-                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_eps)
+-                for j, k in T.Parallel(MULT, MULT):
+-                    comb[pid, j, k] = cm[j, k]
++                    rsum_l[0] = cm_l[0]
++                    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++                    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++                    cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
++                    csum_l[0] = cm_l[0]
++                    csum_l[0] += T.shfl_xor(csum_l[0], 8)
++                    csum_l[0] += T.shfl_xor(csum_l[0], 4)
++                    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
++                if tx < 16:
++                    comb[pid, tx // MULT, tx % MULT] = cm_l[0]
+             else:
+                 # RMSNorm of the collapse, with the sublayer's weight, and its MXFP8
+                 # cast.
+                 worker = tx - 32
++                for step in T.unroll(steps):
++                    chunk = step * workers + worker
++                    if chunk < chunks:
++                        for v in T.vectorized(VEC):
++                            yv[step * VEC + v] = C[pid, chunk * VEC + v]
+                 total[0] = 0
+-                for i_split in T.serial(splits):
++                for i_split in T.unroll(splits):
+                     total[0] += Q[i_split, pid]
+                 total[0] = T.rsqrt(total[0] / hidden_size + norm_eps)
+-                for step in T.serial(T.ceildiv(chunks, workers)):
++                for step in T.unroll(steps):
+                     chunk = step * workers + worker
+                     if chunk < chunks:
+-                        for v in T.vectorized(VEC):
+-                            yv[v] = C[pid, chunk * VEC + v]
+-                        for v in T.vectorized(VEC):
+-                            wv[v] = weight[chunk * VEC + v]
+                         for v in T.unroll(VEC):
+                             xv[v] = T.Cast(
+                                 T.bfloat16,
+-                                T.Cast(T.float32, yv[v])
++                                T.Cast(T.float32, yv[step * VEC + v])
+                                 * total[0]
+-                                * T.Cast(T.float32, wv[v]),
++                                * T.Cast(T.float32, wv[step * VEC + v]),
+                             )
+                         for v in T.vectorized(VEC):
+                             y[pid, chunk * VEC + v] = xv[v]
