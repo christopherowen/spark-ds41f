@@ -192,6 +192,9 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
     result["nodes_config"] = nodes_path
     result["deployment"]["launch_enabled"] = False
     result["deployment"].pop("branch", None)
+    ssh_user = nodes.get("ssh_user")
+    if result.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
+        result["host"]["home"] = f"/home/{ssh_user}"
     result["distributed"]["master_addr"] = next(n["management_ip"] for n in nodes["nodes"] if n.get("head"))
     for flag in ("--tensor-parallel-size", "--nnodes"):
         set_argument(result, flag, str(count))

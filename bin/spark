@@ -118,7 +118,8 @@ def configuration(
             )
         shape_nodes = int(cluster_recipe.shape_entry(cluster, shape)["nodes"])
         cluster = cluster_recipe.resolve(cluster, shape)
-    nodes_relative = cluster.get("nodes_config", NODES_FILE)
+    nodes_override = getattr(args, "nodes_config", None)
+    nodes_relative = nodes_override or cluster.get("nodes_config", NODES_FILE)
     nodes_path = repository_config_path(nodes_relative)
     upstreams_relative = cluster.get("upstreams_config", "upstreams.lock.json")
     upstreams_path = repository_config_path(upstreams_relative)
@@ -133,11 +134,14 @@ def configuration(
             raise SystemExit(f"invalid JSON in {nodes_relative}: {error}") from error
     if not upstreams_path.is_file():
         raise SystemExit(f"upstreams lock does not exist: {upstreams_relative}")
-    if shape_nodes is not None and len(nodes["nodes"]) != shape_nodes:
+    if shape_nodes is not None and not nodes_override and len(nodes["nodes"]) != shape_nodes:
         raise SystemExit(
             f"shape {cluster['shape']} needs {shape_nodes} nodes and its node map "
             f"{cluster.get('nodes_config', NODES_FILE)} has {len(nodes['nodes'])}"
         )
+    ssh_user = nodes.get("ssh_user")
+    if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
+        cluster["host"]["home"] = f"/home/{ssh_user}"
     return cluster, nodes, json.loads(upstreams_path.read_text(encoding="utf-8"))
 
 
@@ -1382,8 +1386,27 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
             detail = docker_error_detail(node["name"], result.stderr)
-            finding = f"{node['name']}: cannot inspect {name}: {detail}"
-            problems.append(Warn(finding) if "sudo usermod -aG docker" in detail else finding)
+            if "sudo usermod -aG docker" in detail:
+                problems.append(Warn(f"{node['name']}: cannot inspect {name}: {detail}"))
+                continue
+            if "no such object" in detail.lower():
+                label_result = run_ssh(
+                    nodes, node, "docker", "image", "inspect", cluster["container"]["image"]
+                )
+                if label_result.returncode:
+                    problems.append(
+                        Warn(f"{node['name']}: runtime image {cluster['container']['image']} is not present")
+                    )
+                else:
+                    labels = json.loads(label_result.stdout)[0]["Config"].get("Labels") or {}
+                    for key, wanted in cluster["container"]["expected_labels"].items():
+                        if labels.get(key) != wanted:
+                            problems.append(
+                                f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
+                            )
+                    problems.append(Warn(f"{node['name']}: serving container {name} is not running"))
+                continue
+            problems.append(f"{node['name']}: cannot inspect {name}: {detail}")
             continue
         inspection = json.loads(result.stdout)[0]
         if not inspection["State"]["Running"]:
@@ -1582,6 +1605,20 @@ LIVE_RECOMMENDATION_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "weight shards are not at ext4's best extent count",
             "weight fragmentation:",
+        ),
+    ),
+    (
+        "build and distribute runtime image",
+        "bin/spark image build --apply && bin/spark image distribute --apply",
+        (
+            "runtime image",
+        ),
+    ),
+    (
+        "start serving container",
+        "bin/spark --cluster-config <profile> cluster start --apply",
+        (
+            "serving container",
         ),
     ),
 )
