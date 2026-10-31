@@ -1,0 +1,137 @@
+From 46b607588b52dd3efe103f41dae3422fb31c6cdf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:44:52 +0100
+Subject: [PATCH] perf(cudagraph): cover odd c2 and full-depth speculative
+ batches in dense_varlen_decode_shapes
+
+---
+ tests/v1/cudagraph/test_cudagraph_manager.py | 54 ++++++++++++++++++--
+ vllm/v1/worker/gpu/cudagraph_utils.py        | 27 +++++++---
+ 2 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index 16764d043..1b3882728 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -534,11 +534,17 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
+     )
+ 
+     full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+-    assert len(full_descs) == 21
++    assert len(full_descs) == 30
+     dense_shapes = {
+-        (num_reqs, num_reqs * query_len)
+-        for num_reqs in (1, 2)
+-        for query_len in range(1, decode_query_len + 1)
++        *(
++            (num_reqs, num_tokens)
++            for num_reqs in (1, 2)
++            for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
++        ),
++        *(
++            (num_reqs, num_reqs * decode_query_len)
++            for num_reqs in (3, 4)
++        ),
+     }
+     captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
+     assert dense_shapes <= captured_shapes
+@@ -558,11 +564,49 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
+     assert any(desc.num_reqs == 8 and desc.num_tokens == 8 for desc in full_descs)
+ 
+ 
++def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch):
++    decode_query_len = 6
++    capture_sizes = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
++    manager = _make_spec_decode_manager(
++        monkeypatch,
++        decode_query_len=decode_query_len,
++        capture_sizes=capture_sizes,
++        num_speculative_tokens=5,
++        max_num_seqs=8,
++        varlen_decode=True,
++    )
++
++    for num_reqs in (1, 2):
++        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1):
++            desc = manager.dispatch(
++                num_reqs=num_reqs,
++                num_tokens=num_tokens,
++                uniform_token_count=None,
++                num_active_loras=0,
++                max_query_len=decode_query_len,
++            )
++            assert desc.cg_mode == CUDAGraphMode.FULL
++            assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
++
++    for num_reqs in range(1, 9):
++        num_tokens = num_reqs * decode_query_len
++        desc = manager.dispatch(
++            num_reqs=num_reqs,
++            num_tokens=num_tokens,
++            uniform_token_count=decode_query_len,
++            num_active_loras=0,
++            max_query_len=decode_query_len,
++        )
++        assert desc.cg_mode == CUDAGraphMode.FULL
++        assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
++
++
+ @pytest.mark.parametrize(
+     ("num_reqs", "num_tokens", "expected_shape"),
+     [
+-        (2, 3, (2, 4)),
++        (3, 3, (4, 4)),
+         (3, 6, (8, 8)),
++        (5, 24, (8, 24)),
+     ],
+ )
+ def test_varlen_dense_rejection_keeps_larger_full_fallback(
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 5072157e1..49ed6d688 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -62,13 +62,26 @@ _DENSE_VARLEN_DECODE_MAX_REQS = 2
+ def dense_varlen_decode_shapes(
+     max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
+ ) -> tuple[tuple[int, int], ...]:
+-    """Return request and token counts of exact variable-length decode graphs."""
+-    return tuple(
+-        (num_reqs, num_reqs * query_len)
+-        for num_reqs in range(1, min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs) + 1)
+-        for query_len in range(1, decode_query_len + 1)
+-        if num_reqs * query_len <= max_capture_tokens
++    """Return request and token counts of exact variable-length decode graphs.
++
++    Covers every valid token total for low-concurrency batches (``1`` to
++    ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
++    adaptively trimmed totals) and the full-depth speculative batch for each
++    higher request count up to ``max_num_reqs``.
++    """
++    dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
++    dense = (
++        (num_reqs, num_tokens)
++        for num_reqs in range(1, dense_reqs + 1)
++        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
++        if num_tokens <= max_capture_tokens
++    )
++    uniform = (
++        (num_reqs, num_reqs * decode_query_len)
++        for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
++        if decode_query_len > 1 and num_reqs * decode_query_len <= max_capture_tokens
+     )
++    return (*dense, *uniform)
+ 
+ 
+ _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
+@@ -606,7 +619,7 @@ class CudaGraphManager:
+             )
+ 
+         for mode, descs in descs_by_mode.items():
+-            descs.sort(key=lambda d: d.num_tokens, reverse=True)
++            descs.sort(key=lambda d: (d.num_tokens, d.num_reqs or 0), reverse=True)
+             self._capture_descs[mode] = descs
+ 
+         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
+-- 
+2.54.0 (Apple Git-157)
+
