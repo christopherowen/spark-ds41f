@@ -1,0 +1,517 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:12:06 +0100
+Subject: [PATCH 618/618] perf(worker): elide redundant decode-step logits
+ gathers, H2D, and index expansions
+
+---
+ tests/v1/worker/test_dead_rows.py  | 151 +++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu/input_batch.py  |  82 ++++++++++++++--
+ vllm/v1/worker/gpu/model_runner.py | 115 ++++++++++++++++------
+ 3 files changed, 306 insertions(+), 42 deletions(-)
+
+diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
+index 49510938c..e395cf731 100644
+--- a/tests/v1/worker/test_dead_rows.py
++++ b/tests/v1/worker/test_dead_rows.py
+@@ -66,3 +66,154 @@ def test_dead_row_cut_clamps_committed_tokens():
+     )
+     assert sampled.tolist() == [3, 1, 4]
+     assert rejected.tolist() == [3, 5, 2]
++
++
++def test_input_buffers_reuse_and_contiguous_logits_rows(monkeypatch):
++    from dataclasses import replace
++
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.input_batch import (
++        InputBatch,
++        InputBuffers,
++        expand_idx_mapping,
++    )
++
++    dev = torch.device("cuda")
++    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=32, device=dev)
++    idx_mapping = torch.tensor([3, 1], dtype=torch.int64, device=dev)
++    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32, device=dev)
++    seq_lens = torch.tensor([20, 30], dtype=torch.int32, device=dev)
++    prefill_len = torch.tensor([5, 5, 5, 5], dtype=torch.int32, device=dev)
++    last_sampled = torch.tensor([10, 11, 12, 13], dtype=torch.int64, device=dev)
++    draft_tokens = torch.arange(12, dtype=torch.int64, device=dev).view(4, 3) + 100
++
++    logits_indices = combine_sampled_and_draft_tokens(
++        buffers.input_ids,
++        idx_mapping,
++        last_sampled,
++        query_start_loc,
++        seq_lens,
++        prefill_len,
++        draft_tokens,
++        query_start_loc,
++        8,
++        1,
++        out=buffers.logits_indices,
++    )
++    assert logits_indices.data_ptr() == buffers.logits_indices.data_ptr()
++    assert logits_indices.tolist() == list(range(8))
++
++    exp_idx, exp_pos = expand_idx_mapping(
++        idx_mapping,
++        8,
++        query_start_loc,
++        4,
++        out=(buffers.expanded_idx_mapping, buffers.expanded_local_pos),
++    )
++    assert exp_idx.data_ptr() == buffers.expanded_idx_mapping.data_ptr()
++    assert exp_pos.data_ptr() == buffers.expanded_local_pos.data_ptr()
++    assert exp_idx.tolist() == [3, 3, 3, 3, 1, 1, 1, 1]
++    assert exp_pos.tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
++
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    batch.logits_indices = logits_indices
++    batch.cu_num_logits = query_start_loc
++    batch._logits_rows_contiguous = True
++    batch._deferred_expand_max_len = 4
++
++    def _forbid_logits_rows(*args, **kwargs):
++        raise AssertionError("tilelang_inputs.logits_rows should not be called")
++
++    monkeypatch.setattr(tilelang_inputs, "logits_rows", _forbid_logits_rows)
++    ids_view, pos_view = batch.logits_rows()
++    assert ids_view.data_ptr() == batch.input_ids.data_ptr()
++    assert pos_view.data_ptr() == batch.positions.data_ptr()
++    assert ids_view.shape == (8,)
++    assert pos_view.shape == (8,)
++
++    # dataclasses.replace must not inherit _logits_rows_contiguous or _logits_rows.
++    replaced = replace(batch, num_reqs=1)
++    assert not replaced._logits_rows_contiguous
++    assert replaced._logits_rows is None
++
++    # Lazy expansion populates expanded_idx_mapping/expanded_local_pos into buffers.
++    buffers.expanded_idx_mapping.zero_()
++    buffers.expanded_local_pos.zero_()
++    batch.idx_mapping = idx_mapping
++    batch.ensure_expanded_idx_mapping(buffers)
++    assert batch._deferred_expand_max_len is None
++    assert batch.expanded_idx_mapping.data_ptr() == buffers.expanded_idx_mapping.data_ptr()
++    assert batch.expanded_idx_mapping.tolist() == [3, 3, 3, 3, 1, 1, 1, 1]
++    assert batch.expanded_local_pos.tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
++
++
++def test_sample_contiguous_fastpath_skips_gather_and_lazy_expands_on_fallback(
++    monkeypatch,
++):
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++    from vllm.v1.worker.gpu.sample.output import SamplerOutput
++
++    dev = torch.device("cuda")
++    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=16, device=dev)
++    batch = InputBatch.make_dummy(2, 6, buffers)
++    batch.idx_mapping = torch.tensor([2, 0], dtype=torch.int64, device=dev)
++    batch.cu_num_logits = torch.tensor([0, 3, 6], dtype=torch.int32, device=dev)
++    batch.logits_indices = torch.arange(6, dtype=torch.int64, device=dev)
++    batch.num_draft_tokens = 4
++    batch._logits_rows_contiguous = True
++    batch._deferred_expand_max_len = 3
++
++    hidden_states = torch.randn(8, 32, dtype=torch.bfloat16, device=dev)
++
++    def _forbid_gather(*args, **kwargs):
++        raise AssertionError("gather_hidden_rows should not be called")
++
++    monkeypatch.setattr(tilelang_inputs, "gather_hidden_rows", _forbid_gather)
++
++    captured_hidden = {}
++
++    def _fake_verify_greedily(sample_hidden, input_batch, sink_flags):
++        captured_hidden["tensor"] = sample_hidden
++        return SamplerOutput(
++            sampled_token_ids=torch.zeros((2, 3), dtype=torch.int64, device=dev),
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=torch.ones(2, dtype=torch.int32, device=dev),
++            num_rejected=torch.zeros(2, dtype=torch.int32, device=dev),
++        )
++
++    runner = SimpleNamespace(
++        sink=None,
++        batch_sharder=None,
++        input_buffers=buffers,
++        _verifies_greedily=lambda ib, go: go is None,
++        _verify_greedily=_fake_verify_greedily,
++        model=SimpleNamespace(
++            compute_logits=lambda hs: torch.zeros((hs.shape[0], 16), device=dev)
++        ),
++        sampler=lambda logits, ib: SamplerOutput(
++            sampled_token_ids=torch.zeros((2, 1), dtype=torch.int64, device=dev),
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=torch.ones(2, dtype=torch.int32, device=dev),
++            num_rejected=torch.zeros(2, dtype=torch.int32, device=dev),
++        ),
++        rejection_sampler=None,
++    )
++
++    # 1. Greedy verification path: slices hidden_states[:6] without gather or expand.
++    GPUModelRunner.sample(runner, hidden_states, batch, grammar_output=None)
++    assert captured_hidden["tensor"].data_ptr() == hidden_states.data_ptr()
++    assert captured_hidden["tensor"].shape == (6, 32)
++    assert batch._deferred_expand_max_len == 3
++
++    # 2. Non-greedy fallback path: lazily runs ensure_expanded_idx_mapping before sampling.
++    runner._verifies_greedily = lambda ib, go: False
++    GPUModelRunner.sample(runner, hidden_states, batch, grammar_output=None)
++    assert batch._deferred_expand_max_len is None
++    assert batch.expanded_idx_mapping.tolist() == [2, 2, 2, 0, 0, 0]
++    assert batch.expanded_local_pos.tolist() == [0, 1, 2, 0, 1, 2]
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 309f14d3d..2f964251f 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -34,6 +34,15 @@ class InputBuffers:
+         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
++        self.logits_indices = torch.zeros(
++            max_num_tokens, dtype=torch.int64, device=device
++        )
++        self.expanded_idx_mapping = torch.zeros(
++            max_num_tokens, dtype=torch.int64, device=device
++        )
++        self.expanded_local_pos = torch.zeros(
++            max_num_tokens, dtype=torch.int32, device=device
++        )
+         self.query_start_loc = torch.zeros(
+             max_num_reqs + 1, dtype=torch.int32, device=device
+         )
+@@ -145,15 +154,54 @@ class InputBatch:
+     _logits_rows: "tuple[torch.Tensor, torch.Tensor] | None" = field(
+         default=None, init=False, repr=False, compare=False
+     )
++    # True when logits_indices is the contiguous identity prefix [0, ..., n - 1]
++    # of input_ids/positions/hidden_states. Not an init field: a replaced batch
++    # (e.g. batch sharding or PCP) has its own logits_indices.
++    _logits_rows_contiguous: bool = field(
++        default=False, init=False, repr=False, compare=False
++    )
++    # Set when expand_idx_mapping was deferred on a greedy verification step so
++    # sample() can materialize expanded_idx_mapping/expanded_local_pos lazily if
++    # a caller takes the non-greedy path.
++    _deferred_expand_max_len: int | None = field(
++        default=None, init=False, repr=False, compare=False
++    )
+ 
+     def logits_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
+         """``input_ids[logits_indices]`` and ``positions[logits_indices]``: one
+         TileLang launch the first time a step asks, shared by every reader (the
+         samplers, the sink policy and its cut read them, never write them)."""
+         if self._logits_rows is None:
+-            self._logits_rows = _gather_logits_rows(self)
++            if self._logits_rows_contiguous:
++                n = self.logits_indices.shape[0]
++                self._logits_rows = (self.input_ids[:n], self.positions[:n])
++            else:
++                self._logits_rows = _gather_logits_rows(self)
+         return self._logits_rows
+ 
++    def ensure_expanded_idx_mapping(
++        self, input_buffers: InputBuffers | None = None
++    ) -> None:
++        if self._deferred_expand_max_len is None:
++            return
++        max_expand_len = self._deferred_expand_max_len
++        self._deferred_expand_max_len = None
++        out = (
++            (
++                input_buffers.expanded_idx_mapping,
++                input_buffers.expanded_local_pos,
++            )
++            if input_buffers is not None
++            else None
++        )
++        self.expanded_idx_mapping, self.expanded_local_pos = expand_idx_mapping(
++            self.idx_mapping,
++            self.logits_indices.shape[0],
++            self.cu_num_logits,
++            max_expand_len,
++            out=out,
++        )
++
+     @classmethod
+     def make_dummy(
+         cls,
+@@ -588,6 +636,7 @@ def combine_sampled_and_draft_tokens(
+     num_logits: int,
+     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+     dead_rows: "DeadRows | None" = None,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
+     assert num_new_sampled_tokens in (0, 1), (
+@@ -595,11 +644,14 @@ def combine_sampled_and_draft_tokens(
+     )
+     from vllm.v1.worker.gpu import tilelang_inputs
+ 
+-    logits_indices = torch.empty(
+-        num_logits,
+-        dtype=torch.int64,
+-        device=input_ids.device,
+-    )
++    if out is not None and out.shape[0] >= num_logits:
++        logits_indices = out[:num_logits]
++    else:
++        logits_indices = torch.empty(
++            num_logits,
++            dtype=torch.int64,
++            device=input_ids.device,
++        )
+     # A request covers up to next_power_of_2(drafts + new sampled tokens) logits.
+     tilelang_inputs.combine_sampled_and_draft_tokens(
+         input_ids,
+@@ -879,13 +931,23 @@ def expand_idx_mapping(
+     total_num_logits: int,
+     cu_num_logits: torch.Tensor,
+     max_expand_len: int,
++    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     from vllm.v1.worker.gpu import tilelang_inputs
+ 
+-    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
+-    expanded_local_pos = torch.empty(
+-        total_num_logits, dtype=torch.int32, device=idx_mapping.device
+-    )
++    if (
++        out is not None
++        and out[0].dtype == idx_mapping.dtype
++        and out[0].shape[0] >= total_num_logits
++        and out[1].shape[0] >= total_num_logits
++    ):
++        expanded_idx_mapping = out[0][:total_num_logits]
++        expanded_local_pos = out[1][:total_num_logits]
++    else:
++        expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
++        expanded_local_pos = torch.empty(
++            total_num_logits, dtype=torch.int32, device=idx_mapping.device
++        )
+     tilelang_inputs.expand_idx_mapping(
+         idx_mapping,
+         expanded_idx_mapping,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fe7a1929c..d61fe0dbc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1771,6 +1771,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Get the number of draft tokens for each request.
+         draft_tokens = self._drafter_spec_tokens(scheduler_output)
+         num_draft_tokens_per_req = None
++        adaptive_verification = None
+         if not draft_tokens:
+             # No draft token scheduled (common case).
+             total_num_draft_tokens = 0
+@@ -1793,14 +1794,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # at [query_end - num_logits, query_end). Fewer query rows than
+             # that would silently select the preceding request's hidden states.
+             assert (num_scheduled_tokens_np >= num_logits).all()
+-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+-            cu_num_logits_np[0] = 0
+-            np.cumsum(num_logits, out=cu_num_logits_np[1:])
+-            cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
++            adaptive_verification = self.adaptive_verification
++            if adaptive_verification is not None or total_num_logits != num_tokens:
++                cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
++                cu_num_logits_np[0] = 0
++                np.cumsum(num_logits, out=cu_num_logits_np[1:])
++                cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
+ 
+-        adaptive_verification = (
+-            self.adaptive_verification if num_draft_tokens_per_req is not None else None
+-        )
+         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
+         if adaptive_verification is not None:
+             # num_scheduled_tokens represents the draft budget evenly distributed across
+@@ -1825,6 +1825,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         query_start_loc_np[num_reqs + 1 :] = num_tokens
+         query_start_loc = self.input_buffers.query_start_loc
+         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
++        if (
++            draft_tokens
++            and adaptive_verification is None
++            and total_num_logits == num_tokens
++        ):
++            cu_num_logits_np = query_start_loc_np[: num_reqs + 1]
++            cu_num_logits = query_start_loc[: num_reqs + 1]
++        deferred_expand_max_len: int | None = None
+         if adaptive_verification is not None:
+             (
+                 cu_num_logits,
+@@ -1835,9 +1843,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+         elif draft_tokens:
+-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+-                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+-            )
++            if self.pcp_manager is None and self._batch_verifies_greedily(
++                idx_mapping_np,
++                num_reqs,
++                total_num_draft_tokens,
++                scheduler_output.has_structured_output_requests,
++            ):
++                expanded_idx_mapping = idx_mapping
++                expanded_local_pos = self.input_buffers.zero_local_pos[:num_reqs]
++                deferred_expand_max_len = self.decode_query_len
++            else:
++                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
++                    idx_mapping,
++                    total_num_logits,
++                    cu_num_logits,
++                    self.decode_query_len,
++                    out=(
++                        self.input_buffers.expanded_idx_mapping,
++                        self.input_buffers.expanded_local_pos,
++                    ),
++                )
+         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+         query_start_loc = query_start_loc[: num_reqs_padded + 1]
+ 
+@@ -1899,6 +1924,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
+             dead_rows=dead_rows,
++            out=self.input_buffers.logits_indices,
+         )
+ 
+         fast_prefill = None
+@@ -1973,6 +1999,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch,
+             batch_desc,
+         )
++        if deferred_expand_max_len is not None:
++            input_batch._deferred_expand_max_len = deferred_expand_max_len
++        if (
++            adaptive_verification is None
++            and self.pcp_manager is None
++            and total_num_logits == num_tokens
++        ):
++            input_batch._logits_rows_contiguous = True
+         return input_batch
+ 
+     def prepare_attn(
+@@ -2028,6 +2062,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
++            input_batch.ensure_expanded_idx_mapping(self.input_buffers)
+             # Shard the inputs along the batch dimension to sample in parallel
+             # across TP ranks.
+             input_batch, sorted_logits_indices, grammar_output, shard_metadata = (
+@@ -2041,9 +2076,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             logits = all_to_all_logits(local_logits, shard_metadata)
+             logits = logits[:, : self.vocab_size]
+         else:
+-            sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+-                hidden_states, input_batch.logits_indices
+-            )
++            if input_batch._logits_rows_contiguous:
++                sample_hidden_states = hidden_states[
++                    : input_batch.logits_indices.shape[0]
++                ]
++            else:
++                sample_hidden_states = tilelang_inputs.gather_hidden_rows(
++                    hidden_states, input_batch.logits_indices
++                )
+             if self._verifies_greedily(input_batch, grammar_output):
+                 output = self._verify_greedily(
+                     sample_hidden_states, input_batch, sink_flags
+@@ -2053,6 +2093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 assert output.num_sampled is not None
+                 assert output.num_rejected is not None
+                 return output, output.num_sampled, output.num_rejected
++            input_batch.ensure_expanded_idx_mapping(self.input_buffers)
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
+         if grammar_output is not None:
+@@ -2471,25 +2512,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         return layouts
+ 
+-    def _verifies_greedily(
+-        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
++    def _batch_verifies_greedily(
++        self,
++        idx_mapping_np: np.ndarray,
++        num_reqs: int,
++        num_draft_tokens: int,
++        has_structured_output: bool,
+     ) -> bool:
+-        """An all-greedy verification step that nothing else reads the logits of."""
+         if (
+-            grammar_output is not None
+-            or input_batch.num_reqs == 0
+-            or input_batch.num_draft_tokens == 0
++            has_structured_output
++            or num_reqs == 0
++            or num_draft_tokens == 0
+             or not self._greedy_verification_available()
+         ):
+             return False
+         assert self.sampler is not None
+-        idx = input_batch.idx_mapping_np
+         states = self.sampler.sampling_states
+         # No logprobs: neither top logprobs nor logprob_token_ids.
+         return bool(
+-            np.all(states.temperature.np[idx] == 0.0)
+-            and not np.any(self.sampler.needs_logits_processing[idx])
+-            and self.sampler.get_logprobs_dims(idx) is None
++            np.all(states.temperature.np[idx_mapping_np] == 0.0)
++            and not np.any(self.sampler.needs_logits_processing[idx_mapping_np])
++            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
++        )
++
++    def _verifies_greedily(
++        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
++    ) -> bool:
++        """An all-greedy verification step that nothing else reads the logits of."""
++        return self._batch_verifies_greedily(
++            input_batch.idx_mapping_np,
++            input_batch.num_reqs,
++            input_batch.num_draft_tokens,
++            grammar_output is not None,
+         )
+ 
+     def _verify_greedily(
+@@ -3470,12 +3524,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
+             assert self.sampler is not None
+-            if isinstance(self.speculator, DraftModelSpeculator):
++            if (
++                isinstance(self.speculator, DraftModelSpeculator)
++                and self.speculator.acceptance_estimator is not None
++            ):
+                 observed_rejected = num_rejected
+-                if (
+-                    self._dead_row_cut is not None
+-                    and self.speculator.acceptance_estimator is not None
+-                ):
++                if self._dead_row_cut is not None:
+                     # Rows past the dead-row cut skipped routed MoE and were
+                     # never verified; only live rows can be observed as rejected.
+                     live_rejected = (
+@@ -3485,10 +3539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     observed_rejected = torch.minimum(
+                         observed_rejected, live_rejected
+                     )
+-                if (
+-                    sampler_output.sink is not None
+-                    and self.speculator.acceptance_estimator is not None
+-                ):
++                if sampler_output.sink is not None:
+                     # A rejected draft zero left the drafts unjudged.
+                     observed_rejected = observed_rejected.masked_fill(
+                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
