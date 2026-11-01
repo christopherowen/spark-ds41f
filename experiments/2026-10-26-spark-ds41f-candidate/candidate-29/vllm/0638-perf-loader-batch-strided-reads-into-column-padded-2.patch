@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sun, 1 Nov 2026 03:24:28 +0000
+Subject: [PATCH 638/638] perf(loader): batch strided reads into column-padded
+ 2D destinations
+
+Allow _batch.c to coalesce multi-row strided descriptors whenever source_stride >= bytes and destination_stride >= bytes * (1 + expand_bf16), and check 2D strided row intervals when destination bounding boxes overlap so column-padded shards (such as TP5/TP7/TP8 MoE w2.weight and w2.weight_scale) batch into multi-row read jobs instead of issuing one 4 KiB O_DIRECT read per row.
+---
+ .../model_loader/test_direct_loader_cuda.py   | 38 ++++++++++-
+ .../model_loader/direct_io/_batch.c           | 66 ++++++++++++++++---
+ 2 files changed, 91 insertions(+), 13 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+index 5a42f0746..4517a83cc 100644
+--- a/tests/model_executor/model_loader/test_direct_loader_cuda.py
++++ b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+@@ -77,9 +77,8 @@ def test_tp_column_slices_preserve_padding_and_expand_bf16(
+         target = backing[:, :, 1:-1] if padded else backing
+         assert session(target, source)
+         stats = session.stats()
+-        if not padded:
+-            assert stats["strided_copy_bytes"] == source.nbytes
+-            assert stats["reads"] < 8
++        assert stats["strided_copy_bytes"] == source.nbytes
++        assert stats["reads"] < 8
+         assert stats["descriptors"] == 2
+     torch.testing.assert_close(
+         target.cpu(),
+@@ -638,3 +637,36 @@ def test_file_backed_tables_stay_descriptors_beside_routed_weights(tmp_path):
+         checkpoint.seek(descriptor.offset)
+         assert checkpoint.read(table.nbytes) == table.numpy().tobytes()
+     torch.testing.assert_close(destination.cpu(), weight, rtol=0, atol=0)
++
++
++def test_padded_2d_destinations_batch_strided_rows_and_detect_overlaps(tmp_path):
++    """Column-padded 2D destinations (such as TP5/TP7/TP8 MoE w2 shards) must
++    coalesce multi-row strided reads while still rejecting overlapping 2D slices."""
++    expected = torch.arange(2560 * 1152, dtype=torch.int32).to(torch.uint8).reshape(
++        2560, 1152
++    )
++    path = tmp_path / "w2.safetensors"
++    save_file({"w2": expected}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["w2"]
++        backing = torch.full((2560, 160), 255, dtype=torch.uint8, device="cuda")
++        assert session(backing[:, :72], source[:, :72])
++        assert session(backing[:, 80:152], source[:, 72:144])
++        stats = session.stats()
++        assert stats["descriptors"] == 2
++        assert stats["strided_copy_bytes"] == 2560 * 144
++        assert stats["reads"] <= 8
++    actual = backing.cpu()
++    assert torch.equal(actual[:, :72], expected[:, :72])
++    assert torch.equal(actual[:, 80:152], expected[:, 72:144])
++    assert torch.all(actual[:, 72:80] == 255)
++    assert torch.all(actual[:, 152:] == 255)
++
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["w2"]
++        overlap_target = torch.zeros((2560, 160), dtype=torch.uint8, device="cuda")
++        assert session(overlap_target[:, :80], source[:, :80])
++        assert session(overlap_target[:, 64:144], source[:, 64:144])
++        with pytest.raises(RuntimeError, match="overlapping batch destinations"):
++            session.flush()
++    assert torch.count_nonzero(overlap_target) == 0
+diff --git a/vllm/model_executor/model_loader/direct_io/_batch.c b/vllm/model_executor/model_loader/direct_io/_batch.c
+index 51c4426d4..37df00c51 100644
+--- a/vllm/model_executor/model_loader/direct_io/_batch.c
++++ b/vllm/model_executor/model_loader/direct_io/_batch.c
+@@ -68,10 +68,43 @@ static PyObject *py_batch_executor(PyObject *self, PyObject *args) {
+     return capsule;
+ }
+ 
++static uintptr_t job_end(const read_job_t *job) {
++    return (uintptr_t)job->destination +
++           (uint64_t)job->bytes * (1 + job->expand_bf16) +
++           (uint64_t)(job->rows - 1) * (uint64_t)job->destination_stride;
++}
++
+ static int job_destination_order(const void *a, const void *b) {
+-    uintptr_t x = (uintptr_t)((const read_job_t *)a)->destination;
+-    uintptr_t y = (uintptr_t)((const read_job_t *)b)->destination;
+-    return (x > y) - (x < y);
++    const read_job_t *ja = a, *jb = b;
++    uintptr_t x = (uintptr_t)ja->destination;
++    uintptr_t y = (uintptr_t)jb->destination;
++    if (x != y) return (x > y) - (x < y);
++    uintptr_t ex = job_end(ja);
++    uintptr_t ey = job_end(jb);
++    return (ex > ey) - (ex < ey);
++}
++
++static bool jobs_overlap(const read_job_t *a, const read_job_t *b) {
++    uintptr_t start_a = (uintptr_t)a->destination;
++    uintptr_t start_b = (uintptr_t)b->destination;
++    uintptr_t end_a = job_end(a);
++    if (end_a <= start_b) return false;
++    uint64_t width_a = (uint64_t)a->bytes * (1 + a->expand_bf16);
++    uint64_t stride_a = (uint64_t)a->destination_stride;
++    if (a->rows == 1 || stride_a <= width_a) return true;
++    uint64_t width_b = (uint64_t)b->bytes * (1 + b->expand_bf16);
++    uint64_t stride_b = (uint64_t)b->destination_stride;
++    if (b->rows == 1 || stride_b == stride_a) {
++        uint64_t rem = (start_b - start_a) % stride_a;
++        return rem < width_a || rem + width_b > stride_a;
++    }
++    for (int64_t row = 0; row < b->rows; row++) {
++        uintptr_t pos = start_b + (uint64_t)row * stride_b;
++        if (pos >= end_a) break;
++        uint64_t rem = (pos - start_a) % stride_a;
++        if (rem < width_a || rem + width_b > stride_a) return true;
++    }
++    return false;
+ }
+ 
+ static int job_source_order(const void *a, const void *b) {
+@@ -132,8 +165,10 @@ static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
+                 capacity = next;
+             }
+             int64_t chunk = bytes > BATCH_CHUNK_BYTES ? BATCH_CHUNK_BYTES : (int64_t)bytes;
++            uint64_t row_bytes = bytes * (1 + expand_bf16);
+             uint64_t chunk_rows = 1;
+-            if (bytes <= BATCH_CHUNK_BYTES && destination_stride == bytes * (1 + expand_bf16)) {
++            if (bytes <= BATCH_CHUNK_BYTES && source_stride >= bytes &&
++                destination_stride >= row_bytes) {
+                 uint64_t stride = source_stride > destination_stride ? source_stride : destination_stride;
+                 chunk_rows = stride ? BATCH_CHUNK_BYTES / stride : 1;
+                 if (!chunk_rows) chunk_rows = 1;
+@@ -161,14 +196,25 @@ static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
+         }
+     }
+     qsort(jobs, count, sizeof(*jobs), job_destination_order);
++    size_t active_start = 0;
++    uintptr_t max_end = count ? job_end(&jobs[0]) : 0;
+     for (size_t i = 1; i < count; i++) {
+-        read_job_t *previous = &jobs[i - 1];
+-        if ((uintptr_t)previous->destination + previous->bytes * (1 + previous->expand_bf16) +
+-            (previous->rows - 1) * previous->destination_stride >
+-            (uintptr_t)jobs[i].destination) {
+-            snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
+-            goto done;
++        uintptr_t start_i = (uintptr_t)jobs[i].destination;
++        uintptr_t end_i = job_end(&jobs[i]);
++        if (start_i >= max_end) {
++            active_start = i;
++            max_end = end_i;
++            continue;
++        }
++        while (active_start < i && job_end(&jobs[active_start]) <= start_i)
++            active_start++;
++        for (size_t k = active_start; k < i; k++) {
++            if (jobs_overlap(&jobs[k], &jobs[i])) {
++                snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
++                goto done;
++            }
+         }
++        if (end_i > max_end) max_end = end_i;
+     }
+     qsort(jobs, count, sizeof(*jobs), job_source_order);
+     Py_BEGIN_ALLOW_THREADS

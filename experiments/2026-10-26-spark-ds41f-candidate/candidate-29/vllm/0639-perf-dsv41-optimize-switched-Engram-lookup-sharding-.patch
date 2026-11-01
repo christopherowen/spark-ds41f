@@ -1,0 +1,542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:18:36 +0000
+Subject: [PATCH 639/639] perf(dsv41): optimize switched Engram lookup/sharding
+ and decode GEMM tiles
+
+1. Pass token_count=indices.shape[0] and clear_tail=False in resident Engram prepare_embeddings and share prepared_engram_hashes across resident Engram layers so decode steps launch (M, 24, 1) CTAs instead of (16384, 24, 1) CTAs and skip 201 MB tail memsets (~2.1 ms/step saved on TP6..TP8).
+2. Generalize disk Engram column_shard, engram_rows_gather_kernel, and interleaved_rows to support any TP size <= 24 (including TP5 and TP7 where 24 % tp_size != 0) via padded per-rank column strides, eliminating TP5 Rank 4 4-gram skew and 6144-wide all-reduce.
+3. Add TP3..TP8 decode MXFP8 GEMM tile configs in DECODE_FP8_CONFIGS and WIDE_DECODE, including tuned block_M=32 configs for WO-B (5120, 3072/2048/1024).
+---
+ .../test_deepseek_v41_block_scale_words.py    |   2 +
+ .../kernels/test_deepseek_v41_engram_rows.py  |  23 +++-
+ tests/models/test_deepseek_v4_1_engram.py     |  27 ++--
+ vllm/models/deepseek_v4_1/common/engram.py    |  46 ++++---
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   7 +-
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  25 +++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 115 ++++++++++++++++--
+ 7 files changed, 200 insertions(+), 45 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+index 195a9cd1a..0ce70d96d 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
++++ b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+@@ -115,6 +115,7 @@ def _serving_tiles():
+         64,
+         192,
+         256,
++        320,
+         384,
+         512,
+         576,
+@@ -123,6 +124,7 @@ def _serving_tiles():
+         1024,
+         1280,
+         2048,
++        3072,
+         4096,
+         5120,
+         6144,
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4e358c4e8..4b8bd22d8 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -499,15 +499,34 @@ def test_timeline_records_each_step_and_the_gpu_wait():
+ 
+ def test_the_gather_takes_every_nth_column():
+     """The gather writes a rank's columns side by side: every n-th from the first
+-    (``column_shard``), or it refuses the mask."""
+-    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span
++    (``column_shard``), including padded column strides when 24 % tp_size != 0."""
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span, row_kernel_calls
+ 
+     assert column_span(ALL_COLUMNS) == (0, 1, HEADS)
+     assert column_span(TP3_RANK1) == (1, 3, 8)
++    tp5_rank4 = sum(1 << column for column in range(4, HEADS, 5))
++    assert column_span(tp5_rank4) == (4, 5, 4)
+     assert column_span(1 << 23) == (23, 1, 1)
+     for columns in (0, 0b1011, (1 << 2) | (1 << 5) | (1 << 9)):
+         with pytest.raises(ValueError, match="every n-th"):
+             column_span(columns)
++    codes, scales, paths = _write_table(_table_dir(), seed=31)
++    rows = _rows(paths, 0, TABLE_ROWS, tokens=4, columns=tp5_rank4)
++    ids = torch.randint(0, TABLE_ROWS, (4, HEADS), device="cuda")
++    num_tokens = torch.tensor([3], dtype=torch.int32, device="cuda")
++    out = torch.zeros((4, 5 * 256), dtype=torch.bfloat16, device="cuda")
++    rows.stage(torch.cuda.current_stream(), ids, ids.numel())
++    rows.gather(out, ids, num_tokens)
++    torch.testing.assert_close(
++        out[:, : 4 * 256].cpu(),
++        _reference(codes, scales, ids, 3, 0, TABLE_ROWS, tp5_rank4),
++        rtol=0,
++        atol=0,
++        equal_nan=True,
++    )
++    assert torch.count_nonzero(out[:, 4 * 256 :]) == 0
++    assert row_kernel_calls(4 * HEADS, 0, TABLE_ROWS, tp5_rank4, out_cols=5)[1][1][-1] == 5
++    rows.close()
+ 
+ 
+ @pytest.mark.parametrize("columns", [0, 1 << HEADS])
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 75c02de7e..7d89283c9 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1138,12 +1138,12 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+         embed.close()
+ 
+ 
+-@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
++@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
+ def test_disk_shards_interleave_hash_columns(tp_size):
+-    """When the TP size divides the 24 hash columns, rank r reads every tp-th column
+-    from r: the ranks' columns tile all 24 once, and each rank holds heads of every
+-    n-gram order (heads 0-7 2-grams, 8-15 3-grams, 16-23 4-grams) as evenly as the
+-    split allows, so no rank reads only the longest n-grams' distinct rows."""
++    """For every TP size up to 24, rank r reads every tp-th column from r: the
++    ranks' columns tile all 24 once, and each rank holds heads of every n-gram order
++    (heads 0-7 2-grams, 8-15 3-grams, 16-23 4-grams) as evenly as the split allows,
++    so no rank reads only the longest n-grams' distinct rows."""
+     from vllm.models.deepseek_v4_1.common.engram import column_shard
+ 
+     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+@@ -1154,29 +1154,34 @@ def test_disk_shards_interleave_hash_columns(tp_size):
+             assert shard == tuple(range(rank, 24, tp_size))
+             orders = [sum(1 for c in shard if c // 8 == order) for order in range(3)]
+             assert max(orders) - min(orders) <= 1, (tp_size, rank, orders)
+-    assert column_shard(geometry, 0, 5, 0) is None  # 24 columns do not split five ways
++    assert column_shard(geometry, 0, 25, 0) is None
+ 
+ 
+-@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
++@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
+ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+     """Every rank's columns, all-gathered as 256-wide rows along the last dimension,
+-    are the column order exactly, with no copy after the collective."""
++    restore the 24-column order (with no copy when tp_size divides 24, and slicing
++    off the trailing padded columns when 24 % tp_size != 0)."""
+     import vllm.models.deepseek_v4_1.common.engram as engram_module
+ 
+     tokens = 5
++    max_cols = (24 + tp_size - 1) // tp_size
++    padded = torch.zeros(tokens, max_cols * tp_size * 256, dtype=torch.bfloat16)
+     full = torch.randn(tokens, 24 * 256).bfloat16()
++    padded[:, : 24 * 256] = full
+     locals_ = [
+-        full.view(tokens, 24 // tp_size, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
++        padded.view(tokens, max_cols, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
+         for r in range(tp_size)
+     ]
+     gathered = []
+ 
+     def all_gather(local, dim):
+-        assert local.shape == (tokens * 24 // tp_size, 256) and dim == -1
++        assert local.shape == (tokens * max_cols, 256) and dim == -1
+         gathered.append(torch.cat([part.view(-1, 256) for part in locals_], dim=dim))
+         return gathered[-1]
+ 
+     monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
+     rows = engram_module.interleaved_rows(locals_[0])
+     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+-    assert rows.data_ptr() == gathered[0].data_ptr()
++    if 24 % tp_size == 0:
++        assert rows.data_ptr() == gathered[0].data_ptr()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 45ca741de..b6086cb72 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -376,25 +376,28 @@ def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
+     0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams, and a longer n-gram repeats
+     less, so a step reads more distinct rows of it (1 : 1.35 : 1.54 on source text).
+     Interleaving gives every rank columns of each order (TP3: 3/3/2, 3/2/3, 2/3/3;
+-    TP4: 2/2/2), where contiguous columns gave one rank every 4-gram head and the
+-    slowest reads. A rank's gathered columns are joined by an all-gather and put back
+-    in column order (``interleaved_rows``). Requires a TP size that divides 24."""
++    TP4: 2/2/2; TP5: 2/2/1, 2/1/2, 1/2/2, 1/2/2, 2/1/1), where contiguous columns
++    gave one rank every 4-gram head and the slowest reads. A rank's gathered columns
++    are joined by an all-gather and put back in column order (``interleaved_rows``)."""
+     columns = len(geometry.offsets[layer_index])
+-    if columns % tp_size:
++    if tp_size <= 0 or tp_size > columns:
+         return None
+     return tuple(range(tp_rank, columns, tp_size))
+ 
+ 
+ def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
+     """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
+-    this rank's ``[T, (24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
++    this rank's ``[T, ceil(24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
+     side. All-gathered as 256-wide rows along the last dimension, rank r's k-th block
+     of token t lands at column k * tp + r of the token's row: the column order, with
+-    no copy before or after the collective (the one-shot all-gather writes the layout
+-    directly). Exact copies: the same values as one reader's rows."""
++    no copy before or after the collective when ``tp`` divides 24 (and a narrow slice
++    of the trailing padded columns when ``24 % tp != 0``)."""
+     tokens = local.shape[0]
+     gathered = tensor_model_parallel_all_gather(local.view(-1, 256), dim=-1)
+-    return gathered.view(tokens, 24 * 256)
++    rows = gathered.view(tokens, -1)
++    if rows.shape[1] == 24 * 256:
++        return rows
++    return rows[:, : 24 * 256].contiguous()
+ 
+ 
+ class ParallelEngramEmbedding(nn.Module):
+@@ -412,7 +415,11 @@ class ParallelEngramEmbedding(nn.Module):
+         # divides them, so the ranks' rows are joined by an all-gather of their
+         # columns, not summed (resident tables keep equal row shards).
+         self.columns = None
++        self.max_columns = 0
+         self.column_mask = (1 << 24) - 1
++        total_columns = len(
++            geometry.offsets[geometry.layer_ids.index(caps.layer_id)]
++        )
+         columns = (
+             column_shard(
+                 geometry,
+@@ -426,6 +433,7 @@ class ParallelEngramEmbedding(nn.Module):
+         if columns is not None:
+             self.shard_start, self.shard_end = 0, self.table_rows
+             self.columns = columns
++            self.max_columns = (total_columns + caps.tp_size - 1) // caps.tp_size
+             self.column_mask = sum(1 << column for column in columns)
+         self.weight_shape = (self.shard_rows, 256)
+         self.scale_shape = (self.shard_rows, 8)
+@@ -600,7 +608,7 @@ class ParallelEngramEmbedding(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+         from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
+ 
+-        calls = row_kernel_calls(**self._disk_shard())
++        calls = row_kernel_calls(**self._disk_shard(), out_cols=self.max_columns)
+         prepare.declare(lambda: calls)
+ 
+     def open_disk_rows(self) -> None:
+@@ -654,13 +662,14 @@ class ParallelEngramEmbedding(nn.Module):
+         """Wait for the staged step's rows and dequantize them into ``out``."""
+         self.disk_rows.gather(out, self.hashes, self.num_tokens)
+ 
+-    def lookup_native(self, indices, out):
++    def lookup_native(self, indices, out, *, clear_tail: bool = True):
+         if self.plan.prepared is None:
+             raise PreparationResourceUnavailableError(
+                 "Engram lookup plan must be prepared before forwarding"
+             )
+-        self.hashes[: indices.shape[0]].copy_(indices)
+-        self.num_tokens.fill_(indices.shape[0])
++        if indices.data_ptr() != self.hashes.data_ptr():
++            self.hashes[: indices.shape[0]].copy_(indices)
++            self.num_tokens.fill_(indices.shape[0])
+         binding = native.bind_lookup(
+             self.plan,
+             weight=self.weight,
+@@ -672,10 +681,10 @@ class ParallelEngramEmbedding(nn.Module):
+         retain_cuda_graph_capture_resource(binding)
+         if self.mapped_host_nbytes:
+             retain_cuda_graph_capture_resource(self)
+-        native.run_lookup(binding)
++        native.run_lookup(binding, indices.shape[0], clear_tail=clear_tail)
+ 
+-    def lookup(self, indices, out):
+-        self.lookup_native(indices, out)
++    def lookup(self, indices, out, *, clear_tail: bool = True):
++        self.lookup_native(indices, out, clear_tail=clear_tail)
+ 
+ 
+ class Engram(nn.Module):
+@@ -739,9 +748,12 @@ class Engram(nn.Module):
+         # gather and immediately project within their own forward, so they share one
+         # staged_rows buffer across layers on the layout.
+         columns = self.embed_tokens.columns
++        max_columns = self.embed_tokens.max_columns or (
++            len(columns) if columns is not None else 0
++        )
+         staged_rows_shape = (
+             caps.max_tokens,
+-            6144 if columns is None else len(columns) * 256,
++            6144 if columns is None else max_columns * 256,
+         )
+         shared_staged_rows = (
+             getattr(layout, "_shared_disk_staged_rows", None)
+@@ -878,7 +890,7 @@ class Engram(nn.Module):
+         self._disk_prepared = True
+ 
+     def prepare_embeddings(self, hash_ids):
+-        self.embed_tokens.lookup(hash_ids, self.staged_rows)
++        self.embed_tokens.lookup(hash_ids, self.staged_rows, clear_tail=False)
+ 
+     def invalidate_disk_output(self, *, clear=False):
+         self._disk_prepared = False
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 3e74ff9e7..70ada8fca 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -569,7 +569,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             self.engram_layout is not None
+             and self.engram_layout.table_memory in ("ram", "disk")
+         )
+-        if self.disk_engram:
++        if self.disk_engram or self.engram_hash is not None:
+             self.register_engram_hashes()
+ 
+         if get_pp_group().is_last_rank:
+@@ -836,11 +836,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 query_start_loc[1] = input_ids.shape[0]
+                 lookback_token_ids = input_ids.new_full((1, 3), -1)
+             engram_mask = input_ids
+-            engram_hashes = self.engram_hash(
++            engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
++            self.engram_hash.run_native(
+                 input_ids,
+-                positions,
+                 query_start_loc,
+                 lookback_token_ids,
++                engram_hashes,
+             )
+             for layer in islice(self.layers, self.start_layer, self.end_layer):
+                 engram = getattr(layer, "engram", None)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 8edf00d69..3b6fbf037 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -176,11 +176,14 @@ def engram_rows_gather_kernel(
+     shard_start: int,
+     shard_end: int,
+     columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
+     threads: int = 64,
+     vec: int = 4,
+ ):
+     assert threads * vec == ROW and 32 % vec == 0
+     first, step, count = column_span(columns)
++    stride_cols = out_cols or count
++    assert stride_cols >= count
+     tokens = T.dynamic("tokens")
+ 
+     @T.prim_func
+@@ -189,7 +192,7 @@ def engram_rows_gather_kernel(
+         num_tokens: T.Tensor((1,), T.int32),
+         rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
+         scales: T.Tensor((max_lookups, SCALES), T.uint8),
+-        out: T.Tensor((tokens, count * ROW), T.bfloat16),
++        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
+     ):
+         with T.Kernel(count, tokens, threads=threads) as (column, t):
+             tx = T.get_thread_binding()
+@@ -215,15 +218,26 @@ def engram_rows_gather_kernel(
+ 
+ 
+ def row_kernel_calls(
+-    max_lookups: int, shard_start: int, shard_end: int, columns: int
++    max_lookups: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int,
++    out_cols: int = 0,
+ ) -> list[prepare.TileLangCall]:
+     """The kernel calls ``engram_rows_gather`` makes for a reader of ``max_lookups``
+     rows a step (``rows.shape[0]``) and the rank's rows ``[shard_start, shard_end)``
+     of the hash columns in the mask ``columns``."""
++    _, _, count = column_span(columns)
++    extra = (out_cols,) if out_cols and out_cols != count else ()
+     return [
+         prepare.call(engram_rows_wait_kernel),
+         prepare.call(
+-            engram_rows_gather_kernel, max_lookups, shard_start, shard_end, columns
++            engram_rows_gather_kernel,
++            max_lookups,
++            shard_start,
++            shard_end,
++            columns,
++            *extra,
+         ),
+         prepare.call(engram_rows_release_kernel),
+     ]
+@@ -249,8 +263,11 @@ def engram_rows_gather(
+     engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+     if tokens:
++        _, _, count = column_span(columns)
++        stride_cols = out.shape[1] // ROW
++        extra = (stride_cols,) if stride_cols != count else ()
+         kernel = engram_rows_gather_kernel(
+-            rows.shape[0], shard_start, shard_end, columns
++            rows.shape[0], shard_start, shard_end, columns, *extra
+         )
+         kernel(ids[:tokens], num_tokens, rows, scales, out)
+     engram_rows_release_kernel()(control)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 8dbc1fecc..414922944 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1233,7 +1233,12 @@ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
+ }
+ 
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+-    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
++    # Attention: Q-B (TP3, TP4..7, TP8 / indexer Q-B) and fused Q-A/KV.
++    (12288, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=64, block_K=128, num_stages=3),
++        64: dict(block_N=64, block_K=128, num_stages=2),
++    },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
+@@ -1249,46 +1254,130 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         32: dict(block_N=64, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+-    # TP4 shared expert: gate/up and down.
++    # Shared expert gate/up (TP3, TP4, TP5, TP6/TP7, TP8).
++    (1536, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=128, num_stages=2),
++    },
+     (1152, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
++    (1024, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++    (768, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=32, block_K=256, num_stages=2),
++    },
++    (640, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=32, block_K=256, num_stages=2),
++    },
++    # Shared expert down (TP3, TP4, TP5, TP6/TP7, TP8).
++    (5120, 768): {
++        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
++        32: dict(block_N=128, block_K=64, num_stages=2),
++        64: dict(block_N=64, block_K=64, num_stages=2),
++    },
+     (5120, 576): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+-    # TP4 attention output: the grouped WO-A (2 groups) and WO-B (window 3's WO
+-    # sweep, ranked against the default tile; WO-B keeps it from 32 rows).
++    (5120, 512): {
++        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
++        32: dict(block_N=128, block_K=64, num_stages=2),
++        64: dict(block_N=64, block_K=64, num_stages=2),
++    },
++    (5120, 384): {
++        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
++        32: dict(block_N=128, block_K=64, num_stages=2),
++        64: dict(block_N=64, block_K=64, num_stages=2),
++    },
++    (5120, 320): {
++        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
++        32: dict(block_N=128, block_K=64, num_stages=2),
++        64: dict(block_N=64, block_K=64, num_stages=2),
++    },
++    # Attention output: grouped WO-A (TP3 3 groups, TP4..7 2 groups, TP8 1 group)
++    # and WO-B (TP3, TP4..7, TP8).
++    (1024, 4096, 3): {
++        16: dict(block_N=64, block_K=128, num_stages=4),
++        32: dict(block_N=64, block_K=128, num_stages=4),
++        64: dict(block_N=64, block_K=128, num_stages=2),
++    },
+     (1024, 4096, 2): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
++    (1024, 4096): {
++        16: dict(block_N=32, block_K=128, num_stages=4),
++        32: dict(block_N=32, block_K=128, num_stages=4),
++        64: dict(block_N=32, block_K=256, num_stages=2),
++    },
++    (5120, 3072): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
++        96: dict(block_N=64, block_K=128, num_stages=2),
++    },
+     (5120, 2048): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
+         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
+         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+     },
+-    # DSpark main projection (replicated, TP4 shard, and TP3 padded shard).
++    (5120, 1024): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
++        96: dict(block_N=64, block_K=128, num_stages=2),
++    },
++    # DSpark main projection (replicated and TP3..TP8 shards).
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
++    (1728, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++    },
+     (1280, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+-    (1728, 15360): {
++    (1024, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+-        32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+-        64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++    },
++    (896, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=32, block_K=256, num_stages=4, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++    },
++    (768, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++    },
++    (640, 15360): {
++        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+ }
+ 
+@@ -1363,9 +1452,19 @@ def split_row_tile(rows: int) -> int:
+ # projection run faster on their prefill tiles.
+ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+     (1792, 5120): {96: 32, 128: 64},
++    (1536, 5120): {128: 64},
+     (1152, 5120): {128: 64},
++    (1024, 5120): {128: 64},
++    (768, 5120): {128: 64},
++    (640, 5120): {128: 64},
++    (5120, 768): {96: 32},
+     (5120, 576): {96: 32},
++    (5120, 512): {96: 32},
++    (5120, 384): {96: 32},
++    (5120, 320): {96: 32},
++    (5120, 3072): {96: 96},
+     (5120, 2048): {96: 96},
++    (5120, 1024): {96: 96},
+ }
+ 
+ # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
