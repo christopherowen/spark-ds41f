@@ -20,6 +20,7 @@ doctor refuses them.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 from pathlib import Path
 from types import ModuleType
@@ -35,6 +36,7 @@ VLLM_RING_ENV = {
 }
 # Node-map fields for this repository's access to a node, not the fabric.
 SITE_FIELDS = ("transfer_host",)
+GID_PINS = ("NCCL_IB_GID_INDEX", "SPARKNET_ROCE_GID_INDEX")
 
 
 def transport(cluster: dict) -> str | None:
@@ -86,20 +88,49 @@ def fabric(cluster: dict) -> ModuleType:
     return sparknet_topology.package(json.loads(path.read_text()))
 
 
-def fabric_node(node: dict) -> dict:
-    return {key: value for key, value in node.items() if key not in (*SITE_FIELDS, "ssh_host")}
+def gid_pinned(cluster: dict) -> bool:
+    """Whether the configuration pins a RoCE GID slot instead of finding GIDs by address."""
+    env = cluster.get("environment", {})
+    return any(env.get(key) for key in GID_PINS)
 
 
-def fabric_map(nodes: dict) -> dict:
-    return {**nodes, "nodes": [fabric_node(node) for node in nodes.get("nodes", [])]}
+def fabric_node(node: dict, *, strip_gid_index: bool = False) -> dict:
+    excluded = (*SITE_FIELDS, "ssh_host", *(("roce_gid_index",) if strip_gid_index else ()))
+    return {key: value for key, value in node.items() if key not in excluded}
+
+
+def fabric_map(nodes: dict, *, strip_gid_index: bool = False) -> dict:
+    return {**nodes, "nodes": [fabric_node(node, strip_gid_index=strip_gid_index) for node in nodes.get("nodes", [])]}
 
 
 def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     base = {key: str(value) for key, value in cluster["environment"].items()}
     mode = transport(cluster)
     if mode in TRANSPORTS:
-        env = fabric(cluster).render.node_environment({"nodes": [fabric_node(node)]}, fabric_node(node),
-                                                      transport=mode, base=base)
+        sparknet = fabric(cluster)
+        pinned = gid_pinned(cluster)
+        clean_node = fabric_node(node, strip_gid_index=True)
+        clean_base = {k: v for k, v in base.items() if k not in GID_PINS} if not pinned else base
+        env = sparknet.render.node_environment({"nodes": [clean_node]}, clean_node,
+                                               transport=mode, base=clean_base)
+        if pinned:
+            env.pop("SPARKNET_ROCE_SUBNETS", None)
+            for key in GID_PINS:
+                if key in base:
+                    env[key] = base[key]
+            if "roce_gid_index" in node:
+                env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
+                if is_sparknet(mode):
+                    env["SPARKNET_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
+            elif not is_sparknet(mode):
+                env.pop("SPARKNET_ROCE_GID_INDEX", None)
+        elif is_sparknet(mode) and "SPARKNET_ROCE_SUBNETS" not in env:
+            # Each one-shot HCA's cable subnet, in which sparknet finds the HCA's GID.
+            routed = sorted(hcas(cluster, node))
+            declared = node.get("roce_subnets", {})
+            subnets = {h: declared[h] for h in routed if h in declared}
+            if subnets:
+                env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
     else:
         env = base
     env["VLLM_HOST_IP"] = node["management_ip"]
@@ -116,12 +147,22 @@ def hcas(cluster: dict, node: dict) -> list[str]:
 def problems(cluster: dict, nodes: dict) -> list[str]:
     errors = []
     entries = nodes.get("nodes", [])
+    pinned = gid_pinned(cluster)
     for node in entries:
         if "ssh_host" in node:
             errors.append(
                 f"{node.get('name')}: ssh_host is no longer used because name is now the SSH "
                 "target; either rename the node to its SSH target or add an SSH Host alias"
             )
+        if "roce_gid_index" in node:
+            if not pinned:
+                errors.append(
+                    f"{node.get('name')}: roce_gid_index is not read by a configuration that finds GIDs by "
+                    "address (NCCL and sparknet take each HCA's IPv4 RoCE v2 GID in its roce_subnets network); "
+                    "delete the field"
+                )
+            elif type(node["roce_gid_index"]) is not int or node["roce_gid_index"] < 0:
+                errors.append(f"{node.get('name')}: roce_gid_index must be a nonnegative integer")
     count = len(entries)
     mode = transport(cluster)
     if switched(mode):
@@ -137,10 +178,11 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
         errors.append(f"unknown fabric transport {mode!r}")
     else:
         sparknet = fabric(cluster)
-        errors.extend(sparknet.nodes.problems(fabric_map(nodes), mode))
-        errors.extend(sparknet.render.environment_problems(settings, mode, count))
+        errors.extend(sparknet.nodes.problems(fabric_map(nodes, strip_gid_index=True), mode))
+        check_settings = {k: v for k, v in settings.items() if k not in GID_PINS} if pinned else settings
+        errors.extend(sparknet.render.environment_problems(check_settings, mode, count))
         if hasattr(sparknet.render, "base_problems"):
-            errors.extend(sparknet.render.base_problems(settings))
+            errors.extend(sparknet.render.base_problems(check_settings))
     heads = [n for n in entries if n.get("head")]
     if len(heads) == 1 and cluster.get("distributed", {}).get("master_addr") != heads[0].get("management_ip"):
         errors.append("distributed.master_addr must match the API head's management_ip")
@@ -190,9 +232,64 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     return errors
 
 
-def gid_subnet_problems(cluster: dict, node: dict, index: int, output: str) -> list[str]:
-    """Compare the map's subnets with the live RoCE GIDs at ``index``."""
-    return fabric(cluster).nodes.gid_subnet_problems(fabric_node(node), index, output)
+def ipv4_roce_v2_gids(output: str) -> dict[str, list[tuple[int, ipaddress.IPv4Address]]]:
+    """Each HCA's IPv4 RoCE v2 GIDs, (index, address) by index, from ``hca index type gid ndev`` lines."""
+    found: dict[str, list[tuple[int, ipaddress.IPv4Address]]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[1].isdigit():
+            continue
+        found.setdefault(fields[0], [])
+        if fields[2] != "RoCEv2":
+            continue
+        try:
+            address = ipaddress.IPv6Address(fields[3]).ipv4_mapped
+        except ipaddress.AddressValueError:
+            continue
+        if address is not None:
+            found[fields[0]].append((int(fields[1]), address))
+    return {hca: sorted(gids) for hca, gids in found.items()}
+
+
+def gid_subnet_problems(*args: object) -> list[str]:
+    """Each cable HCA's port must carry exactly one IPv4 RoCE v2 GID, in its cable's subnet, at any index.
+
+    sparknet needs one in the subnet. NCCL scans without a per-port range and
+    takes the lowest-index IPv4 RoCE v2 GID, so a second one on the port could
+    become NCCL's source address.
+    """
+    if len(args) == 2:
+        node, output = args  # type: ignore[misc]
+    elif len(args) == 3 and isinstance(args[1], dict):
+        _, node, output = args  # type: ignore[misc]
+    elif len(args) == 3 and isinstance(args[0], dict):
+        node, _, output = args  # type: ignore[misc]
+    elif len(args) == 4:
+        _, node, _, output = args  # type: ignore[misc]
+    else:
+        raise TypeError(f"gid_subnet_problems expects (node, output), got {len(args)} arguments")
+    assert isinstance(node, dict) and isinstance(output, str)
+    gids = ipv4_roce_v2_gids(output)
+    missing = {line.split()[0] for line in output.splitlines() if line.split()[1:] == ["missing"]}
+    errors = []
+    for hca, subnet in node.get("roce_subnets", {}).items():
+        if hca in missing:
+            continue  # reported with the devices
+        network = ipaddress.IPv4Network(subnet)
+        present = gids.get(hca, [])
+        inside = [(i, a) for i, a in present if a in network]
+        outside = ", ".join(f"{a} at index {i}" for i, a in present if a not in network)
+        label = f"{node['name']}: {hca}"
+        if not inside:
+            errors.append(f"{label} has no IPv4 RoCE v2 GID in its cable subnet {subnet}"
+                          + (f" (it has {outside})" if outside else "") + "; check the link's address and cable")
+        elif len(inside) > 1:
+            errors.append(f"{label} has {len(inside)} IPv4 RoCE v2 GIDs in {subnet} (indices "
+                          f"{', '.join(str(i) for i, _ in inside)}); its port needs one address there")
+        elif outside:
+            errors.append(f"{label} also has an IPv4 RoCE v2 GID outside {subnet} ({outside}); NCCL takes the "
+                          "lowest-index one, so give the port only its cable's address")
+    return errors
 
 
 def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:

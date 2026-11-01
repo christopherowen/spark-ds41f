@@ -88,7 +88,7 @@ Do the stages in order on every node, and keep the nodes identical:
 | --- | --- | --- |
 | 1 | [Host baseline](#1-host-baseline) | `scripts/host-recovery check` on each node |
 | 2 | [64 KiB kernel and memory saver](#2-kernel-64-kib-profiles) (skip for the 4 KiB profile) | `getconf PAGESIZE` is 65536; packing is `Y` |
-| 3 | [Fabric](#3-fabric-cabling-and-addressing) | 9000-byte pings on every path; GID index 3 is IPv4 |
+| 3 | [Fabric](#3-fabric-cabling-and-addressing) | 9000-byte pings on every path; one IPv4 RoCE v2 GID per port |
 | 4 | [Site configuration](#4-site-configuration) | `bin/spark doctor` |
 | 5 | [Model](#5-model) | the pinned revision on every node |
 | 6 | [Image](#6-image) | the same image (its layers) on every node |
@@ -407,9 +407,19 @@ From each node, a 9000-byte ping reaches both ends of every cable path:
 ping -c2 -M do -s 8972 10.12.1.2
 ```
 
-and each RoCE device's GID index 3 holds its IPv4 address
-(`cat /sys/class/infiniband/<device>/ports/1/gids/3` ends in the address in
-hex). `doctor --live` and the launch preflight check both.
+and each RoCE device's port carries exactly one IPv4 RoCE v2 GID, its cable
+address (`ibv_devinfo -v -d <device> | grep 'GID\['` lists one `::ffff:<address>,
+RoCE v2` line). With the netplan above it sits at index 3. `doctor --live` and the
+launch preflight check both.
+
+The index can move. The kernel files a re-added address in the next free slot,
+and a slot that running RDMA resources still reference is not free: when a node
+reboots under its neighbours' ranks, their ports facing it come back with the GID
+at index 4 and index 3 empty. NCCL with `NCCL_IB_GID_INDEX` unset and sparknet
+0.5.0 find the GID by address (sparknet in each HCA's cable subnet, which
+`roce_subnets` gives it), so a configuration that pins no slot starts again as
+it is. A configuration that pins one needs the slot back: stop the cluster, then
+`sudo nmcli connection up <connection>` for each moved port.
 
 Revert: remove (or restore) the netplan file and `sudo netplan apply`.
 Switching between a triangle and a ring is a recabling plus new addressing for

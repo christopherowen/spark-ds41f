@@ -68,8 +68,11 @@ For each node:
 - `roce_subnets` records the IPv4 `/24` network for each local HCA. Each
   cable/stripe has its own subnet, present at exactly its two endpoints.
   Two PCIe-root interfaces on one cable use two separate subnets.
-- `roce_gid_index`, when supplied, selects that node's IPv4 RoCEv2 GID slot
-  for both sparknet and NCCL. It may differ between nodes.
+- No GID slot is needed. NCCL with `NCCL_IB_GID_INDEX` unset and sparknet
+  0.5.0 take each HCA's one IPv4 RoCE v2 GID in its `roce_subnets` network,
+  wherever the kernel filed it (`cluster start` renders the subnets as
+  `SPARKNET_ROCE_SUBNETS`). A configuration that pins a slot may move one
+  node's slot with `roce_gid_index`; elsewhere the field is refused.
 
 Create a complete candidate from a base profile:
 
@@ -95,7 +98,8 @@ The generator updates target TP, draft TP and `--nnodes` together. For four
 nodes it selects `fabric.transport=nccl-ring` and the required transport policy
 from `scripts/topology.py`, and drops the base's `SPARKNET_ROCE_*` settings. `doctor` rejects contradictory settings, non-neighbour
 routes, duplicate ranks, asymmetric links and ambiguous subnets. Live doctor
-and launch preflight also compare each selected GID with its declared subnet.
+and launch preflight also check that each port carries exactly one IPv4 RoCE v2
+GID, in its declared subnet, and that any pinned slot holds it.
 These checks report configuration/address mismatches; they do not prove that a
 cable actually delivers RDMA packets. The collective probe checks communication.
 

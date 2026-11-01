@@ -510,6 +510,10 @@ class RoceGidTest(unittest.TestCase):
         self.assertIn("GID index 1 is RoCEv2 fe80", problems[0])
         self.assertIn("at index 3", problems[0])
 
+    def test_the_fixing_settings_are_named(self) -> None:
+        problems = spark.roce_gid_problems("dgx3", 3, ["rocep1s0f0"], SHIFTED_GIDS, ["SPARKNET_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX"])
+        self.assertIn("rocep1s0f0 GID index 3 (fixed by SPARKNET_ROCE_GID_INDEX, NCCL_IB_GID_INDEX) is empty", problems[0])
+
     def test_missing_device_and_missing_ipv4_are_reported(self) -> None:
         output = "rocep1s0f1 missing\nrocep1s0f0 1 RoCEv2 fe80:0000:0000:0000:4ebb:47ff:fee9:7f2b enp1s0f0np0\n"
         problems = spark.roce_gid_problems("dgx2", 3, ["rocep1s0f0", "rocep1s0f1"], output)

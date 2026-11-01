@@ -53,7 +53,7 @@ repository. Every one is an error unless marked **warn**.
 | Memory guards | a guard value is missing or not positive; the startup guard is not larger than the steady guard; `host.memguard_warn_gib` is not a non-negative integer, or is not 0 and not larger than the steady guard |
 | Deployment | `repository`, `path`, `ready_url` or `ready_timeout_seconds` is empty; `launch_enabled` is not true or false |
 | Sources | a revision is not a full commit SHA; a tracking ref or upstream is missing; a patch series or patch file is missing; a patch set's fingerprint differs from the source manifest; TileLang is listed without TileKernels (or the reverse) |
-| Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet |
+| Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet; a sparknet configuration that pins no GID slot runs on a sparknet before 0.5.0 |
 | GLP steering | a `glp` field is malformed: `repo` is not `<owner>/<name>`, `revision` not a full commit SHA, `file` not a `.gguf` name, `sha256` not 64 hex digits; `glp.served_model_name` is not served exactly once after the first `--served-model-name` (the first is the stock model every tool and probe uses); `WEIGHTLESS_STEER_*` is set without a `glp` block |
 | Secrets | a tracked file is named `.env`, `id_rsa`, `id_ed25519` or `credentials.json`, or ends in `.pem`, `.key`, `.local.env` or `.local.json` |
 | Watchlist | **warn**: `docs/inspiration.md` is missing, or a watched reference is absent from it |
@@ -115,11 +115,14 @@ with one another.
 | Check | Severity | Fix |
 | --- | --- | --- |
 | Every RDMA device in `roce_peer_hcas` exists | error | check cabling and `rdma link` |
-| The configured GID index (3 by default) holds the device's IPv4 RoCE v2 address | error | if the GID moved to another slot, re-activate the interface with `nmcli` while nothing uses RDMA |
-| That address is in the cable's `roce_subnets` network | error | check the interface address and the cable it is on |
+| Each device's port carries exactly one IPv4 RoCE v2 GID, in its cable's `roce_subnets` network, at any index (and none outside it, which NCCL could take instead) | error | check the interface address and the cable it is on |
+| Any GID slot a library is still fixed to (`NCCL_IB_GID_INDEX`, an earlier sparknet's `SPARKNET_ROCE_GID_INDEX`) holds that IPv4 RoCE v2 GID | error | if the GID moved to another slot, re-activate the interface with `nmcli` while nothing uses RDMA |
 
-A GID moves when a link flaps while RDMA resources still hold the old entry;
-NCCL then fails with an unhandled system error.
+The kernel files a re-added address in the next free slot, so a link flap while
+RDMA resources still hold the old entry moves the IPv4 RoCE v2 GID (from 3 to 4
+on dgx2 and dgx4 when dgx1 rebooted under a starting service). NCCL with
+`NCCL_IB_GID_INDEX` unset and sparknet 0.5.0 find the GID by address; a library
+fixed to the old slot fails (NCCL with an unhandled system error).
 
 ### Service
 
@@ -173,7 +176,7 @@ a start cannot survive, on every node, and refuses to launch on any failure:
 - each node's checkout is at the same commit, clean, and its `origin` is the
   deployment repository;
 - the profile's kernel requirements (above);
-- the RDMA devices, GID index and cable subnets (above). On more than one node,
+- the RDMA devices, their GIDs, any pinned GID slot and the cable subnets (above). On more than one node,
   every RoCE interface the profile uses needs its `roce_subnets` entry: without
   it the start could not tell a triangle from a ring;
 - `bin/spark doctor` passes on the node itself;

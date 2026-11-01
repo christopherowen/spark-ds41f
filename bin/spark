@@ -700,6 +700,12 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "sparknet.tree")
             if label != source_manifest["sparknet"]["expected_tree"]:
                 problems.append("sparknet image tree does not match its source manifest")
+            # Before 0.5.0 sparknet reads one GID slot (3 when none is set), so a
+            # configuration that pins none must run one that finds GIDs by address.
+            version = upstreams["sources"]["sparknet"].get("version") or "0"
+            if not topology.gid_pinned(cluster) and tuple(int(p) for p in version.split(".")) < (0, 5, 0):
+                problems.append(f"a configuration that pins no GID slot needs sparknet 0.5.0 or later, which finds "
+                                f"each HCA's GID by address; the lock's sparknet is {version}")
     problems.extend(source_identifier_problems(upstreams, source_manifest))
     for relative, wanted in source_manifest.get("deployment_artifacts", {}).items():
         candidate = ROOT / relative
@@ -1242,12 +1248,38 @@ def fan_control_problems(node_name: str, facts: dict[str, str],
     return []
 
 
+def roce_hcas(cluster_or_node: dict, node: dict | None = None) -> list[str]:
+    """The node's cable HCAs."""
+    if node is None:
+        target = cluster_or_node
+        if "roce_hcas" in target and "roce_peer_hcas" not in target:
+            return sorted(target["roce_hcas"])
+        return sorted({hca for peers in target.get("roce_peer_hcas", {}).values() for hca in peers})
+    return sorted(topology.hcas(cluster_or_node, node))
+
+
 def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
     """The GID index sparknet and NCCL are configured to use, and the node's HCAs."""
     env = expected_environment(cluster, node)
     key = "SPARKNET_ROCE_GID_INDEX" if topology.is_sparknet(topology.transport(cluster)) else "NCCL_IB_GID_INDEX"
     index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
     return index, sorted(topology.hcas(cluster, node))
+
+
+def roce_gid_pins(cluster: dict, node: dict) -> dict[int, list[str]]:
+    """GID slots a library of this configuration is fixed to, and the settings that fix each.
+
+    Empty when the configuration finds GIDs by address (``topology.gid_pinned``):
+    NCCL with NCCL_IB_GID_INDEX unset and sparknet 0.5.0. A configuration of an
+    earlier sparknet pins NCCL_IB_GID_INDEX and SPARKNET_ROCE_GID_INDEX, per node
+    through ``roce_gid_index``.
+    """
+    env = expected_environment(cluster, node)
+    pins: dict[int, list[str]] = {}
+    for key in ("SPARKNET_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX"):
+        if env.get(key):
+            pins.setdefault(int(env[key]), []).append(key)
+    return pins
 
 
 def roce_gid_query(hcas: list[str]) -> str:
@@ -1262,14 +1294,33 @@ def roce_gid_query(hcas: list[str]) -> str:
     )
 
 
-def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str) -> list[str]:
-    """Problems when an HCA's configured GID slot is not its IPv4 RoCE v2 address.
+def roce_gid_findings(cluster: dict, node: dict, output: str,
+                      hcas: list[str] | None = None) -> list[str]:
+    """The node's RoCE GIDs (``roce_gid_query`` output) against what its libraries will select.
 
-    sparknet and NCCL both use one fixed GID index. The kernel files a re-added
-    address in the lowest free slot, so a link flap while RDMA resources still
-    hold the old entry moves the IPv4 RoCE v2 GID (dgx3 moved from 3 to 4 when
-    its peers rebooted under a starting service), and NCCL then fails with an
-    unhandled system error.
+    Every cable HCA must carry exactly one IPv4 RoCE v2 GID, in its cable's
+    subnet, at any index; a slot a library is still fixed to must hold it.
+    """
+    if hcas is None:
+        hcas = roce_hcas(cluster, node)
+    missing = {line.split()[0] for line in output.splitlines() if line.split()[1:] == ["missing"]}
+    problems = [f"{node['name']}: RDMA device {hca} is missing" for hca in hcas if hca in missing]
+    problems += topology.gid_subnet_problems(node, output)
+    for index, settings in sorted(roce_gid_pins(cluster, node).items()):
+        problems += roce_gid_problems(node["name"], index, [h for h in hcas if h not in missing], output, settings)
+    return problems
+
+
+def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str,
+                      pinned_by: list[str] | None = None) -> list[str]:
+    """Problems when an HCA's fixed GID slot is not its IPv4 RoCE v2 address.
+
+    Only a library fixed to one slot needs this (``roce_gid_pins``). The kernel
+    files a re-added address in the lowest free slot, so a link flap while RDMA
+    resources still hold the old entry moves the IPv4 RoCE v2 GID (dgx3 moved
+    from 3 to 4 when its peers rebooted under a starting service), and a
+    library fixed to the old slot then fails (NCCL with an unhandled system
+    error).
     """
     slots: dict[str, dict[int, tuple[str, str, str]]] = {hca: {} for hca in hcas}
     for line in output.splitlines():
@@ -1297,8 +1348,9 @@ def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str) 
             "with nmcli while nothing uses RDMA"
             if found else "it has no IPv4 RoCE v2 GID"
         )
+        pinned = f" (fixed by {', '.join(pinned_by)})" if pinned_by else ""
         problems.append(
-            f"{node_name}: {hca} GID index {index} is "
+            f"{node_name}: {hca} GID index {index}{pinned} is "
             f"{kind + ' ' + gid if kind else 'empty'}; {where}"
         )
     return problems
@@ -1458,10 +1510,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(wireless_warnings(node["name"], facts))
         problems.extend(fan_control_problems(
             node["name"], facts, fan_control=fan_control_enabled(cluster)))
-        gid_index, hcas = roce_gid_setting(cluster, node)
+        _, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
-        problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
-        problems.extend(topology.gid_subnet_problems(cluster, node, gid_index, gids.stdout))
+        problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
         problems.extend(node_glp_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
@@ -2097,10 +2148,9 @@ def node_runtime_problems(
                 node["name"], inventory, cluster["host"]["kernel"], policy
             )
         )
-    gid_index, hcas = roce_gid_setting(cluster, node)
+    _, hcas = roce_gid_setting(cluster, node)
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
-    problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
-    problems.extend(topology.gid_subnet_problems(cluster, node, gid_index, gids.stdout))
+    problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
     problems.extend(unrecorded_subnet_problems(nodes, node, hcas))
     doctor = run_ssh(
         nodes,
