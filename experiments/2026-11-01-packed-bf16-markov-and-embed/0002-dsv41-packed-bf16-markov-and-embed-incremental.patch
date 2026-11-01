@@ -1,0 +1,1083 @@
+From a1d9bcc89beddb2722715a59523a5a172b785fad Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:11:34 +0100
+Subject: [PATCH] feat(ds41-tilelang): 12-bit packed BF16 Markov W2 projection
+ and token embedding lookup
+
+---
+ .../test_deepseek_v41_tilelang_vocab.py       |  51 +++
+ .../test_deepseek_v41_tilelang_embedding.py   |  73 ++++
+ .../test_dspark_v41_gathered_markov.py        |  42 ++
+ .../layers/vocab_parallel_embedding.py        |   6 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  53 ++-
+ .../deepseek_v4_1/tilelang/embedding.py       | 378 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   | 267 ++++++++++++-
+ 7 files changed, 850 insertions(+), 20 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 04dd18b7b..e24a77837 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -391,3 +391,54 @@ def test_packed_bf16_lm_head_method_tilelang_without_b12x(monkeypatch):
+         method.declare_layer_kernels(layer)
+         x = (torch.randn(9, 512, device=DEVICE) * 0.5).bfloat16()
+         assert _close_to_fp32(project_head(layer, x), x, original)
++
++
++@pytest.mark.parametrize("n", [32320, 43092])
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
++def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_dtype):
++    from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
++        greedy_markov_shard_pair,
++        scratch_shape,
++    )
++
++    k = 256
++    weight = _head(n, k, seed=n + 303)
++    weight[100] = weight[5]
++    weight[500] = weight[5]
++    layer = _packed_layer(weight)
++    layer.tilelang_max_rows = 64
++    layer.tilelang_markov_head = True
++    prepare_packed_head(layer, out_dtype)
++    assert hasattr(layer, "tilelang_vocab_markov_greedy")
++    generator = torch.Generator(device=DEVICE).manual_seed(n + 404)
++    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
++    base_3d = torch.randn(
++        64, 5, n, generator=generator, device=DEVICE, dtype=out_dtype
++    )
++    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
++        for rows in (1, 5, 16, 17, 33, 64):
++            part = x[:rows].contiguous()
++            base_step = base_3d[:rows, 2]
++            bias = project_head(layer, part)
++            expected = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
++            shape = scratch_shape(rows, vocab)
++            values = torch.empty(shape, dtype=torch.float32, device=DEVICE)
++            indices = torch.empty(shape, dtype=torch.int32, device=DEVICE)
++            greedy_markov_shard_pair(
++                base_step[:, :vocab],
++                bias[:, :vocab],
++                vocab_start,
++                expected,
++                values,
++                indices,
++            )
++            actual = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
++            project_head_markov_greedy_pairs(
++                layer,
++                part,
++                base_step,
++                vocab=vocab,
++                vocab_start=vocab_start,
++                out=actual,
++            )
++            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab, out_dtype)
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_embedding.py b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+index 6ab906e27..417b66561 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_embedding.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+@@ -226,3 +226,76 @@ def test_declared_as_the_lookup_calls_it():
+         for d in ("int32", "int64")
+         for p in (1, full)
+     ]
++
++
++def _embedding_table_with_exceptions(rows: int, width: int, seed: int) -> torch.Tensor:
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    weight = (torch.randn(rows, width, generator=generator, device="cuda") * 0.02).bfloat16()
++    flat = weight.view(-1)
++    picks = torch.randint(0, flat.numel(), (128,), generator=generator, device="cuda")
++    flat[picks[:48]] = 300.0
++    flat[picks[48:96]] = -1.5e-7
++    flat[picks[96:]] = 0.0
++    return weight
++
++
++@pytest.mark.parametrize("tp,rank", [(4, 0), (4, 3), (3, 2)])
++@pytest.mark.parametrize("tokens", [1, 6, 80, 1024])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++def test_packed_embedding_bit_identical_to_the_cuda_kernel(tp, rank, tokens, id_dtype):
++    """After ``process_weights_after_loading`` packs the BF16 shard into 12 bits per
++    weight (with out-of-window exceptions), ``TileLangEmbeddingMethod`` produces the
++    exact same bits as ``ops.vocab_parallel_embedding`` on the unpacked BF16 shard."""
++    shard, rows = _shard_indices(VOCAB, VOCAB, rank, tp)
++    original = _embedding_table_with_exceptions(rows, HIDDEN, seed=tp * 100 + rank)
++    ids = _ids(tokens, VOCAB, id_dtype, seed=tokens + 17)
++    ends = torch.tensor(
++        [shard.org_vocab_start_index, shard.org_vocab_end_index - 1], dtype=id_dtype
++    )[:tokens]
++    ids[: ends.numel()] = ends
++    want = _cuda(ids, original, shard)
++
++    layer = torch.nn.Module()
++    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
++    layer.shard_indices = shard
++    method = embedding.TileLangEmbeddingMethod()
++    method.process_weights_after_loading(layer)
++    assert layer.weight.dtype == torch.uint8
++    assert layer.weight.shape == (rows, HIDDEN + HIDDEN // 2)
++    assert layer.packed_bf16_exceptions > 0
++
++    got = method.parallel_embedding(layer, ids)
++    assert got.dtype == want.dtype and got.shape == want.shape
++    assert torch.equal(_bits(got), _bits(want))
++
++
++def test_packed_embedding_declaration_and_tp1_embedding():
++    """Declared kernels for a packed embedding layer match ``vocab_embedding_packed``
++    and ``method.embedding`` handles arbitrary input shapes."""
++    shard, rows = _shard_indices(2048, 2048, 0, 1)
++    width = 256
++    original = _embedding_table_with_exceptions(rows, width, seed=55)
++    layer = torch.nn.Module()
++    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
++    layer.shard_indices = shard
++    method = embedding.TileLangEmbeddingMethod()
++    method.process_weights_after_loading(layer)
++
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        method.declare_layer_kernels(layer)
++    calls = list(prepare.declared_calls(registry))
++    assert calls == [
++        (
++            embedding.packed_vocab_embedding_kernel,
++            (width, layer.packed_bf16_exponent_base, d),
++            {"threads": 128},
++        )
++        for d in ("int32", "int64")
++    ]
++
++    ids_2d = torch.randint(0, 2048, (4, 7), dtype=torch.int64, device="cuda")
++    got_2d = method.embedding(layer, ids_2d)
++    want_2d = torch.nn.functional.embedding(ids_2d, original)
++    assert got_2d.shape == (4, 7, width)
++    assert torch.equal(_bits(got_2d), _bits(want_2d))
+diff --git a/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py b/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
+index c714af4e4..8aaa8e9e5 100644
+--- a/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
++++ b/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
+@@ -46,3 +46,45 @@ def test_gathered_markov_bias_with_full_vocab_keeps_greedy_argmax():
+         embed, torch.full_like(base, float("-inf")), values, index
+     )
+     assert torch.equal(out.argmax(-1), (base + embed @ weight.T).argmax(-1))
++
++
++def test_gathered_markov_bias_with_packed_bf16_w2():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
++        pytest.skip("TileLang V4.1 kernels target SM120/SM121")
++    pytest.importorskip("tilelang")
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        VocabParallelEmbedding,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++    torch.manual_seed(2)
++    vocab, rank, reqs, k = 512, 256, 3, 64
++    weight = (torch.randn(vocab, rank, device="cuda") * 0.05).bfloat16()
++    weight[5, 17] = 300.0
++    embed = torch.randn(reqs, rank, device="cuda", dtype=torch.bfloat16)
++    base = torch.randn(reqs, vocab, device="cuda", dtype=torch.bfloat16)
++    values, index = base.topk(k, dim=-1)
++
++    unpacked_out = _draft(weight).apply_markov_bias_gathered(
++        embed, torch.full_like(base, float("-inf")), values, index
++    )
++
++    packed = pack_bf16_weight(weight.clone())
++    shard = VocabParallelEmbedding._get_indices(vocab, vocab, vocab, vocab, 0, 1)
++    w2 = SimpleNamespace(
++        weight=packed.values,
++        weight_exception_rows=packed.exception_rows,
++        weight_exception_entries=packed.exception_entries,
++        weight_row_offsets=packed.row_offsets,
++        packed_bf16_in_features=rank,
++        packed_bf16_exponent_base=packed.exponent_base,
++        shard_indices=shard,
++    )
++    draft = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
++    object.__setattr__(draft, "model", SimpleNamespace(markov_head=SimpleNamespace(markov_w2=w2)))
++    object.__setattr__(draft, "logits_processor", SimpleNamespace(scale=1.0))
++
++    packed_out = draft.apply_markov_bias_gathered(
++        embed, torch.full_like(base, float("-inf")), values, index
++    )
++    assert torch.equal(packed_out.view(torch.int16), unpacked_out.view(torch.int16))
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 9ff2cf754..bb860c17c 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -426,7 +426,7 @@ class VocabParallelEmbedding(PluggableLayer):
+             )
+ 
+             config = get_current_vllm_config()
+-            tied = getattr(
++            tied = not prefix.endswith("markov_w2") and getattr(
+                 getattr(config.model_config, "hf_text_config", None),
+                 "tie_word_embeddings",
+                 False,
+@@ -787,8 +787,8 @@ class VocabParallelEmbedding(PluggableLayer):
+             )
+         if self.use_fused_embedding:
+             output_parallel = torch.empty(
+-                (padded_rows, self.weight.shape[1]),
+-                dtype=self.weight.dtype,
++                (padded_rows, self.embedding_dim),
++                dtype=self.params_dtype,
+                 device=self.weight.device,
+             )
+             self._fused_embedding(input_, out=output_parallel[:rows])
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 9a6616166..438e3c9cb 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -305,20 +305,39 @@ class DSparkDeepseekV4Model(nn.Module):
+         draft_vocab_size = (
+             getattr(config, "draft_vocab_size", None) or config.vocab_size
+         )
++        from vllm.model_executor.layers.quantization.online.packed_bf16 import (
++            packed_bf16_supported,
++        )
++
++        markov_quantization = (
++            "nvfp4"
++            if envs.VLLM_DS41_MARKOV_NVFP4
++            else (
++                "packed_bf16"
++                if current_vllm_config.kernel_config.linear_backend == "tilelang"
++                and packed_bf16_supported(
++                    config.dspark_markov_rank, torch.get_default_dtype()
++                )
++                else None
++            )
++        )
+         self.markov_head = DSparkMarkovHead(
+             config.vocab_size,
+             draft_vocab_size,
+             config.dspark_markov_rank,
+             prefix=maybe_prefix(prefix, "markov_head"),
+             # An NVFP4 transition head fits the GB10 L2, so the sequential
+-            # draft positions after the first reread it from L2.
+-            lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
++            # draft positions after the first reread it from L2. On the
++            # TileLang path without NVFP4, pack the BF16 transition head
++            # losslessly into 12 bits per weight (75% of BF16 bytes).
++            lm_head_quantization=markov_quantization,
+             vocab_parallel=_vocab_parallel_greedy(),
+         )
+         # Each sequential Markov step projects one row per request.
+         self.markov_head.markov_w2.tilelang_max_rows = (
+             vllm_config.scheduler_config.max_num_seqs
+         )
++        self.markov_head.markov_w2.tilelang_markov_head = True
+         self.confidence_head: DSparkConfidenceHead | None = None
+         if getattr(config, "enable_confidence_head", True):
+             self.confidence_head = kernels.dspark_confidence_head(
+@@ -730,7 +749,35 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         scattered into it. The target still verifies every draft, so this
+         can change acceptance but not the output.
+         """
+-        weight = self.model.markov_head.markov_w2.weight[index]
++        w2 = self.model.markov_head.markov_w2
++        if hasattr(w2, "packed_bf16_exponent_base"):
++            from ..tilelang.embedding import vocab_embedding_packed
++
++            flat_index = index.reshape(-1).contiguous()
++            in_features = w2.packed_bf16_in_features
++            weight = torch.empty(
++                (flat_index.shape[0], in_features),
++                dtype=torch.bfloat16,
++                device=w2.weight.device,
++            )
++            shard = w2.shard_indices
++            vocab_embedding_packed(
++                flat_index,
++                w2.weight,
++                w2.weight_exception_entries,
++                w2.weight_row_offsets,
++                in_features,
++                w2.packed_bf16_exponent_base,
++                weight,
++                shard.org_vocab_start_index,
++                shard.org_vocab_end_index,
++                shard.num_org_vocab_padding,
++                shard.added_vocab_start_index,
++                shard.added_vocab_end_index,
++            )
++            weight = weight.view(*index.shape, in_features)
++        else:
++            weight = w2.weight[index]
+         bias = torch.bmm(weight, markov_embed.to(weight.dtype).unsqueeze(-1))
+         bias = bias.squeeze(-1).to(values.dtype)
+         if self.logits_processor.scale != 1.0:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index 87a52713e..88bbdd066 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -39,6 +39,7 @@ from torch import nn
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     UnquantizedEmbeddingMethod,
+ )
++from vllm.model_executor.utils import replace_parameter
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ # 32-bit words in one sixteen-byte piece of a row.
+@@ -46,8 +47,125 @@ _WORDS = 4
+ # Tokens from which a row is one block instead of a block a piece.
+ _PREFILL_TOKENS = 512
+ _THREADS = 128
++_GROUP = 128
+ _ID_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
+ 
++_PACKED_EMBED_HEADER = r"""
++#include <stdint.h>
++
++template <int BASE_MINUS_ONE>
++__device__ __forceinline__ void vllm_embed_decode_vec16(
++    const void* __restrict__ low_a_ptr,
++    const void* __restrict__ low_b_ptr,
++    const void* __restrict__ codes_ptr,
++    void* __restrict__ out_a_ptr,
++    void* __restrict__ out_b_ptr) {
++  const uint4 low_a4 = *reinterpret_cast<const uint4*>(low_a_ptr);
++  const uint4 low_b4 = *reinterpret_cast<const uint4*>(low_b_ptr);
++  const uint4 codes4 = *reinterpret_cast<const uint4*>(codes_ptr);
++  const unsigned int* la = reinterpret_cast<const unsigned int*>(&low_a4);
++  const unsigned int* lb = reinterpret_cast<const unsigned int*>(&low_b4);
++  const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
++  unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
++  unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
++  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
++
++  #pragma unroll
++  for (int w = 0; w < 4; ++w) {
++    const unsigned int c_word = cd[w];
++    const unsigned int la_word = la[w];
++    const unsigned int lb_word = lb[w];
++
++    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
++    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
++
++    const unsigned int ca01 = c01 & 0x000F000Fu;
++    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
++    const unsigned int ca23 = c23 & 0x000F000Fu;
++    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
++
++    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
++
++    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
++    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
++    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
++    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
++
++    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
++    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
++    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
++    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
++
++    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
++    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
++    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
++    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
++  }
++}
++
++template <int K, int BASE_MINUS_ONE, int THREADS>
++__device__ __forceinline__ void vllm_packed_vocab_embedding_row(
++    const uint8_t* __restrict__ values,
++    const int* __restrict__ exception_entries,
++    const int* __restrict__ row_offsets,
++    void* __restrict__ out_ptr,
++    int64_t row,
++    int t,
++    int tx) {
++  constexpr int GROUP = 128;
++  constexpr int HALF = 64;
++  constexpr int TOTAL_SLICES = K / 32;
++  constexpr int64_t ROW_BYTES = K + K / 2;
++  uint16_t* __restrict__ out_row = reinterpret_cast<uint16_t*>(out_ptr) + (int64_t)t * K;
++  if (row >= 0) {
++    const uint8_t* __restrict__ w_row = values + row * ROW_BYTES;
++    #pragma unroll
++    for (int s = tx; s < TOTAL_SLICES; s += THREADS) {
++      const int g = s >> 2;
++      const int c = (s & 3) << 4;
++      uint4 out_a[2], out_b[2];
++      vllm_embed_decode_vec16<BASE_MINUS_ONE>(
++          w_row + g * GROUP + c,
++          w_row + g * GROUP + HALF + c,
++          w_row + K + g * HALF + c,
++          out_a,
++          out_b);
++      uint4* dst_a = reinterpret_cast<uint4*>(out_row + g * GROUP + c);
++      uint4* dst_b = reinterpret_cast<uint4*>(out_row + g * GROUP + HALF + c);
++      dst_a[0] = out_a[0];
++      dst_a[1] = out_a[1];
++      dst_b[0] = out_b[0];
++      dst_b[1] = out_b[1];
++    }
++    const int exc_start = row_offsets[row];
++    const int exc_end = row_offsets[row + 1];
++    if (exc_start < exc_end) {
++      __syncthreads();
++      for (int idx = exc_start + tx; idx < exc_end; idx += THREADS) {
++        const unsigned int entry = (unsigned int)exception_entries[idx];
++        out_row[entry >> 16] = (uint16_t)(entry & 0xFFFFu);
++      }
++    }
++  } else {
++    const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
++    #pragma unroll
++    for (int s = tx; s < TOTAL_SLICES; s += THREADS) {
++      const int g = s >> 2;
++      const int c = (s & 3) << 4;
++      uint4* dst_a = reinterpret_cast<uint4*>(out_row + g * GROUP + c);
++      uint4* dst_b = reinterpret_cast<uint4*>(out_row + g * GROUP + HALF + c);
++      dst_a[0] = zero4;
++      dst_a[1] = zero4;
++      dst_b[0] = zero4;
++      dst_b[1] = zero4;
++    }
++  }
++}
++"""
++
+ 
+ @tilelang.jit(
+     pass_configs={
+@@ -126,6 +244,166 @@ def vocab_embedding_kernel(
+     return vocab_embedding
+ 
+ 
++def _packed_threads(k: int) -> int:
++    return 160 if k % (160 * 32) == 0 else _THREADS
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def packed_vocab_embedding_kernel(
++    k: int,
++    exponent_base: int,
++    id_dtype: str,
++    threads: int = 160,
++):
++    """``out[t] = unpack(values[row(ids[t])])`` or zeros, for 12-bit packed BF16
++    rows of ``k`` elements (`k` divisible by 128) with SWAR ``__byte_perm`` decode
++    and exact out-of-window exception patching."""
++    assert k > 0 and k % _GROUP == 0 and threads % 32 == 0
++    row_bytes = k + k // 2
++    base_minus_one = exponent_base - 1
++    tokens = T.dynamic("tokens")
++    rows = T.dynamic("rows")
++    exceptions = T.dynamic("exceptions")
++    offsets = T.dynamic("offsets")
++
++    @T.prim_func
++    def vocab_packed_embedding(
++        ids: T.Tensor((tokens,), id_dtype),
++        values: T.Tensor((rows, row_bytes), T.uint8),
++        exception_entries: T.Tensor((exceptions,), T.int32),
++        row_offsets: T.Tensor((offsets,), T.int32),
++        out: T.Tensor((tokens, k), T.bfloat16),
++        org_start: T.int64,
++        org_end: T.int64,
++        added_start: T.int64,
++        added_end: T.int64,
++        added_offset: T.int64,
++    ):
++        with T.Kernel(tokens, threads=threads) as (t,):
++            T.import_source(_PACKED_EMBED_HEADER)
++            tx = T.get_thread_binding()
++            token = T.alloc_var(T.int64, init=T.cast(ids[t], T.int64))
++            row = T.alloc_var(
++                T.int64,
++                init=T.if_then_else(
++                    (token >= org_start) & (token < org_end),
++                    token - org_start,
++                    T.if_then_else(
++                        (token >= added_start) & (token < added_end),
++                        token + added_offset,
++                        T.int64(-1),
++                    ),
++                ),
++            )
++            T.call_extern(
++                "handle",
++                f"vllm_packed_vocab_embedding_row<{k}, {base_minus_one}, {threads}>",
++                T.address_of(values[0, 0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                T.address_of(out[0, 0]),
++                row,
++                t,
++                tx,
++            )
++
++    return vocab_packed_embedding
++
++
++@cache
++def _packed_kernel(k: int, exponent_base: int, id_dtype: str):
++    return packed_vocab_embedding_kernel(
++        k, exponent_base, id_dtype, threads=_packed_threads(k)
++    )
++
++
++def packed_kernel_calls(k: int, exponent_base: int) -> list[prepare.TileLangCall]:
++    threads = _packed_threads(k)
++    return [
++        prepare.call(
++            packed_vocab_embedding_kernel, k, exponent_base, d, threads=threads
++        )
++        for d in _ID_DTYPES.values()
++    ]
++
++
++def declare_packed(k: int, exponent_base: int) -> None:
++    prepare.declare(
++        lambda: packed_kernel_calls(k, exponent_base),
++        bind=lambda: [
++            _packed_kernel(k, exponent_base, d) for d in _ID_DTYPES.values()
++        ],
++    )
++
++
++def vocab_embedding_packed(
++    input_ids: torch.Tensor,
++    values: torch.Tensor,
++    exception_entries: torch.Tensor,
++    row_offsets: torch.Tensor,
++    in_features: int,
++    exponent_base: int,
++    out: torch.Tensor,
++    org_vocab_start_index: int,
++    org_vocab_end_index: int,
++    num_org_vocab_padding: int,
++    added_vocab_start_index: int,
++    added_vocab_end_index: int,
++) -> None:
++    """This rank's partial BF16 embeddings of ``input_ids`` ([T] int32 or int64)
++    decoded directly from its 12-bit packed shard ``values`` into ``out`` ([T, K]
++    BF16): bit-identical to ``vocab_embedding`` on the unpacked table."""
++    tokens = input_ids.shape[0]
++    row_bytes = in_features + in_features // 2
++    if (
++        input_ids.dim() != 1
++        or input_ids.dtype not in _ID_DTYPES
++        or values.dim() != 2
++        or values.dtype != torch.uint8
++        or values.shape[1] != row_bytes
++        or out.shape != (tokens, in_features)
++        or out.dtype != torch.bfloat16
++        or not (input_ids.is_contiguous() and values.is_contiguous())
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "TileLang packed vocabulary embedding needs 1-D int32/int64 ids, a "
++            "contiguous [rows, K + K // 2] uint8 packed table and a contiguous "
++            f"[ids, K] bfloat16 output: ids {tuple(input_ids.shape)} "
++            f"{input_ids.dtype}, table {tuple(values.shape)} {values.dtype}, "
++            f"output {tuple(out.shape)} {out.dtype}"
++        )
++    if values.data_ptr() % 16 or out.data_ptr() % 16:
++        raise ValueError(
++            "TileLang packed vocabulary embedding needs 16-byte aligned rows"
++        )
++    if tokens == 0:
++        return
++    added_offset = (
++        org_vocab_end_index
++        - org_vocab_start_index
++        + num_org_vocab_padding
++        - added_vocab_start_index
++    )
++    _packed_kernel(in_features, exponent_base, _ID_DTYPES[input_ids.dtype])(
++        input_ids,
++        values,
++        exception_entries,
++        row_offsets,
++        out,
++        org_vocab_start_index,
++        org_vocab_end_index,
++        added_vocab_start_index,
++        added_vocab_end_index,
++        added_offset,
++    )
++
++
+ def _per_thread(words: int, tokens: int) -> int:
+     """Pieces a thread for a lookup of ``tokens`` rows of ``words`` words."""
+     if tokens < _PREFILL_TOKENS:
+@@ -229,24 +507,116 @@ def vocab_embedding(
+ 
+ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+     """The unquantized embedding's sharded weights and ties, with the tensor-parallel
+-    lookup in TileLang (``VocabParallelEmbedding``'s fused path)."""
++    lookup in TileLang (``VocabParallelEmbedding``'s fused path).
++
++    After loading, BF16 tables whose width is divisible by 128 are packed in-place
++    into B12X/TileLang's exact 12-bit representation (75% of BF16 bytes) and decoded
++    on the fly during lookup.
++    """
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        super().process_weights_after_loading(layer)
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++        weight = getattr(layer, "weight", None)
++        if (
++            weight is None
++            or not weight.is_cuda
++            or weight.dtype != torch.bfloat16
++            or weight.ndim != 2
++            or weight.shape[0] == 0
++            or weight.shape[1] == 0
++            or weight.shape[1] % _GROUP != 0
++        ):
++            return
++        from .vocab import pack_bf16_weight
++
++        data = weight.data
++        in_features = int(data.shape[1])
++        packed = pack_bf16_weight(data, in_place=True)
++        del data
++        replace_parameter(layer, "weight", packed.values)
++        replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
++        replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
++        replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
++        layer.packed_bf16_in_features = in_features
++        layer.packed_bf16_exponent_base = packed.exponent_base
++        layer.packed_bf16_exceptions = packed.exceptions
++        layer._already_called_process_weights_after_loading = True
+ 
+     def declare_layer_kernels(self, layer: nn.Module) -> None:
++        if hasattr(layer, "packed_bf16_exponent_base"):
++            declare_packed(
++                layer.packed_bf16_in_features, layer.packed_bf16_exponent_base
++            )
++            return
+         declare(row_words(layer.weight))
+ 
++    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        if not hasattr(layer, "packed_bf16_exponent_base"):
++            return super().embedding(layer, input_)
++        flat = input_ if input_.ndim == 1 else input_.reshape(-1)
++        if not flat.is_contiguous():
++            flat = flat.contiguous()
++        in_features = layer.packed_bf16_in_features
++        out = torch.empty(
++            (flat.shape[0], in_features),
++            dtype=torch.bfloat16,
++            device=layer.weight.device,
++        )
++        shard = layer.shard_indices
++        vocab_embedding_packed(
++            flat,
++            layer.weight,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            in_features,
++            layer.packed_bf16_exponent_base,
++            out,
++            shard.org_vocab_start_index,
++            shard.org_vocab_end_index,
++            shard.num_org_vocab_padding,
++            shard.added_vocab_start_index,
++            shard.added_vocab_end_index,
++        )
++        return out if input_.ndim == 1 else out.view(*input_.shape, in_features)
++
+     def parallel_embedding(
+         self,
+         layer: nn.Module,
+         input_ids: torch.Tensor,
+         out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        shard = layer.shard_indices
++        if hasattr(layer, "packed_bf16_exponent_base"):
++            in_features = layer.packed_bf16_in_features
++            if out is None:
++                out = torch.empty(
++                    (input_ids.shape[0], in_features),
++                    dtype=torch.bfloat16,
++                    device=layer.weight.device,
++                )
++            vocab_embedding_packed(
++                input_ids,
++                layer.weight,
++                layer.weight_exception_entries,
++                layer.weight_row_offsets,
++                in_features,
++                layer.packed_bf16_exponent_base,
++                out,
++                shard.org_vocab_start_index,
++                shard.org_vocab_end_index,
++                shard.num_org_vocab_padding,
++                shard.added_vocab_start_index,
++                shard.added_vocab_end_index,
++            )
++            return out
+         if out is None:
+             out = torch.empty(
+                 (input_ids.shape[0], layer.weight.shape[1]),
+                 dtype=layer.weight.dtype,
+                 device=layer.weight.device,
+             )
+-        shard = layer.shard_indices
+         vocab_embedding(
+             input_ids,
+             layer.weight,
+@@ -263,8 +633,12 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+ __all__ = [
+     "TileLangEmbeddingMethod",
+     "declare",
++    "declare_packed",
+     "kernel_calls",
++    "packed_kernel_calls",
++    "packed_vocab_embedding_kernel",
+     "row_words",
+     "vocab_embedding",
+     "vocab_embedding_kernel",
++    "vocab_embedding_packed",
+ ]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index abc26f1f1..c27194e88 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -452,9 +452,15 @@ BF16_HEAD_CONFIGS = {
+ 
+ def tile_config(block_M: int, k: int) -> dict:
+     """The token tile's configuration; one group per step when two do not divide K."""
++    if k <= 2 * GROUP:
++        return dict(block_N=32, threads=128, step_groups=1, num_stages=1)
+     config = dict(TILE_CONFIGS[block_M])
+     if k % (GROUP * config["step_groups"]):
+         config["step_groups"] = 1
++    if k // (GROUP * config["step_groups"]) < config["num_stages"]:
++        config["num_stages"] = max(1, k // (GROUP * config["step_groups"]))
++        if config.get("act_stages") is not None:
++            config["act_stages"] = min(config["act_stages"], config["num_stages"])
+     return config
+ 
+ 
+@@ -704,8 +710,12 @@ def packed_vocab_projection(
+             # share the last stage, so the decoded weights need one buffer.
+             last = num_stages - 1
+             act_stage = 0 if act_stages is None else last - act_stages + 1
+-            for s in T.Pipelined(
+-                steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++            for s in (
++                T.serial(steps)
++                if num_stages <= 1
++                else T.Pipelined(
++                    steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++                )
+             ):
+                 T.copy(A[by * block_M, s * STEP], A_shared)
+                 T.copy(W[bx * block_N, s * STEP], low_shared)
+@@ -832,8 +842,12 @@ def packed_vocab_greedy_partials(
+             T.clear(C_local)
+             last = num_stages - 1
+             act_stage = 0 if act_stages is None else last - act_stages + 1
+-            for s in T.Pipelined(
+-                steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++            for s in (
++                T.serial(steps)
++                if num_stages <= 1
++                else T.Pipelined(
++                    steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++                )
+             ):
+                 T.copy(A[by * block_M, s * STEP], A_shared)
+                 T.copy(W[bx * block_N, s * STEP], low_shared)
+@@ -906,6 +920,166 @@ def packed_vocab_greedy_partials(
+     return vocab_packed_greedy_partials
+ 
+ 
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def packed_vocab_markov_greedy_partials(
++    N: int,
++    K: int,
++    exponent_base: int,
++    block_M: int = 16,
++    block_N: int = 64,
++    num_stages: int = 1,
++    threads: int = 128,
++    step_groups: int = 1,
++    act_stages: int | None = None,
++    out_dtype: T.dtype = T.bfloat16,
++):
++    """Per-tile ``(max, shard index)`` of ``Base + A @ W^T`` for BF16 Markov
++    embeddings ``A[M, K]``, 12-bit packed weights ``W``, and strided base logits
++    ``Base[M, N]``, reduced in each CTA's epilogue without materializing the
++    ``[M, N]`` Markov bias tensor."""
++    assert K % (GROUP * step_groups) == 0
++    assert (
++        shared_memory_bytes(
++            block_M, block_N, num_stages, step_groups, act_stages=act_stages
++        )
++        <= SHARED_MEMORY
++    )
++    steps = K // (GROUP * step_groups)
++    STEP = GROUP * step_groups
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = HALF // VEC
++    items = block_N * step_groups * slices
++    num_tiles = (N + block_N - 1) // block_N
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++    base_stride = T.dynamic("base_stride", "int64")
++
++    @T.prim_func
++    def vocab_packed_markov_greedy_partials(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, row_bytes), T.uint8),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((N + 1,), T.int32),
++        Base: T.StridedTensor((M, N), (base_stride, 1), out_dtype),
++        partial_vals: T.Tensor((M, num_tiles), T.float32),
++        partial_idxs: T.Tensor((M, num_tiles), T.int32),
++        vocab: T.int32,
++    ):
++        with T.Kernel(
++            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
++        ) as (bx, by):
++            pdl.chain()
++            T.import_source(_GREEDY_HEADER)
++            A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
++            low_shared = T.alloc_shared((block_N, STEP), T.uint8)
++            code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
++            B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
++            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            low_a = T.alloc_local((VEC,), T.uint8)
++            low_b = T.alloc_local((VEC,), T.uint8)
++            codes = T.alloc_local((VEC,), T.uint8)
++            out_a = T.alloc_local((VEC,), T.bfloat16)
++            out_b = T.alloc_local((VEC,), T.bfloat16)
++            tx = T.get_thread_binding()
++            T.clear(C_local)
++            last = num_stages - 1
++            act_stage = 0 if act_stages is None else last - act_stages + 1
++            for s in (
++                T.serial(steps)
++                if num_stages <= 1
++                else T.Pipelined(
++                    steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
++                )
++            ):
++                T.copy(A[by * block_M, s * STEP], A_shared)
++                T.copy(W[bx * block_N, s * STEP], low_shared)
++                T.copy(W[bx * block_N, K + s * (STEP // 2)], code_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // (step_groups * slices)
++                        g = item // slices % step_groups
++                        c = item % slices * VEC
++                        for v in T.vectorized(VEC):
++                            low_a[v] = low_shared[j, g * GROUP + c + v]
++                        for v in T.vectorized(VEC):
++                            low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
++                        for v in T.vectorized(VEC):
++                            codes[v] = code_shared[j, g * HALF + c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        for v in T.vectorized(VEC):
++                            B_shared[j, g * GROUP + c + v] = out_a[v]
++                        for v in T.vectorized(VEC):
++                            B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            first = bx * block_N
++            start = T.alloc_var(T.int32, init=row_offsets[first])
++            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
++            if start < end:
++                for index in T.serial(start, end):
++                    row = T.alloc_var(T.int32, init=exception_rows[index] - first)
++                    entry = T.alloc_var(T.int32, init=exception_entries[index])
++                    value = T.alloc_var(
++                        T.float32,
++                        init=T.Cast(
++                            T.float32,
++                            T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
++                        ),
++                    )
++                    column = T.alloc_var(T.int32, init=entry >> 16)
++                    for i, j in T.Parallel(block_M, block_N):
++                        if j == row:
++                            token = T.min(by * block_M + i, M - 1)
++                            C_local[i, j] = C_local[i, j] + value * T.Cast(
++                                T.float32, A[token, column]
++                            )
++            for i, j in T.Parallel(block_M, block_N):
++                row = T.min(by * block_M + i, M - 1)
++                col = T.min(bx * block_N + j, N - 1)
++                bias_val = (
++                    T.Cast(T.float32, T.Cast(T.bfloat16, C_local[i, j]))
++                    if out_dtype == T.bfloat16
++                    else C_local[i, j]
++                )
++                summed = T.Cast(T.float32, Base[row, col]) + bias_val
++                C_local[i, j] = (
++                    T.Cast(T.float32, T.Cast(T.bfloat16, summed))
++                    if out_dtype == T.bfloat16
++                    else summed
++                )
++            T.copy(C_local, C_shared)
++            T.call_extern(
++                "handle",
++                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
++                T.address_of(C_shared[0, 0]),
++                T.address_of(partial_vals[0, 0]),
++                T.address_of(partial_idxs[0, 0]),
++                by,
++                bx,
++                M,
++                vocab,
++                num_tiles,
++                tx,
++            )
++
++    return vocab_packed_markov_greedy_partials
++
++
+ @tilelang.jit(
+     pass_configs={
+         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+@@ -1088,6 +1262,33 @@ def _packed_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dic
+     return {"partials": partials, "finishes": finishes}
+ 
+ 
++def _packed_head_markov_greedy_kernels(
++    layer: nn.Module, out_dtype: torch.dtype
++) -> dict:
++    """A packed Markov head's fused Markov-bias projection, base-logit addition and
++    per-tile greedy reduction for every token tile, as calls."""
++    n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
++    partials = {}
++    finishes = {}
++    for block_M in _head_row_tiles(layer):
++        config = tile_config(block_M, k)
++        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
++        partials[block_M] = prepare.call(
++            packed_vocab_markov_greedy_partials,
++            n,
++            k,
++            layer.packed_bf16_exponent_base,
++            block_M=block_M,
++            out_dtype=_OUT[out_dtype],
++            **config,
++        )
++        finishes.setdefault(
++            num_tiles,
++            prepare.call(finish_vocab_greedy_pairs, num_tiles),
++        )
++    return {"partials": partials, "finishes": finishes}
++
++
+ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     """A BF16 head's projection for every token tile, as calls."""
+     n, k = map(int, layer.weight.shape)
+@@ -1183,6 +1384,34 @@ def prepare_packed_head(
+         lambda: list(partials.values()) + list(finishes.values()),
+         bind=bind_greedy,
+     )
++    if getattr(layer, "tilelang_markov_head", False):
++        markov = _packed_head_markov_greedy_kernels(layer, out_dtype)
++        m_partials = markov["partials"]
++        m_finishes = markov["finishes"]
++
++        def bind_markov_greedy() -> None:
++            n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
++            compiled_finishes = {
++                num_tiles: function(*args, **kwargs)
++                for num_tiles, (function, args, kwargs) in m_finishes.items()
++            }
++            layer.tilelang_vocab_markov_greedy = {
++                block_M: (
++                    function(*args, **kwargs),
++                    compiled_finishes[
++                        (n + tile_config(block_M, k)["block_N"] - 1)
++                        // tile_config(block_M, k)["block_N"]
++                    ],
++                    (n + tile_config(block_M, k)["block_N"] - 1)
++                    // tile_config(block_M, k)["block_N"],
++                )
++                for block_M, (function, args, kwargs) in m_partials.items()
++            }
++
++        prepare.declare(
++            lambda: list(m_partials.values()) + list(m_finishes.values()),
++            bind=bind_markov_greedy,
++        )
+ 
+ 
+ def prepare_bf16_head(
+@@ -1384,14 +1613,27 @@ def project_head_markov_greedy_pairs(
+         x.device,
+         out=out,
+     )
+-    partials_kernel(
+-        x,
+-        layer.weight,
+-        base_logits,
+-        partial_vals,
+-        partial_idxs,
+-        vocab,
+-    )
++    if hasattr(layer, "packed_bf16_exponent_base"):
++        partials_kernel(
++            x,
++            layer.weight,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            base_logits,
++            partial_vals,
++            partial_idxs,
++            vocab,
++        )
++    else:
++        partials_kernel(
++            x,
++            layer.weight,
++            base_logits,
++            partial_vals,
++            partial_idxs,
++            vocab,
++        )
+     finish_kernel(partial_vals, partial_idxs, pairs, vocab_start)
+     return pairs
+ 
+@@ -1411,6 +1653,7 @@ __all__ = [
+     "packed_bf16_histogram",
+     "packed_bf16_pack_rows",
+     "packed_vocab_greedy_partials",
++    "packed_vocab_markov_greedy_partials",
+     "packed_vocab_projection",
+     "prepare_bf16_head",
+     "prepare_packed_head",
+-- 
+2.54.0 (Apple Git-157)
+
