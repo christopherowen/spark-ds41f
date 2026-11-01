@@ -427,6 +427,43 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(values["max_cudagraph_capture_size"], "96")
         self.assertEqual(values["long_prefill_token_threshold"], "16288")
         self.assertEqual(values["tensor_parallel_size"], "4")
+        self.assertEqual(values["engram_on_disk"], "true")
+        self.assertEqual(values["engram_table_memory"], "disk")
+
+    def test_engram_on_disk_is_off_for_tp6_through_tp8(self):
+        """TP3..TP5 keep Engram tables on disk; TP6..TP8 set engram_on_disk to false so
+        --engram-config renders table_memory="device"."""
+        self.assertIs(self.recipe["engram_on_disk"], True)
+        expected = {
+            "tp3-triangle": True,
+            "tp3-switched": True,
+            "tp3-triangle-4k": True,
+            "tp4-ring": True,
+            "tp4-switched": True,
+            "tp5-switched": True,
+            "tp6-switched": False,
+            "tp7-switched": False,
+            "tp8-switched": False,
+        }
+        self.assertEqual(set(self.recipe["shapes"]), set(expected))
+        for name, on_disk in expected.items():
+            self.assertIs(self.recipe["shapes"][name]["engram_on_disk"], on_disk, name)
+            entry = recipe.shape_entry(self.recipe, name)
+            self.assertIs(recipe.engram_on_disk(self.recipe, entry), on_disk, name)
+            resolved = recipe.resolve(self.recipe, name)
+            self.assertNotIn("engram_on_disk", resolved)
+            engram = json.loads(argument(resolved, "--engram-config"))
+            self.assertEqual(engram["table_memory"], "disk" if on_disk else "device", name)
+            self.assertEqual(engram["projection_tp"], True, name)
+        # An overlay arm can toggle engram_on_disk either way.
+        tp4 = recipe.resolve(self.recipe, "tp4-ring")
+        off_arm = recipe.overlay({"extends": {}, "set": {"engram_on_disk": False}}, tp4)
+        self.assertEqual(json.loads(argument(off_arm, "--engram-config"))["table_memory"], "device")
+        self.assertNotIn("engram_on_disk", off_arm)
+        on_arm = recipe.overlay({"extends": {}, "set": {"engram_on_disk": True}}, off_arm)
+        self.assertEqual(json.loads(argument(on_arm, "--engram-config"))["table_memory"], "disk")
+        with self.assertRaisesRegex(SystemExit, "engram_on_disk must be a boolean"):
+            recipe.overlay({"extends": {}, "set": {"engram_on_disk": "no"}}, tp4)
 
     def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
         """The capture ladder ends at streams x (1 + drafts) even when that falls between two of

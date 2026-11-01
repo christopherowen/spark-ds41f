@@ -121,6 +121,7 @@
     "XDG_CACHE_HOME": "/cache/spark-ds41f/jit"
   },
   "drafts": 5,
+  "engram_on_disk": true,
   "serve_args": [
     "/models",
     "--served-model-name",
@@ -159,7 +160,7 @@
     "--generation-config",
     "vllm",
     "--engram-config",
-    "{\"table_memory\":\"disk\",\"disk_resident_scales\":false,\"projection_tp\":true}",
+    "{\"table_memory\":\"${engram_table_memory}\",\"disk_resident_scales\":false,\"projection_tp\":true}",
     "--attention-backend",
     "TILELANG",
     "--linear-backend",
@@ -215,6 +216,7 @@
     "tp4-ring": {
       "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12). Its long-prefill budget is 16,384 from the release after spark-ds41f-1022: with the CED skip, +5.4-6.3% prefill over 8,192 for decode steps beside a long prompt about twice as long (experiments/2026-10-23-next-release). spark-ds41f-1030 (candidate 14: candidate 12 with vLLM 0566 and 0567) serves the GLP-steered name beside the stock one and yields a long prompt's chunk to short requests (--prefill-yield short, 10 s); against spark-ds41f-1025 decode is 4.6% faster on the engine grid, prefill 8.4-12.2% faster from 32K to 1M, and the startup line reads 11,554,122 tokens (experiments/2026-10-26-spark-ds41f-candidate).",
       "nodes": 4,
+      "engram_on_disk": true,
       "nodes_config": "config/nodes-ring4.local.json",
       "fabric": {
         "transport": "oneshot-ring4"
@@ -269,6 +271,7 @@
     "tp4-switched": {
       "notes": "Four nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing.",
       "extends": "tp4-ring",
+      "engram_on_disk": true,
       "nodes_config": "config/nodes-switched.local.json",
       "fabric": {
         "transport": "oneshot-switched",
@@ -280,33 +283,38 @@
       "notes": "Five nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
       "extends": "tp4-switched",
       "nodes": 5,
+      "engram_on_disk": true,
       "nodes_config": "config/nodes-switched5.local.json",
       "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched5.json"
     },
     "tp6-switched": {
-      "notes": "Six nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "notes": "Six nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628 and Engram tables resident in device memory (engram_on_disk: false).",
       "extends": "tp4-switched",
       "nodes": 6,
+      "engram_on_disk": false,
       "nodes_config": "config/nodes-switched6.local.json",
       "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched6.json"
     },
     "tp7-switched": {
-      "notes": "Seven nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "notes": "Seven nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628 and Engram tables resident in device memory (engram_on_disk: false).",
       "extends": "tp4-switched",
       "nodes": 7,
+      "engram_on_disk": false,
       "nodes_config": "config/nodes-switched7.local.json",
       "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched7.json"
     },
     "tp8-switched": {
-      "notes": "Eight nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "notes": "Eight nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628 and Engram tables resident in device memory (engram_on_disk: false).",
       "extends": "tp4-switched",
       "nodes": 8,
+      "engram_on_disk": false,
       "nodes_config": "config/nodes-switched8.local.json",
       "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched8.json"
     },
     "tp3-triangle": {
       "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate). From the release after spark-ds41f-1025 it is 6,144 (owner, 2026-10-27), the prepared fallback (rc6/rc-tp3-6144.json): against 8,192 it gives up about 3% of prefill (1M 3,797 against 3,907 tok/s) for a median step beside a long prompt 21% shorter (1.143 s against 1.444 s; experiments/2026-10-19-prefill-budget-tp3). A site triangle measured the same trade on candidate 8 (#503: about 2% prefill at 131K for 24% longer stalls), with decode unchanged at every budget. The startup line at 6,144 reads 4,354,971 tokens; the pool still holds 5 full 1M contexts. spark-ds41f-1030 (candidate 14) is qualified on the ring only; its full qualification on the triangle runs once the triangle is cabled (candidate 13's TP3 arms and specs in experiments/2026-10-26-spark-ds41f-candidate/rc13, moved to candidate 14's image). Candidate 12's expert scale codes cost about 1.4 GiB a rank at TP3 (#668); 0566 returns it.",
       "nodes": 3,
+      "engram_on_disk": true,
       "nodes_config": "config/nodes.json",
       "fabric": {
         "transport": "oneshot-direct"
@@ -348,6 +356,7 @@
     "tp3-switched": {
       "notes": "Three nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp3-triangle's sizing.",
       "extends": "tp3-triangle",
+      "engram_on_disk": true,
       "nodes_config": "config/nodes-switched3.local.json",
       "fabric": {
         "transport": "oneshot-switched",
@@ -358,6 +367,7 @@
     "tp3-triangle-4k": {
       "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md). It keeps the 4,096-token budget: the triangle's larger budgets were measured with Memory Saver at 1M only.",
       "extends": "tp3-triangle",
+      "engram_on_disk": true,
       "host": {
         "kernel": {
           "release": "7.0.0-1019-nvidia",
