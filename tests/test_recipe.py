@@ -633,6 +633,62 @@ class RecipeTest(unittest.TestCase):
         """One recipe: no per-shape copies beside it."""
         self.assertEqual(sorted(p.name for p in (ROOT / "config").glob("cluster*.json")), ["cluster.json"])
 
+    def test_all_switched_shapes_use_direct_fabric_profile(self):
+        """Every switched shape (tp3-switched through tp8-switched) uses sparknet's direct /
+        oneshot-switched profile (8 NCCL channels, 1 MiB NCCL buffers, cuMem off, 4 MiB
+        one-shot all-gather cap), strips ring-only controls, and declares the direct profile
+        explicitly on both switched base shapes (tp3-switched and tp4-switched)."""
+        for base_switched in ("tp3-switched", "tp4-switched"):
+            self.assertEqual(
+                self.recipe["shapes"][base_switched].get("environment"),
+                recipe.SWITCHED_DIRECT_ENV,
+                base_switched,
+            )
+        switched_shapes = (
+            "tp3-switched",
+            "tp4-switched",
+            "tp5-switched",
+            "tp6-switched",
+            "tp7-switched",
+            "tp8-switched",
+        )
+        resolved_envs = {}
+        for name in switched_shapes:
+            resolved = recipe.resolve(self.recipe, name)
+            self.assertEqual(
+                resolved["fabric"],
+                {"transport": "oneshot-switched", "topology": "switched"},
+                name,
+            )
+            env = resolved["environment"]
+            resolved_envs[name] = env
+            for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+                self.assertEqual(env[key], value, (name, key))
+            for key in recipe.SWITCHED_STRIP_RING_KEYS:
+                self.assertNotIn(key, env, (name, key))
+        # Every switched shape renders the exact same NCCL/sparknet fabric environment;
+        # only SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS differs between TP3 (1) and TP4..8 (0).
+        tp4_env = resolved_envs["tp4-switched"]
+        for name in ("tp5-switched", "tp6-switched", "tp7-switched", "tp8-switched"):
+            self.assertEqual(resolved_envs[name], tp4_env, name)
+        self.assertEqual(
+            {k: v for k, v in resolved_envs["tp3-switched"].items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
+            {k: v for k, v in tp4_env.items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
+        )
+        # Mutating tp3-triangle's environment does not move tp3-switched's direct profile.
+        mutated = json.loads(json.dumps(self.recipe))
+        mutated["shapes"]["tp3-triangle"]["environment"].update({
+            "NCCL_BUFFSIZE": "4194304",
+            "NCCL_CUMEM_ENABLE": "1",
+            "NCCL_MAX_NCHANNELS": "4",
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152",
+            "NCCL_ALGO": "Ring",
+        })
+        tp3_sw_mut = recipe.resolve(mutated, "tp3-switched")["environment"]
+        for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+            self.assertEqual(tp3_sw_mut[key], value, key)
+        self.assertNotIn("NCCL_ALGO", tp3_sw_mut)
+
 
 
 class OverlayTest(unittest.TestCase):
@@ -763,6 +819,8 @@ class GLPTest(unittest.TestCase):
         for key in ("NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
                     "NCCL_THREAD_THRESHOLDS", "NCCL_SWITCHLESS_BIDIRECTIONAL"):
             self.assertNotIn(key, switched["environment"])
+        for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+            self.assertEqual(switched["environment"][key], value, key)
         explicit = recipe.overlay({**arm, "unset": ["benchmark_reference", "environment.NCCL_ALGO"]}, base)
         self.assertNotIn("NCCL_ALGO", explicit["environment"])
         self.assertNotIn("benchmark_reference", explicit)

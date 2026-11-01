@@ -57,6 +57,37 @@ SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_ca
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
 SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "environment", "host",
               "engram_on_disk", "benchmark_reference", "notes"}
+SWITCHED_STRIP_RING_KEYS = (
+    "NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
+    "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
+    "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
+    "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT",
+)
+# sparknet's direct / oneshot-switched fabric settings (replacing tp4-ring's 4-channel ring values).
+SWITCHED_DIRECT_ENV = {
+    "NCCL_BUFFSIZE": "1048576",
+    "NCCL_CUMEM_ENABLE": "0",
+    "NCCL_MAX_NCHANNELS": "8",
+    "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
+}
+
+
+def _apply_switched_direct_env(target: dict, explicit_env: dict, unset: list[str] | tuple[str, ...] = ()) -> None:
+    env = target.get("environment")
+    if not isinstance(env, dict):
+        return
+    unset_env = {path.split(".", 1)[1] for path in unset if path.startswith("environment.")}
+    for key in SWITCHED_STRIP_RING_KEYS:
+        if key not in explicit_env:
+            env.pop(key, None)
+    transport = target.get("fabric", {}).get("transport")
+    for key, value in SWITCHED_DIRECT_ENV.items():
+        if key.startswith("SPARKNET_") and transport == "nccl-switched":
+            continue
+        if key not in explicit_env and key not in unset_env:
+            env[key] = value
 
 
 def is_recipe(cluster: dict) -> bool:
@@ -137,12 +168,7 @@ def shape_entry(recipe: dict, name: str) -> dict:
             merged[key] = copy.deepcopy(value)
     if (merged.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        explicit_env = entry.get("environment", {})
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
-            if key not in explicit_env:
-                merged.get("environment", {}).pop(key, None)
+        _apply_switched_direct_env(merged, entry.get("environment", {}))
     if "benchmark_reference" not in entry:
         # A variant is qualified by its own release benchmark, never through its base.
         merged.pop("benchmark_reference", None)
@@ -394,12 +420,7 @@ def overlay(arm: dict, base: dict) -> dict:
         cluster.pop("notes", None)
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        explicit_env = sets.get("environment", {})
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
-            if key not in explicit_env:
-                cluster.get("environment", {}).pop(key, None)
+        _apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
     if base.get("glp") or cluster.get("glp"):
         # Rendered again whatever the arm changed: a serve_args or mount list it sets
         # replaces the base's, which held the rendering.

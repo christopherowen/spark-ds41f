@@ -128,6 +128,16 @@ class SwitchedTopologyTest(unittest.TestCase):
             with self.subTest(count=count):
                 cluster, nodes = fixture(count=count)
                 self.assertEqual(topology.problems(cluster, nodes), [])
+                shape_cluster = spark.read_cluster('config/cluster.json', f'tp{count}-switched')
+                shape_cluster['distributed']['master_addr'] = nodes['nodes'][0]['management_ip']
+                self.assertEqual(topology.problems(shape_cluster, nodes), [])
+                for node in nodes['nodes']:
+                    env = spark.expected_environment(shape_cluster, node)
+                    self.assertEqual(env['SPARKNET_ROCE_TOPOLOGY'], 'direct')
+                    self.assertEqual(env['NCCL_BUFFSIZE'], '1048576')
+                    self.assertEqual(env['NCCL_CUMEM_ENABLE'], '0')
+                    self.assertEqual(env['NCCL_MAX_NCHANNELS'], '8')
+                    self.assertEqual(env['SPARKNET_ROCE_ALLGATHER_MAX_BYTES'], '4194304')
         for bad_count in (2, 9):
             with self.subTest(bad_count=bad_count):
                 cluster, nodes = fixture(count=bad_count)
