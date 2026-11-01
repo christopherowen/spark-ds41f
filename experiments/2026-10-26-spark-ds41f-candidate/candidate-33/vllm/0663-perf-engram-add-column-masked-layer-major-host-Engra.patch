@@ -1,4 +1,4 @@
-From 888c4793a5f59d91802964df7c80c715d735caff Mon Sep 17 00:00:00 2001
+From f1f43b1e5f334f6384ac29a252a8e2fd06158213 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 10:52:51 +0000
 Subject: [PATCH] perf(engram): add column-masked layer-major host Engram hash
@@ -6,12 +6,12 @@ Subject: [PATCH] perf(engram): add column-masked layer-major host Engram hash
 
 ---
  ...test_deepseek_v41_engram_host_placement.py |  28 ++++
- .../kernels/test_deepseek_v41_engram_rows.py  |  41 ++++++
+ .../kernels/test_deepseek_v41_engram_rows.py  |  42 ++++++
  .../deepseek_v4_1/engram_rows/_reader.c       |  40 +++++-
  .../deepseek_v4_1/engram_rows/host_hash.py    | 132 +++++++++++++++---
  vllm/models/deepseek_v4_1/engram_rows/rows.py |  19 ++-
  .../deepseek_v4_1/nvidia/model_state.py       |  21 ++-
- 6 files changed, 248 insertions(+), 33 deletions(-)
+ 6 files changed, 249 insertions(+), 33 deletions(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_engram_host_placement.py b/tests/kernels/test_deepseek_v41_engram_host_placement.py
 index fc58c53a9..1fc01f566 100644
@@ -50,13 +50,14 @@ index fc58c53a9..1fc01f566 100644
 +            assert (masked[:16, :, unowned] == -1).all()
 +            assert (masked[16:] == -1).all()
 diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
-index 01b94cc25..fdf4091f1 100644
+index 5ff9e2056..fdf4091f1 100644
 --- a/tests/kernels/test_deepseek_v41_engram_rows.py
 +++ b/tests/kernels/test_deepseek_v41_engram_rows.py
-@@ -700,3 +700,44 @@ def test_mlock_pinned_and_mapped_host_buffers():
+@@ -699,3 +699,45 @@ def test_mlock_pinned_and_mapped_host_buffers():
+     rows.close()
      assert rows._ids_mlocked is False
      assert rows.weights._mlocked is False
- 
++
 +def test_column_masked_early_ids_skip_d2h_ids_copy_and_match_reference():
 +    """When all early lookups are known (including column-masked host hashes where
 +    unowned columns are -1) and check_early is False, stage() skips the D2H copy into

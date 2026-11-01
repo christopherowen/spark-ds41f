@@ -1,4 +1,4 @@
-From 1e418a6d53201d37e045250a541f9fdf94fb508f Mon Sep 17 00:00:00 2001
+From 1c98c4b7a6a4f378cc1df5b51402bccca9f6f9b3 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 11:07:26 +0100
 Subject: [PATCH] perf(dsv41): fuse compressor indexed KV write and indexer.wk
@@ -8,14 +8,14 @@ Subject: [PATCH] perf(dsv41): fuse compressor indexed KV write and indexer.wk
  .../attention/test_deepseek_v41_tilelang.py   |  39 +++
  tests/kernels/deepseek_v41_pdl_sources.py     |  11 +-
  .../test_deepseek_v41_tilelang_compress.py    | 123 ++++++++
- tests/models/test_deepseek_v4_1_attention.py  |  84 ++++++
+ tests/models/test_deepseek_v4_1_attention.py  |  83 ++++++
  vllm/models/deepseek_v4_1/attention.py        |  54 +++-
  vllm/models/deepseek_v4_1/compressor.py       |  78 ++++-
  .../deepseek_v4_1/tilelang/attention.py       |  27 +-
  .../models/deepseek_v4_1/tilelang/compress.py | 270 ++++++++++++++++--
  vllm/models/deepseek_v4_1/tilelang/indexer.py | 100 +++++--
  vllm/models/deepseek_v4_1/tilelang/linear.py  |  24 ++
- 10 files changed, 730 insertions(+), 80 deletions(-)
+ 10 files changed, 729 insertions(+), 80 deletions(-)
 
 diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
 index 17ed2f1f4..2baad24fc 100644
@@ -228,7 +228,7 @@ index cf0d36f09..832deef41 100644
 +    if ratio == 2:
 +        assert torch.equal(pool_fused, pool_sep)
 diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
-index 0108c0ee7..d6f82917b 100644
+index 0108c0ee7..e222237e2 100644
 --- a/tests/models/test_deepseek_v4_1_attention.py
 +++ b/tests/models/test_deepseek_v4_1_attention.py
 @@ -392,6 +392,7 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
@@ -247,7 +247,7 @@ index 0108c0ee7..d6f82917b 100644
          layer._attend_split = lambda *args, **kwargs: None
          return layer
  
-@@ -477,3 +479,85 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
+@@ -477,3 +479,84 @@ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
      l1.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
      assert torch.equal(seen[0][0][2], im.block_table[0:2])
      assert torch.equal(seen[1][0][2], im.block_table[0:2])
@@ -332,7 +332,6 @@ index 0108c0ee7..d6f82917b 100644
 +    assert comp_calls[0]["kv_page_size"] == 64
 +    assert len(key_writes) == 1
 +    assert key_writes[0][0] is partials
-+
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
 index b30e295e4..cb063d495 100644
 --- a/vllm/models/deepseek_v4_1/attention.py

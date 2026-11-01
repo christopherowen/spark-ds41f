@@ -1,4 +1,4 @@
-From c571adb8a978518471b993d5c5136a375458d10f Mon Sep 17 00:00:00 2001
+From 8569154f2eb5329a750076d303efa3c1169923b1 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 11:07:57 +0100
 Subject: [PATCH] perf(dsv41): column-shard target fused_wqa_wkv across TP
@@ -6,13 +6,13 @@ Subject: [PATCH] perf(dsv41): column-shard target fused_wqa_wkv across TP
 
 ---
  .../test_deepseek_v41_tilelang_linear.py      | 104 +++++++++
- tests/models/test_deepseek_v4_1_attention.py  | 199 ++++++++++++++++
+ tests/models/test_deepseek_v4_1_attention.py  | 200 ++++++++++++++++
  vllm/models/deepseek_v4_1/attention.py        | 221 ++++++++++++++++--
  vllm/models/deepseek_v4_1/kernels.py          |   7 +
  vllm/models/deepseek_v4_1/tilelang/front.py   |   4 +-
  vllm/models/deepseek_v4_1/tilelang/gemm.py    |  15 ++
  vllm/models/deepseek_v4_1/tilelang/linear.py  |   4 +
- 7 files changed, 536 insertions(+), 18 deletions(-)
+ 7 files changed, 537 insertions(+), 18 deletions(-)
 
 diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
 index eebb0758a..66a178f01 100644
@@ -127,13 +127,14 @@ index eebb0758a..66a178f01 100644
 +    assert torch.equal(qc_shd.scales[:rows], qc_ref.scales[:rows])
 +    assert torch.equal(cache_shd, cache_ref)
 diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
-index d6f82917b..d949481e8 100644
+index e222237e2..d949481e8 100644
 --- a/tests/models/test_deepseek_v4_1_attention.py
 +++ b/tests/models/test_deepseek_v4_1_attention.py
-@@ -561,3 +561,202 @@ def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypat
+@@ -560,3 +560,203 @@ def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypat
+     assert comp_calls[0]["kv_page_size"] == 64
      assert len(key_writes) == 1
      assert key_writes[0][0] is partials
- 
++
 +
 +@pytest.mark.parametrize("tp_size,expected_part", [(1, 1792), (3, 608), (4, 448)])
 +def test_padded_merged_column_parallel_linear_shards_contiguously(

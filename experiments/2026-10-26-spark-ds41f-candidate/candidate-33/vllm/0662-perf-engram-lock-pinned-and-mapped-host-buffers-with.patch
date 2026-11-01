@@ -1,20 +1,20 @@
-From 299a4467bf9cf6107dd09fc7794e0abc82222ee3 Mon Sep 17 00:00:00 2001
+From e424ca8d880a748d014aaa705f190027c37bf0b4 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 10:51:58 +0000
 Subject: [PATCH] perf(engram): lock pinned and mapped host buffers with
  mlock(2) (#760)
 
 ---
- .../kernels/test_deepseek_v41_engram_rows.py  | 19 +++++
+ .../kernels/test_deepseek_v41_engram_rows.py  | 18 +++++
  vllm/models/deepseek_v4_1/engram_rows/rows.py | 10 +++
  vllm/v1/utils.py                              | 80 ++++++++++++++++++-
- 3 files changed, 108 insertions(+), 1 deletion(-)
+ 3 files changed, 107 insertions(+), 1 deletion(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
-index cc34d72e3..01b94cc25 100644
+index cc34d72e3..5ff9e2056 100644
 --- a/tests/kernels/test_deepseek_v41_engram_rows.py
 +++ b/tests/kernels/test_deepseek_v41_engram_rows.py
-@@ -681,3 +681,22 @@ def test_fadvise_dontneed_evicts_page_cache_on_registration_and_load(monkeypatch
+@@ -681,3 +681,21 @@ def test_fadvise_dontneed_evicts_page_cache_on_registration_and_load(monkeypatch
      _read_table_rows(dest, source, 0)
      assert torch.equal(dest, codes)
      assert _cached_pages(weight_path) <= 2
@@ -36,7 +36,6 @@ index cc34d72e3..01b94cc25 100644
 +    rows.close()
 +    assert rows._ids_mlocked is False
 +    assert rows.weights._mlocked is False
-+
 diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
 index 89dcca295..f5acc279b 100644
 --- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
