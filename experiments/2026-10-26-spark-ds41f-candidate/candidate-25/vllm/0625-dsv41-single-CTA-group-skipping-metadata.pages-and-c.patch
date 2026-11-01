@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:49:58 +0100
+Subject: [PATCH 625/625] dsv41: single-CTA group-skipping metadata.pages and
+ cross-layer index page cache
+
+---
+ tests/models/test_deepseek_v4_1_attention.py  | 102 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  61 ++++++++---
+ .../models/deepseek_v4_1/tilelang/metadata.py |  32 ++++--
+ 3 files changed, 174 insertions(+), 21 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 0dbdd99b6..0108c0ee7 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -375,3 +375,105 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+     positions = torch.arange(4)
+     out = module._forward(positions, track("hidden", torch.ones(4, 32)))
+     assert out.shape == (4, 32)
++
++
++def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
++    """Single-chunk index page tables are shared across layers sharing ``im``,
++    and mixed decode+prefill steps never clobber the cached decode slice."""
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++
++    def make_layer(layer_id):
++        layer = _tilelang_layer(layer_id=layer_id)
++        layer.compress_ratio = 0
++        layer.candidate_source_layer = 99
++        layer._attention_geometry()
++        layer._short_index_shape = None
++        layer.topk_indices_buffer = torch.zeros(128, 512, dtype=torch.int32)
++        layer._index_pages = torch.full((64, 16), -1, dtype=torch.int32)
++        layer._active = torch.tensor([16 * 64], dtype=torch.int32)
++        layer._ready = True
++        layer.swa_cache_layer = SimpleNamespace(prefix="swa")
++        layer.indexer = SimpleNamespace(
++            heads=4,
++            k_cache=SimpleNamespace(prefix="idx"),
++        )
++        layer._attend_split = lambda *args, **kwargs: None
++        return layer
++
++    l0, l1 = make_layer(0), make_layer(1)
++    im = SimpleNamespace(
++        req_id_per_token=torch.arange(128, dtype=torch.int32),
++        cache_lengths=torch.full((128,), 128, dtype=torch.int32),
++        block_table=torch.arange(128 * 16, dtype=torch.int32).view(128, 16),
++        max_seq_len=32768,
++    )
++
++    pages_calls = []
++
++    def fake_pages(reqs, lengths, table, out, offset, rows, read_width, *, page):
++        pages_calls.append((offset, rows))
++        out[:rows] = table[offset : offset + rows, : out.shape[1]]
++
++    monkeypatch.setattr(tl_metadata, "pages", fake_pages)
++
++    seen = {0: [], 1: []}
++    for lid, layer in ((0, l0), (1, l1)):
++        layer._index_chunk = (
++            lambda mode, count, *, page_table, _lid=lid, **kw: seen[_lid].append(
++                (mode, count, page_table.clone())
++            )
++        )
++
++    # Case 1: Mixed step with total rows (6) <= INDEX_CHUNK (64).
++    # Decode uses _index_pages[:2] and rest uses _index_pages[2:6]; both are cached
++    # on l0 and reused on l1 without clobbering.
++    ctx = SimpleNamespace(
++        attn_metadata={
++            "swa": SimpleNamespace(is_decode=False, num_decode_tokens=2),
++            "idx": im,
++        }
++    )
++    monkeypatch.setattr(attention, "get_forward_context", lambda: ctx)
++    q = torch.zeros(6, 2, 512)
++    iq = (
++        torch.zeros(6, 4, 64, dtype=torch.uint8),
++        torch.zeros(6, 4, 4, dtype=torch.uint8),
++        torch.zeros(6, 4),
++        None,
++        None,
++    )
++    l0.forward_mqa(q, None, torch.arange(6), q.clone(), index_query=iq)
++    l1.forward_mqa(q, None, torch.arange(6), q.clone(), index_query=iq)
++    assert pages_calls == [(0, 2), (2, 4)]
++    assert torch.equal(seen[0][0][2], im.block_table[0:2])
++    assert torch.equal(seen[0][1][2], im.block_table[2:6])
++    assert torch.equal(seen[1][0][2], im.block_table[0:2])
++    assert torch.equal(seen[1][1][2], im.block_table[2:6])
++
++    # Case 2: Mixed step with total rows (70) > INDEX_CHUNK (64) and shared buffer.
++    # Decode slice must not be cached across rest multi-chunk overwrite of _index_pages.
++    pages_calls.clear()
++    seen[0].clear()
++    seen[1].clear()
++    ctx2 = SimpleNamespace(
++        attn_metadata={
++            "swa": SimpleNamespace(is_decode=False, num_decode_tokens=2),
++            "idx": im,
++        }
++    )
++    monkeypatch.setattr(attention, "get_forward_context", lambda: ctx2)
++    q70 = torch.zeros(70, 2, 512)
++    iq70 = (
++        torch.zeros(70, 4, 64, dtype=torch.uint8),
++        torch.zeros(70, 4, 4, dtype=torch.uint8),
++        torch.zeros(70, 4),
++        None,
++        None,
++    )
++    l0.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
++    l1.forward_mqa(q70, None, torch.arange(70), q70.clone(), index_query=iq70)
++    assert torch.equal(seen[0][0][2], im.block_table[0:2])
++    assert torch.equal(seen[1][0][2], im.block_table[0:2])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 16ac898ab..b30e295e4 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1141,19 +1141,38 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 count = query[0].shape[0]
+                 cut = min(max(decode_rows - first, 0), count)
+                 if cut:
+-                    select_rows([t[:cut] for t in query], first, selected[:cut], decode)
++                    keep = (
++                        cut == count
++                        or rest[2] is not decode[2]
++                        or first + count <= decode[2].shape[0]
++                    )
++                    select_rows(
++                        [t[:cut] for t in query],
++                        first,
++                        selected[:cut],
++                        decode,
++                        keep=keep,
++                    )
+                 if cut < count:
+                     select_rows(
+-                        [t[cut:] for t in query], first + cut, selected[cut:], rest
++                        [t[cut:] for t in query],
++                        first + cut,
++                        selected[cut:],
++                        rest,
+                     )
+ 
+-            def select_rows(query, first, selected, params):
++            def select_rows(query, first, selected, params, keep=True):
+                 # Query rows start at global row `first`; metadata and
+                 # candidates are indexed by global row, `selected` by query row.
+                 index_mode, chunk_rows, index_pages, score_width = params
+                 index_width = index_pages.shape[1]
+                 iq_data, iq_scale, iw = query
+                 index_rows = iq_data.shape[0]
++                buf = (
++                    index_pages[first:]
++                    if first and first + index_rows <= index_pages.shape[0]
++                    else index_pages
++                )
+                 for offset in range(0, index_rows, chunk_rows):
+                     end = min(offset + chunk_rows, index_rows)
+                     count = end - offset
+@@ -1162,16 +1181,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         metadata as tl_metadata,
+                     )
+ 
+-                    tl_metadata.pages(
+-                        im.req_id_per_token,
+-                        im.cache_lengths,
+-                        im.block_table,
+-                        index_pages,
+-                        row,
+-                        count,
+-                        min(im.block_table.shape[1], index_width),
+-                        page=self._index_page,
+-                    )
++                    page_table = None
++                    cacheable = split is None and index_rows <= chunk_rows
++                    if cacheable:
++                        key = (id(im), row, count, index_width, self._index_page)
++                        shared = get_forward_context().__dict__.setdefault(
++                            "_ds41_index_pages", {}
++                        )
++                        entry = shared.get(key)
++                        if entry is not None and entry[0] is im:
++                            page_table = entry[1]
++                    if page_table is None:
++                        tl_metadata.pages(
++                            im.req_id_per_token,
++                            im.cache_lengths,
++                            im.block_table,
++                            buf,
++                            row,
++                            count,
++                            min(im.block_table.shape[1], index_width),
++                            page=self._index_page,
++                        )
++                        page_table = buf[:count]
++                        if cacheable and keep:
++                            shared[key] = (im, page_table)
+                     candidate_args = {}
+                     if self.layer_id == self.candidate_source_layer:
+                         candidate_args = dict(
+@@ -1192,7 +1225,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         q_mxfp4=iq_data[offset:end],
+                         q_scales=iq_scale[offset:end],
+                         query_weights=iw[offset:end],
+-                        page_table=index_pages[:count],
++                        page_table=page_table,
+                         cache_lengths=im.cache_lengths[row:row_end],
+                         score_width=score_width,
+                         output_indices=selected[offset:end],
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 0b290a32a..a8cbac701 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -358,6 +358,7 @@ def pages_kernel(width: int, page: int):
+     table_rows = T.dynamic("table_rows")
+     table_cols = T.dynamic("table_cols")
+     table_stride = T.dynamic("table_stride")
++    groups = (width + _GROUP * _BLOCK - 1) // (_GROUP * _BLOCK)
+ 
+     @T.prim_func
+     def metadata_pages(
+@@ -368,16 +369,33 @@ def pages_kernel(width: int, page: int):
+         offset: T.int32,
+         read_width: T.int32,
+     ):
+-        with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
++        with T.Kernel(rows, threads=_BLOCK) as (row,):
+             pdl.chain()
+-            entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
+-            col = cb * _BLOCK + T.get_thread_binding()
++            tx = T.get_thread_binding()
++            live = T.alloc_var(T.int32)
++            entries = T.alloc_local((groups * _GROUP,), T.int32)
+             req = reqs[offset + row]
+             live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
+-            if (req >= 0) & (col < live):
+-                # vLLM reserves physical block zero; page tables use -1 for holes.
+-                entry = table[req, col]
+-                out[row, col] = T.if_then_else(entry > 0, entry, -1)
++            if req < 0:
++                live = 0
++            for g in T.unroll(groups):
++                if g * _GROUP * _BLOCK < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * _BLOCK + tx
++                        entries[g * _GROUP + k] = T.if_then_else(
++                            col < live, table[req, col], 0
++                        )
++            for g in T.unroll(groups):
++                if g * _GROUP * _BLOCK < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * _BLOCK + tx
++                        if col < live:
++                            # vLLM reserves physical block zero; page tables use -1 for holes.
++                            out[row, col] = T.if_then_else(
++                                entries[g * _GROUP + k] > 0,
++                                entries[g * _GROUP + k],
++                                -1,
++                            )
+ 
+     return metadata_pages
+ 

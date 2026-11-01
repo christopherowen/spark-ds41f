@@ -306,10 +306,22 @@ the whole release benchmark (release tests, determinism gate, this comparison) a
 
 ```json
 {"kind": "measure", "profile": "release", "bracket": false,
- "arms": [{"config": "<candidate>.json", "label": "<candidate>"},
+ "arms": [{"config": "tp3-dev.json", "label": "candidate-<N>"},
           {"config": "<previous release>.json", "label": "<previous>"},
-          {"config": "<candidate>.json", "label": "<candidate>-again"}]}
+          {"config": "tp3-dev.json", "label": "candidate-<N>-again"}]}
 ```
+
+- **Unified `candidate-<N>` naming (from `candidate-25` onward).** Every release candidate
+  uses `candidate-<N>` everywhere (`rc<N>` and `19f2c20ed4d6-next-<N>` are retired):
+  - directory: `experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/`;
+  - arm configs inside `candidate-<N>/`: `tp3.json`, `tp3-dev.json`, `tp4.json`,
+    `screen-tp3.json`, `upstreams.lock.json` (no `rc-` prefix);
+  - container image tag: `"image": "spark-ds41f:candidate-<N>"`;
+  - suite run and arm label: `"run": "candidate-<N>-screen-tp3"` (or
+    `"candidate-<N>-release-tp3"`), `"label": "candidate-<N>"`;
+  - config `"notes"`: `"candidate-<N> at tp3-triangle ..."` /
+    `"candidate-<N> at tp4-ring ..."`;
+  - git commit subject: `candidate-<N>: ...`.
 
 - **One session, candidate first.** The arms run back to back on the same boot
   conditions. The candidate goes first, so heat soak never counts against it, and runs
