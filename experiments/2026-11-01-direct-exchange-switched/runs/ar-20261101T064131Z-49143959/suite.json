@@ -1,0 +1,375 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "site-levers",
+  "version": 1,
+  "description": "Per-candidate screen for the 2026-11-01 site levers on tp4-switched, about 22 minutes a boot: greedy outputs on 64 prompts (identity against the reference, and heat soak), the engine grid (text-independent step cost), sixteen and one streams in closed loops (paired decode against the reference), and real-text cold prefill at 32K, 128K and 256K, three repeats each.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "limit": 64,
+     "concurrency": 16,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1
+    }
+   },
+   {
+    "id": "c16",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 16,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c1",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 1,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072,
+      262144
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "c433c0377ea65e4b764c5da448ba1454828a21a51d42590798d84d234365c2c1",
+ "label": "ar-20261101T064131Z-49143959",
+ "corpus": null,
+ "started_utc": "2026-11-01T06:43:41+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 78.2
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 107.1
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "output": "c16.json",
+   "exit": 0,
+   "seconds": 370.1
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "output": "c1.json",
+   "exit": 0,
+   "seconds": 362.2
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 191.2
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-11-01-site-levers/arm.json",
+   "cluster_config_sha256": "e4dfee83ca1b923921a9f0af69284810a42037634e3850ed15f9a74d37fcaa0f",
+   "nodes_config": "config/nodes-switched.local.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "spark",
+    "nodes": [
+     {
+      "name": "192.168.1.121",
+      "rank": 0,
+      "management_ip": "192.168.1.121",
+      "head": true,
+      "roce_gid_index": 3,
+      "management_interface": "enP7s7",
+      "roce_hcas": [
+       "rocep1s0f1",
+       "roceP2p1s0f1"
+      ],
+      "roce_subnets": {
+       "rocep1s0f1": "10.100.10.0/24",
+       "roceP2p1s0f1": "10.100.11.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "192.168.1.122",
+      "rank": 1,
+      "management_ip": "192.168.1.122",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enP7s7",
+      "roce_hcas": [
+       "rocep1s0f1",
+       "roceP2p1s0f1"
+      ],
+      "roce_subnets": {
+       "rocep1s0f1": "10.100.10.0/24",
+       "roceP2p1s0f1": "10.100.11.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "192.168.1.123",
+      "rank": 2,
+      "management_ip": "192.168.1.123",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enP7s7",
+      "roce_hcas": [
+       "rocep1s0f1",
+       "roceP2p1s0f1"
+      ],
+      "roce_subnets": {
+       "rocep1s0f1": "10.100.10.0/24",
+       "roceP2p1s0f1": "10.100.11.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "192.168.1.18",
+      "rank": 3,
+      "management_ip": "192.168.1.18",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enP7s7",
+      "roce_hcas": [
+       "rocep1s0f1",
+       "roceP2p1s0f1"
+      ],
+      "roce_subnets": {
+       "rocep1s0f1": "10.100.10.0/24",
+       "roceP2p1s0f1": "10.100.11.0/24"
+      },
+      "roce_traffic_class": 106
+     }
+    ]
+   },
+   "transport": "oneshot-switched",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-30-spark-ds41f-1030",
+   "image": "spark-ds41f:1030-direct",
+   "client_commit": "491439596ae3bc40ca697abd832a14acbdf82fe0",
+   "client_dirty": false,
+   "client_host": "spark-ffc9",
+   "nodes": {
+    "192.168.1.121": {
+     "image_id": "sha256:eea4a6b59145075531bb30d06a3f5b8f97dfa1d77f1db805506ba06998e80e97",
+     "container_started_at": "2026-11-01T06:41:56.737358538Z",
+     "checkout": "491439596ae3bc40ca697abd832a14acbdf82fe0"
+    },
+    "192.168.1.122": {
+     "image_id": "sha256:eea4a6b59145075531bb30d06a3f5b8f97dfa1d77f1db805506ba06998e80e97",
+     "container_started_at": "2026-11-01T06:41:56.324131567Z",
+     "checkout": "491439596ae3bc40ca697abd832a14acbdf82fe0"
+    },
+    "192.168.1.123": {
+     "image_id": "sha256:eea4a6b59145075531bb30d06a3f5b8f97dfa1d77f1db805506ba06998e80e97",
+     "container_started_at": "2026-11-01T06:41:56.334553886Z",
+     "checkout": "491439596ae3bc40ca697abd832a14acbdf82fe0"
+    },
+    "192.168.1.18": {
+     "image_id": "sha256:eea4a6b59145075531bb30d06a3f5b8f97dfa1d77f1db805506ba06998e80e97",
+     "container_started_at": "2026-11-01T06:41:56.319993897Z",
+     "checkout": "491439596ae3bc40ca697abd832a14acbdf82fe0"
+    }
+   },
+   "live_problems": [
+    "192.168.1.121: display manager is active; run sudo systemctl disable --now display-manager.service",
+    "192.168.1.122: display manager is active; run sudo systemctl disable --now display-manager.service",
+    "192.168.1.123: display manager is active; run sudo systemctl disable --now display-manager.service",
+    "192.168.1.18: display manager is active; run sudo systemctl disable --now display-manager.service"
+   ],
+   "live_warnings": [
+    "192.168.1.121: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "192.168.1.121: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "192.168.1.121: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia",
+    "192.168.1.121: missing or empty /boot/initrd.img-7.0.0-1019-nvidia",
+    "192.168.1.121: missing or empty /boot/config-7.0.0-1019-nvidia",
+    "192.168.1.121: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "192.168.1.121: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "192.168.1.121: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "192.168.1.121: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "192.168.1.121: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "192.168.1.121: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: candidate nvidia driver version differs from 580.178.04",
+    "192.168.1.121: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: candidate nvidia_uvm driver version differs from 580.178.04",
+    "192.168.1.121: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: candidate nvidia_drm driver version differs from 580.178.04",
+    "192.168.1.121: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "192.168.1.121: candidate is missing from GRUB",
+    "192.168.1.121: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "192.168.1.121: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.121: candidate UVM does not select the expected memory-saver DKMS module",
+    "192.168.1.121: memory-saver module has no readable Secure Boot signer",
+    "192.168.1.121: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "192.168.1.121: boots to graphical.target, expected multi-user.target (no desktop); run sudo systemctl set-default multi-user.target",
+    "192.168.1.121: nvidia-drm modeset is N, expected Y (a display attached after boot stays dark; serving does not use the display carve-out on this profile); run sudo apt purge nvidia-drm-options-modeset0 and reboot with the service stopped",
+    "192.168.1.121: the active console (tty1) is in graphics mode, so an attached display shows no text; run scripts/host-recovery apply on the node (it switches the console to text mode now and removes splash from later boots)",
+    "192.168.1.121: the kernel command line has splash, which leaves the console in graphics mode after boot; run scripts/host-recovery apply on the node (it installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then reboot with the service stopped",
+    "192.168.1.121: bluetooth.service, cups.service, cups.socket, cups.path, cups-browsed.service, snapd.service, snapd.socket, snapd.seeded.service, snapd.snap-repair.timer, fwupd-refresh.timer, dgx-dashboard.service, dgx-dashboard-admin.service enabled or running, though unused on a headless inference node; run sudo systemctl disable --now bluetooth.service cups.service cups.socket cups.path cups-browsed.service snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer fwupd-refresh.timer dgx-dashboard.service dgx-dashboard-admin.service (scripts/host-recovery apply does the same)",
+    "192.168.1.121: NVMe interrupt coalescing is on (nvme0=0x00000107), but this site keeps it off; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.121: nvidia-nvme-interrupt-coalescing.service is enabled and turns coalescing back on at the next boot; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.121: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 5 ms or more before 1000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.121: nvme0 sleeps in PS4 (46 ms to wake) after 2100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 20 ms or more before 30000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.121: Wi-Fi radio is enabled; run nmcli radio wifi off to keep the management port off wireless",
+    "192.168.1.122: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "192.168.1.122: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "192.168.1.122: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia",
+    "192.168.1.122: missing or empty /boot/initrd.img-7.0.0-1019-nvidia",
+    "192.168.1.122: missing or empty /boot/config-7.0.0-1019-nvidia",
+    "192.168.1.122: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "192.168.1.122: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "192.168.1.122: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "192.168.1.122: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "192.168.1.122: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "192.168.1.122: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: candidate nvidia driver version differs from 580.178.04",
+    "192.168.1.122: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: candidate nvidia_uvm driver version differs from 580.178.04",
+    "192.168.1.122: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: candidate nvidia_drm driver version differs from 580.178.04",
+    "192.168.1.122: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "192.168.1.122: candidate is missing from GRUB",
+    "192.168.1.122: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "192.168.1.122: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.122: candidate UVM does not select the expected memory-saver DKMS module",
+    "192.168.1.122: memory-saver module has no readable Secure Boot signer",
+    "192.168.1.122: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "192.168.1.122: boots to graphical.target, expected multi-user.target (no desktop); run sudo systemctl set-default multi-user.target",
+    "192.168.1.122: nvidia-drm modeset is N, expected Y (a display attached after boot stays dark; serving does not use the display carve-out on this profile); run sudo apt purge nvidia-drm-options-modeset0 and reboot with the service stopped",
+    "192.168.1.122: the active console (tty1) is in graphics mode, so an attached display shows no text; run scripts/host-recovery apply on the node (it switches the console to text mode now and removes splash from later boots)",
+    "192.168.1.122: the kernel command line has splash, which leaves the console in graphics mode after boot; run scripts/host-recovery apply on the node (it installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then reboot with the service stopped",
+    "192.168.1.122: bluetooth.service, cups.service, cups.socket, cups.path, cups-browsed.service, snapd.service, snapd.socket, snapd.seeded.service, snapd.snap-repair.timer, fwupd-refresh.timer, dgx-dashboard.service, dgx-dashboard-admin.service enabled or running, though unused on a headless inference node; run sudo systemctl disable --now bluetooth.service cups.service cups.socket cups.path cups-browsed.service snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer fwupd-refresh.timer dgx-dashboard.service dgx-dashboard-admin.service (scripts/host-recovery apply does the same)",
+    "192.168.1.122: NVMe interrupt coalescing is on (nvme0=0x00000107), but this site keeps it off; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.122: nvidia-nvme-interrupt-coalescing.service is enabled and turns coalescing back on at the next boot; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.122: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 5 ms or more before 1000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.122: nvme0 sleeps in PS4 (46 ms to wake) after 2100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 20 ms or more before 30000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.123: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "192.168.1.123: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "192.168.1.123: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia",
+    "192.168.1.123: missing or empty /boot/initrd.img-7.0.0-1019-nvidia",
+    "192.168.1.123: missing or empty /boot/config-7.0.0-1019-nvidia",
+    "192.168.1.123: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "192.168.1.123: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "192.168.1.123: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "192.168.1.123: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "192.168.1.123: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "192.168.1.123: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: candidate nvidia driver version differs from 580.178.04",
+    "192.168.1.123: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: candidate nvidia_uvm driver version differs from 580.178.04",
+    "192.168.1.123: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: candidate nvidia_drm driver version differs from 580.178.04",
+    "192.168.1.123: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "192.168.1.123: candidate is missing from GRUB",
+    "192.168.1.123: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "192.168.1.123: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.123: candidate UVM does not select the expected memory-saver DKMS module",
+    "192.168.1.123: memory-saver module has no readable Secure Boot signer",
+    "192.168.1.123: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "192.168.1.123: boots to graphical.target, expected multi-user.target (no desktop); run sudo systemctl set-default multi-user.target",
+    "192.168.1.123: nvidia-drm modeset is N, expected Y (a display attached after boot stays dark; serving does not use the display carve-out on this profile); run sudo apt purge nvidia-drm-options-modeset0 and reboot with the service stopped",
+    "192.168.1.123: the active console (tty1) is in graphics mode, so an attached display shows no text; run scripts/host-recovery apply on the node (it switches the console to text mode now and removes splash from later boots)",
+    "192.168.1.123: the kernel command line has splash, which leaves the console in graphics mode after boot; run scripts/host-recovery apply on the node (it installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then reboot with the service stopped",
+    "192.168.1.123: bluetooth.service, cups.service, cups.socket, cups.path, cups-browsed.service, snapd.service, snapd.socket, snapd.seeded.service, snapd.snap-repair.timer, fwupd-refresh.timer, dgx-dashboard.service, dgx-dashboard-admin.service enabled or running, though unused on a headless inference node; run sudo systemctl disable --now bluetooth.service cups.service cups.socket cups.path cups-browsed.service snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer fwupd-refresh.timer dgx-dashboard.service dgx-dashboard-admin.service (scripts/host-recovery apply does the same)",
+    "192.168.1.123: NVMe interrupt coalescing is on (nvme0=0x00000107), but this site keeps it off; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.123: nvidia-nvme-interrupt-coalescing.service is enabled and turns coalescing back on at the next boot; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.123: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 5 ms or more before 1000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.123: nvme0 sleeps in PS4 (46 ms to wake) after 2100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 20 ms or more before 30000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.123: Wi-Fi radio is enabled; run nmcli radio wifi off to keep the management port off wireless",
+    "192.168.1.18: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "192.168.1.18: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "192.168.1.18: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "192.168.1.18: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "192.168.1.18: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "192.168.1.18: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "192.168.1.18: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "192.168.1.18: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: candidate nvidia driver version differs from 580.178.04",
+    "192.168.1.18: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: candidate nvidia_uvm driver version differs from 580.178.04",
+    "192.168.1.18: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: candidate nvidia_drm driver version differs from 580.178.04",
+    "192.168.1.18: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "192.168.1.18: candidate is missing from GRUB",
+    "192.168.1.18: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "192.168.1.18: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "192.168.1.18: candidate UVM does not select the expected memory-saver DKMS module",
+    "192.168.1.18: memory-saver module has no readable Secure Boot signer",
+    "192.168.1.18: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "192.168.1.18: boots to graphical.target, expected multi-user.target (no desktop); run sudo systemctl set-default multi-user.target",
+    "192.168.1.18: nvidia-drm modeset is N, expected Y (a display attached after boot stays dark; serving does not use the display carve-out on this profile); run sudo apt purge nvidia-drm-options-modeset0 and reboot with the service stopped",
+    "192.168.1.18: the active console (tty1) is in graphics mode, so an attached display shows no text; run scripts/host-recovery apply on the node (it switches the console to text mode now and removes splash from later boots)",
+    "192.168.1.18: the kernel command line has splash, which leaves the console in graphics mode after boot; run scripts/host-recovery apply on the node (it installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then reboot with the service stopped",
+    "192.168.1.18: bluetooth.service, cups.service, cups.socket, cups.path, cups-browsed.service, snapd.service, snapd.socket, snapd.seeded.service, snapd.snap-repair.timer, fwupd-refresh.timer, dgx-dashboard.service, dgx-dashboard-admin.service enabled or running, though unused on a headless inference node; run sudo systemctl disable --now bluetooth.service cups.service cups.socket cups.path cups-browsed.service snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer fwupd-refresh.timer dgx-dashboard.service dgx-dashboard-admin.service (scripts/host-recovery apply does the same)",
+    "192.168.1.18: NVMe interrupt coalescing is on (nvme0=0x00000107), but this site keeps it off; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.18: nvidia-nvme-interrupt-coalescing.service is enabled and turns coalescing back on at the next boot; run sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable",
+    "192.168.1.18: nvme0 sleeps in PS3 (11 ms to wake) after 100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 5 ms or more before 1000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.18: nvme0 sleeps in PS4 (46 ms to wake) after 2100 ms idle, and the Engram reader's first read after a pause waits for it (no state of 20 ms or more before 30000 ms idle); set nvme_core apst_primary_timeout_ms=2000 and apst_secondary_timeout_ms=60000: now with echo 2000 | sudo tee /sys/module/nvme_core/parameters/apst_primary_timeout_ms, echo 60000 | sudo tee /sys/module/nvme_core/parameters/apst_secondary_timeout_ms and rewriting each controller's power/pm_qos_latency_tolerance_us to re-arm APST; at boot with 'options nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000' in /etc/modprobe.d/nvme-apst.conf and sudo update-initramfs -u",
+    "192.168.1.18: Wi-Fi radio is enabled; run nmcli radio wifi off to keep the management port off wireless",
+    "Kernel corrections (not executed):\n  192.168.1.121: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  192.168.1.121: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  192.168.1.121: sudo update-grub\n  192.168.1.121: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  192.168.1.121: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  192.168.1.122: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  192.168.1.122: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  192.168.1.122: sudo update-grub\n  192.168.1.122: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  192.168.1.122: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  192.168.1.123: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  192.168.1.123: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  192.168.1.123: sudo update-grub\n  192.168.1.123: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  192.168.1.123: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  192.168.1.18: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  192.168.1.18: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  192.168.1.18: sudo update-grub\n  192.168.1.18: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  192.168.1.18: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel."
+   ]
+  }
+ },
+ "finished_utc": "2026-11-01T07:02:09+00:00"
+}

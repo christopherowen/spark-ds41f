@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:30:00 -0500
+Subject: [PATCH] perf(dsv41): exchange directly at four ranks on a switched
+ fabric
+
+At four ranks the rank-order reduce-scatter's chunk exchange
+(tilelang/collectives.py exchange_into, which sequence-parallel prefill's
+row exchange also uses) and PyNCCL's all_to_all_rows relay half of the
+opposite rank's block through each neighbour: on sparknet's switchless
+four-node ring, ranks two apart share no cable. Behind a switch every pair
+is one hop, and the relay costs a second serialized group and 4 instead of
+3 chunk-units sent per rank.
+
+ring4_relay() now drops the relay only when sparknet renders the direct
+topology (SPARKNET_ROCE_TOPOLOGY=direct, as tp4-switched does); every rank
+then sends to and receives from every other in one group, the path other
+world sizes already take. Any other value, or none, keeps the relay, which
+works on every fabric. Since candidate-35's 0669, exchanges sparknet's
+one-shot accepts (since candidate-36, single-slot messages) go there first;
+this changes the PyNCCL path the larger prefill exchanges still take.
+
+Base: candidate-36's vLLM series (vllm 19f2c20e + 0001..0673, expected
+tree cc0fdf58); with this patch, tree bc7c9cd5.
+
+Quality: only bytes move. The rank-order sum and every part are the same
+bits, so outputs are unchanged. Measured on four GB10 behind one switch
+(MikroTik CRS804-4DDQ) on candidate-36 against candidate-36's own two
+files, two boots each at the recipe's 16,384-token budget: prefill +3.2%
+to +3.4% at 32K-256K, closed-loop decode unchanged, engine grid -0.16%
++-1.05% over boots; greedy token ids and every teacher-forced top-20
+distribution identical (KL 0); no RDMA error counter grew on any HCA.
+On spark-ds41f-1030 the same change read prefill +2.7%.
+
+Tests: tests/kernels/test_deepseek_v41_tilelang_collectives.py gains a
+switched fabric (every pair linked) and checks that four ranks exchange
+with every peer in one group per exchange with the relay's bits, and that
+every other SPARKNET_ROCE_TOPOLOGY value keeps the ring relay;
+tests/models/test_deepseek_v41_sp_project_reduce_scatter.py runs
+all_to_all_rows on both topologies. On GB10 (release-test runner, the 10
+gate files that exercise the exchange): 822 passed, 1 failed, 1 skipped,
+every new or changed case passed; the one failure (a disk-Engram
+preparation test) fails identically without this patch.
+
+Upstream status: local to spark-ds41f; not proposed to vLLM (the relay
+and sparknet's topology are this deployment's).
+---
+ .../test_deepseek_v41_tilelang_collectives.py | 94 +++++++++++++++++--
+ ..._deepseek_v41_sp_project_reduce_scatter.py | 27 +++++-
+ .../device_communicators/pynccl.py            | 17 +++-
+ .../deepseek_v4_1/tilelang/collectives.py     | 13 ++-
+ 4 files changed, 133 insertions(+), 18 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 9f6f8ac34..d6a1ce716 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """The rank-order reduce-scatter: the exchange (simulated ranks on the host, the
+-neighbour relay at four ranks) and the TileLang sum (GPU)."""
++neighbour relay at four ranks on a ring, direct behind a switch) and the TileLang
++sum (GPU)."""
+ 
+ import threading
+ from collections import defaultdict, deque
+@@ -23,15 +24,19 @@ assert WORLDS[-1] == MAX_RANK_ORDER_WORLD
+ 
+ 
+ class _Fabric:
+-    """Point-to-point links between simulated ranks. At four ranks only the ring
+-    neighbours are cabled, as on ring4: a send to the opposite rank fails."""
++    """Point-to-point links between simulated ranks. At four ranks on a ring only
++    the neighbours are cabled, as on ring4: a send to the opposite rank fails.
++    Behind a switch (``switched``) every pair is linked. ``pairs`` records the
++    linked pairs that carried a send, ``groups`` each rank's send/recv groups."""
+ 
+-    def __init__(self, world: int):
+-        self.world = world
++    def __init__(self, world: int, switched: bool = False):
++        self.world, self.switched = world, switched
+         self.barrier = threading.Barrier(world)
+         self.queues = defaultdict(deque)
+         self.gathered = {}
+         self.lock = threading.Lock()
++        self.pairs: set[frozenset] = set()
++        self.groups = defaultdict(int)
+ 
+ 
+ class _Comm:
+@@ -44,10 +49,15 @@ class _Comm:
+ 
+     def group_start(self):
+         self.sends, self.recvs = [], []
++        with self.fabric.lock:
++            self.fabric.groups[self.rank] += 1
+ 
+     def send(self, tensor, peer):
+-        if self.fabric.world == 4 and (peer - self.rank) % 4 == 2:
++        fabric = self.fabric
++        if fabric.world == 4 and not fabric.switched and (peer - self.rank) % 4 == 2:
+             raise AssertionError(f"rank {self.rank} sent to its opposite rank {peer}")
++        with fabric.lock:
++            fabric.pairs.add(frozenset((self.rank, peer)))
+         self.sends.append((peer, tensor.clone()))
+ 
+     def recv(self, tensor, peer):
+@@ -87,9 +97,29 @@ def _host_zero_fill(monkeypatch):
+     )
+ 
+ 
+-def _run(inputs, collective=None):
++@pytest.fixture(autouse=True)
++def topology(monkeypatch):
++    """``SPARKNET_ROCE_TOPOLOGY`` for one test, unset unless the test sets it (None
++    unsets): the exchange reads it through ``ring4_relay``, which caches its answer,
++    so the cache is cleared around every setting."""
++    from vllm.distributed.device_communicators.pynccl import ring4_relay
++
++    def set_topology(value):
++        if value is None:
++            monkeypatch.delenv("SPARKNET_ROCE_TOPOLOGY", raising=False)
++        else:
++            monkeypatch.setenv("SPARKNET_ROCE_TOPOLOGY", value)
++        ring4_relay.cache_clear()
++
++    set_topology(None)
++    yield set_topology
++    ring4_relay.cache_clear()
++
++
++
++def _run(inputs, collective=None, fabric=None):
+     world = len(inputs)
+-    fabric = _Fabric(world)
++    fabric = fabric or _Fabric(world)
+     out, errors = [None] * world, []
+     if collective is None:
+         collective = reduce_scatter_rank_order
+@@ -167,6 +197,54 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
+         assert torch.equal(sliced[rank].sum(), whole[rank])
+ 
+ 
++@pytest.mark.parametrize("bounds", [(0, 7), (0, 3, 7), (0, 1, 2, 7)])
++def test_switched_four_ranks_exchange_directly_with_the_same_bits(topology, bounds):
++    """Behind a switch (``SPARKNET_ROCE_TOPOLOGY=direct``) four ranks send to every
++    peer, opposite rank included, in one group per exchange instead of the ring
++    relay's two; every part and every rank-order sum is the relay's, bit for bit."""
++    world, local, width = 4, bounds[-1], 24
++    torch.manual_seed(400 + len(bounds))
++    inputs = [
++        torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
++    ]
++    ring = _Fabric(world)
++    relayed = _run(inputs, _exchange_in_slices(bounds), ring)
++    whole_relayed = _run(inputs)
++    topology("direct")
++    switch = _Fabric(world, switched=True)
++    direct = _run(inputs, _exchange_in_slices(bounds), switch)
++    whole_direct = _run(inputs, fabric=_Fabric(world, switched=True))
++    exchanges = len(bounds) - 1
++    assert switch.pairs == {frozenset((a, b)) for a in range(4) for b in range(a)}
++    assert dict(switch.groups) == {rank: exchanges for rank in range(world)}
++    assert all(ring.groups[rank] > exchanges for rank in range(world))
++    for rank in range(world):
++        for r in range(world):
++            assert torch.equal(direct[rank].packed[r], relayed[rank].packed[r])
++        assert torch.equal(direct[rank].sum(), relayed[rank].sum())
++        assert torch.equal(whole_direct[rank], whole_relayed[rank])
++
++
++@pytest.mark.parametrize("value", [None, "", "ring4", "switched", "DIRECT"])
++def test_every_other_topology_keeps_the_ring_relay(topology, value):
++    """Only ``direct`` drops the relay: with any other value, or none, four ranks
++    exchange over the ring neighbours only (the ring fabric refuses the opposite
++    rank) and sum as before."""
++    topology(value)
++    world, local, width = 4, 5, 16
++    torch.manual_seed(4)
++    inputs = [
++        torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
++    ]
++    ring = _Fabric(world)
++    out = _run(inputs, fabric=ring)
++    assert ring.pairs == {frozenset((r, (r + 1) % 4)) for r in range(4)}
++    for rank in range(world):
++        rows = slice(rank * local, (rank + 1) * local)
++        assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))
++
++
++
+ @pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("rows", [1, 5, 8, 13])
+ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index b3308d30c..d8226e49c 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -355,13 +355,29 @@ class _Fabric:
+         self.barrier.wait()
+ 
+ 
++@pytest.fixture(params=[None, "direct"])
++def topology(request, monkeypatch):
++    """``SPARKNET_ROCE_TOPOLOGY`` unset (a ring, or any fabric) or ``direct`` (a
++    switch); ``ring4_relay`` caches its reading, so the cache is cleared around it."""
++    from vllm.distributed.device_communicators.pynccl import ring4_relay
++
++    if request.param is None:
++        monkeypatch.delenv("SPARKNET_ROCE_TOPOLOGY", raising=False)
++    else:
++        monkeypatch.setenv("SPARKNET_ROCE_TOPOLOGY", request.param)
++    ring4_relay.cache_clear()
++    yield request.param
++    ring4_relay.cache_clear()
++
++
+ @pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
+-def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
++def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
+     """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
+     rank's block of its real rows bit for bit and later rows stay unwritten, with the
+-    last blocks short or empty; at four ranks (the switchless ring) only neighbours
+-    exchange, since ranks two apart share no cable."""
++    last blocks short or empty; at four ranks on the switchless ring only neighbours
++    exchange, since ranks two apart share no cable, and behind a switch
++    (``SPARKNET_ROCE_TOPOLOGY=direct``) ranks two apart exchange directly."""
+     total = max(1, world * rows - short)
+     fabric = _Fabric(world)
+     inputs = [torch.randn(total, 6) for _ in range(world)]
+@@ -391,4 +407,7 @@ def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+             assert got[real:].isnan().all(), (me, source)
+     if world == 4:
+         ring = {frozenset((r, (r + 1) % 4)) for r in range(4)}
+-        assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
++        if topology is None:
++            assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
++        else:
++            assert fabric.pairs - ring, "no pair two apart exchanged directly"
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index 64d16a712..893ae14b5 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -4,6 +4,8 @@
+ 
+ # ===================== import region =====================
+ import contextlib
++import functools
++import os
+ import threading
+ 
+ import torch
+@@ -30,6 +32,17 @@ logger = init_logger(__name__)
+ _warmup_tls = threading.local()
+ 
+ 
++@functools.cache
++def ring4_relay() -> bool:
++    """Whether a four-rank exchange relays the opposite rank's rows through a
++    neighbour, as a switchless four-node ring needs (ranks two apart share no
++    cable). Only a fabric that reaches every peer in one hop says so: sparknet's
++    ``direct`` topology (``SPARKNET_ROCE_TOPOLOGY=direct``: every rank behind one
++    switch) exchanges straight with every peer. Any other value, or none, keeps
++    the relay, which works on every fabric."""
++    return os.environ.get("SPARKNET_ROCE_TOPOLOGY") != "direct"
++
++
+ def _warmup_deferred() -> bool:
+     return getattr(_warmup_tls, "deferred", False)
+ 
+@@ -569,7 +582,7 @@ class PyNcclCommunicator:
+         ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
+         rank (n its real rows, the same from every rank), and later rows are not
+         written. One grouped send/recv per peer; at four ranks, neighbours only
+-        (``_all_to_all_rows_ring``)."""
++        (``_all_to_all_rows_ring``) unless the fabric is ``direct`` (``ring4_relay``)."""
+         if self.disabled:
+             return
+         world, me, total = self.world_size, self.rank, input_.shape[0]
+@@ -587,7 +600,7 @@ class PyNcclCommunicator:
+         mine = real(me)
+         if mine:
+             output[me, :mine].copy_(input_[me * rows : me * rows + mine])
+-        if world == 4:
++        if world == 4 and ring4_relay():
+             self._all_to_all_rows_ring(output, input_, rows, real, stream)
+             return
+         self.group_start()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index b5b9fd46d..af5ef8571 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -11,9 +11,13 @@ the step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduc
+ (NCCL send/recv on the same communicator, the same bytes) and adds them as the
+ one-shot all-reduce does, so a row reduces to the same bits on every path.
+ 
+-At four ranks only the neighbours (rank +-1, the ring4 cable order sparknet and
+-NCCL use) exchange: each half of the opposite rank's chunk is relayed through one
+-neighbour, so the four links carry equal bytes. Other world sizes exchange directly.
++At four ranks only the neighbours (rank +-1, the cable order sparknet and NCCL use)
++exchange, as sparknet's switchless four-node ring needs: each half of the opposite
++rank's chunk is relayed through one neighbour, so the four links carry equal bytes.
++On a fabric that reaches every peer in one hop (``SPARKNET_ROCE_TOPOLOGY=direct``: a
++switch) every rank exchanges with every other directly, in one group
++(``ring4_relay``); the bytes and the rank-order sum are the same. Other world sizes
++exchange directly.
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -25,6 +29,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.distributed.device_communicators.pynccl import ring4_relay
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ _VEC = 8  # BF16 per thread: one 16-byte access
+@@ -298,7 +303,7 @@ def exchange_into(
+     ``chunks`` and ``parts`` are ``(world, L, ...)``, each ``[r]`` contiguous (a
+     row range of a larger buffer will do). ``comm`` is the group's PyNCCL
+     communicator (``send``, ``recv``, ``group_start``, ``group_end``)."""
+-    if world == 4:
++    if world == 4 and ring4_relay():
+         nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
+         half = -(-chunks.shape[1] // 2)
+         # Halves of the opposite rank's chunks, in transit: from the previous rank
+-- 
+2.43.0
+
