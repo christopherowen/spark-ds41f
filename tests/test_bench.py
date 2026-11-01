@@ -603,6 +603,7 @@ class BenchAbortCleanupTest(unittest.TestCase):
                 self.assertEqual(status, 1)
                 report = json.loads((Path(tmp) / "bench.json").read_text())
                 self.assertEqual(report["aborted"], "cooling failed: no zone")
+                self.assertEqual(report["workload"]["concurrency"], [1, 2, 4, 8, 16])
 
 
 class ReferenceShapeTest(unittest.TestCase):
