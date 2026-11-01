@@ -89,12 +89,7 @@ replaces NCCL with sparknet cannot run it, and it requires
 
 ## Qualification scope
 
-**Four nodes at TP4 is the only switched shape that has run on hardware.** A
-three-node switched map is accepted by the tooling — the validation is written
-for a clique of any size, and a triangle of peers is a valid one — but it is
-**unqualified**: no three-node switched deployment has been run, so run the
-collective probe before relying on one. Treat the four-node result above as the
-only measured one.
+**Four nodes at TP4 is the reference switched shape measured in this repository, and six nodes at TP6 has an external switched measurement ([experiments/2026-10-29-tp6-switch](../experiments/2026-10-29-tp6-switch/README.md)).** Switched maps of three to eight nodes (`TP3` through `TP8`) are accepted by the tooling (`scripts/topology.py`) and supported by the TileLang collectives, mHC, GLP steering, and MoE padding kernels (`0625`–`0628`), and `scripts/probe_collectives.py` accepts `--world-size` `2..8`. Shapes other than TP4 remain **unqualified** in the reference cluster until `bin/spark topology probe` and paired serving benchmarks are recorded on the target switch.
 
 ## Qualifying one
 

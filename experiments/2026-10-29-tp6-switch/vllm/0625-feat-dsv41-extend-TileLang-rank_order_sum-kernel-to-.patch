@@ -1,0 +1,323 @@
+From 5cb1b125bed1eb575a5bd185b04b705ed89fa706 Mon Sep 17 00:00:00 2001
+From: vedcsolution <226183072+vedcsolution@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:00:29 +0100
+Subject: [PATCH 625/628] feat(dsv41): extend TileLang rank_order_sum kernel to
+ 2..8 ranks
+
+Support rank-order FP32 reduction in rank_order_sum_kernel across world sizes 2..8 (MAX_RANK_ORDER_WORLD = 8) using distinct prim_func tensor annotations per source rank, and extend collectives unit and GPU tests across WORLDS = [2, 3, 4, 5, 6, 7, 8].
+---
+ .../test_deepseek_v41_tilelang_collectives.py |  29 ++--
+ .../deepseek_v4_1/tilelang/collectives.py     | 124 ++++++++++++------
+ 2 files changed, 107 insertions(+), 46 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 3ed7ba2..9f6f8ac 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -10,6 +10,7 @@ import pytest
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.tilelang.collectives import (
++    MAX_RANK_ORDER_WORLD,
+     RankOrderParts,
+     all_reduce_rank_order,
+     exchange_into,
+@@ -17,6 +18,9 @@ from vllm.models.deepseek_v4_1.tilelang.collectives import (
+     reduce_scatter_rank_order,
+ )
+ 
++WORLDS = [2, 3, 4, 5, 6, 7, 8]
++assert WORLDS[-1] == MAX_RANK_ORDER_WORLD
++
+ 
+ class _Fabric:
+     """Point-to-point links between simulated ranks. At four ranks only the ring
+@@ -116,7 +120,7 @@ def _reference(values):
+     return total.to(values[0].dtype)
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("local", [1, 4, 7])
+ def test_rows_add_as_the_one_shot_all_reduce(world, local):
+     torch.manual_seed(world * 10 + local)
+@@ -145,7 +149,7 @@ def _exchange_in_slices(bounds):
+     return collective
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("bounds", [(0, 7), (0, 3, 7), (0, 1, 2, 7)])
+ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
+     torch.manual_seed(world * 100 + len(bounds))
+@@ -163,7 +167,7 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
+         assert torch.equal(sliced[rank].sum(), whole[rank])
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("rows", [1, 5, 8, 13])
+ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+     # Every rank gets every row, each summed in rank order with one rounding,
+@@ -178,7 +182,7 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+         assert torch.equal(out[rank], want)
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("rows", [1, 5, 13])
+ def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
+     """The padding rows are zeroed by TileLang's fill (stood in for on the host),
+@@ -215,11 +219,12 @@ def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
+         assert torch.equal(out[rank], want)
+ 
+ 
+-def test_row_bits_do_not_depend_on_owner_or_batch():
++@pytest.mark.parametrize("world", [4, 5, 6, 7, 8])
++def test_row_bits_do_not_depend_on_owner_or_batch(world):
+     # One row's partials at every position of batches of two sizes: the reduced
+     # row has the same bits wherever it lands and whichever rank owns it.
+-    torch.manual_seed(1)
+-    world, width = 4, 64
++    torch.manual_seed(world)
++    width = 64
+     row = [torch.randn(width).to(torch.bfloat16) * 10**k for k in range(world)]
+     results = set()
+     for local in (3, 6):
+@@ -244,6 +249,12 @@ def test_torch_sum_leaves_its_inputs(dtype):
+     assert torch.equal(rank_order_sum(parts), first)
+ 
+ 
++def test_nine_or_more_parts_fall_back_to_torch_in_rank_order():
++    torch.manual_seed(9)
++    parts = [torch.randn(5, 16).to(torch.bfloat16) * 10**k for k in range(9)]
++    assert torch.equal(rank_order_sum(parts), _reference(parts))
++
++
+ def test_one_rounding_differs_from_rounding_each_add():
+     # FP32 accumulation is observable: rounding after each BF16 add (as NCCL does
+     # per hop) gives other bits, so the tests above would catch it.
+@@ -256,7 +267,7 @@ def test_one_rounding_differs_from_rounding_each_add():
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ def test_tilelang_sum_rounds_as_float32_in_rank_order(world):
+     torch.manual_seed(world)
+     parts = [
+@@ -311,7 +322,7 @@ def _assert_same_bits(got, want):
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize(
+     "shard, dtype",
+     [
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 5ed772e..8e834a9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -3,17 +3,17 @@
+ """A reduce-scatter with the one-shot all-reduce's arithmetic.
+ 
+ sparknet's one-shot all-reduce adds the ranks' BF16 partials in FP32 in rank order
+-(source 0, then 1, 2, 3) and rounds once, so a row has the same bits whatever the
+-message size, the row's position or the rank. NCCL's reduce-scatter, which prefill
+-sequence parallelism uses from 205 rows, adds a chunk around the ring starting
+-after its owner and rounds to BF16 after every hop: a row's bits change with the
+-step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduced
++(source 0, then 1, 2, ..., world - 1) and rounds once, so a row has the same bits
++whatever the message size, the row's position or the rank. NCCL's reduce-scatter,
++which prefill sequence parallelism uses from 205 rows, adds a chunk around the ring
++starting after its owner and rounds to BF16 after every hop: a row's bits change with
++the step's row count. ``reduce_scatter_rank_order`` exchanges the chunks unreduced
+ (NCCL send/recv on the same communicator, the same bytes) and adds them as the
+ one-shot all-reduce does, so a row reduces to the same bits on every path.
+ 
+ At four ranks only the neighbours (rank +-1, the ring4 cable order sparknet and
+ NCCL use) exchange: each half of the opposite rank's chunk is relayed through one
+-neighbour, so the four links carry equal bytes. Fewer ranks exchange directly.
++neighbour, so the four links carry equal bytes. Other world sizes exchange directly.
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -28,13 +28,14 @@ import torch
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ _VEC = 8  # BF16 per thread: one 16-byte access
++MAX_RANK_ORDER_WORLD = 8
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def rank_order_sum_kernel(world: int, threads: int = 256):
+-    """``out = bf16(((s0 + s1) + s2) + s3)`` in FP32, element by element; the
++    """``out = bf16(((s0 + s1) + s2) + ...)`` in FP32, element by element; the
+     first source is taken as is (not added to zero), so signed zeros survive."""
+-    assert 2 <= world <= 4
++    assert 2 <= world <= MAX_RANK_ORDER_WORLD
+     m = T.dynamic("m")  # groups of _VEC elements
+ 
+     @T.macro
+@@ -54,6 +55,18 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+         for i in T.vectorized(_VEC):
+             out[row, i] = xs[i]
+ 
++    @T.macro
++    def sum_rows(sources, out):
++        with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
++            row = bx * threads + T.get_thread_binding()
++            xs = T.alloc_local((_VEC,), T.bfloat16)
++            total = T.alloc_local((_VEC,), T.float32)
++            if row < m:
++                load(sources[0], xs, total, row, True)
++                for src in sources[1:]:
++                    load(src, xs, total, row, False)
++                store(out, xs, total, row)
++
+     if world == 2:
+ 
+         @T.prim_func
+@@ -62,14 +75,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+             s1: T.Tensor((m, _VEC), T.bfloat16),
+             out: T.Tensor((m, _VEC), T.bfloat16),
+         ):
+-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
+-                row = bx * threads + T.get_thread_binding()
+-                xs = T.alloc_local((_VEC,), T.bfloat16)
+-                total = T.alloc_local((_VEC,), T.float32)
+-                if row < m:
+-                    load(s0, xs, total, row, True)
+-                    load(s1, xs, total, row, False)
+-                    store(out, xs, total, row)
++            sum_rows((s0, s1), out)
+ 
+     elif world == 3:
+ 
+@@ -80,15 +86,61 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+             s2: T.Tensor((m, _VEC), T.bfloat16),
+             out: T.Tensor((m, _VEC), T.bfloat16),
+         ):
+-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
+-                row = bx * threads + T.get_thread_binding()
+-                xs = T.alloc_local((_VEC,), T.bfloat16)
+-                total = T.alloc_local((_VEC,), T.float32)
+-                if row < m:
+-                    load(s0, xs, total, row, True)
+-                    load(s1, xs, total, row, False)
+-                    load(s2, xs, total, row, False)
+-                    store(out, xs, total, row)
++            sum_rows((s0, s1, s2), out)
++
++    elif world == 4:
++
++        @T.prim_func
++        def collectives_rank_order_sum(
++            s0: T.Tensor((m, _VEC), T.bfloat16),
++            s1: T.Tensor((m, _VEC), T.bfloat16),
++            s2: T.Tensor((m, _VEC), T.bfloat16),
++            s3: T.Tensor((m, _VEC), T.bfloat16),
++            out: T.Tensor((m, _VEC), T.bfloat16),
++        ):
++            sum_rows((s0, s1, s2, s3), out)
++
++    elif world == 5:
++
++        @T.prim_func
++        def collectives_rank_order_sum(
++            s0: T.Tensor((m, _VEC), T.bfloat16),
++            s1: T.Tensor((m, _VEC), T.bfloat16),
++            s2: T.Tensor((m, _VEC), T.bfloat16),
++            s3: T.Tensor((m, _VEC), T.bfloat16),
++            s4: T.Tensor((m, _VEC), T.bfloat16),
++            out: T.Tensor((m, _VEC), T.bfloat16),
++        ):
++            sum_rows((s0, s1, s2, s3, s4), out)
++
++    elif world == 6:
++
++        @T.prim_func
++        def collectives_rank_order_sum(
++            s0: T.Tensor((m, _VEC), T.bfloat16),
++            s1: T.Tensor((m, _VEC), T.bfloat16),
++            s2: T.Tensor((m, _VEC), T.bfloat16),
++            s3: T.Tensor((m, _VEC), T.bfloat16),
++            s4: T.Tensor((m, _VEC), T.bfloat16),
++            s5: T.Tensor((m, _VEC), T.bfloat16),
++            out: T.Tensor((m, _VEC), T.bfloat16),
++        ):
++            sum_rows((s0, s1, s2, s3, s4, s5), out)
++
++    elif world == 7:
++
++        @T.prim_func
++        def collectives_rank_order_sum(
++            s0: T.Tensor((m, _VEC), T.bfloat16),
++            s1: T.Tensor((m, _VEC), T.bfloat16),
++            s2: T.Tensor((m, _VEC), T.bfloat16),
++            s3: T.Tensor((m, _VEC), T.bfloat16),
++            s4: T.Tensor((m, _VEC), T.bfloat16),
++            s5: T.Tensor((m, _VEC), T.bfloat16),
++            s6: T.Tensor((m, _VEC), T.bfloat16),
++            out: T.Tensor((m, _VEC), T.bfloat16),
++        ):
++            sum_rows((s0, s1, s2, s3, s4, s5, s6), out)
+ 
+     else:
+ 
+@@ -98,18 +150,13 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+             s1: T.Tensor((m, _VEC), T.bfloat16),
+             s2: T.Tensor((m, _VEC), T.bfloat16),
+             s3: T.Tensor((m, _VEC), T.bfloat16),
++            s4: T.Tensor((m, _VEC), T.bfloat16),
++            s5: T.Tensor((m, _VEC), T.bfloat16),
++            s6: T.Tensor((m, _VEC), T.bfloat16),
++            s7: T.Tensor((m, _VEC), T.bfloat16),
+             out: T.Tensor((m, _VEC), T.bfloat16),
+         ):
+-            with T.Kernel(T.ceildiv(m, threads), threads=threads) as bx:
+-                row = bx * threads + T.get_thread_binding()
+-                xs = T.alloc_local((_VEC,), T.bfloat16)
+-                total = T.alloc_local((_VEC,), T.float32)
+-                if row < m:
+-                    load(s0, xs, total, row, True)
+-                    load(s1, xs, total, row, False)
+-                    load(s2, xs, total, row, False)
+-                    load(s3, xs, total, row, False)
+-                    store(out, xs, total, row)
++            sum_rows((s0, s1, s2, s3, s4, s5, s6, s7), out)
+ 
+     return collectives_rank_order_sum
+ 
+@@ -124,7 +171,9 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
+     group = get_tp_group()
+     world = group.world_size
+     comm = group.device_communicator
+-    if not 2 <= world <= 4 or not getattr(comm, "rank_order_reduce_scatter", False):
++    if not 2 <= world <= MAX_RANK_ORDER_WORLD or not getattr(
++        comm, "rank_order_reduce_scatter", False
++    ):
+         return []
+     return [prepare.call(rank_order_sum_kernel, world)]
+ 
+@@ -224,7 +273,7 @@ def rank_order_sum(
+     if (
+         parts[0].is_cuda
+         and parts[0].dtype == torch.bfloat16
+-        and 2 <= len(parts) <= 4
++        and 2 <= len(parts) <= MAX_RANK_ORDER_WORLD
+         and n % _VEC == 0
+         and all(p.is_contiguous() for p in parts)
+         and out.is_contiguous()
+@@ -359,6 +408,7 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
+ 
+ 
+ __all__ = [
++    "MAX_RANK_ORDER_WORLD",
+     "RankOrderParts",
+     "all_reduce_rank_order",
+     "exchange_into",
+-- 
+2.54.0 (Apple Git-157)
+

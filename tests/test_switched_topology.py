@@ -25,8 +25,16 @@ def fixture(count=4, shape='tp4-ring'):
                                   'NCCL_SWITCHLESS_BIDIRECTIONAL', 'NCCL_MIN_TRAFFIC_PER_CHANNEL',
                                   'NCCL_THREAD_THRESHOLDS')}
     cluster['distributed']['master_addr'] = '192.0.2.11'
+    for flag in ('--tensor-parallel-size', '--nnodes'):
+        topology.set_argument(cluster, flag, str(count))
+    spec = spark.json.loads(topology.argument(cluster, '--speculative-config') or '{}')
+    if spec:
+        spec['draft_tensor_parallel_size'] = count
+        topology.set_argument(cluster, '--speculative-config',
+                              spark.json.dumps(spec, separators=(',', ':')))
     nodes = {'schema_version': 1, 'nodes': []}
-    for rank, name in enumerate(('dgx1', 'dgx2', 'dgx3', 'dgx4')[:count]):
+    for rank in range(count):
+        name = f'dgx{rank + 1}'
         suffix = '1' if rank < 2 else '0'
         rails = [f'rocep1s0f{suffix}', f'roceP2p1s0f{suffix}']
         nodes['nodes'].append(dict(name=name, rank=rank, head=rank == 0,
@@ -114,6 +122,16 @@ class SwitchedTopologyTest(unittest.TestCase):
         # says so and the collective probe is the gate.
         cluster, nodes = fixture(count=3, shape='tp3-triangle')
         self.assertEqual(topology.problems(cluster, nodes), [])
+
+    def test_switched_maps_accept_three_to_eight_nodes_and_reject_outside_bounds(self):
+        for count in (3, 4, 5, 6, 7, 8):
+            with self.subTest(count=count):
+                cluster, nodes = fixture(count=count)
+                self.assertEqual(topology.problems(cluster, nodes), [])
+        for bad_count in (2, 9):
+            with self.subTest(bad_count=bad_count):
+                cluster, nodes = fixture(count=bad_count)
+                self.assertTrue(topology.problems(cluster, nodes))
 
     def test_nccl_switched_needs_plain_nccl_and_no_sparknet_settings(self):
         cluster, nodes = fixture()
