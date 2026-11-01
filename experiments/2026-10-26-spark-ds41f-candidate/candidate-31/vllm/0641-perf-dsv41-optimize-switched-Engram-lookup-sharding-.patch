@@ -1,7 +1,7 @@
 From 045e22bb0f94529422d4af7a3a78160c67bc198f Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 06:18:36 +0000
-Subject: [PATCH 642/651] perf(dsv41): optimize switched Engram lookup/sharding
+Subject: [PATCH 641/650] perf(dsv41): optimize switched Engram lookup/sharding
  and decode GEMM tiles
 
 1. Pass token_count=indices.shape[0] and clear_tail=False in resident Engram prepare_embeddings and share prepared_engram_hashes across resident Engram layers so decode steps launch (M, 24, 1) CTAs instead of (16384, 24, 1) CTAs and skip 201 MB tail memsets (~2.1 ms/step saved on TP6..TP8).
