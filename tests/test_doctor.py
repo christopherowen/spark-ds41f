@@ -1140,6 +1140,13 @@ class NewUserOnboardingTest(unittest.TestCase):
         findings = spark.live_doctor(cluster, nodes)
         self.assertEqual(len(findings), 1)
         self.assertIn("example placeholder addresses (192.0.2.x)", findings[0])
+        args = spark.argparse.Namespace(cluster_config="config/cluster.json", shape=None, live=False, verbose=False)
+        with (
+            mock.patch.object(spark, "configuration", return_value=(cluster, nodes, {})),
+            mock.patch.object(spark, "local_doctor", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(spark.command_doctor(args), 0)
 
     def test_ssh_resolution_problem_checks_ssh_config_or_dns(self) -> None:
         nodes = {"ssh_user": "ubuntu", "nodes": [{"name": "unresolvable-label-xyz", "management_ip": "192.168.20.10"}]}
