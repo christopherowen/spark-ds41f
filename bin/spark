@@ -6277,6 +6277,8 @@ def command_bench(args: argparse.Namespace) -> int:
     args.model = serve_arg(cluster, "--served-model-name")
     args.max_model_len = int(serve_arg(cluster, "--max-model-len"))
     max_seqs = int(serve_arg(cluster, "--max-num-seqs") or 1)
+    if args.concurrency is None:
+        args.concurrency = [c for c in (1, 2, 4, 8, 16) if c <= max_seqs]
     if not args.concurrency or max(args.concurrency) > max_seqs or min(args.concurrency) < 1:
         raise SystemExit(f"--concurrency values must be between 1 and --max-num-seqs ({max_seqs})")
     args.decode_cases = list(dict.fromkeys(
@@ -6686,7 +6688,12 @@ def parser() -> argparse.ArgumentParser:
     )
     bench.add_argument("--min-samples", type=int, help="default 3, or 6 with --full")
     bench.add_argument("--max-samples", type=int, help="default 4, or 40 with --full")
-    bench.add_argument("--concurrency", type=int_list, default=[1, 2, 4, 8])
+    bench.add_argument(
+        "--concurrency",
+        type=int_list,
+        default=None,
+        help="comma-separated decode concurrencies (default: 1,2,4,8, plus 16 when --max-num-seqs >= 16)",
+    )
     bench.add_argument(
         "--decode-cases",
         type=lambda value: [case.strip() for case in value.split(",") if case.strip()],

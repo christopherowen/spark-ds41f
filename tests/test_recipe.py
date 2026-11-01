@@ -430,9 +430,9 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(values["engram_on_disk"], "true")
         self.assertEqual(values["engram_table_memory"], "disk")
 
-    def test_engram_on_disk_is_off_for_tp6_through_tp8(self):
-        """TP3..TP5 keep Engram tables on disk; TP6..TP8 set engram_on_disk to false so
-        --engram-config renders table_memory="device"."""
+    def test_engram_on_disk_is_true_for_all_shapes(self):
+        """All shapes explicitly set engram_on_disk to true (--engram-config table_memory="disk"),
+        and an overlay can set engram_on_disk to false for table_memory="device"."""
         self.assertIs(self.recipe["engram_on_disk"], True)
         expected = {
             "tp3-triangle": True,
@@ -441,9 +441,9 @@ class RecipeTest(unittest.TestCase):
             "tp4-ring": True,
             "tp4-switched": True,
             "tp5-switched": True,
-            "tp6-switched": False,
-            "tp7-switched": False,
-            "tp8-switched": False,
+            "tp6-switched": True,
+            "tp7-switched": True,
+            "tp8-switched": True,
         }
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, on_disk in expected.items():
