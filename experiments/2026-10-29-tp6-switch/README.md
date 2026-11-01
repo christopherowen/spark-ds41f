@@ -2,7 +2,7 @@
 
 ## What this changes
 
-Five vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–`0629`), together with switched-topology and collective-probe support for `TP3..TP8`:
+Six vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–`0630`), together with switched-topology and collective-probe support for `TP3..TP8`:
 
 - **`0625` — TileLang `rank_order_sum` for 2..8 ranks** (`vllm/models/deepseek_v4_1/tilelang/collectives.py`, `tests/kernels/test_deepseek_v41_tilelang_collectives.py`).
   - Raises `MAX_RANK_ORDER_WORLD` to `8`, bounding `rank_order_sum_kernel`, `rank_order_sum_calls`, and `rank_order_sum` together so the kernel launched in the forward pass is always declared during warmup.
@@ -19,6 +19,11 @@ Five vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–
   - When `moe_intermediate_size` is padded (`TP5` rank 4, `TP7` rank 6, and `TP8` all ranks), `RoutedExperts._load_w2` narrows `w2_weight` and `w2_weight_scale` along the column dimension (`destination[:, :narrow_size]`), so `destination_stride > bytes * (1 + expand_bf16)`. Previously, `_batch.c` only allowed `chunk_rows > 1` when `destination_stride == bytes * (1 + expand_bf16)`, splitting every 2560-row `w2.weight` (`144` bytes/row into stride `160` at `TP8`) and `w2.weight_scale` (`9` bytes/row into stride `10` at `TP8`) into `2560` single-row jobs (`~112.7M` 4 KiB `O_DIRECT` reads = `684.55 GB` read from disk and `1540.5 s` target weight load on `TP8`).
   - `_batch.c` now batches `chunk_rows > 1` whenever `source_stride >= bytes` and `destination_stride >= bytes * (1 + expand_bf16)`, and checks 2D strided row intervals when destination bounding boxes overlap so disjoint column slices batch cleanly while overlapping 2D slices are still rejected before writing any destination bytes.
   - On `spaceport` (`sp1`–`sp8`, `tp8-switched`), this reduces `TP8` target weight loading from `1540.48 s` (`684.55 GB` read from disk) to `18.61 s` (`125.55 GB` read from disk, `2.10 GB/s`), and total model loading from `1550.3 s` to `28.44 s` (`54.5x` speedup).
+- **`0630` — Optimize switched resident/disk Engram, `TP3..TP8` decode GEMM tiles, and idle-wakeup burst admission** (`vllm/models/deepseek_v4_1/common/engram.py`, `vllm/models/deepseek_v4_1/tilelang/engram_rows.py`, `vllm/models/deepseek_v4_1/nvidia/model.py`, `vllm/models/deepseek_v4_1/tilelang/gemm.py`, `vllm/v1/engine/core.py`).
+  - Passes `token_count=indices.shape[0]` and `clear_tail=False` in resident Engram `prepare_embeddings` and shares `prepared_engram_hashes` across resident Engram layers so `TP6..TP8` (`table_memory == "device"`) launch `(M, 24, 1)` CTAs instead of `(16384, 24, 1)` CTAs (`786,432` CTAs and `402.6 MB` HBM zeros/step eliminated, saving `~2.1 ms/step`).
+  - Generalizes disk Engram `column_shard`, `engram_rows_gather_kernel`, and `interleaved_rows` to support any `1 <= tp_size <= 24` (including `TP5` and `TP7` where `24 % tp_size != 0`) via padded per-rank column strides (`max_columns = ceil(24 / tp_size)`), eliminating `TP5` Rank 4's contiguous 4-gram head skew and 6144-wide all-reduce.
+  - Adds `TP3, TP5, TP6, TP7, TP8` decode MXFP8 GEMM tile configs to `DECODE_FP8_CONFIGS` and `WIDE_DECODE`, and tunes `block_M = 32` configs for `(4096, 1280)`, `(896, 15360)`, and `WO-B` (`(5120, 3072/2048/1024)`).
+  - Coalesces concurrent burst arrivals for up to `6 ms` when `EngineCoreProc` wakes from idle into step 0 so multi-stream request bursts (`c2, c4, c8, c16`) enter step 0 together instead of splitting `1 + (N-1)` and desynchronizing routed MoE expert activation.
 
 ### Per-rank geometry across `TP3..TP8`
 
