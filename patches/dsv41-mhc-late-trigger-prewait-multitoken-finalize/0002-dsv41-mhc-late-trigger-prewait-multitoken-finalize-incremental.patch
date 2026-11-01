@@ -1,0 +1,189 @@
+From 71803d6b3eba9bef29d3bbe2cfa042ceea79d6fd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:40:07 +0100
+Subject: [PATCH] Optimize multi-token mHC project+finalize with late PDL
+ trigger, split claim/wait, and pre-wait preload
+
+---
+ .../kernels/test_deepseek_v41_tilelang_mhc.py | 30 ++++++++
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 76 ++++++++++++++-----
+ 2 files changed, 85 insertions(+), 21 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 9b2fe2af1..1ac3bfe6a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -955,3 +955,33 @@ def test_post_collapse_norm_matches_separate_kernels(mhc, tokens, column):
+     if column >= 0:
+         assert_same_nonfinite(cols_out, expected_cols)
+         _assert_bits_equal(cols_out, expected_cols, "columns: ")
++
++
++def test_project_and_finalize_uses_late_pdl_trigger_and_split_claim():
++    """project_and_finalize_streams triggers PDL only after Stage 1 + mhc_claim
++    and overlaps weight/scale/base preloads with mhc_wait_splits."""
++    from tests.kernels.deepseek_v41_pdl_sources import TRIGGER, WAIT, functions
++
++    fused = project_and_finalize_streams(
++        HIDDEN,
++        "post_pre",
++        4 * HIDDEN,
++        CONFIG.rms_norm_eps,
++        CONFIG.hc_eps,
++        CONFIG.hc_sinkhorn_iters,
++        CONFIG.rms_norm_eps,
++        block_M=BLOCK_M,
++    )
++    src = fused.get_kernel_source()
++    assert "mhc_claim(" in src
++    assert "mhc_wait_splits(" in src
++    assert "nanosleep.u32 32;" in src
++    bodies = [body for _, _, body in functions(src)]
++    assert bodies
++    for body in bodies:
++        wait_pdl_pos = body.index(WAIT)
++        claim_pos = body.index("mhc_claim(")
++        trigger_pos = body.index(TRIGGER)
++        wait_splits_pos = body.index("mhc_wait_splits(")
++        assert wait_pdl_pos < claim_pos < trigger_pos < wait_splits_pos
++
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index f1dbe3d98..93ae5fb04 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -86,20 +86,39 @@ _FUSE_HEADER = r"""
+ #include <tl_templates/cuda/common.h>
+ #include <tl_templates/cuda/cuda_fp8.h>
+ __device__ __forceinline__ void mhc_fence() { __threadfence(); }
+-__device__ __forceinline__ int mhc_claim_and_wait(int* counter, int splits, int live_m) {
++__device__ __forceinline__ int mhc_claim(int* counter, int splits, int live_m) {
+     int arrived = atomicAdd(counter, 1);
+     int rank = splits - 1 - arrived;
+     if (rank >= live_m) {
+         return -1;
+     }
+-    int val;
+-    do {
++    if (live_m == 1) {
++#if __CUDA_ARCH__ >= 700
++        asm volatile("st.global.release.gpu.b32 [%0], 0;" :: "l"(counter));
++#else
++        *reinterpret_cast<volatile int*>(counter) = 0;
++#endif
++    }
++    return rank;
++}
++__device__ __forceinline__ void mhc_wait_splits(int* counter, int splits, int live_m, int rank) {
++    if (live_m <= 1) {
++        return;
++    }
++    if (rank > 0) {
++        int val;
+ #if __CUDA_ARCH__ >= 700
+         asm volatile("ld.global.acquire.gpu.b32 %0, [%1];" : "=r"(val) : "l"(counter));
++        while (val < splits) {
++            asm volatile("nanosleep.u32 32;");
++            asm volatile("ld.global.acquire.gpu.b32 %0, [%1];" : "=r"(val) : "l"(counter));
++        }
+ #else
+-        val = *reinterpret_cast<const volatile int*>(counter);
++        do {
++            val = *reinterpret_cast<const volatile int*>(counter);
++        } while (val < splits);
+ #endif
+-    } while (val < splits);
++    }
+     __threadfence();
+     int done = atomicAdd(counter, 1);
+     if (done == splits + live_m - 1) {
+@@ -109,7 +128,6 @@ __device__ __forceinline__ int mhc_claim_and_wait(int* counter, int splits, int
+         *reinterpret_cast<volatile int*>(counter) = 0;
+ #endif
+     }
+-    return rank;
+ }
+ """
+ 
+@@ -616,13 +634,13 @@ def project_and_finalize_streams(
+         by,
+     ):
+         T.import_source(_FUSE_HEADER)
+-        pdl.chain()
++        pdl.wait()
+         h0 = sp * block_H
+         A_shared = T.alloc_shared((block_M, block_H), T.float32)
+         F_shared = T.alloc_shared((N, block_H), T.float32)
+         F_mid = T.alloc_shared((N, block_H), T.float32)
+         F_low = T.alloc_shared((N, block_H), T.float32)
+-        my_tok = T.alloc_shared((1,), T.int32)
++        my_rank = T.alloc_shared((1,), T.int32)
+         C_local = T.alloc_fragment((block_M, N), T.float32)
+         xv = T.alloc_local((COLS,), T.bfloat16)
+         xp = T.alloc_local((world * COLS,), T.bfloat16)
+@@ -775,25 +793,43 @@ def project_and_finalize_streams(
+ 
+         T.call_extern("handle", "mhc_fence")
+         T.sync_threads()
++        live_m = T.min(M - by * block_M, block_M)
+         if tx == 0:
+-            live_m = T.min(M - by * block_M, block_M)
+-            rank = T.call_extern(
++            my_rank[0] = T.call_extern(
+                 "int32",
+-                "mhc_claim_and_wait",
++                "mhc_claim",
+                 T.access_ptr(counters[by], "rw", 1),
+                 splits,
+                 live_m,
+             )
+-            my_tok[0] = T.if_then_else(rank >= 0, by * block_M + rank, -1)
+         T.sync_threads()
+-        tok = my_tok[0]
+-        if tok >= 0:
++        pdl.trigger()
++        rank = my_rank[0]
++        if rank >= 0:
++            tok = by * block_M + rank
++            if tx < 24:
++                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
++                s_val[0] = scale[scale_idx]
++                b_val[0] = base[mix_idx]
++            elif tx >= 32:
++                worker = tx - 32
++                for step in T.unroll(steps):
++                    chunk = step * workers + worker
++                    if chunk < chunks:
++                        for v in T.vectorized(VEC):
++                            wv[step * VEC + v] = weight[chunk * VEC + v]
++            if tx == 0:
++                T.call_extern(
++                    "handle",
++                    "mhc_wait_splits",
++                    T.access_ptr(counters[by], "rw", 1),
++                    splits,
++                    live_m,
++                    rank,
++                )
++            T.sync_threads()
+             if tx < 32:
+-                if tx < 24:
+-                    mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
+-                    scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
+-                    s_val[0] = scale[scale_idx]
+-                    b_val[0] = base[mix_idx]
+                 rms_l[0] = 0.0
+                 p_acc[0] = 0.0
+                 cm_l[0] = 0.0
+@@ -842,8 +878,6 @@ def project_and_finalize_streams(
+                 for step in T.unroll(steps):
+                     chunk = step * workers + worker
+                     if chunk < chunks:
+-                        for v in T.vectorized(VEC):
+-                            wv[step * VEC + v] = weight[chunk * VEC + v]
+                         for v in T.vectorized(VEC):
+                             yv[step * VEC + v] = C[tok, chunk * VEC + v]
+                 total[0] = 0.0
+-- 
+2.54.0 (Apple Git-157)
+
