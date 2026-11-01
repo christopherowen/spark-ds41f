@@ -95,7 +95,7 @@ def correctness_shapes(itemsize: int, limits=()) -> list[tuple[int, int]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, required=True)
-    parser.add_argument("--world-size", type=int, choices=(3, 4), required=True)
+    parser.add_argument("--world-size", type=int, choices=(2, 3, 4, 5, 6, 7, 8), required=True)
     parser.add_argument("--master-addr", required=True)
     parser.add_argument("--master-port", type=int, required=True)
     parser.add_argument("--benchmark", action="store_true",
@@ -223,9 +223,17 @@ def main() -> None:
         # inputs distinguish floating reduction order from transport corruption.
         for dtype in (torch.bfloat16, torch.float32):
             base = torch.arange(64, dtype=torch.float32) % 8
-            inputs = [(base + 1) * 16777216, (base + 1) / 16,
-                      -(base + 1) * 16777216, (base + 1) / 32]
-            inputs = [v.to(dtype) for v in inputs]
+            patterns = [
+                (base + 1) * 16777216,
+                (base + 1) / 16,
+                -(base + 1) * 16777216,
+                (base + 1) / 32,
+                (base + 1) / 64,
+                (base + 1) / 128,
+                (base + 1) / 256,
+                (base + 1) / 512,
+            ]
+            inputs = [v.to(dtype) for v in patterns[:args.world_size]]
             reference = inputs[0].float()
             for v in inputs[1:]: reference = reference + v.float()
             reference = reference.to(dtype)

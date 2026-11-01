@@ -123,9 +123,12 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 "target; either rename the node to its SSH target or add an SSH Host alias"
             )
     count = len(entries)
-    if count not in (3, 4):
-        errors.append(f"deployment requires 3 or 4 nodes, got {count}")
     mode = transport(cluster)
+    if switched(mode):
+        if not 3 <= count <= 8:
+            errors.append(f"switched deployment requires 3 to 8 nodes, got {count}")
+    elif count not in (3, 4):
+        errors.append(f"deployment requires 3 or 4 nodes, got {count}")
     settings = cluster.get("environment", {})
     if mode is None:
         errors.append("fabric.transport is required; a configuration without one ran B12X's "

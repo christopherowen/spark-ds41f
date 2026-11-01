@@ -24,7 +24,7 @@ class PackedShapeTest(unittest.TestCase):
                     self.assertEqual(width * itemsize % 16, 0)
                     # Mirrors all_reduce_rank_order's padded rows and zero_ slice:
                     # both the start address offset and fill size must be packs.
-                    for world in (3, 4):
+                    for world in (2, 3, 4, 5, 6, 7, 8):
                         padded = -(-rows // world) * world
                         self.assertEqual(rows * width * itemsize % 16, 0)
                         self.assertEqual((padded - rows) * width * itemsize % 16, 0)
