@@ -1,0 +1,881 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:52:10 +0000
+Subject: [PATCH] feat(v1): make loop detection default and harden windowed
+ detector
+
+---
+ tests/v1/core/test_repetition_detection.py    | 274 ++++++++++++------
+ .../openai/chat_completion/protocol.py        |  20 +-
+ vllm/entrypoints/openai/responses/protocol.py |  20 +-
+ vllm/v1/core/sched/scheduler.py               |  40 ++-
+ vllm/v1/core/sched/utils.py                   | 189 ++++++++----
+ vllm/v1/request.py                            |   6 +-
+ 6 files changed, 348 insertions(+), 201 deletions(-)
+
+diff --git a/tests/v1/core/test_repetition_detection.py b/tests/v1/core/test_repetition_detection.py
+index 70e56970b..aa7d90141 100644
+--- a/tests/v1/core/test_repetition_detection.py
++++ b/tests/v1/core/test_repetition_detection.py
+@@ -6,6 +6,7 @@ from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+ from vllm.v1.core.sched.utils import (
+     check_sequence_repetition,
+     check_stop,
++    detect_thinking_loop,
+     has_thinking_loop,
+ )
+ from vllm.v1.request import Request, RequestStatus
+@@ -316,10 +317,12 @@ class TestRepetitionDetectionIntegration:
+ 
+         # Contiguous 4x repeat of 6-token phrase
+         assert has_thinking_loop(let_me_do_it * 4)
++        assert detect_thinking_loop(let_me_do_it * 4) == ("contiguous_phrase", 6, 4)
+ 
+         # Interspersed 3x A + B + 2x A (shared ".\n" suffix between B and A)
+         interspersed = let_me_do_it * 3 + read_lines + let_me_do_it * 2
+         assert has_thinking_loop(interspersed)
++        assert detect_thinking_loop(interspersed) == ("windowed_phrase", 6, 5)
+ 
+         # Double interjection: 2x A + B + 2x A + C + 1x A
+         double_inter = (
+@@ -330,10 +333,48 @@ class TestRepetitionDetectionIntegration:
+             + let_me_do_it
+         )
+         assert has_thinking_loop(double_inter)
++        assert detect_thinking_loop(double_inter) == ("windowed_phrase", 6, 5)
+ 
+         # Normal varied reasoning trace should not trigger
+         varied = list(range(500, 700))
+         assert not has_thinking_loop(varied)
++        assert detect_thinking_loop(varied) is None
++
++    def test_windowed_parallel_enumeration_does_not_false_positive(self):
++        """Parallel list enumerations (e.g. Rank 0..4 with shared 7-token suffix)
++        have zero contiguous A + A pairs and must not false-positive."""
++        shared_suffix = [10, 11, 12, 13, 14, 15, 198]  # " shard is aligned to 16 bytes.\n"
++        parallel_enum = []
++        for rank in range(5):
++            parallel_enum.extend([500, rank] + shared_suffix)
++        assert not has_thinking_loop(parallel_enum)
++        assert detect_thinking_loop(parallel_enum) is None
++
++    def test_short_pattern_min_span_24_tokens(self):
++        """Short 2-token and 4-token patterns require a >= 24-token repeated span
++        so 8-element array initializers or short table borders do not misfire."""
++        # 8x 2-token (", 0" * 8 = 16 tokens) and 4x 4-token (16 tokens) must not trigger
++        assert not has_thinking_loop([44, 48] * 8)
++        assert not has_thinking_loop([91, 92, 93, 94] * 4)
++
++        # 12x 2-token (24 tokens) and 6x 4-token (24 tokens) must trigger
++        assert detect_thinking_loop([44, 48] * 12) == ("contiguous_short", 2, 12)
++        assert detect_thinking_loop([91, 92, 93, 94] * 6) == ("contiguous_phrase", 4, 6)
++
++    def test_windowed_multi_clause_loop_beyond_two_internal_suffix_matches(self):
++        """When internal clauses of a repeating paragraph share a >= 5-token ending,
++        _find_windowed_repeating_pattern scans up to 4 candidate periods to find the
++        full repeating phrase."""
++        shared_clause_end = [901, 902, 903, 13, 198]
++        clause_1 = [801, 802] + shared_clause_end
++        clause_2 = [811, 812] + shared_clause_end
++        clause_3 = [821, 822] + shared_clause_end
++        paragraph = clause_1 + clause_2 + clause_3
++        interjection = [701, 702, 703, 13, 198]
++        trace = paragraph * 3 + interjection + paragraph * 2
++        info = detect_thinking_loop(trace)
++        assert info is not None
++        assert info[0] == "windowed_phrase"
+ 
+     def test_thinking_loop_break_forces_end_then_recovers(self):
+         """Test that a loop inside <think> sets force_thinking_end without stopping,
+@@ -360,15 +401,14 @@ class TestRepetitionDetectionIntegration:
+             request.update_reasoning_markers(
+                 start_ids, end_ids, prev_num_output=prev_out
+             )
+-            stopped = check_stop(
+-                request, max_model_len=2048, thinking_loop_break=True
+-            )
++            stopped = check_stop(request, max_model_len=2048)
+             if request.force_thinking_end:
+                 break
+ 
+         assert not stopped
+         assert request.force_thinking_end
+         assert request.thinking_loop_breaks == 1
++        assert request.last_loop_info == ("windowed_phrase", 6, 5)
+         assert request.thinking_output_start == 0
+         assert not request.is_finished()
+ 
+@@ -379,7 +419,7 @@ class TestRepetitionDetectionIntegration:
+         assert not request.force_thinking_end
+         assert request.thinking_output_start == -1
+         assert request.thinking_end_output_idx == len(request._output_token_ids)
+-        assert not check_stop(request, max_model_len=2048, thinking_loop_break=True)
++        assert not check_stop(request, max_model_len=2048)
+ 
+         # Normal tool-call tokens after </think> must not false-trigger on pre-</think> tokens
+         for tok in [401, 402, 403, 404, 405]:
+@@ -388,9 +428,7 @@ class TestRepetitionDetectionIntegration:
+             request.update_reasoning_markers(
+                 start_ids, end_ids, prev_num_output=prev_out
+             )
+-            assert not check_stop(
+-                request, max_model_len=2048, thinking_loop_break=True
+-            )
++            assert not check_stop(request, max_model_len=2048)
+ 
+         # If the model still loops after </think>, safety net finishes with FINISHED_REPETITION
+         for tok in let_me_do_it * 4:
+@@ -399,91 +437,131 @@ class TestRepetitionDetectionIntegration:
+             request.update_reasoning_markers(
+                 start_ids, end_ids, prev_num_output=prev_out
+             )
+-            if check_stop(request, max_model_len=2048, thinking_loop_break=True):
++            if check_stop(request, max_model_len=2048):
+                 stopped = True
+                 break
+ 
+         assert stopped
+         assert request.status == RequestStatus.FINISHED_REPETITION
+         assert request.stop_reason == "repetition_detected"
++        assert request.last_loop_info == ("contiguous_phrase", 6, 4)
+ 
+-    def test_thinking_off_skips_repetition_guard(self):
+-        """Test that when thinking is disabled (via prompt ending in </think>,
+-        thinking_token_budget=0, reasoning_ended=True, or reasoning_parser_kwargs),
+-        the repetition guard does not run."""
++    def test_default_loop_detection_post_think_and_thinking_off(self):
++        """Loop detection is active by default after natural </think> (even when
++        thinking_loop_breaks == 0 and repetition_detection is None) and when
++        thinking is disabled (finishing with FINISHED_REPETITION without setting
++        force_thinking_end)."""
+         start_ids = (128805,)
+         end_ids = (128806,)
+         let_me_do_it = [101, 102, 103, 104, 13, 198]
+-        default_rep = RepetitionDetectionParams(
+-            max_pattern_size=64, min_pattern_size=5, min_count=3
+-        )
+ 
+-        # 1. Prompt ends with </think> (DeepSeek-V4.1 thinking=False prompt)
+-        req_prompt_off = Request(
+-            request_id="think-off-prompt",
+-            prompt_token_ids=[1, 2, 128804, 128806],
+-            sampling_params=SamplingParams(
+-                max_tokens=512, repetition_detection=default_rep
+-            ),
++        # 1. Natural </think> without an in-<think> loop break, followed by post-</think> loop
++        req_post = Request(
++            request_id="natural-post-think-loop",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=512),
+             pooling_params=None,
+         )
+-        assert not req_prompt_off.thinking_disabled
+-        for tok in let_me_do_it * 5:
+-            prev_out = len(req_prompt_off._output_token_ids)
+-            req_prompt_off.append_output_token_ids(tok)
+-            req_prompt_off.update_reasoning_markers(
+-                start_ids, end_ids, prev_num_output=prev_out
+-            )
+-            assert req_prompt_off.thinking_disabled
+-            assert not check_stop(
+-                req_prompt_off, max_model_len=2048, thinking_loop_break=True
+-            )
+-            assert not req_prompt_off.force_thinking_end
++        for tok in [301, 302, 303, 128806]:
++            prev_out = len(req_post._output_token_ids)
++            req_post.append_output_token_ids(tok)
++            req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++            assert not check_stop(req_post, max_model_len=2048)
++        assert req_post.thinking_loop_breaks == 0
++        assert req_post.thinking_output_start == -1
+ 
+-        # 2. Explicit thinking-off flags at Request initialization
++        stopped = False
++        for tok in let_me_do_it * 4:
++            prev_out = len(req_post._output_token_ids)
++            req_post.append_output_token_ids(tok)
++            req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++            if check_stop(req_post, max_model_len=2048):
++                stopped = True
++                break
++        assert stopped
++        assert not req_post.force_thinking_end
++        assert req_post.status == RequestStatus.FINISHED_REPETITION
++        assert req_post.stop_reason == "repetition_detected"
++
++        # 2. Thinking disabled -> skips marker tracking & force_thinking_end, but still catches loops by default
+         for init_kwargs in (
++            {"prompt_token_ids": [1, 2, 128804, 128806]},
+             {"reasoning_ended": True},
+-            {
+-                "sampling_params": SamplingParams(
+-                    max_tokens=512,
+-                    thinking_token_budget=0,
+-                    repetition_detection=default_rep,
+-                )
+-            },
+-            {
+-                "reasoning_parser_kwargs": {
+-                    "chat_template_kwargs": {"thinking": False}
+-                }
+-            },
+-            {
+-                "reasoning_parser_kwargs": {
+-                    "chat_template_kwargs": {"enable_thinking": False}
+-                }
+-            },
++            {"sampling_params": SamplingParams(max_tokens=512, thinking_token_budget=0)},
++            {"reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking": False}}},
++            {"reasoning_parser_kwargs": {"chat_template_kwargs": {"enable_thinking": False}}},
+             {"reasoning_parser_kwargs": {"reasoning_effort": "none"}},
+         ):
+-            params = init_kwargs.get(
+-                "sampling_params",
+-                SamplingParams(max_tokens=512, repetition_detection=default_rep),
+-            )
+             req = Request(
+-                request_id="think-off-init",
+-                prompt_token_ids=[1, 2, 128805, 198],
+-                sampling_params=params,
++                request_id="think-off-default-loop",
++                prompt_token_ids=init_kwargs.get("prompt_token_ids", [1, 2, 128805, 198]),
++                sampling_params=init_kwargs.get("sampling_params", SamplingParams(max_tokens=512)),
+                 pooling_params=None,
+                 reasoning_ended=init_kwargs.get("reasoning_ended"),
+                 reasoning_parser_kwargs=init_kwargs.get("reasoning_parser_kwargs"),
+             )
+-            assert req.thinking_disabled
+-            req.append_output_token_ids(let_me_do_it * 5)
+-            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=0)
+-            assert not check_stop(req, max_model_len=2048, thinking_loop_break=True)
+-
+-    def test_protocol_to_sampling_params_skips_default_repetition_when_thinking_off(
+-        self,
+-    ):
+-        """Test that ChatCompletionRequest and ResponsesRequest do not apply
+-        server-default repetition_detection when thinking is disabled."""
++            stopped = False
++            for tok in let_me_do_it * 4:
++                prev_out = len(req._output_token_ids)
++                req.append_output_token_ids(tok)
++                req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++                assert req.thinking_disabled
++                assert not req.force_thinking_end
++                if check_stop(req, max_model_len=2048):
++                    stopped = True
++                    break
++            assert stopped
++            assert not req.force_thinking_end
++            assert req.status == RequestStatus.FINISHED_REPETITION
++
++        # 3. Explicit opt-out via RepetitionDetectionParams(max_pattern_size=0) disables detection
++        req_opt_out = Request(
++            request_id="explicit-opt-out",
++            prompt_token_ids=[1, 2],
++            sampling_params=SamplingParams(
++                max_tokens=512,
++                repetition_detection=RepetitionDetectionParams(max_pattern_size=0),
++            ),
++            pooling_params=None,
++        )
++        req_opt_out.append_output_token_ids(let_me_do_it * 5)
++        assert not check_stop(req_opt_out, max_model_len=2048)
++
++    def test_leading_newline_before_think_does_not_disable_tracking(self):
++        """When <think> is emitted in the output after 1..3 leading newline/whitespace
++        tokens, update_reasoning_markers must not prematurely latch thinking_disabled."""
++        start_ids = (128805,)
++        end_ids = (128806,)
++        let_me_do_it = [101, 102, 103, 104, 13, 198]
++
++        req = Request(
++            request_id="leading-newline-think",
++            prompt_token_ids=[1, 2, 3],
++            sampling_params=SamplingParams(max_tokens=512),
++            pooling_params=None,
++        )
++        for tok in [198, 128805, 198]:
++            prev_out = len(req._output_token_ids)
++            req.append_output_token_ids(tok)
++            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++
++        assert not req.thinking_disabled
++        assert req.thinking_output_start == 2
++
++        for tok in let_me_do_it * 4:
++            prev_out = len(req._output_token_ids)
++            req.append_output_token_ids(tok)
++            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++            check_stop(req, max_model_len=2048)
++            if req.force_thinking_end:
++                break
++
++        assert req.force_thinking_end
++        assert req.thinking_loop_breaks == 1
++
++    def test_protocol_to_sampling_params_inherits_default_repetition_detection(self):
++        """Test that ChatCompletionRequest and ResponsesRequest inherit
++        server-default repetition_detection by default."""
+         from vllm.entrypoints.openai.chat_completion.protocol import (
+             ChatCompletionRequest,
+         )
+@@ -498,40 +576,46 @@ class TestRepetitionDetectionIntegration:
+         }
+         msgs = [{"role": "user", "content": "hi"}]
+ 
+-        # Thinking enabled by default -> inherits default repetition_detection
+-        req_on = ChatCompletionRequest(messages=msgs)
+-        sp_on = req_on.to_sampling_params(128, default_sampling_params)
+-        assert sp_on.repetition_detection is not None
+-
+-        # Thinking disabled via each supported API switch -> skips default
+         for kwargs in (
++            {},
+             {"thinking": {"type": "disabled"}},
+             {"chat_template_kwargs": {"thinking": False}},
+-            {"chat_template_kwargs": {"enable_thinking": False}},
+             {"reasoning_effort": "none"},
+-            {"thinking_token_budget": 0},
+         ):
+-            req_off = ChatCompletionRequest(messages=msgs, **kwargs)
+-            sp_off = req_off.to_sampling_params(128, default_sampling_params)
+-            assert sp_off.repetition_detection is None
+-
+-        # ResponsesRequest with reasoning.effort="none" or enable_thinking=False
+-        resp_on = ResponsesRequest(input="hi")
+-        assert (
+-            resp_on.to_sampling_params(
+-                128, default_sampling_params
+-            ).repetition_detection
+-            is not None
+-        )
++            req = ChatCompletionRequest(messages=msgs, **kwargs)
++            sp = req.to_sampling_params(128, default_sampling_params)
++            assert sp.repetition_detection is not None
++
+         for r_kwargs in (
++            {},
+             {"reasoning": {"effort": "none"}},
+-            {"chat_template_kwargs": {"enable_thinking": False}},
+             {"chat_template_kwargs": {"thinking": False}},
+         ):
+-            resp_off = ResponsesRequest(input="hi", **r_kwargs)
++            resp = ResponsesRequest(input="hi", **r_kwargs)
+             assert (
+-                resp_off.to_sampling_params(
+-                    128, default_sampling_params
+-                ).repetition_detection
+-                is None
++                resp.to_sampling_params(128, default_sampling_params).repetition_detection
++                is not None
+             )
++
++    def test_thinking_enabled_non_looping_state_invariance(self):
++        """Non-looping thinking-enabled requests keep force_thinking_end=False,
++        thinking_loop_breaks=0, last_loop_info=None, and copy_draft_alloc unchanged."""
++        start_ids = (128805,)
++        end_ids = (128806,)
++        req = Request(
++            request_id="thinking-bit-identical",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=512),
++            pooling_params=None,
++        )
++        req.copy_draft_alloc = 6
++        stream = list(range(600, 680)) + [128806] + list(range(700, 740))
++        for tok in stream:
++            prev_out = len(req._output_token_ids)
++            req.append_output_token_ids(tok)
++            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++            assert not check_stop(req, max_model_len=2048)
++            assert not req.force_thinking_end
++            assert req.thinking_loop_breaks == 0
++            assert req.last_loop_info is None
++            assert req.copy_draft_alloc == 6
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index c961efd4b..e51174638 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -720,22 +720,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             self.response_format,
+         )
+ 
+-    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
+-        if thinking_token_budget is not None and thinking_token_budget == 0:
+-            return True
+-        user_kwargs = self.chat_template_kwargs or {}
+-        if "thinking" in user_kwargs:
+-            return not bool(user_kwargs["thinking"])
+-        if "enable_thinking" in user_kwargs:
+-            return not bool(user_kwargs["enable_thinking"])
+-        if user_kwargs.get("thinking_mode") == "chat":
+-            return True
+-        if self.thinking is not None:
+-            return self.thinking.type != "enabled"
+-        if self.reasoning_effort is not None:
+-            return self.reasoning_effort == "none"
+-        return False
+-
+     def to_sampling_params(
+         self,
+         max_tokens: int,
+@@ -765,9 +749,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             )
+         if (thinking_token_budget := self.thinking_token_budget) is None:
+             thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+-        if (repetition_detection := self.repetition_detection) is None and not (
+-            self._is_thinking_disabled(thinking_token_budget)
+-        ):
++        if (repetition_detection := self.repetition_detection) is None:
+             repetition_detection = default_sampling_params.get("repetition_detection")
+ 
+         # Merge server-default stop_token_ids (e.g., model-specific tokens
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index 48ac71158..3d6041d80 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -392,20 +392,6 @@ class ResponsesRequest(OpenAIBaseModel):
+             )
+         return None
+ 
+-    def _is_thinking_disabled(self, thinking_token_budget: int | None) -> bool:
+-        if thinking_token_budget is not None and thinking_token_budget == 0:
+-            return True
+-        user_kwargs = self.chat_template_kwargs or {}
+-        if "thinking" in user_kwargs:
+-            return not bool(user_kwargs["thinking"])
+-        if "enable_thinking" in user_kwargs:
+-            return not bool(user_kwargs["enable_thinking"])
+-        if user_kwargs.get("thinking_mode") == "chat":
+-            return True
+-        if self.reasoning is not None and self.reasoning.effort is not None:
+-            return self.reasoning.effort == "none"
+-        return False
+-
+     def to_sampling_params(
+         self,
+         default_max_tokens: int,
+@@ -450,11 +436,7 @@ class ResponsesRequest(OpenAIBaseModel):
+             extra_args["ec_transfer_params"] = self.ec_transfer_params
+ 
+         thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+-        repetition_detection = (
+-            None
+-            if self._is_thinking_disabled(thinking_token_budget)
+-            else default_sampling_params.get("repetition_detection")
+-        )
++        repetition_detection = default_sampling_params.get("repetition_detection")
+ 
+         return SamplingParams.from_optional(
+             temperature=temperature,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b3f667124..317ce3acc 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3943,13 +3943,49 @@ class Scheduler(SchedulerInterface):
+                 thinking_loop_break=self.thinking_loop_break,
+             )
+             if not was_forced and request.force_thinking_end:
++                loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
++                    "unknown",
++                    0,
++                    0,
++                )
+                 logger.info(
+-                    "Detected reasoning loop in request %s at %d output tokens; "
+-                    "forcing reasoning end token.",
++                    "Detected reasoning loop in request %s at %d output tokens "
++                    "(mode=%s, pattern_len=%d, count=%d); forcing reasoning end token.",
+                     request.request_id,
+                     request.num_output_tokens,
++                    loop_mode,
++                    loop_pat_len,
++                    loop_count,
+                 )
+             if stopped:
++                if (
++                    request.thinking_loop_breaks > 0
++                    or request.status == RequestStatus.FINISHED_REPETITION
++                ):
++                    post_think_tokens = (
++                        max(0, request.num_output_tokens - request.thinking_end_output_idx)
++                        if request.thinking_end_output_idx > 0
++                        else 0
++                    )
++                    loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
++                        "none",
++                        0,
++                        0,
++                    )
++                    logger.info(
++                        "Request %s finished after loop detection "
++                        "(breaks=%d, last_mode=%s, pattern_len=%d, count=%d): "
++                        "status=%s, stop_reason=%s, output_tokens=%d, post_think_tokens=%d.",
++                        request.request_id,
++                        request.thinking_loop_breaks,
++                        loop_mode,
++                        loop_pat_len,
++                        loop_count,
++                        request.status.name,
++                        request.stop_reason,
++                        request.num_output_tokens,
++                        post_think_tokens,
++                    )
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
+         return new_token_ids, stopped
+diff --git a/vllm/v1/core/sched/utils.py b/vllm/v1/core/sched/utils.py
+index ca5abbcc2..fa8527184 100644
+--- a/vllm/v1/core/sched/utils.py
++++ b/vllm/v1/core/sched/utils.py
+@@ -25,7 +25,7 @@ def _has_repeating_pattern(
+     return True
+ 
+ 
+-def _has_windowed_repeating_pattern(
++def _find_windowed_repeating_pattern(
+     token_ids: Sequence[int],
+     min_pattern_size: int,
+     max_pattern_size: int,
+@@ -33,10 +33,11 @@ def _has_windowed_repeating_pattern(
+     start_idx: int = 0,
+     window_size: int = 160,
+     min_density: float = 0.6,
+-) -> bool:
+-    """Check if the tail of token_ids ends with a phrase that repeats at least
+-    ``min_count`` times within the last ``window_size`` tokens (allowing short
+-    interspersed variations such as ``3xA + B + 2xA``) and covers at least
++) -> tuple[int, int] | None:
++    """Return ``(pattern_len, count)`` if the tail of ``token_ids`` ends with a
++    phrase that repeats at least ``min_count`` times within the last
++    ``window_size`` tokens (with at least one contiguous ``A + A`` pair so
++    parallel list enumerations do not false-positive) and covers at least
+     ``min_density`` of the span from its first matched occurrence to the end.
+     """
+     seq = getattr(token_ids, "_x", token_ids)
+@@ -44,7 +45,7 @@ def _has_windowed_repeating_pattern(
+     avail = n - start_idx
+     eff_min = max(min_pattern_size, 5)
+     if avail < eff_min * min_count or eff_min > max_pattern_size:
+-        return False
++        return None
+ 
+     win_start = max(start_idx, n - window_size)
+     last_tok = seq[n - 1]
+@@ -77,6 +78,7 @@ def _has_windowed_repeating_pattern(
+                 continue
+             cand = seq[n - cand_len : n]
+             count = 1
++            contiguous_pairs = 0
+             pos = n - cand_len
+             while pos - cand_len >= win_start:
+                 nxt = pos - 1
+@@ -85,55 +87,85 @@ def _has_windowed_repeating_pattern(
+                 if nxt - cand_len + 1 < win_start:
+                     break
+                 if seq[nxt - cand_len + 1 : nxt + 1] == cand:
++                    if nxt == pos - 1:
++                        contiguous_pairs += 1
+                     count += 1
+                     pos = nxt - cand_len + 1
+                     if (
+                         count >= min_count
++                        and contiguous_pairs >= 1
+                         and count * cand_len >= (n - pos) * min_density
+                     ):
+-                        return True
++                        return (cand_len, count)
+                 else:
+                     pos = nxt
+ 
+         checked_patterns += 1
+-        if checked_patterns >= 2:
++        if checked_patterns >= 4:
+             break
+ 
+-    return False
++    return None
+ 
+ 
+-def has_thinking_loop(
++def _has_windowed_repeating_pattern(
+     token_ids: Sequence[int],
++    min_pattern_size: int,
++    max_pattern_size: int,
++    min_count: int,
+     start_idx: int = 0,
++    window_size: int = 160,
++    min_density: float = 0.6,
+ ) -> bool:
+-    """Detect degenerate repetition loops inside a ``<think>`` block.
++    return (
++        _find_windowed_repeating_pattern(
++            token_ids,
++            min_pattern_size=min_pattern_size,
++            max_pattern_size=max_pattern_size,
++            min_count=min_count,
++            start_idx=start_idx,
++            window_size=window_size,
++            min_density=min_density,
++        )
++        is not None
++    )
++
++
++def detect_thinking_loop(
++    token_ids: Sequence[int],
++    start_idx: int = 0,
++) -> tuple[str, int, int] | None:
++    """Detect degenerate repetition loops and return ``(mode, pattern_len, count)``.
+ 
+     Catches:
+-    1. Short contiguous token loops (pattern length 1..3 repeated >= 8 times
+-       with total repeated span >= 16 tokens).
++    1. Short contiguous token loops (pattern length 1..3 repeated >= 10 times
++      with total repeated span >= 24 tokens).
+     2. Phrase/sentence contiguous loops (pattern length 4..64 repeated >= 4
+-       times contiguously).
++       times contiguously with total repeated span >= 24 tokens).
+     3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
+-       times within a 160-token window covering >= 60% of the span).
++       times within a 160-token window with >= 1 contiguous pair and covering
++       >= 60% of the span).
+     """
+     seq = getattr(token_ids, "_x", token_ids)
+     avail = len(seq) - start_idx
+-    if avail < 16:
+-        return False
++    if avail < 24:
++        return None
+ 
+     for pattern_len in range(1, 4):
+-        min_count = max(8, (16 + pattern_len - 1) // pattern_len)
++        min_count = max(10, (24 + pattern_len - 1) // pattern_len)
+         if pattern_len * min_count <= avail and _has_repeating_pattern(
+             seq, pattern_len, min_count
+         ):
+-            return True
++            return ("contiguous_short", pattern_len, min_count)
+ 
+     max_len = min(64, avail // 4)
+     for pattern_len in range(4, max_len + 1):
+-        if _has_repeating_pattern(seq, pattern_len, 4):
+-            return True
++        min_count = max(4, (24 + pattern_len - 1) // pattern_len)
++        if pattern_len * min_count <= avail and _has_repeating_pattern(
++            seq, pattern_len, min_count
++        ):
++            return ("contiguous_phrase", pattern_len, min_count)
+ 
+-    return _has_windowed_repeating_pattern(
++    win_match = _find_windowed_repeating_pattern(
+         seq,
+         min_pattern_size=5,
+         max_pattern_size=64,
+@@ -142,6 +174,17 @@ def has_thinking_loop(
+         window_size=160,
+         min_density=0.6,
+     )
++    if win_match is not None:
++        return ("windowed_phrase", win_match[0], win_match[1])
++    return None
++
++
++def has_thinking_loop(
++    token_ids: Sequence[int],
++    start_idx: int = 0,
++) -> bool:
++    """Return True if ``token_ids[start_idx:]`` ends with a repetition loop."""
++    return detect_thinking_loop(token_ids, start_idx=start_idx) is not None
+ 
+ 
+ def check_sequence_repetition(
+@@ -158,12 +201,9 @@ def check_sequence_repetition(
+         True if a repetition pattern is found, False otherwise.
+     """
+     max_pattern_size = params.max_pattern_size
+-    min_pattern_size = params.min_pattern_size
++    min_pattern_size = max(params.min_pattern_size, 1)
+     min_count = params.min_count
+ 
+-    if min_pattern_size <= 0:
+-        min_pattern_size = 1
+-
+     if max_pattern_size <= 0 or min_count < 2 or min_pattern_size > max_pattern_size:
+         return False
+ 
+@@ -197,21 +237,23 @@ def check_sequence_repetition(
+ def remove_all(lst: list, items_to_remove: set) -> list:
+     """Remove all items from a list that are in the items_to_remove set.
+ 
+-    This method optimizes for the common case of removing a single item,
+-    falling back to list comprehension for multiple items.
++    This function optimizes for the common case of removing a single item,
++    using list.remove() which avoids creating a new list. For multiple items,
++    it uses a list comprehension.
++
++    Note: For a single item, the input list is modified in-place and returned.
++    For multiple items, a new list is created and returned.
+ 
+     Args:
+-        lst: The list to remove items from
+-        items_to_remove: Set of items to remove
++        lst: The list to remove items from.
++        items_to_remove: Set of items to remove from the list.
+ 
+     Returns:
+-        Either the modified original list (for single item removal) or
+-        a new list (for multiple item removal). Callers should use the
+-        returned value.
+-
+-    Note:
+-        For single item removal, this modifies the original list in-place
+-        and returns it. For multiple items, it creates and returns a new list.
++        Either the modified input list (for single item) or a new list
++        (for multiple items) with the specified items removed. Caller should
++        always use the returned value.
++        Note: for single item, it modifies the input list in-place and
++        returns it. For multiple items, it creates and returns a new list.
+     """
+     if not items_to_remove:
+         return lst
+@@ -243,7 +285,7 @@ def stops_on_next_token(request: Request, token_id: int, max_model_len: int) ->
+ def check_stop(
+     request: Request,
+     max_model_len: int,
+-    thinking_loop_break: bool = False,
++    thinking_loop_break: bool = True,
+ ) -> bool:
+     assert not request.pooling_params
+ 
+@@ -275,26 +317,30 @@ def check_stop(
+     if request.num_output_tokens < sampling_params.min_tokens:
+         return False
+ 
+-    if request.thinking_disabled:
++    repetition_detection = sampling_params.repetition_detection
++    if repetition_detection is not None and (
++        repetition_detection.max_pattern_size <= 0
++        or repetition_detection.min_count < 2
++    ):
+         return False
+ 
+-    repetition_detection = sampling_params.repetition_detection
+     if request.thinking_output_start >= 0:
+         if request.force_thinking_end:
+             return False
+         start_idx = request.thinking_output_start
+-        loop_detected = False
+-        if thinking_loop_break and request.thinking_loop_breaks == 0:
+-            loop_detected = has_thinking_loop(
++        loop_info: tuple[str, int, int] | None = None
++        if repetition_detection is not None and check_sequence_repetition(
++            request._output_token_ids,
++            repetition_detection,
++            start_idx=start_idx,
++        ):
++            loop_info = ("custom_repetition", 0, 0)
++        if loop_info is None:
++            loop_info = detect_thinking_loop(
+                 request._output_token_ids, start_idx=start_idx
+             )
+-        if not loop_detected and repetition_detection is not None:
+-            loop_detected = check_sequence_repetition(
+-                request._output_token_ids,
+-                repetition_detection,
+-                start_idx=start_idx,
+-            )
+-        if loop_detected:
++        if loop_info is not None:
++            request.last_loop_info = loop_info
+             if thinking_loop_break and request.thinking_loop_breaks == 0:
+                 request.force_thinking_end = True
+                 request.thinking_loop_breaks += 1
+@@ -306,20 +352,35 @@ def check_stop(
+         return False
+ 
+     start_idx = request.thinking_end_output_idx
+-    if repetition_detection is not None and check_sequence_repetition(
+-        request._output_token_ids,
+-        repetition_detection,
+-        start_idx=start_idx,
+-    ):
+-        request.status = RequestStatus.FINISHED_REPETITION
+-        request.stop_reason = "repetition_detected"
+-        return True
++    if repetition_detection is not None:
++        if check_sequence_repetition(
++            request._output_token_ids,
++            repetition_detection,
++            start_idx=start_idx,
++        ):
++            request.last_loop_info = ("custom_repetition", 0, 0)
++            request.status = RequestStatus.FINISHED_REPETITION
++            request.stop_reason = "repetition_detected"
++            return True
++        if request.thinking_loop_breaks > 0:
++            loop_info = detect_thinking_loop(
++                request._output_token_ids, start_idx=start_idx
++            )
++            if loop_info is not None:
++                request.last_loop_info = loop_info
++                request.status = RequestStatus.FINISHED_REPETITION
++                request.stop_reason = "repetition_detected"
++                return True
++        return False
+ 
+-    if request.thinking_loop_breaks > 0 and has_thinking_loop(
+-        request._output_token_ids, start_idx=start_idx
+-    ):
+-        request.status = RequestStatus.FINISHED_REPETITION
+-        request.stop_reason = "repetition_detected"
+-        return True
++    if thinking_loop_break or request.thinking_loop_breaks > 0:
++        loop_info = detect_thinking_loop(
++            request._output_token_ids, start_idx=start_idx
++        )
++        if loop_info is not None:
++            request.last_loop_info = loop_info
++            request.status = RequestStatus.FINISHED_REPETITION
++            request.stop_reason = "repetition_detected"
++            return True
+ 
+     return False
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 756a05e2f..c987eb710 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -266,7 +266,7 @@ class Request:
+         # - thinking_end_output_idx: index in _output_token_ids immediately
+         #   after the most recent </think> marker.
+         # - thinking_disabled: True when thinking is disabled for this request
+-        #   so the repetition guard and marker tracking do not run.
++        #   so reasoning marker scanning and forced </think> injection do not run.
+         self._reasoning_ended_init: bool | None = reasoning_ended
+         self._reasoning_parser_kwargs_init: dict[str, Any] | None = (
+             reasoning_parser_kwargs
+@@ -275,6 +275,7 @@ class Request:
+         self.thinking_end_output_idx: int = 0
+         self.force_thinking_end: bool = False
+         self.thinking_loop_breaks: int = 0
++        self.last_loop_info: tuple[str, int, int] | None = None
+         self._reasoning_markers_initialized: bool = False
+         self.thinking_disabled: bool = self._compute_thinking_disabled()
+ 
+@@ -375,6 +376,7 @@ class Request:
+         self.thinking_end_output_idx = 0
+         self.force_thinking_end = False
+         self.thinking_loop_breaks = 0
++        self.last_loop_info = None
+         self._reasoning_markers_initialized = False
+         self.thinking_disabled = self._compute_thinking_disabled()
+ 
+@@ -443,7 +445,7 @@ class Request:
+         if (
+             self.thinking_output_start < 0
+             and self.thinking_end_output_idx == 0
+-            and cur_num_output >= start_len
++            and cur_num_output >= start_len + 3
+         ):
+             self.thinking_disabled = True
+ 
