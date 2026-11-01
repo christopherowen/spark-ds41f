@@ -151,6 +151,33 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertIn("from vllm.model_executor.model_loader.direct_io import _native as direct_native", stages["runtime-core"])
         self.assertIn("from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native", stages["runtime-core"])
 
+    def test_build_commands_refuse_misaligned_arm_notes_and_labels(self) -> None:
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+
+        lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/upstreams.lock.json")
+        cluster = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/tp4.json")
+        cluster["notes"] = "candidate-33 at tp4-ring: vLLM 0568..0636 (patch head 2c2d396f, tree 88468fc7)."
+        cluster["container"]["expected_labels"]["local.spark-ds41f.vllm.tree"] = "041f8e3c" + "0" * 32
+
+        for fn, args in (
+            (spark.command_build_prepare, argparse.Namespace(cluster_config="c.json", only=None, lock=False)),
+            (spark.command_build_check, argparse.Namespace(cluster_config="c.json")),
+            (spark.command_build_image, argparse.Namespace(cluster_config="c.json", tag=None, apply=False)),
+        ):
+            output = io.StringIO()
+            with mock.patch.object(spark, "configuration", return_value=(cluster, None, lock)), \
+                    mock.patch.object(spark, "build_problems", return_value=[]), \
+                    contextlib.redirect_stdout(output):
+                code = fn(args)
+            self.assertEqual(code, 1, fn.__name__)
+            text = output.getvalue()
+            self.assertIn("local.spark-ds41f.vllm.tree", text)
+            self.assertIn("arm notes cite vllm tree 88468fc7, expected 354fd6e6", text)
+            self.assertIn("arm notes cite vLLM 0568..0636", text)
+
 
 if __name__ == "__main__":
     unittest.main()

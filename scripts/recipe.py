@@ -388,6 +388,10 @@ def overlay(arm: dict, base: dict) -> dict:
         del node[last]
     for key in ("shape", "benchmark_reference"):
         cluster.pop(key, None)
+    if "notes" in arm:
+        cluster["notes"] = arm["notes"]
+    else:
+        cluster.pop("notes", None)
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
         explicit_env = sets.get("environment", {})

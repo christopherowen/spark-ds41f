@@ -136,7 +136,7 @@ class RecipeTest(unittest.TestCase):
         reference that name it."""
         resolved = recipe.resolve(load("experiments/2026-10-16-r6s/r6n/cluster.json"), "tp4-ring")
         released = load_spark().read_cluster("experiments/2026-10-15-r6n/r6n-release.json")
-        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
@@ -204,7 +204,7 @@ class RecipeTest(unittest.TestCase):
         args[args.index("--limit-mm-per-prompt") + 1] = '{"image":32}'
         self.assertEqual(arm["serve_args"], args)
         # An arm carries neither the recipe's shape nor its qualifying benchmark.
-        skip = ("serve_args", "shape", "benchmark_reference")
+        skip = ("serve_args", "shape", "benchmark_reference", "notes")
         self.assertEqual({k: v for k, v in arm.items() if k not in skip},
                          {k: v for k, v in base.items() if k not in skip})
 
@@ -300,7 +300,7 @@ class RecipeTest(unittest.TestCase):
         at_6144 = json.loads(json.dumps(candidate))
         at_6144["shapes"]["tp3-triangle"]["sizing"]["max_num_batched_tokens"] = 6144
         self.assertEqual(fallback["serve_args"], recipe.resolve(at_6144, "tp3-triangle")["serve_args"])
-        self.assertEqual({k for k in fallback if fallback[k] != tp3.get(k)}, {"serve_args"})
+        self.assertEqual({k for k in fallback if fallback[k] != tp3.get(k)}, {"serve_args", "notes"})
         self.assertEqual((argument(fallback, "--max-num-batched-tokens"),
                           argument(fallback, "--long-prefill-token-threshold")), ("6144", "6096"))
         for dev, base in (("rc-tp3-dev.json", tp3), ("rc-tp3-6144-dev.json", fallback)):
@@ -640,10 +640,13 @@ class OverlayTest(unittest.TestCase):
 
     def test_an_overlay_sets_unsets_and_is_not_production(self):
         base = recipe.resolve(load("config/cluster.json"), "tp4-ring")
-        arm = {"extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
+        arm = {"notes": "arm note",
+               "extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
                "set": {"container": {"image": "x:y"}, "environment": {"NEW": "1"}},
                "unset": ["environment.SPARKNET_ROCE_TIMEOUT_MS"]}
         resolved = recipe.overlay(arm, base)
+        self.assertEqual(resolved["notes"], "arm note")
+        self.assertNotIn("notes", recipe.overlay({"extends": {}}, resolved))
         self.assertEqual(resolved["container"]["image"], "x:y")
         self.assertEqual(resolved["container"]["name"], base["container"]["name"])  # merged, not replaced
         self.assertEqual(resolved["environment"]["NEW"], "1")
@@ -679,8 +682,8 @@ class OverlayTest(unittest.TestCase):
                          {"SPARKNET_ROCE_KERNELS", "SPARKNET_ROCE_SPIN_LIMIT", "SPARKNET_ROCE_TIMEOUT_MS",
                           "SPARK3_ENGRAM_ASYNC"})
         self.assertEqual(r6m["serve_args"], r6l["serve_args"])
-        self.assertEqual({k: v for k, v in r6m.items() if k not in ("container", "environment", "upstreams_config")},
-                         {k: v for k, v in r6l.items() if k not in ("container", "environment", "upstreams_config")})
+        self.assertEqual({k: v for k, v in r6m.items() if k not in ("container", "environment", "upstreams_config", "notes")},
+                         {k: v for k, v in r6l.items() if k not in ("container", "environment", "upstreams_config", "notes")})
         # An arm of the recipe names its shape: it must not follow the site's cabling.
         unpinned = {"extends": {"config": "config/cluster.json"}, "set": {}}
         read = spark.read_json

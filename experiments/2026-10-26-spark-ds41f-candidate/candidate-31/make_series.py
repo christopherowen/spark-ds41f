@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""candidate-28's vLLM series: candidate-27's, then the 3 mHC / MoE / L2-prefetch commits (0634..0636).
+"""candidate-31's vLLM series: candidate-28's 0634..0635, then 0636..0650 (535 patches total).
 
 usage: make_series.py VLLM_REPO
 
-Candidate 27's series (../candidate-27/vllm/series) ends at 68ffa3c2b. Every commit
-listed below is written to vllm/ as one patch, numbered from 0634 in
-application order. vllm/series lists candidate-27's patches, their paths
-relative to this folder, then these. Nothing that exists is overwritten.
+Candidate 28's base series (0001..0635) is extended with 0636..0650 in
+application order. Nothing that exists is overwritten.
 """
 
 import subprocess

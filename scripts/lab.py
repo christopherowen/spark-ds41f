@@ -1146,7 +1146,7 @@ def plan_problems(steps: list[dict]) -> list[str]:
     servebench arguments its parser rejects."""
     problems = []
     for step in steps:
-        if step["kind"] == "boot":
+        if step["kind"] in ("boot", "image", "fabric"):
             if not (ROOT / step["config"]).is_file():
                 problems.append(f"arm configuration {step['config']} does not exist")
             else:

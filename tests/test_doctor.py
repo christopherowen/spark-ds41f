@@ -1244,5 +1244,40 @@ class NewUserOnboardingTest(unittest.TestCase):
             self.assertIn(command, line)
 
 
+class IdentifierAlignmentTest(unittest.TestCase):
+    def test_arm_notes_and_lock_identifiers_are_checked_and_synced(self) -> None:
+        import copy
+
+        lock = copy.deepcopy(spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/upstreams.lock.json"))
+        manifest = copy.deepcopy(spark.read_json(lock["source_manifest"]))
+        arm = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/tp4.json")
+        self.assertEqual(spark.source_identifier_problems(lock, manifest), [])
+        self.assertEqual(spark.arm_note_problems(arm, lock, manifest), [])
+
+        stale_arm = copy.deepcopy(arm)
+        stale_arm["notes"] = (
+            "candidate-33 at tp4-ring: candidate-27 + #790; "
+            "vLLM 0568..0636 (patch head 2c2d396f, tree 88468fc7)."
+        )
+        problems = spark.arm_note_problems(stale_arm, lock, manifest)
+        self.assertEqual(len(problems), 3)
+        self.assertTrue(any("patch head 2c2d396f, expected 10bef730" in p for p in problems))
+        self.assertTrue(any("vllm tree 88468fc7, expected 354fd6e6" in p for p in problems))
+        self.assertTrue(any("vLLM 0568..0636" in p and "ends at 0663" in p for p in problems))
+
+        synced_notes = spark.sync_arm_notes(stale_arm["notes"], lock, manifest)
+        self.assertIn("vLLM 0568..0663 (patch head 10bef730, tree 354fd6e6)", synced_notes)
+        stale_arm["notes"] = synced_notes
+        self.assertEqual(spark.arm_note_problems(stale_arm, lock, manifest), [])
+
+        stale_lock = copy.deepcopy(lock)
+        stale_lock["sources"]["vllm"]["expected_tree"] = "88468fc7" + "0" * 32
+        stale_manifest = copy.deepcopy(manifest)
+        stale_manifest["vllm"]["patch_count"] = 512
+        lock_problems = spark.source_identifier_problems(stale_lock, stale_manifest)
+        self.assertTrue(any("lock expected_tree" in p for p in lock_problems))
+        self.assertTrue(any("patch_count is 512" in p for p in lock_problems))
+
+
 if __name__ == "__main__":
     unittest.main()

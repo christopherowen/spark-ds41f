@@ -681,7 +681,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     source_manifest = read_json(
         upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
     )
-    problems.extend(kernel_backend.source_problems(cluster, upstreams, source_manifest))
+    problems.extend(arm_source_problems(cluster, upstreams, source_manifest))
     listed = [name for name in OPTIONAL_BUILD_PROJECTS if name in upstreams["sources"]]
     if listed and len(listed) != len(OPTIONAL_BUILD_PROJECTS):
         problems.append(f"{' and '.join(OPTIONAL_BUILD_PROJECTS)} are built together; the lock lists only {listed[0]}")
@@ -700,18 +700,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "sparknet.tree")
             if label != source_manifest["sparknet"]["expected_tree"]:
                 problems.append("sparknet image tree does not match its source manifest")
-    for name in build_projects(upstreams["sources"]):
-        source = upstreams["sources"][name]
-        if missing_patches(source):
-            continue  # reported above
-        record = source_manifest.get(name)
-        if record is None:
-            problems.append(f"{name}: source manifest has no record")
-            continue
-        if record.get("patchset_sha256") != patchset_sha256(source):
-            problems.append(f"{name}: patch-set fingerprint differs from source manifest")
-        if source.get("submodules") and not isinstance(record.get("submodules"), dict):
-            problems.append(f"{name}: source manifest does not record its submodule commits")
+    problems.extend(source_identifier_problems(upstreams, source_manifest))
     for relative, wanted in source_manifest.get("deployment_artifacts", {}).items():
         candidate = ROOT / relative
         if not candidate.is_file():
@@ -3219,6 +3208,334 @@ def git_output(directory: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def active_series_patches(series_path: Path) -> list[str]:
+    if not series_path.is_file():
+        return []
+    return [name for name in read_series(series_path) if not name.startswith("TODO-")]
+
+
+def source_identifier_problems(
+    upstreams: dict,
+    source_manifest: dict,
+    projects: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Problems when an upstream lock, its source manifest and its patch series disagree."""
+    problems: list[str] = []
+    sources = upstreams.get("sources", {})
+    for name in projects or build_projects(sources):
+        source = sources.get(name)
+        if source is None or missing_patches(source):
+            continue
+        record = source_manifest.get(name)
+        if record is None:
+            problems.append(f"{name}: source manifest has no record")
+            continue
+        if source.get("revision") and record.get("base_revision") and source["revision"] != record["base_revision"]:
+            problems.append(
+                f"{name}: lock revision {source['revision'][:12]} differs from source manifest "
+                f"base_revision {record['base_revision'][:12]}"
+            )
+        patchset = patchset_sha256(source)
+        if record.get("patchset_sha256") != patchset:
+            problems.append(f"{name}: patch-set fingerprint differs from source manifest")
+        for key in ("patch_series", "patchset_sha256", "patch_head", "expected_tree"):
+            if key in source and key in record and source[key] != record[key]:
+                problems.append(
+                    f"{name}: lock {key} {source[key]} differs from source manifest {record[key]}"
+                )
+        series = source.get("patch_series")
+        if series and isinstance(record.get("patch_count"), int):
+            series_path = ROOT / series
+            if series_path.is_file():
+                actual_count = len(active_series_patches(series_path))
+                if record["patch_count"] != actual_count:
+                    problems.append(
+                        f"{name}: source manifest patch_count is {record['patch_count']}, "
+                        f"but {series} has {actual_count} patches"
+                    )
+        if source.get("submodules") and not isinstance(record.get("submodules"), dict):
+            problems.append(f"{name}: source manifest does not record its submodule commits")
+    return problems
+
+
+def arm_note_problems(cluster: dict, upstreams: dict, source_manifest: dict) -> list[str]:
+    """Problems when an arm's human-readable notes cite a stale patch range, patch head or tree."""
+    notes = cluster.get("notes")
+    if not isinstance(notes, str) or not notes:
+        return []
+    problems: list[str] = []
+    vllm_head = source_manifest.get("vllm", {}).get("patch_head", "")
+    if vllm_head:
+        for cited in re.findall(r"\bpatch head ([0-9a-f]{7,40})\b", notes, flags=re.IGNORECASE):
+            if not vllm_head.startswith(cited.lower()):
+                problems.append(
+                    f"arm notes cite patch head {cited}, expected {vllm_head[:len(cited)]}"
+                )
+    vllm_tree = source_manifest.get("vllm", {}).get("expected_tree", "")
+    sparknet_tree = source_manifest.get("sparknet", {}).get("expected_tree", "")
+    for match in re.finditer(r"\btree ([0-9a-f]{7,40})\b", notes, flags=re.IGNORECASE):
+        cited = match.group(1).lower()
+        clause = notes[max(0, match.start() - 48):match.start()].lower()
+        if "overlay/ over" in clause:
+            continue
+        target_name = "sparknet" if "sparknet" in clause and sparknet_tree else "vllm"
+        target_tree = sparknet_tree if target_name == "sparknet" else vllm_tree
+        if target_tree and not target_tree.startswith(cited):
+            problems.append(
+                f"arm notes cite {target_name} tree {cited}, expected {target_tree[:len(cited)]}"
+            )
+    vllm_series = upstreams.get("sources", {}).get("vllm", {}).get("patch_series")
+    if vllm_series and (ROOT / vllm_series).is_file():
+        patches = active_series_patches(ROOT / vllm_series)
+        if patches and (last_match := re.match(r"^(\d{4})-", patches[-1])):
+            last_num = last_match.group(1)
+            for start_num, end_num in re.findall(r"\bvLLM (\d{4})\.\.(\d{4})\b", notes):
+                if end_num != last_num:
+                    problems.append(
+                        f"arm notes cite vLLM {start_num}..{end_num}, "
+                        f"but {vllm_series} ends at {last_num} ({patches[-1]})"
+                    )
+    return problems
+
+
+def arm_source_problems(cluster: dict, upstreams: dict, source_manifest: dict) -> list[str]:
+    """Problems when an arm configuration's expected image labels or notes disagree
+    with its upstream lock and source manifest."""
+    problems = list(kernel_backend.source_problems(cluster, upstreams, source_manifest))
+    problems.extend(arm_note_problems(cluster, upstreams, source_manifest))
+    return problems
+
+
+def sync_arm_notes(notes: str, upstreams: dict, source_manifest: dict) -> str:
+    """Return ``notes`` with its vLLM patch range end, patch head and source trees aligned
+    to ``upstreams`` and ``source_manifest``."""
+    vllm_head = source_manifest.get("vllm", {}).get("patch_head", "")
+    vllm_tree = source_manifest.get("vllm", {}).get("expected_tree", "")
+    sparknet_tree = source_manifest.get("sparknet", {}).get("expected_tree", "")
+    if vllm_head:
+        notes = re.sub(
+            r"\b(patch head )([0-9a-f]{7,40})\b",
+            lambda m: f"{m.group(1)}{vllm_head[:len(m.group(2))]}",
+            notes,
+            flags=re.IGNORECASE,
+        )
+
+    def replace_tree(match: re.Match[str]) -> str:
+        prefix, cited = match.group(1), match.group(2)
+        clause = notes[max(0, match.start() - 48):match.start()].lower()
+        if "overlay/ over" in clause:
+            return match.group(0)
+        target = sparknet_tree if "sparknet" in clause and sparknet_tree else vllm_tree
+        return f"{prefix}{target[:len(cited)]}" if target else match.group(0)
+
+    notes = re.sub(r"\b(tree )([0-9a-f]{7,40})\b", replace_tree, notes, flags=re.IGNORECASE)
+    vllm_series = upstreams.get("sources", {}).get("vllm", {}).get("patch_series")
+    if vllm_series and (ROOT / vllm_series).is_file():
+        patches = active_series_patches(ROOT / vllm_series)
+        if patches and (last_match := re.match(r"^(\d{4})-", patches[-1])):
+            last_num = last_match.group(1)
+            notes = re.sub(r"\b(vLLM \d{4}\.\.)(\d{4})\b", rf"\g<1>{last_num}", notes)
+    return notes
+
+
+def sync_lock_and_arms(
+    upstreams_relative: str,
+    arm_paths: list[str] | None = None,
+) -> list[str]:
+    """Align a lock, its source manifest and its arm configs from the manifest's recorded
+    patch heads and trees and the active patch series on disk."""
+    upstreams_path = repository_config_path(upstreams_relative)
+    upstreams = json.loads(upstreams_path.read_text(encoding="utf-8"))
+    manifest_relative = upstreams["source_manifest"]
+    manifest_path = repository_config_path(manifest_relative)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    updated: list[str] = []
+
+    manifest_changed = False
+    lock_changed = False
+    for name in build_projects(upstreams.get("sources", {})):
+        source = upstreams["sources"][name]
+        record = manifest.get(name)
+        if record is None or missing_patches(source):
+            continue
+        if source.get("revision") and record.get("base_revision") != source["revision"]:
+            record["base_revision"] = source["revision"]
+            manifest_changed = True
+        series = source.get("patch_series")
+        if series:
+            if record.get("patch_series") != series:
+                record["patch_series"] = series
+                manifest_changed = True
+            series_path = ROOT / series
+            if series_path.is_file() and "patch_count" in record:
+                count = len(active_series_patches(series_path))
+                if record["patch_count"] != count:
+                    record["patch_count"] = count
+                    manifest_changed = True
+        patchset = patchset_sha256(source)
+        if record.get("patchset_sha256") != patchset:
+            record["patchset_sha256"] = patchset
+            manifest_changed = True
+        for key in ("patch_series", "patchset_sha256", "patch_head", "expected_tree"):
+            if key in source and key in record and source[key] != record[key]:
+                source[key] = record[key]
+                lock_changed = True
+
+    if manifest_changed:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        updated.append(manifest_relative)
+    if lock_changed:
+        upstreams_path.write_text(json.dumps(upstreams, indent=2) + "\n", encoding="utf-8")
+        updated.append(upstreams_relative)
+
+    candidate_arms: list[Path] = []
+    if arm_paths:
+        for raw in arm_paths:
+            candidate_arms.append(repository_config_path(raw))
+    for sibling in sorted(upstreams_path.parent.glob("*.json")):
+        if sibling not in candidate_arms and sibling not in (upstreams_path, manifest_path):
+            candidate_arms.append(sibling)
+
+    for arm_path in candidate_arms:
+        if not arm_path.is_file():
+            continue
+        try:
+            arm = json.loads(arm_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(arm, dict):
+            continue
+        arm_lock = arm.get("upstreams_config")
+        if arm_lock and repository_config_path(arm_lock) != upstreams_path:
+            continue
+        if not arm_lock and arm_path.parent != upstreams_path.parent and (
+            not arm_paths or arm_path not in [repository_config_path(p) for p in arm_paths]
+        ):
+            continue
+        arm_changed = False
+        labels = arm.get("container", {}).get("expected_labels")
+        if isinstance(labels, dict):
+            for name in build_projects(upstreams.get("sources", {})):
+                tree = manifest.get(name, {}).get("expected_tree")
+                if tree and source_labels.get(labels, f"{name}.tree") not in (None, tree):
+                    labels[source_labels.key(labels, f"{name}.tree")] = tree
+                    arm_changed = True
+        if isinstance(arm.get("notes"), str):
+            new_notes = sync_arm_notes(arm["notes"], upstreams, manifest)
+            if new_notes != arm["notes"]:
+                arm["notes"] = new_notes
+                arm_changed = True
+        if arm_changed:
+            arm_path.write_text(json.dumps(arm, indent=2) + "\n", encoding="utf-8")
+            updated.append(arm_path.resolve().relative_to(ROOT.resolve()).as_posix())
+
+    results_path = upstreams_path.parent / "results.json"
+    if upstreams_path.parent.name.startswith("candidate-") and results_path.is_file() and "vllm" in manifest:
+        try:
+            results = json.loads(results_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            results = None
+        if isinstance(results, dict) and "patch_head" in results:
+            vllm_record = manifest["vllm"]
+            results_changed = False
+            for key in ("patch_head", "expected_tree", "patchset_sha256"):
+                if key in results and key in vllm_record and results[key] != vllm_record[key]:
+                    results[key] = vllm_record[key]
+                    results_changed = True
+            if (
+                "total_patches" in results
+                and "patch_count" in vllm_record
+                and results["total_patches"] != vllm_record["patch_count"]
+            ):
+                results["total_patches"] = vllm_record["patch_count"]
+                results_changed = True
+            if results_changed:
+                results_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+                updated.append(results_path.resolve().relative_to(ROOT.resolve()).as_posix())
+    return updated
+
+
+def lock_build_identifiers(
+    args: argparse.Namespace,
+    upstreams: dict,
+    parts: list[str] | None = None,
+) -> dict:
+    """Prepare changed project series in a temporary checkout to compute their canonical
+    patch_head and expected_tree, then atomically align source.json, upstreams.lock.json
+    and the candidate's arm configurations."""
+    cluster_path, canonical = cluster_config_path(args)
+    raw_cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
+    resolved_cluster = read_cluster(canonical) if cluster_recipe.is_overlay(raw_cluster) else raw_cluster
+    upstreams_relative = resolved_cluster.get("upstreams_config", "upstreams.lock.json")
+    manifest_relative = upstreams["source_manifest"]
+    manifest_path = repository_config_path(manifest_relative)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sources = upstreams["sources"]
+    selected = [name for name in build_projects(sources) if parts is None or name in parts]
+
+    manifest_changed = False
+    for name in selected:
+        source = sources[name]
+        missing = missing_patches(source)
+        if missing:
+            raise SystemExit(f"{name}: missing patch {', '.join(missing)}")
+        record = manifest.setdefault(name, {})
+        patchset = patchset_sha256(source)
+        needs_checkout = (
+            record.get("base_revision") != source["revision"]
+            or record.get("patchset_sha256") != patchset
+            or not record.get("patch_head")
+            or not record.get("expected_tree")
+        )
+        if needs_checkout:
+            BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=f".lock-{name}.", dir=BUILD_ROOT))
+            try:
+                checked(["git", "init", "--quiet"], cwd=temporary)
+                checked(["git", "remote", "add", "upstream", source["upstream"]], cwd=temporary)
+                checked(
+                    ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", source["revision"]],
+                    cwd=temporary,
+                )
+                checked(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=temporary)
+                if source.get("patch_series"):
+                    series = ROOT / source["patch_series"]
+                    for patch_name in active_series_patches(series):
+                        checked(
+                            [
+                                "git", "-c", f"user.name={PATCH_COMMITTER[0]}",
+                                "-c", f"user.email={PATCH_COMMITTER[1]}",
+                                "am", "--quiet", "--committer-date-is-author-date",
+                                str(series.parent / patch_name),
+                            ],
+                            cwd=temporary,
+                        )
+                checked(["git", "diff", "--check", source["revision"], "HEAD"], cwd=temporary)
+                if source.get("submodules"):
+                    checked(
+                        ["git", "submodule", "update", "--quiet", "--init", "--recursive",
+                         "--depth", "1", "--jobs", "4"],
+                        cwd=temporary,
+                    )
+                    record["submodules"] = submodule_commits(temporary)
+                record["patch_head"] = git_output(temporary, "rev-parse", "HEAD")
+                record["expected_tree"] = git_output(temporary, "rev-parse", "HEAD^{tree}")
+                record["patchset_sha256"] = patchset
+                record["base_revision"] = source["revision"]
+                manifest_changed = True
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+    if manifest_changed:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    arm_paths = [canonical] if getattr(args, "cluster_config", None) else None
+    updated = sync_lock_and_arms(upstreams_relative, arm_paths=arm_paths)
+    if manifest_changed and manifest_relative not in updated:
+        updated.insert(0, manifest_relative)
+    if updated:
+        print(f"locked build identifiers in {', '.join(updated)}", flush=True)
+    return read_json(upstreams_relative)
+
+
 def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
     """Everything that determines the build contexts, read from the lock.
 
@@ -3262,8 +3579,11 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
         if patchset != record["patchset_sha256"]:
             raise SystemExit(
                 f"{name}: the patch series differs from {upstreams['source_manifest']}; "
-                "record its new patch head and tree there first"
+                "record its new patch head and tree there first (or run `bin/spark build prepare --lock`)"
             )
+        identifier_problems = source_identifier_problems(upstreams, manifest, (name,))
+        if identifier_problems:
+            raise SystemExit("; ".join(identifier_problems))
         inputs[name] = {
             "upstream": source["upstream"],
             "tracking_ref": source["tracking_ref"],
@@ -3514,7 +3834,7 @@ def build_problems(directory: Path, inputs: dict) -> list[str]:
 
 
 def command_build_prepare(args: argparse.Namespace) -> int:
-    _, _, upstreams = configuration(args)
+    cluster, _, upstreams = configuration(args)
     parts = args.only.split(",") if args.only else None
     if parts:
         optional = LISTED_BUILD_PROJECTS
@@ -3524,7 +3844,17 @@ def command_build_prepare(args: argparse.Namespace) -> int:
         unlisted = [part for part in parts if part in optional and part not in upstreams["sources"]]
         if unlisted:
             raise SystemExit(f"{', '.join(unlisted)}: not listed in the upstreams lock")
+    if getattr(args, "lock", False):
+        upstreams = lock_build_identifiers(args, upstreams, parts)
+        cluster, _, upstreams = configuration(args)
     inputs = build_inputs(upstreams, parts)
+    if not args.only:
+        manifest = read_json(upstreams["source_manifest"])
+        arm_problems = arm_source_problems(cluster, upstreams, manifest)
+        if arm_problems:
+            for problem in arm_problems:
+                print(f"WARN: {problem}")
+            return 1
     directory = build_directory(inputs)
     parts = parts or [*BUILD_PARTS, *build_projects(inputs)]
     if not args.only and not build_problems(directory, inputs):
@@ -3571,10 +3901,11 @@ def command_build_prepare(args: argparse.Namespace) -> int:
 
 
 def command_build_check(args: argparse.Namespace) -> int:
-    _, _, upstreams = configuration(args)
+    cluster, _, upstreams = configuration(args)
     inputs = build_inputs(upstreams)
     directory = build_directory(inputs)
-    problems = build_problems(directory, inputs)
+    problems = arm_source_problems(cluster, upstreams, read_json(upstreams["source_manifest"]))
+    problems.extend(build_problems(directory, inputs))
     if problems:
         for problem in problems:
             print(f"WARN: {problem}")
@@ -3709,7 +4040,8 @@ def command_build_image(args: argparse.Namespace) -> int:
     cluster, _, upstreams = configuration(args)
     inputs = build_inputs(upstreams)
     directory = build_directory(inputs)
-    problems = build_problems(directory, inputs)
+    problems = arm_source_problems(cluster, upstreams, read_json(upstreams["source_manifest"]))
+    problems.extend(build_problems(directory, inputs))
     if problems:
         for problem in problems:
             print(f"WARN: {problem}")
@@ -6599,6 +6931,12 @@ def parser() -> argparse.ArgumentParser:
         help="comma-separated subset of: "
         + ", ".join((*BUILD_PARTS, *OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS))
         + " (sources only, no contexts; the last two only when the lock lists them)",
+    )
+    build_prepare.add_argument(
+        "--lock",
+        action="store_true",
+        help="record canonical patch heads, trees, patch counts and fingerprints in the source "
+        "manifest, upstreams lock and candidate arm configs before preparing",
     )
     build_prepare.set_defaults(func=command_build_prepare)
     build_check = build_commands.add_parser("check", help="verify the prepared build directory")
