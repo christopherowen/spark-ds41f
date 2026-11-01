@@ -3,7 +3,7 @@
 
 usage: make_series.py VLLM_REPO
 
-Candidate 26's series (../candidate-26/vllm/series) ends at 9c3ca6b56 (patch_head bac628a65). Every commit
+Candidate 26's series (../candidate-26/vllm/series) ends at 9c3ca6b56 (patch_head 2dd4d168c). Every commit
 listed below is written to vllm/ as one patch, numbered from 0631 in
 application order. vllm/series lists candidate-26's patches, their paths
 relative to this folder, then these. Nothing that exists is overwritten.
