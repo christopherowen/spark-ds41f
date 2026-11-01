@@ -16,11 +16,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "candidate-27/vllm/series"
 BASE = "68ffa3c2b"  # vLLM candidate-27 head
-HEAD = "78171359d"  # vLLM candidate-28 head
+HEAD = "5335ff004"  # vLLM candidate-28 head
 PATCHES = [
-    ('3ed232ef6', 634),  # dsv41: optimize mHC finalize, project_streams, in-register aux collapse, and fused post_collapse_norm (#790 + #821/#835)
-    ('afa03acc5', 635),  # Defer grouped_fp8_fp4_gemm barrier init past empty-CTA return and use 2 stages for decode down GEMM (#792)
-    ('78171359d', 636),  # Configure GB10 persisting-L2 set-aside and clamp V4.1 prefetch window budgets (#766, flagless)
+    ('c4c170275', 634),  # dsv41: optimize mHC finalize, project_streams, in-register aux collapse, and fused post_collapse_norm (#790 + #821/#835)
+    ('d91d6f97a', 635),  # Defer grouped_fp8_fp4_gemm barrier init past empty-CTA return and use 2 stages for decode down GEMM (#792)
+    ('5335ff004', 636),  # Configure GB10 persisting-L2 set-aside and clamp V4.1 prefetch window budgets (#766, flagless)
 ]
 
 

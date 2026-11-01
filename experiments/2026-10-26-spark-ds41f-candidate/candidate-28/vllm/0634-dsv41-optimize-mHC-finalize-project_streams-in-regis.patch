@@ -6,10 +6,12 @@ Subject: [PATCH 634/634] dsv41: optimize mHC finalize, project_streams,
 
 ---
  tests/kernels/deepseek_v41_pdl_sources.py     |    2 +
- .../kernels/test_deepseek_v41_tilelang_mhc.py |  154 +-
- vllm/models/deepseek_v4_1/nvidia/model.py     |  159 +-
+ .../kernels/test_deepseek_v41_tilelang_mhc.py |  172 +-
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   72 +
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  161 +-
+ .../deepseek_v4_1/tilelang/collectives.py     |    8 +
  vllm/models/deepseek_v4_1/tilelang/mhc.py     | 1643 ++++++++++++-----
- 4 files changed, 1421 insertions(+), 537 deletions(-)
+ 6 files changed, 1521 insertions(+), 537 deletions(-)
 
 diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
 index 66b42a0e2..4f2285d8c 100644
@@ -32,7 +34,7 @@ index 66b42a0e2..4f2285d8c 100644
      "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
      "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
-index 6b187def4..88d4692ba 100644
+index 6b187def4..235284e19 100644
 --- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
 +++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
 @@ -45,6 +45,7 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
@@ -152,7 +154,7 @@ index 6b187def4..88d4692ba 100644
  def test_project_and_finalize_bits_match_split(tokens, mode):
      """project_and_finalize_streams produces bit-identical outputs to project_streams
      plus finalize across all modes and token counts, and resets its counters to zero."""
-@@ -816,3 +857,100 @@ def test_single_row_entry_launches_fused_kernel(mhc, monkeypatch):
+@@ -816,3 +857,118 @@ def test_single_row_entry_launches_fused_kernel(mhc, monkeypatch):
      residual2, fn2, scale2, base2, weight2, incoming2 = _inputs(2, seed=2302)
      mhc.pre(residual2, fn2, scale2, base2, weight2, incoming2)
      assert len(called) == 1
@@ -253,8 +255,106 @@ index 6b187def4..88d4692ba 100644
 +    if column >= 0:
 +        assert_same_nonfinite(cols_out, expected_cols)
 +        _assert_bits_equal(cols_out, expected_cols, "columns: ")
++
++
++def test_rank_order_parts_device_and_compacted_final_collapse_sink_columns(
++    mhc, monkeypatch
++):
++    """When ``not rows_here`` (SP or compacted CED rows) and ``_sink_columns`` is
++    active on a multi-rank step whose last layer returns ``RankOrderParts``,
++    ``DeepseekV4Model.forward`` allocates local ``columns`` on ``residual.device`` /
++    ``RankOrderParts.device`` and scatters them into ``_sink_columns``."""
++    from types import SimpleNamespace
++    from vllm.models.deepseek_v4_1.nvidia import model as native
++
++    residual, fn, scale, base, weight, incoming = _inputs(6, seed=2501)
++    parts = RankOrderParts(
++        torch.randn(2, 6, HIDDEN, device=DEVICE, dtype=torch.bfloat16)
++    )
++    assert parts.device == residual.device
++    assert parts.dtype == torch.bfloat16
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 5e46a559e..364ad18c7 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -995,3 +995,75 @@ def test_dspark_tp_defaults_enabled_for_multi_rank(monkeypatch):
+     monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
+     assert dspark._vocab_parallel_greedy()
+     assert not hasattr(dspark, "_use_sequence_parallel")
++
++
++def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
++    pytest.importorskip("b12x")
++    from vllm.models.deepseek_v4_1.nvidia import model as native
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++
++    world = _World(3)
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 3)
++    monkeypatch.setattr(native, "get_tensor_model_parallel_rank", lambda: world.rank)
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
++    )
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
++    )
++    table = torch.randn(16, 2, dtype=torch.float32)
++    ids = torch.arange(9)
++
++    def run(_rank):
++        layers = nn.ModuleList(_Layer(i, world, []) for i in range(2))
++        orig_ffn = layers[-1].ffn.forward
++        layers[-1].ffn.forward = lambda hidden, i, **kw: RankOrderParts(
++            orig_ffn(hidden, i, **kw).unsqueeze(0)
++        )
++
++        def post_collapse_norm(
++            x, residual, post, comb, pre, weight, eps, *, columns=None, column=0, out=None
++        ):
++            if isinstance(x, RankOrderParts):
++                x = x.packed.sum(dim=0)
++            recon = layers[-1].mhc.post(x, residual, post, comb)
++            if columns is not None:
++                columns.copy_(recon[:, :, column].float())
++            return layers[-1].mhc.collapse(recon, pre) * 2
++
++        layers[-1].mhc.post_collapse_norm = post_collapse_norm
++        sink = torch.zeros((16, 4), dtype=torch.float32)
++        target = SimpleNamespace(
++            embed_input_ids=lambda input_ids: table[input_ids],
++            embed_tokens=_Embedding(table, world),
++            prefill_sp_min_rows=4,
++            prefill_sp_unreduced=False,
++            disk_engram=False,
++            engram_hash=None,
++            start_layer=0,
++            end_layer=2,
++            ced_decoder_start=None,
++            layers=layers,
++            aux_hidden_state_layers=set(),
++            _l2pf_ready=True,
++            _sink_columns=sink,
++            _sink_column=0,
++            hc_mult=4,
++            rms_norm_eps=1e-6,
++            _graph_out=lambda index, rows: None,
++            glp=None,
++            norm=SimpleNamespace(weight=torch.ones(2)),
++        )
++        out = native.DeepseekV4Model.forward(target, ids, ids, None)
++        return out, sink[:9].clone()
++
++    results = world.run(run)
++    for out, sink in results:
++        assert out.shape == (9, 2)
++        assert sink.abs().sum() > 0
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index d0d95d809..69288dc6b 100644
+index d0d95d809..9fef85f4a 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -317,6 +317,7 @@ class DeepseekV4DecoderLayer(nn.Module):
@@ -319,7 +419,7 @@ index d0d95d809..69288dc6b 100644
              if boundary_indices is not None:
                  assert ced_positions is not None
                  positions = ced_positions
-@@ -931,41 +948,104 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -931,41 +948,106 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                      if sp is None and not decoder_compacted
                      else None
                  )
@@ -332,11 +432,6 @@ index d0d95d809..69288dc6b 100644
 -                else:
 -                    aux_recon = layer.mhc.post(
 -                        hidden_states, residual, post_mix, res_mix
--                    )
--                    aux_hidden_state = (
--                        layer.mhc.collapse(aux_recon)
--                        if aux_out is None
--                        else layer.mhc.collapse(aux_recon, out=aux_out)
 +                next_layer = (
 +                    self.layers[idx + 1] if idx + 1 < self.end_layer else None
 +                )
@@ -347,6 +442,14 @@ index d0d95d809..69288dc6b 100644
 +                        getattr(next_layer, "engram", None) is None
 +                        or engram_hashes is None
                      )
+-                    aux_hidden_state = (
+-                        layer.mhc.collapse(aux_recon)
+-                        if aux_out is None
+-                        else layer.mhc.collapse(aux_recon, out=aux_out)
++                    and (
++                        ced_indices is None
++                        or idx + 1 != self.ced_decoder_start
+                     )
 -                    if idx + 1 == self.end_layer:
 -                        final_aux_recon = aux_recon
 -                    del aux_recon
@@ -355,10 +458,7 @@ index d0d95d809..69288dc6b 100644
 -                if decoder_compacted:
 -                    aux_hidden_state = scatter_rows(
 -                        aux_hidden_state, ced_indices, full_num_tokens
-+                    and (
-+                        ced_indices is None
-+                        or idx + 1 != self.ced_decoder_start
-                     )
+-                    )
 -                aux_hidden_states.append(aux_hidden_state)
 +                )
 +                if can_fuse_into_next_pre:
@@ -412,7 +512,9 @@ index d0d95d809..69288dc6b 100644
 +                else torch.empty(
 +                    (local_tokens, self.hc_mult),
 +                    dtype=torch.float32,
-+                    device=hidden_states.device,
++                    device=residual.device
++                    if residual is not None
++                    else hidden_states.device,
 +                )
 +            )
 +        fused_final_collapse_norm = (
@@ -449,7 +551,7 @@ index d0d95d809..69288dc6b 100644
              hidden_states = layer.mhc.post_collapse(
                  hidden_states, residual, post_mix, res_mix, pre_mix
              )
-@@ -990,25 +1070,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -990,25 +1072,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  {"hidden_states": hidden_states, "pre_mix": pre_mix}
              )
  
@@ -476,7 +578,7 @@ index d0d95d809..69288dc6b 100644
              hidden_states = (
                  layer.mhc.collapse(hidden_states, pre_mix)
                  if columns is None
-@@ -1023,10 +1088,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1023,10 +1090,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              if decoder_compacted:
                  columns = scatter_rows(columns, ced_indices, full_num_tokens)
              self._sink_columns[:full_num_tokens].copy_(columns)
@@ -493,6 +595,25 @@ index d0d95d809..69288dc6b 100644
          if sp is not None:
              hidden_states = sp.gather(hidden_states)
          if decoder_compacted:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 5ed772e5c..8c6fdf4b8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -309,6 +309,14 @@ class RankOrderParts:
+     def shape(self) -> torch.Size:
+         return self.packed.shape[1:]
+ 
++    @property
++    def device(self) -> torch.device:
++        return self.packed.device
++
++    @property
++    def dtype(self) -> torch.dtype:
++        return self.packed.dtype
++
+     def sum(self, out: torch.Tensor | None = None) -> torch.Tensor:
+         return rank_order_sum(list(self.packed.unbind(0)), out)
+ 
 diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
 index 7b33ff2da..06200f436 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
