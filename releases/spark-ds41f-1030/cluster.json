@@ -276,6 +276,34 @@
       },
       "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched.json"
     },
+    "tp5-switched": {
+      "notes": "Five nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "extends": "tp4-switched",
+      "nodes": 5,
+      "nodes_config": "config/nodes-switched5.local.json",
+      "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched5.json"
+    },
+    "tp6-switched": {
+      "notes": "Six nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "extends": "tp4-switched",
+      "nodes": 6,
+      "nodes_config": "config/nodes-switched6.local.json",
+      "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched6.json"
+    },
+    "tp7-switched": {
+      "notes": "Seven nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "extends": "tp4-switched",
+      "nodes": 7,
+      "nodes_config": "config/nodes-switched7.local.json",
+      "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched7.json"
+    },
+    "tp8-switched": {
+      "notes": "Eight nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp4-ring's sizing, with uneven tensor-parallel shards padded per 0625-0628.",
+      "extends": "tp4-switched",
+      "nodes": 8,
+      "nodes_config": "config/nodes-switched8.local.json",
+      "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched8.json"
+    },
     "tp3-triangle": {
       "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 since spark-ds41f-1025 (owner, 2026-10-25: \"if 8k fits\"). The fit check passed with dgx1 at 6.67 GiB lowest through three cold 1M prefills. Against spark-ds41f-1022 at 4,096, prefill is +25.5-28.2% from 32K to 500K (with the CED skip and the TileLang completion), and decode steps beside a long prompt run about 1.7 times as long as at 4,096 (against plain decode, steps during a 131K prefill are 8.6-14.4 times as long). vLLM's startup line reads 4,009,281 tokens; the pool still holds 5 full 1M contexts (experiments/2026-10-25-spark-ds41f-candidate). From the release after spark-ds41f-1025 it is 6,144 (owner, 2026-10-27), the prepared fallback (rc6/rc-tp3-6144.json): against 8,192 it gives up about 3% of prefill (1M 3,797 against 3,907 tok/s) for a median step beside a long prompt 21% shorter (1.143 s against 1.444 s; experiments/2026-10-19-prefill-budget-tp3). A site triangle measured the same trade on candidate 8 (#503: about 2% prefill at 131K for 24% longer stalls), with decode unchanged at every budget. The startup line at 6,144 reads 4,354,971 tokens; the pool still holds 5 full 1M contexts. spark-ds41f-1030 (candidate 14) is qualified on the ring only; its full qualification on the triangle runs once the triangle is cabled (candidate 13's TP3 arms and specs in experiments/2026-10-26-spark-ds41f-candidate/rc13, moved to candidate 14's image). Candidate 12's expert scale codes cost about 1.4 GiB a rank at TP3 (#668); 0566 returns it.",
       "nodes": 3,
@@ -316,6 +344,16 @@
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
       },
       "benchmark_reference": "manifests/suites/2026-10-30-spark-ds41f-1030-tp3"
+    },
+    "tp3-switched": {
+      "notes": "Three nodes cabled through a switch (two ConnectX-7 paths per port); NCCL and one-shot settings are sparknet's oneshot-switched profile over tp3-triangle's sizing.",
+      "extends": "tp3-triangle",
+      "nodes_config": "config/nodes-switched3.local.json",
+      "fabric": {
+        "transport": "oneshot-switched",
+        "topology": "switched"
+      },
+      "benchmark_reference": "manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched3.json"
     },
     "tp3-triangle-4k": {
       "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md). It keeps the 4,096-token budget: the triangle's larger budgets were measured with Memory Saver at 1M only.",

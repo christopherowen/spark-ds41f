@@ -110,6 +110,15 @@ class ReleaseTest(unittest.TestCase):
             [s["name"] for s in data["shapes"]],
             list(production["shapes"].keys()),
         )
+        for s in data["shapes"]:
+            if s["benchmark_reference"]:
+                self.assertIsNotNone(s["memory"], s["name"])
+                self.assertGreater(s["memory"]["head_min_available_gib"], 5.0, s["name"])
+                self.assertGreater(s["memory"]["worker_min_available_gib"], 5.0, s["name"])
+                self.assertGreater(s["memory"]["headroom_above_startup_guard_gib"], 0.0, s["name"])
+                self.assertEqual(s["memory"]["max_swap_growth_gib"], 0.0, s["name"])
+            else:
+                self.assertIsNone(s["memory"], s["name"])
         suite_dirs = sorted(
             p.name
             for p in (ROOT / "manifests/suites").iterdir()

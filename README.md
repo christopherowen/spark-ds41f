@@ -198,12 +198,17 @@ See [docs/current-state.md](docs/current-state.md) and the manifest-driven dashb
 [docs/index.html](docs/index.html) (regenerated and verified by `scripts/render_docs.py`).
 
 <!-- BEGIN GENERATED: current-baseline-summary -->
-| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Full contexts held (startup line) | Qualified reference |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) |
-| `tp4-switched` | TP4 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched.json) |
-| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) |
-| `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | 8 (8.80x; startup `1,348,708` / `5.14x`) | unqualified (`--unqualified-shape`) |
+| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Min free RAM (head / workers) | Full contexts held (startup line) | Qualified reference |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 20.33 / 22.58 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) |
+| `tp4-switched` | TP4 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 20.83 / 20.92 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched.json) |
+| `tp5-switched` | TP5 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 28.86 / 28.89 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched5.json) |
+| `tp6-switched` | TP6 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.77 / 44.18 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched6.json) |
+| `tp7-switched` | TP7 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.05 / 43.60 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched7.json) |
+| `tp8-switched` | TP8 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 51.80 / 52.33 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched8.json) |
+| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.81 / 8.17 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) |
+| `tp3-switched` | TP3 `oneshot-switched` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.41 / 6.92 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched3.json) |
+| `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | — | 8 (8.80x; startup `1,348,708` / `5.14x`) | unqualified (`--unqualified-shape`) |
 <!-- END GENERATED: current-baseline-summary -->
 
 The promoted deployment (`tp4-ring` on four nodes by default; `tp3-triangle` on three nodes
