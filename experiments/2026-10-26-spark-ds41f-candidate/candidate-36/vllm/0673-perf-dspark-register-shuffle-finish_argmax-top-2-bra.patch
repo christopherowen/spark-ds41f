@@ -1,0 +1,1317 @@
+From 4fa7ec9acfd05cc8384f9f6293760a9fb0c1a242 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:04:29 +0100
+Subject: [PATCH 673/674] perf(dspark): register-shuffle finish_argmax top-2
+ branching without feature flags (#780)
+
+---
+ .../spec_decode/test_dspark_vocab_parallel.py | 157 +++++
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 630 ++++++++++++++++--
+ .../worker/gpu/spec_decode/dspark/greedy.py   |  33 +-
+ .../gpu/spec_decode/dspark/speculator.py      |  74 +-
+ 4 files changed, 819 insertions(+), 75 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_dspark_vocab_parallel.py b/tests/v1/spec_decode/test_dspark_vocab_parallel.py
+index e92bdab52..5efd8bff9 100644
+--- a/tests/v1/spec_decode/test_dspark_vocab_parallel.py
++++ b/tests/v1/spec_decode/test_dspark_vocab_parallel.py
+@@ -46,6 +46,9 @@ def test_shard_pairs_reproduce_the_full_argmax(dtype, ranks):
+     torch.manual_seed(0)
+     rows, vocab = 8, 129280
+     base = torch.randn(rows, vocab, device="cuda").to(dtype)
++    for r in range(rows):
++        base[r, (r * 3) * 2048 + 7] = 25.0
++        base[r, (r * 3 + 1) * 2048 + 13] = 22.0
+     bias = torch.randn(rows, vocab, device="cuda").to(dtype)
+     # Ties across shard boundaries resolve to the lowest index; NaN wins.
+     base[1, [100, 50000, 120000]] = 30
+@@ -61,3 +64,157 @@ def test_shard_pairs_reproduce_the_full_argmax(dtype, ranks):
+     got = _sharded(base, bias, ranks, padded=-(-vocab // ranks) + 64)
+     assert got.tolist() == expected.tolist()
+     assert expected[1].item() == 100 and expected[2].item() == 20000 and expected[3].item() == 70000
++
++
++def _sharded_top2(base, bias, ranks, padded, embed=None, branch_cfg=None):
++    rows, vocab = base.shape
++    per_rank = -(-vocab // ranks)
++    values = torch.empty(
++        scratch_shape(rows, padded, top2=True), dtype=torch.float32, device="cuda"
++    )
++    indices = torch.empty(
++        scratch_shape(rows, padded, top2=True), dtype=torch.int32, device="cuda"
++    )
++    pairs = []
++    for rank in range(ranks):
++        start = rank * per_rank
++        stop = min(vocab, start + per_rank)
++        shard_base = torch.full((rows, padded), 7.0, dtype=base.dtype, device="cuda")
++        shard_bias = torch.full((rows, padded), 7.0, dtype=bias.dtype, device="cuda")
++        shard_base[:, : stop - start] = base[:, start:stop]
++        shard_bias[:, : stop - start] = bias[:, start:stop]
++        pair = torch.empty(rows, 4, dtype=torch.float32, device="cuda")
++        greedy_markov_shard_pair(
++            shard_base[:, : stop - start],
++            shard_bias[:, : stop - start],
++            start,
++            pair,
++            values,
++            indices,
++            top2=True,
++        )
++        pairs.append(pair)
++    out = torch.empty(rows, 5, dtype=torch.int64, device="cuda")[:, 2]
++    runner_up = torch.empty(rows, 3, dtype=torch.int64, device="cuda")[:, 1]
++    margin = torch.empty(rows, 2, dtype=torch.float32, device="cuda")[:, 0]
++    weight, branch_margin, branch_weight = (
++        branch_cfg if branch_cfg is not None else (None, 0.0, 1.0)
++    )
++    select_first_argmax(
++        torch.cat(pairs, dim=-1),
++        out,
++        pair_width=4,
++        embed=embed,
++        top2_branch=(weight, runner_up, margin, branch_margin, branch_weight),
++    )
++    return out, runner_up, margin
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("ranks", [1, 2, 3, 4])
++def test_shard_pairs_top2_reproduce_full_top1_and_runner_up(dtype, ranks):
++    torch.manual_seed(7)
++    rows, vocab = 8, 129280
++    base = torch.randn(rows, vocab, device="cuda").to(dtype)
++    for r in range(rows):
++        base[r, (r * 3) * 2048 + 7] = 25.0
++        base[r, (r * 3 + 1) * 2048 + 13] = 22.0
++    bias = torch.randn(rows, vocab, device="cuda").to(dtype)
++    # Row 1: three-way tie across shards -> top1=100, runner-up=50000
++    base[1, [100, 50000, 120000]] = 30
++    bias[1, [100, 50000, 120000]] = 0
++    # Row 2: distinct top1=20000 (40.0) and runner-up=90000 (39.5) across shards
++    base[2, 20000] = 40.0
++    bias[2, 20000] = 0.0
++    base[2, 90000] = 39.5
++    bias[2, 90000] = 0.0
++    # Row 3: top1 and runner-up in the same shard (even within the same 2048-col part)
++    base[3, 4100] = 50.0
++    bias[3, 4100] = 0.0
++    base[3, 6200] = 48.0
++    bias[3, 6200] = 0.0
++
++    summed = (base.float() + bias.float()).to(dtype).float()
++    expected_top1 = summed.argmax(dim=-1)
++    masked = summed.clone()
++    masked[torch.arange(rows, device="cuda"), expected_top1] = -float("inf")
++    expected_top2 = masked.argmax(dim=-1)
++    expected_margin = (
++        summed[torch.arange(rows, device="cuda"), expected_top1]
++        - summed[torch.arange(rows, device="cuda"), expected_top2]
++    )
++
++    got_top1, got_top2, got_margin = _sharded_top2(
++        base, bias, ranks, padded=-(-vocab // ranks) + 64
++    )
++    assert torch.equal(got_top1, expected_top1)
++    assert torch.equal(got_top2, expected_top2)
++    assert torch.allclose(got_margin, expected_margin, atol=0.0, rtol=0.0)
++    assert got_top1[1].item() == 100 and got_top2[1].item() == 50000
++    assert got_top1[2].item() == 20000 and got_top2[2].item() == 90000
++    assert got_top1[3].item() == 4100 and got_top2[3].item() == 6200
++
++
++@pytest.mark.parametrize("ranks", [1, 3, 4])
++def test_top2_branch_markov_confidence_promotion(ranks):
++    torch.manual_seed(11)
++    rows, vocab, embed_width = 4, 129280, 256
++    base = torch.full((rows, vocab), -10.0, dtype=torch.bfloat16, device="cuda")
++    bias = torch.zeros((rows, vocab), dtype=torch.bfloat16, device="cuda")
++
++    # Row 0: narrow margin (0.125 <= 0.25), runner-up has strong Markov confidence -> promote
++    base[0, 1000] = 10.0
++    base[0, 95000] = 9.875
++    # Row 1: narrow margin (0.125 <= 0.25), but top1 has stronger Markov confidence -> keep top1
++    base[1, 2000] = 10.0
++    base[1, 96000] = 9.875
++    # Row 2: wide margin (1.0 > 0.25), even with strong runner-up confidence -> keep top1
++    base[2, 3000] = 10.0
++    base[2, 97000] = 9.0
++    # Row 3: exact tie (margin == 0.0); with branch_margin=0.0 must stay bit-identical to argmax
++    base[3, 4000] = 10.0
++    base[3, 98000] = 10.0
++
++    table = torch.zeros((vocab, embed_width), dtype=torch.bfloat16, device="cuda")
++    table[95000] = 1.0
++    table[1000] = -1.0
++    table[2000] = 1.0
++    table[96000] = -1.0
++    table[97000] = 1.0
++    table[3000] = -1.0
++    table[98000] = 1.0
++    table[4000] = -1.0
++    markov_conf_weight = torch.full(
++        (embed_width,), 0.01, dtype=torch.float32, device="cuda"
++    )
++
++    step_out0 = torch.empty((rows, embed_width), dtype=torch.bfloat16, device="cuda")
++    conf_out0 = torch.empty((rows, embed_width), dtype=torch.bfloat16, device="cuda")
++    got_zero_margin, got_zero_runner, _ = _sharded_top2(
++        base,
++        bias,
++        ranks,
++        padded=-(-vocab // ranks) + 64,
++        embed=(table, step_out0, conf_out0),
++        branch_cfg=(markov_conf_weight, 0.0, 1.0),
++    )
++    assert got_zero_margin.tolist() == [1000, 2000, 3000, 4000]
++    assert got_zero_runner.tolist() == [95000, 96000, 97000, 98000]
++    assert torch.equal(step_out0, table[got_zero_margin])
++    assert torch.equal(conf_out0, table[got_zero_margin])
++
++    step_out = torch.empty((rows, embed_width), dtype=torch.bfloat16, device="cuda")
++    conf_out = torch.empty((rows, embed_width), dtype=torch.bfloat16, device="cuda")
++    got_branched, got_runner, got_margin = _sharded_top2(
++        base,
++        bias,
++        ranks,
++        padded=-(-vocab // ranks) + 64,
++        embed=(table, step_out, conf_out),
++        branch_cfg=(markov_conf_weight, 0.25, 1.0),
++    )
++    assert got_branched.tolist() == [95000, 2000, 3000, 98000]
++    assert got_runner.tolist() == [1000, 96000, 97000, 4000]
++    assert torch.equal(step_out, table[got_branched])
++    assert torch.equal(conf_out, table[got_branched])
++    assert got_margin.tolist() == [0.125, 0.125, 1.0, 0.0]
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 4d8610dc0..4f889ec46 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -1926,17 +1926,125 @@ def _warp_first_argmax(best, best_index, other, other_index):
+     _first_exchange(best, best_index, other, other_index, 1)
+ 
+ 
++@T.macro
++def _first_keep_or_take_top2(
++    best, best_index, second, second_index, value, index
++):
++    """Update top-1 ``(best, best_index)`` and runner-up ``(second, second_index)``
++    with ``(value, index)`` by branchless selects under ``vllm_first_argmax_keep``,
++    ignoring duplicate indices."""
++    dup = T.alloc_var(
++        T.int32,
++        init=T.if_then_else(
++            (index == best_index[0]) | (index == second_index[0]), 1, 0
++        ),
++    )
++    keep_best = T.alloc_var(
++        T.int32,
++        init=T.if_then_else(
++            dup != 0,
++            1,
++            T.call_extern(
++                "int32", "vllm_first_argmax_keep", best[0], best_index[0], value, index
++            ),
++        ),
++    )
++    cand_v = T.alloc_var(
++        T.float32, init=T.if_then_else(keep_best != 0, value, best[0])
++    )
++    cand_i = T.alloc_var(
++        T.int32, init=T.if_then_else(keep_best != 0, index, best_index[0])
++    )
++    best[0] = T.if_then_else(keep_best != 0, best[0], value)
++    best_index[0] = T.if_then_else(keep_best != 0, best_index[0], index)
++    keep_sec = T.alloc_var(
++        T.int32,
++        init=T.if_then_else(
++            dup != 0,
++            1,
++            T.call_extern(
++                "int32",
++                "vllm_first_argmax_keep",
++                second[0],
++                second_index[0],
++                cand_v,
++                cand_i,
++            ),
++        ),
++    )
++    second[0] = T.if_then_else(keep_sec != 0, second[0], cand_v)
++    second_index[0] = T.if_then_else(keep_sec != 0, second_index[0], cand_i)
++
++
++@T.macro
++def _first_exchange_top2(
++    best,
++    best_index,
++    second,
++    second_index,
++    other,
++    other_index,
++    other2,
++    other2_index,
++    distance,
++):
++    other[0] = T.shfl_xor(best[0], distance)
++    other_index[0] = T.shfl_xor(best_index[0], distance)
++    other2[0] = T.shfl_xor(second[0], distance)
++    other2_index[0] = T.shfl_xor(second_index[0], distance)
++    _first_keep_or_take_top2(
++        best, best_index, second, second_index, other[0], other_index[0]
++    )
++    _first_keep_or_take_top2(
++        best, best_index, second, second_index, other2[0], other2_index[0]
++    )
++
++
++@T.macro
++def _warp_first_argmax_top2(
++    best,
++    best_index,
++    second,
++    second_index,
++    other,
++    other_index,
++    other2,
++    other2_index,
++):
++    """Every lane's ``((best, best_index), (second, second_index))`` = the warp's
++    top-1 and runner-up under ``vllm_first_argmax_keep``'s total order."""
++    _first_exchange_top2(
++        best, best_index, second, second_index, other, other_index, other2, other2_index, 16
++    )
++    _first_exchange_top2(
++        best, best_index, second, second_index, other, other_index, other2, other2_index, 8
++    )
++    _first_exchange_top2(
++        best, best_index, second, second_index, other, other_index, other2, other2_index, 4
++    )
++    _first_exchange_top2(
++        best, best_index, second, second_index, other, other_index, other2, other2_index, 2
++    )
++    _first_exchange_top2(
++        best, best_index, second, second_index, other, other_index, other2, other2_index, 1
++    )
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def partial_argmax_kernel(
+-    base_dtype: str, bias_dtype: str | None, vector: bool, threads: int = _THREADS
++    base_dtype: str,
++    bias_dtype: str | None,
++    vector: bool,
++    threads: int = _THREADS,
++    top2: bool = False,
+ ):
+     """``dspark.greedy._partial_argmax`` (with a bias, each sum rounded to the base
+     dtype as the materialized ``torch.add``) and ``_partial_argmax_logits``
+-    (without): the first maximum of each 2048-column part of each row, by value
+-    and shard-local column, into flat FP32 / int32 scratch at ``row * parts +
+-    part``. ``threads`` a block; with ``vector`` (16-byte aligned rows, columns a
+-    multiple of eight), each thread reads runs of eight consecutive values. The
+-    combine is a total order, so the layout does not change the result."""
++    (without): the first maximum (and when ``top2`` is True, the runner-up) of each
++    2048-column part of each row, by value and shard-local column, into flat
++    FP32 / int32 scratch. ``threads`` a block; with ``vector`` (16-byte aligned rows,
++    columns a multiple of eight), each thread reads runs of eight consecutive values.
++    The combine is a total order, so the layout does not change the result."""
+     rows, vocab, values_len, indices_len = T.dynamic(
+         "rows, vocab, values_len, indices_len"
+     )
+@@ -1969,9 +2077,18 @@ def partial_argmax_kernel(
+             other_index = T.alloc_local((1,), T.int32)
+             partial = T.alloc_shared((warps,), T.float32)
+             partial_index = T.alloc_shared((warps,), T.int32)
++            second = T.alloc_local((1,), T.float32)
++            second_index = T.alloc_local((1,), T.int32)
++            other2 = T.alloc_local((1,), T.float32)
++            other2_index = T.alloc_local((1,), T.int32)
++            partial2 = T.alloc_shared((warps,), T.float32)
++            partial2_index = T.alloc_shared((warps,), T.int32)
+             # Triton's masked lanes, which no column beats.
+             best[0] = -T.infinity(T.float32)
+             best_index[0] = _INT32_MAX
++            if top2:
++                second[0] = -T.infinity(T.float32)
++                second_index[0] = _INT32_MAX
+             if vector:
+                 # The launch checked it: rows 16-byte aligned, columns whole runs.
+                 T.assume(base_stride % _VEC == 0)
+@@ -1999,7 +2116,12 @@ def partial_argmax_kernel(
+                                     ),
+                                     T.float32,
+                                 )
+-                            _first_keep_or_take(best, best_index, value, col0 + i)
++                            if top2:
++                                _first_keep_or_take_top2(
++                                    best, best_index, second, second_index, value, col0 + i
++                                )
++                            else:
++                                _first_keep_or_take(best, best_index, value, col0 + i)
+             else:
+                 for j in T.unroll(passes):
+                     col = part * GREEDY_BLOCK + j * threads + tx
+@@ -2016,18 +2138,68 @@ def partial_argmax_kernel(
+                                 T.cast(value + T.cast(b[j], T.float32), base_dtype),
+                                 T.float32,
+                             )
+-                        _first_keep_or_take(best, best_index, value, col)
+-            _warp_first_argmax(best, best_index, other, other_index)
+-            if tx % 32 == 0:
+-                partial[tx // 32] = best[0]
+-                partial_index[tx // 32] = best_index[0]
+-            T.sync_threads()
+-            if tx == 0:
+-                for w in T.unroll(1, warps):
+-                    _first_keep_or_take(best, best_index, partial[w], partial_index[w])
+-                slot = T.cast(row, T.int64) * T.ceildiv(vocab, GREEDY_BLOCK) + part
+-                values[slot] = best[0]
+-                indices[slot] = best_index[0]
++                        if top2:
++                            _first_keep_or_take_top2(
++                                best, best_index, second, second_index, value, col
++                            )
++                        else:
++                            _first_keep_or_take(best, best_index, value, col)
++            if top2:
++                _warp_first_argmax_top2(
++                    best,
++                    best_index,
++                    second,
++                    second_index,
++                    other,
++                    other_index,
++                    other2,
++                    other2_index,
++                )
++                if tx % 32 == 0:
++                    partial[tx // 32] = best[0]
++                    partial_index[tx // 32] = best_index[0]
++                    partial2[tx // 32] = second[0]
++                    partial2_index[tx // 32] = second_index[0]
++                T.sync_threads()
++                if tx == 0:
++                    for w in T.unroll(1, warps):
++                        _first_keep_or_take_top2(
++                            best,
++                            best_index,
++                            second,
++                            second_index,
++                            partial[w],
++                            partial_index[w],
++                        )
++                        _first_keep_or_take_top2(
++                            best,
++                            best_index,
++                            second,
++                            second_index,
++                            partial2[w],
++                            partial2_index[w],
++                        )
++                    slot = (
++                        T.cast(row, T.int64) * T.ceildiv(vocab, GREEDY_BLOCK) + part
++                    ) * 2
++                    values[slot] = best[0]
++                    values[slot + 1] = second[0]
++                    indices[slot] = best_index[0]
++                    indices[slot + 1] = second_index[0]
++            else:
++                _warp_first_argmax(best, best_index, other, other_index)
++                if tx % 32 == 0:
++                    partial[tx // 32] = best[0]
++                    partial_index[tx // 32] = best_index[0]
++                T.sync_threads()
++                if tx == 0:
++                    for w in T.unroll(1, warps):
++                        _first_keep_or_take(
++                            best, best_index, partial[w], partial_index[w]
++                        )
++                    slot = T.cast(row, T.int64) * T.ceildiv(vocab, GREEDY_BLOCK) + part
++                    values[slot] = best[0]
++                    indices[slot] = best_index[0]
+ 
+     return partial_argmax
+ 
+@@ -2041,7 +2213,9 @@ _FINISH_LANES = (1, 2)
+ def finish_argmax_kernel(output: str, per_lane: int = 1):
+     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
+     maximum and its global index ``+ vocab_start`` as FP32 into ``out[row *
+-    out_stride]`` and the element after it) and ``_finish_argmax`` ("int32" /
++    out_stride]`` and the element after it; ``output`` "pair_top2": also the
++    runner-up maximum and its global index into columns 2 and 3 of the 16-byte
++    pair row) and ``_finish_argmax`` ("int32" /
+     "int64": the index into ``out[row * out_stride]``), from the parts' scratch, a
+     warp a row. As Triton's, every part
+     is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
+@@ -2050,7 +2224,8 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+     rows, values_len, indices_len, out_len = T.dynamic(
+         "rows, values_len, indices_len, out_len"
+     )
+-    pair = output == "pair"
++    pair = output in ("pair", "pair_top2")
++    top2 = output == "pair_top2"
+     out_dtype = "float32" if pair else output
+ 
+     @T.prim_func
+@@ -2072,6 +2247,10 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+             best_index = T.alloc_local((1,), T.int32)
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
++            second = T.alloc_local((1,), T.float32)
++            second_index = T.alloc_local((1,), T.int32)
++            other2 = T.alloc_local((1,), T.float32)
++            other2_index = T.alloc_local((1,), T.int32)
+             for k in T.unroll(per_lane):
+                 part = tx + k * 32
+                 slot = T.cast(row, T.int64) * parts + T.min(part, parts - 1)
+@@ -2081,19 +2260,50 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+                 ix[k] = T.if_then_else(part < parts, indices[slot], _INT32_MAX)
+             best[0] = v[0]
+             best_index[0] = ix[0]
+-            for k in T.unroll(1, per_lane):
+-                _first_keep_or_take(best, best_index, v[k], ix[k])
+-            _warp_first_argmax(best, best_index, other, other_index)
+-            if tx == 0:
+-                if pair:
+-                    out[T.cast(row, T.int64) * out_stride] = best[0]
+-                    out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
+-                        best_index[0] + vocab_start, T.float32
++            if top2:
++                for k in T.unroll(1, per_lane):
++                    _first_keep_or_take(best, best_index, v[k], ix[k])
++                _warp_first_argmax(best, best_index, other, other_index)
++                second[0] = T.if_then_else(
++                    ix[0] == best_index[0], -T.infinity(T.float32), v[0]
++                )
++                second_index[0] = T.if_then_else(
++                    ix[0] == best_index[0], _INT32_MAX, ix[0]
++                )
++                for k in T.unroll(1, per_lane):
++                    _first_keep_or_take(
++                        second,
++                        second_index,
++                        T.if_then_else(
++                            ix[k] == best_index[0], -T.infinity(T.float32), v[k]
++                        ),
++                        T.if_then_else(ix[k] == best_index[0], _INT32_MAX, ix[k]),
+                     )
+-                else:
+-                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                        best_index[0], out_dtype
++                _warp_first_argmax(second, second_index, other, other_index)
++                if tx == 0:
++                    base_out = T.cast(row, T.int64) * out_stride
++                    out[base_out] = best[0]
++                    out[base_out + 1] = T.cast(best_index[0] + vocab_start, T.float32)
++                    out[base_out + 2] = second[0]
++                    out[base_out + 3] = T.if_then_else(
++                        second_index[0] < _INT32_MAX,
++                        T.cast(second_index[0] + vocab_start, T.float32),
++                        T.float32(1 << 30),
+                     )
++            else:
++                for k in T.unroll(1, per_lane):
++                    _first_keep_or_take(best, best_index, v[k], ix[k])
++                _warp_first_argmax(best, best_index, other, other_index)
++                if tx == 0:
++                    if pair:
++                        out[T.cast(row, T.int64) * out_stride] = best[0]
++                        out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
++                            best_index[0] + vocab_start, T.float32
++                        )
++                    else:
++                        out[T.cast(row, T.int64) * out_stride] = T.cast(
++                            best_index[0], out_dtype
++                        )
+ 
+     return finish_argmax
+ 
+@@ -2121,6 +2331,56 @@ def _select_pairs(
+         _first_exchange(best, best_index, other, other_index, 1)
+ 
+ 
++@T.macro
++def _select_pairs_top2(
++    pairs,
++    best,
++    best_index,
++    second,
++    second_index,
++    other,
++    other_index,
++    other2,
++    other2_index,
++    row,
++    tx,
++    ranks,
++    span,
++    pair_width,
++):
++    """Every lane's top-1 and runner-up over the row's ranks' 4-column pairs
++    ``[best_v, best_i, second_v, second_i]``, in lanes below ``span``."""
++    lane = T.min(tx, ranks - 1)
++    v1 = pairs[row, pair_width * lane]
++    i1 = pairs[row, pair_width * lane + 1]
++    v2 = pairs[row, pair_width * lane + 2]
++    i2 = pairs[row, pair_width * lane + 3]
++    best[0] = T.if_then_else(tx < ranks, v1, -T.infinity(T.float32))
++    best_index[0] = T.if_then_else(tx < ranks, T.cast(i1, T.int32), T.int32(1 << 30))
++    second[0] = T.if_then_else(tx < ranks, v2, -T.infinity(T.float32))
++    second_index[0] = T.if_then_else(tx < ranks, T.cast(i2, T.int32), T.int32(1 << 30))
++    if span >= 32:
++        _first_exchange_top2(
++            best, best_index, second, second_index, other, other_index, other2, other2_index, 16
++        )
++    if span >= 16:
++        _first_exchange_top2(
++            best, best_index, second, second_index, other, other_index, other2, other2_index, 8
++        )
++    if span >= 8:
++        _first_exchange_top2(
++            best, best_index, second, second_index, other, other_index, other2, other2_index, 4
++        )
++    if span >= 4:
++        _first_exchange_top2(
++            best, best_index, second, second_index, other, other_index, other2, other2_index, 2
++        )
++    if span >= 2:
++        _first_exchange_top2(
++            best, best_index, second, second_index, other, other_index, other2, other2_index, 1
++        )
++
++
+ @T.macro
+ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_rows):
+     """Row ``token`` of the Markov embedding ``table`` into both outputs' ``row``,
+@@ -2134,7 +2394,11 @@ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def select_first_argmax_kernel(
+-    output_dtype: str, ranks: int, embed_width: int = 0, pair_width: int = 2
++    output_dtype: str,
++    ranks: int,
++    embed_width: int = 0,
++    pair_width: int = 2,
++    top2_branch: bool = False,
+ ):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
+@@ -2147,14 +2411,22 @@ def select_first_argmax_kernel(
+ 
+     With ``embed_width``, the drafter's next step: the selected token's row of the
+     Markov embedding ``table`` ([vocab, embed_width] BF16) into ``step_out[row]``
+-    and ``confidence_out[row]``, which ``nn.Embedding`` and a stack wrote."""
++    and ``confidence_out[row]``, which ``nn.Embedding`` and a stack wrote.
++
++    With ``top2_branch`` (``pair_width == 4``), also reduces the global runner-up
++    ``(second_value, second_index)`` across all shards, writes the runner-up token
++    and top1-top2 logit margin, and when ``embed_width > 0`` and ``best - second <=
++    branch_margin``, scores ``markov_conf_weight . (table[second] - table[best])``
++    across the warp to promote the runner-up when its transition confidence gain
++    outweighs the logit gap."""
+     assert 1 <= ranks <= 32
+     assert embed_width % 32 == 0
++    assert not top2_branch or pair_width == 4
+     rows, width, out_len = T.dynamic("rows, width, out_len")
+     pairs_stride = T.dynamic("pairs_stride", "int64")
+     span = 1 << max(ranks - 1, 0).bit_length()
+ 
+-    if not embed_width:
++    if not embed_width and not top2_branch:
+ 
+         @T.prim_func
+         def select_first_argmax(
+@@ -2180,14 +2452,99 @@ def select_first_argmax_kernel(
+ 
+         return select_first_argmax
+ 
++    if not embed_width and top2_branch:
++        runner_up_len, margin_len = T.dynamic("runner_up_len, margin_len")
++
++        @T.prim_func
++        def select_first_argmax_top2(
++            pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
++            out: T.Tensor((out_len,), output_dtype),
++            out_stride: T.int64,
++            runner_up_out: T.Tensor((runner_up_len,), output_dtype),
++            runner_up_stride: T.int64,
++            margin_out: T.Tensor((margin_len,), T.float32),
++            margin_stride: T.int64,
++        ):
++            with T.Kernel(rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                second = T.alloc_local((1,), T.float32)
++                second_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                other2 = T.alloc_local((1,), T.float32)
++                other2_index = T.alloc_local((1,), T.int32)
++                _select_pairs_top2(
++                    pairs, best, best_index, second, second_index, other,
++                    other_index, other2, other2_index, row, tx, ranks, span,
++                    pair_width,
++                )  # fmt: skip
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
++                    runner_up_out[T.cast(row, T.int64) * runner_up_stride] = T.cast(
++                        T.if_then_else(
++                            second_index[0] < (1 << 30), second_index[0], best_index[0]
++                        ),
++                        output_dtype,
++                    )
++                    margin_out[T.cast(row, T.int64) * margin_stride] = (
++                        best[0] - second[0]
++                    )
++
++        return select_first_argmax_top2
++
+     table_rows = T.dynamic("table_rows")
+     step_stride, confidence_stride = T.dynamic(
+         "step_stride, confidence_stride", "int64"
+     )
+     per_lane = embed_width // 32
+ 
++    if not top2_branch:
++
++        @T.prim_func
++        def select_first_argmax_embed(
++            pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
++            out: T.Tensor((out_len,), output_dtype),
++            out_stride: T.int64,
++            table: T.Tensor((table_rows, embed_width), T.bfloat16),
++            step_out: T.StridedTensor((rows, embed_width), (step_stride, 1), T.bfloat16),
++            confidence_out: T.StridedTensor(
++                (rows, embed_width), (confidence_stride, 1), T.bfloat16
++            ),
++        ):
++            with T.Kernel(rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                selected = T.alloc_shared((1,), T.int32)
++                _select_pairs(
++                    pairs, best, best_index, other, other_index, row, tx, ranks,
++                    span, pair_width,
++                )  # fmt: skip
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
++                    selected[0] = best_index[0]
++                T.sync_threads()
++                _embed_row(
++                    table, selected[0], step_out, confidence_out, row, tx, per_lane,
++                    table_rows,
++                )  # fmt: skip
++
++        return select_first_argmax_embed
++
++    runner_up_len, margin_len = T.dynamic("runner_up_len, margin_len")
++
+     @T.prim_func
+-    def select_first_argmax_embed(
++    def select_first_argmax_embed_top2(
+         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
+@@ -2196,31 +2553,95 @@ def select_first_argmax_kernel(
+         confidence_out: T.StridedTensor(
+             (rows, embed_width), (confidence_stride, 1), T.bfloat16
+         ),
++        markov_conf_weight: T.Tensor((embed_width,), T.float32),
++        runner_up_out: T.Tensor((runner_up_len,), output_dtype),
++        runner_up_stride: T.int64,
++        margin_out: T.Tensor((margin_len,), T.float32),
++        margin_stride: T.int64,
++        branch_margin: T.float32,
++        branch_weight: T.float32,
+     ):
+         with T.Kernel(rows, threads=32) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+             best = T.alloc_local((1,), T.float32)
+             best_index = T.alloc_local((1,), T.int32)
++            second = T.alloc_local((1,), T.float32)
++            second_index = T.alloc_local((1,), T.int32)
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
+-            selected = T.alloc_shared((1,), T.int32)
+-            _select_pairs(
+-                pairs, best, best_index, other, other_index, row, tx, ranks,
+-                span, pair_width,
++            other2 = T.alloc_local((1,), T.float32)
++            other2_index = T.alloc_local((1,), T.int32)
++            s_idx = T.alloc_shared((2,), T.int32)
++            s_val = T.alloc_shared((2,), T.float32)
++            eb = T.alloc_local((per_lane,), T.bfloat16)
++            es = T.alloc_local((per_lane,), T.bfloat16)
++            mw = T.alloc_local((per_lane,), T.float32)
++            diff_acc = T.alloc_local((1,), T.float32)
++            _select_pairs_top2(
++                pairs, best, best_index, second, second_index, other,
++                other_index, other2, other2_index, row, tx, ranks, span,
++                pair_width,
+             )  # fmt: skip
+             if tx == 0:
+-                out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                    best_index[0], output_dtype
++                s_idx[0] = best_index[0]
++                s_idx[1] = T.if_then_else(
++                    second_index[0] < (1 << 30), second_index[0], best_index[0]
+                 )
+-                selected[0] = best_index[0]
++                s_val[0] = best[0]
++                s_val[1] = second[0]
+             T.sync_threads()
+-            _embed_row(
+-                table, selected[0], step_out, confidence_out, row, tx, per_lane,
+-                table_rows,
+-            )  # fmt: skip
++            b_idx = s_idx[0]
++            r_idx = s_idx[1]
++            b_val = s_val[0]
++            r_val = s_val[1]
++            margin = b_val - r_val
++            src_b = T.max(T.min(b_idx, table_rows - 1), 0)
++            for v in T.vectorized(per_lane):
++                eb[v] = table[src_b, tx * per_lane + v]
++            if (
++                (branch_margin > T.float32(0.0))
++                & (r_idx != b_idx)
++                & (margin >= T.float32(0.0))
++                & (margin <= branch_margin)
++            ):
++                src_r = T.max(T.min(r_idx, table_rows - 1), 0)
++                for v in T.vectorized(per_lane):
++                    es[v] = table[src_r, tx * per_lane + v]
++                for v in T.unroll(per_lane):
++                    mw[v] = markov_conf_weight[tx * per_lane + v]
++                diff_acc[0] = T.float32(0.0)
++                for v in T.unroll(per_lane):
++                    diff_acc[0] = diff_acc[0] + (
++                        T.cast(es[v], T.float32) - T.cast(eb[v], T.float32)
++                    ) * mw[v]
++                diff_acc[0] = T.warp_reduce_sum(diff_acc[0])
++                take_second = (r_val + branch_weight * diff_acc[0]) > b_val
++                for v in T.unroll(per_lane):
++                    eb[v] = T.if_then_else(take_second, es[v], eb[v])
++                if tx == 0:
++                    chosen = T.if_then_else(take_second, r_idx, b_idx)
++                    runner_up = T.if_then_else(take_second, b_idx, r_idx)
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        chosen, output_dtype
++                    )
++                    runner_up_out[T.cast(row, T.int64) * runner_up_stride] = T.cast(
++                        runner_up, output_dtype
++                    )
++                    margin_out[T.cast(row, T.int64) * margin_stride] = margin
++            else:
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(b_idx, output_dtype)
++                    runner_up_out[T.cast(row, T.int64) * runner_up_stride] = T.cast(
++                        r_idx, output_dtype
++                    )
++                    margin_out[T.cast(row, T.int64) * margin_stride] = margin
++            for v in T.vectorized(per_lane):
++                step_out[row, tx * per_lane + v] = eb[v]
++            for v in T.vectorized(per_lane):
++                confidence_out[row, tx * per_lane + v] = eb[v]
+ 
+-    return select_first_argmax_embed
++    return select_first_argmax_embed_top2
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -2320,11 +2741,13 @@ def _finish(
+ ) -> None:
+     if rows == 0:
+         return
++    top2 = output == "pair_top2"
++    lanes = _FINISH_LANES
+     per_lane = -(-parts // 32)
+-    if per_lane not in _FINISH_LANES:
++    if per_lane not in lanes:
+         raise ValueError(
+             f"{parts} vocabulary parts exceed the greedy finish's "
+-            f"{32 * _FINISH_LANES[-1]} (_FINISH_LANES)"
++            f"{32 * lanes[-1]} ({lanes})"
+         )
+     kernel = _kernel(finish_argmax_kernel, output, per_lane)
+     kernel(
+@@ -2345,6 +2768,8 @@ def greedy_markov_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    *,
++    top2: bool = False,
+ ) -> None:
+     """``dspark.greedy.greedy_markov_shard_pair``."""
+     if base_logits.shape != markov_bias.shape:
+@@ -2356,7 +2781,8 @@ def greedy_markov_shard_pair(
+     if vocab_start + vocab > 1 << 24:
+         raise ValueError("vocabulary indices must stay exact in FP32")
+     parts = -(-vocab // GREEDY_BLOCK)
+-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
++    needed = rows * parts
++    if min(partial_values.numel(), partial_indices.numel()) < needed:
+         raise ValueError("DSpark greedy scratch is smaller than the logits require")
+     _partial_argmax(base_logits, markov_bias, partial_values, partial_indices)
+     _finish(
+@@ -2367,7 +2793,7 @@ def greedy_markov_shard_pair(
+         parts,
+         pairs.stride(0),
+         vocab_start,
+-        "pair",
++        "pair_top2" if top2 else "pair",
+     )
+ 
+ 
+@@ -2406,34 +2832,83 @@ def select_first_argmax(
+     output: torch.Tensor,
+     pair_width: int = 2,
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    top2_branch: (
++        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float, float] | None
++    ) = None,
+ ) -> None:
+     """``dspark.greedy.select_first_argmax``; with ``embed`` (table, step rows,
+-    confidence rows), also the selected tokens' Markov embeddings."""
++    confidence rows), also the selected tokens' Markov embeddings; with
++    ``top2_branch`` (markov_conf_weight, runner_up_out, margin_out, branch_margin,
++    branch_weight), also reduces the global runner-up and promotes it when
++    Markov transition confidence outweighs a narrow top1-top2 logit gap."""
+     rows = pairs.shape[0]
+     if rows == 0:
+         return
+     ranks = pairs.shape[1] // pair_width
++    use_top2 = top2_branch is not None
+     if embed is None:
+         kernel = _kernel(
+             select_first_argmax_kernel,
+-            *select_first_argmax_key(output, ranks, 0, pair_width),
++            *select_first_argmax_key(output, ranks, 0, pair_width, top2_branch=use_top2),
++        )
++        if not use_top2:
++            kernel(pairs, _flat(output), output.stride(0))
++            return
++        _, runner_up_out, margin_out, _, _ = top2_branch
++        kernel(
++            pairs,
++            _flat(output),
++            output.stride(0),
++            _flat(runner_up_out),
++            runner_up_out.stride(0),
++            _flat(margin_out),
++            margin_out.stride(0),
+         )
+-        kernel(pairs, _flat(output), output.stride(0))
+         return
+     table, step_out, confidence_out = embed
+     kernel = _kernel(
+         select_first_argmax_kernel,
+-        *select_first_argmax_key(output, ranks, table.shape[1], pair_width),
++        *select_first_argmax_key(
++            output, ranks, table.shape[1], pair_width, top2_branch=use_top2
++        ),
++    )
++    if not use_top2:
++        kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
++        return
++    markov_conf_weight, runner_up_out, margin_out, branch_margin, branch_weight = (
++        top2_branch
++    )
++    assert markov_conf_weight is not None
++    kernel(
++        pairs,
++        _flat(output),
++        output.stride(0),
++        table,
++        step_out,
++        confidence_out,
++        markov_conf_weight,
++        _flat(runner_up_out),
++        runner_up_out.stride(0),
++        _flat(margin_out),
++        margin_out.stride(0),
++        float(branch_margin),
++        float(branch_weight),
+     )
+-    kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
+ 
+ 
+ def select_first_argmax_key(
+-    output: torch.Tensor | torch.dtype, ranks: int, embed_width: int, pair_width: int
++    output: torch.Tensor | torch.dtype,
++    ranks: int,
++    embed_width: int,
++    pair_width: int,
++    *,
++    top2_branch: bool = False,
+ ) -> tuple:
+     """``select_first_argmax_kernel``'s key: the width-2 pairs (Triton's layout)
+     keep the original kernel's key."""
+     dtype = _DTYPES[output if isinstance(output, torch.dtype) else output.dtype]
++    if top2_branch:
++        return (dtype, ranks, embed_width, pair_width, True)
+     if pair_width == 2:
+         return (dtype, ranks, embed_width) if embed_width else (dtype, ranks)
+     return (dtype, ranks, embed_width, pair_width)
+@@ -2464,10 +2939,12 @@ def markov_embed_calls(
+     output_dtype: torch.dtype,
+     ranks: int,
+     embed_width: int,
++    *,
++    top2_branch: bool = False,
+ ) -> list:
+     """The drafter's Markov embeddings: the anchor's, and the selection that also
+     embeds the next step's token."""
+-    return [
++    calls = [
+         _call(
+             markov_anchor_embed_kernel,
+             _DTYPES[ids_dtype],
+@@ -2479,6 +2956,16 @@ def markov_embed_calls(
+             *select_first_argmax_key(output_dtype, ranks, embed_width, 4),
+         ),
+     ]
++    if top2_branch:
++        calls.append(
++            _call(
++                select_first_argmax_kernel,
++                *select_first_argmax_key(
++                    output_dtype, ranks, embed_width, 4, top2_branch=True
++                ),
++            )
++        )
++    return calls
+ 
+ 
+ def sample_greedy_markov(
+@@ -3121,6 +3608,7 @@ def greedy_calls(
+     select: Sequence[tuple[torch.dtype, int, int]] = (),
+     finish_outputs: Sequence[torch.dtype] = (),
+     rejection: Sequence[tuple[int, int, int]] = (),
++    top2: bool = False,
+ ) -> list:
+     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
+     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
+@@ -3143,6 +3631,7 @@ def greedy_calls(
+             calls.append(
+                 _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+             )
++
+     for item in logits:
+         if isinstance(item, tuple):
+             dtype, vec = item
+@@ -3156,17 +3645,30 @@ def greedy_calls(
+             )
+     if markov or logits:
+         calls += [_call(finish_argmax_kernel, "pair", lanes) for lanes in _FINISH_LANES]
++        if top2:
++            calls += [
++                _call(finish_argmax_kernel, "pair_top2", lanes)
++                for lanes in _FINISH_LANES
++            ]
+     calls += [
+         _call(finish_argmax_kernel, _DTYPES[dtype], lanes)
+         for dtype in finish_outputs
+         for lanes in _FINISH_LANES
+     ]
+-    calls += [
+-        _call(
+-            select_first_argmax_kernel, *select_first_argmax_key(dtype, ranks, 0, width)
++    for dtype, ranks, width in select:
++        calls.append(
++            _call(
++                select_first_argmax_kernel,
++                *select_first_argmax_key(dtype, ranks, 0, width),
++            )
+         )
+-        for dtype, ranks, width in select
+-    ]
++        if top2 and width == 4:
++            calls.append(
++                _call(
++                    select_first_argmax_kernel,
++                    *select_first_argmax_key(dtype, ranks, 0, width, top2_branch=True),
++                )
++            )
+     calls += [
+         _call(
+             greedy_rejection_kernel, *greedy_rejection_key(width, dtype, ranks, pairs)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index d127b353b..2b831d0ec 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -18,6 +18,7 @@ def register_greedy_markov_shard_pair_warmup(
+     bias_stride: int,
+     vocab: int,
+     vocab_start: int,
++    top2: bool = False,
+ ) -> None:
+     """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
+     and a Markov bias of these dtypes, strides, alignment and shard width."""
+@@ -33,7 +34,7 @@ def register_greedy_markov_shard_pair_warmup(
+     )
+     tilelang_sampling.declare(
+         lambda: tilelang_sampling.greedy_calls(
+-            markov=[(base_dtype, bias_dtype, vector)]
++            markov=[(base_dtype, bias_dtype, vector)], top2=top2
+         )
+     )
+ 
+@@ -62,6 +63,7 @@ def register_select_first_argmax_warmup(
+     output_stride: int,
+     output_aligned: bool,
+     pair_width: int = 4,
++    top2: bool = False,
+ ) -> None:
+     """Declare ``select_first_argmax`` for an output column of ``output_dtype``
+     over pairs of ``pair_width`` columns (the runner's 16-byte rows)."""
+@@ -69,7 +71,7 @@ def register_select_first_argmax_warmup(
+ 
+     tilelang_sampling.declare(
+         lambda: tilelang_sampling.greedy_calls(
+-            select=[(output_dtype, ranks, pair_width)]
++            select=[(output_dtype, ranks, pair_width)], top2=top2
+         )
+     )
+ 
+@@ -95,10 +97,14 @@ def greedy_markov_shard_pair(
+     pairs: torch.Tensor,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    *,
++    top2: bool = False,
+ ) -> None:
+     """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
+     over one vocabulary shard into the first two columns of FP32 ``pairs`` ([rows,
+-    2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place).
++    2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place;
++    with ``top2=True``, columns 2 and 3 receive the shard's runner-up value and
++    global index).
+ 
+     The value keeps the materialized sum's rounding, and the index is the
+     shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
+@@ -109,7 +115,13 @@ def greedy_markov_shard_pair(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.greedy_markov_shard_pair(
+-        base_logits, markov_bias, vocab_start, pairs, partial_values, partial_indices
++        base_logits,
++        markov_bias,
++        vocab_start,
++        pairs,
++        partial_values,
++        partial_indices,
++        top2=top2,
+     )
+ 
+ 
+@@ -137,14 +149,21 @@ def select_first_argmax(
+     output: torch.Tensor,
+     pair_width: int = 2,
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    top2_branch: (
++        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, float, float] | None
++    ) = None,
+ ) -> None:
+     """Reduce all-gathered shard pairs ([rows, pair_width * ranks], FP32, each
+     rank's pair first in its ``pair_width`` columns) to the first maximum's global
+     index, written to ``output`` (one per row). With ``embed`` (a BF16 Markov W1
+-    table and two row outputs), also the selected tokens' rows of the table."""
++    table and two row outputs), also the selected tokens' rows of the table. With
++    ``top2_branch``, also reduces the global runner-up and promotes it when
++    Markov transition confidence outweighs a narrow top1-top2 logit gap."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+-    tilelang_sampling.select_first_argmax(pairs, output, pair_width, embed)
++    tilelang_sampling.select_first_argmax(
++        pairs, output, pair_width, embed, top2_branch=top2_branch
++    )
+ 
+ 
+ def markov_anchor_embed(
+@@ -161,7 +180,7 @@ def markov_anchor_embed(
+     tilelang_sampling.markov_anchor_embed(ids, index, table, step_out, confidence_out)
+ 
+ 
+-def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
++def scratch_shape(max_requests: int, vocabulary_size: int, *, top2: bool = False) -> tuple[int, int]:
+     return max_requests, cdiv(vocabulary_size, _BLOCK)
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index bae921dbb..dc6940283 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -99,11 +99,37 @@ class DSparkSpeculator(DFlashSpeculator):
+         )
+ 
+         self.use_confidence_head: bool = False
++        self._top2_branch_margin: float = float(
++            getattr(
++                self.draft_model_config.hf_config,
++                "dspark_top2_branch_margin",
++                0.0,
++            )
++        )
++        self._top2_branch_weight: float = float(
++            getattr(
++                self.draft_model_config.hf_config,
++                "dspark_top2_branch_weight",
++                1.0,
++            )
++        )
++        self._enable_top2_branch: bool = (
++            bool(
++                getattr(
++                    self.draft_model_config.hf_config,
++                    "dspark_top2_branch",
++                    False,
++                )
++            )
++            or self._top2_branch_margin > 0.0
++        )
+         draft_vocab = max(
+             self.draft_model_config.hf_config.vocab_size,
+             getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
+         )
+-        shape = scratch_shape(self.max_num_reqs, draft_vocab)
++        shape = scratch_shape(
++            self.max_num_reqs, draft_vocab, top2=self._enable_top2_branch
++        )
+         self._greedy_partial_values = torch.empty(
+             shape, dtype=torch.float32, device=device
+         )
+@@ -112,11 +138,18 @@ class DSparkSpeculator(DFlashSpeculator):
+         )
+         # Per-request (max, global index) of this rank's vocabulary shard,
+         # for vocabulary-parallel greedy drafts.
+-        # (value, index) and two unused columns: 16-byte rows, which the
+-        # one-shot all-gather writes in place (no staging or reshape copies).
++        # (value, index) and two slack columns (used for shard runner-up
++        # (second_value, second_index) when top-2 branch tracking is enabled):
++        # 16-byte rows, which the one-shot all-gather writes in place.
+         self._greedy_shard_pairs = torch.empty(
+             (self.max_num_reqs, 4), dtype=torch.float32, device=device
+         )
++        self.draft_runner_up_tokens = torch.zeros_like(self.draft_tokens)
++        self.draft_top2_margins = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps),
++            dtype=torch.float32,
++            device=device,
++        )
+         # The vocabulary-parallel greedy steps' Markov embeddings, which the
+         # anchor lookup and each step's selection write (with a replicated BF16
+         # W1): the next step's rows, and every step's in the (request, step)
+@@ -130,6 +163,9 @@ class DSparkSpeculator(DFlashSpeculator):
+             dtype=torch.bfloat16,
+             device=device,
+         )
++        self._markov_conf_weight = torch.zeros(
++            rank, dtype=torch.float32, device=device
++        )
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -183,6 +219,18 @@ class DSparkSpeculator(DFlashSpeculator):
+             # The acceptance estimator is not needed when a trained confidence head
+             # is available.
+             self.use_acceptance_estimator = False
++        head = getattr(model.model, "confidence_head", None)
++        proj = getattr(head, "proj", None)
++        weight = getattr(proj, "weight", None)
++        rank = self._markov_step_embed.shape[1]
++        hidden = self.hidden_states.shape[1]
++        if (
++            weight is not None
++            and weight.dtype == torch.float32
++            and weight.numel() == hidden + rank
++            and rank > 0
++        ):
++            self._markov_conf_weight = weight.view(-1)[hidden:].contiguous()
+         return model
+ 
+     @property
+@@ -277,6 +325,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         vocab_start, shard_vocab = self.model.draft_vocab_shard
+         dtype, head_width, markov_width = self.model.draft_logits_local_layout
+         n_spec = self.num_speculative_steps
++        use_top2 = self._enable_top2_branch
+         for i in range(n_spec):
+             register_greedy_markov_shard_pair_warmup(
+                 base_dtype=dtype,
+@@ -286,12 +335,14 @@ class DSparkSpeculator(DFlashSpeculator):
+                 bias_stride=markov_width,
+                 vocab=shard_vocab,
+                 vocab_start=vocab_start,
++                top2=use_top2,
+             )
+             register_select_first_argmax_warmup(
+                 ranks=get_tensor_model_parallel_world_size(),
+                 output_dtype=self.draft_tokens.dtype,
+                 output_stride=self.draft_tokens.stride(0),
+                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
++                top2=use_top2,
+             )
+         if not getattr(self, "sample_from_anchor", False):
+             tilelang_inputs.declare(
+@@ -311,6 +362,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                     self.draft_tokens.dtype,
+                     get_tensor_model_parallel_world_size(),
+                     table.shape[1],
++                    top2_branch=use_top2,
+                 )
+             )
+ 
+@@ -405,6 +457,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 prev = draft_sampled_i
+                 continue
+             if vocab_parallel:
++                use_top2 = self._enable_top2_branch
+                 bias = self.model.markov_bias_local(markov_embed)
+                 pairs = self._greedy_shard_pairs[:num_reqs]
+                 greedy_markov_shard_pair(
+@@ -414,15 +467,28 @@ class DSparkSpeculator(DFlashSpeculator):
+                     pairs,
+                     self._greedy_partial_values,
+                     self._greedy_partial_indices,
++                    top2=use_top2,
+                 )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
++                has_embed = table is not None and i + 1 < n_spec
+                 select_first_argmax(
+                     tensor_model_parallel_all_gather(pairs, dim=-1),
+                     draft_sampled_i,
+                     pair_width=4,
+                     embed=(
+                         (table, step_embed, confidence_embeds[:, i + 1])
+-                        if table is not None and i + 1 < n_spec
++                        if has_embed
++                        else None
++                    ),
++                    top2_branch=(
++                        (
++                            self._markov_conf_weight if has_embed else None,
++                            self.draft_runner_up_tokens[:num_reqs, i],
++                            self.draft_top2_margins[:num_reqs, i],
++                            self._top2_branch_margin,
++                            self._top2_branch_weight,
++                        )
++                        if use_top2
+                         else None
+                     ),
+                 )
+-- 
+2.43.0
+

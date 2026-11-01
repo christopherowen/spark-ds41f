@@ -1,0 +1,106 @@
+From 2aeda2678ad4787bcc61f6dedb605306f2e58f4a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:38:15 +0100
+Subject: [PATCH 669/674] feat(collectives): dispatch SP reduce_scatter,
+ all_to_all_rows, and exchange_into to sparknet oneshot
+
+---
+ .../device_communicators/cuda_communicator.py | 26 +++++++++++++++++--
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 22 +++++++++++++---
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 4b77a852e..2ccde309a 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -695,9 +695,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+     def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
+         """Row blocks of ``rows``: block r goes to rank r; the output's [s] holds
+-        rank s's block (rows past this rank's real rows unwritten). PyNCCL only
+-        (grouped send/recv)."""
++        rank s's block (rows past this rank's real rows unwritten)."""
+         self._require_roce_policy()
++        b12x_ar_comm = self.b12x_ar_comm
++        should_a2a = getattr(b12x_ar_comm, "should_all_to_all_rows", None)
++        a2a = getattr(b12x_ar_comm, "all_to_all_rows", None)
++        if (
++            b12x_ar_comm is not None
++            and not b12x_ar_comm.disabled
++            and should_a2a is not None
++            and should_a2a(input_, rows)
++        ):
++            assert a2a is not None
++            return a2a(input_, rows)
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is None or pynccl_comm.disabled:
+             raise RuntimeError("all_to_all_rows needs the PyNCCL communicator")
+@@ -715,6 +725,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             # Convert negative dim to positive.
+             dim += input_.dim()
+ 
++        b12x_ar_comm = self.b12x_ar_comm
++        should_rs = getattr(b12x_ar_comm, "should_reduce_scatter", None)
++        rs = getattr(b12x_ar_comm, "reduce_scatter", None)
++        if (
++            b12x_ar_comm is not None
++            and not b12x_ar_comm.disabled
++            and should_rs is not None
++            and should_rs(input_, dim)
++        ):
++            assert rs is not None
++            return rs(input_, dim)
++
+         # Note: This will produce an incorrect answer if we don't make
+         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+         input_tensor = input_.movedim(0, dim).contiguous()
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 375325ceb..ed03400d2 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -405,7 +405,17 @@ class SPRows:
+         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+         send = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
+         parts = torch.empty_like(send)
+-        comm = get_tp_group().device_communicator.pynccl_comm
++        dev_comm = get_tp_group().device_communicator
++        comm = dev_comm.pynccl_comm
++        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
++        should_ex = getattr(roce_comm, "should_exchange", None)
++        ex_into = getattr(roce_comm, "exchange_into", None)
++        use_roce_ex = (
++            roce_comm is not None
++            and not roce_comm.disabled
++            and should_ex is not None
++            and ex_into is not None
++        )
+         slices = max(slices, 1)
+         if slices == 1 and not per_block:
+             flat = send.view(world * local, *row_shape)
+@@ -414,7 +424,10 @@ class SPRows:
+             parts[self.rank].copy_(send[self.rank])
+             if then is not None:
+                 then()
+-            exchange_into(comm, send, parts, self.rank, world)
++            if use_roce_ex and should_ex(send):
++                ex_into(send, parts)
++            else:
++                exchange_into(comm, send, parts, self.rank, world)
+             return parts
+ 
+         def write(owner, lo, hi):
+@@ -436,7 +449,10 @@ class SPRows:
+                     write(owner, lo, hi)
+             side.wait_stream(main)
+             with torch.cuda.stream(side):
+-                exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
++                if use_roce_ex and should_ex(send[:, lo:hi]):
++                    ex_into(send[:, lo:hi], parts[:, lo:hi])
++                else:
++                    exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
+             write(self.rank, lo, hi)
+         if then is not None:
+             then()
+-- 
+2.43.0
+
