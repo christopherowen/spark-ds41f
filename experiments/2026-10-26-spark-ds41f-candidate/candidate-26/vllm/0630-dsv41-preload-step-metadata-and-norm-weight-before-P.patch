@@ -10,7 +10,7 @@ Subject: [PATCH 630/630] dsv41: preload step metadata and norm weight before
  2 files changed, 38 insertions(+), 22 deletions(-)
 
 diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
-index 58aa61152..521ebc1f4 100644
+index 76d85d07a..66b42a0e2 100644
 --- a/tests/kernels/deepseek_v41_pdl_sources.py
 +++ b/tests/kernels/deepseek_v41_pdl_sources.py
 @@ -69,6 +69,8 @@ EXEMPT = {"pdl_early_reader"}
@@ -21,7 +21,7 @@ index 58aa61152..521ebc1f4 100644
 +    "compress_gather_partial_state": {"counts", "positions", "starts", "table"},
      "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
      "mhc_post": {"comb", "post", "residual"},
-     "mhc_post_collapse": {"comb", "mix", "post", "residual"},
+     "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
 diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
 index 66e19e712..e71e2407b 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/compress.py
