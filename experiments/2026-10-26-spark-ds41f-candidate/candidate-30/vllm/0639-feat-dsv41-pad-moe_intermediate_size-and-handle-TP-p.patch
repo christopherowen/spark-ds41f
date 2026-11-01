@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sun, 1 Nov 2026 01:05:31 +0100
+Subject: [PATCH 0639/0528] feat(dsv41): pad moe_intermediate_size and handle
+ TP-padded expert scale codes for TP5..TP8
+
+Pad DeepSeek V4.1 moe_intermediate_size to a multiple of tp_size * 64 in DeepseekV41ForCausalLMConfig.update_model_config_for_parallelism (2304 -> 2560 at TP5 and TP8, 2304 -> 2688 at TP7), enable allow_tp_padding on shared_experts when padded, and ignore zero-padded scale columns in _row_deltas when packing routed-expert UE8M0 scale codes.
+---
+ .../test_deepseek_v41_expert_scale_codes.py   | 42 +++++++++++
+ tests/models/test_deepseek_v4_1_config.py     | 47 +++++++++++++
+ vllm/model_executor/models/config.py          | 70 ++++++++++++++-----
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 12 ++++
+ .../deepseek_v4_1/tilelang/scale_codes.py     | 16 ++++-
+ 5 files changed, 167 insertions(+), 20 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+index b89c6aa2a..ca5e46a63 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
++++ b/tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+@@ -655,3 +655,45 @@ def test_process_weights_replaces_w13_before_preparing_w2(monkeypatch):
+     experts.fold_shared = True
+     experts.process_weights_after_loading(layer)
+     assert calls == [0, 1]
++
++
++@pytest.mark.parametrize(
++    "k, loaded_cols",
++    [
++        (512, 8),   # TP5 rank 4: 256 of 512 columns loaded (8 of 16 scale blocks)
++        (384, 2),   # TP7 rank 6: 64 of 384 columns loaded (2 of 12 scale blocks)
++        (320, 9),   # TP8 all ranks: 288 of 320 columns loaded (9 of 10 scale blocks)
++    ],
++)
++def test_tp_zero_padded_scale_columns_preserve_loaded_exponents_and_narrow_flag(
++    k: int, loaded_cols: int
++):
++    """When TP pads ``moe_intermediate_size`` to a multiple of ``tp_size * 64``
++    (TP5, TP7, TP8), ``RoutedExperts._load_w2`` leaves trailing ``w2_weight`` and
++    ``w2_weight_scale`` columns zero-filled. ``_row_deltas`` ignores those zero
++    scale bytes when computing ``base`` and ``deltas`` so loaded columns expand
++    byte-for-byte, zero-padded columns expand to ``base`` (multiplying zero weights),
++    and narrow/wide expert classification depends only on the loaded columns."""
++    exponents = _experts(k)
++    exponents[:, :, loaded_cols:] = 0
++    n_exp = k // 32
++
++    got = pack_expert_scale_codes(exponents)
++    assert got.narrow.tolist() == [1, 0]
++
++    narrow_words = expand_scale_codes_2bit(got.codes_2bit[0], got.base[0])
++    assert torch.equal(narrow_words, expand_scale_codes(got.codes[0], got.base[0]))
++    raw0 = narrow_words.view(torch.uint8).reshape(exponents.shape[1], -1)
++    assert torch.equal(raw0[:, :loaded_cols], exponents[0, :, :loaded_cols])
++    assert torch.equal(
++        raw0[:, loaded_cols:n_exp],
++        got.base[0].unsqueeze(1).expand(-1, n_exp - loaded_cols),
++    )
++
++    wide_words = expand_scale_codes(got.codes[1], got.base[1])
++    raw1 = wide_words.view(torch.uint8).reshape(exponents.shape[1], -1)
++    assert torch.equal(raw1[:, :loaded_cols], exponents[1, :, :loaded_cols])
++    assert torch.equal(
++        raw1[:, loaded_cols:n_exp],
++        got.base[1].unsqueeze(1).expand(-1, n_exp - loaded_cols),
++    )
+diff --git a/tests/models/test_deepseek_v4_1_config.py b/tests/models/test_deepseek_v4_1_config.py
+index a7f8e0861..eaaa0794b 100644
+--- a/tests/models/test_deepseek_v4_1_config.py
++++ b/tests/models/test_deepseek_v4_1_config.py
+@@ -67,3 +67,50 @@ def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
+     assert text_config.num_attention_heads == 72
+     assert text_config.o_groups == 9
+     assert model_config.model_arch_config.total_num_attention_heads == 72
++
++
++@pytest.mark.parametrize(
++    "tp_size, expected_heads, expected_groups, expected_moe_intermediate",
++    [
++        (3, 72, 9, 2304),
++        (4, 64, 8, 2304),
++        (5, 80, 10, 2560),
++        (6, 96, 12, 2304),
++        (7, 112, 14, 2688),
++        (8, 64, 8, 2560),
++    ],
++)
++def test_deepseek_v41_tp3_to_tp8_padding_aligns_heads_and_moe_intermediate(
++    tp_size: int,
++    expected_heads: int,
++    expected_groups: int,
++    expected_moe_intermediate: int,
++) -> None:
++    text_config = SimpleNamespace(
++        num_attention_heads=64,
++        o_groups=8,
++        moe_intermediate_size=2304,
++    )
++    model_config = SimpleNamespace(
++        architecture="DeepseekV41ForCausalLM",
++        hf_config=text_config,
++        hf_text_config=text_config,
++        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
++    )
++    model_config.get_model_arch_config = lambda: SimpleNamespace(
++        total_num_attention_heads=text_config.num_attention_heads
++    )
++    parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
++
++    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
++    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
++
++    assert text_config.num_attention_heads == expected_heads
++    assert text_config.o_groups == expected_groups
++    assert text_config.moe_intermediate_size == expected_moe_intermediate
++    assert (text_config.moe_intermediate_size // tp_size) % 64 == 0
++    if expected_heads != 64:
++        assert text_config.original_num_attention_heads == 64
++        assert text_config.original_o_groups == 8
++    if expected_moe_intermediate != 2304:
++        assert text_config.original_moe_intermediate_size == 2304
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 37bdb7512..bd0e0098a 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -511,9 +511,22 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             )
+ 
+         padded_groups = round_up(original_groups, tp_size)
+-        if padded_groups == original_groups:
+-            return
+         padded_heads = padded_groups * (original_heads // original_groups)
++        original_moe_intermediate = getattr(
++            text_config,
++            "original_moe_intermediate_size",
++            getattr(text_config, "moe_intermediate_size", None),
++        )
++        padded_moe_intermediate = (
++            round_up(original_moe_intermediate, tp_size * 64)
++            if original_moe_intermediate is not None
++            else None
++        )
++        if (
++            padded_groups == original_groups
++            and padded_moe_intermediate == original_moe_intermediate
++        ):
++            return
+ 
+         seen: set[int] = set()
+         for config in (
+@@ -525,23 +538,46 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+                 continue
+             seen.add(id(config))
+             config_with_originals: Any = config
+-            if hasattr(config, "num_attention_heads"):
+-                config_with_originals.original_num_attention_heads = original_heads
+-                config.num_attention_heads = padded_heads
+-            if hasattr(config, "o_groups"):
+-                config_with_originals.original_o_groups = original_groups
+-                config.o_groups = padded_groups
++            if padded_groups != original_groups:
++                if hasattr(config, "num_attention_heads"):
++                    config_with_originals.original_num_attention_heads = original_heads
++                    config.num_attention_heads = padded_heads
++                if hasattr(config, "o_groups"):
++                    config_with_originals.original_o_groups = original_groups
++                    config.o_groups = padded_groups
++            if (
++                padded_moe_intermediate is not None
++                and padded_moe_intermediate != original_moe_intermediate
++                and hasattr(config, "moe_intermediate_size")
++            ):
++                config_with_originals.original_moe_intermediate_size = (
++                    original_moe_intermediate
++                )
++                config.moe_intermediate_size = padded_moe_intermediate
+ 
+         model_config.model_arch_config = model_config.get_model_arch_config()
+-        logger.warning(
+-            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+-            "output groups %d -> %d.",
+-            tp_size,
+-            original_heads,
+-            padded_heads,
+-            original_groups,
+-            padded_groups,
+-        )
++        if padded_groups != original_groups:
++            logger.warning(
++                "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
++                "output groups %d -> %d.",
++                tp_size,
++                original_heads,
++                padded_heads,
++                original_groups,
++                padded_groups,
++            )
++        if (
++            padded_moe_intermediate is not None
++            and padded_moe_intermediate != original_moe_intermediate
++        ):
++            logger.warning(
++                "Padded DeepSeek V4.1 MoE intermediate size for TP%d: "
++                "%d -> %d (%d per rank).",
++                tp_size,
++                original_moe_intermediate,
++                padded_moe_intermediate,
++                padded_moe_intermediate // tp_size,
++            )
+ 
+     @staticmethod
+     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 9fef85f4a..1f97f79d1 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import (
+     is_pp_missing_parameter,
+     make_layers,
+ )
++from vllm.model_executor.utils import set_weight_attrs
+ from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+ from vllm.models.deepseek_v41.nvidia.model import (
+@@ -148,6 +149,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+             shared.act_fn = kernels.shared_expert_activation(
+                 shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
+             )
++            if (
++                getattr(
++                    config,
++                    "original_moe_intermediate_size",
++                    config.moe_intermediate_size,
++                )
++                != config.moe_intermediate_size
++            ):
++                for proj in (shared.gate_up_proj, shared.down_proj):
++                    for param in proj.parameters():
++                        set_weight_attrs(param, {"allow_tp_padding": True})
+         # The mHC entries write these projections' MXFP8 input (the routed
+         # experts' too): ``forward`` hands it over and they cast nothing.
+         self.attn.fused_wqa_wkv.tilelang_mxfp8_input = True
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+index 32a532725..5d6c9b0cc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+@@ -32,10 +32,20 @@ class ExpertScaleCodes(NamedTuple):
+ def _row_deltas(
+     exponents: torch.Tensor, max_delta: int
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``."""
++    """Row minimum ``base`` and padded 4-tuples of uint8 deltas ``e - base``.
++
++    Zero bytes on a row that also holds non-zero UE8M0 exponents come from TP
++    column zero-padding on ``w2_weight_scale`` (where the corresponding
++    ``w2_weight`` columns are zero); they take delta 0 so their expanded scale is
++    ``base`` and the row's base and span reflect only the loaded checkpoint scales.
++    """
+     e = exponents.view(torch.uint8)
+-    base = e.amin(dim=-1).contiguous()
+-    deltas = e - base.unsqueeze(-1)
++    nonzero = e > 0
++    min_nonzero = torch.where(nonzero, e, torch.full_like(e, 255)).amin(dim=-1)
++    base = torch.where(
++        nonzero.any(dim=-1), min_nonzero, torch.zeros_like(min_nonzero)
++    ).contiguous()
++    deltas = torch.where(nonzero, e - base.unsqueeze(-1), torch.zeros_like(e))
+     span = int(deltas.max()) if deltas.numel() else 0
+     if span > max_delta:
+         bits = 2 if max_delta == 3 else 4
