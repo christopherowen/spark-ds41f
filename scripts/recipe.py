@@ -56,7 +56,7 @@ SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_ca
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
 SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "environment", "host",
-              "benchmark_reference", "notes"}
+              "engram_on_disk", "benchmark_reference", "notes"}
 
 
 def is_recipe(cluster: dict) -> bool:
@@ -258,6 +258,34 @@ def _with_generation_defaults(cluster: dict) -> None:
     cluster["serve_args"] = args
 
 
+def engram_on_disk(recipe: dict, shape: dict) -> bool:
+    """Whether ``shape`` keeps the Engram tables on disk (default True)."""
+    sizing = shape.get("sizing", {})
+    if "engram_on_disk" in sizing:
+        on_disk = sizing["engram_on_disk"]
+    elif "engram_on_disk" in shape:
+        on_disk = shape["engram_on_disk"]
+    else:
+        on_disk = recipe.get("engram_on_disk", True)
+    if not isinstance(on_disk, bool):
+        raise SystemExit("engram_on_disk must be a boolean")
+    return on_disk
+
+
+def _with_engram_on_disk(cluster: dict, on_disk: bool) -> None:
+    """Render ``engram_on_disk`` into ``--engram-config``'s ``table_memory``."""
+    if not isinstance(on_disk, bool):
+        raise SystemExit("engram_on_disk must be a boolean")
+    args = list(cluster["serve_args"])
+    if "--engram-config" in args:
+        at = args.index("--engram-config") + 1
+        if at < len(args):
+            engram = json.loads(args[at])
+            engram["table_memory"] = "disk" if on_disk else "device"
+            args[at] = json.dumps(engram, separators=(",", ":"))
+    cluster["serve_args"] = args
+
+
 def values(recipe: dict, shape: dict) -> dict[str, str]:
     """The placeholders of ``serve_args`` for one shape."""
     sizing = shape["sizing"]
@@ -266,12 +294,15 @@ def values(recipe: dict, shape: dict) -> dict[str, str]:
         raise SystemExit(f"shape sizing lacks {', '.join(missing)}")
     nodes, drafts = int(shape["nodes"]), int(recipe["drafts"])
     rows = int(sizing["max_num_seqs"]) * (1 + drafts)
+    on_disk = engram_on_disk(recipe, shape)
     derived = {
         "tensor_parallel_size": nodes,
         "max_cudagraph_capture_size": rows,
         "cudagraph_capture_sizes": json.dumps(capture_sizes(rows), separators=(",", ":")),
         "long_prefill_token_threshold": int(sizing["max_num_batched_tokens"]) - rows,
         "drafts": drafts,
+        "engram_on_disk": str(on_disk).lower(),
+        "engram_table_memory": "disk" if on_disk else "device",
     }
     return {key: str(value) for key, value in {**sizing, **derived}.items()}
 
@@ -280,7 +311,7 @@ def resolve(recipe: dict, name: str) -> dict:
     """The concrete cluster configuration of shape ``name``."""
     shape = shape_entry(recipe, name)
     cluster = {key: copy.deepcopy(value) for key, value in recipe.items()
-               if key not in ("shapes", "drafts", "default_shape")}
+               if key not in ("shapes", "drafts", "engram_on_disk", "default_shape")}
     cluster["schema_version"] = 1
     cluster["shape"] = name
     fill = values(recipe, shape)
@@ -288,6 +319,7 @@ def resolve(recipe: dict, name: str) -> dict:
         cluster["serve_args"] = [string.Template(arg).substitute(fill) for arg in recipe["serve_args"]]
     except KeyError as error:
         raise SystemExit(f"serve_args names ${{{error.args[0]}}}, which no shape value defines") from error
+    _with_engram_on_disk(cluster, engram_on_disk(recipe, shape))
     cluster["environment"] = {**recipe["environment"], **shape.get("environment", {})}
     overlap = set(recipe["environment"]) & set(shape.get("environment", {}))
     if overlap:
@@ -344,6 +376,8 @@ def overlay(arm: dict, base: dict) -> dict:
         _with_model_mounts(cluster)
     if "generation_defaults" in arm.get("set", {}):
         _with_generation_defaults(cluster)
+    if "engram_on_disk" in sets:
+        _with_engram_on_disk(cluster, cluster.pop("engram_on_disk"))
     for dotted in arm.get("unset", []):
         *parents, last = dotted.split(".")
         node = cluster
