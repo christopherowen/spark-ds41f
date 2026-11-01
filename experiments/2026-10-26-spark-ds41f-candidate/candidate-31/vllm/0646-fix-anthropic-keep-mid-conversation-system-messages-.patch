@@ -1,0 +1,545 @@
+From 322fa7f26d89da6d306d9ad600c6ea6cb89a7f18 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:27:59 +0100
+Subject: [PATCH 646/651] fix(anthropic): keep mid-conversation system messages
+ in place (#63992)
+
+---
+ .../test_anthropic_messages_conversion.py     | 137 ++++++++++++++--
+ .../scale_out/render/test_render.py           |   6 +-
+ vllm/entrypoints/anthropic/serving.py         | 151 +++++++++++++-----
+ vllm/entrypoints/scale_out/render/serving.py  |  24 ++-
+ vllm/tokenizers/deepseek_v32.py               |   3 +
+ vllm/tokenizers/deepseek_v4.py                |   3 +
+ vllm/tokenizers/deepseek_v41.py               |   2 +
+ 7 files changed, 261 insertions(+), 65 deletions(-)
+
+diff --git a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+index 0c986f129..ef12d9144 100644
+--- a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
++++ b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+@@ -30,6 +30,7 @@ from vllm.entrypoints.anthropic.protocol import (
+ )
+ from vllm.entrypoints.anthropic.serving import (
+     AnthropicServingMessages,
++    InlineSystemMode,
+     _build_anthropic_usage,
+ )
+ from vllm.entrypoints.generate.base.protocol import (
+@@ -1383,35 +1384,137 @@ Q35_TEMPLATE = (
+ )
+ 
+ 
+-class TestDetectMergeInlineSystem:
+-    """Verify _detect_merge_inline_system auto-detection.
++LLAMA2_ALTERNATING_TEMPLATE = (
++    "{%- for message in messages %}"
++    "{%- if (message.role == 'user') != (loop.index0 % 2 == 0) %}"
++    "{{- raise_exception('Conversation roles must alternate') }}"
++    "{%- endif %}"
++    "{%- endfor %}"
++)
+ 
+-    Tests three scenarios:
+-    1. Template with system-first guard (e.g. Qwen) → merge needed
+-    2. Template without restrictions → no merge, cache-friendly
+-    3. No template provided → safe default: merge
+-    """
+ 
+-    def test_qwen_template_requires_merge(self):
+-        """Template with loop.first guard rejects mid-conversation system."""
++class _ProbeTokenizer:
++    """Tokenizer that encodes messages in code, like deepseek_v41."""
++
++    def __init__(self, *, system_anywhere: bool) -> None:
++        self.system_anywhere = system_anywhere
++
++    def apply_chat_template(self, messages, tokenize=True, **kwargs):
++        for index, message in enumerate(messages):
++            if message["role"] == "system" and index and not self.system_anywhere:
++                raise ValueError("System message must be at the beginning.")
++        return "".join(message["content"] for message in messages)
++
++
++class TestDetectInlineSystemMode:
++    """How the served template takes mid-conversation system messages."""
++
++    def test_system_first_template_keeps_the_text_in_place_as_user(self):
++        """Qwen-style templates reject a later system message but accept
++        consecutive user messages."""
+         assert (
+-            AnthropicServingMessages._detect_merge_inline_system(Q35_TEMPLATE) is True
++            AnthropicServingMessages.detect_inline_system_mode(Q35_TEMPLATE)
++            is InlineSystemMode.AS_USER
+         )
+ 
+-    def test_no_restriction_no_merge(self):
+-        """Template without restriction accepts mid-conversation system."""
++    def test_unrestricted_template_keeps_system_in_place(self):
+         assert (
+-            AnthropicServingMessages._detect_merge_inline_system(
++            AnthropicServingMessages.detect_inline_system_mode(
+                 "{%- for message in messages %}"
+                 "{{- message.role }}: {{ message.content }}\n"
+                 "{%- endfor %}"
+             )
+-            is False
++            is InlineSystemMode.KEEP
++        )
++
++    def test_alternating_template_merges(self):
++        assert (
++            AnthropicServingMessages.detect_inline_system_mode(
++                LLAMA2_ALTERNATING_TEMPLATE
++            )
++            is InlineSystemMode.MERGE
++        )
++
++    def test_tokenizer_template_is_probed_without_chat_template(self):
++        """Without --chat-template the served tokenizer decides; before, every
++        such model (deepseek_v41 among them) had its inline system messages
++        merged into the leading block, which invalidated the cached prefix."""
++        assert (
++            AnthropicServingMessages.detect_inline_system_mode(
++                None, _ProbeTokenizer(system_anywhere=True)
++            )
++            is InlineSystemMode.KEEP
++        )
++        assert (
++            AnthropicServingMessages.detect_inline_system_mode(
++                None, _ProbeTokenizer(system_anywhere=False)
++            )
++            is InlineSystemMode.AS_USER
++        )
++
++    def test_declared_format_without_inline_system_keeps_the_text_as_user(self):
++        """DeepSeek V4 renders a later system message as unmarked text, so
++        its tokenizer declares that its format has none."""
++        tokenizer = _ProbeTokenizer(system_anywhere=True)
++        tokenizer.supports_inline_system_messages = False
++        assert (
++            AnthropicServingMessages.detect_inline_system_mode(None, tokenizer)
++            is InlineSystemMode.AS_USER
++        )
++
++    def test_nothing_to_render_merges(self):
++        assert (
++            AnthropicServingMessages.detect_inline_system_mode(None)
++            is InlineSystemMode.MERGE
++        )
++
++
++class TestInlineSystemConversion:
++    """Each mode places a mid-conversation system message differently."""
++
++    @staticmethod
++    def _roles_and_contents(mode: InlineSystemMode) -> list[tuple[str, str]]:
++        request = _make_request(
++            [
++                {"role": "user", "content": "first"},
++                {"role": "assistant", "content": "answer"},
++                {"role": "system", "content": "reminder"},
++                {"role": "user", "content": "second"},
++            ],
++            system="base",
+         )
++        chat = AnthropicServingMessages.to_chat_completion_request(
++            request, inline_system=mode
++        )
++        return [(m["role"], m["content"]) for m in chat.messages]
++
++    def test_keep_leaves_the_system_message_in_place(self):
++        assert self._roles_and_contents(InlineSystemMode.KEEP) == [
++            ("system", "base"),
++            ("user", "first"),
++            ("assistant", "answer"),
++            ("system", "reminder"),
++            ("user", "second"),
++        ]
+ 
+-    def test_no_template_defaults_merge(self):
+-        """No chat_template → conservative default: merge."""
+-        assert AnthropicServingMessages._detect_merge_inline_system(None) is True
++    def test_as_user_leaves_the_text_in_place(self):
++        """The earlier turns stay byte-identical, so their cached prefix
++        remains valid when a new reminder arrives."""
++        assert self._roles_and_contents(InlineSystemMode.AS_USER) == [
++            ("system", "base"),
++            ("user", "first"),
++            ("assistant", "answer"),
++            ("user", "reminder"),
++            ("user", "second"),
++        ]
++
++    def test_merge_moves_the_text_into_the_leading_system_message(self):
++        assert self._roles_and_contents(InlineSystemMode.MERGE) == [
++            ("system", "basereminder"),
++            ("user", "first"),
++            ("assistant", "answer"),
++            ("user", "second"),
++        ]
+ 
+ 
+ # ======================================================================
+diff --git a/tests/entrypoints/scale_out/render/test_render.py b/tests/entrypoints/scale_out/render/test_render.py
+index 6aaf119f1..84b45aa1f 100644
+--- a/tests/entrypoints/scale_out/render/test_render.py
++++ b/tests/entrypoints/scale_out/render/test_render.py
+@@ -822,9 +822,9 @@ async def test_messages_render_system_and_multi_turn(client):
+ async def test_messages_render_merges_inline_system(client):
+     """Inline system messages merge into the leading system block.
+ 
+-    Without a --chat-template arg the /v1/messages server path detects
+-    merge_inline_system=True, so render must produce the same tokens as
+-    the manually pre-merged request.
++    The model's Llama-2 template enforces user/assistant alternation, so
++    the /v1/messages path detects InlineSystemMode.MERGE and render must
++    produce the same tokens as the manually pre-merged request.
+     """
+     inline = await client.post(
+         "/v1/messages/render",
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index f8784284b..ab25d537c 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -5,6 +5,7 @@
+ 
+ """Anthropic Messages API serving handler"""
+ 
++import enum
+ import json
+ import logging
+ import time
+@@ -52,6 +53,37 @@ from vllm.renderers.online_renderer import OnlineRenderer
+ logger = logging.getLogger(__name__)
+ 
+ 
++class InlineSystemMode(enum.Enum):
++    """Where mid-conversation system messages (for example Claude Code's
++    system reminders) go in the converted chat request."""
++
++    # The chat template renders system messages anywhere: keep them in place.
++    KEEP = "keep"
++    # The template wants the system message first: keep the text in place as
++    # a user message, so the cached prefix of the conversation stays valid.
++    AS_USER = "as_user"
++    # The template rejects that too: merge the text into the leading system
++    # message. Every new inline message then invalidates the cached prefix.
++    MERGE = "merge"
++
++
++# Probe conversations for _detect_inline_system_mode.
++_INLINE_SYSTEM_PROBE = [
++    {"role": "system", "content": "t"},
++    {"role": "user", "content": "t"},
++    {"role": "assistant", "content": "t"},
++    {"role": "system", "content": "t"},
++    {"role": "user", "content": "t"},
++]
++_INLINE_AS_USER_PROBE = [
++    {"role": "system", "content": "t"},
++    {"role": "user", "content": "t"},
++    {"role": "assistant", "content": "t"},
++    {"role": "user", "content": "t"},
++    {"role": "user", "content": "t"},
++]
++
++
+ def _build_anthropic_usage(
+     usage: UsageInfo | None,
+ ) -> AnthropicUsage:
+@@ -137,37 +169,75 @@ class AnthropicServingMessages(OpenAIServingChat):
+             "length": "max_tokens",
+             "tool_calls": "tool_use",
+         }
+-        self._merge_inline_system = self._detect_merge_inline_system(chat_template)
++        self._chat_template = chat_template
++        self._inline_system_mode: InlineSystemMode | None = None
++
++    def _resolve_inline_system_mode(self) -> InlineSystemMode:
++        """The inline system mode of the served chat template, detected once."""
++        if self._inline_system_mode is None:
++            self._inline_system_mode = self.detect_inline_system_mode(
++                self._chat_template, self.online_renderer.renderer.tokenizer
++            )
++            logger.info(
++                "Anthropic Messages API: mid-conversation system messages use "
++                "inline mode %s",
++                self._inline_system_mode.value,
++            )
++        return self._inline_system_mode
+ 
+     @staticmethod
+-    def _detect_merge_inline_system(chat_template: str | None) -> bool:
+-        """Auto-detect whether the chat template requires system-first ordering.
+-
+-        Renders a [system, user, system, user] conversation against the
+-        template; if it raises (e.g. Qwen's ``loop.first`` guard), the
+-        model needs inline system messages merged into the leading block.
++    def detect_inline_system_mode(
++        chat_template: str | None, tokenizer: Any = None
++    ) -> InlineSystemMode:
++        """Detect how the served template takes mid-conversation system messages.
++
++        Renders probe conversations with the --chat-template, or with the
++        tokenizer's own template when there is none. Tokenizers that encode
++        messages in code, such as deepseek_v41, are probed the same way and
++        may declare ``supports_inline_system_messages``.
++
++        Args:
++            chat_template: The resolved --chat-template, or None.
++            tokenizer: The served tokenizer, used when chat_template is None.
++
++        Returns:
++            KEEP when a system message renders after the first turn, AS_USER
++            when the template accepts consecutive user messages instead, and
++            MERGE otherwise or when nothing can be rendered.
+         """
+-        if not chat_template:
+-            return True
+-        try:
+-            env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+-                trim_blocks=True,
+-                lstrip_blocks=True,
+-                extensions=[jinja2.ext.loopcontrols],
+-            )
+-            env.from_string(chat_template).render(
+-                messages=[
+-                    {"role": "system", "content": "t"},
+-                    {"role": "user", "content": "t"},
+-                    {"role": "system", "content": "t"},
+-                    {"role": "user", "content": "t"},
+-                ],
+-                add_generation_prompt=False,
+-            )
+-            return False
+-        except jinja2.TemplateError:
++
++        def renders(messages: list[dict[str, str]]) -> bool:
++            try:
++                if chat_template:
++                    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
++                        trim_blocks=True,
++                        lstrip_blocks=True,
++                        extensions=[jinja2.ext.loopcontrols],
++                    )
++                    env.from_string(chat_template).render(
++                        messages=messages, add_generation_prompt=True
++                    )
++                elif tokenizer is not None:
++                    tokenizer.apply_chat_template(
++                        messages, tokenize=False, add_generation_prompt=True
++                    )
++                else:
++                    return False
++            except Exception:
++                return False
+             return True
+ 
++        # A tokenizer that encodes messages in code may render a later system
++        # message as unmarked text although its format has no such message.
++        declared = None
++        if not chat_template:
++            declared = getattr(tokenizer, "supports_inline_system_messages", None)
++        if declared is not False and renders(_INLINE_SYSTEM_PROBE):
++            return InlineSystemMode.KEEP
++        if renders(_INLINE_AS_USER_PROBE):
++            return InlineSystemMode.AS_USER
++        return InlineSystemMode.MERGE
++
+     @staticmethod
+     def _convert_image_source_to_url(source: dict[str, Any]) -> str:
+         """Convert an Anthropic image source to an OpenAI-compatible URL.
+@@ -194,7 +264,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+         cls,
+         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+         *,
+-        merge_inline_system: bool = False,
++        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
+     ) -> ChatCompletionRequest:
+         """Convert Anthropic message format to OpenAI format"""
+         openai_messages: list[dict[str, Any]] = []
+@@ -202,12 +272,12 @@ class AnthropicServingMessages(OpenAIServingChat):
+         cls._convert_system_message(
+             anthropic_request,
+             openai_messages,
+-            merge_inline_system=merge_inline_system,
++            inline_system=inline_system,
+         )
+         cls._convert_messages(
+             anthropic_request.messages,
+             openai_messages,
+-            merge_inline_system=merge_inline_system,
++            inline_system=inline_system,
+         )
+         req = cls._build_base_request(anthropic_request, openai_messages)
+         cls._handle_streaming_options(req, anthropic_request)
+@@ -222,7 +292,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+         openai_messages: list[dict[str, Any]],
+         *,
+-        merge_inline_system: bool = False,
++        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
+     ) -> None:
+         """Convert Anthropic system message to OpenAI format"""
+         system_parts: list[str] = []
+@@ -240,10 +310,10 @@ class AnthropicServingMessages(OpenAIServingChat):
+                             continue
+                         system_parts.append(block.text)
+ 
+-        # When the template requires system-first ordering, extract inline
+-        # system messages from the messages array and merge them into the
++        # When the template accepts neither inline system messages nor
++        # consecutive user messages, merge inline system messages into the
+         # top-level block so the template doesn't reject them.
+-        if merge_inline_system:
++        if inline_system == InlineSystemMode.MERGE:
+             for msg in anthropic_request.messages:
+                 if msg.role != "system":
+                     continue
+@@ -276,7 +346,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+         messages: list,
+         openai_messages: list[dict[str, Any]],
+         *,
+-        merge_inline_system: bool = False,
++        inline_system: InlineSystemMode = InlineSystemMode.KEEP,
+     ) -> None:
+         """Convert Anthropic messages to OpenAI format"""
+         for msg in messages:
+@@ -286,11 +356,16 @@ class AnthropicServingMessages(OpenAIServingChat):
+             # doesn't strip billing headers and may produce messages with
+             # no "content" key.
+             if msg.role == "system":
+-                if merge_inline_system:
++                if inline_system == InlineSystemMode.MERGE:
+                     continue  # already merged into top-level by _convert_system_message
+                 text = cls._extract_system_text(msg)
+                 if text:
+-                    openai_messages.append({"role": "system", "content": text})
++                    role = (
++                        "user"
++                        if inline_system == InlineSystemMode.AS_USER
++                        else "system"
++                    )
++                    openai_messages.append({"role": role, "content": text})
+                 continue
+ 
+             openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
+@@ -603,7 +678,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+             logger.debug("Received messages request %s", request.model_dump_json())
+         chat_req = self.to_chat_completion_request(
+             request,
+-            merge_inline_system=self._merge_inline_system,
++            inline_system=self._resolve_inline_system_mode(),
+         )
+         if logger.isEnabledFor(logging.DEBUG):
+             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
+@@ -1026,7 +1101,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+         """Implements Anthropic's messages.count_tokens endpoint."""
+         chat_req = self.to_chat_completion_request(
+             request,
+-            merge_inline_system=self._merge_inline_system,
++            inline_system=self._resolve_inline_system_mode(),
+         )
+         result = await self.render_chat_request(chat_req)
+         if isinstance(result, ErrorResponse):
+diff --git a/vllm/entrypoints/scale_out/render/serving.py b/vllm/entrypoints/scale_out/render/serving.py
+index b79138664..fc59e9610 100644
+--- a/vllm/entrypoints/scale_out/render/serving.py
++++ b/vllm/entrypoints/scale_out/render/serving.py
+@@ -3,7 +3,10 @@
+ from typing import TYPE_CHECKING
+ 
+ from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+-from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
++from vllm.entrypoints.anthropic.serving import (
++    AnthropicServingMessages,
++    InlineSystemMode,
++)
+ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+ from vllm.entrypoints.openai.models.serving import (
+@@ -56,11 +59,7 @@ class ServingRender(BaseServing):
+         self.online_renderer = online_renderer
+         self.tool_server = tool_server
+ 
+-        self._merge_inline_system = (
+-            AnthropicServingMessages._detect_merge_inline_system(
+-                online_renderer.chat_template
+-            )
+-        )
++        self._inline_system_mode: InlineSystemMode | None = None
+ 
+         self._placeholder_metadata_parser: MultiModalDataParser | None = None
+         self._placeholder_metadata_parser_failed = False
+@@ -163,6 +162,17 @@ class ServingRender(BaseServing):
+             token_offsets=engine_input.get("prompt_token_offsets"),
+         )
+ 
++    def _resolve_inline_system_mode(self) -> InlineSystemMode:
++        """The inline system mode of the served chat template, detected once."""
++        if self._inline_system_mode is None:
++            self._inline_system_mode = (
++                AnthropicServingMessages.detect_inline_system_mode(
++                    self.online_renderer.chat_template,
++                    self.online_renderer.renderer.tokenizer,
++                )
++            )
++        return self._inline_system_mode
++
+     async def render_messages_request(
+         self,
+         request: AnthropicMessagesRequest,
+@@ -174,7 +184,7 @@ class ServingRender(BaseServing):
+         render_chat_request so the rendered tokens match the server exactly.
+         """
+         chat_req = AnthropicServingMessages.to_chat_completion_request(
+-            request, merge_inline_system=self._merge_inline_system
++            request, inline_system=self._resolve_inline_system_mode()
+         )
+         return await self.render_chat_request(chat_req)
+ 
+diff --git a/vllm/tokenizers/deepseek_v32.py b/vllm/tokenizers/deepseek_v32.py
+index 0e9aaa2ca..ea87d1412 100644
+--- a/vllm/tokenizers/deepseek_v32.py
++++ b/vllm/tokenizers/deepseek_v32.py
+@@ -21,6 +21,9 @@ def get_deepseek_v32_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+     added_vocab = tokenizer.get_added_vocab()
+ 
+     class _DeepseekV32Tokenizer(tokenizer.__class__):  # type: ignore
++        # The V3.2 format has no mid-conversation system messages.
++        supports_inline_system_messages = False
++
+         def apply_chat_template(
+             self,
+             messages: list["ChatCompletionMessageParam"],
+diff --git a/vllm/tokenizers/deepseek_v4.py b/vllm/tokenizers/deepseek_v4.py
+index 2a0db215b..ba23712ad 100644
+--- a/vllm/tokenizers/deepseek_v4.py
++++ b/vllm/tokenizers/deepseek_v4.py
+@@ -21,6 +21,9 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+     added_vocab = tokenizer.get_added_vocab()
+ 
+     class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
++        # The V4 format has no mid-conversation system messages.
++        supports_inline_system_messages = False
++
+         def apply_chat_template(
+             self,
+             messages: list["ChatCompletionMessageParam"],
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 707513487..ff12f7215 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -323,6 +323,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+         return ids
+ 
+     class _DeepseekV41Tokenizer(tokenizer.__class__):  # type: ignore
++        supports_inline_system_messages = True
++
+         def apply_chat_template(
+             self,
+             messages: list[ChatCompletionMessageParam],
+-- 
+2.43.0
+

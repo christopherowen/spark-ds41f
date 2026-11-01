@@ -1,0 +1,721 @@
+From ba22628eeabfeaf7aefc342db93afb1cb2029f13 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:23:00 +0100
+Subject: [PATCH 644/651] Stream DeepSeek-V3.2 / V4 / V4.1 string tool
+ arguments incrementally (#61689, #64673)
+
+---
+ tests/parser/engine/test_deepseek_v4.py       | 50 ++++++++++
+ tests/parser/engine/test_deepseek_v41.py      | 49 ++++++++++
+ tests/parser/engine/test_parser_engine.py     |  5 +-
+ .../test_deepseekv32_tool_parser.py           | 39 ++++++++
+ .../test_deepseekv4_tool_parser.py            | 78 ++++++++++++++++
+ vllm/parser/deepseek_v32.py                   |  2 +
+ vllm/parser/deepseek_v4.py                    | 72 ++++++++++++++-
+ vllm/parser/deepseek_v41.py                   |  9 ++
+ vllm/parser/engine/parser_engine.py           | 91 ++++++++++++++-----
+ vllm/parser/engine/parser_engine_config.py    | 26 ++++++
+ 10 files changed, 391 insertions(+), 30 deletions(-)
+
+diff --git a/tests/parser/engine/test_deepseek_v4.py b/tests/parser/engine/test_deepseek_v4.py
+index fcd15f9dc..42473646a 100644
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -34,6 +34,7 @@ from vllm.parser.deepseek_v4 import (
+     DSML_TOOL_START_VARIANTS,
+     DeepSeekV4Parser,
+     _dsml_arg_converter,
++    _dsml_arg_value_extender,
+     _unwrap_wrapper_args,
+     deepseek_v4_config,
+ )
+@@ -1399,6 +1400,55 @@ class TestDelegatingParserLargeDelta:
+         assert output.tool_calls == []
+ 
+ 
++# ── Open string values stream without re-running the converter (#52846) ──
++
++
++class TestArgValueExtender:
++    def test_stops_at_split_param_close(self):
++        extend = _dsml_arg_value_extender(
++            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "x"
++        )
++        assert extend is not None
++        assert [extend(d) for d in ['a"\n', "</｜DSML｜para", "meter>"]] == [
++            'a\\"\\n',
++            "</｜DSML｜para",
++            None,
++        ]
++
++    @pytest.mark.parametrize(
++        "raw_args",
++        [
++            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "x" + _PARAM_CLOSE,
++            "<" + _PARAM_OPEN.format(name="k", is_str="false") + "1",
++            "<"
++            + _PARAM_OPEN.format(name="k", is_str="true")
++            + "x"
++            + _PARAM_CLOSE
++            + "<"
++            + _PARAM_OPEN.format(name="k", is_str="true")
++            + "y",
++        ],
++        ids=["closed_value", "non_string_value", "repeated_key"],
++    )
++    def test_no_extender_unless_open_string_value(self, raw_args):
++        assert _dsml_arg_value_extender(raw_args) is None
++
++    @pytest.mark.parametrize(
++        "partial_tag", ['<｜DSML｜parameter name="j', "<｜DSML｜parameter na"]
++    )
++    def test_holds_back_partial_tag_after_gt(self, partial_tag):
++        raw_args = (
++            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "a > b" + partial_tag
++        )
++        assert json.loads(_dsml_arg_converter(raw_args, True)) == {"k": "a > b"}
++        assert _dsml_arg_value_extender(raw_args) is None
++
++    def test_arms_on_value_ending_in_newline(self):
++        raw_args = "<" + _PARAM_OPEN.format(name="k", is_str="true") + "def f():\n"
++        assert json.loads(_dsml_arg_converter(raw_args, True)) == {"k": "def f():\n"}
++        assert _dsml_arg_value_extender(raw_args) is not None
++
++
+ # ── Malformed DSML markup must not leak into content (#51914) ─────────
+ 
+ _WRAPPER_VARIANTS = list(DSML_TOOL_START_VARIANTS)
+diff --git a/tests/parser/engine/test_deepseek_v41.py b/tests/parser/engine/test_deepseek_v41.py
+index d99ca6b2a..67f1b8f2d 100644
+--- a/tests/parser/engine/test_deepseek_v41.py
++++ b/tests/parser/engine/test_deepseek_v41.py
+@@ -146,3 +146,52 @@ def test_python_argument_conversion_and_partial_values():
+         "bare": 7,
+         "text": "  a<b",
+     }
++
++
++@pytest.mark.parametrize(
++    "partial_tag", ['<｜DSML｜ parameter name="j', "<｜DSML｜ parameter na"]
++)
++def test_partial_tag_after_gt_is_held_back(partial_tag):
++    config = deepseek_v41_config()
++    assert config.arg_converter is not None
++    assert config.arg_value_extender is not None
++    raw = '<｜DSML｜ parameter name="k" string="true">a > b' + partial_tag
++    assert json.loads(config.arg_converter(raw, True)) == {"k": "a > b"}
++    assert config.arg_value_extender(raw) is None
++
++
++def test_long_string_argument_streams_before_close():
++    # Regression for #52846: a string body has no ">" so it used to be
++    # buffered until the closing parameter tag arrived.
++    body = "A" * 4096
++    text = (
++        '<｜DSML｜ calls>\n<｜DSML｜ invoke name="emit">\n'
++        f'<｜DSML｜ parameter name="text" string="true">{body}'
++        "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
++    )
++    tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "emit",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            },
++        }
++    ]
++    tokenizer, tokens = tokenizer_for(text, False)
++    parser = parser_for(tokenizer, {"thinking": False})
++    results = replay_streaming(
++        parser, tokens, chunk_size=32, finished_on_last=True, tools=tools
++    )
++    arg_chunks = [
++        tool_call.function.arguments
++        for result in results
++        if result
++        for tool_call in result.tool_calls or []
++        if tool_call.function and tool_call.function.arguments
++    ]
++    assert len(arg_chunks) > len(body) // 64
++    assert json.loads("".join(arg_chunks)) == {"text": body}
+diff --git a/tests/parser/engine/test_parser_engine.py b/tests/parser/engine/test_parser_engine.py
+index 58ad006de..95323982b 100644
+--- a/tests/parser/engine/test_parser_engine.py
++++ b/tests/parser/engine/test_parser_engine.py
+@@ -1700,14 +1700,15 @@ class TestSafeArgPrefix:
+         ],
+     )
+     def test_safe_arg_prefix(self, json_str, expected):
+-        assert ParserEngine._safe_arg_prefix(json_str) == expected
++        assert ParserEngine._safe_arg_prefix(json_str)[0] == expected
+ 
+     def test_schema_typed_trailing_string_is_withheld_with_its_key(self):
+         # ``count`` may be coerced to a number, so its value cannot stream and
+         # the separator must not be left dangling either.
+         json_str = '{"path": "README.md", "count": "1'
+         assert (
+-            ParserEngine._safe_arg_prefix(json_str, {"path"}) == '{"path": "README.md"'
++            ParserEngine._safe_arg_prefix(json_str, {"path"})[0]
++            == '{"path": "README.md"'
+         )
+ 
+ 
+diff --git a/tests/tool_parsers/test_deepseekv32_tool_parser.py b/tests/tool_parsers/test_deepseekv32_tool_parser.py
+index 40ad6033d..3783ca8a7 100644
+--- a/tests/tool_parsers/test_deepseekv32_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv32_tool_parser.py
+@@ -969,6 +969,45 @@ class TestExtractToolCallsStreaming:
+         assert combined  # some partial args emitted
+         assert combined.startswith('{"k"')
+ 
++    def test_long_string_argument_streams_before_close(self):
++        """A string body has no ">" and must not be buffered until
++        </parameter> arrives (GitHub #52846)."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="emit",
++                parameters={
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        body = "A" * 4096
++        chunks = [
++            f'{FC_START}\n{INV_START}emit">\n{PARAM_START}text" string="true">',
++            *(body[i : i + 32] for i in range(0, len(body), 32)),
++            f"{PARAM_END}\n{INV_END}\n{FC_END}",
++        ]
++        per_chunk_args = []
++        prev = ""
++        for chunk in chunks:
++            result = parser.extract_tool_calls_streaming(
++                previous_text=prev,
++                current_text=prev + chunk,
++                delta_text=chunk,
++                previous_token_ids=[],
++                current_token_ids=[],
++                delta_token_ids=[1],
++                request=make_request(),
++            )
++            prev += chunk
++            per_chunk_args.append(
++                self._reconstruct_args([result]) if result is not None else ""
++            )
++
++        assert sum(1 for args in per_chunk_args[1:-1] if args) > 1
++        assert json.loads("".join(per_chunk_args)) == {"text": body}
++
+     def test_no_marker_leak_chunked(self, parser):
+         """Chunked streaming must NOT leak DSML start-marker fragments
+         as content (GitHub #40801)."""
+diff --git a/tests/tool_parsers/test_deepseekv4_tool_parser.py b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+index e79465ed9..f730e29b9 100644
+--- a/tests/tool_parsers/test_deepseekv4_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+@@ -254,6 +254,84 @@ def test_streaming_emits_incremental_argument_chunks():
+     }
+ 
+ 
++def _stream_param_body(properties: dict, param_open: str, body: str) -> list[str]:
++    """Stream one parameter body in 32-char chunks, one argument list per chunk."""
++    tool = ChatCompletionToolsParam(
++        function=FunctionDefinition(
++            name="emit",
++            parameters={"type": "object", "properties": properties},
++        ),
++    )
++    parser = make_parser(tools=[tool])
++    chunks = [
++        f'{TC_START}\n{INV_START}emit">\n{param_open}',
++        *(body[i : i + 32] for i in range(0, len(body), 32)),
++        f"{PARAM_END}\n{INV_END}\n{TC_END}",
++    ]
++    per_chunk_args = []
++    previous_text = ""
++    for delta_text in chunks:
++        current_text = previous_text + delta_text
++        delta = parser.extract_tool_calls_streaming(
++            previous_text=previous_text,
++            current_text=current_text,
++            delta_text=delta_text,
++            previous_token_ids=[],
++            current_token_ids=[],
++            delta_token_ids=[1],
++            request=make_request(),
++        )
++        previous_text = current_text
++        per_chunk_args.append(
++            "".join(
++                tool_call.function.arguments
++                for tool_call in (delta.tool_calls if delta else [])
++                if tool_call.function and tool_call.function.arguments
++            )
++        )
++    return per_chunk_args
++
++
++def test_streaming_long_string_argument_is_incremental():
++    # Regression for #52846: a string body has no ">" so it used to be
++    # buffered until </parameter> arrived.
++    body = "A" * 4096
++    per_chunk_args = _stream_param_body(
++        {"text": {"type": "string"}},
++        f'{PARAM_START}text" string="true">',
++        body,
++    )
++
++    body_chunks = per_chunk_args[1:-1]
++    assert sum(1 for args in body_chunks if args) > 1
++    assert json.loads("".join(per_chunk_args)) == {"text": body}
++
++
++def test_streaming_non_string_argument_is_withheld_until_close():
++    body = "1" * 128
++    per_chunk_args = _stream_param_body(
++        {"count": {"type": "integer"}},
++        f'{PARAM_START}count" string="false">',
++        body,
++    )
++
++    assert not any(per_chunk_args[1:-1])
++    assert json.loads("".join(per_chunk_args)) == {"count": int(body)}
++
++
++def test_streaming_string_argument_with_markup_is_incremental():
++    body = '<div class="a">x > y</div>\n' * 64
++    per_chunk_args = _stream_param_body(
++        {"html": {"type": "string"}},
++        f'{PARAM_START}html" string="true">',
++        body,
++    )
++
++    body_chunks = per_chunk_args[1:-1]
++    assert sum(1 for args in body_chunks if args) > 1
++    assert json.loads("".join(per_chunk_args)) == {"html": body}
++
++
+ def _with_strict(
+     tools: list[ChatCompletionToolsParam],
+ ) -> list[ChatCompletionToolsParam]:
+diff --git a/vllm/parser/deepseek_v32.py b/vllm/parser/deepseek_v32.py
+index de6634cf7..ae5f33a09 100644
+--- a/vllm/parser/deepseek_v32.py
++++ b/vllm/parser/deepseek_v32.py
+@@ -28,6 +28,7 @@ from vllm.parser.deepseek_v4 import (
+     DSML_PARAM_CLOSE,
+     DSML_PARAM_START,
+     _dsml_arg_converter,
++    _dsml_arg_value_extender,
+     _unwrap_wrapper_args,
+ )
+ from vllm.parser.engine.events import EventType
+@@ -115,6 +116,7 @@ def deepseek_v32_config() -> ParserEngineConfig:
+         },
+         arg_converter=_dsml_arg_converter,
+         arg_structural_chars=frozenset(">"),
++        arg_value_extender=_dsml_arg_value_extender,
+         strip_content_whitespace_with_tools=False,
+         tool_args_json=False,
+     )
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 49ef63736..f18b4ad46 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -28,6 +28,7 @@ import regex as re
+ from vllm.parser.engine.events import EventType
+ from vllm.parser.engine.parser_engine import ParserEngine
+ from vllm.parser.engine.parser_engine_config import (
++    ArgValueExtender,
+     ParserEngineConfig,
+     ParserState,
+     Transition,
+@@ -64,24 +65,46 @@ def _param_patterns(
+ 
+     The ``string`` attribute is optional: the model sometimes omits it, and
+     dropping such a parameter hands the client a tool call with no arguments.
++    The trailing-partial regex captures the open value up to the end of the
++    text; ``_match_open_param`` holds back an unfinished next parameter tag
++    so a streamed string value never includes it.
+     """
+     start, close = re.escape(param_start), re.escape(param_close)
+     head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+     return (
+         re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+-        re.compile(rf"{head}(.*)$", re.DOTALL),
++        re.compile(rf"{head}(.*)\Z", re.DOTALL),
+     )
+ 
+ 
+ _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+ 
+ 
++def _match_open_param(
++    raw_args: str, pos: int, partial_param_re: re.Pattern, param_start: str
++) -> tuple[str, str | None, str, bool] | None:
++    """Return (name, is_str, value, held_back) for the trailing open param.
++
++    An unfinished next parameter tag (``param_start`` with no ``>`` after it)
++    is cut from the value; ``held_back`` reports whether that happened.
++    """
++    pm = partial_param_re.search(raw_args, pos)
++    if pm is None:
++        return None
++    value = pm.group(3)
++    cut = value.find(param_start, value.rfind(">") + 1)
++    if cut >= 0:
++        return pm.group(1), pm.group(2), value[:cut], True
++    return pm.group(1), pm.group(2), value, False
++
++
+ def _dsml_arg_converter(
+     raw_args: str,
+     partial: bool,
+     *,
+     param_re: re.Pattern = _PARAM_RE,
+     partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
++    param_start: str = DSML_PARAM_START,
+ ) -> str:
+     params: dict[str, object] = {}
+ 
+@@ -100,9 +123,11 @@ def _dsml_arg_converter(
+         last_end = m.end()
+ 
+     if partial:
+-        pm = partial_param_re.search(raw_args, last_end)
+-        if pm:
+-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
++        open_param = _match_open_param(
++            raw_args, last_end, partial_param_re, param_start
++        )
++        if open_param:
++            name, is_str, value, _ = open_param
+             if is_str == "true":
+                 params[name] = value
+             else:
+@@ -112,6 +137,44 @@ def _dsml_arg_converter(
+     return json.dumps(params, ensure_ascii=False)
+ 
+ 
++def _dsml_arg_value_extender(
++    raw_args: str,
++    *,
++    param_re: re.Pattern = _PARAM_RE,
++    partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
++    param_start: str = DSML_PARAM_START,
++    param_close: str = DSML_PARAM_CLOSE,
++) -> ArgValueExtender | None:
++    # ``arg_structural_chars`` skips every delta without ``>``, so a long
++    # string value would wait for its closing tag. Extend the open trailing
++    # ``string="true"`` value instead. The lexer can flush a held partial
++    # tag as text, so keep a tail to catch a tag split across deltas.
++    names = set()
++    last_end = 0
++    for m in param_re.finditer(raw_args):
++        names.add(m.group(1))
++        last_end = m.end()
++    open_param = _match_open_param(raw_args, last_end, partial_param_re, param_start)
++    if open_param is None:
++        return None
++    name, is_str, _, held_back = open_param
++    if is_str != "true" or name in names or held_back:
++        return None
++
++    keep = max(len(param_start), len(param_close)) - 1
++    tail = raw_args[-keep:]
++
++    def extend(delta: str) -> str | None:
++        nonlocal tail
++        text = tail + delta
++        if param_start in text or param_close in text:
++            return None
++        tail = text[-keep:]
++        return json.dumps(delta, ensure_ascii=False)[1:-1]
++
++    return extend
++
++
+ def _unwrap_wrapper_args(
+     args_json: str,
+     tools: list[Tool] | None,
+@@ -238,6 +301,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+         },
+         arg_converter=_dsml_arg_converter,
+         arg_structural_chars=frozenset(">"),
++        arg_value_extender=_dsml_arg_value_extender,
+         strip_content_whitespace_with_tools=False,
+         tool_args_json=False,
+     )
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 842160051..76c7ad19b 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -8,6 +8,7 @@ from dataclasses import replace
+ from vllm.parser.deepseek_v4 import (
+     DeepSeekV4Parser,
+     _dsml_arg_converter,
++    _dsml_arg_value_extender,
+     _param_patterns,
+     deepseek_v4_config,
+ )
+@@ -46,6 +47,14 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+             _dsml_arg_converter,
+             param_re=_PARAM_RE,
+             partial_param_re=_PARTIAL_PARAM_RE,
++            param_start=DSML_PARAM_START,
++        ),
++        arg_value_extender=functools.partial(
++            _dsml_arg_value_extender,
++            param_re=_PARAM_RE,
++            partial_param_re=_PARTIAL_PARAM_RE,
++            param_start=DSML_PARAM_START,
++            param_close=DSML_PARAM_CLOSE,
+         ),
+     )
+ 
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 22a16175e..d9df0357b 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -25,7 +25,11 @@ from vllm.entrypoints.generate.base.protocol import (
+ from vllm.logger import init_logger
+ from vllm.parser.abstract_parser import Parser, StreamState
+ from vllm.parser.engine.events import EventType, SemanticEvent
+-from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
++from vllm.parser.engine.parser_engine_config import (
++    ArgValueExtender,
++    ParserEngineConfig,
++    ParserState,
++)
+ from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+ from vllm.tool_parsers.utils import (
+     coerce_to_schema_type,
+@@ -53,7 +57,10 @@ class ToolCallSlot:
+         "_args_joined",
+         "name_sent",
+         "string_keys",
+-        "streamed_json",
++        "_streamed_parts",
++        "_streamed_joined",
++        "extend_open_value",
++        "open_value_streams",
+     )
+ 
+     def __init__(self) -> None:
+@@ -63,7 +70,10 @@ class ToolCallSlot:
+         self._args_joined: str | None = ""
+         self.name_sent: bool = False
+         self.string_keys: set[str] | None = None
+-        self.streamed_json: str = ""
++        self._streamed_parts: list[str] = []
++        self._streamed_joined: str | None = ""
++        self.extend_open_value: ArgValueExtender | None = None
++        self.open_value_streams: bool = False
+ 
+     @property
+     def args(self) -> str:
+@@ -75,6 +85,21 @@ class ToolCallSlot:
+         self._args_parts.append(value)
+         self._args_joined = None
+ 
++    @property
++    def streamed_json(self) -> str:
++        if self._streamed_joined is None:
++            self._streamed_joined = "".join(self._streamed_parts)
++        return self._streamed_joined
++
++    @streamed_json.setter
++    def streamed_json(self, value: str) -> None:
++        self._streamed_parts = [value]
++        self._streamed_joined = value
++
++    def append_streamed(self, value: str) -> None:
++        self._streamed_parts.append(value)
++        self._streamed_joined = None
++
+ 
+ class ParserEngine(Parser):
+     """A :class:`Parser` backed by a single declarative engine config.
+@@ -126,6 +151,7 @@ class ParserEngine(Parser):
+ 
+         self._arg_converter = parser_engine_config.arg_converter
+         self._arg_structural_chars = parser_engine_config.arg_structural_chars
++        self._arg_value_extender = parser_engine_config.arg_value_extender
+         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
+         self._strip_trailing_reasoning_ws = (
+             parser_engine_config.strip_trailing_reasoning_whitespace
+@@ -296,7 +322,9 @@ class ParserEngine(Parser):
+         return args, changed
+ 
+     @staticmethod
+-    def _safe_arg_prefix(json_str: str, string_keys: set[str] | None = None) -> str:
++    def _safe_arg_prefix(
++        json_str: str, string_keys: set[str] | None = None
++    ) -> tuple[str, bool]:
+         """Return the prefix of *json_str* up to the last top-level value.
+ 
+         Middle values (followed by a comma) are stable across streaming
+@@ -306,6 +334,11 @@ class ParserEngine(Parser):
+         String values for keys in ``string_keys`` are prefix-stable, so stream
+         their unterminated content instead of buffering long arguments until
+         the closing tag arrives.
++
++        Also returns whether the returned prefix stops inside that trailing
++        string, so streamed text may be appended to it.  This holds even when
++        *json_str* closes the string: converters serialise an open raw value
++        as a closed JSON string.
+         """
+         last_colon = -1
+         last_comma = -1
+@@ -341,7 +374,7 @@ class ParserEngine(Parser):
+             elif c == "," and depth == 1:
+                 last_comma = i
+         if last_colon < 0:
+-            return ""
++            return "", False
+         end = last_colon + 1
+         while end < len(json_str) and json_str[end] in (" ", "\t", "\n", "\r"):
+             end += 1
+@@ -354,7 +387,7 @@ class ParserEngine(Parser):
+             # top-level value rather than after ``"key": ``: the flush can
+             # drop an unfinished parameter, and a prefix that ends on the
+             # separator then has no valid completion.
+-            return json_str[:last_comma] if last_comma >= 0 else ""
++            return (json_str[:last_comma] if last_comma >= 0 else ""), False
+ 
+         escape = False
+         escape_start = -1
+@@ -378,11 +411,11 @@ class ParserEngine(Parser):
+                 escape_start = i
+                 continue
+             if c == '"':
+-                return json_str[:i]
++                return json_str[:i], True
+         if escape_start >= 0:
+             # Never end on a partial escape: ``\u12`` has no valid completion.
+-            return json_str[:escape_start]
+-        return json_str
++            return json_str[:escape_start], True
++        return json_str, True
+ 
+     @staticmethod
+     def _streamable_string_keys(properties: dict) -> set[str] | None:
+@@ -1034,11 +1067,19 @@ class ParserEngine(Parser):
+         if not self._stream_arg_deltas:
+             return None
+ 
++        slot = self._tool_slots[idx]
+         structural = self._arg_structural_chars
+-        if structural is not None and structural.isdisjoint(raw_delta):
++        if slot.extend_open_value is not None:
++            diff = slot.extend_open_value(raw_delta)
++            if diff is not None:
++                if not diff or not slot.open_value_streams:
++                    return None
++                slot.append_streamed(diff)
++                return diff
++            slot.extend_open_value = None
++        elif structural is not None and structural.isdisjoint(raw_delta):
+             return None
+ 
+-        slot = self._tool_slots[idx]
+         try:
+             current_json = converter(slot.args, True)
+         except (json.JSONDecodeError, ValueError, TypeError):
+@@ -1052,22 +1093,24 @@ class ParserEngine(Parser):
+             current_json = self._fix_arg_types(current_json, slot.name)
+ 
+         prev = slot.streamed_json
+-        safe_json = self._safe_arg_prefix(current_json, slot.string_keys)
++        safe_json, value_streams = self._safe_arg_prefix(current_json, slot.string_keys)
+ 
+-        if not safe_json or safe_json == prev:
++        if not safe_json:
++            return None
++        if prev and not safe_json.startswith(prev):
++            if self._arg_value_extender is not None:
++                # A repeated key replaced a streamed value. Deltas that only
++                # extend the new value skip the conversion until it closes.
++                slot.extend_open_value = self._arg_value_extender(slot.args)
++                slot.open_value_streams = False
+             return None
+ 
+-        if prev:
+-            if not safe_json.startswith(prev):
+-                return None
+-            diff = safe_json[len(prev) :]
+-        else:
+-            diff = safe_json
+-
+-        if diff:
+-            slot.streamed_json = safe_json
+-            return diff
+-        return None
++        slot.streamed_json = safe_json
++        if self._arg_value_extender is not None:
++            # Deltas that only extend the open value skip the conversion above.
++            slot.extend_open_value = self._arg_value_extender(slot.args)
++            slot.open_value_streams = value_streams
++        return safe_json[len(prev) :] or None
+ 
+     def _flush_arg_converter(self, idx: int) -> str | None:
+         converter = self._arg_converter
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index 6e32b3009..d2b9ddd85 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -26,6 +26,10 @@ from functools import cached_property
+ 
+ from vllm.parser.engine.events import EventType
+ 
++# Maps a raw argument delta to the JSON text it appends to the open trailing
++# value, or returns None when the delta may change anything else.
++ArgValueExtender = Callable[[str], str | None]
++
+ 
+ class ParserState(Enum):
+     CONTENT = auto()
+@@ -87,6 +91,19 @@ class ParserEngineConfig:
+ 
+     arg_structural_chars: frozenset[str] | None = None
+ 
++    # Called with the raw argument text after each streaming conversion whose
++    # prefix-safe JSON extends the JSON streamed so far; returns an extender
++    # when the text ends in an open value that is the last value in the
++    # converted JSON, else None. While live, the extender receives every delta
++    # in place of ``arg_converter`` until it returns None, meaning the delta
++    # closed the value. Returned text is streamed as is, so it must match what
++    # ``arg_converter`` would serialise for those raw characters. Deltas are
++    # lexer output: a terminal is never split across deltas, but the lexer
++    # flushes a held partial terminal as text at the end of the stream or
++    # before a terminal matched by token ID, so a truncated value may end in
++    # a terminal prefix. Requires ``arg_converter`` and ``stream_arg_deltas``.
++    arg_value_extender: Callable[[str], ArgValueExtender | None] | None = None
++
+     # Special tokens exempt from auto-drop but not state-machine terminals.
+     preserve_tokens: frozenset[str] = field(default_factory=frozenset)
+ 
+@@ -110,6 +127,15 @@ class ParserEngineConfig:
+         default_factory=dict,
+     )
+ 
++    def __post_init__(self) -> None:
++        if self.arg_value_extender is not None and (
++            self.arg_converter is None or not self.stream_arg_deltas
++        ):
++            raise ValueError(
++                f"{self.name}: arg_value_extender requires arg_converter "
++                "and stream_arg_deltas=True"
++            )
++
+     def terminal_literal(self, name: str) -> str | None:
+         """Canonical spelling of terminal *name*, or ``None`` if undeclared."""
+         value = self.terminals.get(name)
+-- 
+2.43.0
+
