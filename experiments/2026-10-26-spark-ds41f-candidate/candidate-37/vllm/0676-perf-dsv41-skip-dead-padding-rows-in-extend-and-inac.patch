@@ -1,0 +1,371 @@
+From 945710a0910a39dc8528c28f16f34ef236f1606b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:07:09 +0100
+Subject: [PATCH 676/676] perf(dsv41): skip dead/padding rows in extend and
+ inactive segments in decode sparse_mla_fwd_v41 (#778)
+
+Keep split_block_H (< 32, single-wave split route) branch-free at compile time so 1x2/1x3 and 1..4-row drafter steps pay zero branch overhead, while skipping dead CED rows in extend and inactive segments/rows in multi-head-block decode.
+---
+ .../deepseek_v4_1/tilelang/sparse_mla.py      | 315 ++++++++++--------
+ 1 file changed, 172 insertions(+), 143 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 66a6b67ae..ea0291388 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -384,6 +384,24 @@ def sparse_mla_fwd_v41(
+     def sink_log2(Sinks, h):
+         return T.fmul(T.if_then_else(h < heads, Sinks[T.min(h, heads - 1)], 0), LOG2E)
+ 
++    @T.macro
++    def row_active(SwaLengths, IdxLengths, row):
++        if not idx_blocks:
++            return SwaLengths[row] > 0
++        return (SwaLengths[row] > 0) | (IdxLengths[row] > 0)
++
++    @T.macro
++    def seg_active(seg, SwaLengths, IdxLengths, row):
++        swa_active = (seg * G < swa_blocks) & (seg * G * BI < SwaLengths[row])
++        if not idx_blocks:
++            return swa_active
++        idx_first = T.max(seg * G - swa_blocks, 0) * BI
++        return swa_active | (
++            (seg * G + G > swa_blocks)
++            & (seg * G < chunks)
++            & (idx_first < IdxLengths[row])
++        )
++
+     @T.macro
+     def extend_body(
+         Q,
+@@ -436,80 +454,85 @@ def sparse_mla_fwd_v41(
+ 
+             pdl.chain()
+ 
+-            # Resolve the row's slots once, so record copies never wait on index loads.
+-            gather_swa(SwaIndices, SwaLengths, row, 0, swa_blocks * BI, slots, 0)
+-            if idx_blocks:
+-                gather_idx(
+-                    IdxIndices,
+-                    IdxLengths,
+-                    IdxPageTable,
+-                    row,
+-                    0,
+-                    idx_blocks * BI,
+-                    slots,
+-                    swa_blocks * BI,
+-                )
+-            T.sync_threads()
+-            stage_chunk(SwaRecords, IdxRecords, 0, slots, 0, staged, copy_slot)
+-            load_q(Q, row, h0, Q_shared)
+-            T.fill(acc_o, 0)
+-            T.fill(L, 1)
+-
+-            for seg in T.serial(segments):
+-                clear_segment(acc_g, m_g, l_g)
+-                for c in T.serial(G):
+-                    chunk = seg * G + c
+-                    if chunk < chunks:
+-                        T.ptx_wait_group(0)
+-                        T.sync_threads()
+-                        dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
+-                        T.sync_threads()
+-                        # The next chunk's records load while this chunk computes.
+-                        if chunk + 1 < chunks:
+-                            stage_chunk(
+-                                SwaRecords,
+-                                IdxRecords,
+-                                chunk + 1,
++            if row_active(SwaLengths, IdxLengths, row):
++                # Resolve the row's slots once, so record copies never wait on index loads.
++                gather_swa(SwaIndices, SwaLengths, row, 0, swa_blocks * BI, slots, 0)
++                if idx_blocks:
++                    gather_idx(
++                        IdxIndices,
++                        IdxLengths,
++                        IdxPageTable,
++                        row,
++                        0,
++                        idx_blocks * BI,
++                        slots,
++                        swa_blocks * BI,
++                    )
++                T.sync_threads()
++                stage_chunk(SwaRecords, IdxRecords, 0, slots, 0, staged, copy_slot)
++                load_q(Q, row, h0, Q_shared)
++                T.fill(acc_o, 0)
++                T.fill(L, 1)
++
++                for seg in T.serial(segments):
++                    clear_segment(acc_g, m_g, l_g)
++                    for c in T.serial(G):
++                        chunk = seg * G + c
++                        if chunk < chunks:
++                            T.ptx_wait_group(0)
++                            T.sync_threads()
++                            dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
++                            T.sync_threads()
++                            # The next chunk's records load while this chunk computes.
++                            if chunk + 1 < chunks:
++                                stage_chunk(
++                                    SwaRecords,
++                                    IdxRecords,
++                                    chunk + 1,
++                                    slots,
++                                    (chunk + 1) * BI,
++                                    staged,
++                                    copy_slot,
++                                )
++                            chunk_update(
++                                Q_shared,
++                                KV_shared,
+                                 slots,
+-                                (chunk + 1) * BI,
+-                                staged,
+-                                copy_slot,
++                                chunk * BI,
++                                P_shared,
++                                acc_s,
++                                acc_g,
++                                m_g,
++                                l_g,
++                                m_prev,
++                                alpha,
++                                row_sum,
+                             )
+-                        chunk_update(
+-                            Q_shared,
+-                            KV_shared,
+-                            slots,
+-                            chunk * BI,
+-                            P_shared,
+-                            acc_s,
+-                            acc_g,
+-                            m_g,
+-                            l_g,
+-                            m_prev,
+-                            alpha,
+-                            row_sum,
+-                        )
+-                # Fold the segment into the running state, as the decode merge does,
+-                # in the form no constant can change (see FOLD below).
++                    # Fold the segment into the running state, as the decode merge does,
++                    # in the form no constant can change (see FOLD below).
++                    for h in T.Parallel(block_H):
++                        m_new = T.max(M[h], m_g[h])
++                        a[h] = T.exp2(M[h] - m_new)
++                        b[h] = T.exp2(m_g[h] - m_new)
++                        L[h] = T.fma(l_g[h], b[h], T.fmul(L[h], a[h]))
++                        M[h] = m_new
++                    for h, d in T.Parallel(block_H, D):
++                        acc_o[h, d] = T.fma(acc_g[h, d], b[h], T.fmul(acc_o[h, d], a[h]))
++
+                 for h in T.Parallel(block_H):
+-                    m_new = T.max(M[h], m_g[h])
+-                    a[h] = T.exp2(M[h] - m_new)
+-                    b[h] = T.exp2(m_g[h] - m_new)
+-                    L[h] = T.fma(l_g[h], b[h], T.fmul(L[h], a[h]))
+-                    M[h] = m_new
++                    L[h] = 1.0 / L[h]
++                # WO-A's input, staged in Q_shared once every warp is done with Q.
++                T.sync_threads()
+                 for h, d in T.Parallel(block_H, D):
+-                    acc_o[h, d] = T.fma(acc_g[h, d], b[h], T.fmul(acc_o[h, d], a[h]))
+-
+-            for h in T.Parallel(block_H):
+-                L[h] = 1.0 / L[h]
+-            # WO-A's input, staged in Q_shared once every warp is done with Q.
+-            T.sync_threads()
+-            for h, d in T.Parallel(block_H, D):
+-                Q_shared[h, d] = T.fmul(acc_o[h, d], L[h])
+-            wo_input(Q_shared, block_H, None, cs_shared, X, amax, inv, scale)
+-            for h, d in T.Parallel(block_H, D):
+-                if h0 + h < heads:
+-                    Output[row, h0 + h, d] = Q_shared[h, d]
++                    Q_shared[h, d] = T.fmul(acc_o[h, d], L[h])
++                wo_input(Q_shared, block_H, None, cs_shared, X, amax, inv, scale)
++                for h, d in T.Parallel(block_H, D):
++                    if h0 + h < heads:
++                        Output[row, h0 + h, d] = Q_shared[h, d]
++            else:
++                for h, d in T.Parallel(block_H, D):
++                    if h0 + h < heads:
++                        Output[row, h0 + h, d] = 0
+ 
+     @T.macro
+     def decode_body(
+@@ -546,71 +569,72 @@ def sparse_mla_fwd_v41(
+             alpha = T.alloc_fragment([block_H], accum_dtype)
+             row_sum = T.alloc_fragment([block_H], accum_dtype)
+ 
+-            for c in T.serial(G):
+-                chunk = seg * G + c
+-                if not idx_blocks:
+-                    if chunk < swa_blocks:
++            if True if block_H < 32 else seg_active(seg, SwaLengths, IdxLengths, row):
++                for c in T.serial(G):
++                    chunk = seg * G + c
++                    if not idx_blocks:
++                        if chunk < swa_blocks:
++                            gather_swa(
++                                SwaIndices, SwaLengths, row, chunk * BI, BI, slots, c * BI
++                            )
++                    elif chunk < swa_blocks:
+                         gather_swa(
+                             SwaIndices, SwaLengths, row, chunk * BI, BI, slots, c * BI
+                         )
+-                elif chunk < swa_blocks:
+-                    gather_swa(
+-                        SwaIndices, SwaLengths, row, chunk * BI, BI, slots, c * BI
+-                    )
+-                elif chunk < chunks:
+-                    gather_idx(
+-                        IdxIndices,
+-                        IdxLengths,
+-                        IdxPageTable,
+-                        row,
+-                        (chunk - swa_blocks) * BI,
+-                        BI,
+-                        slots,
+-                        c * BI,
+-                    )
+-            T.sync_threads()
+-            stage_chunk(SwaRecords, IdxRecords, seg * G, slots, 0, staged, copy_slot)
+-            h0 = hb * block_H
+-            load_q(Q, row, h0, Q_shared)
+-            clear_segment(acc_g, m_g, l_g)
+-            for c in T.serial(G):
+-                chunk = seg * G + c
+-                if chunk < chunks:
+-                    T.ptx_wait_group(0)
+-                    T.sync_threads()
+-                    dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
+-                    T.sync_threads()
+-                    if (c + 1 < G) & (chunk + 1 < chunks):
+-                        stage_chunk(
+-                            SwaRecords,
+-                            IdxRecords,
+-                            chunk + 1,
++                    elif chunk < chunks:
++                        gather_idx(
++                            IdxIndices,
++                            IdxLengths,
++                            IdxPageTable,
++                            row,
++                            (chunk - swa_blocks) * BI,
++                            BI,
+                             slots,
+-                            (c + 1) * BI,
+-                            staged,
+-                            copy_slot,
++                            c * BI,
+                         )
+-                    chunk_update(
+-                        Q_shared,
+-                        KV_shared,
+-                        slots,
+-                        c * BI,
+-                        P_shared,
+-                        acc_s,
+-                        acc_g,
+-                        m_g,
+-                        l_g,
+-                        m_prev,
+-                        alpha,
+-                        row_sum,
+-                    )
+-            for h, d in T.Parallel(block_H, D):
+-                if h0 + h < heads:
+-                    Partial[row, seg, h0 + h, d] = acc_g[h, d]
+-            for h in T.Parallel(block_H):
+-                if h0 + h < heads:
+-                    PartialStats[row, seg, h0 + h, 0] = m_g[h]
+-                    PartialStats[row, seg, h0 + h, 1] = l_g[h]
++                T.sync_threads()
++                stage_chunk(SwaRecords, IdxRecords, seg * G, slots, 0, staged, copy_slot)
++                h0 = hb * block_H
++                load_q(Q, row, h0, Q_shared)
++                clear_segment(acc_g, m_g, l_g)
++                for c in T.serial(G):
++                    chunk = seg * G + c
++                    if chunk < chunks:
++                        T.ptx_wait_group(0)
++                        T.sync_threads()
++                        dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
++                        T.sync_threads()
++                        if (c + 1 < G) & (chunk + 1 < chunks):
++                            stage_chunk(
++                                SwaRecords,
++                                IdxRecords,
++                                chunk + 1,
++                                slots,
++                                (c + 1) * BI,
++                                staged,
++                                copy_slot,
++                            )
++                        chunk_update(
++                            Q_shared,
++                            KV_shared,
++                            slots,
++                            c * BI,
++                            P_shared,
++                            acc_s,
++                            acc_g,
++                            m_g,
++                            l_g,
++                            m_prev,
++                            alpha,
++                            row_sum,
++                        )
++                for h, d in T.Parallel(block_H, D):
++                    if h0 + h < heads:
++                        Partial[row, seg, h0 + h, d] = acc_g[h, d]
++                for h in T.Parallel(block_H):
++                    if h0 + h < heads:
++                        PartialStats[row, seg, h0 + h, 0] = m_g[h]
++                        PartialStats[row, seg, h0 + h, 1] = l_g[h]
+ 
+         # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+@@ -634,20 +658,25 @@ def sparse_mla_fwd_v41(
+             L = 1.0
+             T.clear(o)
+             pdl.chain()
+-            for c in T.unroll(segments):
+-                m_new = T.max(M, PartialStats[rc, c, hc, 0])
+-                a = T.exp2(M - m_new)
+-                b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
+-                L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
+-                M = m_new
++            if True if block_H < 32 else row_active(SwaLengths, IdxLengths, rc):
++                for c in T.unroll(segments):
++                    if True if block_H < 32 else seg_active(c, SwaLengths, IdxLengths, rc):
++                        m_new = T.max(M, PartialStats[rc, c, hc, 0])
++                        a = T.exp2(M - m_new)
++                        b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
++                        L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
++                        M = m_new
++                        for d in T.Parallel(D):
++                            o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
++                L = 1.0 / L
++                for d in T.Parallel(D):
++                    O_shared[0, d] = T.fmul(o[d], L)
++                wo_input(O_shared, 1, None, cs_shared, X, amax, inv, scale)
++                for d in T.Parallel(D):
++                    Output[rc, hc, d] = O_shared[0, d]
++            else:
+                 for d in T.Parallel(D):
+-                    o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
+-            L = 1.0 / L
+-            for d in T.Parallel(D):
+-                O_shared[0, d] = T.fmul(o[d], L)
+-            wo_input(O_shared, 1, None, cs_shared, X, amax, inv, scale)
+-            for d in T.Parallel(D):
+-                Output[rc, hc, d] = O_shared[0, d]
++                    Output[rc, hc, d] = 0
+ 
+     # SWA-only layers (idx_width == 0) compile without the indexed tensors.
+     if schedule == "extend":
+-- 
+2.43.0
+
