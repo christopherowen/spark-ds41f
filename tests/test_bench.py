@@ -615,7 +615,14 @@ class ReferenceShapeTest(unittest.TestCase):
     TP4_MISMATCH = "was measured with nodes 3, transport oneshot-direct; this {} has nodes 4, transport oneshot-ring4"
     # The profiles read the site's git-ignored node maps; use the example map
     # of the same size.
-    EXAMPLE_NODES = {"3": "config/nodes.example.json", "4": "config/examples/nodes-ring4.json"}
+    EXAMPLE_NODES = {
+        "3": "config/nodes.example.json",
+        "4": "config/examples/nodes-ring4.json",
+        "5": "config/examples/nodes-switched5.json",
+        "6": "config/examples/nodes-switched6.json",
+        "7": "config/examples/nodes-switched7.json",
+        "8": "config/examples/nodes-switched8.json",
+    }
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

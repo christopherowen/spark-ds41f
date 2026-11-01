@@ -439,7 +439,12 @@ class RecipeTest(unittest.TestCase):
         triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
         expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
                     "tp4-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
+                    "tp5-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
+                    "tp6-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
+                    "tp7-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
+                    "tp8-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
                     "tp3-triangle": ("8", "48", triangle, "6096"),
+                    "tp3-switched": ("8", "48", triangle, "6096"),
                     "tp3-triangle-4k": ("8", "48", triangle, "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, (streams, largest, ladder, threshold) in expected.items():
@@ -530,7 +535,10 @@ class RecipeTest(unittest.TestCase):
         third of the model, so its headroom differs): changing one must not move another.
         The threshold is the budget less streams x (1 + drafts)."""
         expected = {"tp4-ring": ("16384", "16288"), "tp4-switched": ("16384", "16288"),
-                    "tp3-triangle": ("6144", "6096"), "tp3-triangle-4k": ("4096", "4048")}
+                    "tp5-switched": ("16384", "16288"), "tp6-switched": ("16384", "16288"),
+                    "tp7-switched": ("16384", "16288"), "tp8-switched": ("16384", "16288"),
+                    "tp3-triangle": ("6144", "6096"), "tp3-switched": ("6144", "6096"),
+                    "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
             values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, name))

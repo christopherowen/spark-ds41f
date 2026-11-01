@@ -299,6 +299,49 @@ def load_suite_directory(suite_dir: Path) -> dict[str, Any]:
     }
 
 
+def _load_shape_memory(bench_ref: str | None) -> dict[str, Any] | None:
+    if not bench_ref:
+        return None
+    ref_path = ROOT / bench_ref
+    if ref_path.is_dir():
+        cond_path = ref_path / "conditions.json"
+        if not cond_path.is_file():
+            return None
+        mem_raw = json.loads(cond_path.read_text()).get("memory")
+    elif ref_path.is_file():
+        mem_raw = json.loads(ref_path.read_text()).get("memory")
+    else:
+        return None
+    if not isinstance(mem_raw, dict) or not mem_raw:
+        return None
+    per_node: dict[str, dict[str, float]] = {}
+    for node_name, vals in sorted(mem_raw.items()):
+        if isinstance(vals, dict) and vals.get("min_available_gib") is not None:
+            per_node[node_name] = {
+                "min_available_gib": round(float(vals["min_available_gib"]), 2),
+                "swap_growth_gib": round(float(vals.get("swap_growth_gib", 0.0)), 2),
+            }
+    if not per_node:
+        return None
+    head_key = "dgx1" if "dgx1" in per_node else next(iter(per_node))
+    head_min = per_node[head_key]["min_available_gib"]
+    worker_mins = [v["min_available_gib"] for k, v in per_node.items() if k != head_key]
+    worker_min = min(worker_mins) if worker_mins else head_min
+    worker_max = max(worker_mins) if worker_mins else head_min
+    cluster_min = min(v["min_available_gib"] for v in per_node.values())
+    max_swap = max(v["swap_growth_gib"] for v in per_node.values())
+    return {
+        "per_node": per_node,
+        "head_min_available_gib": head_min,
+        "worker_min_available_gib": worker_min,
+        "worker_max_available_gib": worker_max,
+        "cluster_min_available_gib": cluster_min,
+        "max_swap_growth_gib": max_swap,
+        "headroom_above_startup_guard_gib": round(cluster_min - 5.0, 2),
+        "headroom_above_steady_guard_gib": round(cluster_min - 3.0, 2),
+    }
+
+
 def collect_manifest_data() -> dict[str, Any]:
     cluster = json.loads((ROOT / "config/cluster.json").read_text())
     upstreams = json.loads((ROOT / "upstreams.lock.json").read_text())
@@ -359,6 +402,7 @@ def collect_manifest_data() -> dict[str, Any]:
                 "kv_cache_gib": _format_gib(int(entry["sizing"]["kv_cache_memory_bytes"])),
                 "prefix_cache_retention_interval": int(entry["sizing"]["prefix_cache_retention_interval"]),
                 "kv_capacity": kv,
+                "memory": _load_shape_memory(bench_ref),
                 "benchmark_reference": bench_ref,
                 "qualified_release": qualified_release,
             }
@@ -446,8 +490,8 @@ def collect_manifest_data() -> dict[str, Any]:
 
 def render_readme_current_baseline(data: dict[str, Any]) -> str:
     lines = [
-        f"| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Full contexts held (startup line) | Qualified reference |",
-        f"| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        f"| Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Min free RAM (head / workers) | Full contexts held (startup line) | Qualified reference |",
+        f"| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for s in data["shapes"]:
         kv = s["kv_capacity"]
@@ -458,6 +502,11 @@ def render_readme_current_baseline(data: dict[str, Any]) -> str:
         held_label = (
             f"{kv['full_contexts']} ({kv['contexts']:.2f}x; startup `{startup_tok:,}` / `{startup_ctx:.2f}x`)"
         )
+        mem = s.get("memory")
+        if mem:
+            free_label = f"{mem['head_min_available_gib']:.2f} / {mem['worker_min_available_gib']:.2f} GiB"
+        else:
+            free_label = "—"
         if s["benchmark_reference"]:
             ref_target = (
                 s["benchmark_reference"]
@@ -471,7 +520,7 @@ def render_readme_current_baseline(data: dict[str, Any]) -> str:
         lines.append(
             f"| `{s['name']}`{default_badge} | TP{s['nodes']} `{s['transport']}` ({s['page_size_label']}) | "
             f"{ctx_label} | {seq_label} | {s['max_num_batched_tokens']:,} | {s['kv_cache_gib']} | "
-            f"{held_label} | {ref_link} |"
+            f"{free_label} | {held_label} | {ref_link} |"
         )
     return "\n".join(lines)
 
@@ -1246,6 +1295,8 @@ def render_site_html(data: dict[str, Any]) -> str:
               <th class="num">Max Seqs</th>
               <th class="num">Batch Tokens</th>
               <th class="num">KV Pool / Rank</th>
+              <th class="num">Min Free RAM (Head / Workers)</th>
+              <th class="num">5 GiB Guard Headroom</th>
               <th class="num">Pool Blocks</th>
               <th class="num">Full Contexts Held</th>
               <th class="num">vLLM 0491 Startup Line</th>
@@ -1708,6 +1759,8 @@ def render_site_html(data: dict[str, Any]) -> str:
               <div>All ${{s.max_num_seqs}} Seqs Fit: <strong>${{kv.every_sequence_tokens.toLocaleString()}}</strong> tok</div>
               <div>Batch Budget: <strong>${{s.max_num_batched_tokens.toLocaleString()}}</strong> tok</div>
               <div>CUDA Graphs: <strong>1–${{s.max_cudagraph_capture_size}}</strong> rows</div>
+              <div>Min Free RAM (Head / Workers): <strong>${{s.memory ? `${{s.memory.head_min_available_gib.toFixed(2)}} / ${{s.memory.worker_min_available_gib.toFixed(2)}} GiB` : "—"}}</strong></div>
+              <div>5 GiB Guard Headroom: <strong>${{s.memory ? `+${{s.memory.headroom_above_startup_guard_gib.toFixed(2)}} GiB` : "—"}}</strong></div>
             </div>
           </div>
         `;
@@ -1715,6 +1768,9 @@ def render_site_html(data: dict[str, Any]) -> str:
 
       document.getElementById("shapes-tbody").innerHTML = DATA.shapes.map(s => {{
         const kv = s.kv_capacity;
+        const mem = s.memory;
+        const freeCell = mem ? `${{mem.head_min_available_gib.toFixed(2)}} / ${{mem.worker_min_available_gib.toFixed(2)}} GiB` : "—";
+        const headroomCell = mem ? `+${{mem.headroom_above_startup_guard_gib.toFixed(2)}} GiB` : "—";
         return `
           <tr>
             <td><code>${{esc(s.name)}}</code>${{s.default ? ' <span class="badge live">default</span>' : ''}}</td>
@@ -1724,6 +1780,8 @@ def render_site_html(data: dict[str, Any]) -> str:
             <td class="num">${{s.max_num_seqs}}</td>
             <td class="num">${{s.max_num_batched_tokens.toLocaleString()}}</td>
             <td class="num">${{esc(s.kv_cache_gib)}}</td>
+            <td class="num">${{esc(freeCell)}}</td>
+            <td class="num">${{esc(headroomCell)}}</td>
             <td class="num">${{kv.pool_blocks.toLocaleString()}}</td>
             <td class="num"><strong>${{kv.full_contexts}}</strong> (${{kv.contexts.toFixed(2)}}×)</td>
             <td class="num">${{kv.vllm_capacity_tokens.toLocaleString()}} (${{kv.vllm_capacity_contexts.toFixed(2)}}×)</td>
