@@ -16,12 +16,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "candidate-33/vllm/series"
 BASE = "f1f43b1e5"  # vLLM candidate-33 head
-HEAD = "679ccdd19"  # vLLM candidate-34 head
+HEAD = "635eab8b2"  # vLLM candidate-34 head
 PATCHES = [
     ('7106b0f50', 664),  # perf(cudagraph): cover odd c2 and full-depth speculative batches in dense_varlen_decode_shapes (#740)
     ('774918a36', 665),  # perf(dsv41): use 16-row MoE decode tiles below 1 tile/expert and 3-tile 2D prefill swizzle (#764, #765)
-    ('f891d7a96', 666),  # perf(dsv41): run attention_front at prefill, share group metadata, trim TP3 rank-2 group, and use hybrid TP/SP fused_wqa_wkv (#744, #745, #776)
-    ('679ccdd19', 667),  # perf(dsv41): fuse mhc.post into engram_post_gate and chain Engram gates on PDL (#833)
+    ('d706d2638', 666),  # perf(dsv41): run attention_front at prefill, share group metadata, trim TP3 rank-2 group, and use hybrid TP/SP fused_wqa_wkv (#744, #745, #776)
+    ('635eab8b2', 667),  # perf(dsv41): fuse mhc.post into engram_post_gate and chain Engram gates on PDL (#833)
 ]
 
 

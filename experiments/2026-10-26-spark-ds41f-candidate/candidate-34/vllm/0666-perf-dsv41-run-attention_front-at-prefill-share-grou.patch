@@ -12,8 +12,8 @@ Subject: [PATCH 666/666] perf(dsv41): run attention_front at prefill, share
  vllm/models/deepseek_v4_1/l2_prefetch.py      |  11 +-
  vllm/models/deepseek_v4_1/tilelang/front.py   |   2 +-
  vllm/models/deepseek_v4_1/tilelang/gemm.py    |   1 +
- vllm/models/deepseek_v4_1/tilelang/linear.py  |  80 +++-
- 7 files changed, 488 insertions(+), 135 deletions(-)
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 100 ++++-
+ 7 files changed, 506 insertions(+), 137 deletions(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_front.py b/tests/kernels/test_deepseek_v41_tilelang_front.py
 index 2be8e0c0c..5fee245be 100644
@@ -813,7 +813,7 @@ index 741f6ff14..8dd8c9a49 100644
      (4096, 1280),
  }
 diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
-index 3f3210880..517b35261 100644
+index 3f3210880..64bd3413b 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/linear.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
 @@ -262,8 +262,8 @@ def _carve(scratch: torch.Tensor, specs):
@@ -847,12 +847,16 @@ index 3f3210880..517b35261 100644
      if rows > layer.tilelang_decode_rows:
          gemm = layer.tilelang_prefill
          # A producer pads rows that another projection's decode tiles read.
-@@ -523,8 +536,28 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+@@ -523,8 +536,32 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
      caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches.
      A layer marked ``tilelang_mxfp8_input`` reads its input's cast from the input's
      producer (``provide_mxfp8``) and casts nothing either."""
 -    n, k = layer.weight.shape
-+    n = getattr(layer, "logical_output_size", layer.weight.shape[0])
++    n = (
++        layer.logical_output_size
++        if getattr(layer, "part_output_size", 0) > 0
++        else layer.weight.shape[0]
++    )
 +    k = layer.weight.shape[1]
      kernels = _block32_kernels(n, k, groups)
 +    part_n = (
@@ -877,7 +881,7 @@ index 3f3210880..517b35261 100644
      layer.tilelang_groups = groups
      layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
      layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
-@@ -553,9 +586,14 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+@@ -553,9 +590,14 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
      def bind() -> None:
          for name, kernel in _launch(kernels).items():
              setattr(layer, f"tilelang_{name}", kernel)
@@ -893,13 +897,17 @@ index 3f3210880..517b35261 100644
          bind=bind,
          warm=(lambda: _warm_casts(k * groups)) if cast else None,
      )
-@@ -575,9 +613,21 @@ def _block32_scale_words(layer) -> None:
+@@ -575,9 +617,25 @@ def _block32_scale_words(layer) -> None:
              f"block scales have {scales.shape[0]} rows for {rows} outputs; "
              "the GEMM reads one scale row per 32 output rows"
          )
 -    layer.tilelang_weight_sf = pack_scale_words(scales)
 +    full_sf = pack_scale_words(scales)
-+    logical_n = getattr(layer, "logical_output_size", rows)
++    logical_n = (
++        layer.logical_output_size
++        if getattr(layer, "part_output_size", 0) > 0
++        else rows
++    )
 +    layer.tilelang_weight_sf = full_sf[: logical_n // 32]
 +    if (
 +        getattr(layer, "tp_size", 1) > 1
@@ -917,22 +925,28 @@ index 3f3210880..517b35261 100644
          and getattr(layer, "tilelang_groups", 1) == 1
          and not getattr(layer, "tilelang_weight_packed", False)
      ):
-@@ -586,12 +636,19 @@ def _block32_scale_words(layer) -> None:
+@@ -586,12 +644,23 @@ def _block32_scale_words(layer) -> None:
          layer.tilelang_weight = packed
          layer.tilelang_weight_packed = True
      elif not getattr(layer, "tilelang_weight_packed", False):
 -        layer.tilelang_weight = layer.weight
-+        layer.tilelang_weight = layer.weight[:logical_n]
- 
- 
+-
+-
 -def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
++        layer.tilelang_weight = layer.weight[:logical_n]
++
++
 +def _apply_block32(
 +    layer, x: torch.Tensor, *, out_cols: int | None = None
 +) -> torch.Tensor:
 +    cols = (
 +        out_cols
 +        if out_cols is not None
-+        else getattr(layer, "logical_output_size", layer.weight.shape[0])
++        else (
++            layer.logical_output_size
++            if getattr(layer, "part_output_size", 0) > 0
++            else layer.weight.shape[0]
++        )
 +    )
      out = torch.empty(
 -        (*x.shape[:-1], layer.weight.shape[0]),
@@ -940,13 +954,17 @@ index 3f3210880..517b35261 100644
          dtype=torch.bfloat16,
          device=x.device,
      )
-@@ -634,8 +691,9 @@ class TileLangBlock32Rows:
+@@ -634,8 +703,13 @@ class TileLangBlock32Rows:
      def __init__(self, layer: nn.Module, start: int):
          if start % 32:
              raise ValueError(f"rows from {start} do not start on a 32-row scale block")
 -        self.weight = layer.weight[start:]
 -        self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
-+        stop = getattr(layer, "logical_output_size", layer.weight.shape[0])
++        stop = (
++            layer.logical_output_size
++            if getattr(layer, "part_output_size", 0) > 0
++            else layer.weight.shape[0]
++        )
 +        self.weight = layer.weight[start:stop]
 +        self.weight_scale_inv = layer.weight_scale_inv[start // 32 : stop // 32]
          _block32_scale_words(self)

@@ -1,6 +1,6 @@
 # Candidate 34 (`spark-ds41f:candidate-34`)
 
-Built directly on `candidate-33` (`0001..0663`, 548 patches) with 4 hardware-audited vLLM patches (`0664..0667`, 552 patches total; `patch_head` `679ccdd190c9`, `expected_tree` `9744f37b7ea6`, `patchset_sha256` `07b681514a53`):
+Built directly on `candidate-33` (`0001..0663`, 548 patches) with 4 hardware-audited vLLM patches (`0664..0667`, 552 patches total; `patch_head` `635eab8b20c9`, `expected_tree` `9744f37b7ea6`, `patchset_sha256` `07b681514a53`):
 
 | Patch | PRs | Summary | GB10 Hardware Audit & Microbenchmark |
 | --- | --- | --- | --- |
