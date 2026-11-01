@@ -1,0 +1,16 @@
+{
+ "notes": "The candidate the harness boots. Direct exchange (spark-ds41f:1030-direct) with sparknet's switched NCCL profile in place of tp4-switched's inherited tp4-ring settings: at most 8 channels (was 4; switched shapes carry no NCCL_MIN_NCHANNELS), 1 MiB NCCL buffers (was 4 MiB), NCCL_CUMEM_ENABLE=0 (was 1), a 4 MiB one-shot all-gather cap (was 2 MiB). VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "environment": {
+   "VLLM_SERVER_DEV_MODE": "1",
+   "NCCL_MAX_NCHANNELS": "8",
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_CUMEM_ENABLE": "0",
+   "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
+  }
+ }
+}
