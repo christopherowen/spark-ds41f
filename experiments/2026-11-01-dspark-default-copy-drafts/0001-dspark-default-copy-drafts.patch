@@ -1,0 +1,232 @@
+diff --git a/tests/v1/core/test_copy_drafts_scheduler.py b/tests/v1/core/test_copy_drafts_scheduler.py
+index 39299cabb..986dbdf38 100644
+--- a/tests/v1/core/test_copy_drafts_scheduler.py
++++ b/tests/v1/core/test_copy_drafts_scheduler.py
+@@ -76,6 +76,88 @@ def test_copy_drafts_need_dspark_with_adaptive_verification(copy_drafts):
+         )
+ 
+ 
++def test_dspark_greedy_adaptive_verification_enables_copy_drafts_by_default(tmp_path):
++    from vllm.config import (
++        CompilationConfig,
++        ModelConfig,
++        ParallelConfig,
++        SchedulerConfig,
++        VllmConfig,
++    )
++
++    (tmp_path / "config.json").write_text(
++        json.dumps(
++            {**_OPT_CONFIG, "max_position_embeddings": 32768, "n_predict": BLOCK}
++        )
++    )
++    target = ModelConfig(
++        model=str(tmp_path), tokenizer_mode="skip", max_model_len=32768
++    )
++    spec = SpeculativeConfig(
++        model=str(tmp_path),
++        method="dspark",
++        num_speculative_tokens=BLOCK,
++        enable_adaptive_verification=True,
++        draft_sample_method="greedy",
++        target_model_config=target,
++        target_parallel_config=ParallelConfig(),
++    )
++    assert spec.copy_drafts == CopyDraftsConfig(
++        min_match=16, max_drafts=LOOKAHEAD, initial_drafts=8
++    )
++    assert spec.num_verification_tokens == LOOKAHEAD
++
++    non_adaptive = SpeculativeConfig(
++        model=str(tmp_path),
++        method="dspark",
++        num_speculative_tokens=BLOCK,
++        enable_adaptive_verification=False,
++        draft_sample_method="greedy",
++        target_model_config=target,
++        target_parallel_config=ParallelConfig(),
++    )
++    assert non_adaptive.copy_drafts is None
++
++    probabilistic = SpeculativeConfig(
++        model=str(tmp_path),
++        method="dspark",
++        num_speculative_tokens=BLOCK,
++        enable_adaptive_verification=True,
++        draft_sample_method="probabilistic",
++        target_model_config=target,
++        target_parallel_config=ParallelConfig(),
++    )
++    assert probabilistic.copy_drafts is None
++
++    tp3_ladder = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
++    vllm_config = VllmConfig(
++        model_config=target,
++        speculative_config=spec,
++        scheduler_config=SchedulerConfig(
++            max_model_len=32768,
++            is_encoder_decoder=False,
++            max_num_seqs=8,
++            max_num_batched_tokens=6144,
++            long_prefill_token_threshold=6096,
++            async_scheduling=True,
++        ),
++        compilation_config=CompilationConfig(
++            max_cudagraph_capture_size=48,
++            cudagraph_capture_sizes=list(tp3_ladder),
++        ),
++    )
++    assert vllm_config.max_decode_rows == 59
++    assert vllm_config.scheduler_config.long_prefill_token_threshold == 6096
++    assert vllm_config.scheduler_config.max_num_batched_tokens == 6155
++    assert vllm_config.scheduler_config.max_num_scheduled_tokens == 6155
++    assert vllm_config.compilation_config.max_cudagraph_capture_size == 59
++    assert vllm_config.compilation_config.cudagraph_capture_sizes == [
++        *tp3_ladder,
++        56,
++        59,
++    ]
++
++
+ def _scheduler(monkeypatch, tmp_path, *, copy_drafts: bool, max_num_seqs: int):
+     utils = pytest.importorskip("tests.v1.core.utils")
+     # The configuration validates the n-gram fixture for the V1 runner; the
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 4dd05cb82..1fac6f25d 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -669,10 +669,10 @@ class SpeculativeConfig:
+ 
+     copy_drafts: CopyDraftsConfig | None = None
+     """Copy drafts from the request's own history beside DSpark
+-    (``CopyDraftsConfig``). Its ``max_drafts`` is the verification lookahead
+-    (``num_verification_tokens``); ``num_speculative_tokens`` stays DSpark's
+-    block. Requires DSpark with adaptive verification, greedy drafts and async
+-    scheduling."""
++    (``CopyDraftsConfig``). Enabled by default on DSpark with adaptive
++    verification and greedy drafts. Its ``max_drafts`` is the verification
++    lookahead (``num_verification_tokens``); ``num_speculative_tokens`` stays
++    DSpark's block."""
+ 
+     @property
+     def num_verification_tokens(self) -> int:
+@@ -1793,6 +1793,20 @@ class SpeculativeConfig:
+                 "adaptive_verification_row_cost requires DSpark adaptive verification"
+             )
+ 
++        self._copy_drafts_defaulted = False
++        if (
++            self.copy_drafts is None
++            and self.method == "dspark"
++            and self.enable_adaptive_verification
++            and self.draft_sample_method == "greedy"
++        ):
++            self.copy_drafts = CopyDraftsConfig(
++                max_drafts=max(
++                    CopyDraftsConfig().max_drafts, self.num_speculative_tokens
++                )
++            )
++            self._copy_drafts_defaulted = True
++
+         if self.copy_drafts is not None:
+             # The draft budget decides how many of a copy's drafts a step
+             # verifies; copy drafts are one-hot proposals, as greedy DSpark
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 5945d3e23..81faf47f2 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1793,12 +1793,22 @@ class VllmConfig:
+         ):
+             # The scheduler lays out a copying request's rows from the copy
+             # state the V2 runner returns with each step's output.
+-            if not self.scheduler_config.async_scheduling:
+-                raise ValueError("copy_drafts requires async scheduling")
+-            if not self.use_v2_model_runner:
+-                raise ValueError("copy_drafts requires the V2 model runner")
+-            if self.parallel_config.pipeline_parallel_size > 1:
+-                raise ValueError("copy_drafts does not support pipeline parallelism")
++            if getattr(self.speculative_config, "_copy_drafts_defaulted", False) and (
++                not self.scheduler_config.async_scheduling
++                or not self.use_v2_model_runner
++                or self.parallel_config.pipeline_parallel_size > 1
++                or self.use_request_boundary_checkpoints
++            ):
++                self.speculative_config.copy_drafts = None
++            else:
++                if not self.scheduler_config.async_scheduling:
++                    raise ValueError("copy_drafts requires async scheduling")
++                if not self.use_v2_model_runner:
++                    raise ValueError("copy_drafts requires the V2 model runner")
++                if self.parallel_config.pipeline_parallel_size > 1:
++                    raise ValueError(
++                        "copy_drafts does not support pipeline parallelism"
++                    )
+ 
+         if (
+             self.observability_config.per_request_spec_decode_metrics != "none"
+@@ -2402,6 +2412,20 @@ class VllmConfig:
+         worker is configured to handle.
+         """
+         if self.speculative_config is not None:
++            base_decode_rows = (
++                self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++            )
++            threshold = self.scheduler_config.long_prefill_token_threshold
++            if (
++                self.max_decode_rows > base_decode_rows
++                and threshold > 0
++                and threshold + base_decode_rows
++                <= self.scheduler_config.max_num_batched_tokens
++                < threshold + self.max_decode_rows
++            ):
++                self.scheduler_config.max_num_batched_tokens = (
++                    threshold + self.max_decode_rows
++                )
+             scheduled_token_delta = (
+                 self.speculative_config.max_num_new_slots_for_drafting
+             )
+@@ -2490,6 +2514,34 @@ class VllmConfig:
+             and not self.model_config.enforce_eager
+             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+         ):
++            base_decode_rows = (
++                self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++            )
++            if (
++                self.max_decode_rows > base_decode_rows
++                and self.compilation_config.max_cudagraph_capture_size
++                == base_decode_rows
++            ):
++                self.compilation_config.max_cudagraph_capture_size = (
++                    self.max_decode_rows
++                )
++                if (
++                    self.compilation_config.cudagraph_capture_sizes
++                    and max(self.compilation_config.cudagraph_capture_sizes)
++                    == base_decode_rows
++                ):
++                    extra_sizes = [
++                        size
++                        for size in (
++                            *range(12, 33, 4),
++                            *range(40, self.max_decode_rows, 8),
++                        )
++                        if base_decode_rows < size < self.max_decode_rows
++                    ] + [self.max_decode_rows]
++                    self.compilation_config.cudagraph_capture_sizes = [
++                        *self.compilation_config.cudagraph_capture_sizes,
++                        *extra_sizes,
++                    ]
+             # determine the initial max_cudagraph_capture_size
+             max_cudagraph_capture_size = (
+                 self.compilation_config.max_cudagraph_capture_size
+@@ -2507,7 +2559,8 @@ class VllmConfig:
+                 decode_query_len = self.uniform_decode_query_len
+                 max_num_seqs = self.scheduler_config.max_num_seqs
+                 max_cudagraph_capture_size = min(
+-                    max_num_seqs * decode_query_len * 2, default_max_graph_size
++                    max(max_num_seqs * decode_query_len * 2, self.max_decode_rows),
++                    default_max_graph_size,
+                 )
+                 if decode_query_len > 1:
+                     # A uniform decode batch is decode_query_len tokens per
