@@ -1,0 +1,209 @@
+From eab2fe4ff4a500d5b1c1dd285b7a2af01818ebc3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:51:19 +0000
+Subject: [PATCH] perf(dsv41): launch aux-stream shared experts after decode
+ router gate GEMM
+
+---
+ .../models/test_deepseek_v4_1_l2_schedule.py  | 69 +++++++++++++++++++
+ .../layers/fused_moe/runner/moe_runner.py     | 51 +++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/router.py  |  9 +++
+ 3 files changed, 119 insertions(+), 10 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index 5284b965e..1fbc86154 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -178,3 +178,72 @@ def test_engram_layer_moves_next_after_its_projection(segments, issued):
+     other.ffn.experts._l2_prefetch_pre_reduce_hook(6)
+     (plan, _), *rest = issued
+     assert not rest and plan[-2:] == ("indexer.wq_b", "indexer.weights_proj")
++
++
++def test_decode_shared_experts_launch_after_router_gate():
++    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
++    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
++        SharedExpertsOrder,
++    )
++
++    events = []
++    experts = SimpleNamespace(fold_shared=True, combine_addend=None)
++
++    class _Router:
++        routes_hidden_states = True
++        _post_gate_hook = None
++
++        def select_experts(self, **kwargs):
++            events.append("gate")
++            if self._post_gate_hook is not None:
++                hook = self._post_gate_hook
++                self._post_gate_hook = None
++                hook()
++            events.append("topk")
++            return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int64)
++
++    class _Shared:
++        output = "shared_out"
++
++        def workspace_size(self, x):
++            return 0
++
++        def __call__(self, x, order, workspace=None):
++            return None
++
++        def _determine_shared_experts_order(self, x):
++            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
++
++        def maybe_forward_async(self, x, workspace=None):
++            events.append("shared_async")
++            return True
++
++        def wait_output(self):
++            return "shared_out"
++
++        def wait(self):
++            events.append("shared_wait")
++
++    runner = SimpleNamespace(
++        _shared_experts=_Shared(),
++        _maybe_apply_shared_experts=lambda *a, **k: None,
++        _quant_method=SimpleNamespace(
++            modular_experts=experts,
++            topk_indices_dtype=torch.int64,
++        ),
++        routed_experts=SimpleNamespace(
++            quant_method=SimpleNamespace(is_monolithic=False),
++            forward_modular=lambda **kwargs: (events.append("routed"), "routed_out")[1],
++        ),
++        router=_Router(),
++    )
++
++    x6 = torch.zeros(6, 16)
++    MoERunner._apply_quant_method(runner, x6, x6, x6)
++    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
++
++    events.clear()
++    x48 = torch.zeros(48, 16)
++    MoERunner._apply_quant_method(runner, x48, x48, x48)
++    assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
++
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index de0b66bce..465e02b80 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -756,6 +756,7 @@ class MoERunner(MoERunnerInterface):
+         )
+         experts = self._quant_method.modular_experts
+         overlap_fold = False
++        launch_shared = None
+         if getattr(experts, "fold_shared", False):
+             assert self._shared_experts is not None
+             assert shared_experts_input is not None
+@@ -771,14 +772,36 @@ class MoERunner(MoERunnerInterface):
+             else:
+                 # The shared expert runs on the aux stream beside the routed
+                 # experts; their combine waits for it, then adds its output.
++                # When the router runs a single-tile decode gate projection
++                # itself (<= 32 rows, 24 CTAs), defer the aux-stream launch
++                # until immediately after the gate GEMM so shared gate_up_proj
++                # overlaps top-k routing and routed experts instead of
++                # contending with the critical-path gate GEMM and FFN L2
++                # prefetch.
+                 if not shared_experts_overlapping:
+-                    launched = self._shared_experts.maybe_forward_async(
+-                        shared_experts_input, shared_workspace
+-                    )
+-                    assert launched
++                    shared_experts = self._shared_experts
++
++                    def _launch_shared() -> None:
++                        nonlocal launch_shared
++                        if launch_shared is None:
++                            return
++                        launch_shared = None
++                        launched = shared_experts.maybe_forward_async(
++                            shared_experts_input, shared_workspace
++                        )
++                        assert launched
++
++                    launch_shared = _launch_shared
++                    if (
++                        not getattr(self.router, "routes_hidden_states", False)
++                        or hidden_states.shape[0] > 32
++                    ):
++                        launch_shared()
+                 experts.combine_addend = self._shared_experts.wait_output
+ 
+         if self.routed_experts.quant_method.is_monolithic:
++            if launch_shared is not None:
++                launch_shared()
+             # Monolithic kernels: pass router_logits to routed_experts
+             fused_out = self.routed_experts.forward_monolithic(
+                 x=hidden_states,
+@@ -787,12 +810,20 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             # Modular kernels: select experts first, then call routed_experts
+-            topk_weights, topk_ids = self.router.select_experts(
+-                hidden_states=hidden_states,
+-                router_logits=router_logits,
+-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+-                input_ids=input_ids,
+-            )
++            if launch_shared is not None:
++                self.router._post_gate_hook = launch_shared
++            try:
++                topk_weights, topk_ids = self.router.select_experts(
++                    hidden_states=hidden_states,
++                    router_logits=router_logits,
++                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
++                    input_ids=input_ids,
++                )
++            finally:
++                if launch_shared is not None:
++                    self.router._post_gate_hook = None
++            if launch_shared is not None:
++                launch_shared()
+ 
+             if workspace is None:
+                 fused_out = self.routed_experts.forward_modular(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 6c7755dba..61ece0f4d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -1211,16 +1211,23 @@ class TileLangGateRouter(TileKernelsRouter):
+ 
+         gate = self.gate
+         x = router_logits.reshape(-1, gate.weight.shape[1])
++        post_gate = getattr(self, "_post_gate_hook", None)
++        if post_gate is not None:
++            self._post_gate_hook = None
+         provided = provided_routes(x)
+         if provided is not None:
+             if indices_type not in (None, torch.int64):
+                 raise ValueError(
+                     f"TileLang routing writes int64 expert ids, not {indices_type}"
+                 )
++            if post_gate is not None:
++                post_gate()
+             return provided
+         specs = _partial_specs(gate, x.shape[0])
+         if not specs:
+             logits, _ = gate(x)
++            if post_gate is not None:
++                post_gate()
+             return super()._compute_routing(
+                 hidden_states,
+                 logits,
+@@ -1234,6 +1241,8 @@ class TileLangGateRouter(TileKernelsRouter):
+             )
+         (partials,) = _scratch(specs, None)
+         partials_kernel(gate, x.shape[0])(x, gate.weight, partials)
++        if post_gate is not None:
++            post_gate()
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+-- 
+2.43.0
+

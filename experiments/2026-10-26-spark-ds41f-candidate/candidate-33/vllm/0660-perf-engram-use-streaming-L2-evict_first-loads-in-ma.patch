@@ -1,0 +1,140 @@
+From 958467cdbff8fea28675645b3e168881cc8a2b09 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:51:33 +0000
+Subject: [PATCH] perf(engram): use streaming L2::evict_first loads in
+ mapped-host Engram gather kernel (#768)
+
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 20 ++++++
+ .../deepseek_v4_1/tilelang/engram_rows.py     | 64 +++++++++++++++++--
+ 2 files changed, 77 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 9806e687b..626e8ce07 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -605,3 +605,23 @@ def test_tilelang_engram_geometry_matches_prime_and_pcg64_contract():
+         tp_rank=1,
+     )
+     assert caps.device.type == "cuda" and caps.tp_rank == 1
++def test_gather_kernel_uses_streaming_cache_hints_and_matches_reference():
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather_kernel
++
++    kernel = engram_rows_gather_kernel(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1)
++    src = kernel.get_kernel_source()
++    assert "ld.global.cs.s64" in src
++    assert "ld.global.cs.u8" in src
++    assert "ld.global.cs.u32" in src
++
++    codes, scales, paths = _write_table(_table_dir(), seed=41)
++    rows = _rows(paths, tokens=8, columns=TP3_RANK1)
++    try:
++        gen = torch.Generator().manual_seed(42)
++        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), generator=gen).cuda()
++        out, _ = _step(rows, ids, 7)
++        torch.cuda.synchronize()
++        expected = _reference(codes, scales, ids.cpu(), 7, 0, TABLE_ROWS, TP3_RANK1)
++        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++    finally:
++        rows.close()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 757fc0e55..4f22f0b66 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -126,6 +126,27 @@ __device__ __forceinline__ void engram_release_rows(void *control) {
+     asm volatile("st.release.sys.global.u32 [%0], %1;"
+                  :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
+ }
++
++// One-shot streaming loads (L2::evict_first) for step row IDs and mapped-host
++// E4M3 rows / E8M0 scales: each slot is consumed once by a single thread, so
++// streaming keeps mapped-host reads from evicting resident weights in the 24 MB L2.
++__device__ __forceinline__ long long engram_ld_cs_s64(const void *ptr) {
++    long long val;
++    asm("ld.global.cs.s64 %0, [%1];" : "=l"(val) : "l"(ptr));
++    return val;
++}
++
++__device__ __forceinline__ unsigned int engram_ld_cs_u8(const void *ptr) {
++    unsigned int val;
++    asm("ld.global.cs.u8 %0, [%1];" : "=r"(val) : "l"(ptr));
++    return val;
++}
++
++__device__ __forceinline__ unsigned int engram_ld_cs_u32(const void *ptr) {
++    unsigned int val;
++    asm("ld.global.cs.u32 %0, [%1];" : "=r"(val) : "l"(ptr));
++    return val;
++}
+ """  # noqa: E501 (CUDA source)
+ )
+ 
+@@ -170,7 +191,12 @@ def column_span(columns: int) -> tuple[int, int, int]:
+     return heads[0], step, len(heads)
+ 
+ 
+-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
+ def engram_rows_gather_kernel(
+     max_lookups: int,
+     shard_start: int,
+@@ -195,21 +221,45 @@ def engram_rows_gather_kernel(
+         out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
+     ):
+         with T.Kernel(count, tokens, threads=threads) as (column, t):
++            T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+             head = first + column * step
+-            row = ids[t, head]
++            row = T.call_extern(
++                "int64", "engram_ld_cs_s64", T.address_of(ids[t, head])
++            )
+             lookup = t * HEADS + head
+             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
+             if owned:
+-                exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
++                exponent = T.call_extern(
++                    "uint32",
++                    "engram_ld_cs_u8",
++                    T.address_of(scales[lookup, tx * vec // 32]),
++                )
+                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
+                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
+-                for i in T.vectorized(vec):
+-                    out[t, column * ROW + tx * vec + i] = T.cast(
+-                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
+-                        T.bfloat16,
++                if vec == 4:
++                    packed = T.call_extern(
++                        "uint32",
++                        "engram_ld_cs_u32",
++                        T.address_of(rows[lookup, tx * vec]),
+                     )
++                    for i in T.vectorized(vec):
++                        byte = T.cast(
++                            T.shift_right(packed, T.uint32(8 * i)) & T.uint32(0xFF),
++                            T.uint8,
++                        )
++                        out[t, column * ROW + tx * vec + i] = T.cast(
++                            T.cast(T.reinterpret(byte, T.float8_e4m3fn), T.float32)
++                            * scale,
++                            T.bfloat16,
++                        )
++                else:
++                    for i in T.vectorized(vec):
++                        out[t, column * ROW + tx * vec + i] = T.cast(
++                            T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
++                            T.bfloat16,
++                        )
+             else:
+                 for i in T.vectorized(vec):
+                     out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
+-- 
+2.43.0
+

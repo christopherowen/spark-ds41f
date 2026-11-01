@@ -1,0 +1,455 @@
+From 888c4793a5f59d91802964df7c80c715d735caff Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:52:51 +0000
+Subject: [PATCH] perf(engram): add column-masked layer-major host Engram hash
+ and skip known-only D2H IDs copy (#762)
+
+---
+ ...test_deepseek_v41_engram_host_placement.py |  28 ++++
+ .../kernels/test_deepseek_v41_engram_rows.py  |  41 ++++++
+ .../deepseek_v4_1/engram_rows/_reader.c       |  40 +++++-
+ .../deepseek_v4_1/engram_rows/host_hash.py    | 132 +++++++++++++++---
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  19 ++-
+ .../deepseek_v4_1/nvidia/model_state.py       |  21 ++-
+ 6 files changed, 248 insertions(+), 33 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_host_placement.py b/tests/kernels/test_deepseek_v41_engram_host_placement.py
+index fc58c53a9..1fc01f566 100644
+--- a/tests/kernels/test_deepseek_v41_engram_host_placement.py
++++ b/tests/kernels/test_deepseek_v41_engram_host_placement.py
+@@ -121,3 +121,31 @@ def test_max_l2_cpus_selects_big_l2_cores(tmp_path, monkeypatch):
+ 
+     monkeypatch.setenv("SPARK_DS41F_ENGRAM_CPU_AFFINITY", "0")
+     assert host_hash.pin_to_max_l2_cpus(sysfs_root=tmp_path) == []
++def test_step_ids_layer_slices_are_contiguous_and_column_mask_matches_full_hash():
++    from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
++
++    rng = np.random.default_rng(7)
++    token_map = rng.integers(0, 1000, size=256, dtype=np.int64)
++    multipliers = rng.integers(1, 1 << 30, size=(2, 4), dtype=np.int64)
++    primes = rng.integers(1000, 10000, size=(2, 24), dtype=np.int64)
++    offsets = rng.integers(0, 100000, size=(2, 24), dtype=np.int64)
++    host = HostEngramHash(token_map, multipliers, primes, offsets)
++
++    tokens = rng.integers(0, 256, size=32, dtype=np.int64)
++    reqs = [(0, 16, tokens, np.arange(16, dtype=np.int64))]
++    full = host.step_ids(20, reqs)
++    assert full.shape == (20, 2, 24)
++    for layer in range(2):
++        assert full[:, layer].flags.c_contiguous
++
++    for tp_size in (3, 4):
++        for tp_rank in range(tp_size):
++            owned = [c for c in range(24) if c % tp_size == tp_rank]
++            unowned = [c for c in range(24) if c % tp_size != tp_rank]
++            mask = sum(1 << c for c in owned)
++            masked = host.step_ids(20, reqs, columns=mask)
++            for layer in range(2):
++                assert masked[:, layer].flags.c_contiguous
++            assert np.array_equal(masked[:, :, owned], full[:, :, owned])
++            assert (masked[:16, :, unowned] == -1).all()
++            assert (masked[16:] == -1).all()
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 01b94cc25..fdf4091f1 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -700,3 +700,44 @@ def test_mlock_pinned_and_mapped_host_buffers():
+     assert rows._ids_mlocked is False
+     assert rows.weights._mlocked is False
+ 
++def test_column_masked_early_ids_skip_d2h_ids_copy_and_match_reference():
++    """When all early lookups are known (including column-masked host hashes where
++    unowned columns are -1) and check_early is False, stage() skips the D2H copy into
++    rows.ids while still gathering bit-identical BF16 rows."""
++    from vllm.models.deepseek_v4_1.engram_rows.host_hash import UNKNOWN
++
++    codes, scales, paths = _write_table(_table_dir(), seed=35)
++    rows = _rows(paths, tokens=8, columns=TP3_RANK1, check_early=False)
++    try:
++        rows.ids.fill_(-42)
++        gen = torch.Generator().manual_seed(36)
++        ids = torch.randint(0, TABLE_ROWS, (8, HEADS), generator=gen)
++        early = ids.clone().numpy()
++        unowned = [c for c in range(HEADS) if not ((TP3_RANK1 >> c) & 1)]
++        early[:, unowned] = -1
++
++        out = torch.full(
++            (8, 8 * 256), 7, dtype=torch.bfloat16, device="cuda"
++        )
++        num_tokens = torch.tensor([7], dtype=torch.int32, device="cuda")
++        stream = torch.cuda.current_stream()
++        rows.stage(stream, ids.cuda(), ids.numel(), early)
++        rows.gather(out, ids.cuda(), num_tokens)
++        torch.cuda.synchronize()
++
++        expected = _reference(codes, scales, ids, 7, 0, TABLE_ROWS, TP3_RANK1)
++        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        # Because early had no UNKNOWN entries and check_early=False, rows.ids was not
++        # overwritten by a D2H copy.
++        assert (rows.ids == -42).all()
++
++        # When early contains an UNKNOWN entry, stage() copies the GPU IDs into rows.ids.
++        early_partial = early.copy()
++        early_partial[3, 1] = UNKNOWN
++        rows.stage(stream, ids.cuda(), ids.numel(), early_partial)
++        rows.gather(out, ids.cuda(), num_tokens)
++        torch.cuda.synchronize()
++        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        assert torch.equal(rows.ids[: ids.numel()], ids.view(-1))
++    finally:
++        rows.close()
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index cec4ed373..a866f07e6 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -742,8 +742,30 @@ static PyObject *py_add(PyObject *self, PyObject *args) {
+     Py_RETURN_NONE;
+ }
+ 
+-/* submit(reader, sequence, count, wait_s, early): queue one step behind every step
+- * already queued. ``early`` is None or ``count`` int64 IDs the host hashed
++/* has_unknown(early): whether any int64 element of ``early`` equals UNKNOWN_ID. */
++static PyObject *py_has_unknown(PyObject *self, PyObject *early_object) {
++    (void)self;
++    Py_buffer view;
++    if (PyObject_GetBuffer(early_object, &view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
++    if (view.len < 0 || view.len % (Py_ssize_t)sizeof(int64_t) != 0) {
++        PyBuffer_Release(&view);
++        return PyErr_Format(PyExc_ValueError, "Engram early IDs must be int64 values");
++    }
++    const int64_t *early = (const int64_t *)view.buf;
++    size_t count = (size_t)view.len / sizeof(int64_t);
++    bool found = false;
++    for (size_t i = 0; i < count; i++) {
++        if (early[i] == UNKNOWN_ID) {
++            found = true;
++            break;
++        }
++    }
++    PyBuffer_Release(&view);
++    return PyBool_FromLong(found);
++}
++
++/* submit(reader, sequence, count, wait_s, early, has_unknown): queue one step behind every
++ * step already queued. ``early`` is None or ``count`` int64 IDs the host hashed
+  * (UNKNOWN_ID where only the GPU knows the ID), copied here. Returns at once unless
+  * the queue is full; then it waits for space, without the GIL. */
+ static PyObject *py_submit(PyObject *self, PyObject *args) {
+@@ -751,8 +773,11 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+     PyObject *capsule, *early_object = Py_None;
+     unsigned int sequence, count;
+     double wait;
++    int has_unknown_arg = -1;
+     uint64_t submitted = now_ns();
+-    if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
++    if (!PyArg_ParseTuple(args, "OIId|Oi", &capsule, &sequence, &count, &wait, &early_object,
++                          &has_unknown_arg))
++        return NULL;
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+     if (count > reader->plan.max_lookups)
+@@ -773,8 +798,12 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+         }
+         memcpy(early, view.buf, (size_t)count * sizeof(*early));
+         PyBuffer_Release(&view);
+-        has_unknown = false;
+-        for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
++        if (has_unknown_arg >= 0) {
++            has_unknown = has_unknown_arg != 0;
++        } else {
++            has_unknown = false;
++            for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
++        }
+     }
+     const char *problem = NULL;
+     failure_t failure = {{0}};
+@@ -903,6 +932,7 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
+ static PyMethodDef methods[] = {
+     {"reader", py_reader, METH_VARARGS, NULL},
+     {"add", py_add, METH_VARARGS, NULL},
++    {"has_unknown", py_has_unknown, METH_O, NULL},
+     {"submit", py_submit, METH_VARARGS, NULL},
+     {"status", py_status, METH_O, NULL},
+     {"timeline", py_timeline, METH_O, NULL},
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+index 234868358..27b9a41a9 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+@@ -20,6 +20,7 @@ from pathlib import Path
+ import numpy as np
+ 
+ HEADS = 24
++ALL_COLUMNS = (1 << HEADS) - 1
+ LAGS = 4
+ PAD_TOKEN = 2
+ IMAGE_SENTINEL = 129264
+@@ -114,7 +115,6 @@ class HostEngramHash:
+             self.token_map = np.asarray(token_map_arr, dtype=np.int64)
+         self.multipliers = np.asarray(multipliers, dtype=np.int64)  # [layers, 4]
+         self.primes = np.asarray(primes, dtype=np.int64)  # [layers, 24]
+-        self.offsets = np.asarray(offsets, dtype=np.int64)  # [layers, 24]
+         self.layers = self.multipliers.shape[0]
+         if self.multipliers.shape != (self.layers, LAGS) or self.primes.shape != (
+             self.layers,
+@@ -124,8 +124,25 @@ class HostEngramHash:
+                 "Engram hash geometry must be [layers, 4] multipliers and "
+                 "[layers, 24] primes"
+             )
++        self.offsets = np.broadcast_to(
++            np.asarray(offsets, dtype=np.int64), (self.layers, HEADS)
++        )
+         self.pad = self.token_map[PAD_TOKEN]
+         self.vocab = self.token_map.shape[0]
++        self._lags = np.arange(LAGS, dtype=np.int64)[None, :]
++        self._multipliers_u64 = np.ascontiguousarray(
++            self.multipliers[:, None, :], dtype=np.uint64
++        )
++        self._primes_3x8 = np.ascontiguousarray(
++            self.primes.reshape(self.layers, 1, 3, 8)
++        )
++        self._offsets_3x8 = np.ascontiguousarray(
++            self.offsets.reshape(self.layers, 1, 3, 8)
++        )
++        self._column_plans: dict[
++            int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
++        ] = {}
++
+         if os.environ.get("SPARK_DS41F_ENGRAM_HOST_HASH_AFFINITY", "1") != "0":
+             pin_to_max_l2_cpus(0)
+ 
+@@ -135,56 +152,124 @@ class HostEngramHash:
+         missing = self.token_map.dtype.type(-1)
+         return np.where(valid, self.token_map[np.where(valid, raw, 0)], missing)
+ 
++    def _column_plan(
++        self, columns: int
++    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++        plan = self._column_plans.get(columns)
++        if plan is None:
++            if not 0 < columns <= ALL_COLUMNS:
++                raise ValueError(
++                    f"Engram host hash columns must be a nonzero 24-bit mask: {columns:#x}"
++                )
++            cols = np.array(
++                [c for c in range(HEADS) if (columns >> c) & 1], dtype=np.intp
++            )
++            orders = cols // 8
++            primes_sub = np.ascontiguousarray(self.primes[:, cols][:, None, :])
++            offsets_sub = np.ascontiguousarray(self.offsets[:, cols][:, None, :])
++            plan = (cols, orders, primes_sub, offsets_sub)
++            self._column_plans[columns] = plan
++        return plan
++
+     def compress(self, raw: np.ndarray) -> np.ndarray:
+         """Compressed ids of raw token ids; -1 for a missing token (negative), an
+         image token or one outside the tokenizer map."""
+         return self._compress_compact(raw).astype(np.int64, copy=False)
+ 
+-    def hash_positions(self, tokens: np.ndarray, positions: np.ndarray) -> np.ndarray:
+-        """Row ids ``[len(positions), layers, 24]`` of the tokens at ``positions``
+-        of one request whose token ids up to the last position are ``tokens`` (prompt
+-        order; the GPU's query tokens and committed history are the same ids)."""
++    def _hash_positions_into(
++        self,
++        planes: np.ndarray,
++        first_row: int,
++        tokens: np.ndarray,
++        positions: np.ndarray,
++        columns: int = ALL_COLUMNS,
++    ) -> None:
+         positions = np.asarray(positions, dtype=np.int64)
+-        lags = positions[:, None] - np.arange(LAGS, dtype=np.int64)[None, :]  # [T, 4]
++        n = positions.shape[0]
++        lags = positions[:, None] - self._lags  # [T, 4]
+         raw = np.where(lags >= 0, tokens[np.maximum(lags, 0)], -1)
+         sources = self._compress_compact(raw)
+         # From the first missing source on, every lag takes the pad id.
+         blocked = np.logical_or.accumulate(sources == -1, axis=1)
+-        values = np.where(blocked, self.pad, sources)
++        values_u64 = np.where(blocked, self.pad, sources).astype(np.uint64)
+         # value * multiplier in wrapping int64, as the GPU computes it.
+-        products = (
+-            values[:, None, :].astype(np.uint64)
+-            * self.multipliers[None, :, :].astype(np.uint64)
+-        ).view(np.int64)  # [T, layers, 4]
++        products = (values_u64[None, :, :] * self._multipliers_u64).view(
++            np.int64
++        )  # [layers, T, 4]
+         mixed2 = products[..., 0] ^ products[..., 1]
+         mixed3 = mixed2 ^ products[..., 2]
+         mixed4 = mixed3 ^ products[..., 3]
+         # Heads 0-7 hash 2-grams, 8-15 3-grams, 16-23 4-grams.
+-        mixed = np.concatenate(
+-            [np.repeat(m[..., None], 8, axis=-1) for m in (mixed2, mixed3, mixed4)],
+-            axis=-1,
+-        )  # [T, layers, 24]
+         # The floor remainder (the sign of the divisor), as TileLang's int64 %. The
+         # model's bounded multipliers keep ``mixed`` non-negative, where it equals
+         # C's truncating one.
+-        return np.remainder(mixed, self.primes[None]) + self.offsets[None]
++        if columns == ALL_COLUMNS:
++            mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)[
++                ..., None
++            ]  # [layers, T, 3, 1]
++            planes[:, first_row : first_row + n, :] = (
++                np.remainder(mixed_orders, self._primes_3x8) + self._offsets_3x8
++            ).reshape(self.layers, n, HEADS)
++        else:
++            cols, orders, primes_sub, offsets_sub = self._column_plan(columns)
++            mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)
++            mixed_sub = mixed_orders[:, :, orders]
++            planes[:, first_row : first_row + n, :] = -1
++            planes[:, first_row : first_row + n, cols] = (
++                np.remainder(mixed_sub, primes_sub) + offsets_sub
++            )
++
++    def hash_positions(
++        self,
++        tokens: np.ndarray,
++        positions: np.ndarray,
++        *,
++        columns: int = ALL_COLUMNS,
++    ) -> np.ndarray:
++        """Row ids ``[len(positions), layers, 24]`` of the tokens at ``positions``
++        of one request whose token ids up to the last position are ``tokens`` (prompt
++        order; the GPU's query tokens and committed history are the same ids).
++        Returned as a view over a layer-major ``[layers, len(positions), 24]`` buffer
++        so each layer's slice ``[:, layer]`` is C-contiguous."""
++        n = len(positions)
++        planes = np.empty((self.layers, n, HEADS), dtype=np.int64)
++        if n:
++            self._hash_positions_into(planes, 0, tokens, positions, int(columns))
++        return planes.transpose(1, 0, 2)
+ 
+-    def step_ids(self, num_tokens: int, requests) -> np.ndarray:
++    def step_ids(
++        self,
++        num_tokens: int,
++        requests,
++        *,
++        columns: int = ALL_COLUMNS,
++    ) -> np.ndarray:
+         """A step's row ids ``[num_tokens, layers, 24]``: ``requests`` yields, per
+         request in the step's token order, ``(first_row, rows, tokens, positions)``:
+         the request's first row and row count in the step, its token ids, and the
+         positions of its leading rows whose ids the host has (the rest of its rows are
+         ``UNKNOWN``). Rows past the last request's rows are padding, -1 as the GPU
+-        writes them."""
+-        out = np.full((num_tokens, self.layers, HEADS), UNKNOWN, dtype=np.int64)
++        writes them. Returned as a view over a layer-major ``[layers, num_tokens, 24]``
++        buffer so each layer's slice ``[:, layer]`` is C-contiguous."""
++        columns = int(columns)
++        if columns != ALL_COLUMNS:
++            self._column_plan(columns)
++        planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
++        out = planes.transpose(1, 0, 2)
++        custom_hash = "hash_positions" in self.__dict__
+         live = 0
+         for first_row, rows, tokens, positions in requests:
+             live = max(live, first_row + rows)
+             if len(positions):
+-                out[first_row : first_row + len(positions)] = self.hash_positions(
+-                    tokens, positions
+-                )
+-        out[live:] = -1
++                if custom_hash and columns == ALL_COLUMNS:
++                    out[first_row : first_row + len(positions)] = self.hash_positions(
++                        tokens, positions
++                    )
++                else:
++                    self._hash_positions_into(
++                        planes, first_row, tokens, positions, columns
++                    )
++        planes[:, live:, :] = -1
+         return out
+ 
+ 
+@@ -213,6 +298,7 @@ def placed_by_host(requests: list, drafts: np.ndarray | None) -> list:
+ 
+ 
+ __all__ = [
++    "ALL_COLUMNS",
+     "HEADS",
+     "UNKNOWN",
+     "HostEngramHash",
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index f5acc279b..a846d58f9 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -174,18 +174,29 @@ class EngramDiskRows:
+         self.raise_if_failed()
+         from cuda.bindings import driver
+ 
++        has_unknown = True
+         if early is not None:
+-            early = np.ascontiguousarray(early, dtype=np.int64).reshape(-1)
++            if not (
++                isinstance(early, np.ndarray)
++                and early.dtype == np.int64
++                and early.flags.c_contiguous
++            ):
++                early = np.ascontiguousarray(early, dtype=np.int64)
++            early = early.reshape(-1)
+             if early.shape[0] != count:
+                 raise ValueError(
+                     f"Engram early IDs: {early.shape[0]} for a step of {count} lookups"
+                 )
++            has_unknown = bool(self.native.has_unknown(early))
+         self._sequence = (self._sequence + 1) & 0xFFFFFFFF or 1
+-        with torch.cuda.stream(stream):
+-            self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
++        if has_unknown or self.check_early:
++            with torch.cuda.stream(stream):
++                self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
+         _check(driver.cuStreamWriteValue32(stream.cuda_stream, self._ids_seq_device, self._sequence, 0),
+                "cuStreamWriteValue32")
+-        self.native.submit(self._reader, self._sequence, count, 60.0, early)
++        self.native.submit(
++            self._reader, self._sequence, count, 60.0, early, int(has_unknown)
++        )
+ 
+     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
+         """Wait for the staged step's rows and dequantize the first ``num_tokens``
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 771b85b5f..c697d2f48 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -388,7 +388,9 @@ class DeepseekV41ModelState(DefaultModelState):
+         or None when the step has no prefill chunk to hash."""
+         if not input_batch.has_prefill:
+             return None
++        from vllm.models.deepseek_v4_1.common import engram as engram_module
+         from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
++            ALL_COLUMNS,
+             HostEngramHash,
+             placed_by_host,
+         )
+@@ -417,7 +419,24 @@ class DeepseekV41ModelState(DefaultModelState):
+         requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
+         if not any(len(positions) for *_, positions in requests):
+             return None
+-        return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
++        columns = ALL_COLUMNS
++        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
++            masks = {
++                layer.engram.embed_tokens.column_mask
++                for layer in model.layers[model.start_layer : model.end_layer]
++                if getattr(layer, "engram", None) is not None
++            }
++            check_early = any(
++                layer.engram.embed_tokens.disk_rows is not None
++                and layer.engram.embed_tokens.disk_rows.check_early
++                for layer in model.layers[model.start_layer : model.end_layer]
++                if getattr(layer, "engram", None) is not None
++            )
++            if len(masks) == 1 and not check_early:
++                columns = next(iter(masks))
++        return self._host_engram_hash.step_ids(
++            input_batch.input_ids.shape[0], requests, columns=columns
++        )
+ 
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+-- 
+2.43.0
+
