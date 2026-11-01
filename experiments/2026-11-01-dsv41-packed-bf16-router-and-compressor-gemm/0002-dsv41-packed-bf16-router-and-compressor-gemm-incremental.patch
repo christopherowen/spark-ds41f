@@ -1,0 +1,1453 @@
+From 9f472dbbdf6145cc7df44a99f3fc1459408cc67d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:38:42 +0100
+Subject: [PATCH] [DeepSeek-V4.1][TileLang] Pack BF16 router, indexer, and
+ compressor weights into 12-bit with SWAR __byte_perm unpacking
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 151 ++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 881 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 227 ++++-
+ vllm/models/deepseek_v4_1/tilelang/router.py  |   7 +-
+ 4 files changed, 1224 insertions(+), 42 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index eebb0758a..325198a6b 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -211,11 +211,12 @@ def test_split_linear(parts, out_dtype, k=5120):
+ 
+     gen = _gen(5)
+     layer = nn.Module()
+-    weight = torch.randn((512 * parts, k), generator=gen, device=DEVICE) * 0.02
+-    layer.weight = nn.Parameter(weight.bfloat16(), requires_grad=False)
++    weight = (torch.randn((512 * parts, k), generator=gen, device=DEVICE) * 0.02).bfloat16()
++    layer.weight = nn.Parameter(weight.clone(), requires_grad=False)
+     layer.out_dtype = out_dtype
+     method = TileLangSplitLinearMethod(parts)
+     method.process_weights_after_loading(layer)
++    assert hasattr(layer, "packed_bf16_exponent_base")
+     method.declare_layer_kernels(layer)  # standalone: prepares and binds now
+     x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+     scratch = torch.empty(
+@@ -233,7 +234,7 @@ def test_split_linear(parts, out_dtype, k=5120):
+ 
+     full = project(max(ROWS))
+     for index, out in enumerate(full):
+-        ref = x.float() @ layer.weight[index * 512 : (index + 1) * 512].float().T
++        ref = x.float() @ weight[index * 512 : (index + 1) * 512].float().T
+         torch.testing.assert_close(
+             out.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+         )
+@@ -551,3 +552,147 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+         for rows in ROWS:
+             out = method.apply(layer, x[:rows])
+             assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
++
++
++@pytest.mark.parametrize("n, k", [(32, 5120), (128, 5120), (384, 5120), (512, 5120)])
++def test_packed_bf16_gemm_and_partials_match_bf16(n, k):
++    """Packed 12-bit BF16 GEMMs and split-K partials with zero exceptions match
++    unpacked ``bf16_gemm`` and ``bf16_gemm_partials`` bit for bit."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import (
++        packed_bf16_gemm,
++        packed_bf16_gemm_partials,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.linear import PARTIAL_ROW_TILES
++    from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++    gen = _gen(31)
++    # Narrow exponent spread so exceptions == 0 (all values representable in 12-bit).
++    weight = (torch.rand((n, k), generator=gen, device=DEVICE, dtype=torch.float32) + 1.0).bfloat16()
++    packed = pack_bf16_weight(weight)
++    assert packed.exceptions == 0
++    x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
++    shards = bf16_shards(n, k)
++
++    ref_prefill = bf16_gemm(n, k, out_dtype="bfloat16", shards=shards)
++    pack_prefill = packed_bf16_gemm(
++        n,
++        k,
++        out_dtype="bfloat16",
++        shards=shards,
++        exponent_base=packed.exponent_base,
++    )
++    out_ref = torch.empty((max(ROWS), n), dtype=torch.bfloat16, device=DEVICE)
++    out_pack = torch.empty_like(out_ref)
++    ref_prefill(x, weight, out_ref)
++    pack_prefill(
++        x,
++        packed.values,
++        packed.exception_rows,
++        packed.exception_entries,
++        packed.row_offsets,
++        out_pack,
++    )
++    assert torch.equal(out_pack, out_ref)
++
++    for blocked in (False, True):
++        for block_M in PARTIAL_ROW_TILES:
++            ref_part = bf16_gemm_partials(
++                n, k, shards, block_M=block_M, blocked=blocked
++            )
++            pack_part = packed_bf16_gemm_partials(
++                n,
++                k,
++                shards,
++                block_M=block_M,
++                blocked=blocked,
++                exponent_base=packed.exponent_base,
++            )
++            for rows in (1, 7, block_M):
++                p_ref = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
++                p_pack = torch.empty_like(p_ref)
++                ref_part(x[:rows], weight, p_ref)
++                pack_part(
++                    x[:rows],
++                    packed.values,
++                    packed.exception_rows,
++                    packed.exception_entries,
++                    packed.row_offsets,
++                    p_pack,
++                )
++                assert torch.equal(p_pack, p_ref), (
++                    f"n={n} blocked={blocked} block_M={block_M} rows={rows}"
++                )
++
++
++@pytest.mark.parametrize("parts, out_dtype", [(1, torch.bfloat16), (2, torch.float32)])
++def test_packed_linear_and_split_linear_with_exceptions(parts, out_dtype, k=5120):
++    """Wide exponent outliers, subnormals, and signed zeros stored in the CSR
++    exception table are accumulated identically across decode split-K and prefill."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangLinearMethod,
++        TileLangSplitLinearMethod,
++        project_parts,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    gen = _gen(41)
++    n = 512 * parts
++    # Wide exponent distribution + explicit zeros and extreme magnitudes so exceptions > 0.
++    weight = (torch.randn((n, k), generator=gen, device=DEVICE) * 0.5).bfloat16()
++    weight[:, ::64] = 0.0
++    weight[:, 1::128] = 1e-6
++    weight[:, 3::128] = 64.0
++    x = torch.randn((max(ROWS), k), generator=_gen(42), device=DEVICE).bfloat16()
++
++    if parts == 1:
++        linear_layer = nn.Module()
++        linear_layer.weight = nn.Parameter(weight[:384].clone(), requires_grad=False)
++        linear_method = TileLangLinearMethod()
++        linear_method.process_weights_after_loading(linear_layer)
++        assert linear_layer.packed_bf16_exceptions > 0
++        linear_method.declare_layer_kernels(linear_layer)
++        scratch_lin = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++        ref_lin = x.float() @ weight[:384].float().T
++        with use_preallocated_workspace(scratch_lin):
++            full_lin = linear_method.apply(linear_layer, x)
++            torch.testing.assert_close(
++                full_lin.float(), ref_lin, rtol=1e-2, atol=1e-2 * ref_lin.abs().max().item()
++            )
++            for rows in ROWS:
++                out_lin = linear_method.apply(linear_layer, x[:rows])
++                assert torch.equal(out_lin, full_lin[:rows]), f"linear rows={rows}"
++
++    layer = nn.Module()
++    layer.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    layer.out_dtype = out_dtype
++    method = TileLangSplitLinearMethod(parts)
++    method.process_weights_after_loading(layer)
++    assert layer.packed_bf16_exceptions > 0
++    method.declare_layer_kernels(layer)
++    scratch = torch.empty(
++        method.get_workspace_size(layer, max(ROWS)), dtype=torch.uint8, device=DEVICE
++    )
++
++    def project(rows):
++        outs = [
++            torch.full((max(ROWS), 512), float("nan"), dtype=out_dtype, device=DEVICE)
++            for _ in range(parts)
++        ]
++        with use_preallocated_workspace(scratch):
++            project_parts(layer, x[:rows], outs, rows)
++        return outs
++
++    full = project(max(ROWS))
++    for index, out in enumerate(full):
++        ref = x.float() @ weight[index * 512 : (index + 1) * 512].float().T
++        torch.testing.assert_close(
++            out.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
++        )
++    for rows in ROWS:
++        for out, whole in zip(project(rows), full):
++            assert torch.equal(out[:rows], whole[:rows]), f"split rows={rows}"
++            assert out[rows:].isnan().all()
++    assert not layer.tilelang_counters.any()
++
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 8dbc1fecc..e733fdb73 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1181,6 +1181,887 @@ def bf16_gemm_splitk(
+     return gemm_bf16_splitk
+ 
+ 
++_PACKED_GROUP = 128
++_PACKED_HALF = 64
++_PACKED_VEC = 16
++
++_PACKED_BF16_HEADER = r"""
++#include <stdint.h>
++
++__device__ __forceinline__ void splitk_fence() { __threadfence(); }
++
++template <int BASE_MINUS_ONE>
++__device__ __forceinline__ void vllm_packed_bf16_decode_vec16(
++    const void* __restrict__ low_a_ptr,
++    const void* __restrict__ low_b_ptr,
++    const void* __restrict__ codes_ptr,
++    void* __restrict__ out_a_ptr,
++    void* __restrict__ out_b_ptr) {
++  const uint4 low_a4 = *reinterpret_cast<const uint4*>(low_a_ptr);
++  const uint4 low_b4 = *reinterpret_cast<const uint4*>(low_b_ptr);
++  const uint4 codes4 = *reinterpret_cast<const uint4*>(codes_ptr);
++  const unsigned int* la = reinterpret_cast<const unsigned int*>(&low_a4);
++  const unsigned int* lb = reinterpret_cast<const unsigned int*>(&low_b4);
++  const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
++  unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
++  unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
++  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
++
++  #pragma unroll
++  for (int w = 0; w < 4; ++w) {
++    const unsigned int c_word = cd[w];
++    const unsigned int la_word = la[w];
++    const unsigned int lb_word = lb[w];
++
++    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
++    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
++
++    const unsigned int ca01 = c01 & 0x000F000Fu;
++    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
++    const unsigned int ca23 = c23 & 0x000F000Fu;
++    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
++
++    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
++
++    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
++    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
++    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
++    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
++
++    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
++    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
++    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
++    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
++
++    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
++    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
++    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
++    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
++  }
++}
++"""
++
++
++def _packed_bf16_gemm(
++    N: int,
++    K: int,
++    exponent_base: int,
++    block_M: int = 64,
++    block_N: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++    out_dtype: T.dtype = T.bfloat16,
++    shards: int = 1,
++    blocked: bool = False,
++):
++    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and 12-bit packed BF16 ``W``."""
++    assert K % _PACKED_GROUP == 0
++    k_groups = K // _PACKED_GROUP
++    assert shards == 1 or k_groups % shards == 0
++    shard_groups = k_groups // shards
++    shard_cols = K // shards
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = _PACKED_HALF // _PACKED_VEC
++    items = block_N * slices
++    pipe_stages = min(num_stages, 2 if block_N >= 64 else num_stages, k_groups)
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def gemm_packed_bf16(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, row_bytes), T.uint8),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((N + 1,), T.int32),
++        C: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(
++            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
++        ) as (bx, by):
++            T.import_source(_PACKED_BF16_HEADER)
++            if blocked:
++                A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                B0_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                B1_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                C_block = T.alloc_fragment((block_M, block_N), T.float32)
++            else:
++                A_shared = T.alloc_shared((block_M, _PACKED_GROUP), T.bfloat16)
++                B_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.bfloat16)
++            low_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.uint8)
++            code_shared = T.alloc_shared((block_N, _PACKED_HALF), T.uint8)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_total = T.alloc_fragment(
++                (block_M, block_N) if shards > 1 else (1, 1), T.float32
++            )
++            low_a = T.alloc_local((_PACKED_VEC,), T.uint8)
++            low_b = T.alloc_local((_PACKED_VEC,), T.uint8)
++            codes = T.alloc_local((_PACKED_VEC,), T.uint8)
++            out_a = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            out_b = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            tx = T.get_thread_binding()
++            first = bx * block_N
++            start = T.alloc_var(T.int32, init=row_offsets[first])
++            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
++            T.clear(C_local)
++            if shards > 1:
++                T.clear(C_total)
++            last = pipe_stages - 1
++            for kg in (
++                T.serial(k_groups)
++                if pipe_stages <= 1 or shards > 1
++                else T.Pipelined(
++                    k_groups,
++                    order=(
++                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
++                        if blocked
++                        else [0, 1, 2, 3, 4]
++                    ),
++                    stage=(
++                        [0, 0, 0, 0, last, last, last, last, last, last, last]
++                        if blocked
++                        else [0, 0, 0, last, last]
++                    ),
++                )
++            ):
++                if blocked:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A0_shared)
++                    T.copy(
++                        A[by * block_M, kg * _PACKED_GROUP + _PACKED_HALF], A1_shared
++                    )
++                else:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A_shared)
++                T.copy(W[bx * block_N, kg * _PACKED_GROUP], low_shared)
++                T.copy(W[bx * block_N, K + kg * _PACKED_HALF], code_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // slices
++                        c = item % slices * _PACKED_VEC
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_a[v] = low_shared[j, c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_b[v] = low_shared[j, _PACKED_HALF + c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            codes[v] = code_shared[j, c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_packed_bf16_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        if blocked:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B0_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B1_shared[j, c + v] = out_b[v]
++                        else:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, _PACKED_HALF + c + v] = out_b[v]
++                if blocked:
++                    T.clear(C_block)
++                    T.gemm(A0_shared, B0_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                    T.clear(C_block)
++                    T.gemm(A1_shared, B1_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                else:
++                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++                if shards > 1:  # noqa: SIM102
++                    if (kg + 1) % shard_groups == 0:
++                        s_idx = kg // shard_groups
++                        if start < end:
++                            for index in T.serial(start, end):
++                                entry = T.alloc_var(
++                                    T.int32, init=exception_entries[index]
++                                )
++                                column = T.alloc_var(T.int32, init=entry >> 16)
++                                if column // shard_cols == s_idx:
++                                    row = T.alloc_var(
++                                        T.int32, init=exception_rows[index] - first
++                                    )
++                                    value = T.alloc_var(
++                                        T.float32,
++                                        init=T.Cast(
++                                            T.float32,
++                                            T.reinterpret(
++                                                T.Cast(T.uint16, entry & 0xFFFF),
++                                                T.bfloat16,
++                                            ),
++                                        ),
++                                    )
++                                    for i, j in T.Parallel(block_M, block_N):
++                                        if j == row:
++                                            token = T.min(by * block_M + i, M - 1)
++                                            C_local[i, j] = C_local[
++                                                i, j
++                                            ] + value * T.Cast(
++                                                T.float32, A[token, column]
++                                            )
++                        for i, j in T.Parallel(block_M, block_N):
++                            C_total[i, j] = T.if_then_else(
++                                kg + 1 == shard_groups,
++                                C_local[i, j],
++                                C_total[i, j] + C_local[i, j],
++                            )
++                        T.clear(C_local)
++            if shards == 1 and start < end:
++                for index in T.serial(start, end):
++                    row = T.alloc_var(T.int32, init=exception_rows[index] - first)
++                    entry = T.alloc_var(T.int32, init=exception_entries[index])
++                    value = T.alloc_var(
++                        T.float32,
++                        init=T.Cast(
++                            T.float32,
++                            T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
++                        ),
++                    )
++                    column = T.alloc_var(T.int32, init=entry >> 16)
++                    for i, j in T.Parallel(block_M, block_N):
++                        if j == row:
++                            token = T.min(by * block_M + i, M - 1)
++                            C_local[i, j] = C_local[i, j] + value * T.Cast(
++                                T.float32, A[token, column]
++                            )
++            if shards > 1:
++                T.copy(C_total, C[by * block_M, bx * block_N])
++            else:
++                T.copy(C_local, C[by * block_M, bx * block_N])
++
++    return gemm_packed_bf16
++
++
++packed_bf16_gemm = tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++)(_packed_bf16_gemm)
++packed_bf16_gemm_decode = packed_bf16_gemm
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def packed_bf16_gemm_two(
++    N: int,
++    K: int,
++    exponent_base: int,
++    block_M: int = 64,
++    block_N: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++    out_dtype: T.dtype = T.bfloat16,
++    shards: int = 1,
++    blocked: bool = False,
++):
++    """``packed_bf16_gemm`` of a ``[2N, K]`` packed weight into two ``[M, N]`` outputs."""
++    assert K % _PACKED_GROUP == 0 and N % block_N == 0
++    k_groups = K // _PACKED_GROUP
++    assert shards == 1 or k_groups % shards == 0
++    shard_groups = k_groups // shards
++    shard_cols = K // shards
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = _PACKED_HALF // _PACKED_VEC
++    items = block_N * slices
++    tiles = N // block_N
++    pipe_stages = min(num_stages, 2 if block_N >= 64 else num_stages, k_groups)
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def gemm_packed_bf16_two(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((2 * N, row_bytes), T.uint8),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((2 * N + 1,), T.int32),
++        C0: T.Tensor((M, N), out_dtype),
++        C1: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(2 * tiles, T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            T.import_source(_PACKED_BF16_HEADER)
++            if blocked:
++                A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                B0_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                B1_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                C_block = T.alloc_fragment((block_M, block_N), T.float32)
++            else:
++                A_shared = T.alloc_shared((block_M, _PACKED_GROUP), T.bfloat16)
++                B_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.bfloat16)
++            low_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.uint8)
++            code_shared = T.alloc_shared((block_N, _PACKED_HALF), T.uint8)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_total = T.alloc_fragment(
++                (block_M, block_N) if shards > 1 else (1, 1), T.float32
++            )
++            low_a = T.alloc_local((_PACKED_VEC,), T.uint8)
++            low_b = T.alloc_local((_PACKED_VEC,), T.uint8)
++            codes = T.alloc_local((_PACKED_VEC,), T.uint8)
++            out_a = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            out_b = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            tx = T.get_thread_binding()
++            first = bx * block_N
++            start = T.alloc_var(T.int32, init=row_offsets[first])
++            end = T.alloc_var(
++                T.int32, init=row_offsets[T.min(first + block_N, 2 * N)]
++            )
++            T.clear(C_local)
++            if shards > 1:
++                T.clear(C_total)
++            last = pipe_stages - 1
++            for kg in (
++                T.serial(k_groups)
++                if pipe_stages <= 1 or shards > 1
++                else T.Pipelined(
++                    k_groups,
++                    order=(
++                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
++                        if blocked
++                        else [0, 1, 2, 3, 4]
++                    ),
++                    stage=(
++                        [0, 0, 0, 0, last, last, last, last, last, last, last]
++                        if blocked
++                        else [0, 0, 0, last, last]
++                    ),
++                )
++            ):
++                if blocked:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A0_shared)
++                    T.copy(
++                        A[by * block_M, kg * _PACKED_GROUP + _PACKED_HALF], A1_shared
++                    )
++                else:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A_shared)
++                T.copy(W[bx * block_N, kg * _PACKED_GROUP], low_shared)
++                T.copy(W[bx * block_N, K + kg * _PACKED_HALF], code_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // slices
++                        c = item % slices * _PACKED_VEC
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_a[v] = low_shared[j, c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_b[v] = low_shared[j, _PACKED_HALF + c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            codes[v] = code_shared[j, c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_packed_bf16_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        if blocked:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B0_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B1_shared[j, c + v] = out_b[v]
++                        else:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, _PACKED_HALF + c + v] = out_b[v]
++                if blocked:
++                    T.clear(C_block)
++                    T.gemm(A0_shared, B0_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                    T.clear(C_block)
++                    T.gemm(A1_shared, B1_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                else:
++                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++                if shards > 1:  # noqa: SIM102
++                    if (kg + 1) % shard_groups == 0:
++                        s_idx = kg // shard_groups
++                        if start < end:
++                            for index in T.serial(start, end):
++                                entry = T.alloc_var(
++                                    T.int32, init=exception_entries[index]
++                                )
++                                column = T.alloc_var(T.int32, init=entry >> 16)
++                                if column // shard_cols == s_idx:
++                                    row = T.alloc_var(
++                                        T.int32, init=exception_rows[index] - first
++                                    )
++                                    value = T.alloc_var(
++                                        T.float32,
++                                        init=T.Cast(
++                                            T.float32,
++                                            T.reinterpret(
++                                                T.Cast(T.uint16, entry & 0xFFFF),
++                                                T.bfloat16,
++                                            ),
++                                        ),
++                                    )
++                                    for i, j in T.Parallel(block_M, block_N):
++                                        if j == row:
++                                            token = T.min(by * block_M + i, M - 1)
++                                            C_local[i, j] = C_local[
++                                                i, j
++                                            ] + value * T.Cast(
++                                                T.float32, A[token, column]
++                                            )
++                        for i, j in T.Parallel(block_M, block_N):
++                            C_total[i, j] = T.if_then_else(
++                                kg + 1 == shard_groups,
++                                C_local[i, j],
++                                C_total[i, j] + C_local[i, j],
++                            )
++                        T.clear(C_local)
++            if shards == 1 and start < end:
++                for index in T.serial(start, end):
++                    row = T.alloc_var(T.int32, init=exception_rows[index] - first)
++                    entry = T.alloc_var(T.int32, init=exception_entries[index])
++                    value = T.alloc_var(
++                        T.float32,
++                        init=T.Cast(
++                            T.float32,
++                            T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
++                        ),
++                    )
++                    column = T.alloc_var(T.int32, init=entry >> 16)
++                    for i, j in T.Parallel(block_M, block_N):
++                        if j == row:
++                            token = T.min(by * block_M + i, M - 1)
++                            C_local[i, j] = C_local[i, j] + value * T.Cast(
++                                T.float32, A[token, column]
++                            )
++            if bx < tiles:
++                if shards > 1:
++                    T.copy(C_total, C0[by * block_M, bx * block_N])
++                else:
++                    T.copy(C_local, C0[by * block_M, bx * block_N])
++            else:
++                if shards > 1:
++                    T.copy(C_total, C1[by * block_M, (bx - tiles) * block_N])
++                else:
++                    T.copy(C_local, C1[by * block_M, (bx - tiles) * block_N])
++
++    return gemm_packed_bf16_two
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def packed_bf16_gemm_partials(
++    N: int,
++    K: int,
++    shards: int,
++    exponent_base: int,
++    block_M: int = 64,
++    block_N: int = 64,
++    num_stages: int = 3,
++    threads: int = 128,
++    blocked: bool = False,
++):
++    """Split-K 12-bit packed BF16 GEMM for decode rows: FP32 ``P[s] = A @ W^T`` over shard ``s``."""
++    assert K % _PACKED_GROUP == 0 and (K // _PACKED_GROUP) % shards == 0
++    shard_groups = K // _PACKED_GROUP // shards
++    shard_cols = K // shards
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = _PACKED_HALF // _PACKED_VEC
++    items = block_N * slices
++    pipe_stages = min(
++        num_stages, 2 if block_M + block_N >= 128 else num_stages, shard_groups
++    )
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def gemm_packed_bf16_partials(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, row_bytes), T.uint8),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((N + 1,), T.int32),
++        P: T.Tensor((shards, M, N), T.float32),
++    ):
++        with T.Kernel(
++            T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
++        ) as (bx, s, by):
++            pdl.chain()
++            T.import_source(_PACKED_BF16_HEADER)
++            if blocked:
++                A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                B0_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                B1_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                C_block = T.alloc_fragment((block_M, block_N), T.float32)
++            else:
++                A_shared = T.alloc_shared((block_M, _PACKED_GROUP), T.bfloat16)
++                B_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.bfloat16)
++            low_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.uint8)
++            code_shared = T.alloc_shared((block_N, _PACKED_HALF), T.uint8)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            low_a = T.alloc_local((_PACKED_VEC,), T.uint8)
++            low_b = T.alloc_local((_PACKED_VEC,), T.uint8)
++            codes = T.alloc_local((_PACKED_VEC,), T.uint8)
++            out_a = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            out_b = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            tx = T.get_thread_binding()
++            T.clear(C_local)
++            last = pipe_stages - 1
++            for gb in (
++                T.serial(shard_groups)
++                if pipe_stages <= 1
++                else T.Pipelined(
++                    shard_groups,
++                    order=(
++                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
++                        if blocked
++                        else [0, 1, 2, 3, 4]
++                    ),
++                    stage=(
++                        [0, 0, 0, 0, last, last, last, last, last, last, last]
++                        if blocked
++                        else [0, 0, 0, last, last]
++                    ),
++                )
++            ):
++                kg = s * shard_groups + gb
++                if blocked:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A0_shared)
++                    T.copy(
++                        A[by * block_M, kg * _PACKED_GROUP + _PACKED_HALF], A1_shared
++                    )
++                else:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A_shared)
++                T.copy(W[bx * block_N, kg * _PACKED_GROUP], low_shared)
++                T.copy(W[bx * block_N, K + kg * _PACKED_HALF], code_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // slices
++                        c = item % slices * _PACKED_VEC
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_a[v] = low_shared[j, c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_b[v] = low_shared[j, _PACKED_HALF + c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            codes[v] = code_shared[j, c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_packed_bf16_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        if blocked:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B0_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B1_shared[j, c + v] = out_b[v]
++                        else:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, _PACKED_HALF + c + v] = out_b[v]
++                if blocked:
++                    T.clear(C_block)
++                    T.gemm(A0_shared, B0_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                    T.clear(C_block)
++                    T.gemm(A1_shared, B1_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                else:
++                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            first = bx * block_N
++            start = T.alloc_var(T.int32, init=row_offsets[first])
++            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
++            if start < end:
++                for index in T.serial(start, end):
++                    entry = T.alloc_var(T.int32, init=exception_entries[index])
++                    column = T.alloc_var(T.int32, init=entry >> 16)
++                    if column // shard_cols == s:
++                        row = T.alloc_var(T.int32, init=exception_rows[index] - first)
++                        value = T.alloc_var(
++                            T.float32,
++                            init=T.Cast(
++                                T.float32,
++                                T.reinterpret(
++                                    T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16
++                                ),
++                            ),
++                        )
++                        for i, j in T.Parallel(block_M, block_N):
++                            if j == row:
++                                token = T.min(by * block_M + i, M - 1)
++                                C_local[i, j] = C_local[i, j] + value * T.Cast(
++                                    T.float32, A[token, column]
++                                )
++            T.copy(
++                C_local,
++                P[
++                    s,
++                    by * block_M : (by + 1) * block_M,
++                    bx * block_N : (bx + 1) * block_N,
++                ],
++            )
++
++    return gemm_packed_bf16_partials
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def packed_bf16_gemm_splitk(
++    N: int,
++    K: int,
++    shards: int,
++    exponent_base: int,
++    block_M: int = 16,
++    block_N: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++    out_dtype: T.dtype = T.float32,
++    parts: int = 1,
++    blocked: bool = False,
++):
++    """Split-K 12-bit packed BF16 GEMM in one launch."""
++    assert K % _PACKED_GROUP == 0 and (K // _PACKED_GROUP) % shards == 0
++    assert (
++        parts in (1, 2) and N % parts == 0 and (parts == 1 or (N // 2) % block_N == 0)
++    )
++    shard_groups = K // _PACKED_GROUP // shards
++    shard_cols = K // shards
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = _PACKED_HALF // _PACKED_VEC
++    items = block_N * slices
++    tiles_N = tilelang.cdiv(N, block_N)
++    part = N // parts
++    pipe_stages = min(num_stages, 2 if block_N >= 64 else num_stages, shard_groups)
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++    tiles = T.dynamic("tiles")
++
++    @T.macro
++    def body(
++        A, W, exception_rows, exception_entries, row_offsets, P, counters, C0, C1
++    ):
++        with T.Kernel(tiles_N, shards, T.ceildiv(M, block_M), threads=threads) as (
++            bx,
++            s,
++            by,
++        ):
++            T.import_source(_PACKED_BF16_HEADER)
++            pdl.chain()
++            tx = T.get_thread_binding()
++            if blocked:
++                A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
++                B0_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                B1_shared = T.alloc_shared((block_N, _PACKED_HALF), T.bfloat16)
++                C_block = T.alloc_fragment((block_M, block_N), T.float32)
++            else:
++                A_shared = T.alloc_shared((block_M, _PACKED_GROUP), T.bfloat16)
++                B_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.bfloat16)
++            low_shared = T.alloc_shared((block_N, _PACKED_GROUP), T.uint8)
++            code_shared = T.alloc_shared((block_N, _PACKED_HALF), T.uint8)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            low_a = T.alloc_local((_PACKED_VEC,), T.uint8)
++            low_b = T.alloc_local((_PACKED_VEC,), T.uint8)
++            codes = T.alloc_local((_PACKED_VEC,), T.uint8)
++            out_a = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            out_b = T.alloc_local((_PACKED_VEC,), T.bfloat16)
++            last_cta = T.alloc_shared((1,), T.int32)
++            T.clear(C_local)
++            last = pipe_stages - 1
++            for gb in (
++                T.serial(shard_groups)
++                if pipe_stages <= 1
++                else T.Pipelined(
++                    shard_groups,
++                    order=(
++                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
++                        if blocked
++                        else [0, 1, 2, 3, 4]
++                    ),
++                    stage=(
++                        [0, 0, 0, 0, last, last, last, last, last, last, last]
++                        if blocked
++                        else [0, 0, 0, last, last]
++                    ),
++                )
++            ):
++                kg = s * shard_groups + gb
++                if blocked:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A0_shared)
++                    T.copy(
++                        A[by * block_M, kg * _PACKED_GROUP + _PACKED_HALF], A1_shared
++                    )
++                else:
++                    T.copy(A[by * block_M, kg * _PACKED_GROUP], A_shared)
++                T.copy(W[bx * block_N, kg * _PACKED_GROUP], low_shared)
++                T.copy(W[bx * block_N, K + kg * _PACKED_HALF], code_shared)
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // slices
++                        c = item % slices * _PACKED_VEC
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_a[v] = low_shared[j, c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            low_b[v] = low_shared[j, _PACKED_HALF + c + v]
++                        for v in T.vectorized(_PACKED_VEC):
++                            codes[v] = code_shared[j, c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_packed_bf16_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        if blocked:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B0_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B1_shared[j, c + v] = out_b[v]
++                        else:
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, c + v] = out_a[v]
++                            for v in T.vectorized(_PACKED_VEC):
++                                B_shared[j, _PACKED_HALF + c + v] = out_b[v]
++                if blocked:
++                    T.clear(C_block)
++                    T.gemm(A0_shared, B0_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                    T.clear(C_block)
++                    T.gemm(A1_shared, B1_shared, C_block, transpose_B=True)
++                    for i, j in T.Parallel(block_M, block_N):
++                        C_local[i, j] += C_block[i, j]
++                else:
++                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            first = bx * block_N
++            start = T.alloc_var(T.int32, init=row_offsets[first])
++            end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
++            if start < end:
++                for index in T.serial(start, end):
++                    entry = T.alloc_var(T.int32, init=exception_entries[index])
++                    column = T.alloc_var(T.int32, init=entry >> 16)
++                    if column // shard_cols == s:
++                        row = T.alloc_var(T.int32, init=exception_rows[index] - first)
++                        value = T.alloc_var(
++                            T.float32,
++                            init=T.Cast(
++                                T.float32,
++                                T.reinterpret(
++                                    T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16
++                                ),
++                            ),
++                        )
++                        for i, j in T.Parallel(block_M, block_N):
++                            if j == row:
++                                token = T.min(by * block_M + i, M - 1)
++                                C_local[i, j] = C_local[i, j] + value * T.Cast(
++                                    T.float32, A[token, column]
++                                )
++            T.copy(C_local, P[s, by * block_M, bx * block_N])
++            T.call_extern("handle", "splitk_fence")
++            T.sync_threads()
++            if tx == 0:
++                arrived = T.atomic_add(
++                    counters[by * tiles_N + bx],
++                    1,
++                    memory_order="acq_rel",
++                    return_prev=True,
++                )
++                last_cta[0] = T.if_then_else(arrived == shards - 1, 1, 0)
++            T.sync_threads()
++            if last_cta[0] == 1:
++                T.call_extern("handle", "splitk_fence")
++                for i, j in T.Parallel(block_M, block_N):
++                    m = by * block_M + i
++                    n = bx * block_N + j
++                    if m < M and n < N:
++                        acc = T.alloc_var(T.float32)
++                        acc = P[0, m, n]
++                        for t in T.serial(1, shards):
++                            acc = acc + P[t, m, n]
++                        if parts == 1:
++                            C0[m, n] = acc
++                        else:
++                            if n < part:  # noqa: SIM102
++                                C0[m, n] = acc
++                            else:
++                                C1[m, n - part] = acc
++                if tx == 0:
++                    counters[by * tiles_N + bx] = 0
++
++    if parts == 2:
++
++        @T.prim_func
++        def gemm_packed_bf16_splitk(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, row_bytes), T.uint8),
++            exception_rows: T.Tensor((E,), T.int32),
++            exception_entries: T.Tensor((E,), T.int32),
++            row_offsets: T.Tensor((N + 1,), T.int32),
++            P: T.Tensor((shards, M, N), T.float32),
++            counters: T.Tensor((tiles,), T.int32),
++            C0: T.Tensor((M, part), out_dtype),
++            C1: T.Tensor((M, part), out_dtype),
++        ):
++            body(
++                A,
++                W,
++                exception_rows,
++                exception_entries,
++                row_offsets,
++                P,
++                counters,
++                C0,
++                C1,
++            )
++
++    else:
++
++        @T.prim_func
++        def gemm_packed_bf16_splitk(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, row_bytes), T.uint8),
++            exception_rows: T.Tensor((E,), T.int32),
++            exception_entries: T.Tensor((E,), T.int32),
++            row_offsets: T.Tensor((N + 1,), T.int32),
++            P: T.Tensor((shards, M, N), T.float32),
++            counters: T.Tensor((tiles,), T.int32),
++            C0: T.Tensor((M, N), out_dtype),
++        ):
++            body(
++                A,
++                W,
++                exception_rows,
++                exception_entries,
++                row_offsets,
++                P,
++                counters,
++                C0,
++                None,
++            )
++
++    return gemm_packed_bf16_splitk
++
++
+ # ---------------------------------------------------------------------------
+ # Scale packing and tile configuration
+ # ---------------------------------------------------------------------------
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 95b007fc4..cbdfa8f99 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -58,11 +58,16 @@ from .gemm import (
+     mxfp8_gemm_partials,
+     pack_scale_words,
+     pack_weight_tiles,
++    packed_bf16_gemm,
++    packed_bf16_gemm_partials,
++    packed_bf16_gemm_splitk,
++    packed_bf16_gemm_two,
+     scale_words,
+     split_bucket,
+     split_row_tile,
+     splitk_reduce,
+ )
++from .vocab import GROUP, pack_bf16_weight
+ 
+ _TORCH_TO_TL = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+ 
+@@ -344,10 +349,62 @@ def _block32_split_mxfp8(
+     layer.tilelang_reduce(partials, out)
+ 
+ 
++def _bf16_shape(layer: nn.Module) -> tuple[int, int]:
++    """Logical ``(out_features, in_features)`` of an unpacked or 12-bit packed BF16 weight."""
++    return (
++        int(layer.weight.shape[0]),
++        int(getattr(layer, "packed_bf16_in_features", layer.weight.shape[1])),
++    )
++
++
++def _pack_bf16_layer(layer: nn.Module, shards: int) -> None:
++    """Pack a contiguous CUDA BF16 weight in place when ``K`` and its shards are
++    multiples of ``GROUP`` (128)."""
++    if hasattr(layer, "packed_bf16_exponent_base"):
++        return
++    weight = layer.weight.data
++    if (
++        weight.ndim != 2
++        or weight.dtype != torch.bfloat16
++        or not weight.is_cuda
++        or not weight.is_contiguous()
++    ):
++        return
++    n, k = map(int, weight.shape)
++    if n == 0 or k == 0 or k % GROUP or (k // GROUP) % shards:
++        return
++    packed = pack_bf16_weight(weight, in_place=True)
++    layer.weight.data = packed.values
++    layer.packed_bf16_in_features = k
++    layer.packed_bf16_exponent_base = packed.exponent_base
++    layer.packed_bf16_exceptions = packed.exceptions
++    layer.weight_exception_rows = packed.exception_rows
++    layer.weight_exception_entries = packed.exception_entries
++    layer.weight_row_offsets = packed.row_offsets
++
++
++def launch_partials(
++    layer: nn.Module, x: torch.Tensor, partials: torch.Tensor
++) -> None:
++    """Launch ``layer``'s split-K partials kernel on ``x`` into ``partials``."""
++    kernel = partials_kernel(layer, x.shape[0])
++    if hasattr(layer, "packed_bf16_exponent_base"):
++        kernel(
++            x,
++            layer.weight,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            partials,
++        )
++    else:
++        kernel(x, layer.weight, partials)
++
++
+ def _bf16_linear(
+     layer, x: torch.Tensor, out: torch.Tensor, scratch: torch.Tensor | None
+ ) -> None:
+-    n, k = layer.weight.shape
++    n, k = _bf16_shape(layer)
+     if x.ndim != 2:
+         rows = x.numel() // k
+         x, out = x.reshape(rows, k), out.view(rows, n)
+@@ -356,8 +413,17 @@ def _bf16_linear(
+     specs = _partial_specs(layer, rows)
+     if specs:
+         (partials,) = _scratch(specs, scratch)
+-        partials_kernel(layer, rows)(x, layer.weight, partials)
++        launch_partials(layer, x, partials)
+         layer.tilelang_reduce(partials, out)
++    elif hasattr(layer, "packed_bf16_exponent_base"):
++        layer.tilelang_gemm(
++            x,
++            layer.weight,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            out,
++        )
+     else:
+         layer.tilelang_gemm(x, layer.weight, out)
+ 
+@@ -612,20 +678,42 @@ def _out_dtype(layer: nn.Module) -> str:
+ 
+ def _bf16_kernels(layer: nn.Module) -> dict:
+     """Every kernel of a BF16 projection of ``layer.weight``, as calls."""
+-    n, k = layer.weight.shape
++    n, k = _bf16_shape(layer)
+     out_dtype = _out_dtype(layer)
+     shards = bf16_shards(n, k)
+     router = getattr(layer, "tilelang_router", None)
+     bounded_router = router is not None and router.max_rows is not None
++    packed_base = getattr(layer, "packed_bf16_exponent_base", None)
+     kernels = {}
+     if shards == 1 or not bounded_router or router._gates_every_row():
+-        kernels["gemm"] = prepare.call(
+-            bf16_gemm, n, k, out_dtype=out_dtype, shards=shards
+-        )
++        if packed_base is not None:
++            kernels["gemm"] = prepare.call(
++                packed_bf16_gemm,
++                n,
++                k,
++                packed_base,
++                out_dtype=out_dtype,
++                shards=shards,
++            )
++        else:
++            kernels["gemm"] = prepare.call(
++                bf16_gemm, n, k, out_dtype=out_dtype, shards=shards
++            )
+     if shards > 1:
+         max_rows = router.max_rows if bounded_router else None
+         kernels["partials"] = {
+-            block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
++            block_M: (
++                prepare.call(
++                    packed_bf16_gemm_partials,
++                    n,
++                    k,
++                    shards,
++                    packed_base,
++                    block_M=block_M,
++                )
++                if packed_base is not None
++                else prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
++            )
+             for i, block_M in enumerate(PARTIAL_ROW_TILES)
+             if i == 0 or max_rows is None or max_rows > PARTIAL_ROW_TILES[i - 1]
+         }
+@@ -640,7 +728,7 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+     """BF16 weights, BF16 or FP32 output (``layer.out_dtype``)."""
+ 
+     def declare_layer_kernels(self, layer: nn.Module) -> None:
+-        n, k = layer.weight.shape
++        n, k = _bf16_shape(layer)
+         layer.tilelang_shards = bf16_shards(n, k)
+         layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
+ 
+@@ -651,7 +739,9 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         prepare.declare(lambda: _calls(_bf16_kernels(layer)), bind=bind)
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        """The checkpoint weight is used as loaded."""
++        """Pack the checkpoint BF16 weight into exact 12-bit storage when supported."""
++        n, k = _bf16_shape(layer)
++        _pack_bf16_layer(layer, bf16_shards(n, k))
+ 
+     def apply(
+         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+@@ -688,6 +778,7 @@ class TileLangScaledLinearMethod(TileLangLinearMethod):
+         if not torch.equal(scaled / self.scale, weight):
+             raise ValueError(f"{self.scale} does not scale this weight exactly")
+         weight.copy_(scaled)
++        super().process_weights_after_loading(layer)
+ 
+ 
+ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+@@ -706,7 +797,7 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         self.parts = parts
+ 
+     def _split(self, layer: nn.Module) -> dict:
+-        n, k = layer.weight.shape
++        n, k = _bf16_shape(layer)
+         split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
+         decode = split.get("decode", {})
+         if any("block_K" in config for config in decode.values()):
+@@ -715,44 +806,86 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+             )
+         return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+ 
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        """Pack the checkpoint BF16 weight into exact 12-bit storage when supported."""
++        _pack_bf16_layer(layer, self._split(layer)["shards"])
++
+     def _kernels(self, layer: nn.Module) -> dict:
+         """Every kernel of the split projection, as calls."""
+-        n, k = layer.weight.shape
++        n, k = _bf16_shape(layer)
+         out_dtype = _out_dtype(layer)
+         split = self._split(layer)
+         shards, blocked, decode = split["shards"], split["blocked"], split["decode"]
++        packed_base = getattr(layer, "packed_bf16_exponent_base", None)
+         if self.parts == 2:
+-            gemm = prepare.call(
+-                bf16_gemm_two,
+-                n // 2,
+-                k,
+-                out_dtype=out_dtype,
+-                shards=shards,
+-                blocked=blocked,
+-            )
++            if packed_base is not None:
++                gemm = prepare.call(
++                    packed_bf16_gemm_two,
++                    n // 2,
++                    k,
++                    packed_base,
++                    out_dtype=out_dtype,
++                    shards=shards,
++                    blocked=blocked,
++                )
++            else:
++                gemm = prepare.call(
++                    bf16_gemm_two,
++                    n // 2,
++                    k,
++                    out_dtype=out_dtype,
++                    shards=shards,
++                    blocked=blocked,
++                )
+         else:
+-            gemm = prepare.call(
+-                bf16_gemm, n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
+-            )
++            if packed_base is not None:
++                gemm = prepare.call(
++                    packed_bf16_gemm,
++                    n,
++                    k,
++                    packed_base,
++                    out_dtype=out_dtype,
++                    shards=shards,
++                    blocked=blocked,
++                )
++            else:
++                gemm = prepare.call(
++                    bf16_gemm, n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
++                )
+         # Decode rows: one launch per call (the last CTA of a tile adds the shards).
+         splitk = {
+-            block_M: prepare.call(
+-                bf16_gemm_splitk,
+-                n,
+-                k,
+-                shards,
+-                block_M=block_M,
+-                out_dtype=out_dtype,
+-                parts=self.parts,
+-                blocked=blocked,
+-                **decode.get(block_M, {}),
++            block_M: (
++                prepare.call(
++                    packed_bf16_gemm_splitk,
++                    n,
++                    k,
++                    shards,
++                    packed_base,
++                    block_M=block_M,
++                    out_dtype=out_dtype,
++                    parts=self.parts,
++                    blocked=blocked,
++                    **decode.get(block_M, {}),
++                )
++                if packed_base is not None
++                else prepare.call(
++                    bf16_gemm_splitk,
++                    n,
++                    k,
++                    shards,
++                    block_M=block_M,
++                    out_dtype=out_dtype,
++                    parts=self.parts,
++                    blocked=blocked,
++                    **decode.get(block_M, {}),
++                )
+             )
+             for block_M in PARTIAL_ROW_TILES
+         }
+         return {"gemm": gemm, "splitk": splitk}
+ 
+     def declare_layer_kernels(self, layer: nn.Module) -> None:
+-        n, k = layer.weight.shape
++        n, k = _bf16_shape(layer)
+         if n % self.parts:
+             raise ValueError(f"{n} rows do not split into {self.parts} parts")
+         layer.tilelang_parts = self.parts
+@@ -782,8 +915,9 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+ 
+ 
+ def _split_bf16(layer, x, outputs, scratch) -> None:
+-    n, k = layer.weight.shape
++    n, _ = _bf16_shape(layer)
+     rows = x.shape[0]
++    packed = hasattr(layer, "packed_bf16_exponent_base")
+     if rows <= SPLIT_DECODE_ROWS:
+         (partials,) = _scratch(
+             (((layer.tilelang_shards, rows, n), torch.float32),), scratch
+@@ -791,8 +925,29 @@ def _split_bf16(layer, x, outputs, scratch) -> None:
+         block_M = next(
+             (bm for bm in PARTIAL_ROW_TILES if rows <= bm), PARTIAL_ROW_TILES[-1]
+         )
+-        layer.tilelang_splitk[block_M](
+-            x, layer.weight, partials, layer.tilelang_counters, *outputs
++        if packed:
++            layer.tilelang_splitk[block_M](
++                x,
++                layer.weight,
++                layer.weight_exception_rows,
++                layer.weight_exception_entries,
++                layer.weight_row_offsets,
++                partials,
++                layer.tilelang_counters,
++                *outputs,
++            )
++        else:
++            layer.tilelang_splitk[block_M](
++                x, layer.weight, partials, layer.tilelang_counters, *outputs
++            )
++    elif packed:
++        layer.tilelang_gemm(
++            x,
++            layer.weight,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            *outputs,
+         )
+     else:
+         layer.tilelang_gemm(x, layer.weight, *outputs)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index db8bdff6b..5a5ea56cb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -994,10 +994,11 @@ class TileLangGateRouter(TileKernelsRouter):
+         input_ids: torch.Tensor | None = None,
+         sp_rows=None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        from .linear import _partial_specs, _scratch, partials_kernel
++        from .linear import _bf16_shape, _partial_specs, _scratch, launch_partials
+ 
+         gate = self.gate
+-        x = router_logits.reshape(-1, gate.weight.shape[1])
++        _, k = _bf16_shape(gate)
++        x = router_logits.reshape(-1, k)
+         provided = provided_routes(x)
+         if provided is not None:
+             if indices_type not in (None, torch.int64):
+@@ -1032,7 +1033,7 @@ class TileLangGateRouter(TileKernelsRouter):
+             )
+         else:
+             (partials,) = _scratch(specs, None)
+-        partials_kernel(gate, rows)(x, gate.weight, partials)
++        launch_partials(gate, x, partials)
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+-- 
+2.54.0 (Apple Git-157)
+
