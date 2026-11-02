@@ -4,14 +4,14 @@ overlay integrity across all 14 unified PRs, and recorded verdict/results."""
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 RC16 = ROOT / "experiments/2026-10-26-spark-ds41f-candidate/rc16"
 BUNDLE = RC16 / "bundles/candidate-16"
 sys.path.insert(0, str(RC16))
@@ -20,10 +20,8 @@ import measure_candidate_16 as measure  # noqa: E402
 
 
 def load_spark():
-    loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-    spec = importlib.util.spec_from_loader("spark", loader)
-    spark = importlib.util.module_from_spec(spec)
-    loader.exec_module(spark)
+    import spark_ds41f as spark
+
     return spark
 
 

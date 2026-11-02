@@ -3,17 +3,15 @@ the same revisions, patch counts, patch heads, trees and patch ranges."""
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark_source_locks_test", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 HISTORICAL_PROFILES = {
     "experiments/2026-10-03-tilelang-tp4-performance/round2-tilelang.json",

@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 MEMGUARD = ROOT / "scripts" / "memguard.sh"
 MEMGUARD_START = ROOT / "scripts" / "memguard-start.sh"
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+import spark_ds41f as spark
 
 
 class MemguardTest(unittest.TestCase):

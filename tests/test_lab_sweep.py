@@ -5,11 +5,14 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import sys
 import unittest
 from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def load(name: str, path: str):
@@ -22,20 +25,24 @@ def load(name: str, path: str):
 
 sweep_module = load("lab_sweep", "scripts/lab_sweep.py")
 streams_module = load("distinct_streams", "scripts/distinct_streams.py")
-lab = load("lab_for_sweep", "scripts/lab.py")
-lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
+from spark_ds41f import lab
 
 
 SITE_SHAPE = mock.patch.object(lab.spark.cluster_recipe, "site_shape", return_value="tp3-triangle")
+SITE_NODES = mock.patch.object(
+    lab.spark, "site_nodes", side_effect=lambda: lab.spark.read_json("config/nodes.example.json")
+)
 
 
 def setUpModule() -> None:
     # Planning resolves the recipe at the site's shape; the example map is a triangle.
     SITE_SHAPE.start()
+    SITE_NODES.start()
 
 
 def tearDownModule() -> None:
     # As in test_lab: pytest skips unittest's module cleanups, not tearDownModule.
+    SITE_NODES.stop()
     SITE_SHAPE.stop()
 
 BASE_PATH = "config/cluster.json"
