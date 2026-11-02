@@ -51,9 +51,12 @@ placeholders, not in the copy drafts tensor.
 - `copy_probe` tokens a step, m=8: copy **16.360**, edit **15.792**, tool
   **6.905**, prose 2.651. Before the fix: 16.360 / 15.792 / 6.636 / 2.651 — the
   tool category gains from not verifying rows the proposal does not have.
-- Single-stream closed loop: baseline 64.897 tok/s, m=16 without the fix 64.683,
-  m=8 with the fix 63.867 (CI95 2.77%). The blocking copy costs about 1.6% on this
-  synthetic loop; the copy-heavy categories are unchanged.
+- Clean m=16 A/B (same image/profile/suite): suite **63.58** vs 64.683 tok/s
+  unfixed (−1.7%, CI95 2.78% — level); probe copy 16.014, edit 15.315 unchanged,
+  tool 6.083 → 6.232, prose 2.651. The fix is not a speedup.
+- m=8 single-stream with the fix: 63.867 vs 64.897 baseline (−1.6%, CI95 2.77%).
+  Copy-heavy categories unchanged; the blocking copy costs ~1–2% on this
+  synthetic loop.
 - m=16 in the live gateway pool (since 17:36Z): gateway traffic plus five
   30k-token real-agent-transcript requests (512-token completions), no asserts,
   engine healthy. The unfixed arm died within minutes on the same pool.
