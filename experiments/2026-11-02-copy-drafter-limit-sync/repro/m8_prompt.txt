@@ -1,0 +1,700 @@
+# Gate Genie handoff for exact native GDN replay on Spark5 and Spark6
+
+**Complete as of 2026-09-30: the optimized production pair is validated and left
+running on Spark5 and Spark6. Public upstream PR #3 is submitted and ready for
+review; source CI passed on the published fork commit.**
+Prepared for the owner and Gate Genie on 2026-09-30. This is an operational,
+local handoff, not the public PR description. Private container snapshots and
+real captured model activations must remain private.
+
+At the owner's usual eight concurrent requests, three matched runs per workload
+show **+10.06% code, +9.15% thinking and +6.62% mixed-request throughput**. This
+is a decode improvement. Completed warm long-context comparisons show roughly
+6–8% more throughput; cold very-long-prompt totals were approximately flat
+because unchanged prompt processing dominates those jobs. Both Sparks retained
+the owner-configured approximately 2.2 GHz underclock throughout. These figures measure
+different work and must not be presented as interchangeable estimates. The
+performance sweep and final installation checks are complete. A separate live
+post-install code confirmation measured 334.465 TPS, +7.94% against its matched
+original case; it does not replace the three-run mean.
+
+## Purpose and owner requirements
+
+The owner authorized research into lossless kernel performance improvements for
+the myllmbox Qwen3.8-Flash-Next two-Spark recipe, then authorized a maintainable
+installation on Spark5 and Spark6 and submission of a well-tested pull request.
+The primary real workload is **eight concurrent requests**. The final validated
+optimized configuration is to be left running on both nodes. This handoff must
+explain exactly what changed, why, how it was measured, how to debug it, and what
+would be required to apply it to another system.
+
+Preservation is a hard requirement: do not silently cap or change context,
+output capacity, concurrency, thinking, sampling, tools, model files, precision,
+prefix caching, cache retention, launch/network settings, or working features.
+Do not carry benchmark settings into production. Back up before infrastructure
+changes, wait for active work to drain before restarts, retain the original
+working containers and image, and verify actual behavior after any switch.
+Unexplained degradation of this local AI infrastructure is unacceptable to the
+owner. Honor the workspace AGENTS.md and the owner's current authorization.
+
+## What this optimization does
+
+The model contains 36 Gated DeltaNet (GDN) recurrent layers in addition to its
+other attention layers. With five speculative draft tokens, the original native
+kernel verifies up to six tokens per request. For every verified token, it
+computes a full FP32 recurrent state and writes that large state to memory.
+Rejection sampling later determines which verified tokens were accepted.
+
+The candidate retains the verification arithmetic but replaces these repeated
+large state writes with compact FP32 records. Each token and value head records:
+
+1. The 128-element correction delta that the original verifier calculated.
+2. The 128-element normalized key that the original verifier used.
+3. The actual rounded decay multiplier used by the original recurrence.
+
+After the existing sampler chooses the accepted token count, a grouped CUDA
+kernel replays the recurrence in forward token order and writes the final
+accepted state. It also writes an intermediate state if that step crosses a
+prefix-cache block boundary. This commit happens before native aligned-state
+postprocessing/migration. Convolution states, cache allocation/layout, sampling,
+and the rest of the model remain under the original implementation.
+
+For scale, one layer's full per-token recurrent state is
+24 × 128 × 128 × 4 = 1572864 bytes; its replay record is
+24 × 257 × 4 = 24672 bytes, about 63.8 times smaller. This is a storage-size
+comparison for the replaced per-token writes, not a claim of 63.8 times less
+total traffic or 63.8 times faster inference. Verification still does the
+original arithmetic, commit reads and writes accepted states, and the rest of
+the model still runs. The observed C8 end-to-end gain is the measured 6–10%
+range described above.
+
+For an individual state element, the important arithmetic is a rounded FP32
+multiply followed by the original FP32 fused multiply-add:
+
+```
+h = fma_rn(key[k], delta[v], mul_rn(h, actual_decay))
+```
+
+The actual decay is stored directly. Recomputing it from a logarithm, combining
+the recurrence algebraically, changing operation order, or reducing record
+precision is not covered by the exactness contract. Compiler flush-to-zero
+behavior must also match the native implementation. The source checker verifies
+that the verifier changes are limited to replacing state writes with records.
+
+Each commit thread owns disjoint state elements throughout its recurrence.
+This preserves source/final/boundary aliasing when a destination is also the
+source slot. Within one request it reads its source elements before overwriting
+them, and other threads do not need those elements. Request metadata must retain
+the original scheduler's ownership invariants; this is not an arbitrary public
+tensor API with bounds checks on every device-side metadata value.
+
+### Decode versus prefill
+
+This is a **speculative decode** optimization. Pure supported speculative decode
+batches use replay. Prefill, mixed prefill/decode paths, ordinary unsupported
+decode, and unsupported configurations retain the original implementation.
+Cold long prompts spend substantial time in prefill, so a decode gain does not
+imply a comparable reduction in cold time to first token. Warm prefix-cache
+tests help separate reuse/admission/prefill costs from sustained generation.
+
+### Meaning of lossless
+
+The change introduces no new quantization and no intended approximation. Native
+verifier outputs and accepted/boundary recurrent states are compared **bit for
+bit**, including forward trajectories and captured real model inputs. The
+FP32 arithmetic contract, source comparison, and direct state comparisons are
+the strongest evidence for the changed operation.
+
+Do not promise identical full generated text for every run of the distributed
+server: the unchanged baseline itself showed run-to-run differences at fixed
+seed and temperature zero. Finite tests are evidence, not a proof for every
+possible model input. Distinguish native-state exactness from whole-server
+nondeterminism, quality scores, and throughput benchmarks.
+
+## Scope and compatibility
+
+The current package deliberately targets one validated recipe and stack:
+
+| Item | Required/established value |
+|---|---|
+| Base recipe | `myllmbox/qwen38-flash-next-cluster-recipe` |
+| Base image | `myllmbox/qwen38-flash-next-cluster-vllm:v6` |
+| Pinned image digest | `sha256:861ac752164e0d723c5eff3f876586c6678c26ad4a516112c48745f6a101ff4d` |
+| Original local image ID | `sha256:4d03fc80b2c28088808115eec524cb36732c8181b13ba15085095fa927b91815` |
+| vLLM | 0.30.0 stack, native reference commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
+| Torch/CUDA ABI | `2.13.0+cu130`, CUDA 13.0 |
+| Hardware | Two GB10 devices, compute capability 12.1 |
+| Owner clock setting | Both Sparks underclocked to approximately 2.2 GHz; observed SM clocks 2184/2190 MHz in both arms; preserved unchanged |
+| Native compilation target | `sm_120f`, matching the tested prototype |
+| Checkpoint | Existing `Qwen3.8-Flash-Next-hibrid48` |
+| Distributed layout | TP=2, PP=1, two nodes |
+| Target GDN layers | 36 per rank; local K heads=8, V heads=24; K/V dimensions=128 |
+| Activation/state | Existing BF16 activation and FP32 recurrent state |
+| GDN output norm gate | Native sigmoid implementation |
+| Speculation | MTP, five drafts, block rejection, probabilistic draft sampling |
+| Aligned cache block | 1632 tokens |
+| Maximum sequences | 64, with 384 speculative verification tokens |
+| Replay storage | 36 × 384 × 24 × 257 × 4 bytes, approximately 325.3 MiB per rank |
+
+The runtime checks the configuration before attaching replay to any layer. An
+unsupported configuration logs that the optimization is unavailable and retains
+the original kernel. It does not retune or reduce the user's settings. The
+build also rejects unexpected source hashes and a mismatched Torch ABI rather
+than applying an unreviewed patch.
+
+## Established production configuration to preserve
+
+Before installation, both original containers were named
+`qwen38-flash-next-cluster`; Spark5 is rank 0
+and serves the HTTP endpoint, Spark6 is rank 1 and headless. The original
+container entrypoint is `['vllm']`, followed by a command starting with `serve`.
+Do not accidentally use the image's different default entrypoint when cloning
+a container.
+
+| Setting | Established value |
+|---|---|
+| Served model ID | `Qwen/Qwen3.8-Flash-Next` |
+| Container model path | `/models/Qwen3.8-Flash-Next-hibrid48` |
+| HTTP bind | `127.0.0.1:8000` on Spark5 |
+| Maximum total context | 262144 |
+| Maximum sequences | 64 |
+| Maximum batched tokens | 8192 |
+| KV memory | 41000000000 bytes per rank |
+| GPU memory utilization argument | 0.70; explicit KV allocation remains authoritative |
+| Prefix caching | Enabled; existing sparse retention interval=0 unchanged |
+| Graph mode | `FULL_AND_PIECEWISE` |
+| Graph capture sizes | `[1,2,4,6,8,12,16,18,24,30,32,36,48,60,64,72,96,120,128,144,192,240,256,288,336,384]` |
+| Compilation | Declared range endpoint `[32]`; live resolved `CompilationMode.NONE`, range endpoints `[32,8192]`, graph warmups=1; original behavior preserved |
+| GDN prefill backend | FlashInfer |
+| MoE backend | Marlin |
+| Load format | fastsafetensors |
+| Engram CPU offload | False |
+| Scheduler | Async scheduling enabled |
+| Tool parser | Effective live `qwen3_coder`, auto tool choice enabled |
+| Reasoning parser | `qwen3` |
+| CPU affinity | `5-9,15-19` |
+| Container networking/IPC | Host networking and host IPC |
+| Device/capabilities | All GPUs, `/dev/infiniband`, IPC_LOCK, SYS_PTRACE, unlimited memlock |
+
+The node-local recipe directory is
+`/home/jordi/recipes/qwen38-flash-next-cluster-recipe`.
+Its `models` and `cache` directories are the original read/write `/models` and
+`/cache` bind sources. Preserve these paths and mount permissions in production.
+The staged candidate uses its own temporary cache directory; that diagnostic
+cache path must not be carried into the final production container.
+
+Spark5 had intentional local differences, including its tool parser and a
+launcher library executable bit. Spark6's recipe file and the effective worker
+flags are not necessarily textually identical. Preserve each node's own files;
+do not replace either with a fresh generic upstream recipe.
+
+## Source build and integration map
+
+Public PR checkout on this Mac:
+`/Users/jordiposthumus/SparkSetup/qwen38-gdn-replay-install`.
+Branch: `codex/exact-gdn-replay`, initially based on recipe main `4e4747b`.
+
+The optional directory is `exact-gdn-replay/`:
+
+| File | Purpose |
+|---|---|
+| `csrc/verify.cu` | Native verifier with original arithmetic and compact record writes |
+| `csrc/commit.cu` | Grouped forward commit of accepted and boundary states |
+| `csrc/replay.h` | By-value 36-layer launch table, 1728 bytes |
+| `csrc/ops.cpp` | Registered Torch CUDA operators with explicit tensor inputs, mutation schemas, layout/device guards and current-stream launch |
+| `mbx_gdn_replay/__init__.py` | ABI check, load the built shared library, register fake implementations |
+| `mbx_gdn_replay/runtime.py` | Narrow configuration/dispatch guards, per-layer buffers, per-step metadata lifetime, commit before original postprocess |
+| `install.py` | Hash-guarded, anchored edits to two pinned vLLM Python source files |
+| `source-manifest.json` | Reference commit, hashes, arithmetic/layout contract and attribution |
+| `setup.py` | Native extension wheel build against the exact runtime ABI |
+| `Dockerfile` | Pinned multi-stage build and installation into a derived image |
+| `tests/` | Differential kernels, trajectories, registration, runtime/lifetime and installation guards |
+| `benchmark.py` | Standard-library HTTP measurement harness with fixed request identities and raw result records |
+
+The public recipe's default `recipe.yaml` remains unchanged. Its README links
+to this optional build. This follows the maintainer's prior preference for
+optional additions rather than forcing a new default across all users.
+
+### Registered operators and metadata lifetime
+
+`mbx_gdn_replay::verify` declares mutation of its preallocated output and replay
+record tensors. It does not declare or perform mutation of the input state.
+`mbx_gdn_replay::commit` declares mutation of an explicit list of state tensors.
+Every device allocation used by the commit is supplied as a tensor argument;
+the small pointer table is assembled in C++ and passed by value as kernel
+parameters. No cached GPU tensor of raw pointers is exposed to Torch.
+
+This matters for Torch's schema checking, input cloning, fake execution,
+functionalization, current-stream behavior, and CUDA graphs. A hidden cached
+pointer tensor could refer to obsolete allocations when a subsystem clones
+inputs. The runtime retains strong references only for the current real step,
+clears dummy/profile/capture metadata, and releases the step after committing.
+Retaining profiling metadata can accidentally retain a very large dummy KV
+allocation, so the lifetime test is deliberate.
+
+The production image has no runtime `ctypes` loader, JIT compilation, research
+source bind mount, or `/research` dependency. Build artifacts are an installed
+wheel plus the two guarded integration edits. The original files also remain
+inside the derived image as `.before-mbx-replay` copies for audit/testing.
+
+### Guarded source hashes
+
+| Source | Original SHA-256 |
+|---|---|
+| `model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | `b80f8e6f3fff442fb880aebb3209c52f814f66490009f4ac4003de603576d10a` |
+| `v1/worker/gpu/model_states/mamba_hybrid.py` | `573e130ac5587d4822fabf97adad1ad0fda02ff83c5e70df879a5bb175ae845c` |
+| Native reference `csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu` | `9581d256847b1922b21a54c39086d92da4f402b7310b0e8649e45ec0cae341fe` |
+
+Do not "fix" a hash mismatch by blindly replacing the manifest's expected hash.
+Review the source changes and revalidate the native arithmetic, integration
+ordering, cache layout, graph behavior and API contract first.
+
+## Evidence from the prototype and packaged deployment
+
+The following figures are from the completed research prototype. They are not
+automatically measurements of the subsequently packaged image.
+
+| Workload | Original | Prototype | Interpretation |
+|---|---:|---:|---|
+| C8, roughly 1K-input code, 1024 output tokens | 316.0935 aggregate TPS | 339.6466 aggregate TPS | +23.553 TPS, +7.451%; one matched pair |
+| Approximate C8 per-stream share for that pair | 39.51 TPS | 42.46 TPS | Aggregate divided by eight; not a per-request percentile |
+| Repeated short-code C64 | 809.61 / 801.45 TPS | 1004.46 / 1009.02 TPS | Roughly +25%; do not present as C8 gain |
+| Mixed C16, 512 output tokens | 294.79 / 290.96 TPS | 328.58 TPS | +11.46 / +12.93% against those repeats |
+| Mixed C64, 512 output tokens | 542.84 / 537.10 TPS | 614.86 TPS | +13.27 / +14.48% |
+| Thinking C4, 1024 output tokens | 139.49 TPS | 152.99 TPS | +9.68% |
+| Thinking C16, 1024 output tokens | 285.50 TPS | 321.96 TPS | +12.77% |
+
+These workloads differ in prompt text, length, output budgets, acceptance
+behavior, and cache state. Do not combine them into one universal percentage.
+Profiled batch-16 verifier+commit time fell from approximately 30 ms to 14 ms
+across the affected layers/rank, but batch-one verifier+commit was approximately
+0.2 ms slower. First-token latency was mixed. No energy-saving claim was proven.
+
+Prototype direct correctness evidence included 36 real captured snapshots from
+both ranks, 3132 token outputs, 522 accepted states and 12 intermediate boundary
+states, all bitwise equal. Synthetic replay/group/trajectory/numerical-edge
+tests and memcheck, synccheck, initcheck and racecheck passed in that study.
+Those checks are rerun where relevant for the new operator integration.
+
+Prototype HumanEval base runs scored 160/159/158 out of 164 and candidate runs
+158/159; the unchanged baseline varied too. GSM checks were 62/64 on both arms
+with the same errors. These finite checks did not demonstrate a quality gain or
+establish universal output-sequence identity.
+
+### Long context
+
+The original study tested nine cold and warm full-context requests on both
+arms. All retrievals were correct; warm cache-hit counts matched at 2,335,392
+tokens, and no preemptions occurred. Cold total wall time was 797.05 s original
+versus 801.33 s prototype; warm was 13.895 versus 13.4035 s. These generated only
+64 output tokens and therefore tested capacity/retrieval/cache behavior rather
+than sustained long-context decode. Cold admission peaked at three concurrent
+requests; warm admission reached nine. Do not describe nine cold requests as
+nine simultaneous fully resident long-context decodes.
+
+The new installation protocol uses C8 with **1024 output tokens per request**
+at approximately 8K, 32K, 128K and 260K input, each cold and warm. Actual prompt
+counts, admission, cache hits and output counts must accompany the results.
+"Decode TPS" measured during cold concurrent prefill can include interference
+from other requests' prefill; the warm phase is the cleaner decode comparison.
+
+The initial packaged image `sha256:a782e7086914c93cbafb5765f9d0a629eead3e5d51fd3b98db970a0b7a9ea8ec`
+passed all 76 installed tests independently on Spark5 and Spark6. It
+matches 36 real snapshots, 3132 token outputs, 522 accepted states and 12 boundary
+states bitwise. The four NVIDIA sanitizer tools report zero errors; racecheck
+also reports zero warnings/hazards. Tests include registered-op schema/fake/AOT
+checks, graph replay and a nondefault stream.
+
+Initial validation corrected one empty-input guard: the original native API
+rejects zero verification tokens, so the package now rejects that input too.
+No numerical mismatch was found. An initcheck run with a GDN-only kernel filter
+reported the synthetic index allocation as uninitialized in the original
+kernel. Repeating the same tests **without a kernel filter** tracks Torch's
+index-initialization kernel and reports zero errors. Keep initcheck unfiltered;
+do not suppress an unexplained diagnostic or count the interrupted filtered run
+as a pass. The earlier evidence and logs are retained.
+
+The C++17 build emits two existing Torch-header warnings about C++20 bit-field
+initializers, and the Python tests emit Torch JIT deprecation warnings. These
+are recorded warnings, not failed correctness checks.
+
+The final build is `sha256:8c689aca101820218f3995e93efa4c52c5dd1302765a13d065498ba9d9b65c44`.
+It changes only the logger namespace to `vllm.mbx_gdn_replay`: the original
+package namespace inherited Python's WARNING root level while vLLM's handler
+is INFO. This correction makes enabled/selected evidence visible without
+changing the owner's logging configuration. The native library is byte-identical
+between builds: SHA-256 `03cca6dafc1527f20ad8aea6f4c7efc399be51e0e1d7d26a9d11cc06b9a5eb11`.
+The final suite passed all 76 tests again on each node (18.02 s on Spark5 and
+17.59 s on Spark6).
+
+The first staged live run passed 64 running requests, thinking, tools and five
+prompt-logprob probes. A 262080-token input plus 64-token output reached the full
+262144 boundary, with correct cold/warm retrieval and 0 then 259488 cache-hit
+tokens. Its cold TTFT was 86.350 s and warm TTFT 1.257 s. These are capability
+checks; the staged cache was initially separate and cold.
+
+The final packaged code benchmark is complete at C8: baseline runs
+309.86499 / 310.37040 / 318.14790 aggregate TPS versus final-image runs
+350.05906 / 343.31238 / 339.37215 TPS. Means are **312.79443 → 344.24786 TPS,
++31.45344 TPS or +10.0556%**. Pooled throughput is 312.74886 → 344.19152 TPS
+(+10.0536%). Individual paired gains span 6.6712–12.9715%. All request hashes,
+prompt counts and 1024-token output counts match; all arms have zero prefix hits
+and zero preemptions. Each run has 16 requests at eight in flight. Approximate
+per-stream capacity share is 39.10 → 43.03 TPS, not a latency percentile.
+
+The three mixed runs are also complete: original 229.75782 / 225.07539 /
+229.52767 TPS versus candidate 244.75373 / 242.18055 / 242.76363 TPS. Means are
+**228.12029 → 243.23264 TPS, +6.6247%** (pooled +6.6321%). Each run sent 32
+requests, C8, exactly 1024 output tokens each. Paired gains span 5.7666–7.5997%.
+
+The three thinking runs preserved reasoning and measured original 176.23058 /
+178.91144 / 179.41506 TPS versus candidate 192.50483 / 194.93378 / 196.00514 TPS.
+Means are **178.18570 → 194.48125 TPS, +9.1453%** (pooled +9.1458%). Each run
+sent 16 requests, C8, exactly 1024 output tokens each. Paired gains span
+8.9555–9.2468%. All mixed/thinking payload hashes and token counts match, with
+zero errors, prefix-hit tokens and preemptions in both arms.
+
+Combined accepted draft tokens per draft changed 3.49749 → 3.51210 for code,
+2.85354 → 2.85657 for mixed, and 1.84350 → 1.84680 for thinking. Acceptance and
+dynamic batching are allowed to vary; throughput is an end-to-end observation.
+All baseline timing ran before candidate timing, not in randomized alternating
+order. Mid-short-workload GPU clocks were 2184/2190 MHz in both arms and
+temperatures 66–68 °C. First-token latency was mixed; no universal TTFT gain is
+claimed. Three repeats do not establish a statistical confidence interval.
+
+## Long context at concurrency eight
+
+Each phase sent eight requests with exactly 1024 generated tokens each. Cold
+and warm phases reused the same measured payloads in both arms. C8 is offered
+client concurrency; cold prefill admission is dynamic and does not imply that
+eight requests were decoding simultaneously throughout the cold phase.
+
+| Input size | Phase | Original aggregate TPS | Packaged aggregate TPS | Change | Cache-hit tokens in each arm |
+|---|---|---:|---:|---:|---:|
+| 8K | cold | 137.647 | 145.199 | +5.49% | 0 |
+| 8K | warm | 172.762 | 183.180 | +6.03% | 39,168 |
+| 32K | cold | 67.869 | 68.708 | +1.24% | 0 |
+| 32K | warm | 183.501 | 193.932 | +5.68% | 248,064 |
+| 128K | cold | 21.716 | 21.777 | +0.28% | 0 |
+| 128K | warm | 167.410 | 181.108 | +8.18% | 1,031,424 |
+| 260K | cold | 11.040 | 11.022 | -0.16% | 0 |
+| 260K | warm | 156.821 | 168.220 | +7.27% | 2,062,848 |
+
+Actual input token ranges: 8K: 8136–8142; 32K: 32657–32663; 128K: 130858–130864; 260K: 260058–260064.
+
+All paired payload hashes and input/output counts match. There were zero
+request errors and zero preemptions. Each arm has 256 measured requests across
+the 17 cases (512 requests total), excluding warmups.
+
+Warm throughput improved 5.68–8.18% across these lengths. Cold 32K/128K/260K
+end-to-end throughput was approximately flat (+1.24%, +0.28%, −0.16%): unchanged
+prefill dominates those jobs. The 260K cold runs took 742.055 and 743.217 seconds.
+These single matched long-context pairs do not establish small differences as
+repeatable effects. The change does not accelerate prefill.
+
+The public `exact-gdn-replay/measurements.json` include wall times, token
+counts, TTFT/TPOT statistics, cache hits, draft acceptance and exact-output
+sequence counts. Whole-server output identity is separate from native-state
+bitwise correctness.
+
+The final staged mixed-prefill/decode stress suite passed all 17 cases, including
+three cancelled streams and a fresh correct retrieval after slot reuse. Four
+generated-prefix cases (1628, 1631, 3260, 3263 input plus 1800 generated tokens)
+had correct follow-ups and cold controls, with identical answer token sequences.
+First follow-ups missed and second follow-ups hit 1632/3264 tokens, matching the
+unchanged original policy. All five validation-client phases completed with
+exit code zero at 13:31:08 UTC; the formal staging gate passed at 13:31:57 UTC.
+
+Final production validation used the original model/cache mounts on both nodes.
+Both live configurations matched the saved originals except the derived image,
+enable flag and descriptive/ownership labels; each node's recipe differed only
+in its image value. The original containers remained stopped and intact.
+All other recorded recipe files, file permissions and eight bundled patch files
+per node were preserved. Installed native and Python package hashes matched the
+tested public sources. Both ranks enabled and selected all 36 GDN layers.
+
+On this final production pair, thinking/tool checks and five prompt-logprob
+probes passed, a peak of 64 running requests was observed, and cold/warm requests
+both reached 262144 total tokens with correct retrieval. Cold prefix hits were
+zero and warm hits were 259488 tokens. TTFT was 86.283 seconds cold and 1.209
+seconds warm. The 41 GB KV allocation per rank and 2,450,356-token KV pool remained
+unchanged. These are capability/cache checks, not throughput-gain estimates.
+
+The final configuration audit completed at 13:36:52 UTC; the full capability
+suite completed at 13:38:10 UTC. Logs resolved `CompilationMode.NONE`,
+`FULL_AND_PIECEWISE` graphs, 262144 context, 64 sequences, 8192 batched tokens,
+five probabilistic MTP drafts with block rejection, FlashInfer prefill,
+Marlin MoE, and the original tool/reasoning parsers. The normal HTTP endpoint
+remains Spark5's `127.0.0.1:8000`; gateway routing and drain status were not
+changed by this kernel installation.
+
+
+After the final switch to the original production cache mounts, a separate C8
+code confirmation measured **334.465 aggregate TPS**, versus 309.865 TPS for its
+matched original case (**+7.94%**). Payload hashes and token counts matched, with
+zero errors, prefix hits and preemptions. This one confirmation does not replace
+the three-run staging mean; the observed run-to-run spread remains relevant.
+
+All final client phases completed with exit code zero at **13:39:10 UTC**.
+The installed pair is left running. The private deployment state is
+`production_validated`; no benchmark request overrides were added to a launcher. The last
+read-only receipt at **13:44:55 UTC** confirmed HTTP health, zero running/waiting
+requests, and both expected optimized container/image IDs still running;
+see `installation/results/final-live-receipt.json`.
+
+## Measurement protocol and reproducibility
+
+Private installation driver:
+`qwen-lossless-research-20260930/installation/run_c8_suite.py`.
+On Spark5 this is staged under `/research/scripts/` in a CPU-only measurement
+container, using host networking and CPU affinity 0,1. It drives the server by
+HTTP and does not require GPU access or a model mount.
+
+Short tests: three repetitions each of mixed prompts (32 requests) and thinking
+prompts (16 requests), at C8. Long tests: eight requests per phase, C8, cold then
+warm, with repeat counts 202/815/3270/6500 for the named context lengths.
+Each arm uses exactly the same case/payload identities. All outputs are saved.
+
+The throughput workload uses temperature zero, fixed per-request seed,
+top-p=0.95, top-k=20, and **request-local `ignore_eos=True`** to produce equal
+1024-token output budgets. This is a benchmark setting, not a server setting
+and not a quality score. It must not enter the production launcher. Cold cases
+use one distinct warmup request; warm cases reuse identical measured prompts
+without another warmup. Keep raw payload hashes, actual token counts, metrics,
+errors, cache hits, preemptions and wall times for fair comparison.
+
+No builds, GPU microbenchmarks, sanitizer tests or unrelated server traffic
+should overlap a serving performance measurement. Run one arm at a time and
+record clocks, thermals and memory. Do not silently change clock/network/CPU
+settings between arms. Report run spread rather than presenting three repeats
+as a rigorous confidence interval.
+
+## Deployment and rollback records
+
+Private lifecycle implementation:
+`qwen-lossless-research-20260930/installation/deployment.py`.
+It clones the complete original Docker `Config` and `HostConfig` through the
+Docker API, checks all intended differences, and never deletes a container.
+Private JSON snapshots contain launch/environment data and should not be
+published in the PR or copied into a public issue.
+
+Intended candidate changes: derived image, explicit
+`MBX_EXACT_GDN_REPLAY=1`, descriptive ownership/image labels, and—only during
+staging—a separate cache bind source. The final production containers use
+the original model/cache binds with their original read/write semantics and all
+original arguments, environment values, capabilities, affinity and network
+settings. Only each node-local recipe's `server.image` value changed; other
+bytes and local patches were preserved.
+
+Timestamped backups, image IDs, container IDs, exact recipe hashes, rollback
+names and deployment status are recorded in `installation/deployment-state.json`,
+`installation/deployment-events.jsonl`, and
+`installation/backups/20260930T122150Z/`. The final configuration audit is
+`installation/results/packaged-production-audit-001/summary.json`. Remote backups live below
+`/home/jordi/qwen-exact-gdn-install-20260930/backups/`.
+
+The backup timestamp is `20260930T122150Z`; each node has a private snapshot in
+`/home/jordi/qwen-exact-gdn-install-20260930/backups/20260930T122150Z`.
+Docker normalizes `HostConfig.OomKillDisable` from null to false on creating a
+container; both express the default policy of not disabling the OOM killer.
+This metadata normalization is explicitly checked. Resource limits are unchanged.
+The private rollback helper waits for more than 100 GiB of available unified
+memory before starting the original pair, just as the forward switch does.
+This prevents a restart from racing delayed GPU memory release after shutdown.
+The helper is specific to this recorded deployment, including image IDs and
+ownership labels. If someone later recreates the canonical service with the
+normal launcher or changes its configuration, inspect that new state and adapt
+the rollback deliberately; do not bypass a failed identity check.
+
+The original image remains available. Original container IDs before deployment:
+
+- Spark5: `e22fc7e64ab1c565ad62827779fdc2685b89eac1f2106b52205f2786496c49b8`
+- Spark6: `a6f5f98729dd2a4ea5c0062df42b7cea50aaae14d681458f2d773b5c7e39274e`
+
+Do not invoke the root recipe's normal `run.sh` blindly when preserving the
+original containers: that launcher can remove containers with the canonical
+name. The installation workflow first retains them under timestamped backup
+names and gives the new pair the canonical names.
+
+The final promotion completed at **13:32:53 UTC on 2026-09-30**. Both nodes now
+use the canonical name `qwen38-flash-next-cluster` for the optimized pair. Each
+original was retained as
+`qwen38-flash-next-cluster-before-exact-20260930t122150z`.
+
+| Node | Final container ID | Final recipe SHA-256 |
+|---|---|---|
+| Spark5 | `638aead615a96c4455d772abde9525e903c79baabcb7bbdf74d797a1813d7780` | `0a28ec54b477502e04db7a56c5c01a3d20d73f44ac71417cefb40c438b658ae6` |
+| Spark6 | `a10cac9125bfe0ce3a229d1f8f83c683f32a8a18cb1c6607830f8da802bfcd18` | `797f814bde9afa5a7631fe00fa7269fbb4cec5282704f000705a5e03b0c5f389` |
+
+Both use image
+`qwen38-flash-next-cluster-vllm:exact-gdn-replay-v1`, ID
+`sha256:8c689aca101820218f3995e93efa4c52c5dd1302765a13d065498ba9d9b65c44`.
+The exact recipe delta was one image-value replacement per node. The original
+cache source is `/home/jordi/recipes/qwen38-flash-next-cluster-recipe/cache`;
+the original models source is the same directory's `models` subdirectory.
+Both bind destinations and read/write semantics are retained. No research
+source directory is mounted into either production server.
+
+Read-only status from the local control machine:
+
+```bash
+cd /Users/jordiposthumus/SparkSetup
+python3 qwen-lossless-research-20260930/installation/deployment.py status
+ssh Spark5 'curl -fsS http://127.0.0.1:8000/health'
+ssh Spark5 'docker logs --tail 40 qwen38-flash-next-cluster'
+ssh Spark6 'docker logs --tail 40 qwen38-flash-next-cluster'
+```
+
+For an owner-authorized rollback of this recorded deployment, first confirm the
+pair is idle and that the helper's identity/configuration preconditions still
+apply. Then the private controller can perform the reversible restoration:
+
+```bash
+cd /Users/jordiposthumus/SparkSetup
+python3 qwen-lossless-research-20260930/installation/deployment.py rollback
+```
+
+It retains the optimized containers, restores original names and the exact
+backed-up recipe text, waits for unified memory to be released, and starts the
+original pair. Follow with direct health, configuration and capability checks;
+`original_restored_unvalidated` is deliberately not a successful validation
+claim. The unchanged original pair was previously restarted and validated
+before this installation's baseline measurements. The final deployment's new
+rollback command has been reviewed and its retained identities/backups checked;
+it has not been rehearsed by interrupting the final production pair.
+
+The inspected normal launcher tries `docker pull` and then accepts a successful
+`docker image inspect` if the pull fails. Thus the local built tag is usable on
+future normal launches when it exists on both nodes; there is no need to publish
+an image or change the launcher. A failed registry pull for this local tag can
+be expected before that local-image check succeeds. The upstream launcher
+starts the head then worker; the private staged switch used worker then head,
+with the worker waiting for rendezvous. Both reached the validated TP2 service.
+
+The final image logged 36 enabled layers at 12:44:04 UTC and 36 selected layers
+at 12:44:41 UTC on both nodes. Selection occurred during startup warmup before
+HTTP health, so it is not a per-HTTP-request trace. Real serving tests, installed
+source/dispatch checks and kernel differential evidence are separate from those
+activation lines.
+
+## Applying this to another system
+
+First inspect that system's actual image digest, Torch/CUDA ABI, GPU capability,
+model architecture, TP/PP topology, state and activation types, GDN backend,
+speculation, block size, cache mode, sequence limits, local launch patches,
+available memory, and active workload. Compare them to the contract above.
+Do not reduce or overwrite the other system's settings to make the guards pass.
+
+If the system is the same supported two-GB10 stack, use the same verified image
+on both ranks, verify its ID, preserve local configuration, snapshot and retain
+the original pair, drain requests, stage, run the differential tests and direct
+behavioral checks, benchmark its real workload, and only then select the new
+image for normal launches. The extra 325.3 MiB per rank must fit without reducing
+the existing KV allocation, context, concurrency, cache retention, or reliability.
+
+If architecture, precision, backend, source version, shapes or cache lifecycle
+differ, this package is not a validated drop-in. A port needs a fresh arithmetic
+and integration review. In particular, a Triton backend, SiLU gate, different
+state dtype, log-decay replay format, different speculative width, LoRA,
+recoverssm mode, different block/cache mode, single-device deployment, or
+different TP/PP layout is outside the current runtime contract. Do not bypass
+the guards and assume the numerical result remains lossless.
+
+## Debugging guide
+
+| Symptom | First checks and interpretation |
+|---|---|
+| Build rejects source hash | Confirm the exact pinned base digest and compare source changes; do not just update hashes |
+| ABI/load error | Confirm Torch `2.13.0+cu130`, CUDA 13.0, arm64 build, matching derived image on both ranks and installed `_C.so` |
+| No replay-enabled log | Check environment and every runtime compatibility guard; unsupported config should keep original behavior and log the reason generally |
+| Enabled log but no selection log | Exercise a real pure speculative decode; prefill/mixed batches intentionally keep original dispatch |
+| Health passes but performance unchanged | Confirm real selection, C8 payload identity, output token counts, cold/warm cache state, acceptance rates, prefill share and competing work |
+| Memory pressure | Check extra replay allocation, KV bytes unchanged, dummy/profile metadata lifetime, live process ownership and unified-memory release after stops |
+| Graph/capture issue | Use operator registration/fake/AOT and CUDA graph tests; examine metadata lifetime and current-stream use; do not disable graphs silently |
+| Prefix mismatch | Check accepted counts, request mapping, computed-token positions, boundary calculation and commit-before-native-postprocess ordering |
+| Output mismatch | Reproduce against pinned original native kernel with real captured tensors; compare raw FP32/BF16 bits, source hash, compile flags and operation ordering |
+| Apparent full-text change | Repeat baseline under identical conditions, inspect sampling/acceptance, then use state/logprob evidence; baseline nondeterminism is not proof that a kernel mismatch is harmless |
+| Restart/launch failure | Check both node image IDs and original full launch/network settings, then retained original rollback pair; never silently lower capacity to make startup succeed |
+
+For prefix-cache diagnosis, include the real asynchronous output hook and
+established sparse retention policy. An earlier research fixture omitted that
+hook and initially suggested a cache bug; it was corrected and the bug claim
+withdrawn. Do not resurrect that disproven finding from intermediate files.
+Generated-prefix tests deliberately cross 1632/3264 boundaries and compare
+cached continuations with cold recomputation.
+
+Interpret the generated-prefix fixture carefully: in the earlier matched
+baseline and candidate, the first follow-up missed and the second follow-up
+hit 1632 or 3264 tokens. This matches the established sparse retention policy.
+That second hit follows a recomputing prefill on the first follow-up; it is not
+proof that the initial generation's speculative boundary state was directly
+reused. The direct bitwise boundary-state checks, native cache trajectories
+and real captured-state comparisons provide the separate kernel-state evidence.
+
+## Evidence locations and confidentiality
+
+- Research root: `/Users/jordiposthumus/SparkSetup/qwen-lossless-research-20260930`.
+- Final research account: `final-report.txt`, `ledger.jsonl`, and `review-package/`.
+- New installation plan and scripts: `installation/`.
+- New raw measurement/results on Spark5: `/home/jordi/qwen-lossless-research-20260930/installation/results/`.
+- Original inventory and prior restoration proofs: `results/restored-inventory-001/` and `results/restored-original-001/`.
+- Private real-input snapshots: `real-snapshots/{Spark5,Spark6}/real-gdn-capture-002/`.
+- Source/build provenance and public tests: the separate `qwen38-gdn-replay-install` checkout.
+
+Keep raw model tensors, Docker environment snapshots, cluster configuration and
+private access details out of GitHub. Publish only synthetic tests, source
+provenance, reproducible harnesses and appropriately curated measurement data.
+
+## Maintainer and upstream credit
+
+The recipe maintainer assembled and documented a difficult two-GB10 serving
+stack exceptionally carefully. Its readable patches, measured configuration,
+explanations and working baseline made this investigation possible. Preserve
+that credit and thank the maintainer generously in the PR.
+
+Compact GDN replay is also being developed in vLLM PRs
+[#59366](https://github.com/vllm-project/vllm/pull/59366) and
+[#58863](https://github.com/vllm-project/vllm/pull/58863). The inspected heads were
+`285e578f9e6d955e91abb2f08651db025fb26c72` and
+`3388ba1a254d1f308c54f0bdec102866fe38d24b`. Full-graph support and ordered alias
+handling already appear in that work; do not claim those ideas as new here.
+The narrow contribution is the pinned native FP32 actual-decay arithmetic
+contract, forward commit, evidence and maintainable recipe-specific packaging.
+
+No formal CONTRIBUTING document or PR template was found in the recipe. The
+prior contribution in PR #2 was incorporated through the optional patch
+framework; this addition likewise remains opt-in.
+The owner specifically requested a public fork. It has been created and GitHub
+reports `fork=true`, `private=false`, `visibility=public`, parent
+`myllmbox/qwen38-flash-next-cluster-recipe`:
+https://github.com/JordiPosthumus/qwen38-flash-next-cluster-recipe.
+The published branch is `codex/exact-gdn-replay`; the PR targets the original
+repository's `main` branch. Private installation snapshots and model tensors
+were excluded from the public commit.
+
+Public upstream PR: [myllmbox PR #3](https://github.com/myllmbox/qwen38-flash-next-cluster-recipe/pull/3).
+It is open, non-draft and reported mergeable at submission. Its head is the
+public fork's `codex/exact-gdn-replay` branch, commit
+`8a9cbe2573627e1e32971afbf5e0221e3e8354a4`, targeting upstream `main`.
+The [fork source-check workflow](https://github.com/JordiPosthumus/qwen38-flash-next-cluster-recipe/actions/runs/36723536961)
+passed on that exact commit. At the final check, the PR reported no separate
+upstream status-check entries; do not imply maintainer approval or merge.
+Maintainer review remains external and pending.
+
+The PR explicitly records the owner-configured approximately **2.2 GHz
+underclock** and observed 2184/2190 MHz SM clocks, both repeat averages and the
+separate final production confirmation, the long-context distinction, test
+scope, memory cost, limitations, and substantial appreciation for the maintainer.
+
+## Gate Genie prompt
+
+The complete copyable prompt is saved alongside this document at
+`/Users/jordiposthumus/SparkSetup/GATE-GENIE-QWEN-EXACT-GDN-PROMPT-20260930.txt`.
+Read it together with this handoff and begin with read-only inspection. This
+installation does not authorize changes to other systems without the owner's
+requested target and scope.
+
+A next research direction would be lossless improvements to long-context
+prefill, particularly avoidable memory traffic or kernel-launch overhead after
+profiling the actual workload. This is an unmeasured research hypothesis; no
+second optimization has been installed or promised.

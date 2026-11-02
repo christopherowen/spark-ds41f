@@ -74,9 +74,31 @@ instrumentation / `-1`→`0` control patches. Raw receipts are under
 ## Status
 
 The host-sync patch is the validated diagnosis/fix used on our rings. The
-upstream review asks for a device-side clamp so the pinned non-blocking test
-stays green; that is the intended merge form. This record is the repro for the
-host-sync diagnosis.
+upstream review (#855) holds the non-blocking D2H invariant, so the merge form
+is the device-side clamp in `repro/patches/0004-device-clamp.patch` (same
+candidate-37 base; it supersedes 0001 rather than stacking on it):
+`CopyDrafter.propose` zeroes confidence past the device limit, and the combine's
+dead-row gate writes the last sampled token for rows past the cut. The host sync
+is reverted; the pinned `test_stale_wide_allocation_...` path stays non-blocking.
+
+Validated on ring2 (candidate-37, TP3, direct,
+`SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`):
+
+- `tests/v1/spec_decode/test_copy_drafts.py`: **22 passed**, including the
+  pinned no-sync test.
+- `tests/v1/core/test_copy_drafts_scheduler.py`: **11 passed**.
+- m=8 copy-dense workload (8 concurrent, 10,456-token prompt, 256 completion):
+  **159.90 output tok/s** vs **126.05** on the host-sync arm; no engine assert
+  and no non-finite MoE gate in the head log.
+- The device profile is `config/site-cand37-ring2-copy8-device.local.json`;
+  the device files are mounted over `copy_drafts.py` and `tilelang_inputs.py`
+  on all three ranks.
+
+Open: the clamp covers the dead-row path, which is the production recipe. The
+non-dead-row combine path still has no limit/padding mask, so the review's
+"with or without dead rows" is only half-covered. The paired lab suite and the
+NaN-producer diagnostic are not yet run. The host-sync ring remains the fallback
+if the device arm regresses.
 
 ## Integration
 

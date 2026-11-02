@@ -1,0 +1,100 @@
+From a3a09856b8c58a2bc656cb7793914f435517b703 Mon Sep 17 00:00:00 2001
+From: dev <dev@localhost>
+Date: Mon, 2 Nov 2026 17:37:54 -0400
+Subject: [PATCH] spec_decode: clamp stale draft rows on device
+
+---
+ tests/v1/spec_decode/test_copy_drafts.py      |  5 ++-
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py |  8 +++++
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 31 +++++++++++--------
+ 3 files changed, 30 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee92..4a12f2c 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -879,11 +879,14 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+ 
+     # Step t proposes 8 copy drafts (columns 0..7) and pads columns 8..15 with -1.
+     drafter.prepare_alloc(idx, one, zero, None)
+-    drafts, _, _ = drafter.propose(
++    # A stale/never-written confidence tail must not survive the clamp.
++    drafter.confidences[0, INITIAL:] = 0.9
++    drafts, confs, _ = drafter.propose(
+         idx, dspark_drafts, dspark_conf, one, zero, None, matched=True
+     )
+     assert int(drafter.int_state[slot, 1]) == INITIAL
+     assert (drafts[0, INITIAL:] == -1).all()
++    assert (confs[0, INITIAL:] == 0).all()
+ 
+     # Step t+1 was scheduled with 16 draft slots from an earlier wide allocation.
+     # Even if the target argmax at column 8 (and beyond) is token 0, the -1
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30..5fdf23e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -278,4 +278,12 @@ class CopyDrafter:
+             self.min_match,
+             self.initial,
+         )
++        # Device-side clamp: rows past the current proposal's valid count must
++        # never reach the gate, even when the host's async mirror is stale.
++        limits = self.slot_draft_limits.gpu[idx_mapping.clamp_min(0)]
++        cols = torch.arange(drafts.shape[1], device=drafts.device)
++        valid = idx_mapping >= 0
++        confidences.masked_fill_(
++            (cols[None, :] >= limits[:, None]) & valid[:, None], 0.0
++        )
+         return drafts, confidences, planned
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 436c94e..6f396e2 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -1482,19 +1482,6 @@ def combine_sampled_and_draft_tokens_kernel(
+                 T.cast(query_end - num_logits + j, T.int64), j < num_logits,
+             )  # fmt: skip
+         decoding = seq > prefill
+-        if num_new > 0:
+-            # Keep prompt-tail slots; only generated-token slots take it.
+-            T.call_extern(
+-                "handle", "vllm_store_if_b32",
+-                T.address_of(input_ids[query_end - num_logits]), T.cast(last, T.int32),
+-                decoding & (seq - num_logits >= prefill),
+-            )  # fmt: skip
+-        for j in T.unroll(drafts):
+-            T.call_extern(
+-                "handle", "vllm_store_if_b32",
+-                T.address_of(input_ids[query_end - num_drafts + j]),
+-                T.cast(tokens[j], T.int32), decoding & (j < num_drafts),
+-            )  # fmt: skip
+         if dead_rows:
+             # Requests without drafts are never clamped.
+             cut = T.alloc_var(T.int32, init=block + 1)
+@@ -1520,6 +1507,24 @@ def combine_sampled_and_draft_tokens_kernel(
+                     if j < num_drafts and j >= cut:
+                         is_padding[query_end - num_drafts + j] = T.uint8(1)
+             dead_cut[b] = cut
++        if num_new > 0:
++            # Keep prompt-tail slots; only generated-token slots take it.
++            T.call_extern(
++                "handle", "vllm_store_if_b32",
++                T.address_of(input_ids[query_end - num_logits]), T.cast(last, T.int32),
++                decoding & (seq - num_logits >= prefill),
++            )  # fmt: skip
++        for j in T.unroll(drafts):
++            value = tokens[j]
++            if dead_rows:
++                # Rows past the live cut are padding; give them a valid id so
++                # the embedding cannot see the -1 placeholder.
++                value = T.if_then_else(j < cut, value, last)
++            T.call_extern(
++                "handle", "vllm_store_if_b32",
++                T.address_of(input_ids[query_end - num_drafts + j]),
++                T.cast(value, T.int32), decoding & (j < num_drafts),
++            )  # fmt: skip
+ 
+     if not dead_rows:
+ 
+-- 
+2.56.0
+
