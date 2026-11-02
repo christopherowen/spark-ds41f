@@ -968,12 +968,72 @@ def site_node_problems(cluster: dict, nodes: dict) -> list[str]:
     ]
 
 
+def image_content_identity(image: dict) -> dict:
+    """Store-independent identity of the filesystem and runtime configuration.
+
+    Docker's containerd and overlay2 stores can give a faithful copy different
+    image IDs. The ordered layer digests and image Config survive that copy.
+    """
+    rootfs = image.get("RootFS")
+    layers = rootfs.get("Layers") if isinstance(rootfs, dict) else None
+    if not isinstance(layers, list) or not layers or any(
+        not isinstance(layer, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", layer)
+        for layer in layers
+    ):
+        raise ValueError("running image has no valid ordered layer digests")
+    config = image.get("Config")
+    if not isinstance(config, dict):
+        raise ValueError("running image has no runtime Config")
+    if config.get("Labels") is not None and not isinstance(config["Labels"], dict):
+        raise ValueError("running image has invalid source labels")
+    content = json.dumps({"layers": layers, "config": config}, sort_keys=True, separators=(",", ":"))
+    return {
+        "image_layers": layers,
+        "image_content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def read_running_image(nodes: dict, node: dict, image_id: str | None) -> dict:
+    """Inspect only the immutable image named by the container, never its tag."""
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise ValueError("cannot read the serving container's immutable image ID")
+    result = run_ssh(nodes, node, "docker", "image", "inspect", image_id)
+    if result.returncode:
+        raise ValueError(f"cannot inspect running image {image_id}")
+    try:
+        images = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("cannot decode the running image inspection") from error
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise ValueError("running image inspection must contain one image")
+    image_content_identity(images[0])
+    return images[0]
+
+
+def running_image_problems(cluster: dict, images: dict[str, dict]) -> list[str]:
+    """Validate captured running images against the profile and one another."""
+    problems = []
+    reference = None
+    for node, image in images.items():
+        content = image_content_identity(image)["image_content_sha256"]
+        labels = image["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"]["expected_labels"].items():
+            if labels.get(key) != wanted:
+                problems.append(f"{node}: running image label {key}={labels.get(key)!r}, expected {wanted!r}")
+        if reference is None:
+            reference = (node, content)
+        elif content != reference[1]:
+            problems.append(f"{node}: running image layers or runtime Config differ from {reference[0]}")
+    return problems
+
+
 def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     """Findings about the live cluster: errors, and Warn for the minor ones."""
     site_problems = site_node_problems(cluster, nodes)
     if site_problems:
         return site_problems
     problems: list[str] = []
+    running_images = {}
     trial_path = kernel_policy_path(cluster)
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
     kernel_inventories = {}
@@ -1060,18 +1120,18 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         wanted_command = expected_command(cluster, node)
         if actual_command != wanted_command:
             problems.append(f"{node['name']}: vLLM command differs from promoted config")
-        # The container's own image, not the configured tag: its Config.Env is
-        # what the container inherited.
-        image_result = run_ssh(nodes, node, "docker", "image", "inspect", inspection["Image"])
-        if image_result.returncode:
-            problems.append(f"{node['name']}: cannot inspect the container's image environment")
+        try:
+            image = read_running_image(nodes, node, inspection.get("Image"))
+        except ValueError as error:
+            problems.append(f"{node['name']}: {error}")
             continue
+        running_images[node["name"]] = image
         problems.extend(
             environment_problems(
                 node["name"],
                 expected_environment(cluster, node),
                 inspection["Config"]["Env"],
-                json.loads(image_result.stdout)[0]["Config"].get("Env"),
+                image["Config"].get("Env"),
             )
         )
         problems.extend(
@@ -1082,23 +1142,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
                 nodes, node, "sh", "-c", "grep -H . /sys/devices/system/cpu/cpu[0-9]*/cpu_capacity").stdout)
             problems.extend(cpuset_problems(node["name"], configured_cpuset(cluster),
                                             inspection["HostConfig"].get("CpusetCpus") or "", capacities))
-        label_result = run_ssh(
-            nodes,
-            node,
-            "docker",
-            "image",
-            "inspect",
-            cluster["container"]["image"],
-        )
-        if label_result.returncode:
-            problems.append(f"{node['name']}: cannot inspect image labels")
-            continue
-        labels = json.loads(label_result.stdout)[0]["Config"].get("Labels") or {}
-        for key, wanted in cluster["container"]["expected_labels"].items():
-            if labels.get(key) != wanted:
-                problems.append(
-                    f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
-                )
+    problems.extend(running_image_problems(cluster, running_images))
     if trial:
         problems.extend(kernel_readiness.alignment(kernel_inventories))
         if corrections:

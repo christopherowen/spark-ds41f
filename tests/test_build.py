@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -175,6 +178,113 @@ class LockWithoutB12xTest(unittest.TestCase):
             self.assertIn("local.spark-ds41f.vllm.tree", text)
             self.assertIn("arm notes cite vllm tree 88468fc7, expected 354fd6e6", text)
             self.assertIn("arm notes cite vLLM 0568..0636", text)
+
+
+class BuildEvidenceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        root_patch = mock.patch.object(spark, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        self.relative = "experiments/candidate-99"
+        self.directory = self.root / self.relative
+        self.directory.mkdir(parents=True)
+        self.lock_path = f"{self.relative}/upstreams.lock.json"
+        self.old = "1" * 40
+        self.new = "2" * 40
+        self.write("source.json", {"vllm": {
+            "base_revision": self.new, "patch_head": self.new,
+            "expected_tree": self.new, "patchset_sha256": "old fingerprint",
+        }})
+        self.write("upstreams.lock.json", {
+            "source_manifest": f"{self.relative}/source.json",
+            "sources": {
+                "vllm": {"revision": self.new, "patch_head": self.old,
+                         "expected_tree": self.old, "patchset_sha256": "old fingerprint"},
+                "nccl": {"revision": self.old},
+            },
+        })
+
+    def write(self, name: str, value: dict) -> Path:
+        path = self.directory / name
+        path.write_text(json.dumps(value, indent=1) + "\n")
+        return path
+
+    def test_refresh_keeps_result_identity_and_verdict_bytes(self) -> None:
+        results = self.write("results.json", {
+            "patch_head": self.old, "expected_tree": self.old,
+            "patchset_sha256": "measured fingerprint", "total_patches": 10,
+            "image_digest": "sha256:measured-image",
+            "kernel_local_verdict": {"passed": True, "seconds": 191.06},
+        })
+        verdict = self.write("verdict.json", {"passed": True, "image": "sha256:measured-image"})
+        before = {path: path.read_bytes() for path in (results, verdict)}
+
+        updated = spark.sync_lock_and_arms(self.lock_path)
+
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertNotIn(path.relative_to(self.root).as_posix(), updated)
+        # The new inputs still advance, so the old receipt remains visibly different.
+        lock = json.loads((self.directory / "upstreams.lock.json").read_text())
+        self.assertEqual(lock["sources"]["vllm"]["expected_tree"], self.new)
+        self.assertNotEqual(json.loads(results.read_text())["expected_tree"],
+                            lock["sources"]["vllm"]["expected_tree"])
+
+    def test_sibling_receipt_notes_are_not_treated_as_arm_configuration(self) -> None:
+        notes = f"Measured vLLM patch head {self.old[:8]}, tree {self.old[:8]}."
+        receipt = self.write("results.json", {
+            "notes": notes, "container": {"expected_labels": {
+                "local.spark-ds41f.vllm.tree": self.old,
+            }}, "serve_args": [], "passed": True,
+        })
+        verdict = self.write("verdict.json", {"notes": notes, "passed": True})
+        measurements = self.write("measurements.json", {"notes": notes, "seconds": 191.06})
+        before = {path: path.read_bytes() for path in (receipt, verdict, measurements)}
+        arm = self.write("tp3.json", {
+            "notes": notes, "upstreams_config": self.lock_path, "serve_args": [],
+            "container": {"expected_labels": {"local.spark-ds41f.vllm.tree": self.old}},
+        })
+        overlay = self.write("tp3-dev.json", {
+            "notes": notes, "extends": {"config": f"{self.relative}/tp3.json"},
+        })
+
+        updated = spark.sync_lock_and_arms(self.lock_path)
+
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+            self.assertNotIn(path.relative_to(self.root).as_posix(), updated)
+        for path in (arm, overlay):
+            self.assertIn(path.relative_to(self.root).as_posix(), updated)
+            self.assertIn(self.new[:8], json.loads(path.read_text())["notes"])
+        self.assertEqual(json.loads(arm.read_text())["container"]["expected_labels"]
+                         ["local.spark-ds41f.vllm.tree"], self.new)
+
+    def test_overlay_refresh_updates_nested_labels_and_respects_its_lock(self) -> None:
+        notes = f"vLLM patch head {self.old[:8]}, tree {self.old[:8]}."
+        overlay = {
+            "notes": notes, "extends": {"config": "releases/previous/cluster.json"},
+            "set": {"upstreams_config": self.lock_path,
+                    "container": {"expected_labels": {"local.spark-ds41f.vllm.tree": self.old}}},
+        }
+        current = self.write("tp3.json", overlay)
+        other = copy.deepcopy(overlay)
+        other["set"]["upstreams_config"] = "experiments/another/upstreams.lock.json"
+        unrelated = self.write("tp3-other.json", other)
+        before = unrelated.read_bytes()
+
+        updated = spark.sync_lock_and_arms(
+            self.lock_path, arm_paths=[unrelated.relative_to(self.root).as_posix()])
+
+        refreshed = json.loads(current.read_text())
+        self.assertIn(current.relative_to(self.root).as_posix(), updated)
+        self.assertEqual(refreshed["set"]["container"]["expected_labels"]
+                         ["local.spark-ds41f.vllm.tree"], self.new)
+        self.assertIn(self.new[:8], refreshed["notes"])
+        self.assertEqual(unrelated.read_bytes(), before)
+        self.assertNotIn(unrelated.relative_to(self.root).as_posix(), updated)
 
 
 class PackageStructureTest(unittest.TestCase):

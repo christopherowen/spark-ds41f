@@ -69,6 +69,14 @@ rebuilds only what is missing or wrong. It writes `inputs.json` last, so an
 interrupted run is never mistaken for a complete one. `check` recomputes each
 context's digest.
 
+**Measured evidence:** `prepare --lock` refreshes build identifiers in the lock,
+source manifest and arm configurations. It leaves results and verdict receipts
+unchanged, including their source identifiers, image digests and notes. A source
+change needs new test and benchmark receipts for that build; an earlier passing
+result does not qualify it. Preserve the earlier run and its identity instead of
+editing its identifiers to match the new source. The source-lock tests flag a
+candidate summary that still names a different source from its current manifest.
+
 **Contexts:** these are exports without Git metadata. File modes are
 normalized to Git's 644 and 755, so the contexts don't depend on the host
 umask and are identical on every host. The earlier recipe copied whole
