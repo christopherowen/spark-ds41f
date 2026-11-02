@@ -54,8 +54,9 @@ placeholders, not in the copy drafts tensor.
 - Single-stream closed loop: baseline 64.897 tok/s, m=16 without the fix 64.683,
   m=8 with the fix 63.867 (CI95 2.77%). The blocking copy costs about 1.6% on this
   synthetic loop; the copy-heavy categories are unchanged.
-- m=16 real-traffic soak with the fix: pending in this PR (the unfixed arm died
-  in a few minutes on the same pool; result will be posted here).
+- m=16 in the live gateway pool (since 17:36Z): gateway traffic plus five
+  30k-token real-agent-transcript requests (512-token completions), no asserts,
+  engine healthy. The unfixed arm died within minutes on the same pool.
 
 ## Integration
 
