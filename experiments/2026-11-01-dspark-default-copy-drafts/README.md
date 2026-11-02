@@ -14,11 +14,16 @@ step work.
   `spark-ds41f:candidate-37` (label `local.spark-ds41f.vllm.patch-head`
   `5b7cfa37...`), on dgx4 and sp8 (GB10, 48 SMs).
 - **Patch:** [`0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch`](0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch),
-  one commit on that head (`bc71d8191`, tree
-  `9f9c6d73158c0a23fed023059f8c6f194e769075`). Its message states base,
-  rationale, quality, tests and upstream status. It replaces the earlier
-  `0001-dspark-default-copy-drafts.patch` of this PR, which was written on
-  candidate-27 and kept the option.
+  one commit (`0c017c680`, tree `458b91a205f2154f1718552fb212cf6edaa0c004`) on
+  that head plus [#856](https://github.com/christopherowen/spark-ds41f/pull/856)'s
+  fix for #852 (vLLM `8bb508091`, tree `a751f693`: `sync_slot_draft_limits`
+  waits for the limit copy and publishes it). Its message states base,
+  rationale, quality, tests and upstream status.
+  - It replaces the earlier `0001-dspark-default-copy-drafts.patch` of this PR,
+    which was written on candidate-27 and kept the option.
+  - It also replaces this PR's first candidate-37 version (`bc71d8191`, tree
+    `9f9c6d73`, directly on `5b7cfa37f`), which still read the host limits
+    without waiting.
 - **Variable:** copy drafts on wherever DSpark verifies greedy drafts adaptively.
   At the cluster this is candidate-37's copy arms run from the plain recipe. The
   rework of the step's copy work is bit-identical in its outputs and is measured
@@ -271,14 +276,17 @@ config/candidate-37-tp3-switched-dev.local.json cluster sync`.
 The tree (dgx4; any clone that has `19f2c20ed`):
 
 ```bash
-# candidate-37's series, then this patch, in a fresh repository
+# candidate-37's series, #856's fix, then this patch, in a fresh repository
 git init fresh && cd fresh
 git fetch --depth 1 --no-tags /path/to/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
 git switch -c spark/build FETCH_HEAD
 # each patch of ../2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series in order
 git am --committer-date-is-author-date <series patches...>            # tree af0fb152
+# #856 (branch copy-drafter-limit-sync), the same change as vLLM 8bb508091
+git am --committer-date-is-author-date \
+  ../2026-11-02-copy-drafter-limit-sync/vllm/0001-fix-copy-drafts-publish-the-latest-proposal-s-slot-draft-limits.patch  # tree a751f693
 git am --committer-date-is-author-date 0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch
-git rev-parse HEAD^{tree}                                              # 9f9c6d73
+git rev-parse HEAD^{tree}                                              # 458b91a2
 git diff --check HEAD~1 HEAD
 ```
 
@@ -289,7 +297,8 @@ over `/opt/spark-ds41f/candidate/vllm`. The tblib stand-in
 
 ```bash
 TREE=/tmp/842-final/vllm ./run_image.sh "python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub \
-  tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_copy_drafts.py"
+  tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_copy_drafts.py \
+  tests/v1/spec_decode/test_adaptive_verification.py"
 ```
 
 The microbenchmark ([`bench_copy_kernels.py`](bench_copy_kernels.py)) puts
@@ -315,6 +324,27 @@ All runs are kept below, unfavourable and failed ones included. The raw JSON is
 in [`runs/`](runs/).
 
 ### Unit tests (dgx4, 2026-11-02)
+
+**On #856 (this patch's base, rebased 2026-11-02; tree `458b91a2`):**
+- `test_copy_drafts.py`, `test_copy_drafts_scheduler.py` and
+  `test_adaptive_verification.py` in the candidate-37 image: **77 passed, 1
+  skipped** (the two-GPU test). #856 alone gives 71 passed, 1 skipped.
+- The rebase kept #856's blocking `sync_slot_draft_limits`, without the reset
+  bookkeeping it removed. It adds
+  `test_side_stream_limits_reach_the_host_as_the_latest_proposals`: with the
+  match and allocation on a side stream held busy before each step, the host
+  limits after `attach_async_output` equal the latest proposal's device limits.
+- Mutation check: putting candidate-37's non-blocking `query()` back fails that
+  test and #856's `test_sync_slot_draft_limits_waits_for_the_queued_copy`.
+- The kernels and the step's copy work are untouched by #856
+  (`tilelang_copy.py` is the same), so the bit-identity and microbenchmark
+  results below stand.
+- The host's limit wait ends at the same point in the step as on
+  candidate-37 + #856: the limit copy follows `copy_alloc` on the output copy
+  stream, as it followed `copy_alloc` on the main stream there. Its serving
+  cost is #856's to measure (`lab-cost.json` there).
+
+**On candidate-37 (the first version, `bc71d8191`):**
 
 - `test_copy_drafts_scheduler.py` + `test_copy_drafts.py`: **38 passed** (81 s).
   This run (17:04:41-17:06:10, dgx4 time) overlapped a sibling session's GPU
@@ -663,16 +693,20 @@ unnecessary; both are dropped.
 
 **What it takes to be ready** (owner's call; the serving clusters and any GitHub
 post to the operator are yours):
-1. Localize the NaN. The sp5-sp7 window could not reproduce it: #852's exact
-   sequence is clean on tp3-switched with and without 0676, at unlocked clocks
-   and at 2,200 MHz, under 1, 8 and 16 streams. Next is the census
-   (`census/0001-…patch`, vLLM `cb46d6c82`) on the operator's ring, where m=8
-   crashes deterministically. Their census lines name the layer, row, slot,
-   origin and whether the row lies past a rejected draft.
-2. Fix it, then rerun their m=8 repro clean.
-3. Run a concurrent soak where the token budget binds (mixed prompt lengths,
-   copy-dense and tool-like prompts, several streams), on a candidate image with
-   this patch and the plain `tp3.json` / `tp4.json`.
+1. Localize the NaN and fix it.
+   - The sp5-sp7 window could not reproduce it: #852's exact sequence is clean on
+     tp3-switched with and without 0676, at unlocked clocks and at 2,200 MHz,
+     under 1, 8 and 16 streams, with dead rows on.
+   - The operator's claimed cause, #855, taken in as
+     [#856](https://github.com/christopherowen/spark-ds41f/pull/856): a stale
+     host limit admits `-1` placeholder rows, which dead rows would mask. #856's
+     blocking limit sync is this patch's base now.
+   - #856's own window (`lab-repro.json`: dead rows off, candidate-37 against
+     the fix, with the census) is the test.
+2. #856's cost (`lab-cost.json`: paired single-stream verdict, 8 and 16 streams).
+3. Then this patch on #856 in a candidate image, with the plain `tp3.json` /
+   `tp4.json`, and a concurrent soak where the token budget binds (mixed prompt
+   lengths, copy-dense and tool-like prompts, several streams).
 
 Expected startup lines: "Copy drafts widen max_num_batched_tokens from 6144 to
 6155 ..." and "... capture range from 48 to 59 rows" (TP3); 16384 → 16395 and
