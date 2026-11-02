@@ -78,6 +78,9 @@ python3 -m pytest -q -o addopts="" --noconftest -p tests.kernels.deepseek_v41_pd
 python3 /bench/bench_markov_greedy.py --dtype float32 --out /bench/out/markov-fp32-boot{1,2}.json
 python3 /bench/profile_markov_kernels.py --out /bench/out/markov-kernels-fp32.json
 python3 /bench/bench_tile64_step_groups.py --out /bench/out/tile64-boot{1,2}.json
+python3 /bench/soak_markov_greedy.py --dtype float32 --out /bench/out/soak-fp32.json
+python3 /bench/soak_markov_greedy.py --dtype float32 --top2 --out /bench/out/soak-fp32-top2.json
+python3 /bench/soak_markov_greedy.py --dtype bfloat16 --out /bench/out/soak-bf16.json
 ```
 
 Each `boot` is a fresh container (new process, cold TileLang load, new allocations).
@@ -107,6 +110,51 @@ Each `boot` is a fresh container (new process, cold TileLang load, new allocatio
   violations) kept the materialized path for heads that do not fuse. The final
   revision removes that path and raises instead. The kernels, and so every
   benchmark below (which calls them directly), are the same in both.
+
+### Functional soak under serving's workspace discipline
+
+The one thing the fused path changes outside the kernels is where its scratch
+lives. The materialized path reduced into the speculator's own buffers. The fused
+path borrows its tile partials (`rows × tiles × 8` bytes) from the workspace
+manager, and in serving that is the DSpark draft lane's slot: the V2 runner
+captures and runs `propose` under `use_workspace_lane(_draft_workspace_lane)`
+(lane 1). The kernel tests above take the persistent-scratch fallback instead,
+so they don't exercise this.
+
+[`scripts/soak_markov_greedy.py`](scripts/soak_markov_greedy.py) reproduces that
+discipline on one GB10 (sp8) and checks every row, not timing:
+
+- a workspace manager with a draft lane, which the drafter's other borrowers size
+  first (4 MB);
+- every captured size (1, 2, 4, 8, 16, 24, 32, 48 requests) warmed eagerly and
+  captured under that lane, then the workspace locked, as after the runner's last
+  capture;
+- per step, a random captured size and 1..size active rows, the rest padding.
+  Active rows get fresh base logits (some with exact ties, a NaN or a −inf row)
+  and anchor ids; padding rows get NaN, +inf, −inf, 3e38 or 0 and garbage ids.
+  The draft lane's whole slot is filled with 0xFF before each arm's replay.
+
+Results, 3,000 steps per run over 16 shape × size cells (TP4, TP3; 159–201 steps
+each):
+
+| run | mismatching steps | tokens outside the shard | non-finite pair rows (padding) | negative control |
+|---|---:|---:|---:|---|
+| FP32, top-2 off (serving) | 0 | 0 | 16,006 | flagged |
+| FP32, top-2 on | 0 | 0 | 16,006 | flagged |
+| BF16, top-2 off | 0 | 0 | 16,006 | flagged |
+
+A mismatching step is any bit of any output differing on any row, padding
+included. The slot never grew past its 4 MB after locking
+([`runs/soak-fp32.json`](runs/soak-fp32.json),
+[`runs/soak-fp32-top2.json`](runs/soak-fp32-top2.json),
+[`runs/soak-bf16.json`](runs/soak-bf16.json)). The drafts are the same bits as
+before for every row, padding rows included, so the target's verification rows,
+their count and their padding are those of candidate-37.
+
+Not covered: a serving soak with real concurrent traffic and mixed prompt lengths
+where the token budget binds (the lesson of #842, whose arm crashed in the MoE
+router only under production traffic). That needs an image with 0677 and a
+cluster window, and it has not been run.
 
 ## Draft-step microbenchmark (sp8, FP32 logits, top-2 off)
 
@@ -259,8 +307,10 @@ on TP3 (+0.4–0.6 µs per position). With the shard hot in L2 for the whole loo
 faster beyond. These are microbenchmark deltas on one rank. No end-to-end run was
 made; at one request the difference is about 0.03% of a 10 ms decode step.
 
-Promotion is the owner's decision with a candidate screen. Follow-ups, each its own
-experiment:
+Before it is called ready, it needs a serving soak on a candidate image: real
+concurrent traffic, mixed prompt lengths, the token budget binding. The
+functional soak above is clean but does not replace it. Promotion is the owner's
+decision with a candidate screen. Follow-ups, each its own experiment:
 
 - The 1–2-request overhead is the fused epilogue and the 1,010–1,348-tile finish.
   A cheaper finish, or wider tiles for the Markov head, could remove it.
