@@ -8,7 +8,9 @@ ratio, then checks the trigger's expectation:
 - clean: finishes by itself (finish_reason stop) and no run reaches 24 tokens;
 - bounded: may degenerate, but never runs away: no run longer than max_run, and
   a reply that degenerated does not end on finish_reason length;
-- kept: legitimate repetition: finish_reason stop, never repetition.
+- kept: legitimate repetition is never cut by the loop handling: finish_reason is
+  not repetition. The model may still run past what was asked (the 2026-11-02 soak
+  wrote 'hello' 281 times when asked for 200) and end on length.
 
 Read-only towards the server: chat completions and /tokenize only. Run it in a
 lab window like the sink probes (experiments/2026-10-19-sink-rejection-v2).
@@ -60,8 +62,8 @@ def verdict(trigger: dict, finish_reason: str, stats: dict) -> tuple[bool, str]:
         ok = finish_reason == "stop" and run < DEGENERATE_RUN
         return ok, "" if ok else f"finish_reason {finish_reason}, longest run {run}"
     if expect == "kept":
-        ok = finish_reason == "stop"
-        return ok, "" if ok else f"legitimate repetition ended with {finish_reason}"
+        ok = finish_reason != "repetition"
+        return ok, "" if ok else "legitimate repetition was stopped as a loop"
     if expect == "bounded":
         if run > trigger.get("max_run", 600):
             return False, f"run of {run} tokens passed max_run"
