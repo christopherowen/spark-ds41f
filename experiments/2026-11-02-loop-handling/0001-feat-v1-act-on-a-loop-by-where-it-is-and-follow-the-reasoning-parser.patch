@@ -1,0 +1,667 @@
+From 6698d7467426d675b10839cd5c1fe885bd809cff Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:09:11 +0000
+Subject: [PATCH] feat(v1): act on a loop by where it is, and follow the
+ reasoning parser's markers
+
+Base: candidate-37's patch head 5b7cfa37f (vLLM tree af0fb152), on 0656
+and 0674 (#787, #845).
+
+Rationale. 0674 made loop detection the default everywhere, with the
+thresholds tuned for reasoning (a 24-token span). Inside reasoning the
+action is mild: the reasoning ends and the model answers. In the visible
+answer the action stops the request, and legitimate answers repeat too: a
+zero-filled array, a table rule, a file written through a tool call. An
+operator found 199-token runs of one token in legitimate messages whose
+distinct-token ratio was 0.82-0.84 (#787, comment 6564709937). The
+handling now depends on where the loop is:
+
+- inside reasoning: break at the first loop, as before; a forced end that
+  has not landed within FORCED_REASONING_END_GRACE (64) output tokens stops
+  the request instead of leaving the loop unchecked until max_tokens;
+- in the answer after a reasoning loop: stop at the first loop (the context
+  is already degenerate);
+- in the answer of a request whose reasoning did not loop: stop only a loop
+  that persists OUTPUT_LOOP_PERSIST (256) tokens past its first detection
+  (gaps up to 16) and then leaves fewer than one distinct token in ten
+  among the answer's last 512 tokens.
+
+A token-soup rule joins the detector: one token at 60% or more of the last
+32-64 tokens, with at most one distinct token per eight. It catches the
+production collapse ("11x Vila, Estud compar, 9x Vila, ..."), whose runs
+are shorter than the contiguous rules need and whose period is irregular.
+
+Request.update_reasoning_markers follows DeepSeekV4Parser's transitions:
+inside reasoning only the end marker leaves, so a repeated start marker no
+longer restarts the loop window or cancels a forced end; in the answer a
+start marker opens reasoning again and a stray end marker is answer text,
+so it no longer moves the answer's start (which let a loop with end markers
+in it evade detection). A client's repetition_detection now adds to the
+built-in detection in the answer instead of replacing it.
+
+The scheduler logs one line when an answer loop is first suspected, with
+the request's answer start, thinking_disabled and loop breaks, so a missed
+loop can be explained from the log.
+
+Quality implications. Sampling is unchanged: check_stop only reads
+committed tokens, so a request that never loops gets the same tokens and
+the same finish. Requests that loop in the answer run longer before they
+stop (a single-token run inside varied output stops once it dominates the
+answer's last 512 tokens, within 512 tokens of its start); requests whose
+legitimate answer repeats are no longer cut. Replayed over 3,618 chunks
+(5.84M tokens) of real code and documentation as visible answers,
+candidate-37 stops 31 and this stops none; as reasoning both break 31, and
+the token-soup rule adds none. The detector costs 8.1 us a token against
+7.7 us (single core, recorded outputs).
+
+Tests. tests/v1/core/test_repetition_detection.py: token soup (the
+incident shape, interjections of new tokens, alternations and prose that
+must not match), the parser-following markers, the forced-end grace, the
+answer's persistence and diversity, and known trigger shapes (the 736-token
+production run, separator rules of 199 and 300 tokens in varied output,
+requested repetition of 200 words, a 128-zero array, the "Let me do it."
+stall). The scheduler and output suites fail exactly as they do on
+candidate-37 (the offline hub lacks facebook/opt-125m).
+
+Upstream status: local, on the local patches 0656 and 0674; not submitted.
+---
+ tests/v1/core/test_repetition_detection.py | 228 ++++++++++++++++++++-
+ vllm/v1/core/sched/scheduler.py            |  20 ++
+ vllm/v1/core/sched/utils.py                | 164 +++++++++++----
+ vllm/v1/request.py                         |  39 +++-
+ 4 files changed, 400 insertions(+), 51 deletions(-)
+
+diff --git a/tests/v1/core/test_repetition_detection.py b/tests/v1/core/test_repetition_detection.py
+index aa7d90141..ed2d95900 100644
+--- a/tests/v1/core/test_repetition_detection.py
++++ b/tests/v1/core/test_repetition_detection.py
+@@ -4,6 +4,9 @@ import pytest
+ 
+ from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+ from vllm.v1.core.sched.utils import (
++    FORCED_REASONING_END_GRACE,
++    OUTPUT_LOOP_PERSIST,
++    _find_dominant_token_window,
+     check_sequence_repetition,
+     check_stop,
+     detect_thinking_loop,
+@@ -471,7 +474,7 @@ class TestRepetitionDetectionIntegration:
+         assert req_post.thinking_output_start == -1
+ 
+         stopped = False
+-        for tok in let_me_do_it * 4:
++        for tok in let_me_do_it * 60:
+             prev_out = len(req_post._output_token_ids)
+             req_post.append_output_token_ids(tok)
+             req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
+@@ -479,6 +482,11 @@ class TestRepetitionDetectionIntegration:
+                 stopped = True
+                 break
+         assert stopped
++        # A healthy answer stops only once the loop has persisted.
++        assert (
++            req_post.num_output_tokens - req_post.output_loop_since
++            == OUTPUT_LOOP_PERSIST
++        )
+         assert not req_post.force_thinking_end
+         assert req_post.status == RequestStatus.FINISHED_REPETITION
+         assert req_post.stop_reason == "repetition_detected"
+@@ -501,7 +509,7 @@ class TestRepetitionDetectionIntegration:
+                 reasoning_parser_kwargs=init_kwargs.get("reasoning_parser_kwargs"),
+             )
+             stopped = False
+-            for tok in let_me_do_it * 4:
++            for tok in let_me_do_it * 60:
+                 prev_out = len(req._output_token_ids)
+                 req.append_output_token_ids(tok)
+                 req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
+@@ -619,3 +627,219 @@ class TestRepetitionDetectionIntegration:
+             assert req.thinking_loop_breaks == 0
+             assert req.last_loop_info is None
+             assert req.copy_draft_alloc == 6
++
++    @staticmethod
++    def _feed(req, tokens, start_ids=(128805,), end_ids=(128806,)):
++        """Append tokens one at a time as the scheduler does; return the
++        number fed when check_stop stopped the request, else None."""
++        for i, tok in enumerate(tokens, 1):
++            prev_out = len(req._output_token_ids)
++            req.append_output_token_ids(tok)
++            req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
++            if check_stop(req, max_model_len=1 << 20):
++                return i
++        return None
++
++    def test_token_soup_detected(self):
++        """One token repeated with short interjections (the production 'Vila'
++        collapse): every run is under 24 tokens and the period is irregular, so
++        only the token-soup rule sees it."""
++        vila, estud, compar, evelyn, laud = 125221, 96830, 6289, 88227, 100308
++        incident = [vila] * 11 + [estud, compar] + [vila] * 9 + [estud, compar]
++        incident += [vila] * 9
++        assert detect_thinking_loop(incident) == ("token_soup", 3, 29)
++
++        soup = []
++        for run in (12, 7, 15, 9, 11, 13):
++            soup += [vila] * run + [evelyn, laud]
++        # Longer soups may also meet the windowed rule; either catches them.
++        assert detect_thinking_loop(soup) is not None
++        # Ending on an interjection: still caught.
++        assert detect_thinking_loop(soup + [estud]) is not None
++        # Interjections of new cone tokens every few tokens: only soup.
++        cone = [evelyn, laud, estud, compar, 92036, 68908]
++        mixed = []
++        for i, run in enumerate((5, 3, 6, 4, 5, 3, 6, 4, 5, 6)):
++            mixed += [vila] * run + [cone[i % len(cone)]]
++        assert detect_thinking_loop(mixed)[0] == "token_soup"
++
++    def test_token_soup_ignores_alternations_and_prose(self):
++        """No single token dominates bit strings, zero matrices or prose."""
++        import random
++
++        rng = random.Random(0)
++        bits = [rng.choice((15, 16)) for _ in range(64)]
++        assert _find_dominant_token_window(bits) is None
++
++        # [[0, 0, 0], [0, 0, 0], ...]: '0' is under 60% of the tokens.
++        matrix = []
++        for _ in range(8):
++            matrix += [58, 15, 11, 15, 11, 15, 59, 11]
++        assert _find_dominant_token_window(matrix) is None
++
++        prose = [rng.randrange(1000, 60000) for _ in range(200)]
++        assert detect_thinking_loop(prose) is None
++
++    def test_reasoning_markers_follow_the_parser(self):
++        """A start marker inside reasoning is reasoning text, an end marker in
++        the answer is answer text, and a start marker in the answer opens
++        reasoning again, as DeepSeekV4Parser decides."""
++        req = Request(
++            request_id="markers",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=4096),
++            pooling_params=None,
++        )
++        assert self._feed(req, [501, 502, 128805, 503]) is None
++        assert req.thinking_output_start == 0
++
++        # A loop breaks reasoning; a repeated start marker before the forced
++        # end must not cancel it.
++        assert self._feed(req, [9] * 24) is None
++        assert req.force_thinking_end and req.thinking_loop_breaks == 1
++        assert self._feed(req, [128805]) is None
++        assert req.force_thinking_end
++        assert req.thinking_output_start == 0
++
++        assert self._feed(req, [128806]) is None
++        end_idx = req.thinking_end_output_idx
++        assert end_idx == req.num_output_tokens
++        assert req.thinking_output_start == -1 and not req.force_thinking_end
++
++        # A stray end marker in the answer does not move the answer's start.
++        assert self._feed(req, [601, 128806, 602]) is None
++        assert req.thinking_end_output_idx == end_idx
++
++        # A start marker in the answer opens reasoning again.
++        assert self._feed(req, [128805, 701]) is None
++        assert req.thinking_output_start == req.num_output_tokens - 1
++
++    def test_forced_reasoning_end_that_never_arrives_stops(self):
++        """Once a reasoning loop forces the end, the loop may run on through
++        the steps in flight, but not past the grace."""
++        req = Request(
++            request_id="forced-end-lost",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=4096),
++            pooling_params=None,
++        )
++        assert self._feed(req, [9] * 24) is None
++        assert req.force_thinking_end
++        forced_at = req.num_output_tokens
++        assert req.force_thinking_end_at == forced_at
++
++        fed = self._feed(req, [9] * (FORCED_REASONING_END_GRACE + 8))
++        assert fed == FORCED_REASONING_END_GRACE + 1
++        assert req.status == RequestStatus.FINISHED_REPETITION
++        assert req.num_output_tokens - forced_at == FORCED_REASONING_END_GRACE + 1
++
++    def test_healthy_answer_repetition_that_ends_is_not_stopped(self):
++        """A zero-filled array or a table rule in a healthy answer repeats for
++        a while and moves on: detections that stop before the persistence
++        span cost nothing, and a later loop is timed from its own start."""
++        req = Request(
++            request_id="zeros",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=8192),
++            pooling_params=None,
++        )
++        assert self._feed(req, [301, 302, 128806]) is None
++        zeros = [44, 48] * 100  # ", 0" x 100: detected from the 24th token
++        assert self._feed(req, zeros) is None
++        assert req.output_loop_since >= 0
++        tail = list(range(2000, 2040))
++        assert self._feed(req, tail) is None
++        assert req.output_loop_since == -1
++
++        loop_start = req.num_output_tokens
++        fed = self._feed(req, [101, 102, 103, 104, 13, 198] * 100)
++        assert fed is not None
++        assert req.status == RequestStatus.FINISHED_REPETITION
++        assert req.output_loop_since > loop_start
++        assert req.num_output_tokens - req.output_loop_since == OUTPUT_LOOP_PERSIST
++
++    def test_answer_after_a_reasoning_loop_stops_at_its_first_loop(self):
++        """After a forced end the context is degenerate: no persistence."""
++        req = Request(
++            request_id="degraded",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=4096),
++            pooling_params=None,
++        )
++        assert self._feed(req, [9] * 24 + [128806]) is None
++        assert req.thinking_loop_breaks == 1
++        vila, laud = 125221, 100308
++        fed = self._feed(req, ([vila] * 10 + [laud]) * 4)
++        assert fed is not None and fed <= 33
++        assert req.status == RequestStatus.FINISHED_REPETITION
++
++    @staticmethod
++    def _answer_request(request_id):
++        """A thinking request whose reasoning closed naturally."""
++        req = Request(
++            request_id=request_id,
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=1 << 16),
++            pooling_params=None,
++        )
++        assert TestRepetitionDetectionIntegration._feed(req, [301, 302, 128806]) is None
++        assert req.thinking_loop_breaks == 0 and req.thinking_output_start == -1
++        return req
++
++    @staticmethod
++    def _varied(n, seed):
++        import random
++
++        rng = random.Random(seed)
++        return [rng.randrange(1000, 60000) for _ in range(n)]
++
++    def test_known_trigger_single_token_attractor_in_answer(self):
++        """The 2026-11-01 production collapse (#787): a 736-token run of ' Vila'
++        in the visible answer after normal output. It stops once the run
++        dominates the answer's last 512 tokens, long before the 736 tokens."""
++        vila = 125221
++        req = self._answer_request("vila-736")
++        assert self._feed(req, self._varied(1500, 1)) is None
++        run_start = req.num_output_tokens
++        fed = self._feed(req, [vila] * 736)
++        assert fed is not None
++        assert req.status == RequestStatus.FINISHED_REPETITION
++        assert OUTPUT_LOOP_PERSIST < fed <= 512
++
++    def test_known_trigger_separator_rule_in_varied_answer_is_kept(self):
++        """Legitimate messages in the same sessions carried 199-token runs of
++        one token (separator rules) at a distinct-token ratio of 0.82-0.84.
++        Runs up to 300 inside varied output are never stopped."""
++        for run in (199, 300):
++            req = self._answer_request(f"separator-{run}")
++            stream = self._varied(400, 2) + [4521] * run + self._varied(400, 3)
++            assert self._feed(req, stream) is None, run
++            assert not req.is_finished()
++
++    def test_known_trigger_requested_repetition_is_kept(self):
++        """'Repeat hello 200 times', a 128-zero C array and an answer that is
++        one token 100 times: legitimate, bounded, never stopped."""
++        hello, comma, zero = 23714, 11, 15
++        cases = {
++            "hello-200": [hello] * 200,
++            "zeros-128": [comma, zero] * 128,
++            "one-token-100": [hello] * 100,
++        }
++        for name, stream in cases.items():
++            req = self._answer_request(name)
++            assert self._feed(req, stream + self._varied(40, 4)) is None, name
++
++    def test_known_trigger_reasoning_stall_breaks_at_once(self):
++        """The 2026-11-01 replay (#787): 'Let me do it.' repeated inside
++        reasoning at effort max. Reasoning breaks at the first loop."""
++        let_me_do_it = [101, 102, 103, 104, 13, 198]
++        req = Request(
++            request_id="stall",
++            prompt_token_ids=[1, 2, 128805, 198],
++            sampling_params=SamplingParams(max_tokens=4096),
++            pooling_params=None,
++        )
++        assert self._feed(req, self._varied(120, 5)) is None
++        assert self._feed(req, let_me_do_it * 4) is None
++        assert req.force_thinking_end and req.thinking_loop_breaks == 1
++        assert req.last_loop_info == ("contiguous_phrase", 6, 4)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 317ce3acc..c90e485d9 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3937,11 +3937,31 @@ class Scheduler(SchedulerInterface):
+             # Check for stop and update request state.
+             # This must be called before we make the EngineCoreOutput.
+             was_forced = request.force_thinking_end
++            was_suspected = request.output_loop_since >= 0
+             stopped = check_stop(
+                 request,
+                 self.max_model_len,
+                 thinking_loop_break=self.thinking_loop_break,
+             )
++            if not was_suspected and request.output_loop_since >= 0:
++                loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
++                    "unknown",
++                    0,
++                    0,
++                )
++                logger.info(
++                    "Suspected loop in the answer of request %s at %d output "
++                    "tokens (mode=%s, pattern_len=%d, count=%d, answer_start=%d, "
++                    "thinking_disabled=%s, breaks=%d); stopping it if it persists.",
++                    request.request_id,
++                    request.num_output_tokens,
++                    loop_mode,
++                    loop_pat_len,
++                    loop_count,
++                    request.thinking_end_output_idx,
++                    request.thinking_disabled,
++                    request.thinking_loop_breaks,
++                )
+             if not was_forced and request.force_thinking_end:
+                 loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
+                     "unknown",
+diff --git a/vllm/v1/core/sched/utils.py b/vllm/v1/core/sched/utils.py
+index fa8527184..e44b779ed 100644
+--- a/vllm/v1/core/sched/utils.py
++++ b/vllm/v1/core/sched/utils.py
+@@ -6,6 +6,20 @@ from collections.abc import Sequence
+ from vllm.sampling_params import RepetitionDetectionParams
+ from vllm.v1.request import Request, RequestStatus
+ 
++# Output tokens a forced end of reasoning may take to land: the rest of the
++# step that found the loop and the step already in flight, each up to its
++# verification width (drafts and copy drafts).
++FORCED_REASONING_END_GRACE = 64
++# Output tokens a loop in a healthy answer must persist past its first
++# detection before the request stops, and the longest gap between detections
++# that still counts as the same loop.
++OUTPUT_LOOP_PERSIST = 256
++OUTPUT_LOOP_GAP = 16
++# ... and the answer's last OUTPUT_LOOP_WINDOW tokens must then hold fewer
++# than one distinct token in OUTPUT_LOOP_MAX_DISTINCT_INV.
++OUTPUT_LOOP_WINDOW = 512
++OUTPUT_LOOP_MAX_DISTINCT_INV = 10
++
+ 
+ def _has_repeating_pattern(
+     token_ids: Sequence[int],
+@@ -130,6 +144,42 @@ def _has_windowed_repeating_pattern(
+     )
+ 
+ 
++def _find_dominant_token_window(
++    token_ids: Sequence[int],
++    start_idx: int = 0,
++    window_size: int = 64,
++    min_window: int = 32,
++) -> tuple[int, int] | None:
++    """Return ``(distinct, dominant_count)`` if one token makes up at least
++    60% of the last ``window_size`` tokens (at least ``min_window`` of them)
++    and the window holds at most one distinct token per eight.
++
++    This is token soup: one token repeated with a few interjections, such as
++    ``11x Vila, Estud compar, 9x Vila, Estud compar, 9x Vila``. Every run is
++    shorter than the contiguous rules need and the period is irregular, so
++    neither the contiguous nor the windowed phrase rule sees it. A run of two
++    or more alternating tokens (bit strings, ``0, 0, 0``) has no token at 60%.
++    """
++    seq = getattr(token_ids, "_x", token_ids)
++    n = len(seq)
++    wlen = min(window_size, n - start_idx)
++    if wlen < min_window:
++        return None
++    # Soup repeats its token within any eight; prose and code rarely do, and
++    # this keeps the per-token cost of the count off them.
++    if len(set(seq[n - 8 : n])) > 5:
++        return None
++    counts: dict[int, int] = {}
++    for tok in seq[n - wlen : n]:
++        counts[tok] = counts.get(tok, 0) + 1
++    if len(counts) * 8 > wlen:
++        return None
++    dominant = max(counts.values())
++    if dominant * 5 < wlen * 3:
++        return None
++    return (len(counts), dominant)
++
++
+ def detect_thinking_loop(
+     token_ids: Sequence[int],
+     start_idx: int = 0,
+@@ -144,6 +194,9 @@ def detect_thinking_loop(
+     3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
+        times within a 160-token window with >= 1 contiguous pair and covering
+        >= 60% of the span).
++    4. Token soup (one token >= 60% of the last 32..64 tokens, at most one
++       distinct token per eight); ``pattern_len`` is the number of distinct
++       tokens and ``count`` the dominant token's count.
+     """
+     seq = getattr(token_ids, "_x", token_ids)
+     avail = len(seq) - start_idx
+@@ -176,6 +229,10 @@ def detect_thinking_loop(
+     )
+     if win_match is not None:
+         return ("windowed_phrase", win_match[0], win_match[1])
++
++    soup_match = _find_dominant_token_window(seq, start_idx=start_idx)
++    if soup_match is not None:
++        return ("token_soup", soup_match[0], soup_match[1])
+     return None
+ 
+ 
+@@ -326,7 +383,16 @@ def check_stop(
+ 
+     if request.thinking_output_start >= 0:
+         if request.force_thinking_end:
+-            return False
++            # The worker forces the end of reasoning in the request's next
++            # scheduled step, after the step already in flight. A forced end
++            # that never arrives stops the request instead of leaving the
++            # loop unchecked until max_tokens.
++            if (
++                request.num_output_tokens - request.force_thinking_end_at
++                <= FORCED_REASONING_END_GRACE
++            ):
++                return False
++            return _finish_repetition(request)
+         start_idx = request.thinking_output_start
+         loop_info: tuple[str, int, int] | None = None
+         if repetition_detection is not None and check_sequence_repetition(
+@@ -339,48 +405,66 @@ def check_stop(
+             loop_info = detect_thinking_loop(
+                 request._output_token_ids, start_idx=start_idx
+             )
+-        if loop_info is not None:
+-            request.last_loop_info = loop_info
+-            if thinking_loop_break and request.thinking_loop_breaks == 0:
+-                request.force_thinking_end = True
+-                request.thinking_loop_breaks += 1
+-                request.copy_draft_alloc = 0
+-                return False
+-            request.status = RequestStatus.FINISHED_REPETITION
+-            request.stop_reason = "repetition_detected"
+-            return True
+-        return False
++        if loop_info is None:
++            return False
++        request.last_loop_info = loop_info
++        if thinking_loop_break and request.thinking_loop_breaks == 0:
++            request.force_thinking_end = True
++            request.force_thinking_end_at = request.num_output_tokens
++            request.thinking_loop_breaks += 1
++            request.copy_draft_alloc = 0
++            return False
++        return _finish_repetition(request)
+ 
+     start_idx = request.thinking_end_output_idx
+-    if repetition_detection is not None:
+-        if check_sequence_repetition(
+-            request._output_token_ids,
+-            repetition_detection,
+-            start_idx=start_idx,
++    if repetition_detection is not None and check_sequence_repetition(
++        request._output_token_ids,
++        repetition_detection,
++        start_idx=start_idx,
++    ):
++        request.last_loop_info = ("custom_repetition", 0, 0)
++        return _finish_repetition(request)
++
++    if not (thinking_loop_break or request.thinking_loop_breaks > 0):
++        return False
++    loop_info = detect_thinking_loop(request._output_token_ids, start_idx=start_idx)
++    if request.thinking_loop_breaks > 0:
++        # Reasoning already looped: stop the answer at its first loop.
++        if loop_info is None:
++            return False
++        request.last_loop_info = loop_info
++        return _finish_repetition(request)
++
++    # The visible answer of a request whose reasoning did not loop. Legitimate
++    # answers repeat too (a zero-filled array, a table rule, a file written
++    # through a tool call) and then move on; a degenerate loop does not. Stop
++    # only a loop that persists and dominates the answer's last
++    # OUTPUT_LOOP_WINDOW tokens, so a false detection costs nothing: a long
++    # run inside otherwise varied output (a 199-token separator rule in a
++    # message whose distinct-token ratio is 0.8) is never stopped.
++    num_output = request.num_output_tokens
++    if loop_info is None:
++        if (
++            request.output_loop_since >= 0
++            and num_output - request.output_loop_last > OUTPUT_LOOP_GAP
+         ):
+-            request.last_loop_info = ("custom_repetition", 0, 0)
+-            request.status = RequestStatus.FINISHED_REPETITION
+-            request.stop_reason = "repetition_detected"
+-            return True
+-        if request.thinking_loop_breaks > 0:
+-            loop_info = detect_thinking_loop(
+-                request._output_token_ids, start_idx=start_idx
+-            )
+-            if loop_info is not None:
+-                request.last_loop_info = loop_info
+-                request.status = RequestStatus.FINISHED_REPETITION
+-                request.stop_reason = "repetition_detected"
+-                return True
++            request.output_loop_since = -1
++        return False
++    if request.output_loop_since < 0:
++        request.output_loop_since = num_output
++    request.output_loop_last = num_output
++    request.last_loop_info = loop_info
++    if num_output - request.output_loop_since < OUTPUT_LOOP_PERSIST:
+         return False
++    window = request._output_token_ids[
++        max(start_idx, num_output - OUTPUT_LOOP_WINDOW) : num_output
++    ]
++    if len(set(window)) * OUTPUT_LOOP_MAX_DISTINCT_INV >= len(window):
++        return False
++    return _finish_repetition(request)
+ 
+-    if thinking_loop_break or request.thinking_loop_breaks > 0:
+-        loop_info = detect_thinking_loop(
+-            request._output_token_ids, start_idx=start_idx
+-        )
+-        if loop_info is not None:
+-            request.last_loop_info = loop_info
+-            request.status = RequestStatus.FINISHED_REPETITION
+-            request.stop_reason = "repetition_detected"
+-            return True
+ 
+-    return False
++def _finish_repetition(request: Request) -> bool:
++    request.status = RequestStatus.FINISHED_REPETITION
++    request.stop_reason = "repetition_detected"
++    return True
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index c987eb710..7dd1ddd79 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -274,8 +274,14 @@ class Request:
+         self.thinking_output_start: int = -1
+         self.thinking_end_output_idx: int = 0
+         self.force_thinking_end: bool = False
++        # num_output_tokens when force_thinking_end was set.
++        self.force_thinking_end_at: int = 0
+         self.thinking_loop_breaks: int = 0
+         self.last_loop_info: tuple[str, int, int] | None = None
++        # The answer's current loop: num_output_tokens at its first and at its
++        # latest detection (-1 when none).
++        self.output_loop_since: int = -1
++        self.output_loop_last: int = -1
+         self._reasoning_markers_initialized: bool = False
+         self.thinking_disabled: bool = self._compute_thinking_disabled()
+ 
+@@ -375,8 +381,11 @@ class Request:
+         self.thinking_output_start = -1
+         self.thinking_end_output_idx = 0
+         self.force_thinking_end = False
++        self.force_thinking_end_at = 0
+         self.thinking_loop_breaks = 0
+         self.last_loop_info = None
++        self.output_loop_since = -1
++        self.output_loop_last = -1
+         self._reasoning_markers_initialized = False
+         self.thinking_disabled = self._compute_thinking_disabled()
+ 
+@@ -422,25 +431,37 @@ class Request:
+             return
+         start_last = start_ids[-1]
+         end_last = end_ids[-1]
++        # The reasoning parser's transitions: inside reasoning only the end
++        # marker leaves (a repeated start marker is reasoning text); in the
++        # answer a start marker opens reasoning again and a stray end marker
++        # is answer text. A marker the parser treats as text must not restart
++        # a loop window or cancel a forced end.
+         for out_pos in range(prev_num_output + 1, cur_num_output + 1):
+             all_pos = num_prompt + out_pos
+             tok = all_ids[all_pos - 1]
+-            if tok == end_last and all_pos >= end_len:
++            if self.thinking_output_start >= 0:
+                 if (
+-                    end_len == 1
+-                    or tuple(all_ids[all_pos - end_len : all_pos]) == end_ids
++                    tok == end_last
++                    and all_pos >= end_len
++                    and (
++                        end_len == 1
++                        or tuple(all_ids[all_pos - end_len : all_pos]) == end_ids
++                    )
+                 ):
+                     self.thinking_output_start = -1
+                     self.thinking_end_output_idx = out_pos
+                     self.force_thinking_end = False
+-                    continue
+-            if tok == start_last and all_pos >= start_len:
+-                if (
++                    self.output_loop_since = -1
++            elif (
++                tok == start_last
++                and all_pos >= start_len
++                and (
+                     start_len == 1
+                     or tuple(all_ids[all_pos - start_len : all_pos]) == start_ids
+-                ):
+-                    self.thinking_output_start = out_pos
+-                    self.force_thinking_end = False
++                )
++            ):
++                self.thinking_output_start = out_pos
++                self.output_loop_since = -1
+ 
+         if (
+             self.thinking_output_start < 0
+-- 
+2.43.0
+
