@@ -96,6 +96,17 @@ against candidate-37's `dspark.py` (checked on a tree with only the test file ch
 The repository's unit suite (615 tests) and `bin/spark --shape … doctor` for all nine
 shapes pass.
 
+### Beside #854
+
+#854 (`dspark-fused-markov-greedy`) also changes `dspark.py` and also numbers its patch 0677.
+On candidate-37's head the two patches apply cleanly in either order and give the same tree,
+`34c3774f42925102eefd2b11ac4efb2d8d607063`. A series that carries both renumbers one of them
+to 0678.
+
+Each soak arm mounts its own whole-file `dspark.py`: candidate-37 plus that PR's patch only.
+The two soaks therefore test the patches apart. A candidate with both needs one file from the
+combined tree.
+
 ## Harness
 
 `bench_context_ladder.py` builds one rank's context path at the shape's TP degree from the
