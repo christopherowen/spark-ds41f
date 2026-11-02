@@ -219,7 +219,8 @@ differs only in cabling, transport and memory sizing):
   parallelism 3 (`tp3-triangle`), on DGX Spark 26.09.2 with kernel `7.0.0-1019-nvidia-64k`
   (`kho=off`), signed memory-saver DKMS 0.4.1 with UVM leaf-table packing enabled, no desktop,
   `vm.watermark_boost_factor=0`, and glibc malloc pinned (`MALLOC_ARENA_MAX=2`,
-  `MALLOC_MMAP_THRESHOLD_=1048576`);
+  `MALLOC_MMAP_THRESHOLD_=1048576`); vLLM's usage reporting off (`VLLM_NO_USAGE_STATS=1`,
+  `DO_NOT_TRACK=1`, in the recipe and the image);
 - dual ConnectX-7 200 GbE RoCE paths between every adjacent pair of nodes (`oneshot-ring4` on four
   nodes, `oneshot-direct` on three);
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (`19f2c20e`) with the
