@@ -14,9 +14,9 @@ step), up to the context limit.
 
 **Result (one GB10, single-rank harness, four processes per shape):**
 - **Faster, but only slightly.** With L2 flushed before each replay, as after a target
-  forward, the mean over every row count is -0.76 ± 0.59 µs at TP3 and -1.98 ± 0.71 µs at
-  TP4. The largest saving is -6.8 ± 2.4 µs at TP4 c11 (96 → 66 rows). Full-depth c1..cmax
-  averages -1.0 ± 1.0 µs (TP3) and -2.4 ± 0.6 µs (TP4). Decode steps are about 25-66 ms
+  forward, the mean over every row count is -0.76 ± 0.59 µs at TP3 and -1.65 ± 0.49 µs at
+  TP4. The largest saving is -7.1 ± 2.0 µs at TP4 c11 (96 → 66 rows). Full-depth c1..cmax
+  averages -1.0 ± 1.0 µs (TP3) and -2.1 ± 0.8 µs (TP4). Decode steps are about 25-66 ms
   (spark-ds41f-1030's switched benchmark runs,
   `manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched*.json`), so the saving is at
   most about 0.01% of a step: no end-to-end bench can resolve it.
@@ -139,11 +139,24 @@ bash runimg.sh spark-ds41f:candidate-37 /tmp/c37-ladder-739/vllm -m pytest -q -r
   tests/kernels/test_deepseek_v41_tilelang_dspark_context.py   # commands/run-in-image.sh
 bash matrix.sh                                          # commands/matrix.sh: 8 replay runs
 bash memory.sh                                          # commands/memory.sh: 8 memory runs
+bash rerun.sh                                           # commands/rerun-tp4-ladder-first.sh
 bash fresh.sh patch/0677-*.patch                        # commands/apply-series-and-patch.sh
 python3 analyze.py runs > summary.json                  # here
 ```
 
-`runs/` keeps every run's JSON and log. `runs/smoke/smoke-tp3.json` is the first harness
+`runs/` keeps every run's JSON and log (`runs/logs/`).
+
+**A run set aside: `runs/overlapped/tp4-ladder-first-2`.**
+- Another session's unit-test container used dgx4's GPU from 17:04:41 to 17:06:10, which
+  overlapped this run (17:03:50-17:06:03). That session reported the overlap.
+- `commands/rerun-tp4-ladder-first.sh` repeated the run as `tp4-ladder-first-3`
+  (17:18:45-17:20:57), sampling the GPU's compute processes every 2 s. All 62 samples
+  showed only the run's own process.
+- The TP4 figures below are the four clean processes. With the overlapped run as a fifth,
+  TP4 cold reads -1.84 ± 0.62 µs over every row count and -2.20 ± 0.59 µs at full depth
+  (hot: -2.78 ± 2.96 and -3.79 ± 3.50). Its bits matched too. The conclusion is the same.
+
+`runs/smoke/smoke-tp3.json` is the first harness
 check, with 20/5 iterations and one round. It was run before the capture-memory
 measurement settled the allocator, which made its base capture read -82 MiB reserved. It
 is not in the summary.
@@ -156,11 +169,11 @@ Average over row counts:
 
 | | TP3 cold | TP3 hot | TP4 cold | TP4 hot |
 |---|---:|---:|---:|---:|
-| every row count 1..limit | -0.76 ± 0.59 | -3.51 ± 2.47 | -1.98 ± 0.71 | -2.36 ± 4.03 |
-| row counts whose capacity changes (32 of 48; 76 of 96) | -1.20 ± 0.61 | -4.98 ± 3.42 | -2.51 ± 0.75 | -3.17 ± 4.61 |
-| unchanged capacity (A/A) | +0.12 ± 0.57 | -0.57 ± 0.74 | +0.03 ± 1.21 | +0.72 ± 2.59 |
-| full depth, c1..cmax | -1.03 ± 0.98 | -4.11 ± 3.04 | -2.37 ± 0.57 | -3.27 ± 4.72 |
-| rows 1-12 (one or two requests, any trim) | -0.30 ± 0.62 | -1.47 ± 1.24 | -0.51 ± 0.49 | -2.68 ± 5.06 |
+| every row count 1..limit | -0.76 ± 0.59 | -3.51 ± 2.47 | -1.65 ± 0.49 | -3.74 ± 1.85 |
+| row counts whose capacity changes (32 of 48; 76 of 96) | -1.20 ± 0.61 | -4.98 ± 3.42 | -2.15 ± 0.62 | -4.78 ± 1.85 |
+| unchanged capacity (A/A) | +0.12 ± 0.57 | -0.57 ± 0.74 | +0.25 ± 1.02 | +0.21 ± 2.35 |
+| full depth, c1..cmax | -1.03 ± 0.98 | -4.11 ± 3.04 | -2.13 ± 0.83 | -4.97 ± 1.91 |
+| rows 1-12 (one or two requests, any trim) | -0.30 ± 0.62 | -1.47 ± 1.24 | -0.44 ± 0.55 | -0.79 ± 2.18 |
 
 Full-depth steps (6 rows a request). "Gather" is the all_gather bytes the ladder saves:
 10 KiB per row, not measured here.
@@ -182,28 +195,28 @@ TP4 (tp4-ring shape: TP4 shard, limit 96):
 
 | c | rows | capacity | gather | base cold | Δ cold | base hot | Δ hot |
 |---:|---:|---|---:|---:|---:|---:|---:|
-| 1 | 6 | 8 → 6 | 20 KiB | 206.0 | -0.30 ± 0.37 | 105.8 | -1.96 ± 5.58 |
-| 2 | 12 | 16 → 12 | 40 KiB | 208.4 | -0.79 ± 0.99 | 113.6 | -2.74 ± 5.13 |
-| 3 | 18 | 32 → 18 | 140 KiB | 212.9 | -1.85 ± 0.35 | 129.7 | -9.21 ± 5.85 |
-| 4 | 24 | 32 → 24 | 80 KiB | 213.8 | -1.80 ± 2.74 | 133.2 | -5.13 ± 11.31 |
-| 5 | 30 | 32 → 30 | 20 KiB | 213.5 | -0.57 ± 0.43 | 132.1 | +0.85 ± 8.19 |
-| 6 | 36 | 64 → 36 | 280 KiB | 221.0 | -2.79 ± 1.72 | 154.1 | -8.73 ± 8.90 |
-| 7 | 42 | 64 → 42 | 220 KiB | 221.9 | -1.94 ± 3.55 | 155.3 | -4.21 ± 7.39 |
-| 8 | 48 | 64 → 48 | 160 KiB | 223.2 | -2.32 ± 1.19 | 156.2 | -0.67 ± 9.06 |
-| 9 | 54 | 64 → 54 | 100 KiB | 222.9 | -1.33 ± 1.31 | 158.9 | +0.61 ± 8.49 |
-| 10 | 60 | 64 → 60 | 40 KiB | 223.8 | -1.15 ± 1.83 | 158.2 | +4.61 ± 9.88 |
-| 11 | 66 | 96 → 66 | 300 KiB | 264.2 | -6.79 ± 2.41 | 224.3 | -10.00 ± 2.43 |
-| 12 | 72 | 96 → 72 | 240 KiB | 264.5 | -5.01 ± 2.02 | 227.6 | -10.79 ± 3.90 |
-| 13 | 78 | 96 → 78 | 180 KiB | 266.8 | -5.64 ± 3.37 | 226.3 | -3.28 ± 10.71 |
-| 14 | 84 | 96 → 84 | 120 KiB | 266.2 | -3.12 ± 0.57 | 229.1 | -4.30 ± 6.97 |
-| 15 | 90 | 96 → 90 | 60 KiB | 266.9 | -1.90 ± 1.24 | 228.4 | -1.27 ± 6.58 |
-| 16 | 96 | 96 → 96 | 0 | 267.7 | -0.54 ± 0.87 | 227.9 | +3.95 ± 10.71 |
+| 1 | 6 | 8 → 6 | 20 KiB | 205.6 | -0.31 ± 0.36 | 108.2 | -0.91 ± 3.95 |
+| 2 | 12 | 16 → 12 | 40 KiB | 207.9 | -0.42 ± 0.80 | 114.8 | -1.13 ± 3.13 |
+| 3 | 18 | 32 → 18 | 140 KiB | 212.5 | -1.66 ± 0.82 | 129.3 | -8.18 ± 8.24 |
+| 4 | 24 | 32 → 24 | 80 KiB | 213.7 | -1.77 ± 2.77 | 133.7 | -7.29 ± 5.02 |
+| 5 | 30 | 32 → 30 | 20 KiB | 213.4 | -0.71 ± 0.32 | 132.2 | -0.38 ± 5.89 |
+| 6 | 36 | 64 → 36 | 280 KiB | 220.5 | -2.35 ± 0.59 | 154.9 | -11.33 ± 3.04 |
+| 7 | 42 | 64 → 42 | 220 KiB | 221.1 | -1.20 ± 2.64 | 156.0 | -7.15 ± 5.86 |
+| 8 | 48 | 64 → 48 | 160 KiB | 222.7 | -2.08 ± 1.37 | 157.3 | -4.29 ± 5.29 |
+| 9 | 54 | 64 → 54 | 100 KiB | 222.2 | -0.73 ± 1.03 | 159.3 | -1.27 ± 4.87 |
+| 10 | 60 | 64 → 60 | 40 KiB | 223.1 | -0.62 ± 0.60 | 159.6 | +0.34 ± 5.50 |
+| 11 | 66 | 96 → 66 | 300 KiB | 264.7 | -7.11 ± 2.02 | 224.6 | -12.51 ± 5.69 |
+| 12 | 72 | 96 → 72 | 240 KiB | 264.9 | -5.16 ± 1.73 | 229.2 | -13.80 ± 12.21 |
+| 13 | 78 | 96 → 78 | 180 KiB | 266.9 | -5.39 ± 3.76 | 226.6 | -6.50 ± 5.83 |
+| 14 | 84 | 96 → 84 | 120 KiB | 266.4 | -2.88 ± 1.12 | 227.2 | -4.20 ± 7.08 |
+| 15 | 90 | 96 → 90 | 60 KiB | 267.2 | -1.59 ± 1.51 | 229.1 | -2.32 ± 6.34 |
+| 16 | 96 | 96 → 96 | 0 | 268.0 | -0.07 ± 1.54 | 228.7 | +1.48 ± 8.98 |
 
 Reading:
-- The cold saving tracks the rows removed: about 0.08-0.23 µs per padded row. It is
+- The cold saving tracks the rows removed: about 0.08-0.24 µs per padded row. It is
   largest above 64 rows, where the base pads to 96 (c11-c13 at TP4).
-- Hot mode at TP4 is noisy: its A/A row counts swing ±2.6 µs, and single row counts swing
-  ±10 µs. Cold mode is tight (A/A within ±1.2 µs) and is the one to read.
+- Hot mode is noisy: its TP4 A/A row counts swing ±2.4 µs, and single row counts up to
+  ±12 µs. Cold mode is tight (A/A within ±1.0 µs) and is the one to read.
 - In serving, adaptive verification trims drafts, so many steps sit below 6c. All 1..limit
   row counts are in `summary.json` (`per_rows`).
 - The context step adds the RoCE all_gather on top; this harness has only its device copy.
