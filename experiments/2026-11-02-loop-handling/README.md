@@ -9,7 +9,7 @@ two legitimate answers: a 128-zero C array at its 292nd of 396 tokens, and
 `hello` written 200 times, which the model ran past to 281. v2 replaces v1's
 single 256-token horizon for a healthy answer with two (see The change). It
 passes the unit tests and the offline replays on candidate-37's image on sp8.
-Its probe soak is queued in the same window. Not promoted; no recipe change.
+Its probe soak in the same window passed 15 of 15. Not promoted; no recipe change.
 
 - Base: candidate-37, vLLM patch head `5b7cfa37f` (tree `af0fb152`), image
   `spark-ds41f:candidate-37` (`sha256:e1ee7b19…` on sp8).
@@ -239,11 +239,29 @@ stopped with `finish_reason` repetition, and the engine stayed healthy.
 
 Every other reply passed, including the sink triggers (clean), the quoted
 soup and stall at max (bounded: the longest run was 12 tokens) and the
-separator table (kept). The candidate-37 and v1-repeat arms are still to
-report.
+separator table (kept).
 
-**v2** ([lab-probes-v2.json](lab-probes-v2.json), run `loop-v2-probes-sp`,
-queued last in the same window) boots one arm.
+| Arm | Probes failed | Which |
+|---|---|---|
+| v1 | 2 of 15 | `repeat-word-200` at 281 tokens, `zero-array-128` at 292 |
+| candidate-37 | 3 of 15 | the same two plus `separator-table`, at 25, 36 and 43 tokens |
+| v1 repeat | 2 of 15 | the same two as v1 |
+
+Telemetry: every measured step ran with the clocks unlocked.
+
+**v2** ([lab-probes-v2.json](lab-probes-v2.json), run `loop-v2-probes-sp`, from
+20:36Z, last in the same window) boots one arm. Result: **15 of 15 probes
+pass**, and 16 distinct streams run at 160.65 tok/s (±0.6%).
+- `zero-array-128` is kept: 397 tokens, `finish_reason` stop.
+- `separator-table` is kept: a 200-token run.
+- The quoted stall stops by itself at 93 to 206 tokens.
+- The quoted soup stays bounded: the longest run is 12, at the 6,000-token limit.
+- `repeat-word-200` ran to the 1,000-token limit, a run of 999 `hello`s. The
+  model doesn't stop by itself after 200. v1 cut it at 281. v2 lets an exactly
+  periodic loop run 2,048 tokens, past this trigger's limit. That is the cost
+  The change names: a periodic runaway is bounded at about 2,070 tokens, not
+  stopped early.
+
 - [arm-tp3-switched-v2.json](arm-tp3-switched-v2.json) mounts `overlay-v2/`'s
   `utils.py` (vLLM 050e8b1cc) with `overlay/`'s `scheduler.py` and
   `request.py`, which v2 doesn't change.
@@ -255,7 +273,7 @@ queued last in the same window) boots one arm.
 
 ## Not done
 
-- **Hardware.** v2's probe soak is queued, not yet run. The release suites and a
+- **Hardware.** v2 passed its probe soak (above). The release suites and a
   thinking-on determinism check (the operator's bit-identity checks send
   `thinking: false` only) still need a window.
 - **Real reasoning traces.** The reasoning-side false-positive rate needs
