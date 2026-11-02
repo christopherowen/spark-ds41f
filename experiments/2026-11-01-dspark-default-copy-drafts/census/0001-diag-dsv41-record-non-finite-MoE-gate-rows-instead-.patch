@@ -1,0 +1,300 @@
+From cb46d6c82f7e29b901b871d8c8a229998dcaeff4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:54:34 +0100
+Subject: [PATCH] diag(dsv41): record non-finite MoE gate rows instead of
+ asserting (#842 census)
+
+Base: candidate-37 (vLLM patch head 5b7cfa37f). Diagnostic only, never for
+serving: for the #842 crash repro (route_partials: gate logits contain nan or
+inf, under copy drafts).
+
+TileLangGateRouter flags a routed decode row whose gate partials do not sum to
+finite logits (rows route_partials' mask skips are not looked at), records it
+in a per-router buffer and zeroes its partials, so route_partials' assert does
+not fire and the step finishes: the row routes to weight-0 experts and its
+hidden state stays non-finite. Device-only torch ops, captured with the decode
+graphs.
+
+The V2 runner reads the census after the step's sampling (the target's rows)
+and after the drafter proposes (the drafter's), a host sync each, and logs at
+ERROR, as NONFINITE lines: the step's requests (rows, sampled, the copy
+proposal being verified, total length) and every flagged row's layer, row,
+request, slot, draft index, position, input id, padding flag, origin (anchor,
+copy, dspark, placeholder) and whether it lies past the first rejected draft.
+
+Tests: tests/kernels/moe/test_deepseek_v41_tilelang_router.py (a NaN and an
+inf row recorded, padding not looked at, other rows as before, cleared on
+read, under CUDA-graph replay).
+
+Upstream: not for upstream; a lab image's patch.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  | 50 ++++++++++
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 56 ++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 91 +++++++++++++++++++
+ 3 files changed, 197 insertions(+)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 5f5636863..d410a000e 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -572,3 +572,53 @@ def test_gate_router_route_local_matches_full_rows(
+             None, handle, None, input_ids=input_ids
+         )
+     assert handed_w is gathered_weights and handed_ids is gathered_ids
++
++
++def test_nonfinite_rows_are_recorded_not_asserted(plain_scratch, padded_step):
++    """Diagnostic census (#842): a routed row whose gate logits are not finite is
++    recorded and routed to weight-0 experts instead of failing route_partials'
++    assert; a padding row's are not looked at; every other row routes as before;
++    reading the census clears it."""
++    rows, padding = 6, 2
++    is_padding = padded_step(rows, padding)
++    generator = torch.Generator(device="cuda").manual_seed(21)
++    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
++    x[1, 7] = float("nan")
++    x[2, 9] = float("inf")
++    x[rows - 1] = float("nan")  # padding
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    gate = _Gate(384, seed=21)
++    router = tilelang_router.TileLangGateRouter(
++        gate=gate,
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    router.declare_kernels()
++    tilelang_router.nonfinite_census()  # earlier tests' routers
++    weights, ids = router._compute_routing(None, x, None)
++    torch.cuda.synchronize()
++    hits = tilelang_router.nonfinite_census()
++    assert [rows_ for name, rows_ in hits if name == router._census_name] == [[1, 2]]
++    assert tilelang_router.nonfinite_census() == []
++    assert torch.isfinite(weights).all()
++    assert (ids[is_padding] == -1).all()
++    good = torch.tensor([True, False, False, True, False, False], device="cuda")
++    logits, _ = gate(x)
++    expected_weights, expected_ids = _reference(logits[good], bias, 6)
++    torch.testing.assert_close(ids[good], expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(weights[good], expected_weights, rtol=2e-6, atol=0)
++
++    # Captured in a CUDA graph, as decode steps run it.
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        router._compute_routing(None, x, None)
++    tilelang_router.nonfinite_census()
++    x[1, 7] = 0.0
++    graph.replay()
++    torch.cuda.synchronize()
++    hits = tilelang_router.nonfinite_census()
++    assert [rows_ for name, rows_ in hits if name == router._census_name] == [[2]]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 61ece0f4d..bacfb6705 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -1059,6 +1059,59 @@ def provided_routes(
+     return None
+ 
+ 
++# Diagnostic (nonfinite census, #842): a decode row whose gate logits are not
++# finite is recorded instead of failing route_partials' assert. Its partials are
++# zeroed so the step finishes (it routes to weight-0 experts), and the runner
++# reads and logs the rows after the step's sampling and after the drafter.
++_CENSUS_ROUTERS: list["TileLangGateRouter"] = []
++_CENSUS_ANY: torch.Tensor | None = None
++
++
++def _census_rows(
++    router: "TileLangGateRouter",
++    partials: torch.Tensor,
++    route_mask: torch.Tensor | None,
++    padding: bool,
++    rows: int,
++) -> None:
++    """Flag the routed rows of ``partials`` (``[shards, rows, experts]``) whose sum
++    is not finite, and zero them; device-only, so a CUDA graph captures it."""
++    global _CENSUS_ANY
++    if router._census is None:
++        router._census = torch.zeros(
++            max(rows, router.gate.tilelang_split_rows),
++            dtype=torch.bool,
++            device=partials.device,
++        )
++        router._census_name = (
++            getattr(router.gate, "prefix", "") or f"router{len(_CENSUS_ROUTERS)}"
++        )
++        _CENSUS_ROUTERS.append(router)
++    if _CENSUS_ANY is None:
++        _CENSUS_ANY = torch.zeros(1, dtype=torch.bool, device=partials.device)
++    bad = ~torch.isfinite(partials.sum(dim=0)).all(dim=-1)
++    if route_mask is not None:
++        # route_partials skips a row whose mask equals ``padding``.
++        bad &= route_mask[:rows] != padding
++    router._census[:rows].logical_or_(bad)
++    _CENSUS_ANY.logical_or_(bad.any())
++    partials.masked_fill_(bad.view(1, rows, 1), 0.0)
++
++
++def nonfinite_census() -> list[tuple[str, list[int]]]:
++    """Each router's rows flagged since the last call, cleared (a host sync)."""
++    if _CENSUS_ANY is None or not bool(_CENSUS_ANY.item()):
++        return []
++    hits = []
++    for router in _CENSUS_ROUTERS:
++        rows = router._census.nonzero().flatten().tolist()
++        if rows:
++            hits.append((router._census_name, rows))
++        router._census.zero_()
++    _CENSUS_ANY.zero_()
++    return hits
++
++
+ class TileLangGateRouter(TileKernelsRouter):
+     """TileKernelsRouter that also runs the gate, fusing its decode reduction.
+ 
+@@ -1084,6 +1137,8 @@ class TileLangGateRouter(TileKernelsRouter):
+         )
+         gate.tilelang_router = self
+         self._mask_variants = _routing_mask_variants(vllm_config)
++        self._census: torch.Tensor | None = None
++        self._census_name = ""
+ 
+     def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
+         """``route_partials`` for each (input ids' dtype, routing mask) a decode
+@@ -1259,6 +1314,7 @@ class TileLangGateRouter(TileKernelsRouter):
+             None if route_mask is None else "padding" if padding else "route",
+         )
+         rows = x.shape[0]
++        _census_rows(self, partials, route_mask, padding, rows)
+         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
+         topk_weights = torch.empty(
+             rows, self.top_k, dtype=torch.float32, device=x.device
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 26992d545..463db348d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -75,6 +75,7 @@ from vllm.multimodal.encoder_budget import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
++from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+ from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
+@@ -700,6 +701,94 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.vllm_config.model_config = self.model_config
+         self.vllm_config.load_config = self.load_config
+ 
++    def _log_nonfinite_rows(
++        self, input_batch: InputBatch, num_sampled: torch.Tensor, *, drafter: bool
++    ) -> None:
++        """Diagnostic (nonfinite census, #842): log the rows whose MoE gate logits
++        were not finite in the target's forward (after sampling) or the drafter's
++        (after it proposes), one ERROR line a row, and the step's layout."""
++        from vllm.models.deepseek_v4_1.tilelang import router as ds41_router
++
++        with gpu_sync_allowed():
++            hits = ds41_router.nonfinite_census()
++            if not hits:
++                return
++            self._nonfinite_hits = getattr(self, "_nonfinite_hits", 0) + 1
++            num_reqs = input_batch.num_reqs
++            qsl = input_batch.query_start_loc[: num_reqs + 1].tolist()
++            sampled = num_sampled[:num_reqs].tolist()
++            slots = input_batch.idx_mapping_np[:num_reqs].tolist()
++            copy = self.copy_drafter
++            pending = (
++                copy.int_state[input_batch.idx_mapping, 1].tolist()
++                if copy is not None
++                else [0] * num_reqs
++            )
++            total_len = self.req_states.total_len.gpu[input_batch.idx_mapping].tolist()
++            logger.error(
++                "NONFINITE gate logits (%s, hit step %d): step of %d requests, "
++                "%d tokens; per request (req_id, slot, rows, sampled, copy "
++                "pending, total_len): %s",
++                "drafter" if drafter else "target",
++                self._nonfinite_hits,
++                num_reqs,
++                input_batch.num_tokens,
++                [
++                    (
++                        input_batch.req_ids[r],
++                        slots[r],
++                        qsl[r + 1] - qsl[r],
++                        sampled[r],
++                        pending[r],
++                        total_len[r],
++                    )
++                    for r in range(num_reqs)
++                ],
++            )
++            for name, rows in hits:
++                for row in rows:
++                    if drafter:
++                        logger.error(
++                            "NONFINITE drafter row: layer=%s row=%d", name, row
++                        )
++                        continue
++                    r = next(
++                        (i for i in range(num_reqs) if qsl[i] <= row < qsl[i + 1]),
++                        -1,
++                    )
++                    j = row - qsl[r] if r >= 0 else -1
++                    accepted = sampled[r] - 1 if r >= 0 else -1
++                    # A copy's drafts are its first ``pending``; DSpark's its
++                    # block; any row past them verifies a -1 placeholder.
++                    offered = pending[r] if r >= 0 and pending[r] > 0 else 0
++                    origin = (
++                        "padding"
++                        if r < 0
++                        else "anchor"
++                        if j == 0
++                        else "copy"
++                        if j <= offered
++                        else "dspark"
++                        if offered == 0 and j <= self.num_draft_steps
++                        else "placeholder"
++                    )
++                    logger.error(
++                        "NONFINITE target row: layer=%s row=%d req=%s slot=%d "
++                        "draft=%d position=%d input_id=%d is_padding=%d origin=%s "
++                        "accepted=%d past_first_rejection=%s",
++                        name,
++                        row,
++                        input_batch.req_ids[r] if r >= 0 else "-",
++                        slots[r] if r >= 0 else -1,
++                        j,
++                        int(self.input_buffers.positions[row]),
++                        int(self.input_buffers.input_ids[row]),
++                        int(self.input_buffers.is_padding[row]),
++                        origin,
++                        accepted,
++                        j > accepted if r >= 0 else "-",
++                    )
++
+     @functools.cached_property
+     def main_stream(self) -> torch.cuda.Stream:
+         # Cache the default CUDA stream to avoid lookup overhead.
+@@ -3435,6 +3524,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
++        self._log_nonfinite_rows(input_batch, num_sampled, drafter=False)
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+@@ -3678,6 +3768,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 )
+                 if boundary_state is not None:
+                     self.speculator.boundary_checkpoint_capture = None
++                self._log_nonfinite_rows(input_batch, num_sampled, drafter=True)
+                 if num_spec_tokens_to_schedule > 0:
+                     draft_tokens = limit_draft_tokens(
+                         draft_tokens,
+-- 
+2.43.0
+

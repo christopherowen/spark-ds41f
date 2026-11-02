@@ -1,30 +1,523 @@
-# Default `CopyDrafter` for DSpark Greedy Adaptive Verification (2026-11-01)
+# Copy drafts as the one behaviour of DSpark greedy adaptive verification (#842)
 
-## Motivation ("One True Way")
+Owner's rule: if it is better it is the default; if it does not work it goes. Copy
+drafts qualified in candidate-36 (36/36 sessions better than spark-ds41f-1030, 0
+worse than candidate-34). They still ran only as separate arms
+(`candidate-37/tp3-copy.json`, `2026-10-29-copy-drafts-c12/copy-tp4.json`), and
+`SpeculativeConfig.copy_drafts` still defaulted to `None`. This experiment makes
+them the only behaviour, with no option, and finishes the stalled rework of their
+step work.
 
-Previously, `SpeculativeConfig.copy_drafts` defaulted to `None`, requiring an explicit `"copy_drafts": {"min_match": 16, "initial_drafts": 8, "max_drafts": 16}` entry in `--speculative-config` plus manual widening of `--max-num-batched-tokens`, `--max-cudagraph-capture-size`, and `cudagraph_capture_sizes` in a separate overlay arm (`tp3-copy.json` / `copy-tp4.json`).
+- **Base:** candidate-37: vLLM `19f2c20ed` plus
+  `../2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series`, patch head
+  `5b7cfa37f`, tree `af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33`. Image
+  `spark-ds41f:candidate-37` (label `local.spark-ds41f.vllm.patch-head`
+  `5b7cfa37...`), on dgx4 and sp8 (GB10, 48 SMs).
+- **Patch:** [`0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch`](0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch),
+  one commit on that head (`bc71d8191`, tree
+  `9f9c6d73158c0a23fed023059f8c6f194e769075`). Its message states base,
+  rationale, quality, tests and upstream status. It replaces the earlier
+  `0001-dspark-default-copy-drafts.patch` of this PR, which was written on
+  candidate-27 and kept the option.
+- **Variable:** copy drafts on wherever DSpark verifies greedy drafts adaptively.
+  At the cluster this is candidate-37's copy arms run from the plain recipe. The
+  rework of the step's copy work is bit-identical in its outputs and is measured
+  here at kernel level.
 
-In Candidate 18 (`rc18`) qualification (`49/49` sessions passed), `CopyDrafter` (`min_match=16, initial_drafts=8, max_drafts=16`) demonstrated:
-- **100% Bit-Exact:** Identical SHA-256 digests across all greedy, logprob, 16K SP, Vision, and seeded-sampling gates.
-- **No Regression on Non-Copy Traffic:**
-  - Engine decode grid: `-0.41% ±0.16%` faster
-  - `c8` paired decode: `+0.43%` tok/s
-  - `c1` paired decode: `+0.19% ±0.16%` faster (`+0.27%` overall)
-  - `sampled c1` paired decode: `+0.23% ±0.06%` faster
-  - `sampled c8` TPOT p99: `-2.89%`
-- **Up to `6.70x` Higher Acceptance on Copy / Edit / Tool Workloads (`copy_probe.py`):**
-  - Aggregate `tokens/step`: `2.350 -> 9.185` (`3.91x`)
-  - `copy`: `2.39 -> 16.029 tok/step` (`6.70x`)
-  - `edit`: `2.38 -> 14.249 tok/step` (`5.99x`)
-  - `tool`: `2.15 -> 6.709 tok/step` (`3.12x`)
+> **Status: blocked. Not ready to merge or default.** Copy drafts on candidate-37
+> crash an operator's engine under real traffic (below, *Unfavourable: the crash*).
+> This patch computes the same proposals as candidate-37's copy arm. Its kernel and
+> c1 results cannot clear it of the crash.
 
-Following the **"One True Way"** design principle, `CopyDrafter` is now enabled by default whenever DSpark runs with greedy adaptive verification on the async V2 model runner, with automatic decode-row and CUDA-graph ladder widening.
+## Unfavourable: the crash (operator's TP3 ring, 2026-11-02)
 
-## Design
+The source is JordiPosthumus's comments on #842 ([6581345928](https://github.com/christopherowen/spark-ds41f/pull/842#issuecomment-6581345928),
+15:42Z; [6581566292](https://github.com/christopherowen/spark-ds41f/pull/842#issuecomment-6581566292),
+15:51Z) and their closed #849. The setup was unpatched candidate-37 on a 3-node
+TP3 ring at 2200 MHz, with explicit `copy_drafts` and this PR's envelope (budget
+6,155, capture to 59, sizes +56, 59).
 
-1. **Default `CopyDraftsConfig` in `SpeculativeConfig.__post_init__` (`vllm/config/speculative.py`):**
-   - When `self.copy_drafts is None` and `self.method == "dspark"` and `self.enable_adaptive_verification` and `self.draft_sample_method == "greedy"`, default `self.copy_drafts` to `CopyDraftsConfig(max_drafts=max(CopyDraftsConfig().max_drafts, self.num_speculative_tokens))` (`min_match=16, initial_drafts=8, max_drafts=16`).
-   - In `VllmConfig.__post_init__` (`vllm/config/vllm.py`), if `copy_drafts` was defaulted and a runtime requirement (`async_scheduling`, `use_v2_model_runner`, `pipeline_parallel_size == 1`, `not use_request_boundary_checkpoints`) is not met, clear `self.speculative_config.copy_drafts = None`.
-2. **Automatic Decode-Row & CUDA-Graph Envelope Widening in `VllmConfig` (`vllm/config/vllm.py`):**
-   - In `_set_max_num_scheduled_tokens`, when `self.max_decode_rows > base_decode_rows` (`max_num_seqs * uniform_decode_query_len`) and `align_prefill_chunks` is enabled with `long_prefill_token_threshold` sized for `base_decode_rows`, automatically widen `max_num_batched_tokens = long_prefill_token_threshold + self.max_decode_rows` (`6144 -> 6155` on TP3, `16384 -> 16395` on TP4) while preserving `long_prefill_token_threshold` (`6096` / `16288`) so aligned prefill chunk boundaries remain 100% unchanged.
-   - In `_set_cudagraph_sizes`, when `self.max_decode_rows > base_decode_rows` and `max_cudagraph_capture_size == base_decode_rows`, automatically widen `max_cudagraph_capture_size = self.max_decode_rows` and extend `cudagraph_capture_sizes` up to `self.max_decode_rows` (`[..., 48] -> [..., 48, 56, 59]` on TP3; `[..., 96] -> [..., 96, 104, 107]` on TP4).
+- **m=16, synthetic suites: passed.**
+  - `copy_probe` tokens per step: copy 5.082 → 16.014, edit 5.163 → 15.315,
+    tool 5.268 → 6.083, prose level.
+  - Single-stream closed loop: 64.897 → 64.683 tok/s (−0.33%, CI95 ±2.33%).
+  - Token-identical to candidate-37 on greedy and copy-dense prompts.
+- **m=16, real agent traffic: crashed.** A few minutes in the operator's gateway
+  pool, then a device assert `route_partials: gate logits contain nan or inf` on
+  worker 0, at 15:47:41Z. Ring2 was restored to plain candidate-37.
+- **m=8, single-stream suite: crashed the same way.** Reproduced on two boots
+  (#849: `cudaErrorAssert`, block [4]). The m=16 arm and the baseline passed that
+  suite.
+
+Not reproduced here: neither dev node (dgx4, sp8) has DS4.1 weights. What reading
+candidate-37 establishes is under *Crash analysis* below. The rest needs the
+operator's repro or a serving-cluster window.
+
+The crash is tracked in [#852](https://github.com/christopherowen/spark-ds41f/issues/852)
+(JordiPosthumus, 16:03Z), and the fix should close it. Their exact repro is
+deterministic at m=8, on two boots:
+- the `candidate-37-af0fb152` image, TP3, 2200 MHz;
+- `copy_drafts={"min_match":8,"initial_drafts":8,"max_drafts":16}` at the #842
+  envelope (budget 6,155, capture 59, sizes +56, 59);
+- `copy_probe.py --prompts 3`, then servebench's `single-stream` suite. The suite
+  dies in its warm-up with `route_partials: gate logits contain nan or inf`
+  (`router.py:973`, worker 0, block [4]).
+
+m=16 passes the probe and the suite with identical tokens, and dies only under
+their real traffic. Plain candidate-37 (without copy drafts) passes. Nobody has
+run candidate-37 with copy drafts at that envelope.
+
+## The change
+
+1. **No option.** `SpeculativeConfig.copy_drafts` becomes a derived field
+   (`field(init=False)`): `CopyDraftsConfig()` (minimum match 16, 8 to 16 drafts)
+   when `method == "dspark"`, `enable_adaptive_verification` and
+   `draft_sample_method == "greedy"`. `--speculative-config` refuses
+   `copy_drafts`, so the old arms' JSON fails loudly instead of being half-applied.
+   Copy drafts are off only where the engine cannot carry them:
+   - without async scheduling on the V2 model runner (`VllmConfig`, an info line);
+   - with a drafter checkpoint that has no confidence head, hence no adaptive
+     verification (the runner drops the copy drafter; it used to raise).
+
+   The request-boundary-checkpoint refusal goes: `use_request_boundary_checkpoints`
+   holds only for MTP/DFlash on hybrid models, never for DSpark. The
+   pipeline-parallel refusal also goes: adaptive verification refuses PP itself.
+2. **The recipe's sizing fits the copy envelope.** `scripts/recipe.py` sizes every
+   shape for DSpark's uniform decode rows (`max_num_seqs × 6`). Copy drafts let one
+   request verify 16 drafts, so `max_decode_rows` is 11 rows wider. `VllmConfig`
+   now widens two things:
+   - **Budget.** With aligned prefill chunks, a token budget equal to the
+     threshold plus the uniform rows grows by the 11 rows: 6,144 → 6,155
+     (`tp3-triangle`), 16,384 → 16,395 (`tp4-ring`). The encoder budgets grow
+     with it. The threshold (6,096 / 16,288), and with it every chunk boundary,
+     is unchanged.
+   - **CUDA-graph range.** A capture range ending at the uniform rows extends on
+     vLLM's default stride of 8, ending at the envelope: `[..., 48]` →
+     `[..., 48, 56, 59]` and `[..., 96]` → `[..., 96, 104, 107]`.
+
+   Both log the widening. This is the configuration of candidate-36's qualified
+   copy arms, now reached from the plain recipe. Both steps are idempotent:
+   `VllmConfig.__post_init__` may run again (e.g. `replace()`) without widening
+   twice.
+3. **One copy pass, beside DSpark.**
+   - `copy_alloc` now updates the copy state from the step's verification and
+     records the choice (source, offered drafts, next drafts, acceptance estimate)
+     beside the allocation and the slot's valid draft count.
+   - `copy_apply` writes the proposals from that choice once DSpark has drafted.
+   - `copy_select` is removed: it repeated the chunk reduction and the state
+     update after DSpark (candidate-37 computed the state twice, discarding
+     `alloc` the second time).
+   - `prepare_alloc` runs `copy_match` and `copy_alloc` on the output copy stream
+     after postprocess, beside DSpark's draft forward. The allocation's copy to
+     the host follows on the same stream; `propose` makes the main stream wait.
+     Nothing DSpark runs reads or writes what they touch (history, lengths, copy
+     state). Every input stays alive until `propose`'s wait, so no allocation can
+     be reused under them.
+   - A `copy_match` block whose share of the context is empty writes −1 without
+     loading the key.
+
+## Review of the stalled diff (`/tmp/vllm-842-work` on dgx4)
+
+That tree (`1285a791f`, tree `378aa2db`) was candidate-37 plus one line in
+`tests/models/test_deepseek_v4_1_l2_schedule.py`. Its uncommitted 838-line diff
+was the starting point. I re-derived it on a freshly prepared candidate-37 tree:
+
+| Item | Verdict |
+|---|---|
+| Default `copy_drafts` in `SpeculativeConfig`, `_copy_drafts_defaulted` flag | **Reworked.** It kept the option (a user value still went through) and needed a flag to tell defaulted from explicit. The field is now derived and not an init argument. |
+| Clear for sync scheduling / V1 / PP / boundary checkpoints | **Reduced** to async + V2. PP is refused by adaptive verification; boundary checkpoints never hold for DSpark. |
+| Budget widening in `_set_max_num_scheduled_tokens` | **Kept, tightened**: only with aligned chunks (where the scheduler requires threshold + envelope); widens the encoder budgets too; logs. |
+| Capture-ladder widening | **Kept, re-ruled**: vLLM's default stride of 8, not a copy of the recipe's ladder rule. Also covers a max size without explicit sizes. Same result at TP3/TP4. |
+| `copy_alloc` takes the state update, `copy_apply` added | **Kept.** The diff also kept `copy_select` behind `propose(matched=False)`: two implementations of the state update. Removed; `propose` now always follows `prepare_alloc`. |
+| Side-stream `prepare_alloc` | **Kept**, with a guard: a `prepare_alloc` not followed by `propose` still orders the next one. |
+| `wait_main_stream` flag in `async_utils.py` | **Dropped**: `attach_async_output` runs right after `prepare_alloc`, before DSpark is enqueued, so waiting on the main stream there costs nothing. |
+| `WIDE_DECODE` `(5120, 3072/2048/1024)` → `{96: 96, 128: 64}` | **Dropped, a no-op.** Those shapes are WO-B (TP3/TP4/TP8). `wo.py` already pins WO-B's decode rows at 128 (`self.tilelang_decode_rows = 128`). `decode_tile_rows` gives 97 to 128 rows 64-row tiles with either table. TP4's 104/107-row steps already ran on the decode path; 0672 covered the shared experts' down projection. |
+| "2-token register pre-filter" in `copy_match` | **Not in the diff; not added.** The run loop's first iteration already is the second-token compare, and only after a first-token hit. The kernel's cost is one coalesced load per window end. |
+| `copy_match` empty-chunk exit | **Kept** (the barrier is block-uniform). Up to 44% faster at short contexts (below). |
+| Tests | **Rewritten** for the above, plus the side-stream test and the not-an-option test. |
+
+## Crash analysis (reading candidate-37; nothing here is reproduced)
+
+**Where the NaN must be.** Rows are batch-invariant (rank-order reductions, aligned
+chunks: the deployment's temperature-0 guarantee). A verified row whose drafts
+were all accepted therefore computes what plain candidate-37 computes at that
+position, and plain candidate-37 does not crash. So the non-finite gate logits
+are in one of two places:
+- a row past a rejected draft, an input plain candidate-37 never evaluates;
+- state corrupted across steps. That would also break bit-identity, which held on
+  the operator's copy-dense prompts.
+
+`route_partials` asserts on every routed row, so a doomed speculative row is fatal
+too. Each of its blocks routes two rows (`warps=2`), so #849's block [4] is rows
+8-9. At c1 those exist only in a copy step: the 8th and 9th drafts, past DSpark's
+6 rows.
+
+**Ruled out:**
+
+| Lead | Why it is not the cause |
+|---|---|
+| `-1` placeholders past `offered` | Their confidence is 0, so dead rows (`SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`) make them padding, which the router skips. Even if routed, the TileLang embedding writes zeros for negative ids, Engram hashes them as the pad id, and every quantizer floors amax at 1e-4. |
+| Layout lag under a binding budget (`_widen_copy_placeholders`) | The worker verifies `min(scheduled, slot limit)` drafts, inside the scheduler's allocation of `num_new_tokens` + 5 lookahead slots from its optimistic count. |
+| SWA blocks freed under in-flight rows | Freeing uses `total_computed - num_in_flight_tokens`, which counts widened copy rows. |
+| DSpark context rows | Sized by `max_decode_rows`; #853's poisoned-buffer soak covered the context ladder. |
+| Sink rejection (one more spec row) | Off in the recipe. |
+| Image placeholder ids copied from a prompt | The VL model's image mask is the runner's, by position, so a decode row with an image id gets that id's text embedding. |
+
+**#852's suspects, against the reading above:**
+
+| Suspect | Status |
+|---|---|
+| The copy verification row/placeholder path | Placeholders past `offered` are ruled out as a NaN source: they are dead rows, hence routing padding, and a negative id embeds as zeros and hashes as pad. The rest of the row path is the open question: copied tokens at rows 8-9 of a copy step. |
+| The 0612-style async event sync racing the row layout under load | The host's `slot_draft_limits` mirror is read without waiting and can be a step stale. Staleness only changes how many scheduled rows are admitted: always inside the scheduler's layout and KV allocation, and any extra rows are zero-confidence dead rows. Not a NaN source on its own. |
+| Draft ids or positions outliving their request or row (garbage embeddings, uninitialized KV) | Copy reads only its own slot's history below `total_len` (tested: stale tokens past a new request's length never propose). Positions come from the worker's own state. SWA blocks are freed on the processed-token basis. Still open: 0676's stale WO-A scratch for zero-length rows, uninitialized or stale input feeding a GEMM. |
+
+**Open:**
+
+- **0676** (in candidate-37, not candidate-36). For a row with zero SWA and
+  indexed lengths, the extend and `block_H ≥ 32` decode combine write
+  `Output = 0` but skip `wo_input`, so WO-A reads stale MXFP8 values and scales
+  for that row. It is harmless only if every such row is also routing padding.
+  Copy steps move c1 off the branch-free split route (≤ ~12 rows) onto the
+  skipping decode route.
+- Which copied inputs or row layouts produce a non-finite activation at all. That
+  needs the model, so the operator's repro or a cluster window.
+
+## Crash repro: the census and two arms (prepared; nothing run on a serving cluster)
+
+**Census** ([`census/0001-diag-dsv41-record-non-finite-MoE-gate-rows-instead-.patch`](census/0001-diag-dsv41-record-non-finite-MoE-gate-rows-instead-.patch)).
+vLLM `cb46d6c82` on candidate-37's `5b7cfa37f` (tree `00d1e4ea`), its own commit,
+never part of #842: the #842 patch keeps the assert.
+
+- `TileLangGateRouter` checks the summed gate partials of every routed decode row
+  before `route_partials`. Rows the kernel's mask skips are not looked at.
+- A non-finite row is recorded in a per-router buffer and its partials are
+  zeroed. The assert never fires, the step finishes, and the row routes to
+  weight-0 experts with its hidden state still non-finite. These are device-only
+  torch ops, so the decode graphs capture them.
+- The V2 runner reads the census after sampling (target rows) and after the
+  drafter (drafter rows). Each read is one host sync, so the arm runs slower than
+  serving.
+- It logs `NONFINITE` lines at ERROR:
+  - the step's requests: rows, sampled, the verified copy proposal, total length;
+  - per flagged row: layer, row, request, slot, draft index, position, input id,
+    padding flag, origin (`anchor`, `copy`, `dspark`, `placeholder`) and
+    `past_first_rejection`.
+- Tests: `test_deepseek_v41_tilelang_router.py` 80/80, including the new test
+  (NaN and inf rows recorded, padding not looked at, other rows routed as before,
+  cleared on read, CUDA-graph replay). A stand-in smoke of the runner's logging
+  printed all three origins.
+
+**Arms.** Both start from candidate-37 as sp5-sp7 serve it, image
+`sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a`.
+dgx4's own candidate-37 is a separate build (`c4c59de1…`).
+
+| Arm | vLLM | Image (built on sp8; Dockerfile under `census/`) | Overlay arm, m=8 (`repro/`) |
+|---|---|---|---|
+| candidate-37 + census | `cb46d6c82` (tree `00d1e4ea`) | `spark-ds41f:candidate-37-census-842` = `sha256:a93654beeacb4a818fee1475d5ff6639653881c86131e05ab1d29996190877de` | `arm-c37-census-m8.json` |
+| candidate-37 − 0676 + census | `cddb10983` = `5b7cfa37f~1` + census (tree `874cbfb2`) | `spark-ds41f:candidate-37-census-no0676-842` = `sha256:0224dca19023686dad5b754477fdb3447972c2563cde2a0071efa3a34e469f09` | `arm-c37-no0676-census-m8.json` (and `-m16` for a soak) |
+
+- Each image is `FROM` that base. Its layers extend the base's (3 and 4 new
+  layers), it holds no stale bytecode, and the router tests pass in it (80/80).
+  The −0676 image also passes `test_deepseek_v41_tilelang.py` (54 passed, 1
+  skipped, 1 xfailed).
+- The overlay arms follow the precedent of `ed5ae38c` (the #848/#854 arms). They
+  extend the profile sp5-sp7 serve (`config/candidate-37-tp3-switched-dev.local.json`,
+  node-local, the same sha on all three) and mount the same files from
+  `repro/overlay/` over the shared base image, so every rank keeps one digest.
+  They add the operator's arm: `copy_drafts` m=8 (8 to 16 drafts) at
+  candidate-37 `tp3-copy.json`'s envelope (6,155 tokens, capture to 59). The
+  overlay files are byte-identical to the images' (sha256).
+- `bin/spark --cluster-config <arm> doctor` (sp5's node map): configuration OK
+  for the dev profile and all three arms.
+
+The two images are the cross-check that the overlays equal them; the window uses
+the overlays, so nothing is distributed and every rank keeps `e1ee7b19`.
+
+**Lab specs.** Dry run with `--production-config
+config/candidate-37-tp3-switched-dev.local.json`: no problems.
+
+[`lab-repro.json`](lab-repro.json), 16 steps:
+- `sync`;
+- each m=8 arm on one boot, in #852's order:
+  1. `copy_probe.py --prompts 3`;
+  2. the `single-stream` suite (`repro/suite_single_stream.py`), where #852 dies in
+     warm-up;
+  3. `repro/census_logs.py`: every rank's NONFINITE and assert lines, collected
+     before the next boot replaces the container;
+  4. 8-stream `distinct_streams.py` (3 samples, 1,024 tokens);
+  5. the census again;
+- the table (`tables_arms.py`).
+
+[`lab-soak16.json`](lab-soak16.json), 8 steps: queued only if the −0676 m=8 arm
+is clean. The −0676 arm at m=16: the 12-prompt probe, the suite, 8- and 16-stream
+loads, the census.
+
+**The window** (owner: "Open a lab window", then "Add them" for the soaks), one
+queue on sp5-sp7, restored once at close:
+1. this repro;
+2. #848 `experiments/2026-11-02-loop-handling/lab-soak.json`;
+3. #854 `experiments/2026-11-02-dspark-markov-greedy-fusion/soak-tp3-switched.json`;
+4. #853 `experiments/2026-11-02-dspark-context-capture-ladder/soak-spec.json`.
+
+#853 and #854 both overlay `dspark.py`, so they stay separate boots. Before
+`window open`, the node checkouts (sp5 `15cba190`, sp6/sp7 `7e33dcc6`) are synced
+to the published main with `bin/spark --cluster-config
+config/candidate-37-tp3-switched-dev.local.json cluster sync`.
+
+## Commands
+
+The tree (dgx4; any clone that has `19f2c20ed`):
+
+```bash
+# candidate-37's series, then this patch, in a fresh repository
+git init fresh && cd fresh
+git fetch --depth 1 --no-tags /path/to/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+git switch -c spark/build FETCH_HEAD
+# each patch of ../2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series in order
+git am --committer-date-is-author-date <series patches...>            # tree af0fb152
+git am --committer-date-is-author-date 0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch
+git rev-parse HEAD^{tree}                                              # 9f9c6d73
+git diff --check HEAD~1 HEAD
+```
+
+[`run_image.sh`](run_image.sh) runs a command in `spark-ds41f:candidate-37` with
+the patch's files (`git diff --name-only 5b7cfa37f` of the tree) mounted read-only
+over `/opt/spark-ds41f/candidate/vllm`. The tblib stand-in
+(`scripts/release_tests/tblib_stub.py`) is mounted on `PYTHONPATH`:
+
+```bash
+TREE=/tmp/842-final/vllm ./run_image.sh "python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub \
+  tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_copy_drafts.py"
+```
+
+The microbenchmark ([`bench_copy_kernels.py`](bench_copy_kernels.py)) puts
+candidate-37's own `tilelang_copy.py` from the image beside it as
+`tilelang_copy_base.py`, and imports vLLM from the candidate tree:
+
+```bash
+docker run --rm --entrypoint cat spark-ds41f:candidate-37 \
+  /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py > bench/tilelang_copy_base.py
+./run_image.sh "PYTHONPATH=/c/w/bench:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x \
+  python3 /c/w/bench/bench_copy_kernels.py /c/w/out/full-1.json"          # and full-2, separate processes
+./run_image.sh "PYTHONPATH=... python3 /c/w/bench/bench_copy_kernels.py /c/w/out/c1-1.json --c1"   # and c1-2
+```
+
+The release gate: `scripts/release_tests.py check <tree> 5b7cfa37f HEAD` and
+`gate <tree> HEAD gate-manifest.json`, then [`gate.sh`](gate.sh) (the bundle's
+runner, environment, io_uring and O_DIRECT dirs, with the patch's files over the
+image tree). `MANIFEST=` selects a subset.
+
+## Runs
+
+All runs are kept below, unfavourable and failed ones included. The raw JSON is
+in [`runs/`](runs/).
+
+### Unit tests (dgx4, 2026-11-02)
+
+- `test_copy_drafts_scheduler.py` + `test_copy_drafts.py`: **38 passed** (81 s).
+  This run (17:04:41-17:06:10, dgx4 time) overlapped a sibling session's GPU
+  benchmark on dgx4 (rework-739's `tp4-ladder-first-2`). It is functional, so the
+  verdict stands; that session was told its run may be perturbed.
+- Mutation check: `propose` without its wait for the side stream fails
+  `test_side_stream_prepare_alloc_matches_the_drafters_stream` (1 failed), and
+  passes with it.
+- `scripts/release_tests.py check`: 127 selected test files (74 gate, 53
+  excluded), **0 problems**. Gate manifest: 121 files.
+- spark-ds41f, as CI runs it (`scripts/example_site.py`, then
+  `unittest discover -s tests`): **615 tests OK** (5 skipped).
+  `bin/spark --shape <shape> doctor`: configuration OK for all 9 shapes. A first
+  pytest run without a site node map had 5 failures; `origin/main` has the same 5
+  without one, and with the example site there are none.
+- vLLM `ruff` 0.14.0 (the tree's pre-commit pin) on the changed hunks: clean. The
+  remaining format and lint findings in those files are candidate-37's own lines,
+  left untouched.
+
+### Release gate
+
+Full gate (121 files) on dgx4 from 17:42 (dgx4 time), patch files over the
+candidate-37 image, the bundle's runner, environment and io_uring: still running
+at this commit. Recorded so far (chunks 0-2, 1,309 cases):
+- 46 failures, none in the changed code.
+- 11 in `test_deepseek_v41_tilelang_wo.py::test_grouped_gemm_equals_groups`
+  (`'Module' object has no attribute 'tilelang_key'`). Unpatched candidate-37
+  fails the same 11 (11 failed, 5 passed).
+- 35 in `test_deepseek_v41_engram_rows.py`: io_uring buffer registration failed,
+  "raise the locked-memory limit". The container ran at Docker's default 8 MiB
+  `memlock`; this file is rerun with `--ulimit memlock=-1`.
+
+### Microbenchmark (`bench_copy_kernels.py`)
+
+Every case runs base (candidate-37's kernels) and patch alternated (ABBA) in one
+process; each measurement was run twice, in separate processes, on an otherwise
+idle GPU. Container events confirm no other container ran: dgx4
+17:15:53-17:18:21, sp8 16:21:17-16:24:17 (local times).
+
+**Bit-identity.** Two checks:
+- every case's first step, from zero state: proposals, confidences, planned
+  confidences, allocation and copy state;
+- a 400-step walk of 8 requests (copied documents with edits, a repeated phrase,
+  random text), with candidate-37's step and the patch's on separate copy state,
+  the verified, accepted, sampled and cut counts varied every step: 1,495 copy
+  proposals.
+
+Result: **identical in every case and every step** (0 mismatched steps), in all
+five runs.
+
+**c1** (`--c1`, sp8, 1,000 alternated steps per case). The main stream's time from
+postprocess to the proposals, with a ~4.8 ms DSpark stand-in: 40 bandwidth-bound
+BF16 GEMMs, every SM busy, the worst case for kernels beside it. Δ = patch −
+candidate-37, mean ± 95% CI:
+
+| context | text | candidate-37 (µs) | patch (µs) | Δ run 1 (µs) | Δ run 2 (µs) |
+|---|---|---:|---:|---:|---:|
+| 2K | prose | 4799.6 | 4801.2 | -0.6 ± 5.6 | -1.1 ± 5.6 |
+| 2K | zipf | 4807.7 | 4808.1 | -2.1 ± 5.7 | +1.4 ± 5.0 |
+| 32K | prose | 4811.6 | 4812.9 | -0.5 ± 4.3 | -1.4 ± 5.4 |
+| 32K | zipf | 4828.1 | 4829.2 | -0.8 ± 5.3 | +0.3 ± 4.9 |
+| 128K | prose | 4832.9 | 4833.5 | -1.0 ± 5.4 | +0.5 ± 4.7 |
+| 128K | zipf | 4833.9 | 4834.9 | +2.8 ± 5.4 | +1.9 ± 5.6 |
+| 1M | prose | 4901.6 | 4867.5 | -34.5 ± 4.8 | -33.4 ± 5.5 |
+| 1M | zipf | 4916.8 | 4879.0 | -35.6 ± 4.5 | -36.2 ± 6.3 |
+
+At 2K to 128K the copy work is 4-9 µs, and moving it beside DSpark changes the
+step by −2.1 to +2.8 µs (CI ±5 µs): **no harm at c1**. At 1M contexts it takes
+`copy_match`'s ~35 µs off the critical path in both runs.
+
+**Kernels** (dgx4, GPU µs per launch from CUDA-graph replays). Selected rows; all
+36 cases are in `runs/bench-full-*.json`. Copy work per step: candidate-37 is match
++ alloc + select, the patch match + alloc + apply.
+
+| requests | context | text | match | alloc | select → apply | step's copy work (run 1; run 2) |
+|---:|---|---|---|---|---|---|
+| 1 | 2K | prose | 1.64 → 1.60 | 1.23 → 1.27 | 1.24 → 0.92 | 4.11 → 3.79; 4.18 → 3.81 |
+| 1 | 128K | zipf | 5.78 → 5.90 | 1.35 → 1.39 | 1.35 → 1.03 | 8.48 → 8.32; 8.73 → 8.24 |
+| 1 | 1M | zipf | 36.77 → 36.57 | 1.37 → 1.40 | 1.37 → 1.03 | 39.51 → 39.00; 39.72 → 39.33 |
+| 8 | 2K | prose | 2.62 → 2.07 | 1.35 → 1.39 | 1.48 → 1.07 | 5.45 → 4.53; 5.38 → 4.43 |
+| 8 | 128K | zipf | 7.64 → 7.62 | 1.39 → 1.40 | 1.39 → 1.06 | 10.42 → 10.08; 10.43 → 10.14 |
+| 8 | 1M | zipf | 200.28 → 196.27 | 1.35 → 1.39 | 1.39 → 1.06 | 203.02 → 198.72; 199.59 → 199.33 |
+| 16 | 2K | prose | 4.10 → 2.29 | 1.42 → 1.50 | 1.40 → 1.07 | 6.92 → 4.86; 6.87 → 4.87 |
+| 16 | 128K | zipf | 19.82 → 19.55 | 1.44 → 1.44 | 1.39 → 1.06 | 22.65 → 22.05; 22.95 → 22.03 |
+| 16 | 1M | zipf | 389.55 → 385.33 | 1.35 → 1.39 | 1.45 → 1.10 | 392.35 → 387.82; 392.70 → 394.66 |
+| 16 | 1M | loop | 4149.24 → 4037.01 | 1.50 → 1.64 | 1.59 → 1.19 | 4152.33 → 4039.84; 4157.39 → 4040.71 |
+
+How the kernels moved:
+- `copy_alloc` changes by −0.04 to +0.16 µs: it now writes the state and the
+  choice.
+- `copy_apply` costs 0.32-0.51 µs less than `copy_select`.
+- `copy_match`'s empty-chunk exit saves up to 1.8 µs (−44%) at 16 × 2K. The match
+  is 0.04-2.25 µs slower in 4 of 72 cells.
+
+The step's copy work is lower in 71 of 72 cells. The exception, 16 × 1M zipf in
+run 2, is +2.0 µs (+0.5%) against −4.5 µs in run 1.
+
+**Step, 1 to 16 requests** (dgx4, 200 alternated steps per case, stand-in as
+above; Δ mean ± 95% CI):
+
+| requests | context | text | stand-in (µs) | candidate-37 (µs) | patch (µs) | Δ run 1 (µs) | Δ run 2 (µs) |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 1 | 2K | prose | 4991 | 5018.6 | 5019.8 | -9.4 ± 16.4 | -19.4 ± 15.0 |
+| 1 | 2K | zipf | 5042 | 5019.3 | 5018.3 | +8.5 ± 15.8 | +2.0 ± 4.6 |
+| 1 | 32K | prose | 4990 | 5019.8 | 5015.0 | -13.3 ± 14.1 | -11.8 ± 15.1 |
+| 1 | 32K | zipf | 4992 | 5015.5 | 5015.7 | +3.6 ± 15.4 | +0.5 ± 11.2 |
+| 1 | 128K | prose | 4997 | 5016.7 | 5023.2 | +18.1 ± 15.3 | -98.8 ± 133.5 |
+| 1 | 128K | zipf | 4996 | 5020.0 | 5023.0 | +9.9 ± 10.6 | +1.9 ± 9.6 |
+| 1 | 128K | loop | 4995 | 5179.8 | 5051.9 | -145.2 ± 14.8 | -123.4 ± 15.1 |
+| 1 | 1M | prose | 5090 | 5078.9 | 5046.1 | +44.3 ± 127.1 | -35.7 ± 14.4 |
+| 1 | 1M | zipf | 5004 | 5082.8 | 5047.6 | -36.7 ± 11.6 | -31.9 ± 16.9 |
+| 1 | 1M | loop | 4998 | 6268.4 | 5252.8 | -1023.1 ± 14.5 | -1032.3 ± 13.7 |
+| 8 | 2K | prose | 3534 | 3550.4 | 3551.3 | +2.0 ± 12.8 | +4.7 ± 10.7 |
+| 8 | 2K | zipf | 3524 | 3551.6 | 3554.7 | +2.5 ± 12.1 | +3.5 ± 10.8 |
+| 8 | 32K | prose | 3526 | 3549.7 | 3550.7 | -3.0 ± 12.3 | -6.4 ± 12.9 |
+| 8 | 32K | zipf | 3527 | 3553.7 | 3553.6 | +1.5 ± 12.0 | +1.4 ± 15.1 |
+| 8 | 128K | prose | 3531 | 3563.5 | 3559.7 | +3.8 ± 9.8 | +4.0 ± 7.5 |
+| 8 | 128K | zipf | 3522 | 3561.2 | 3555.6 | -5.9 ± 15.3 | +3.2 ± 14.7 |
+| 8 | 128K | loop | 3526 | 3871.1 | 3797.6 | -71.0 ± 9.1 | -79.1 ± 5.6 |
+| 8 | 1M | prose | 3524 | 3721.7 | 3712.4 | -6.6 ± 8.2 | -3.5 ± 13.9 |
+| 8 | 1M | zipf | 3523 | 3737.4 | 3703.5 | -22.9 ± 10.5 | -20.6 ± 12.1 |
+| 8 | 1M | loop | 3625 | 6013.2 | 5531.7 | -476.6 ± 37.5 | -497.1 ± 34.5 |
+| 16 | 2K | prose | 3591 | 3618.2 | 3618.3 | +5.2 ± 7.7 | -8.1 ± 9.8 |
+| 16 | 2K | zipf | 3590 | 3617.1 | 3619.2 | +5.1 ± 5.7 | +2.5 ± 7.7 |
+| 16 | 32K | prose | 3593 | 3622.2 | 3622.1 | +4.3 ± 6.6 | -0.2 ± 8.6 |
+| 16 | 32K | zipf | 3593 | 3625.3 | 3624.5 | +12.2 ± 65.9 | -8.8 ± 10.0 |
+| 16 | 128K | prose | 3592 | 3650.1 | 3641.3 | -8.0 ± 6.0 | -4.8 ± 7.2 |
+| 16 | 128K | zipf | 3592 | 3653.9 | 3642.8 | -10.7 ± 8.6 | -4.6 ± 9.0 |
+| 16 | 128K | loop | 3625 | 4145.3 | 4085.1 | -64.7 ± 7.7 | -43.5 ± 7.4 |
+| 16 | 1M | prose | 3620 | 3985.0 | 3973.3 | -16.9 ± 8.6 | -16.9 ± 7.9 |
+| 16 | 1M | zipf | 3625 | 4000.9 | 3970.4 | -32.2 ± 9.2 | -39.4 ± 8.3 |
+| 16 | 1M | loop | 3703 | 7786.3 | 7385.0 | -412.5 ± 25.0 | -393.8 ± 24.0 |
+
+**Natural text up to 128K** (24 cells): one positive Δ excludes zero, 1 × 128K
+prose in run 1 (+18.1 ± 15.3 µs). Its run 2 is −98.8 ± 133.5 (outliers), and the
+c1 runs above (1,000 steps) put the same cell at −1.0 ± 5.4 and +0.5 ± 4.7, so
+I read it as noise. Three favourable cells exclude zero (−8.0, −10.7, −19.4 µs);
+the rest are inside their CI.
+
+**At 1M**, natural text saves 3.5-39.4 µs a step in 11 of 12 cells (8 × 1M prose
+inside its CI). The twelfth, 1 × 1M prose run 1, is +44.3 ± 127.1 (outliers);
+its run 2 is −35.7 ± 14.4.
+
+**A repeated phrase** (`loop`, the match's worst case) saves 44-1,032 µs. At 8
+and 16 requests the side stream's copy work competes with the GEMMs for the SMs,
+so it saves less than its full length there.
+
+**Failed and discarded attempts.** Each was fixed in the script; none produced
+numbers:
+1. vLLM was imported from the base image's site-packages, not the candidate tree
+   (`ImportError: cannot import name 'CopyDraftsConfig'`). Fixed with `PYTHONPATH`.
+2. The stand-in was timed by capturing a graph replay inside a graph
+   (`cudaErrorStreamCaptureUnsupported`). It overlapped a sibling's functional
+   pytest on dgx4.
+3. A host tensor indexed a device tensor in the equivalence walk.
+
+`runs/bench-quick.json` is the `--quick` validation run (60 steps per case) on
+an idle dgx4. Its conclusions agree with the full runs.
+
+### Memory
+
+- `CopyDrafter`: `chosen` (`max_reqs × 3` int32) and `estimates` (`max_reqs` float32)
+  added, `_select_alloc` (`max_reqs` int32) removed: under 200 bytes at 16
+  requests.
+- The engine's sizing is candidate-36's qualified copy arms': 11 more tokens of
+  step budget and two more CUDA graphs per shape (56 and 59, or 104 and 107).
+- Startup memory was not measured here (it needs the cluster). Expect it to equal
+  candidate-37's `tp3-copy.json`, including the startup tokens line.
+
+## Conclusion
+
+**Not ready.** Copy drafts, as candidate-37 computes them and as this patch
+computes them (bit-identically), crash an operator's TP3 engine:
+- under real traffic at m=16;
+- reproducibly at m=8 on single-stream.
+
+The patch stays on this PR as the finished mechanism for when the crash is
+understood and fixed:
+- no option, and the old arms' `copy_drafts` JSON is refused;
+- the recipe's plain shapes reach the copy envelope (6,155 / 16,395 tokens,
+  capture to 59 / 107) with unchanged chunk boundaries;
+- the step's copy work is computed once and beside DSpark.
+
+On GB10 its step work is never slower than candidate-37's:
+- level at c1 from 2K to 128K (|Δ| ≤ 2.8 µs, CI ±5 µs, two runs);
+- 33-36 µs a step faster at c1 at 1M;
+- up to 1 ms faster on degenerate repeats.
+
+Like the operator's m=16 suite pass, these numbers cannot clear the crash. The
+stalled diff's `WIDE_DECODE` change was a no-op, and its stream flag was
+unnecessary; both are dropped.
+
+**What it takes to be ready** (owner's call; the serving clusters and any GitHub
+post to the operator are yours):
+1. Localize the NaN with the operator's repro (m=8 single-stream), running a
+   diagnostic patch (*Crash analysis*), or in an owner-authorized cluster window
+   (candidate-37, then candidate-37 without 0676).
+2. Fix it, then rerun the m=8 single-stream repro clean.
+3. Run a concurrent soak where the token budget binds (mixed prompt lengths,
+   copy-dense and tool-like prompts, several streams), on a candidate image with
+   this patch and the plain `tp3.json` / `tp4.json`.
+
+Expected startup lines: "Copy drafts widen max_num_batched_tokens from 6144 to
+6155 ..." and "... capture range from 48 to 59 rows" (TP3); 16384 → 16395 and
+96 → 107 (TP4). Determinism digests should equal candidate-37's copy arm's.
+
+`min_match` and a copy gate (the replay's oracle reaches +9.0% at m=16 and
++14.3% at m=8) are later, separate variables, after the crash is fixed.

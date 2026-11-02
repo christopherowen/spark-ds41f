@@ -1,0 +1,1590 @@
+From bc71d8191435c59ee64515eca60f95ff17121fca Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:06:55 +0100
+Subject: [PATCH] perf(dspark): copy drafts as the one behaviour of greedy
+ adaptive verification (#842)
+
+Base: candidate-37 (vLLM patch head 5b7cfa37f, tree af0fb152).
+
+Copy drafts are no longer an option. SpeculativeConfig.copy_drafts is derived
+(a field the constructor does not take, so --speculative-config refuses it):
+CopyDraftsConfig's defaults (minimum match 16, 8 to 16 drafts) wherever DSpark
+verifies greedy drafts adaptively. They are off only where the engine cannot
+carry them: without async scheduling on the V2 model runner (VllmConfig), or
+with a drafter checkpoint that has no confidence head, so no adaptive
+verification (the runner; it raised before). The request-boundary checkpoint
+and pipeline-parallel refusals go: the first never holds for DSpark, and
+adaptive verification refuses the second itself.
+
+VllmConfig fits a recipe sized for DSpark's uniform decode rows to the copy
+envelope (max_decode_rows, one request verifying 16 drafts): with aligned
+prefill chunks, a token budget of the chunk threshold beside the uniform rows
+grows by the copy rows (6,144 to 6,155 at TP3, 16,384 to 16,395 at TP4; the
+encoder budgets with it), the threshold and so every chunk boundary unchanged;
+a CUDA-graph range ending at the uniform rows extends to the envelope on the
+default ladder's stride (48 to 56, 59; 96 to 104, 107). That is the
+configuration candidate-36 qualified as its copy arms (tp3-copy.json,
+copy-tp4.json), which the plain recipe now gets.
+
+A step's copy work runs once, beside DSpark. copy_alloc updates the copy state
+from the step's verification and records the choice (source, offered drafts,
+next drafts, acceptance estimate) beside the allocation and the slot's valid
+draft count; copy_apply writes the proposals from that choice once DSpark has
+drafted. copy_select, which repeated the chunk reduction and the state update
+after DSpark, is removed. prepare_alloc runs copy_match and copy_alloc on the
+output copy stream after postprocess, beside DSpark's draft forward, and the
+allocation's copy to the host follows them there; propose makes the main stream
+wait for them. A copy_match block whose share of the context is empty writes -1
+without loading the key.
+
+Quality: no change to what is committed (drafts only change how many tokens a
+step verifies), and the proposals, allocations, slot limits and copy state are
+bit-identical to candidate-37's kernels step by step.
+
+Tests: tests/v1/spec_decode/test_copy_drafts.py (the kernels through copy_alloc
+and copy_apply against the numpy references, every chunk written, CUDA-graph
+replay, the design's walk, temperature-0 text, and the side-stream run equal to
+the drafter-stream run with the side stream held busy, which fails without
+propose's wait); tests/v1/core/test_copy_drafts_scheduler.py (refused as an
+option, derived on and off, the budget and capture range widened at TP3 and
+TP4 shapes, off without async scheduling).
+
+Upstream: local; the copy drafter is this deployment's.
+---
+ tests/v1/core/test_copy_drafts_scheduler.py   | 126 +++++-
+ tests/v1/spec_decode/test_copy_drafts.py      | 189 ++++++---
+ vllm/config/speculative.py                    |  53 ++-
+ vllm/config/vllm.py                           |  84 +++-
+ vllm/v1/worker/gpu/model_runner.py            |  32 +-
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py | 112 ++++--
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 360 ++++++++----------
+ 7 files changed, 608 insertions(+), 348 deletions(-)
+
+diff --git a/tests/v1/core/test_copy_drafts_scheduler.py b/tests/v1/core/test_copy_drafts_scheduler.py
+index 39299cabb..2fcc09bba 100644
+--- a/tests/v1/core/test_copy_drafts_scheduler.py
++++ b/tests/v1/core/test_copy_drafts_scheduler.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Copy drafts in the scheduler: the verification lookahead apart from the
+-drafter's block, and a copying request's rows laid out from its reported copy
+-state, within the decode-row envelope.
++"""Copy drafts in the configuration and the scheduler: on wherever DSpark
++verifies greedy drafts adaptively (not an option), the verification lookahead
++apart from the drafter's block, the token budget and CUDA-graph range widened to
++the decode-row envelope, and a copying request's rows laid out from its reported
++copy state, within that envelope.
+ 
+ The worker is scripted: every draft is accepted, and each output reports the
+ copy allocation the test gives a request. The scheduler is the real async one,
+@@ -23,6 +25,7 @@ pytestmark = pytest.mark.cpu_test
+ 
+ BLOCK = 5  # DSpark's block (num_speculative_tokens)
+ LOOKAHEAD = 16  # copy_drafts.max_drafts
++LADDER = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]  # the recipe's, to 48
+ 
+ # A minimal OPT-125m configuration, so the scheduler builds without the hub
+ # (test_aligned_prefill_chunks.py's).
+@@ -63,17 +66,120 @@ def test_the_lookahead_is_the_block_without_copy_drafts():
+     assert spec.num_verification_tokens == 64
+ 
+ 
++def test_copy_drafts_are_not_an_option():
++    with pytest.raises((TypeError, ValueError), match="copy_drafts"):
++        SpeculativeConfig(
++            model="ngram", num_speculative_tokens=BLOCK, copy_drafts=CopyDraftsConfig()
++        )
++
++
++def _dspark(tmp_path, *, adaptive=True, sample="greedy", max_len=32768):
++    from vllm.config import ModelConfig, ParallelConfig
++
++    (tmp_path / "config.json").write_text(
++        json.dumps(
++            {**_OPT_CONFIG, "max_position_embeddings": max_len, "n_predict": BLOCK}
++        )
++    )
++    target = ModelConfig(
++        model=str(tmp_path), tokenizer_mode="skip", max_model_len=max_len
++    )
++    spec = SpeculativeConfig(
++        model=str(tmp_path),
++        method="dspark",
++        num_speculative_tokens=BLOCK,
++        enable_adaptive_verification=adaptive,
++        draft_sample_method=sample,
++        target_model_config=target,
++        target_parallel_config=ParallelConfig(),
++    )
++    return target, spec
++
++
++def test_dspark_greedy_adaptive_verification_copies(tmp_path):
++    _, spec = _dspark(tmp_path)
++    assert spec.copy_drafts == CopyDraftsConfig(
++        min_match=16, max_drafts=LOOKAHEAD, initial_drafts=8
++    )
++    assert spec.num_verification_tokens == LOOKAHEAD
++    assert _dspark(tmp_path, adaptive=False)[1].copy_drafts is None
++    assert _dspark(tmp_path, sample="probabilistic")[1].copy_drafts is None
++
++
++def _vllm_config(tmp_path, *, max_num_seqs, budget, ladder, async_scheduling=True):
++    from vllm.config import CompilationConfig, SchedulerConfig, VllmConfig
++
++    target, spec = _dspark(tmp_path)
++    rows = max_num_seqs * (1 + BLOCK)
++    return VllmConfig(
++        model_config=target,
++        speculative_config=spec,
++        scheduler_config=SchedulerConfig(
++            max_model_len=32768,
++            is_encoder_decoder=False,
++            max_num_seqs=max_num_seqs,
++            max_num_batched_tokens=budget,
++            long_prefill_token_threshold=budget - rows,
++            align_prefill_chunks=True,
++            async_scheduling=async_scheduling,
++        ),
++        compilation_config=CompilationConfig(
++            cudagraph_mode="FULL_AND_PIECEWISE",
++            max_cudagraph_capture_size=rows,
++            cudagraph_capture_sizes=list(ladder),
++        ),
++    )
++
++
+ @pytest.mark.parametrize(
+-    "copy_drafts",
++    "max_num_seqs, budget, ladder, rows, widened",
+     [
+-        CopyDraftsConfig(),  # n-gram is not DSpark with adaptive verification
++        # tp3-triangle: 8 streams, 6,144 tokens (6,096 + 48).
++        (8, 6144, LADDER, 59, [56, 59]),
++        # tp4-ring: 16 streams, 16,384 tokens (16,288 + 96).
++        (16, 16384, [*LADDER, 56, 64, 72, 80, 88, 96], 107, [104, 107]),
+     ],
+ )
+-def test_copy_drafts_need_dspark_with_adaptive_verification(copy_drafts):
+-    with pytest.raises(ValueError, match="copy_drafts requires method 'dspark'"):
+-        SpeculativeConfig(
+-            model="ngram", num_speculative_tokens=BLOCK, copy_drafts=copy_drafts
+-        )
++def test_copy_drafts_widen_the_budget_and_graphs_to_the_envelope(
++    monkeypatch, tmp_path, max_num_seqs, budget, ladder, rows, widened
++):
++    """A recipe sized for DSpark's uniform decode rows: the budget grows by the
++    copy rows past them (the chunk threshold, so the chunk boundaries, unchanged)
++    and the capture range extends to the envelope."""
++    from vllm.platforms import current_platform
++
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    config = _vllm_config(
++        tmp_path, max_num_seqs=max_num_seqs, budget=budget, ladder=ladder
++    )
++    scheduler = config.scheduler_config
++    uniform = max_num_seqs * (1 + BLOCK)
++    assert config.max_decode_rows == rows == uniform + LOOKAHEAD - BLOCK
++    assert scheduler.long_prefill_token_threshold == budget - uniform
++    assert scheduler.max_num_batched_tokens == budget - uniform + rows
++    assert scheduler.max_num_scheduled_tokens == budget - uniform + rows
++    assert scheduler.max_num_encoder_input_tokens == budget - uniform + rows
++    if current_platform.support_static_graph_mode():
++        compilation = config.compilation_config
++        assert compilation.max_cudagraph_capture_size == rows
++        assert compilation.cudagraph_capture_sizes == [*ladder, *widened]
++
++
++def test_copy_drafts_off_without_async_scheduling(monkeypatch, tmp_path):
++    """Without async scheduling DSpark drafts alone: the lookahead, budget and
++    capture range stay the recipe's."""
++    from vllm.platforms import current_platform
++
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    config = _vllm_config(
++        tmp_path, max_num_seqs=8, budget=6144, ladder=LADDER, async_scheduling=False
++    )
++    assert config.speculative_config.copy_drafts is None
++    assert config.num_verification_tokens == BLOCK
++    assert config.max_decode_rows == 48
++    assert config.scheduler_config.max_num_batched_tokens == 6144
++    if current_platform.support_static_graph_mode():
++        assert config.compilation_config.cudagraph_capture_sizes == LADDER
+ 
+ 
+ def _scheduler(monkeypatch, tmp_path, *, copy_drafts: bool, max_num_seqs: int):
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee920f..e8aec84c8 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -4,15 +4,19 @@
+ references, the proposer (``spec_decode.copy_drafts.CopyDrafter``) against the
+ design's walk, and temperature-0 output with and without copy drafts.
+ 
+-- ``copy_match``/``copy_select`` against references written from the definition:
+-  the latest earlier window end whose preceding tokens equal the context's tail,
+-  at the longest level that has one; the copy state's update and the proposal.
++- ``copy_match``/``copy_alloc``/``copy_apply`` against references written from
++  the definition: the latest earlier window end whose preceding tokens equal the
++  context's tail, at the longest level that has one; the copy state's update,
++  the allocation and the proposal.
+   Contexts from 1 token to past two of the match grid's passes, vocabularies of
+   3 to 129280 tokens (few to rare matches), batches in any slot order.
+ - Nothing but the request's own row up to its length is read: a slot's stale
+   tokens past the length of its new request, and other requests' text in the
+   same batch, never propose; a slot's copy state starts afresh with each request.
+-- Both kernels replay in a CUDA graph with new inputs as they run eagerly.
++- The kernels replay in a CUDA graph with new inputs as they run eagerly.
++- The match and allocation on a side stream beside the drafter give the same
++  proposals and state as on the drafter's stream, however late the side stream
++  runs.
+ - The proposer, driven as the engine lays out steps (its allocation a step
+   late), takes the steps experiments/2026-10-26-suffix-drafter/variants.py's walk
+   takes for the go variant (exact, minimum match 16, at most 16 drafts, the cap
+@@ -78,7 +82,7 @@ def ref_source(S: np.ndarray, p: int, min_match: int = MIN_MATCH) -> int:
+ 
+ 
+ class RefState:
+-    """``copy_select``'s copy state of one slot, as the kernel keeps it."""
++    """``copy_alloc``'s copy state of one slot, as the kernel keeps it."""
+ 
+     def __init__(self):
+         self.doublings, self.pending = 0, 0
+@@ -147,7 +151,7 @@ def _run_match(history, total_len, idx_mapping, min_match=MIN_MATCH):
+ 
+ 
+ def _best(sources_row: torch.Tensor) -> int:
+-    """copy_select's choice from one request's chunk sources."""
++    """copy_alloc's choice from one request's chunk sources."""
+     source = -1
+     for level in range(sources_row.shape[1]):
+         latest = int(sources_row[:, level].max())
+@@ -183,6 +187,8 @@ def test_copy_match_is_the_latest_longest_match(vocab, min_match):
+         total_len[slot] = length
+     idx_mapping = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
+     sources = _run_match(history, total_len, idx_mapping, min_match)
++    # Every chunk writes its sources, those past a short context's end too.
++    assert (sources >= -1).all()
+     for r, slot in enumerate(slots):
+         S = streams[int(slot)]
+         expected = ref_source(S, len(S), min_match)
+@@ -225,7 +231,7 @@ def test_copy_match_reads_only_its_request():
+     assert _best(sources[1]) == -1
+ 
+ 
+-def _select(
++def _propose(
+     history,
+     total_len,
+     idx_mapping,
+@@ -237,36 +243,51 @@ def _select(
+     cut,
+     dspark=None,
+ ):
++    """copy_alloc then copy_apply over one step: the proposals, the allocation
++    and the slots' valid draft counts."""
+     n = idx_mapping.shape[0]
+     if dspark is None:
+         dspark = (
+             torch.arange(n * BLOCK, device=DEVICE).view(n, BLOCK) + 1000,
+             torch.full((n, BLOCK), 0.5, device=DEVICE),
+         )
++    chosen = torch.full((n, tlc.CHOSEN_COLUMNS), -5, dtype=torch.int32, device=DEVICE)
++    estimates = torch.full((n,), -5.0, device=DEVICE)
+     drafts = torch.full((n, LOOKAHEAD), -5, dtype=torch.int64, device=DEVICE)
+     confidences = torch.full((n, LOOKAHEAD), -5.0, device=DEVICE)
+     planned = torch.full((n, LOOKAHEAD), -5.0, device=DEVICE)
+     alloc = torch.full((n,), -5, dtype=torch.int32, device=DEVICE)
+-    tlc.copy_select(
++    limits = torch.full((int_state.shape[0],), -5, dtype=torch.int32, device=DEVICE)
++    tlc.copy_alloc(
+         idx_mapping,
+-        history,
+         total_len,
+         sources,
+-        dspark[0],
+-        dspark[1],
+         num_sampled,
+         verified,
+         cut,
+         int_state,
+         float_state,
+-        drafts,
+-        confidences,
+-        planned,
++        chosen,
++        estimates,
+         alloc,
++        limits,
+         MIN_MATCH,
++        LOOKAHEAD,
++        BLOCK,
+         INITIAL,
+     )
+-    return drafts, confidences, planned, alloc, dspark
++    tlc.copy_apply(
++        idx_mapping,
++        history,
++        chosen,
++        estimates,
++        dspark[0],
++        dspark[1],
++        drafts,
++        confidences,
++        planned,
++    )
++    return drafts, confidences, planned, alloc, limits, dspark
+ 
+ 
+ def _state(rows=MAX_REQS):
+@@ -276,9 +297,10 @@ def _state(rows=MAX_REQS):
+     )
+ 
+ 
+-def test_copy_select_follows_the_reference_over_a_copy():
++def test_copy_alloc_and_apply_follow_the_reference_over_a_copy():
+     """One request copying a document: proposals, the cap's growth and reset, the
+-    estimate, the planned confidences and the allocation, step by step."""
++    estimate, the planned confidences, the allocation and the slot's valid draft
++    count, step by step."""
+     rng = np.random.default_rng(2)
+     S, start = copy_stream(rng, VOCAB, doc=600, edits=4)
+     slot = 5
+@@ -298,7 +320,7 @@ def test_copy_select_follows_the_reference_over_a_copy():
+             torch.tensor([v], dtype=torch.int32, device=DEVICE)
+             for v in (num_sampled, verified, cut)
+         ]
+-        drafts, confidences, planned, alloc, dspark = _select(
++        drafts, confidences, planned, alloc, limits, dspark = _propose(
+             history, total_len, idx_mapping, sources, int_state, float_state, *args
+         )
+         source = ref_source(S, p)
+@@ -306,6 +328,7 @@ def test_copy_select_follows_the_reference_over_a_copy():
+             ref, source, p, num_sampled, verified, cut
+         )
+         assert int(alloc[0]) == ref_alloc
++        assert int(limits[slot]) == (offered if source >= 0 else BLOCK)
+         assert int(int_state[slot, 0]) == ref.doublings
+         assert int(int_state[slot, 1]) == ref.pending
+         torch.testing.assert_close(
+@@ -345,7 +368,7 @@ def test_copy_select_follows_the_reference_over_a_copy():
+     assert copies > 25
+ 
+ 
+-def test_copy_select_judges_only_its_pending_copy():
++def test_copy_alloc_judges_only_its_pending_copy():
+     """No proposal pending, no token sampled (a prefill chunk) or no draft
+     verified: the state stays; a sunk draft zero (one token committed of a
+     verified block) resets the cap."""
+@@ -363,7 +386,9 @@ def test_copy_select_judges_only_its_pending_copy():
+             torch.tensor([v], dtype=torch.int32, device=DEVICE)
+             for v in (num_sampled, verified, cut)
+         ]
+-        _select(history, total_len, idx_mapping, sources, int_state, float_state, *args)
++        _propose(
++            history, total_len, idx_mapping, sources, int_state, float_state, *args
++        )
+         return int(int_state[slot, 0]), int(int_state[slot, 1])
+ 
+     int_state, float_state = _state(4)
+@@ -389,12 +414,16 @@ def test_kernels_replay_in_a_cuda_graph():
+     levels = tlc.num_levels(MIN_MATCH)
+     sources = torch.empty((n, tlc.CHUNKS, levels), dtype=torch.int32, device=DEVICE)
+     int_state, float_state = _state()
+-    outs = (
++    chosen = torch.empty((n, tlc.CHOSEN_COLUMNS), dtype=torch.int32, device=DEVICE)
++    estimates = torch.empty((n,), device=DEVICE)
++    alloc = torch.empty((n,), dtype=torch.int32, device=DEVICE)
++    limits = torch.empty((MAX_REQS,), dtype=torch.int32, device=DEVICE)
++    proposals = (
+         torch.empty((n, LOOKAHEAD), dtype=torch.int64, device=DEVICE),
+         torch.empty((n, LOOKAHEAD), device=DEVICE),
+         torch.empty((n, LOOKAHEAD), device=DEVICE),
+-        torch.empty((n,), dtype=torch.int32, device=DEVICE),
+     )
++    outs = (*proposals, chosen, estimates, alloc, limits)
+     dspark = (
+         torch.randint(0, VOCAB, (n, BLOCK), device=DEVICE),
+         torch.rand((n, BLOCK), device=DEVICE),
+@@ -403,10 +432,11 @@ def test_kernels_replay_in_a_cuda_graph():
+ 
+     def launch():
+         tlc.copy_match(idx_mapping, history, total_len, sources, MIN_MATCH)
+-        tlc.copy_select(
+-            idx_mapping, history, total_len, sources, *dspark, *step,
+-            int_state, float_state, *outs, MIN_MATCH, INITIAL,
++        tlc.copy_alloc(
++            idx_mapping, total_len, sources, *step, int_state, float_state,
++            chosen, estimates, alloc, limits, MIN_MATCH, LOOKAHEAD, BLOCK, INITIAL,
+         )  # fmt: skip
++        tlc.copy_apply(idx_mapping, history, chosen, estimates, *dspark, *proposals)
+ 
+     def fill(seed):
+         g = np.random.default_rng(seed)
+@@ -543,7 +573,8 @@ def engine_walk(drafter, states, S, start, end, req_id="r"):
+         idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
+         sampled = torch.tensor([num_sampled], dtype=torch.int32, device=DEVICE)
+         judged = torch.tensor([verified], dtype=torch.int32, device=DEVICE)
+-        drafts, _, _ = drafter.propose(idx, *dspark, sampled, judged, None)
++        drafter.prepare_alloc(idx, sampled, judged, None)
++        drafts, _, _ = drafter.propose(idx, *dspark)
+         # The slot's pending copy: the drafts its proposal offers (0: DSpark's).
+         offered = int(drafter.int_state[slot, 1])
+         allocs.append(1 + int(drafter.alloc[0]))
+@@ -620,7 +651,8 @@ def test_a_slot_starts_afresh_with_each_request():
+         torch.zeros((1, BLOCK), dtype=torch.int64, device=DEVICE),
+         torch.zeros((1, BLOCK), device=DEVICE),
+     )
+-    drafts, confidences, planned = drafter.propose(idx, *dspark, one, one, None)
++    drafter.prepare_alloc(idx, one, one, None)
++    drafts, confidences, planned = drafter.propose(idx, *dspark)
+     # B's first copy: the initial cap, at the prior's estimate.
+     source = ref_source(T, tstart + 30)
+     assert source >= 0
+@@ -635,9 +667,9 @@ def test_a_slot_starts_afresh_with_each_request():
+     assert int(drafter.alloc[0]) == 2 * INITIAL
+ 
+ 
+-def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
+-    """prepare_alloc computes the same alloc as propose before DSpark runs and
+-    writes each slot's valid draft count to slot_draft_limits."""
++def test_prepare_alloc_writes_alloc_and_slot_draft_limits_before_propose():
++    """prepare_alloc writes the allocation and each slot's valid draft count to
++    slot_draft_limits before DSpark runs; propose leaves them as they are."""
+     rng = np.random.default_rng(7)
+     states = _request_state(8192)
+     drafter = _drafter(states)
+@@ -661,9 +693,7 @@ def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
+     assert int(drafter.slot_draft_limits.gpu[slot_copy]) == INITIAL
+     assert int(drafter.slot_draft_limits.gpu[slot_prose]) == BLOCK
+ 
+-    drafts, confidences, planned = drafter.propose(
+-        idx, *dspark, one, zero, None, matched=True
+-    )
++    drafts, confidences, planned = drafter.propose(idx, *dspark)
+     assert torch.equal(early_alloc, drafter.alloc[:2])
+     assert int(early_alloc[0]) == 2 * INITIAL
+     assert int(early_alloc[1]) == BLOCK
+@@ -769,9 +799,8 @@ def _decode(targets, prompts, count, copy):
+         if copy:
+             for i, text in enumerate(texts):
+                 _set_history(states, f"q{i}", text)
+-            drafts, confidences, _ = drafter.propose(
+-                idx, dspark_drafts, dspark_conf, num_sampled, verified, None
+-            )
++            drafter.prepare_alloc(idx, num_sampled, verified, None)
++            drafts, confidences, _ = drafter.propose(idx, dspark_drafts, dspark_conf)
+             widths = (confidences > 0).sum(dim=1).tolist()
+             proposals = [drafts[i, : widths[i]].tolist() for i in range(n)]
+         else:
+@@ -843,9 +872,7 @@ def test_prepare_alloc_skips_incomplete_prefill_requests():
+     drafter.prepare_alloc(
+         idx, num_sampled, verified, None, match_idx_mapping=match_idx
+     )
+-    drafts, confs, _ = drafter.propose(
+-        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
+-    )
++    drafts, confs, _ = drafter.propose(idx, dspark_drafts, dspark_conf)
+     # Decoding slot s0 matched and proposes INITIAL copy drafts; mid-prefill slot s1
+     # was masked in copy_match and keeps DSpark's block with pending=0.
+     assert int(drafter.int_state[s0, 1]) == INITIAL
+@@ -879,9 +906,7 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+ 
+     # Step t proposes 8 copy drafts (columns 0..7) and pads columns 8..15 with -1.
+     drafter.prepare_alloc(idx, one, zero, None)
+-    drafts, _, _ = drafter.propose(
+-        idx, dspark_drafts, dspark_conf, one, zero, None, matched=True
+-    )
++    drafts, _, _ = drafter.propose(idx, dspark_drafts, dspark_conf)
+     assert int(drafter.int_state[slot, 1]) == INITIAL
+     assert (drafts[0, INITIAL:] == -1).all()
+ 
+@@ -901,9 +926,7 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     verified = torch.tensor([LOOKAHEAD], dtype=torch.int32, device=DEVICE)
+     drafter.prepare_alloc(idx, num_sampled, verified, None)
+     assert int(drafter.slot_draft_limits.gpu[slot]) == 2 * INITIAL
+-    _, _, _ = drafter.propose(
+-        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
+-    )
++    _, _, _ = drafter.propose(idx, dspark_drafts, dspark_conf)
+     assert int(drafter.int_state[slot, 0]) == 1
+     assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
+ 
+@@ -918,3 +941,79 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+     limits = drafter.sync_slot_draft_limits()
+     assert limits.shape == (MAX_REQS,)
++
++
++def test_side_stream_prepare_alloc_matches_the_drafters_stream():
++    """prepare_alloc on a side stream (the runner's output copy stream) beside the
++    drafter gives the proposals, allocation, slot limits and copy state it gives
++    on the drafter's stream, over a turn of steps, though the side stream starts
++    each step's work late (busy with an earlier copy): propose waits for it."""
++    side = torch.cuda.Stream(device=DEVICE)
++    main = torch.cuda.current_stream(DEVICE)
++    runs = []
++    for side_stream in (None, side):
++        states = _request_state(8192)
++        drafter = _drafter(states)
++        S, start = copy_stream(np.random.default_rng(29), VOCAB, doc=400, edits=2)
++        P, pstart = prose_stream(np.random.default_rng(30), VOCAB, length=300)
++        texts = {"copy": list(S[: start + 30]), "prose": list(P[:pstart])}
++        slots = [_set_history(states, req, tokens) for req, tokens in texts.items()]
++        for slot in slots:
++            drafter.add_request(slot)
++        drafter.apply_staged_writes()
++        idx = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
++        num_sampled = torch.ones(2, dtype=torch.int32, device=DEVICE)
++        verified = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++        dspark = (
++            torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE),
++            torch.full((2, BLOCK), 0.6, device=DEVICE),
++        )
++        steps = []
++        for _ in range(20):
++            if side_stream is not None:
++                # An earlier output copy holds the side stream for some ms.
++                with torch.cuda.stream(side_stream):
++                    torch.cuda._sleep(20_000_000)
++            drafter.prepare_alloc(
++                idx,
++                num_sampled,
++                verified,
++                None,
++                copy_stream=side_stream,
++                main_stream=main if side_stream is not None else None,
++            )
++            drafts, confidences, planned = drafter.propose(idx, *dspark)
++            steps.append(
++                [
++                    t.clone()
++                    for t in (
++                        drafts,
++                        confidences,
++                        planned,
++                        drafter.alloc[:2],
++                        drafter.slot_draft_limits.gpu[idx],
++                        drafter.int_state[idx],
++                        drafter.float_state[idx],
++                    )
++                ]
++            )
++            # Every offered draft of the copying request is accepted; the prose
++            # request takes two tokens of DSpark's block.
++            widths = (confidences > 0).sum(dim=1).tolist()
++            counts = []
++            for i, req in enumerate(texts):
++                ahead = S if req == "copy" else P
++                n = len(texts[req])
++                take = widths[i] + 1 if req == "copy" else 2
++                texts[req].extend(int(t) for t in ahead[n : n + take])
++                counts.append(len(texts[req]) - n)
++                _set_history(states, req, texts[req])
++            num_sampled = torch.tensor(counts, dtype=torch.int32, device=DEVICE)
++            verified = torch.tensor(widths, dtype=torch.int32, device=DEVICE)
++        torch.cuda.synchronize()
++        runs.append(steps)
++    for on_main, on_side in zip(*runs):
++        for a, b in zip(on_main, on_side):
++            assert torch.equal(a, b)
++    # The copying request copied: its proposals grew past DSpark's block.
++    assert max(int((step[1][0] > 0).sum()) for step in runs[1]) == LOOKAHEAD
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 4dd05cb82..ebaf191d6 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -4,6 +4,7 @@
+ import copy
+ import functools
+ from collections.abc import Callable, Mapping
++from dataclasses import field
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Literal, get_args
+ 
+@@ -385,7 +386,11 @@ class CopyDraftsConfig:
+     such position, in place of DSpark's drafts; DSpark drafts everywhere else.
+     The search reads only the request's own history: nothing is shared between
+     requests. Drafts never change what is committed, only how many tokens a
+-    step verifies."""
++    step verifies.
++
++    Not an option: DSpark with greedy drafts and adaptive verification always
++    copies, at these defaults (``SpeculativeConfig.copy_drafts``). The fields
++    parametrize the kernels and their tests."""
+ 
+     MAX_LEVEL = 256
+     """The longest suffix compared: a match of 256 tokens ranks above every
+@@ -667,12 +672,13 @@ class SpeculativeConfig:
+     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
+     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+ 
+-    copy_drafts: CopyDraftsConfig | None = None
++    copy_drafts: CopyDraftsConfig | None = field(default=None, init=False)
+     """Copy drafts from the request's own history beside DSpark
+-    (``CopyDraftsConfig``). Its ``max_drafts`` is the verification lookahead
+-    (``num_verification_tokens``); ``num_speculative_tokens`` stays DSpark's
+-    block. Requires DSpark with adaptive verification, greedy drafts and async
+-    scheduling."""
++    (``CopyDraftsConfig``), derived, not an option: on wherever DSpark verifies
++    greedy drafts adaptively, unless the engine cannot carry them
++    (``VllmConfig``: async scheduling on the V2 model runner). Its
++    ``max_drafts`` is the verification lookahead (``num_verification_tokens``);
++    ``num_speculative_tokens`` stays DSpark's block."""
+ 
+     @property
+     def num_verification_tokens(self) -> int:
+@@ -1793,33 +1799,20 @@ class SpeculativeConfig:
+                 "adaptive_verification_row_cost requires DSpark adaptive verification"
+             )
+ 
+-        if self.copy_drafts is not None:
++        if (
++            self.method == "dspark"
++            and self.enable_adaptive_verification
++            and self.draft_sample_method == "greedy"
++        ):
+             # The draft budget decides how many of a copy's drafts a step
+             # verifies; copy drafts are one-hot proposals, as greedy DSpark
+-            # drafts are, so no draft logits exist for them.
+-            if self.method != "dspark" or not self.enable_adaptive_verification:
+-                raise ValueError(
+-                    "copy_drafts requires method 'dspark' with "
+-                    "enable_adaptive_verification"
+-                )
+-            if self.draft_sample_method != "greedy":
+-                raise ValueError("copy_drafts requires draft_sample_method 'greedy'")
+-            copy_drafts = self.copy_drafts
+-            if copy_drafts.max_drafts < self.num_speculative_tokens:
+-                raise ValueError(
+-                    f"copy_drafts.max_drafts ({copy_drafts.max_drafts}) must be at "
+-                    f"least num_speculative_tokens ({self.num_speculative_tokens})"
+-                )
+-            if copy_drafts.initial_drafts > copy_drafts.max_drafts:
+-                raise ValueError(
+-                    f"copy_drafts.initial_drafts ({copy_drafts.initial_drafts}) "
+-                    f"must not exceed max_drafts ({copy_drafts.max_drafts})"
+-                )
+-            if copy_drafts.min_match > CopyDraftsConfig.MAX_LEVEL:
+-                raise ValueError(
+-                    f"copy_drafts.min_match ({copy_drafts.min_match}) must not "
+-                    f"exceed {CopyDraftsConfig.MAX_LEVEL}"
++            # drafts are, so no draft logits exist for them. The lookahead is at
++            # least DSpark's block.
++            self.copy_drafts = CopyDraftsConfig(
++                max_drafts=max(
++                    CopyDraftsConfig().max_drafts, self.num_speculative_tokens
+                 )
++            )
+ 
+         if (
+             self.adaptive_speculative_tokens_initial is not None
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 5945d3e23..5c880c228 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1790,15 +1790,17 @@ class VllmConfig:
+         if (
+             self.speculative_config is not None
+             and self.speculative_config.copy_drafts is not None
++            and not (
++                self.scheduler_config.async_scheduling and self.use_v2_model_runner
++            )
+         ):
+             # The scheduler lays out a copying request's rows from the copy
+-            # state the V2 runner returns with each step's output.
+-            if not self.scheduler_config.async_scheduling:
+-                raise ValueError("copy_drafts requires async scheduling")
+-            if not self.use_v2_model_runner:
+-                raise ValueError("copy_drafts requires the V2 model runner")
+-            if self.parallel_config.pipeline_parallel_size > 1:
+-                raise ValueError("copy_drafts does not support pipeline parallelism")
++            # state the V2 runner returns with each step's output, a step ahead.
++            logger.info_once(
++                "Copy drafts are off: they need async scheduling on the V2 model "
++                "runner; DSpark drafts alone."
++            )
++            self.speculative_config.copy_drafts = None
+ 
+         if (
+             self.observability_config.per_request_spec_decode_metrics != "none"
+@@ -2402,6 +2404,7 @@ class VllmConfig:
+         worker is configured to handle.
+         """
+         if self.speculative_config is not None:
++            self._fit_copy_decode_rows()
+             scheduled_token_delta = (
+                 self.speculative_config.max_num_new_slots_for_drafting
+             )
+@@ -2435,6 +2438,67 @@ class VllmConfig:
+                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
+                 )
+ 
++    def _fit_copy_decode_rows(self) -> None:
++        """Copy drafts widen a step's decode rows (``max_decode_rows``) past every
++        request at the uniform decode width. A budget sized for an aligned
++        prefill chunk beside the uniform rows grows by the difference, so a
++        whole chunk still fits beside them and the chunks still end where
++        ``long_prefill_token_threshold`` puts them (temperature-0 determinism)."""
++        scheduler = self.scheduler_config
++        uniform_rows = scheduler.max_num_seqs * self.uniform_decode_query_len
++        threshold = scheduler.long_prefill_token_threshold
++        budget = scheduler.max_num_batched_tokens
++        if not (
++            scheduler.align_prefill_chunks
++            and threshold > 0
++            and threshold + uniform_rows <= budget < threshold + self.max_decode_rows
++        ):
++            return
++        widened = threshold + self.max_decode_rows
++        scheduler.max_num_batched_tokens = widened
++        # The encoder budgets default to the token budget (SchedulerConfig).
++        if scheduler.max_num_encoder_input_tokens == budget:
++            scheduler.max_num_encoder_input_tokens = widened
++        if scheduler.encoder_cache_size == budget:
++            scheduler.encoder_cache_size = widened
++        logger.info_once(
++            "Copy drafts widen max_num_batched_tokens from %d to %d: an aligned "
++            "%d-token prefill chunk beside %d decode rows.",
++            budget,
++            widened,
++            threshold,
++            self.max_decode_rows,
++        )
++
++    def _fit_copy_capture_sizes(self) -> None:
++        """A CUDA-graph capture range that ends at every request at the uniform
++        decode width extends to the decode rows copy drafts widen a step to
++        (``max_decode_rows``), on the default ladder's stride of 8 and ending at
++        them, so a step with a copying request replays a full graph too."""
++        compilation = self.compilation_config
++        uniform_rows = (
++            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++        )
++        rows = self.max_decode_rows
++        sizes = compilation.cudagraph_capture_sizes
++        largest = compilation.max_cudagraph_capture_size
++        if largest is None and sizes:
++            largest = max(sizes)
++        if rows <= uniform_rows or largest != uniform_rows:
++            return
++        compilation.max_cudagraph_capture_size = rows
++        if sizes:
++            compilation.cudagraph_capture_sizes = [
++                *sizes,
++                *range(uniform_rows // 8 * 8 + 8, rows, 8),
++                rows,
++            ]
++        logger.info_once(
++            "Copy drafts widen the CUDA-graph capture range from %d to %d rows.",
++            uniform_rows,
++            rows,
++        )
++
+     def _set_cudagraph_sizes(self):
+         """
+         vLLM defines the default candidate list of batch sizes for CUDA graph
+@@ -2490,6 +2554,7 @@ class VllmConfig:
+             and not self.model_config.enforce_eager
+             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+         ):
++            self._fit_copy_capture_sizes()
+             # determine the initial max_cudagraph_capture_size
+             max_cudagraph_capture_size = (
+                 self.compilation_config.max_cudagraph_capture_size
+@@ -2506,8 +2571,11 @@ class VllmConfig:
+                 )
+                 decode_query_len = self.uniform_decode_query_len
+                 max_num_seqs = self.scheduler_config.max_num_seqs
++                # At least every decode row a step may hold (copy drafts widen
++                # one request past the uniform width).
+                 max_cudagraph_capture_size = min(
+-                    max_num_seqs * decode_query_len * 2, default_max_graph_size
++                    max(max_num_seqs * decode_query_len * 2, self.max_decode_rows),
++                    default_max_graph_size,
+                 )
+                 if decode_query_len > 1:
+                     # A uniform decode batch is decode_query_len tokens per
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 26992d545..a9c11ac1e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -419,10 +419,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             else None
+         )
+         if copy_drafts is not None and self.speculator is not None:
+-            if vllm_config.use_request_boundary_checkpoints:
+-                raise ValueError(
+-                    "copy_drafts does not support request-boundary checkpoints"
+-                )
+             self.copy_drafter = CopyDrafter(
+                 copy_drafts,
+                 self.req_states,
+@@ -841,11 +837,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+-            # verifies; the drafter's checkpoint must carry a confidence head.
+-            raise ValueError(
+-                "copy_drafts requires adaptive verification, which this drafter "
+-                "does not provide"
++            # verifies: a drafter whose checkpoint has no confidence head has
++            # no adaptive verification, and DSpark drafts alone.
++            logger.info(
++                "Copy drafts are off: the drafter's checkpoint has no confidence "
++                "head for adaptive verification."
+             )
++            self.copy_drafter = None
+ 
+         self.block_tables = BlockTables(
+             block_sizes=block_sizes,
+@@ -3610,11 +3608,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                 )
+-            verified = None
+             if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
+-                # Match the updated histories and publish next-step alloc and
+-                # slot draft limits before the drafter runs, so the async output
+-                # copy completes on output_copy_stream while DSpark executes.
++                # Match the updated histories, update the copy state and publish
++                # next-step alloc and slot draft limits on output_copy_stream
++                # beside the drafter: DSpark does not wait for them, and the
++                # async output copy of their results does not wait for DSpark.
+                 # Requests still mid-prefill after this step have not reached the
+                 # end of their prompt yet and must not be matched.
+                 match_idx_mapping = None
+@@ -3646,6 +3644,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     verified,
+                     self._dead_row_cut if verified is not None else None,
+                     match_idx_mapping=match_idx_mapping,
++                    copy_stream=self.output_copy_stream,
++                    main_stream=self.main_stream,
+                 )
+                 self.copy_drafter.attach_async_output(
+                     async_output,
+@@ -3694,13 +3694,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # verification (fixed draft counts); its rows verify none.
+                 draft_tokens, confidences, planned_confidences = (
+                     self.copy_drafter.propose(
+-                        input_batch.idx_mapping,
+-                        draft_tokens,
+-                        confidences,
+-                        num_sampled,
+-                        verified,
+-                        self._dead_row_cut if verified is not None else None,
+-                        matched=True,
++                        input_batch.idx_mapping, draft_tokens, confidences
+                     )
+                 )
+             num_draft_tokens = draft_tokens.shape[1]
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30b6..a377b903e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Copy drafts beside DSpark (``SpeculativeConfig.copy_drafts``).
++"""Copy drafts beside DSpark (``SpeculativeConfig.copy_drafts``), on wherever
++DSpark verifies greedy drafts adaptively.
+ 
+ After DSpark drafts, each request whose context ends with text it has seen
+ before (an exact suffix match of at least ``min_match`` tokens over its own
+@@ -21,6 +22,12 @@ proposal is verified (async scheduling): each proposal also reports
+ ``alloc``, the drafts of the proposal after it if this one is accepted in full,
+ which the scheduler gives the request's step after next (within its decode-row
+ envelope), and the planned confidences the budget reads at that step.
++
++A step's copy work reads only the committed history and the copy state, never
++DSpark's drafts, so all of it but the proposal itself (``prepare_alloc``: the
++match, the state's update, the choice and the allocation) runs before DSpark
++does, on the output copy stream beside it; ``propose`` waits for it and writes
++the proposals.
+ """
+ 
+ from typing import Any
+@@ -32,6 +39,7 @@ from vllm.config.speculative import CopyDraftsConfig
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu import tilelang_inputs
++from vllm.v1.worker.gpu.async_utils import stream
+ from vllm.v1.worker.gpu.spec_decode import tilelang_copy
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+@@ -95,7 +103,16 @@ class CopyDrafter:
+             torch.cuda.Event(blocking=True) for _ in range(self._ring_size)
+         ]
+         self.alloc = self._alloc_buffers[0].gpu
+-        self._select_alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
++        # The step's choice per request (source, offered drafts, next drafts) and
++        # acceptance estimate, from prepare_alloc for propose, in batch order.
++        self.chosen = torch.zeros(
++            (max_reqs, tilelang_copy.CHOSEN_COLUMNS), dtype=torch.int32, device=device
++        )
++        self.estimates = torch.zeros(max_reqs, dtype=torch.float32, device=device)
++        # prepare_alloc's work on a side stream: the stream that must wait for it
++        # before reading its results, and the event that marks its end.
++        self._prepared = torch.cuda.Event()
++        self._prepared_waiter: torch.cuda.Stream | None = None
+         # Actual valid draft count per slot from the latest proposal, mirrored to
+         # host non-blockingly so the adaptive budget caps stale wide schedules.
+         self.slot_draft_limits = CpuGpuBuffer(
+@@ -159,22 +176,53 @@ class CopyDrafter:
+         dead_row_cut: torch.Tensor | None,
+         *,
+         match_idx_mapping: torch.Tensor | None = None,
++        copy_stream: torch.cuda.Stream | None = None,
++        main_stream: torch.cuda.Stream | None = None,
+     ) -> None:
+-        """Match the batch's updated histories and write ``alloc[:num_reqs]`` and
+-        ``slot_draft_limits.gpu`` before the drafter runs, so the async output
+-        copy does not wait behind the drafter."""
++        """Match the batch's updated histories, update their copy state from this
++        step's verification, and write the step's choice, ``alloc[:num_reqs]``
++        and ``slot_draft_limits.gpu``, so the async output copy does not wait
++        behind the drafter.
++
++        With ``copy_stream`` the work runs there, after ``main_stream``'s work so
++        far and beside what ``main_stream`` runs next (DSpark); ``propose`` makes
++        ``main_stream`` wait for it. Without, it runs on the current stream.
++        """
++        self._join()
+         self.sync_slot_draft_limits()
+         self._ring_idx = (self._ring_idx + 1) % self._ring_size
+         self.alloc = self._alloc_buffers[self._ring_idx].gpu
+         num_reqs = idx_mapping.shape[0]
+         if verified is None:
+             verified = self._no_drafts[:num_reqs]
+-        history = self.req_states.all_token_ids.gpu
++        if copy_stream is None:
++            self._prepare(
++                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
++            )
++            return
++        assert main_stream is not None
++        with stream(copy_stream, main_stream):
++            copy_stream.wait_stream(main_stream)
++            self._prepare(
++                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
++            )
++            self._prepared.record(copy_stream)
++        self._prepared_waiter = main_stream
++
++    def _prepare(
++        self,
++        idx_mapping: torch.Tensor,
++        match_idx_mapping: torch.Tensor | None,
++        num_sampled: torch.Tensor,
++        verified: torch.Tensor,
++        dead_row_cut: torch.Tensor | None,
++    ) -> None:
++        num_reqs = idx_mapping.shape[0]
+         total_len = self.req_states.total_len.gpu
+         sources = self.sources[:num_reqs]
+         tilelang_copy.copy_match(
+             idx_mapping if match_idx_mapping is None else match_idx_mapping,
+-            history,
++            self.req_states.all_token_ids.gpu,
+             total_len,
+             sources,
+             self.min_match,
+@@ -187,6 +235,9 @@ class CopyDrafter:
+             verified,
+             verified if dead_row_cut is None else dead_row_cut,
+             self.int_state,
++            self.float_state,
++            self.chosen[:num_reqs],
++            self.estimates[:num_reqs],
+             self.alloc[:num_reqs],
+             self.slot_draft_limits.gpu,
+             self.min_match,
+@@ -195,6 +246,12 @@ class CopyDrafter:
+             self.initial,
+         )
+ 
++    def _join(self) -> None:
++        """Make the stream that reads prepare_alloc's results wait for them."""
++        if self._prepared_waiter is not None:
++            self._prepared_waiter.wait_event(self._prepared)
++            self._prepared_waiter = None
++
+     def attach_async_output(
+         self,
+         async_output: Any,
+@@ -226,56 +283,29 @@ class CopyDrafter:
+         idx_mapping: torch.Tensor,
+         dspark_drafts: torch.Tensor,
+         dspark_confidences: torch.Tensor,
+-        num_sampled: torch.Tensor,
+-        verified: torch.Tensor | None,
+-        dead_row_cut: torch.Tensor | None,
+-        *,
+-        matched: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         """The batch's drafts, confidences and planned confidences
+-        (``[num_reqs, lookahead]``), and ``alloc[:num_reqs]``.
++        (``[num_reqs, lookahead]``), from this step's ``prepare_alloc``.
+ 
+         Args:
+-            idx_mapping: The batch's request slots.
++            idx_mapping: The batch's request slots, as ``prepare_alloc``'s.
+             dspark_drafts: DSpark's drafts, ``[num_reqs, num_draft_steps]``.
+             dspark_confidences: Their confidences (``[>= num_reqs, steps]``).
+-            num_sampled: The tokens this step committed per request.
+-            verified: The drafts this step verified per request (adaptive
+-                verification's admitted counts), None if it verified none.
+-            dead_row_cut: The live drafts per request, None without dead rows.
+-            matched: Whether ``prepare_alloc`` already matched this step's
+-                histories into ``sources[:num_reqs]``.
+         """
+         num_reqs = idx_mapping.shape[0]
+-        if verified is None:
+-            verified = self._no_drafts[:num_reqs]
+-        history = self.req_states.all_token_ids.gpu
+-        total_len = self.req_states.total_len.gpu
+-        sources = self.sources[:num_reqs]
+-        if not matched:
+-            tilelang_copy.copy_match(
+-                idx_mapping, history, total_len, sources, self.min_match
+-            )
+         drafts = self.drafts[:num_reqs]
+         confidences = self.confidences[:num_reqs]
+         planned = self.planned[:num_reqs]
+-        tilelang_copy.copy_select(
++        self._join()
++        tilelang_copy.copy_apply(
+             idx_mapping,
+-            history,
+-            total_len,
+-            sources,
++            self.req_states.all_token_ids.gpu,
++            self.chosen[:num_reqs],
++            self.estimates[:num_reqs],
+             dspark_drafts[:num_reqs],
+             dspark_confidences[:num_reqs, : self.num_draft_steps],
+-            num_sampled,
+-            verified,
+-            verified if dead_row_cut is None else dead_row_cut,
+-            self.int_state,
+-            self.float_state,
+             drafts,
+             confidences,
+             planned,
+-            self._select_alloc[:num_reqs] if matched else self.alloc[:num_reqs],
+-            self.min_match,
+-            self.initial,
+         )
+         return drafts, confidences, planned
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 6a4df890e..340935943 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -17,21 +17,26 @@ kept between steps but the request's copy state, reset with the slot.
+   largest ``e`` whose run reaches it. A thread's ends ascend, so its last hit is
+   its largest; the block takes the maximum over its threads (warp shuffles, then
+   the warps), an order-free reduction, and writes ``sources[r, chunk, level]``
+-  (-1 where none). No atomics: the result is the same on every launch.
+-- ``copy_select``: a warp a request. First the copy state of the request's last
+-  proposal is updated from this step's verification of it: a copy whose live
+-  verified drafts (its admitted drafts, at most the dead-row cut) were all
+-  accepted doubles its cap (from ``initial`` up to the lookahead), a rejection
+-  or a proposal without a copy returns it to ``initial``, and the accepted and
+-  judged drafts update the request's acceptance estimate (decayed counts over a
+-  prior). Then the longest
+-  level with a source over the chunks, its latest source, and the proposal:
+-  ``min(cap, total_len - source)`` tokens from the source, each at the estimate
+-  as its confidence; DSpark's drafts and confidences where no level has one.
+-  It also writes the planned confidences and the allocation the scheduler lays
+-  out the step after next from: as if this proposal is accepted in full, the
+-  next one offers ``min(2 cap, lookahead, total_len - source)`` drafts; DSpark's
+-  confidences and block otherwise.
++  (-1 where none). A block whose share is empty (a context shorter than its
++  first end) writes -1 without loading the key. No atomics: the result is the
++  same on every launch.
++- ``copy_alloc``: a warp a request, before the drafter's proposal is needed.
++  First the copy state of the request's last proposal is updated from this
++  step's verification of it: a copy whose live verified drafts (its admitted
++  drafts, at most the dead-row cut) were all accepted doubles its cap (from
++  ``initial`` up to the lookahead), a rejection or a proposal without a copy
++  returns it to ``initial``, and the accepted and judged drafts update the
++  request's acceptance estimate (decayed counts over a prior). Then the longest
++  level with a source over the chunks, its latest source, and the choice
++  (``chosen``: the source, the ``min(cap, total_len - source)`` drafts it
++  offers, and the ``min(2 cap, lookahead, total_len - source)`` the next
++  proposal offers if this one is accepted in full; ``estimates``: the estimate).
++  It also writes the allocation the scheduler lays out the step after next from
++  (those next drafts, at least DSpark's block) and the slot's valid draft count.
++- ``copy_apply``: a warp a request, once DSpark has drafted: the proposal of
++  ``copy_alloc``'s choice, each copied token at the estimate as its confidence
++  and as its planned confidence up to the next proposal's drafts; DSpark's drafts
++  and confidences where no level has a source.
+ 
+ Every launch has a fixed grid for its request count, no host synchronization and
+ no dynamic allocation, so it can be captured in a CUDA graph.
+@@ -67,6 +72,8 @@ DECAY = 0.9
+ MAX_DOUBLINGS = 16
+ # Copy state columns: int32 (doublings, pending drafts), float32 (hits, trials).
+ STATE_COLUMNS = 2
++# copy_alloc's choice of a request: (source, offered drafts, next drafts).
++CHOSEN_COLUMNS = 3
+ 
+ assert MAX_LEVEL == _MATCH_THREADS, "a thread loads one key token"
+ assert CHUNKS == _SELECT_THREADS, "a lane reads one chunk's source"
+@@ -106,98 +113,89 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
+             length = T.alloc_var(T.int32, init=0)
+             if slot >= 0:
+                 length = total_len[slot]
+-            # The key: the context's last tokens, latest first.
+-            key[tx] = -1
+-            if tx < length:
+-                key[tx] = history[slot, length - 1 - tx]
+-            for i in tuple(range(count)):
+-                best[i] = -1
+-            T.sync_threads()
+-            k0 = T.alloc_var(T.int32, init=key[0])
+-            ends = T.max(length - min_match, 0)  # window ends min_match .. length - 1
+-            for k in T.serial(T.ceildiv(ends, span)):
+-                e = min_match + k * span + c * _MATCH_THREADS + tx
+-                if e < length:
+-                    if history[slot, e - 1] == k0:
+-                        run = T.alloc_var(T.int32, init=1)
+-                        # The shortest level first: most ends fail on its first token.
+-                        # A token is loaded only while the run reaches it.
+-                        for j in T.unroll(1, min_match):
+-                            if run == j:  # noqa: SIM102
+-                                if history[slot, e - 1 - j] == key[j]:
+-                                    run = j + 1
+-                        # A longer level only past a full match of the one before.
+-                        for i in tuple(range(1, count)):
+-                            if run == levels[i - 1]:
+-                                for j in T.serial(levels[i - 1], levels[i]):
+-                                    if run == j and j < e:  # noqa: SIM102
+-                                        if history[slot, e - 1 - j] == key[j]:
+-                                            run = j + 1
+-                        for i in tuple(range(count)):
+-                            if run >= levels[i]:
+-                                best[i] = e
+-            for i in tuple(range(count)):
+-                for distance in (16, 8, 4, 2, 1):
+-                    best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
+-                if tx % 32 == 0:
+-                    partial[tx // 32, i] = best[i]
+-            T.sync_threads()
+-            if tx < count:
+-                latest = T.alloc_var(T.int32, init=-1)
+-                for w in T.unroll(_MATCH_WARPS):
+-                    latest = T.max(latest, partial[w, tx])
+-                sources[r, c, tx] = latest
++            if min_match + c * _MATCH_THREADS >= length:
++                # The block's first end is past the context: no end to compare
++                # (the branch is the whole block's, so no barrier diverges).
++                if tx < count:
++                    sources[r, c, tx] = -1
++            else:
++                # The key: the context's last tokens, latest first.
++                key[tx] = -1
++                if tx < length:
++                    key[tx] = history[slot, length - 1 - tx]
++                for i in tuple(range(count)):
++                    best[i] = -1
++                T.sync_threads()
++                k0 = T.alloc_var(T.int32, init=key[0])
++                # window ends min_match .. length - 1
++                ends = T.max(length - min_match, 0)
++                for k in T.serial(T.ceildiv(ends, span)):
++                    e = min_match + k * span + c * _MATCH_THREADS + tx
++                    if e < length:  # noqa: SIM102
++                        if history[slot, e - 1] == k0:
++                            run = T.alloc_var(T.int32, init=1)
++                            # The shortest level first: most ends fail on its first
++                            # token. A token is loaded only while the run reaches it.
++                            for j in T.unroll(1, min_match):
++                                if run == j:  # noqa: SIM102
++                                    if history[slot, e - 1 - j] == key[j]:
++                                        run = j + 1
++                            # A longer level only past a full match of the one before.
++                            for i in tuple(range(1, count)):
++                                if run == levels[i - 1]:
++                                    for j in T.serial(levels[i - 1], levels[i]):
++                                        if run == j and j < e:  # noqa: SIM102
++                                            if history[slot, e - 1 - j] == key[j]:
++                                                run = j + 1
++                            for i in tuple(range(count)):
++                                if run >= levels[i]:
++                                    best[i] = e
++                for i in tuple(range(count)):
++                    for distance in (16, 8, 4, 2, 1):
++                        best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
++                    if tx % 32 == 0:
++                        partial[tx // 32, i] = best[i]
++                T.sync_threads()
++                if tx < count:
++                    latest = T.alloc_var(T.int32, init=-1)
++                    for w in T.unroll(_MATCH_WARPS):
++                        latest = T.max(latest, partial[w, tx])
++                    sources[r, c, tx] = latest
+ 
+     return copy_match
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_select_kernel(
++def copy_alloc_kernel(
+     min_match: int,
+     lookahead: int,
+     block: int,
+     initial: int,
+     idx_dtype: str,
+ ):
+-    """See the module docstring: the copy state's update and the proposal."""
++    """See the module docstring: the copy state's update and the choice."""
+     count = num_levels(min_match)
+     num_reqs = T.dynamic("num_reqs")
+-    history_rows, history_cols, history_stride = T.dynamic(
+-        "history_rows, history_cols, history_stride"
+-    )
+     total_rows = T.dynamic("total_rows")
+-    draft_rows, draft_stride = T.dynamic("draft_rows, draft_stride")
+-    conf_rows, conf_stride = T.dynamic("conf_rows, conf_stride")
+     state_rows = T.dynamic("state_rows")
+-    passes = -(-lookahead // _SELECT_THREADS)
+ 
+     @T.prim_func
+-    def copy_select(
++    def copy_alloc(
+         idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+-        history: T.StridedTensor(
+-            (history_rows, history_cols), (history_stride, 1), T.int32
+-        ),
+         total_len: T.Tensor((total_rows,), T.int32),
+         sources: T.Tensor((num_reqs, CHUNKS, count), T.int32),
+-        dspark_drafts: T.StridedTensor((draft_rows, block), (draft_stride, 1), T.int64),
+-        dspark_confidences: T.StridedTensor(
+-            (conf_rows, block), (conf_stride, 1), T.float32
+-        ),
+         num_sampled: T.Tensor((num_reqs,), T.int32),
+         verified: T.Tensor((num_reqs,), T.int32),
+         cut: T.Tensor((num_reqs,), T.int32),
+         int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
+         float_state: T.Tensor((state_rows, STATE_COLUMNS), T.float32),
+-        drafts: T.Tensor((num_reqs, lookahead), T.int64),
+-        confidences: T.Tensor((num_reqs, lookahead), T.float32),
+-        planned: T.Tensor((num_reqs, lookahead), T.float32),
++        chosen: T.Tensor((num_reqs, CHOSEN_COLUMNS), T.int32),
++        estimates: T.Tensor((num_reqs,), T.float32),
+         alloc: T.Tensor((num_reqs,), T.int32),
++        slot_limits: T.Tensor((state_rows,), T.int32),
+     ):
+         with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
+             tx = T.get_thread_binding()
+-            # (source, offered, planned) and the estimate, for the whole warp.
+-            chosen = T.alloc_shared((3,), T.int32)
+-            estimate = T.alloc_shared((1,), T.float32)
+             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+             # The longest level with a source wins; its latest source across chunks.
+             source = T.alloc_var(T.int32, init=-1)
+@@ -234,30 +232,67 @@ def copy_select_kernel(
+                 int_state[slot, 1] = offered
+                 float_state[slot, 0] = hits
+                 float_state[slot, 1] = trials
+-                chosen[0] = source
+-                chosen[1] = offered
+-                chosen[2] = after
+-                estimate[0] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
++                chosen[r, 0] = source
++                chosen[r, 1] = offered
++                chosen[r, 2] = after
++                estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
+                 alloc[r] = T.max(after, block)
+-            T.sync_threads()
+-            start = chosen[0]
++                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
++
++    return copy_alloc
++
++
++@tilelang.jit(pass_configs=_PASS)
++def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
++    """See the module docstring: the proposal of ``copy_alloc``'s choice."""
++    num_reqs = T.dynamic("num_reqs")
++    history_rows, history_cols, history_stride = T.dynamic(
++        "history_rows, history_cols, history_stride"
++    )
++    draft_rows, draft_stride = T.dynamic("draft_rows, draft_stride")
++    conf_rows, conf_stride = T.dynamic("conf_rows, conf_stride")
++    passes = -(-lookahead // _SELECT_THREADS)
++
++    @T.prim_func
++    def copy_apply(
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        history: T.StridedTensor(
++            (history_rows, history_cols), (history_stride, 1), T.int32
++        ),
++        chosen: T.Tensor((num_reqs, CHOSEN_COLUMNS), T.int32),
++        estimates: T.Tensor((num_reqs,), T.float32),
++        dspark_drafts: T.StridedTensor((draft_rows, block), (draft_stride, 1), T.int64),
++        dspark_confidences: T.StridedTensor(
++            (conf_rows, block), (conf_stride, 1), T.float32
++        ),
++        drafts: T.Tensor((num_reqs, lookahead), T.int64),
++        confidences: T.Tensor((num_reqs, lookahead), T.float32),
++        planned: T.Tensor((num_reqs, lookahead), T.float32),
++    ):
++        with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
++            tx = T.get_thread_binding()
++            slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
++            start = T.alloc_var(T.int32, init=chosen[r, 0])
++            offered = T.alloc_var(T.int32, init=chosen[r, 1])
++            after = T.alloc_var(T.int32, init=chosen[r, 2])
++            estimate = T.alloc_var(T.float32, init=estimates[r])
+             for k in T.unroll(passes):
+                 col = k * _SELECT_THREADS + tx
+                 if col < lookahead:
+                     if start >= 0:
+                         drafts[r, col] = T.if_then_else(
+-                            col < chosen[1],
++                            col < offered,
+                             T.cast(
+-                                history[slot, start + T.min(col, chosen[1] - 1)],
++                                history[slot, start + T.min(col, offered - 1)],
+                                 T.int64,
+                             ),
+                             T.int64(-1),
+                         )
+                         confidences[r, col] = T.if_then_else(
+-                            col < chosen[1], estimate[0], T.float32(0)
++                            col < offered, estimate, T.float32(0)
+                         )
+                         planned[r, col] = T.if_then_else(
+-                            col < chosen[2], estimate[0], T.float32(0)
++                            col < after, estimate, T.float32(0)
+                         )
+                     else:
+                         value = T.if_then_else(
+@@ -273,77 +308,38 @@ def copy_select_kernel(
+                         confidences[r, col] = value
+                         planned[r, col] = value
+ 
+-    return copy_select
+-
+-
+-@tilelang.jit(pass_configs=_PASS)
+-def copy_alloc_kernel(
+-    min_match: int,
+-    lookahead: int,
+-    block: int,
+-    initial: int,
+-    idx_dtype: str,
+-):
+-    """The copy allocation and per-slot valid draft count before the drafter runs."""
+-    count = num_levels(min_match)
+-    num_reqs = T.dynamic("num_reqs")
+-    total_rows = T.dynamic("total_rows")
+-    state_rows = T.dynamic("state_rows")
+-
+-    @T.prim_func
+-    def copy_alloc(
+-        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+-        total_len: T.Tensor((total_rows,), T.int32),
+-        sources: T.Tensor((num_reqs, CHUNKS, count), T.int32),
+-        num_sampled: T.Tensor((num_reqs,), T.int32),
+-        verified: T.Tensor((num_reqs,), T.int32),
+-        cut: T.Tensor((num_reqs,), T.int32),
+-        int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
+-        alloc: T.Tensor((num_reqs,), T.int32),
+-        slot_limits: T.Tensor((state_rows,), T.int32),
+-    ):
+-        with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
+-            tx = T.get_thread_binding()
+-            slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+-            source = T.alloc_var(T.int32, init=-1)
+-            for i in tuple(range(count)):
+-                latest = T.alloc_var(T.int32, init=sources[r, tx, i])
+-                for step in (16, 8, 4, 2, 1):
+-                    latest = T.max(latest, T.shfl_xor(latest, step))
+-                if latest >= 0:
+-                    source = latest
+-            if tx == 0:
+-                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+-                pending = int_state[slot, 1]
+-                if pending > 0 and num_sampled[r] > 0:
+-                    live = T.min(pending, T.min(verified[r], cut[r]))
+-                    if live > 0:
+-                        accepted = T.min(num_sampled[r] - 1, live)
+-                        doublings = T.if_then_else(
+-                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
+-                        )
+-                cap = T.min(T.int32(initial) << doublings, lookahead)
+-                distance = total_len[slot] - source
+-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+-                after = T.if_then_else(
+-                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+-                )
+-                alloc[r] = T.max(after, block)
+-                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
+-
+-    return copy_alloc
++    return copy_apply
+ 
+ 
+ def copy_match_key(min_match: int, idx_dtype: torch.dtype) -> tuple:
+     return (min_match, _DTYPES[idx_dtype])
+ 
+ 
+-def copy_select_key(
++def copy_alloc_key(
+     min_match: int, lookahead: int, block: int, initial: int, idx_dtype: torch.dtype
+ ) -> tuple:
+     return (min_match, lookahead, block, initial, _DTYPES[idx_dtype])
+ 
+ 
++def copy_apply_key(lookahead: int, block: int, idx_dtype: torch.dtype) -> tuple:
++    return (lookahead, block, _DTYPES[idx_dtype])
++
++
++def copy_match(
++    idx_mapping: torch.Tensor,
++    history: torch.Tensor,
++    total_len: torch.Tensor,
++    sources: torch.Tensor,
++    min_match: int,
++) -> None:
++    """``sources[:num_reqs]`` ([num_reqs, CHUNKS, levels] int32): each chunk's
++    latest window end per level of the batch's requests."""
++    if idx_mapping.shape[0]:
++        _kernel(copy_match_kernel, *copy_match_key(min_match, idx_mapping.dtype))(
++            idx_mapping, history, total_len, sources
++        )
++
++
+ def copy_alloc(
+     idx_mapping: torch.Tensor,
+     total_len: torch.Tensor,
+@@ -352,6 +348,9 @@ def copy_alloc(
+     verified: torch.Tensor,
+     cut: torch.Tensor,
+     int_state: torch.Tensor,
++    float_state: torch.Tensor,
++    chosen: torch.Tensor,
++    estimates: torch.Tensor,
+     alloc: torch.Tensor,
+     slot_limits: torch.Tensor,
+     min_match: int,
+@@ -359,12 +358,13 @@ def copy_alloc(
+     block: int,
+     initial: int,
+ ) -> None:
+-    """``alloc[:num_reqs]`` and ``slot_limits[idx_mapping]`` from ``sources`` and
+-    the current copy state (read-only), before the drafter proposes."""
++    """The batch's requests' copy state updated in place from ``sources``, their
++    choice into ``chosen`` and ``estimates``, ``alloc[:num_reqs]`` and
++    ``slot_limits[idx_mapping]``."""
+     num_reqs = idx_mapping.shape[0]
+     if not num_reqs:
+         return
+-    key = copy_select_key(min_match, lookahead, block, initial, idx_mapping.dtype)
++    key = copy_alloc_key(min_match, lookahead, block, initial, idx_mapping.dtype)
+     _kernel(copy_alloc_kernel, *key)(
+         idx_mapping,
+         total_len,
+@@ -373,70 +373,43 @@ def copy_alloc(
+         verified,
+         cut,
+         int_state,
++        float_state,
++        chosen,
++        estimates,
+         alloc,
+         slot_limits,
+     )
+ 
+ 
+-def copy_match(
+-    idx_mapping: torch.Tensor,
+-    history: torch.Tensor,
+-    total_len: torch.Tensor,
+-    sources: torch.Tensor,
+-    min_match: int,
+-) -> None:
+-    """``sources[:num_reqs]`` ([num_reqs, CHUNKS, levels] int32): each chunk's
+-    latest window end per level of the batch's requests."""
+-    if idx_mapping.shape[0]:
+-        _kernel(copy_match_kernel, *copy_match_key(min_match, idx_mapping.dtype))(
+-            idx_mapping, history, total_len, sources
+-        )
+-
+-
+-def copy_select(
++def copy_apply(
+     idx_mapping: torch.Tensor,
+     history: torch.Tensor,
+-    total_len: torch.Tensor,
+-    sources: torch.Tensor,
++    chosen: torch.Tensor,
++    estimates: torch.Tensor,
+     dspark_drafts: torch.Tensor,
+     dspark_confidences: torch.Tensor,
+-    num_sampled: torch.Tensor,
+-    verified: torch.Tensor,
+-    cut: torch.Tensor,
+-    int_state: torch.Tensor,
+-    float_state: torch.Tensor,
+     drafts: torch.Tensor,
+     confidences: torch.Tensor,
+     planned: torch.Tensor,
+-    alloc: torch.Tensor,
+-    min_match: int,
+-    initial: int,
+ ) -> None:
+-    """The batch's proposals into ``drafts``, ``confidences``, ``planned`` (each
+-    ``[num_reqs, lookahead]``) and ``alloc`` (``[num_reqs]``), and its requests'
+-    copy state updated in place."""
++    """The batch's proposals from ``copy_alloc``'s choice into ``drafts``,
++    ``confidences`` and ``planned`` (each ``[num_reqs, lookahead]``)."""
+     num_reqs = idx_mapping.shape[0]
+     if not num_reqs:
+         return
+     lookahead = drafts.shape[1]
+     block = dspark_drafts.shape[1]
+-    key = copy_select_key(min_match, lookahead, block, initial, idx_mapping.dtype)
+-    _kernel(copy_select_kernel, *key)(
++    key = copy_apply_key(lookahead, block, idx_mapping.dtype)
++    _kernel(copy_apply_kernel, *key)(
+         idx_mapping,
+         history,
+-        total_len,
+-        sources,
++        chosen,
++        estimates,
+         dspark_drafts,
+         dspark_confidences,
+-        num_sampled,
+-        verified,
+-        cut,
+-        int_state,
+-        float_state,
+         drafts,
+         confidences,
+         planned,
+-        alloc,
+     )
+ 
+ 
+@@ -448,10 +421,7 @@ def copy_calls(min_match: int, lookahead: int, block: int, initial: int) -> list
+         _call(copy_match_kernel, *copy_match_key(min_match, idx)),
+         _call(
+             copy_alloc_kernel,
+-            *copy_select_key(min_match, lookahead, block, initial, idx),
+-        ),
+-        _call(
+-            copy_select_kernel,
+-            *copy_select_key(min_match, lookahead, block, initial, idx),
++            *copy_alloc_key(min_match, lookahead, block, initial, idx),
+         ),
++        _call(copy_apply_kernel, *copy_apply_key(lookahead, block, idx)),
+     ]
+-- 
+2.43.0
+
