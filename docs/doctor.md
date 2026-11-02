@@ -133,8 +133,15 @@ fixed to the old slot fails (NCCL with an unhandled system error).
 | Its image tag and vLLM command line equal the configuration's | error |
 | Its environment (`Config.Env`) equals the configuration's: each variable `cluster start` passes (the profile's `environment` plus the per-node values it adds) has its value, and every other variable is the container image's own with the image's value; an extra, missing or different variable fails | error |
 | Its bind mounts (`HostConfig.Binds`) equal the configuration's `container.mounts`; an extra, missing or different mount fails | error |
-| The image's source-tree labels equal the configuration's `expected_labels` | error |
+| The running container's immutable image has the configuration's `expected_labels` | error |
+| Every node's running image has the same ordered layer digests and runtime `Config` | error |
 | While serving, the GPU clock is at least 1,000 MHz | error; a lower clock is the [GB10 clock latch](recovery.md#gb10-gpu-clock-latch), cleared only by removing AC power |
+
+Image checks inspect the container's immutable image ID, so moving a tag cannot hide
+an old running build. Docker's containerd and overlay2 stores may assign different
+IDs to the same copied image; the layers and runtime configuration must still match.
+Benchmarks validate their own captured image inspections and record each node's
+image ID, layers, labels and content fingerprint alongside any validation errors.
 
 ### GLP steering file
 

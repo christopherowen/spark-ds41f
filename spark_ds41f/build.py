@@ -480,7 +480,8 @@ def sync_lock_and_arms(
     arm_paths: list[str] | None = None,
 ) -> list[str]:
     """Align a lock, its source manifest and its arm configs from the manifest's recorded
-    patch heads and trees and the active patch series on disk."""
+    patch heads and trees and the active patch series on disk. Measured results retain
+    the source and image identity of their run; refreshing build inputs cannot update them."""
     upstreams_path = repository_config_path(upstreams_relative)
     upstreams = json.loads(upstreams_path.read_text(encoding="utf-8"))
     manifest_relative = upstreams["source_manifest"]
@@ -534,7 +535,7 @@ def sync_lock_and_arms(
             candidate_arms.append(sibling)
 
     for arm_path in candidate_arms:
-        if not arm_path.is_file():
+        if arm_path.name in {"results.json", "verdict.json"} or not arm_path.is_file():
             continue
         try:
             arm = json.loads(arm_path.read_text(encoding="utf-8"))
@@ -542,7 +543,15 @@ def sync_lock_and_arms(
             continue
         if not isinstance(arm, dict):
             continue
-        arm_lock = arm.get("upstreams_config")
+        # The directory also holds results, verdicts and other receipts. Their notes
+        # and recorded labels describe a past run, not an arm to rebuild.
+        if not (cluster_recipe.is_overlay(arm) or cluster_recipe.is_recipe(arm)
+                or ("container" in arm and "serve_args" in arm)):
+            continue
+        settings = arm.get("set", {}) if cluster_recipe.is_overlay(arm) else arm
+        if not isinstance(settings, dict):
+            continue
+        arm_lock = settings.get("upstreams_config")
         if arm_lock and repository_config_path(arm_lock) != upstreams_path:
             continue
         if not arm_lock and arm_path.parent != upstreams_path.parent and (
@@ -550,7 +559,7 @@ def sync_lock_and_arms(
         ):
             continue
         arm_changed = False
-        labels = arm.get("container", {}).get("expected_labels")
+        labels = settings.get("container", {}).get("expected_labels")
         if isinstance(labels, dict):
             for name in build_projects(upstreams.get("sources", {})):
                 tree = manifest.get(name, {}).get("expected_tree")
@@ -566,29 +575,6 @@ def sync_lock_and_arms(
             arm_path.write_text(json.dumps(arm, indent=2) + "\n", encoding="utf-8")
             updated.append(arm_path.resolve().relative_to(ROOT.resolve()).as_posix())
 
-    results_path = upstreams_path.parent / "results.json"
-    if upstreams_path.parent.name.startswith("candidate-") and results_path.is_file() and "vllm" in manifest:
-        try:
-            results = json.loads(results_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            results = None
-        if isinstance(results, dict) and "patch_head" in results:
-            vllm_record = manifest["vllm"]
-            results_changed = False
-            for key in ("patch_head", "expected_tree", "patchset_sha256"):
-                if key in results and key in vllm_record and results[key] != vllm_record[key]:
-                    results[key] = vllm_record[key]
-                    results_changed = True
-            if (
-                "total_patches" in results
-                and "patch_count" in vllm_record
-                and results["total_patches"] != vllm_record["patch_count"]
-            ):
-                results["total_patches"] = vllm_record["patch_count"]
-                results_changed = True
-            if results_changed:
-                results_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-                updated.append(results_path.resolve().relative_to(ROOT.resolve()).as_posix())
     return updated
 
 
