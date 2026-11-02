@@ -37,7 +37,8 @@ step), up to the context limit.
 Decision: **retain for more evidence**. The patch is tested and harmless, but the
 GPU-side gain is far below what promotion can measure. It is worth carrying only together
 with a cluster measurement of the all_gather bytes, or as a low-risk rider in a candidate
-that is being qualified anyway. Promotion is the owner's call.
+that is being qualified anyway. Promotion is the owner's call. A serving soak in the
+sp5-sp7 window is prepared ([`soak-spec.json`](./soak-spec.json); see Serving soak).
 
 ## Base and the one variable
 
@@ -311,13 +312,69 @@ everything outside the live rows poisoned:
 - The graphs' private-pool temporaries were not poisoned; they hold earlier replays'
   values.
 
+### Serving soak (sp5-sp7, tp3-switched): prepared, not yet run
+
+The owner authorized a traffic soak of this patch in the sp5-sp7 window, which the #842
+session holds. This directory hands it over as files; it ran no cluster command itself.
+
+- **Spec:** [`soak-spec.json`](./soak-spec.json). It runs a `sync`, then one boot of one arm
+  measured with the `release-tp3` suite, into `results/private/suites/dspark-context-ladder-soak-tp3-switched/context-ladder`.
+- **Arm:** [`soak-tp3-switched.json`](./soak-tp3-switched.json). It extends the profile
+  sp5-sp7 serve, `config/candidate-37-tp3-switched-dev.local.json`: node-local,
+  git-ignored, and the same on sp5, sp6 and sp7 (sha256 `92b1712d…`, node map
+  `config/nodes-switched3.local.json`, `0c508533…`).
+  - The arm sets `container.mounts` to the cache and the overlay. The hub and GLP mounts
+    are derived when the profile resolves, so the resolved arm keeps all four.
+  - Nothing else changes: same image (`spark-ds41f:candidate-37`, sha256 `e1ee7b19…` on
+    sp5-sp8), capture sizes, token budget, environment and node map.
+- **Overlay:** `overlay/vllm/vllm/models/deepseek_v4_1/nvidia/dspark.py` is candidate-37's
+  `dspark.py` with 0677 applied (sha256 `b9f15d81…`). The image's own copy is
+  candidate-37's exactly (`f07ae02a…`, checked in the sp5-sp8 build), so the mount changes
+  only the context ladder.
+- **Checked locally:**
+  - `scripts/lab.py run soak-spec.json --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json`
+    lists sync, boot, step-cost save, `bin/spark … bench --suite release-tp3 --compare none`
+    and the table, and reports no problems;
+  - `bin/spark --cluster-config …/soak-tp3-switched.json doctor` reports `configuration OK`.
+
+**Pass:** every suite step completes. No rank logs a non-finite or a device assert, for
+example `nan or inf` (`route_partials`), `device-side assert`, `illegal memory access`,
+`CUDA error` or a Python `Traceback`.
+
+**Engagement:**
+- `results/private/lab/overlays-dspark-context-ladder-soak-tp3-switched.txt` lists the
+  mounted `dspark.py` at `b9f15d81…`.
+- Rank 0's boot log reads `Capturing DSpark context CUDA graphs (FULL): … 23/23`
+  (candidate-37 captures 7/7).
+
+**Which steps replay the new sizes.** The new sizes are those candidate-37 did not
+capture: 3, 5, 6, 7, 9, 10, 11, 12, 18, 20, 24, 28, 30, 36, 40 and 42. 1, 2, 4, 8, 16, 32 and
+48 are shared. A step replays the smallest size at or above its rows: 13-15 rows replay 16,
+25-27 replay 28, 43-47 replay 48.
+
+The context graph runs on every decode step of up to 48 target rows that is not a dummy
+step. Larger steps (a prefill chunk beside decodes) run the eager path, which the patch does
+not change. Serving has no per-size replay counter, so this mapping comes from each step's
+row range and from spark-ds41f-1030's recorded TP3 suite
+(`manifests/suites/2026-10-30-spark-ds41f-1030-tp3/`: mean scheduled tokens per step).
+
+| Step | Load | Decode rows per step | New sizes it reaches |
+|---|---|---|---|
+| `model` | 8 streams, 256 tokens | 8-48 | 9-12, 18, 20, 24, 28, 30, 36, 40, 42 |
+| `c8` | 8 closed streams, 300 s | 8-48; mean 18.0 (30 s batches 16.9-19.1) | the same; most steps near 16-24 rows (candidate-37 padded 17-31 to 32) |
+| `c4` | 4 closed streams, 300 s | 4-24; mean 9.4 (8.9-9.9) | 5-7, 9-12, 18, 20, 24; most near 8-12 rows (candidate-37 padded 9-15 to 16) |
+| `poisson` | rate 0.42/s, 300 s | 1-48 as arrivals vary; mean 9.7 (3.9-17.1) | 3, 5-7, 9-12 at low occupancy; 18-24 and up in bursts |
+| `stall-3`, `stall-6`, `stall-7` | 131K prefills beside 3/6/7 streams; 500-token probes | decode-only steps without a prefill chunk: 3-42 | 3, 5-7, 9-12, 18-42 |
+| `prefill` | single long prompts | the decode tail of one request: 1-6 | 3, 5, 6 |
+| `grid` | the engine's dummy steps | n/a | none: the drafter skips the context graph on dummy runs |
+
+Sizes 28-42 need c8, model or stall steps whose requests verify near full depth. That
+happens when drafts are accepted at a high rate.
+
 ## Not covered
 
-- A soak under real concurrent agent traffic on a cluster (the #842 lesson). It needs a
-  serving window and the owner's authorization, which this rework did not have. The soak
-  above covers the graph and its padding in isolation, not the target, the scheduler or
-  the TP collectives. If this patch rides in a candidate, that candidate's concurrent soak
-  covers it.
+- The serving soak above has not run yet. Until it has, the poisoned-buffer soak covers the
+  graph and its padding in isolation, not the target, the scheduler or the TP collectives.
 - The RoCE all_gather of `main_proj` at TP3/TP4 (bytes above) and the end-to-end decode
   step, which needs a cluster window. At 25-66 ms a step, the GPU-side saving measured here
   is far below the bench's ±0.5 ms step resolution.
