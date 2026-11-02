@@ -35,7 +35,7 @@ VLLM_RING_ENV = {
     "VLLM_DISABLE_PYNCCL": "0",
 }
 # Node-map fields for this repository's access to a node, not the fabric.
-SITE_FIELDS = ("transfer_host",)
+SITE_FIELDS = ("transfer_host", "control_ip")
 GID_PINS = ("NCCL_IB_GID_INDEX", "SPARKNET_ROCE_GID_INDEX")
 
 
@@ -133,10 +133,15 @@ def node_environment(cluster: dict, node: dict) -> dict[str, str]:
                 env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
     else:
         env = base
-    env["VLLM_HOST_IP"] = node["management_ip"]
+    env["VLLM_HOST_IP"] = control_ip(node)
     if switched(mode):
         env["SPARK_DEPLOYMENT_TRANSPORT"] = str(mode)
     return env
+
+
+def control_ip(node: dict) -> str:
+    """The node's control-plane IP (defaults to management_ip)."""
+    return node.get("control_ip") or node["management_ip"]
 
 
 def hcas(cluster: dict, node: dict) -> list[str]:
@@ -184,8 +189,10 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
         if hasattr(sparknet.render, "base_problems"):
             errors.extend(sparknet.render.base_problems(check_settings))
     heads = [n for n in entries if n.get("head")]
-    if len(heads) == 1 and cluster.get("distributed", {}).get("master_addr") != heads[0].get("management_ip"):
-        errors.append("distributed.master_addr must match the API head's management_ip")
+    if len(heads) == 1:
+        allowed_master = {heads[0].get("management_ip"), heads[0].get("control_ip")} - {None}
+        if cluster.get("distributed", {}).get("master_addr") not in allowed_master:
+            errors.append("distributed.master_addr must match the API head's management_ip")
     if switched(mode):
         if cluster.get("fabric", {}).get("topology") != "switched":
             errors.append(f"{mode} requires explicit fabric.topology=switched")
@@ -301,7 +308,7 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
     ssh_user = nodes.get("ssh_user")
     if result.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         result["host"]["home"] = f"/home/{ssh_user}"
-    result["distributed"]["master_addr"] = next(n["management_ip"] for n in nodes["nodes"] if n.get("head"))
+    result["distributed"]["master_addr"] = next(control_ip(n) for n in nodes["nodes"] if n.get("head"))
     for flag in ("--tensor-parallel-size", "--nnodes"):
         set_argument(result, flag, str(count))
     spec = json.loads(argument(result, "--speculative-config") or "{}")

@@ -51,9 +51,13 @@ Each node needs:
   then reconnect);
 - about 480 GiB of free disk (the model, including Engram tables read from
   disk, plus caches); the build host also needs 64 GiB of free memory;
-- a management network for SSH, the API and Gloo, with passwordless SSH from
-  the head node to every node as one user, who also has passwordless `sudo`
-  (the memory guards and several checks use `sudo -n`);
+- a wired management network for SSH, the API and per-step control traffic
+  (Ray, Gloo and ZMQ; Wi-Fi tail spikes stall decode steps, see
+  [#712](https://github.com/christopherowen/spark-ds41f/issues/712), or set
+  `control_ip` / `*_SOCKET_IFNAME` to route control traffic over the
+  ConnectX-7 links when no RJ45 management network is cabled), with
+  passwordless SSH from the head node to every node as one user, who also has
+  passwordless `sudo` (the memory guards and several checks use `sudo -n`);
 - the ConnectX-7 cabling for its topology ([stage 3](#3-fabric-cabling-and-addressing)).
 
 ## What changes on your machines

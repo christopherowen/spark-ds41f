@@ -180,9 +180,9 @@ def configuration(
     if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         cluster["host"]["home"] = f"/home/{ssh_user}"
     if is_recipe_config and cluster.get("distributed", {}).get("master_addr") == "10.0.1.71":
-        heads = [n for n in nodes.get("nodes", []) if n.get("head") and n.get("management_ip")]
+        heads = [n for n in nodes.get("nodes", []) if n.get("head") and (n.get("control_ip") or n.get("management_ip"))]
         if len(heads) == 1:
-            cluster["distributed"]["master_addr"] = heads[0]["management_ip"]
+            cluster["distributed"]["master_addr"] = heads[0].get("control_ip") or heads[0]["management_ip"]
     return cluster, nodes, json.loads(upstreams_path.read_text(encoding="utf-8"))
 
 
@@ -857,6 +857,12 @@ printf 'nvme_apst=%s\n' "$(for c in /dev/nvme[0-9]*; do
   printf '%s|%s|%s\n' "${c#/dev/}" "$table" "$exits"
 done | paste -sd, -)"
 printf 'wifi_radio=%s\n' "$(nmcli radio wifi 2>/dev/null)"
+printf 'wireless_ifaces=%s\n' "$(for d in /sys/class/net/*; do
+  [ -e "$d/wireless" -o -e "$d/phy80211" ] || continue
+  ifname=${d##*/}
+  ips=$(ip -4 -o addr show dev "$ifname" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' | paste -sd/ -)
+  printf '%s:%s\n' "$ifname" "$ips"
+done | paste -sd, -)"
 """
 
 
@@ -1170,16 +1176,50 @@ def nvme_coalescing_warnings(node_name: str, facts: dict[str, str]) -> list[str]
     return warnings
 
 
-def wireless_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Warnings when the onboard Wi-Fi radio is enabled on a cluster node."""
-    if facts.get("wifi_radio") != "enabled":
-        return []
-    return [
-        Warn(
-            f"{node_name}: Wi-Fi radio is enabled; run nmcli radio wifi off "
-            "to keep the management port off wireless"
+def wireless_warnings(
+    node_name: str,
+    facts: dict[str, str],
+    node: dict | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Warnings when the onboard Wi-Fi radio is enabled or carries control traffic."""
+    warnings = []
+    if facts.get("wifi_radio") == "enabled":
+        warnings.append(
+            Warn(
+                f"{node_name}: Wi-Fi radio is enabled; run nmcli radio wifi off "
+                "to keep the management port off wireless"
+            )
         )
-    ]
+    wireless: dict[str, set[str]] = {}
+    for entry in filter(None, facts.get("wireless_ifaces", "").split(",")):
+        ifname, _, ips = entry.partition(":")
+        if ifname:
+            wireless[ifname] = {ip for ip in ips.split("/") if ip}
+    if wireless and (node or env):
+        ctrl_ip = (node or {}).get("control_ip") or (node or {}).get("management_ip")
+        sock_ifaces = {
+            iface.strip()
+            for key in ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME", "TP_SOCKET_IFNAME")
+            for iface in (env or {}).get(key, "").split(",")
+            if iface.strip() and not iface.strip().startswith("^")
+        }
+        if not sock_ifaces and (node or {}).get("management_interface"):
+            sock_ifaces.add(str(node["management_interface"]))
+        hit_ifaces = sorted(
+            ifname
+            for ifname, ips in wireless.items()
+            if ifname in sock_ifaces or (ctrl_ip and ctrl_ip in ips)
+        )
+        if hit_ifaces:
+            warnings.append(
+                Warn(
+                    f"{node_name}: control plane uses wireless interface {', '.join(hit_ifaces)}; "
+                    "move master_addr / VLLM_HOST_IP (control_ip) and *_SOCKET_IFNAME onto wired "
+                    "or ConnectX-7 links and run nmcli radio wifi off (#712)"
+                )
+            )
+    return warnings
 
 
 FAN_CONTROL_VERSION = "0.1.4"
@@ -1507,7 +1547,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(idle_service_warnings(node["name"], facts))
         problems.extend(nvme_coalescing_warnings(node["name"], facts))
         problems.extend(nvme_apst_warnings(node["name"], facts))
-        problems.extend(wireless_warnings(node["name"], facts))
+        problems.extend(wireless_warnings(node["name"], facts, node=node, env=cluster.get("environment")))
         problems.extend(fan_control_problems(
             node["name"], facts, fan_control=fan_control_enabled(cluster)))
         _, hcas = roce_gid_setting(cluster, node)

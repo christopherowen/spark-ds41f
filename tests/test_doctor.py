@@ -1247,6 +1247,27 @@ class NewUserOnboardingTest(unittest.TestCase):
             self.assertIn(f"recommend: {label} -> run: ", line)
             self.assertIn(command, line)
 
+    def test_wireless_warnings_detect_control_plane_on_wireless_interface(self) -> None:
+        node = {"name": "sp1", "management_ip": "192.168.1.10"}
+        env = {"GLOO_SOCKET_IFNAME": "wlp1s0"}
+        warnings = spark.wireless_warnings(
+            "sp1",
+            facts(wifi_radio="disabled", wireless_ifaces="wlp1s0:192.168.1.10"),
+            node=node,
+            env=env,
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("control plane uses wireless interface wlp1s0", warnings[0])
+        self.assertEqual(
+            spark.wireless_warnings(
+                "sp1",
+                facts(wifi_radio="disabled", wireless_ifaces="wlp1s0:192.168.1.10"),
+                node={**node, "control_ip": "192.168.100.10"},
+                env={"GLOO_SOCKET_IFNAME": "enp1s0f0np0"},
+            ),
+            [],
+        )
+
 
 class IdentifierAlignmentTest(unittest.TestCase):
     def test_arm_notes_and_lock_identifiers_are_checked_and_synced(self) -> None:

@@ -316,6 +316,16 @@ class TopologyTest(unittest.TestCase):
         self.assertNotEqual(spark.normalized_repository_url("https://github.com/example/spark-ds41f"),
                             spark.normalized_repository_url(current))
 
+    def test_control_ip_overrides_vllm_host_ip_and_master_addr(self):
+        nodes = copy.deepcopy(self.four)
+        for idx, node in enumerate(nodes["nodes"], 1):
+            node["control_ip"] = f"192.168.100.{idx}"
+        cand = topology.candidate(self.base, nodes, "config/nodes-ring.json")
+        self.assertEqual(cand["distributed"]["master_addr"], "192.168.100.1")
+        self.assertEqual(topology.problems(cand, nodes), [])
+        env = topology.node_environment(cand, nodes["nodes"][1])
+        self.assertEqual(env["VLLM_HOST_IP"], "192.168.100.2")
+
 
 if __name__ == "__main__":
     unittest.main()
