@@ -259,8 +259,8 @@ pass**, and 16 distinct streams run at 160.65 tok/s (±0.6%).
 - `repeat-word-200` ran to the 1,000-token limit, a run of 999 `hello`s. The
   model doesn't stop by itself after 200. v1 cut it at 281. v2 lets an exactly
   periodic loop run 2,048 tokens, past this trigger's limit. That is the cost
-  The change names: a periodic runaway is bounded at about 2,070 tokens, not
-  stopped early.
+  described under The change: a periodic runaway is bounded at about 2,070
+  tokens, not stopped early.
 
 - [arm-tp3-switched-v2.json](arm-tp3-switched-v2.json) mounts `overlay-v2/`'s
   `utils.py` (vLLM 050e8b1cc) with `overlay/`'s `scheduler.py` and
