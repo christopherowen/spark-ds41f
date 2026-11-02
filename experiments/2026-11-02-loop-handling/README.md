@@ -155,11 +155,27 @@ count rule alone, without the pre-check, cost 10.2 µs.
 | `hello` 200 times; a 128-zero C array; a 200-pair separator and table | kept: finish_reason stop |
 | 200K tokens of repository docs at effort max, and at high (`--periodic`) | bounded; the pair separates effort from context length |
 
+## Hardware soak (queued)
+
+The owner authorized this soak in the sp5–sp7 lab window (tp3-switched,
+2026-11-02), after the #842 crash reproduction. [lab-soak.json](lab-soak.json)
+boots three arms in this order: this change, candidate-37, this change again.
+- [arm-tp3-switched.json](arm-tp3-switched.json) is the profile sp5–sp7 serve
+  (`config/candidate-37-tp3-switched-dev.local.json`) with `overlay/` mounted
+  over the image's tree. `overlay/` holds vLLM 6698d7467's `utils.py`,
+  `scheduler.py` and `request.py`. Their base files (5b7cfa37f) are
+  byte-identical to the image's, and the image is digest `sha256:e1ee7b1953b1…`
+  on sp5, sp6, sp7 and sp8.
+- Each arm runs the lean bench, `probes.py` (the triggers below, without the
+  long-context pair) and 16 distinct streams of 1,024 tokens.
+- [tables_arms.py](tables_arms.py) prints each probe's verdict and the speeds
+  against candidate-37.
+
 ## Not done
 
-- **Hardware.** The probes, the release suites and a thinking-on determinism
-  check (the operator's bit-identity checks send `thinking: false` only) need
-  a window.
+- **Hardware.** The soak above is queued, not run. The release suites and a
+  thinking-on determinism check (the operator's bit-identity checks send
+  `thinking: false` only) still need a window.
 - **Real reasoning traces.** The reasoning-side false-positive rate needs
   recorded max-effort reasoning; `replay.py --jsonl` takes
   `{"reasoning", "content"}` lines for that.
