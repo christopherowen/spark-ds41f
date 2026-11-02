@@ -26,6 +26,7 @@ import socket
 import statistics
 import sys
 import time
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -257,6 +258,110 @@ def time_cold(graphs, aux, num_tokens, iters, flush):
     return statistics.median(s.elapsed_time(e) * 1000 for s, e in events)
 
 
+def step_rows(rng, max_num_seqs, rows):
+    """A step's target rows: a decode batch (1..max_num_seqs requests, each verifying
+    1..6 rows: adaptive verification trims drafts), or with a third's chance a
+    prefill chunk beside it, its total kept within the graphs' limit."""
+    requests = rng.randint(1, max_num_seqs)
+    total = sum(rng.randint(1, DECODE_QUERY_LEN) for _ in range(requests))
+    if rng.random() < 1 / 3 and total < rows:
+        total += rng.randint(1, rows - total)
+    return min(total, rows)
+
+
+def soak(args, graphs, arms, model, buffers, aux, scratch, rows, gen):
+    """Random steps, each replayed under both ladders from the same state on the same
+    inputs, with everything outside the step's live rows poisoned: NaN in the shared
+    workspace (stale rows the decode tiles read past a capacity), in the sources' and
+    the context buffer's rows past the step, in each graph's aux buffer, and valid
+    cache slots past the step (a padded row that kept one would overwrite a record).
+    Each step's context rows and all three caches must match bit for bit, and the
+    context rows must be finite."""
+    import random
+
+    hidden_states, positions, slot_mappings = buffers
+    max_num_seqs = SHAPES[args.shape][1]
+    rng = random.Random(11)
+    nan_bf16 = torch.tensor(float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    caches = [layer.attn.cache for layer in model.layers]
+    for cache in caches:
+        cache.random_(generator=gen)
+    capacities = defaultdict(int)
+    mismatches, nonfinite = [], []
+    sizes = []
+    for step in range(args.soak):
+        num_tokens = step_rows(rng, max_num_seqs, rows)
+        sizes.append(num_tokens)
+        live_positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
+        live_slots = torch.randperm(PAGES * PAGE, generator=gen, device=DEVICE)[:rows]
+        for i in range(NUM_AUX):
+            aux[i][:num_tokens].normal_(generator=gen)
+        state = [cache.clone() for cache in caches]
+        outputs = {}
+        for arm in arms:
+            for cache, saved in zip(caches, state):
+                cache.copy_(saved)
+            scratch.fill_(0xFF)  # NaN as E4M3, BF16 pairs and UE8M0 scales
+            for i in range(NUM_AUX):
+                aux[i][num_tokens : rows + 64].fill_(nan_bf16)
+            hidden_states[num_tokens:].fill_(nan_bf16)
+            for graph in graphs.values():
+                graph.aux.fill_(nan_bf16)
+            positions.copy_(torch.randint(0, POSITIONS, positions.shape, generator=gen, device=DEVICE))
+            positions[:rows].copy_(live_positions)
+            slot_mappings[0].copy_(
+                torch.randint(0, PAGES * PAGE, slot_mappings[0].shape, generator=gen, device=DEVICE)
+            )
+            slot_mappings[0, :rows].copy_(live_slots)
+            if args.soak_control and arm == "ladder":
+                # Negative control: without the input launch the graph reads the
+                # poisoned aux buffer, and the soak must report it.
+                from vllm.models.deepseek_v4_1.nvidia import dspark
+
+                launch = dspark.dspark_context.context_inputs
+                dspark.dspark_context.context_inputs = lambda *_: None
+                try:
+                    graphs[arm].run(aux, num_tokens)
+                finally:
+                    dspark.dspark_context.context_inputs = launch
+            else:
+                graphs[arm].run(aux, num_tokens)
+            torch.accelerator.synchronize()
+            capacities[(arm, capacity_of(graphs[arm], num_tokens))] += 1
+            context = hidden_states[:num_tokens].clone()
+            if not torch.isfinite(context.float()).all():
+                nonfinite.append((step, arm, num_tokens))
+            outputs[arm] = (context, [cache.clone() for cache in caches])
+        (h0, c0), (h1, c1) = outputs[arms[0]], outputs[arms[1]]
+        if not (
+            torch.equal(h0.view(torch.int16), h1.view(torch.int16))
+            and all(torch.equal(a, b) for a, b in zip(c0, c1))
+        ):
+            mismatches.append((step, num_tokens))
+    counts = defaultdict(int)
+    for size in sizes:
+        counts[size] += 1
+    ladder_capacities = sorted(c for (arm, c) in capacities if arm == "ladder")
+    return {
+        "summary": {
+            "steps": args.soak,
+            "mismatched_steps": len(mismatches),
+            "nonfinite_context_rows": len(nonfinite),
+            "row_counts_seen": len(counts),
+            "ladder_capacities_replayed": len(ladder_capacities),
+            "ladder_capacities_captured": len(
+                graphs["ladder"].manager.compilation_config.cudagraph_capture_sizes
+            ),
+        },
+        "mismatches": mismatches[:50],
+        "nonfinite": nonfinite[:50],
+        "row_counts": dict(sorted(counts.items())),
+        "replays_by_capacity": {
+            f"{arm}:{capacity}": count for (arm, capacity), count in sorted(capacities.items())
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
@@ -264,6 +369,17 @@ def main():
     parser.add_argument("--hot-iters", type=int, default=300)
     parser.add_argument("--cold-iters", type=int, default=60)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--soak",
+        type=int,
+        default=0,
+        help="this many random steps on NaN-poisoned buffers, both arms, no timing",
+    )
+    parser.add_argument(
+        "--soak-control",
+        action="store_true",
+        help="with --soak: skip the ladder arm's input launch (must be detected)",
+    )
     parser.add_argument(
         "--memory-copies",
         type=int,
@@ -398,6 +514,18 @@ def main():
                     arm, model, vllm_config, buffers, rows
                 )
                 print(arm, json.dumps(record["capture"][arm]), flush=True)
+
+            if args.soak:
+                record["soak"] = soak(
+                    args, graphs, arms, model, buffers, aux, scratch, rows, gen
+                )
+                print("soak", json.dumps(record["soak"]["summary"]), flush=True)
+                for arm in arms:
+                    graphs[arm].close()
+                with open(args.out, "w") as f:
+                    json.dump(record, f, indent=1)
+                print("wrote", args.out)
+                return 0
 
             # Live rows' outputs are the same bits under either ladder.
             mismatches = []

@@ -21,7 +21,10 @@ step), up to the context limit.
   `manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched*.json`), so the saving is at
   most about 0.01% of a step: no end-to-end bench can resolve it.
 - **Outputs are unchanged.** The context buffer and all three SWA caches are bit-identical
-  between the ladders at every row count 1..limit, in all 8 runs.
+  between the ladders at every row count 1..limit, in all 9 runs. A 3,000-step soak per
+  shape also matched bit for bit. It mixed decode and prefill row counts, replayed every
+  new size, and poisoned with NaN everything outside the live rows. A negative control
+  confirmed the poison is caught.
 - **No new kernels.** The TileLang cache was frozen after warming only the old ladder's
   sizes; every new size captured and replayed without compiling.
 - **Costs:** 23 graphs instead of 7 at TP3 and 35 instead of 8 at TP4. Capture takes
@@ -140,6 +143,9 @@ bash runimg.sh spark-ds41f:candidate-37 /tmp/c37-ladder-739/vllm -m pytest -q -r
 bash matrix.sh                                          # commands/matrix.sh: 8 replay runs
 bash memory.sh                                          # commands/memory.sh: 8 memory runs
 bash rerun.sh                                           # commands/rerun-tp4-ladder-first.sh
+bash soak.sh                                            # commands/soak.sh, on sp8
+python3 /bench/bench_context_ladder.py --shape tp4 --first base --soak 300 --soak-control \
+  --out /c/out/soak-control-tp4.json                    # via run-in-image.sh, on sp8
 bash fresh.sh patch/0677-*.patch                        # commands/apply-series-and-patch.sh
 python3 analyze.py runs > summary.json                  # here
 ```
@@ -149,6 +155,8 @@ python3 analyze.py runs > summary.json                  # here
 **A run set aside: `runs/overlapped/tp4-ladder-first-2`.**
 - Another session's unit-test container used dgx4's GPU from 17:04:41 to 17:06:10, which
   overlapped this run (17:03:50-17:06:03). That session reported the overlap.
+- A third session's ~45 s test overlapped the smoke run at about 16:50, not the matrix
+  (which started at 16:52:17).
 - `commands/rerun-tp4-ladder-first.sh` repeated the run as `tp4-ladder-first-3`
   (17:18:45-17:20:57), sampling the GPU's compute processes every 2 s. All 62 samples
   showed only the run's own process.
@@ -156,8 +164,7 @@ python3 analyze.py runs > summary.json                  # here
   TP4 cold reads -1.84 ± 0.62 µs over every row count and -2.20 ± 0.59 µs at full depth
   (hot: -2.78 ± 2.96 and -3.79 ± 3.50). Its bits matched too. The conclusion is the same.
 
-`runs/smoke/smoke-tp3.json` is the first harness
-check, with 20/5 iterations and one round. It was run before the capture-memory
+`runs/smoke/smoke-tp3.json` is the first harness check, with 20/5 iterations and one round. It was run before the capture-memory
 measurement settled the allocator, which made its base capture read -82 MiB reserved. It
 is not in the summary.
 
@@ -246,7 +253,7 @@ Per copy of the ladder, from 20 copies per process, two processes per arm
 ## Quality
 
 - Bits: the context buffer and every SWA cache page are identical between the ladders at
-  every row count, in all 8 runs (`bit_mismatch_rows` empty). Padded rows keep PAD slots
+  every row count, in all 9 runs (`bit_mismatch_rows` empty). Padded rows keep PAD slots
   and write nothing, so the only change is how many padded rows each replay computes.
 - Kernels: the TileLang cache was frozen (`prepare.freeze`) after an eager pass at the old
   ladder's sizes only. Capturing and replaying the new sizes compiled nothing: the GEMM,
@@ -254,9 +261,63 @@ Per copy of the ladder, from 20 copies per process, two processes per arm
 - The context graph is the production decode path: pure decode steps have no CED plan
   (`plan_ced` returns None when every request keeps its rows), and DS4.1 has no streamed
   context states.
+- Stale rows: the ladder stops rewriting the context buffer's rows between the live count
+  and the old power-of-two capacity. Nothing reads them:
+  - DS4.1's DSpark binds no auxiliary stream;
+  - `DSparkSpeculator` reads only the buffer's shape;
+  - the drafter takes `hidden_states[:num_context_tokens]`;
+  - inside the graph, every padded row is rewritten from the zeroed `aux` tail before
+    use.
+  The eager (prefill) path already left those rows untouched.
+
+### Poisoned-buffer soak (sp8)
+
+Prompted by #842: its copy-draft arm was bit-identical on the synthetic suites but hit
+`route_partials: gate logits contain nan or inf` under real concurrent traffic. The
+context graph has no MoE. Its outputs are the context rows and the draft layers' SWA cache
+records, which the draft layers' attention (and then their router) reads. So a ladder
+fault would show as a context row or a cache record that differs from the base ladder's.
+
+`bench_context_ladder.py --soak 3000` (`commands/soak.sh`) builds both arms in one
+process. Each step draws a target row count:
+- 1-max_num_seqs requests, each verifying 1-6 rows (adaptive verification trims drafts);
+- with a third's chance, a prefill chunk beside them, filling up to the graphs' limit (a
+  token budget binding at the limit).
+
+It replays the step under both ladders from the same cache state, on the same inputs, with
+everything outside the live rows poisoned:
+- NaN bytes in the shared workspace: the stale rows a 16/32/64-row decode tile reads past a
+  capacity such as 18;
+- NaN in the target sources' rows past the step, in the context buffer past the step, and
+  in each graph's `aux` buffer;
+- random positions, and valid cache slots past the step. A padded row that kept one would
+  overwrite a live record.
+
+| Shape | Steps | Row counts seen | New capacities replayed | Replays per capacity | Mismatched steps | Non-finite context rows |
+|---|---:|---:|---:|---:|---:|---:|
+| TP3 | 3,000 | 48 of 48 | 23 of 23 | 39-337 | 0 | 0 |
+| TP4 | 3,000 | 96 of 96 | 35 of 35 | 21-253 | 0 | 0 |
+| TP4, control | 300 | 88 | 34 | 2-25 | 300 | 300 |
+
+- The negative control skips the ladder arm's `context_inputs` launch, so its graph reads
+  the poisoned `aux`. Every step is flagged, so the soak does see poison that reaches a
+  graph.
+- The soak ran in sp8's `spark-ds41f:candidate-37` build
+  (`sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a`). It has the
+  same `vllm.patch-head` and `vllm.tree` labels as dgx4's build, and the same patched
+  `dspark.py` was mounted.
+- sp8 also ran another session's functional test containers at the time. That does not
+  matter for a bit comparison (`runs/soak/soak.log` lists the GPU processes at each start).
+- The graphs' private-pool temporaries were not poisoned; they hold earlier replays'
+  values.
 
 ## Not covered
 
+- A soak under real concurrent agent traffic on a cluster (the #842 lesson). It needs a
+  serving window and the owner's authorization, which this rework did not have. The soak
+  above covers the graph and its padding in isolation, not the target, the scheduler or
+  the TP collectives. If this patch rides in a candidate, that candidate's concurrent soak
+  covers it.
 - The RoCE all_gather of `main_proj` at TP3/TP4 (bytes above) and the end-to-end decode
   step, which needs a cluster window. At 25-66 ms a step, the GPU-side saving measured here
   is far below the bench's ±0.5 ms step resolution.
