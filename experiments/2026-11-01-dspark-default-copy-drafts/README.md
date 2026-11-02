@@ -25,9 +25,11 @@ step work.
   here at kernel level.
 
 > **Status: blocked. Not ready to merge or default.** Copy drafts on candidate-37
-> crash an operator's engine under real traffic (below, *Unfavourable: the crash*).
-> This patch computes the same proposals as candidate-37's copy arm. Its kernel and
-> c1 results cannot clear it of the crash.
+> crash an operator's engine under real traffic (#852; below, *Unfavourable: the
+> crash*). This patch computes the same proposals as candidate-37's copy arm. Its
+> kernel and c1 results cannot clear it of the crash. An sp5-sp7 lab window
+> running the operator's exact sequence did not reproduce it (*Lab window on
+> sp5-sp7*).
 
 ## Unfavourable: the crash (operator's TP3 ring, 2026-11-02)
 
@@ -403,6 +405,71 @@ first arm was still booting (17:41:43Z), so #848 measures unlocked.
 `~/spark-lab/` was created on sp5, and the identical spec (sha `f7da0e41`) was
 requeued after #848.
 
+**The 2,200 MHz pass, rerun** (job 18:35:32Z, after #848): **clean.**
+- The SM clocks were locked at 2,200 MHz on sp5-sp7 at 18:35:59Z and reset by the
+  job at 18:50:32Z.
+- Arm 1 (`c37-m8-2200`: candidate-37 + census, m=8): copy probe identical to the
+  unlocked runs (copy 16.367, edit 15.745, tool 6.905, prose 2.651).
+- `single-stream` suite: 59.31 tok/s, 2.26 tokens per step, 0 failed.
+- 16 distinct streams × 1,024 tokens: 160.15 tok/s (CI ±0.9%).
+- Census, from the window's nodes with the fixed collector: 0 NONFINITE and 0
+  assert lines on sp5, sp6 and sp7, after the suite and after the 16 streams.
+
+**Across the window.** The followers kept every serving container's log, seven
+per node, from the repro, the 2,200 MHz pass and the three soaks. They hold 0
+NONFINITE lines and 0 `nan or inf`, `cudaErrorAssert`, device-side assert or
+`EngineDeadError` lines. Neither soak below logged a non-finite or an assert.
+
+**#852 conclusion from this window.** On tp3-switched (sp5-sp7, image
+`e1ee7b19`), candidate-37 with copy drafts at m=8 and the #842 envelope passes
+#852's exact sequence. It passes with and without 0676, at unlocked clocks and
+at 2,200 MHz, under 1, 8 and 16 streams. No routed gate row went non-finite.
+What remains differs from the operator's ring: the fabric, their image build,
+kernel and page size, and their real agent traffic. The operator's offer to
+run the census on their ring is the next step; the owner decides that.
+
+**A likely reason it stayed clean here** (from #855, the operator's claimed root
+cause, opened during the window and not run here):
+- #855's mechanism: `sync_slot_draft_limits` publishes the host limits only once
+  `_limits_event.query()` is true. A stale, wider limit can then admit `-1`
+  placeholder rows into verification, and they NaN the gate. Their control was
+  `-1`→`0`; their fix blocks on the event, reversing 0612's non-blocking design.
+- Every arm in this window ran with `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2` (the
+  recipe's, seen in the containers). Such placeholder rows have confidence 0,
+  so they are dead rows and marked routing padding, and `route_partials` skips
+  them.
+- A run without dead rows (tau unset or 0), or with a batch sharder (dead rows
+  are skipped then), routes them live.
+- A fix that keeps the non-blocking design: clamp each request's verified drafts
+  to the device-side `slot_draft_limits.gpu`, which is always current on the
+  GPU, inside `combine_sampled_and_draft_tokens`. Rows past it become padding
+  with a valid input id, whatever the host's stale mirror admitted. Open; the
+  owner's call.
+
+**The rest of the queue** (other experiments' soaks, recorded here only as this
+window's log; their results belong to their own PRs):
+
+| Job | Time (Z) | Result |
+|---|---|---|
+| #848 `lab-soak.json` | 17:41-18:35 | Done; every measured step "clocks unlocked". Probes failed: loop 2/15, c37 3/15, loop-repeat 2/15. |
+| #854 `soak-tp3-switched.json` | 18:50-19:29 | release-tp3 halted in prefill on the bench's thermal guard ("sp7: GPU at 82 C"). |
+| #853 `soak-spec.json` | 19:29-20:16 | Halted in prefill repeat 2 ("sp6: GPU at 80 C"). Engaged: "Capturing DSpark context CUDA graphs (FULL): 23/23". |
+| #848 `lab-probes-v2.json` (user-approved addition) | 20:36-20:53 | 15 probes, 0 failed. |
+
+sp5-sp7 have no fan curve installed (the suites warn that `dgx-fan-control.service`
+is not installed), which likely explains both thermal halts.
+
+**Close.** At 20:56:24Z: `window close` booted the production profile
+`config/candidate-37-tp3-switched-dev.local.json` (shape unchanged), `doctor --live`
+OK, hold removed.
+- Every node serves under that profile's label, `/health` returns 200, the clocks
+  are unlocked, and no lab process remains.
+- The nodes stay detached at main `700967cc`, the last sync.
+- The followers' per-container counts, 27 containers with 0 NONFINITE and 0 fault
+  lines, are in [`runs/window-census-followers.jsonl`](runs/window-census-followers.jsonl).
+- The followers were then stopped and `/tmp/842-census` removed on sp5-sp7.
+- `~/spark-lab/` stays on sp5 (the lab's directory).
+
 Follow-up, for after the window (a small fix with a test, done separately; not
 patched during the window, whose runner has the code loaded):
 - `scripts/lab.py`'s `gpu_clocks` lock writes its marker
@@ -596,10 +663,13 @@ unnecessary; both are dropped.
 
 **What it takes to be ready** (owner's call; the serving clusters and any GitHub
 post to the operator are yours):
-1. Localize the NaN with the operator's repro (m=8 single-stream), running a
-   diagnostic patch (*Crash analysis*), or in an owner-authorized cluster window
-   (candidate-37, then candidate-37 without 0676).
-2. Fix it, then rerun the m=8 single-stream repro clean.
+1. Localize the NaN. The sp5-sp7 window could not reproduce it: #852's exact
+   sequence is clean on tp3-switched with and without 0676, at unlocked clocks
+   and at 2,200 MHz, under 1, 8 and 16 streams. Next is the census
+   (`census/0001-…patch`, vLLM `cb46d6c82`) on the operator's ring, where m=8
+   crashes deterministically. Their census lines name the layer, row, slot,
+   origin and whether the row lies past a rejected draft.
+2. Fix it, then rerun their m=8 repro clean.
 3. Run a concurrent soak where the token budget binds (mixed prompt lengths,
    copy-dense and tool-like prompts, several streams), on a candidate image with
    this patch and the plain `tp3.json` / `tp4.json`.
