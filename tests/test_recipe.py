@@ -624,6 +624,14 @@ class RecipeTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             recipe.resolve(self.recipe, "tp5-star")
 
+    def test_settings_every_shape_shares_are_stated_once(self):
+        """A setting with one value at every shape is in the shared environment, which no
+        shape may repeat, so shapes agree on it by construction rather than because their
+        bases happen to carry the same value."""
+        entries = [recipe.shape_entry(self.recipe, name).get("environment", {}) for name in self.recipe["shapes"]]
+        common = set.intersection(*(set(env) for env in entries))
+        self.assertEqual(sorted(key for key in common if len({env[key] for env in entries}) == 1), [])
+
     def test_no_other_cluster_files(self):
         """One recipe: no per-shape copies beside it."""
         self.assertEqual(sorted(p.name for p in (ROOT / "config").glob("cluster*.json")), ["cluster.json"])

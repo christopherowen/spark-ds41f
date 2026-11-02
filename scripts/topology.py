@@ -25,6 +25,7 @@ import json
 from pathlib import Path
 from types import ModuleType
 
+import recipe
 import sparknet_topology
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,9 +197,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     if switched(mode):
         if cluster.get("fabric", {}).get("topology") != "switched":
             errors.append(f"{mode} requires explicit fabric.topology=switched")
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
+        for key in recipe.SWITCHED_STALE_RING_KEYS:
             if key in settings:
                 errors.append(f"{mode} must omit stale ring/topology control {key}")
         disabled = "--disable-custom-all-reduce" in cluster.get("serve_args", [])
@@ -319,19 +318,7 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
     if switched_map and not switched(transport(result)):
         result["fabric"] = {"transport": "oneshot-switched", "topology": "switched"}
         result.pop("benchmark_reference", None)
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
-                    "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
-                    "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
-                    "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT"):
-            result["environment"].pop(key, None)
-        result["environment"].update({
-            "NCCL_BUFFSIZE": "1048576",
-            "NCCL_CUMEM_ENABLE": "0",
-            "NCCL_MAX_NCHANNELS": "8",
-            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
-        })
+        recipe.apply_switched_direct_env(result, {})
         if "--disable-custom-all-reduce" in result["serve_args"]:
             result["serve_args"].remove("--disable-custom-all-reduce")
     elif count == 4 and not switched(transport(result)):

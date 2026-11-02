@@ -4,8 +4,9 @@
 features, serving flags) once, and a ``shapes`` table with only what a shape
 really changes:
 
-- the cabling: the node map, the one-shot transport and the NCCL settings of
-  sparknet's profile for that fabric;
+- the cabling: the node map, the one-shot transport and the NCCL settings in
+  which sparknet's profile for that fabric differs from the others (the NCCL
+  settings every fabric shares are in the shared ``environment``);
 - the sizing that follows from memory per rank: context, streams, batched
   tokens, KV cache bytes, prefix-cache retention, the display carve-out;
 - the DSpark cost curves measured on that shape;
@@ -57,10 +58,16 @@ SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_ca
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
 SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "environment", "host",
               "engram_on_disk", "benchmark_reference", "notes"}
-SWITCHED_STRIP_RING_KEYS = (
+# Ring routing and topology controls a switched transport must omit (topology.problems).
+SWITCHED_STALE_RING_KEYS = (
     "NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
     "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
+)
+# What a switched configuration drops from a ring base: those, and the ring's NCCL
+# feature switches (sparknet's RING_ENV), which no switched profile sets.
+SWITCHED_STRIP_RING_KEYS = (
+    *SWITCHED_STALE_RING_KEYS,
     "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
     "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
     "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT",
@@ -74,7 +81,9 @@ SWITCHED_DIRECT_ENV = {
 }
 
 
-def _apply_switched_direct_env(target: dict, explicit_env: dict, unset: list[str] | tuple[str, ...] = ()) -> None:
+def apply_switched_direct_env(target: dict, explicit_env: dict, unset: list[str] | tuple[str, ...] = ()) -> None:
+    """Turn ``target``'s ring-derived environment into the switched one: strip the ring's
+    controls and set the direct profile, except what ``explicit_env`` sets or ``unset`` removes."""
     env = target.get("environment")
     if not isinstance(env, dict):
         return
@@ -168,7 +177,7 @@ def shape_entry(recipe: dict, name: str) -> dict:
             merged[key] = copy.deepcopy(value)
     if (merged.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        _apply_switched_direct_env(merged, entry.get("environment", {}))
+        apply_switched_direct_env(merged, entry.get("environment", {}))
     if "benchmark_reference" not in entry:
         # A variant is qualified by its own release benchmark, never through its base.
         merged.pop("benchmark_reference", None)
@@ -420,7 +429,7 @@ def overlay(arm: dict, base: dict) -> dict:
         cluster.pop("notes", None)
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        _apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
+        apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
     if base.get("glp") or cluster.get("glp"):
         # Rendered again whatever the arm changed: a serve_args or mount list it sets
         # replaces the base's, which held the rendering.
