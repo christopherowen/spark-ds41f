@@ -3,10 +3,13 @@
 Owner, 2026-11-02: take the operator's fix for #852 (PR #855), bring it to the
 repository's standard and include it.
 
-**Status:** patch ready and unit-tested on candidate-37's image on sp8. The fix is
-the operator's (#855), measured on their ring, which reproduces #852. On our
-switched TP3 the crash has not reproduced, and the run that should reproduce it
-(dead rows off) is prepared but not run. Not promoted; no recipe change.
+**Status:** patch ready, unit-tested, and measured on sp5–sp7 (window
+`spark-0013-1793654131`, 2026-11-02). The stale-limit race happens on our switched
+TP3 too: without the census overlay, candidate-37's copy probe loses the same tool
+acceptance the operator saw, and the fix restores it. The wait costs 0.73% in paired
+single-stream decode and nothing measurable at 8 or 16 streams. The crash itself has
+not reproduced here: every repro arm so far carried the census, whose per-step sync
+hides the race. Not promoted; no recipe change. A GPU-side alternative is #859.
 
 - Base: candidate-37, vLLM patch head `5b7cfa37f` (tree `af0fb152`), image
   `spark-ds41f:candidate-37` (`sha256:e1ee7b1953b1…` on sp5, sp6, sp7 and sp8).
@@ -137,38 +140,49 @@ in [experiments/2026-11-01-dspark-default-copy-drafts](../2026-11-01-dspark-defa
 The census logged no non-finite gate row. All of it ran with the recipe's dead
 rows at 0.2, which is the lead above.
 
-## Prepared, not run
+## Measured on sp5–sp7
 
-Both specs dry-run clean with
-`--production-config config/candidate-37-tp3-switched-dev.local.json`, the profile
-sp5–sp7 serve. They need an owner-authorized window.
+Window `spark-0013-1793654131`, queue log `results/private/lab/queue-856.log` on sp5;
+image `sha256:e1ee7b1953b1…`; nodes at main `24c0e8f7`.
 
-- [lab-repro.json](lab-repro.json), run `limit-sync-repro-sp`: #852's sequence on
-  one boot of each arm, with dead rows off (`SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0`)
-  and #842's census. The steps are:
-  - copy probe;
-  - single-stream suite ([suite_single_stream.py](suite_single_stream.py));
-  - census;
-  - 8 streams;
-  - census.
+**[lab-repro.json](lab-repro.json), run `limit-sync-repro-sp`** (21:15 to 21:40Z):
+dead rows off, #842's census, m=8, one boot each.
 
-  Two arms: [arm-c37-m8-nodead.json](arm-c37-m8-nodead.json), the expected
-  reproduction, and [arm-fix-m8-nodead.json](arm-fix-m8-nodead.json), the fix.
-  If candidate-37 logs non-finite rows here and the fix logs none, the
-  dead-rows lead and the fix are both confirmed on our cluster.
-- [lab-cost.json](lab-cost.json), run `limit-sync-cost-sp`: the fix's cost at
-  m=16 with the recipe's dead rows, without the census. The arm order is fix,
-  candidate-37, fix again, so each comparison has a repeat boot.
-  - [arm-fix-m16.json](arm-fix-m16.json) against [arm-c37-m16.json](arm-c37-m16.json).
-  - The single-stream suite gives the lab's paired verdict.
-  - Then the copy probe and 8 and 16 distinct streams.
+| Arm | copy / edit / tool tokens per step | single stream | 8 streams | census |
+|---|---|---|---|---|
+| candidate-37 | 16.367 / 15.745 / 6.905 | 57.85 tok/s | 153.00 tok/s | 0 non-finite, 0 asserts |
+| this fix | 16.367 / 15.745 / 6.905 | 57.85 tok/s | 152.57 tok/s | 0 non-finite, 0 asserts |
 
-[tables_arms.py](tables_arms.py) prints the probe, suite, census and stream
-receipts per arm.
+**This run cannot show the race** (found by #859's session). The census overlay
+reads a device value with `.item()` after the drafter every step. That waits for the
+GPU, so the limit copy has always landed before the next budget read. The same holds
+for every census arm of #842's window. These arms show only that a host whose
+limits are current never verifies a placeholder row.
+
+**[lab-cost.json](lab-cost.json), run `limit-sync-cost-sp`** (21:40 to 22:37Z): m=16,
+the recipe's dead rows, no census, in the order fix, candidate-37, fix.
+
+| Measure | candidate-37 | fix | fix, repeat boot |
+|---|---|---|---|
+| paired single-stream decode (verdict) | — | **−0.73% ±0.12%**, worse (floor 0.32%) | |
+| single-stream window tok/s | 63.44 | 62.89 | 63.12 |
+| TTFT, paired | 0.147 s | +0.97% ±0.75% | +1.06% ±0.43% |
+| copy probe tool tokens/step | **6.083** | **6.232** | **6.232** |
+| copy probe copy / edit | 16.021 / 15.322 | 16.021 / 15.322 | 16.021 / 15.322 |
+| 8 distinct streams | 158.22 tok/s | 157.59 | 157.57 |
+| 16 distinct streams | 162.34 tok/s | 163.34 | 163.76 |
+
+The tool figures are the operator's m=16 numbers (6.083 to 6.232). Candidate-37's
+host read stale, narrower limits often enough to drop drafts the proposal had, and
+the fix's two boots agree. The single-stream suite's text is not copy-dense
+(2.26 tokens per step), so it shows the wait's cost without its gain.
+
+Why our cluster doesn't crash, still to be measured: the recipe's dead rows (0.2)
+mark stale-wide placeholder rows as padding. The census-free repro of #859
+(dead rows off, a host-only stale-read counter) is the run that tests it.
 
 ## Not done
 
-- **Our measurements**: the two specs above.
 - **The producer of the non-finite logits**: which kernel turns a routed `-1`
   placeholder row non-finite. The repro arm's census records it (layer, row,
   input id, origin).
