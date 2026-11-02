@@ -2,7 +2,7 @@
 
 ## What this changes
 
-Four vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–`0628`), together with switched-topology and collective-probe support for `TP3..TP8`:
+Five vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–`0629`), together with switched-topology and collective-probe support for `TP3..TP8`:
 
 - **`0625` — TileLang `rank_order_sum` for 2..8 ranks** (`vllm/models/deepseek_v4_1/tilelang/collectives.py`, `tests/kernels/test_deepseek_v41_tilelang_collectives.py`).
   - Raises `MAX_RANK_ORDER_WORLD` to `8`, bounding `rank_order_sum_kernel`, `rank_order_sum_calls`, and `rank_order_sum` together so the kernel launched in the forward pass is always declared during warmup.
@@ -15,6 +15,10 @@ Four vLLM commits on top of candidate 24's series (`rc24/vllm/series`, `0625`–
 - **`0628` — `moe_intermediate_size` padding and TP-padded expert scale codes for TP5, TP7, TP8** (`vllm/model_executor/models/config.py`, `vllm/models/deepseek_v4_1/nvidia/model.py`, `vllm/models/deepseek_v4_1/tilelang/scale_codes.py`, `tests/models/test_deepseek_v4_1_config.py`, `tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py`).
   - `DeepSeek-V4.1-Flash` has `moe_intermediate_size = 2304`, which divides into 64-element expert GEMM tiles at `TP3` (`768`), `TP4` (`576`), and `TP6` (`384`), but not at `TP5`, `TP7`, or `TP8` (`2304 // 8 = 288`, which is not a multiple of 64).
   - `DeepseekV41ForCausalLMConfig.update_model_config_for_parallelism` now pads `moe_intermediate_size` to `round_up(original_moe_intermediate, tp_size * 64)` (`2304 -> 2560` at TP5 and TP8, `2304 -> 2688` at TP7; unchanged at TP3, TP4, TP6), marks `shared_experts` with `allow_tp_padding=True`, and updates `_row_deltas` in `scale_codes.py` so trailing zero-padded `w2_weight_scale` columns expand to `base` (multiplying zero `w2_weight` columns) without widening the row's UE8M0 exponent span.
+- **`0629` — Batch strided `--load-format direct` reads into column-padded 2D destinations** (`vllm/model_executor/model_loader/direct_io/_batch.c`, `tests/model_executor/model_loader/test_direct_loader_cuda.py`).
+  - When `moe_intermediate_size` is padded (`TP5` rank 4, `TP7` rank 6, and `TP8` all ranks), `RoutedExperts._load_w2` narrows `w2_weight` and `w2_weight_scale` along the column dimension (`destination[:, :narrow_size]`), so `destination_stride > bytes * (1 + expand_bf16)`. Previously, `_batch.c` only allowed `chunk_rows > 1` when `destination_stride == bytes * (1 + expand_bf16)`, splitting every 2560-row `w2.weight` (`144` bytes/row into stride `160` at `TP8`) and `w2.weight_scale` (`9` bytes/row into stride `10` at `TP8`) into `2560` single-row jobs (`~112.7M` 4 KiB `O_DIRECT` reads = `684.55 GB` read from disk and `1540.5 s` target weight load on `TP8`).
+  - `_batch.c` now batches `chunk_rows > 1` whenever `source_stride >= bytes` and `destination_stride >= bytes * (1 + expand_bf16)`, and checks 2D strided row intervals when destination bounding boxes overlap so disjoint column slices batch cleanly while overlapping 2D slices are still rejected before writing any destination bytes.
+  - On `spaceport` (`sp1`–`sp8`, `tp8-switched`), this reduces `TP8` target weight loading from `1540.48 s` (`684.55 GB` read from disk) to `18.61 s` (`125.55 GB` read from disk, `2.10 GB/s`), and total model loading from `1550.3 s` to `28.44 s` (`54.5x` speedup).
 
 ### Per-rank geometry across `TP3..TP8`
 

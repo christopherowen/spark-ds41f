@@ -1,0 +1,15 @@
+{
+ "notes": "tp4-switched with sparknet's switched NCCL profile in place of the four values it inherits from tp4-ring: at most 8 NCCL channels (tp4-ring 4), 1 MiB NCCL buffers (4 MiB), cuMem off (on), a 4 MiB one-shot all-gather cap (2 MiB). Image-independent: a candidate's tp4-switched arm takes the same set. On release the four values go into the recipe's tp4-switched environment; tp5..tp8-switched extend tp4-switched and keep tp4-ring's values until measured at their sizes (README).",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "environment": {
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_CUMEM_ENABLE": "0",
+   "NCCL_MAX_NCHANNELS": "8",
+   "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
+  }
+ }
+}

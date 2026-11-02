@@ -1,0 +1,25 @@
+{
+ "notes": "The candidate the harness boots. Direct exchange (spark-ds41f:1030-direct), sparknet's switched NCCL profile, NVFP4 draft heads with the recipe's five drafts (CUDA graphs to 96 rows), adaptive verification row cost 0.01, and a 32,768-token prefill budget (long-prefill threshold 32,768 - 96). VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "environment": {
+   "VLLM_SERVER_DEV_MODE": "1",
+   "NCCL_MAX_NCHANNELS": "8",
+   "NCCL_BUFFSIZE": "1048576",
+   "NCCL_CUMEM_ENABLE": "0",
+   "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
+   "VLLM_DS41_DRAFT_NVFP4_HEAD": "1",
+   "VLLM_DS41_MARKOV_NVFP4": "1"
+  }
+ },
+ "serve_options": {
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":4,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.01}",
+  "--max-cudagraph-capture-size": "96",
+  "--compilation-config": "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,64,72,80,88,96]}",
+  "--long-prefill-token-threshold": "32672",
+  "--max-num-batched-tokens": "32768"
+ }
+}

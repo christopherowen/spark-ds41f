@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import io
-import importlib.machinery
-import importlib.util
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 # A recipe frozen for these tests, so a release does not move them.
 FIXTURE = "tests/fixtures/cluster.json"
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+import spark_ds41f as spark
 
 
 class DesktopTest(unittest.TestCase):
@@ -509,6 +507,10 @@ class RoceGidTest(unittest.TestCase):
         problems = spark.roce_gid_problems("dgx1", 1, ["rocep1s0f0"], HEALTHY_GIDS)
         self.assertIn("GID index 1 is RoCEv2 fe80", problems[0])
         self.assertIn("at index 3", problems[0])
+
+    def test_the_fixing_settings_are_named(self) -> None:
+        problems = spark.roce_gid_problems("dgx3", 3, ["rocep1s0f0"], SHIFTED_GIDS, ["SPARKNET_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX"])
+        self.assertIn("rocep1s0f0 GID index 3 (fixed by SPARKNET_ROCE_GID_INDEX, NCCL_IB_GID_INDEX) is empty", problems[0])
 
     def test_missing_device_and_missing_ipv4_are_reported(self) -> None:
         output = "rocep1s0f1 missing\nrocep1s0f0 1 RoCEv2 fe80:0000:0000:0000:4ebb:47ff:fee9:7f2b enp1s0f0np0\n"
@@ -1242,6 +1244,62 @@ class NewUserOnboardingTest(unittest.TestCase):
         for line, (label, command) in zip(summary, expected, strict=True):
             self.assertIn(f"recommend: {label} -> run: ", line)
             self.assertIn(command, line)
+
+    def test_wireless_warnings_detect_control_plane_on_wireless_interface(self) -> None:
+        node = {"name": "sp1", "management_ip": "192.168.1.10"}
+        env = {"GLOO_SOCKET_IFNAME": "wlp1s0"}
+        warnings = spark.wireless_warnings(
+            "sp1",
+            facts(wifi_radio="disabled", wireless_ifaces="wlp1s0:192.168.1.10"),
+            node=node,
+            env=env,
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("control plane uses wireless interface wlp1s0", warnings[0])
+        self.assertEqual(
+            spark.wireless_warnings(
+                "sp1",
+                facts(wifi_radio="disabled", wireless_ifaces="wlp1s0:192.168.1.10"),
+                node={**node, "control_ip": "192.168.100.10"},
+                env={"GLOO_SOCKET_IFNAME": "enp1s0f0np0"},
+            ),
+            [],
+        )
+
+
+class IdentifierAlignmentTest(unittest.TestCase):
+    def test_arm_notes_and_lock_identifiers_are_checked_and_synced(self) -> None:
+        import copy
+
+        lock = copy.deepcopy(spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/upstreams.lock.json"))
+        manifest = copy.deepcopy(spark.read_json(lock["source_manifest"]))
+        arm = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-33/tp4.json")
+        self.assertEqual(spark.source_identifier_problems(lock, manifest), [])
+        self.assertEqual(spark.arm_note_problems(arm, lock, manifest), [])
+
+        stale_arm = copy.deepcopy(arm)
+        stale_arm["notes"] = (
+            "candidate-33 at tp4-ring: candidate-27 + #790; "
+            "vLLM 0568..0636 (patch head 2c2d396f, tree 88468fc7)."
+        )
+        problems = spark.arm_note_problems(stale_arm, lock, manifest)
+        self.assertEqual(len(problems), 3)
+        self.assertTrue(any("patch head 2c2d396f, expected 10bef730" in p for p in problems))
+        self.assertTrue(any("vllm tree 88468fc7, expected 354fd6e6" in p for p in problems))
+        self.assertTrue(any("vLLM 0568..0636" in p and "ends at 0663" in p for p in problems))
+
+        synced_notes = spark.sync_arm_notes(stale_arm["notes"], lock, manifest)
+        self.assertIn("vLLM 0568..0663 (patch head 10bef730, tree 354fd6e6)", synced_notes)
+        stale_arm["notes"] = synced_notes
+        self.assertEqual(spark.arm_note_problems(stale_arm, lock, manifest), [])
+
+        stale_lock = copy.deepcopy(lock)
+        stale_lock["sources"]["vllm"]["expected_tree"] = "88468fc7" + "0" * 32
+        stale_manifest = copy.deepcopy(manifest)
+        stale_manifest["vllm"]["patch_count"] = 512
+        lock_problems = spark.source_identifier_problems(stale_lock, stale_manifest)
+        self.assertTrue(any("lock expected_tree" in p for p in lock_problems))
+        self.assertTrue(any("patch_count is 512" in p for p in lock_problems))
 
 
 if __name__ == "__main__":

@@ -98,13 +98,8 @@ def renamed(cluster: dict) -> dict:
 
 
 def load_spark():
-    import importlib.machinery
-    import importlib.util
+    import spark_ds41f as spark
 
-    loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-    spec = importlib.util.spec_from_loader("spark", loader)
-    spark = importlib.util.module_from_spec(spec)
-    loader.exec_module(spark)
     return spark
 
 
@@ -136,7 +131,7 @@ class RecipeTest(unittest.TestCase):
         reference that name it."""
         resolved = recipe.resolve(load("experiments/2026-10-16-r6s/r6n/cluster.json"), "tp4-ring")
         released = load_spark().read_cluster("experiments/2026-10-15-r6n/r6n-release.json")
-        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
@@ -204,7 +199,7 @@ class RecipeTest(unittest.TestCase):
         args[args.index("--limit-mm-per-prompt") + 1] = '{"image":32}'
         self.assertEqual(arm["serve_args"], args)
         # An arm carries neither the recipe's shape nor its qualifying benchmark.
-        skip = ("serve_args", "shape", "benchmark_reference")
+        skip = ("serve_args", "shape", "benchmark_reference", "notes")
         self.assertEqual({k: v for k, v in arm.items() if k not in skip},
                          {k: v for k, v in base.items() if k not in skip})
 
@@ -300,7 +295,7 @@ class RecipeTest(unittest.TestCase):
         at_6144 = json.loads(json.dumps(candidate))
         at_6144["shapes"]["tp3-triangle"]["sizing"]["max_num_batched_tokens"] = 6144
         self.assertEqual(fallback["serve_args"], recipe.resolve(at_6144, "tp3-triangle")["serve_args"])
-        self.assertEqual({k for k in fallback if fallback[k] != tp3.get(k)}, {"serve_args"})
+        self.assertEqual({k for k in fallback if fallback[k] != tp3.get(k)}, {"serve_args", "notes"})
         self.assertEqual((argument(fallback, "--max-num-batched-tokens"),
                           argument(fallback, "--long-prefill-token-threshold")), ("6144", "6096"))
         for dev, base in (("rc-tp3-dev.json", tp3), ("rc-tp3-6144-dev.json", fallback)):
@@ -427,6 +422,43 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(values["max_cudagraph_capture_size"], "96")
         self.assertEqual(values["long_prefill_token_threshold"], "16288")
         self.assertEqual(values["tensor_parallel_size"], "4")
+        self.assertEqual(values["engram_on_disk"], "true")
+        self.assertEqual(values["engram_table_memory"], "disk")
+
+    def test_engram_on_disk_is_true_for_all_shapes(self):
+        """All shapes explicitly set engram_on_disk to true (--engram-config table_memory="disk"),
+        and an overlay can set engram_on_disk to false for table_memory="device"."""
+        self.assertIs(self.recipe["engram_on_disk"], True)
+        expected = {
+            "tp3-triangle": True,
+            "tp3-switched": True,
+            "tp3-triangle-4k": True,
+            "tp4-ring": True,
+            "tp4-switched": True,
+            "tp5-switched": True,
+            "tp6-switched": True,
+            "tp7-switched": True,
+            "tp8-switched": True,
+        }
+        self.assertEqual(set(self.recipe["shapes"]), set(expected))
+        for name, on_disk in expected.items():
+            self.assertIs(self.recipe["shapes"][name]["engram_on_disk"], on_disk, name)
+            entry = recipe.shape_entry(self.recipe, name)
+            self.assertIs(recipe.engram_on_disk(self.recipe, entry), on_disk, name)
+            resolved = recipe.resolve(self.recipe, name)
+            self.assertNotIn("engram_on_disk", resolved)
+            engram = json.loads(argument(resolved, "--engram-config"))
+            self.assertEqual(engram["table_memory"], "disk" if on_disk else "device", name)
+            self.assertEqual(engram["projection_tp"], True, name)
+        # An overlay arm can toggle engram_on_disk either way.
+        tp4 = recipe.resolve(self.recipe, "tp4-ring")
+        off_arm = recipe.overlay({"extends": {}, "set": {"engram_on_disk": False}}, tp4)
+        self.assertEqual(json.loads(argument(off_arm, "--engram-config"))["table_memory"], "device")
+        self.assertNotIn("engram_on_disk", off_arm)
+        on_arm = recipe.overlay({"extends": {}, "set": {"engram_on_disk": True}}, off_arm)
+        self.assertEqual(json.loads(argument(on_arm, "--engram-config"))["table_memory"], "disk")
+        with self.assertRaisesRegex(SystemExit, "engram_on_disk must be a boolean"):
+            recipe.overlay({"extends": {}, "set": {"engram_on_disk": "no"}}, tp4)
 
     def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
         """The capture ladder ends at streams x (1 + drafts) even when that falls between two of
@@ -596,6 +628,62 @@ class RecipeTest(unittest.TestCase):
         """One recipe: no per-shape copies beside it."""
         self.assertEqual(sorted(p.name for p in (ROOT / "config").glob("cluster*.json")), ["cluster.json"])
 
+    def test_all_switched_shapes_use_direct_fabric_profile(self):
+        """Every switched shape (tp3-switched through tp8-switched) uses sparknet's direct /
+        oneshot-switched profile (8 NCCL channels, 1 MiB NCCL buffers, cuMem off, 4 MiB
+        one-shot all-gather cap), strips ring-only controls, and declares the direct profile
+        explicitly on both switched base shapes (tp3-switched and tp4-switched)."""
+        for base_switched in ("tp3-switched", "tp4-switched"):
+            self.assertEqual(
+                self.recipe["shapes"][base_switched].get("environment"),
+                recipe.SWITCHED_DIRECT_ENV,
+                base_switched,
+            )
+        switched_shapes = (
+            "tp3-switched",
+            "tp4-switched",
+            "tp5-switched",
+            "tp6-switched",
+            "tp7-switched",
+            "tp8-switched",
+        )
+        resolved_envs = {}
+        for name in switched_shapes:
+            resolved = recipe.resolve(self.recipe, name)
+            self.assertEqual(
+                resolved["fabric"],
+                {"transport": "oneshot-switched", "topology": "switched"},
+                name,
+            )
+            env = resolved["environment"]
+            resolved_envs[name] = env
+            for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+                self.assertEqual(env[key], value, (name, key))
+            for key in recipe.SWITCHED_STRIP_RING_KEYS:
+                self.assertNotIn(key, env, (name, key))
+        # Every switched shape renders the exact same NCCL/sparknet fabric environment;
+        # only SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS differs between TP3 (1) and TP4..8 (0).
+        tp4_env = resolved_envs["tp4-switched"]
+        for name in ("tp5-switched", "tp6-switched", "tp7-switched", "tp8-switched"):
+            self.assertEqual(resolved_envs[name], tp4_env, name)
+        self.assertEqual(
+            {k: v for k, v in resolved_envs["tp3-switched"].items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
+            {k: v for k, v in tp4_env.items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
+        )
+        # Mutating tp3-triangle's environment does not move tp3-switched's direct profile.
+        mutated = json.loads(json.dumps(self.recipe))
+        mutated["shapes"]["tp3-triangle"]["environment"].update({
+            "NCCL_BUFFSIZE": "4194304",
+            "NCCL_CUMEM_ENABLE": "1",
+            "NCCL_MAX_NCHANNELS": "4",
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152",
+            "NCCL_ALGO": "Ring",
+        })
+        tp3_sw_mut = recipe.resolve(mutated, "tp3-switched")["environment"]
+        for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+            self.assertEqual(tp3_sw_mut[key], value, key)
+        self.assertNotIn("NCCL_ALGO", tp3_sw_mut)
+
 
 
 class OverlayTest(unittest.TestCase):
@@ -603,10 +691,13 @@ class OverlayTest(unittest.TestCase):
 
     def test_an_overlay_sets_unsets_and_is_not_production(self):
         base = recipe.resolve(load("config/cluster.json"), "tp4-ring")
-        arm = {"extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
+        arm = {"notes": "arm note",
+               "extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
                "set": {"container": {"image": "x:y"}, "environment": {"NEW": "1"}},
                "unset": ["environment.SPARKNET_ROCE_TIMEOUT_MS"]}
         resolved = recipe.overlay(arm, base)
+        self.assertEqual(resolved["notes"], "arm note")
+        self.assertNotIn("notes", recipe.overlay({"extends": {}}, resolved))
         self.assertEqual(resolved["container"]["image"], "x:y")
         self.assertEqual(resolved["container"]["name"], base["container"]["name"])  # merged, not replaced
         self.assertEqual(resolved["environment"]["NEW"], "1")
@@ -642,8 +733,8 @@ class OverlayTest(unittest.TestCase):
                          {"SPARKNET_ROCE_KERNELS", "SPARKNET_ROCE_SPIN_LIMIT", "SPARKNET_ROCE_TIMEOUT_MS",
                           "SPARK3_ENGRAM_ASYNC"})
         self.assertEqual(r6m["serve_args"], r6l["serve_args"])
-        self.assertEqual({k: v for k, v in r6m.items() if k not in ("container", "environment", "upstreams_config")},
-                         {k: v for k, v in r6l.items() if k not in ("container", "environment", "upstreams_config")})
+        self.assertEqual({k: v for k, v in r6m.items() if k not in ("container", "environment", "upstreams_config", "notes")},
+                         {k: v for k, v in r6l.items() if k not in ("container", "environment", "upstreams_config", "notes")})
         # An arm of the recipe names its shape: it must not follow the site's cabling.
         unpinned = {"extends": {"config": "config/cluster.json"}, "set": {}}
         read = spark.read_json
@@ -723,6 +814,8 @@ class GLPTest(unittest.TestCase):
         for key in ("NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
                     "NCCL_THREAD_THRESHOLDS", "NCCL_SWITCHLESS_BIDIRECTIONAL"):
             self.assertNotIn(key, switched["environment"])
+        for key, value in recipe.SWITCHED_DIRECT_ENV.items():
+            self.assertEqual(switched["environment"][key], value, key)
         explicit = recipe.overlay({**arm, "unset": ["benchmark_reference", "environment.NCCL_ALGO"]}, base)
         self.assertNotIn("NCCL_ALGO", explicit["environment"])
         self.assertNotIn("benchmark_reference", explicit)

@@ -7,21 +7,19 @@ beside an engine serving under the other name."""
 from __future__ import annotations
 
 import copy
-import importlib.machinery
-import importlib.util
 import json
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 # A recipe frozen for these tests, so a release does not move them.
 FIXTURE = "tests/fixtures/cluster.json"
-loader = importlib.machinery.SourceFileLoader("spark_names_test", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+import spark_ds41f as spark
 source_labels = spark.source_labels
 
 TREE = "e68aa19c8027c34a3dcfeb3ed203f6d285fc4d67"

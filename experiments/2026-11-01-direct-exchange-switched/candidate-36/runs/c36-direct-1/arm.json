@@ -1,0 +1,25 @@
+{
+ "notes": "candidate-36 with the direct exchange (vllm/series: candidate-36's series, then experiments/2026-11-01-direct-exchange-switched's patch) at tp4-switched with the recipe's NCCL settings. VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC. Its node map (config/nodes-switched-c36.local.json, a site file) is the site's switched map without roce_traffic_class, which candidate-36's tooling refuses: its sparknet marks every switched fabric's traffic with class 106 itself.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "upstreams_config": "experiments/2026-11-01-candidate-36-switched/upstreams.lock.json",
+  "container": {
+   "image": "spark-ds41f:candidate-36-direct",
+   "expected_labels": {
+    "local.spark-ds41f.vllm.tree": "bc7c9cd5e022969256a4465252113ab5af510340",
+    "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+    "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+    "local.spark-ds41f.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
+    "local.spark-ds41f.tile_kernels.tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+    "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+   }
+  },
+  "environment": {
+   "VLLM_SERVER_DEV_MODE": "1"
+  },
+  "nodes_config": "config/nodes-switched-c36.local.json"
+ }
+}

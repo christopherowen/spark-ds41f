@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.machinery
-import importlib.util
 import io
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-spec = importlib.util.spec_from_loader("spark", loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 TP4 = ["--tensor-parallel-size", "4", "--max-model-len", "1048576", "--kv-cache-memory-bytes", "11274289152",
        "--nnodes", "4"]

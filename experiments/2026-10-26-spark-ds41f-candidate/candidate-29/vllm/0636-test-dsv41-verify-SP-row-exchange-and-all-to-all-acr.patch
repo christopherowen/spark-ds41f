@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vedcsolution <226183072+vedcsolution@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:03:02 +0100
+Subject: [PATCH 636/636] test(dsv41): verify SP row exchange and all-to-all
+ across 3..8 ranks
+
+Extend test_row_exchange_gives_each_rank_its_rows_of_every_block and test_row_all_to_all_over_cabled_pairs to cover TP3..TP8.
+---
+ tests/models/test_deepseek_v41_sp_project_reduce_scatter.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 1a2c9c424..b3308d30c 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -278,7 +278,7 @@ def test_moe_combine_writes_the_exchange_slots(
+ 
+ 
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+-@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
+ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
+     monkeypatch, tokens, world
+ ):
+@@ -355,7 +355,7 @@ class _Fabric:
+         self.barrier.wait()
+ 
+ 
+-@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("world", [3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
+ def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
+     """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every

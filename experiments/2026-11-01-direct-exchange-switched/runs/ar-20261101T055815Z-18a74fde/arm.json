@@ -1,0 +1,31 @@
+{
+ "notes": "The candidate the harness boots. Baseline: stock spark-ds41f-1030 on tp4-switched, the 1030-direct image with vLLM's two stock files (tree ea1281f8 blobs 64d16a71, 5ed772e5) mounted over the direct-exchange ones, so the four-rank exchange relays through neighbours as stock 1030 does. VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{checkout}/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{checkout}/experiments/2026-11-01-site-levers/overlay/stock/pynccl.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/distributed/device_communicators/pynccl.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-01-site-levers/overlay/stock/collectives.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "VLLM_SERVER_DEV_MODE": "1"
+  }
+ }
+}

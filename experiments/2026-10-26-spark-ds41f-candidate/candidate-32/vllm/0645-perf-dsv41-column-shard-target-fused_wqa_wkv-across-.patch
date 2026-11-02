@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:07:57 +0100
+Subject: [PATCH 0645/0533] perf(dsv41): column-shard target fused_wqa_wkv
+ across TP (#767)
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 104 +++++++++
+ tests/models/test_deepseek_v4_1_attention.py  | 199 ++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 221 ++++++++++++++++--
+ vllm/models/deepseek_v4_1/kernels.py          |   7 +
+ vllm/models/deepseek_v4_1/tilelang/front.py   |   4 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  15 ++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |   4 +
+ 7 files changed, 536 insertions(+), 18 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index eebb0758a..66a178f01 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -551,3 +551,107 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+         for rows in ROWS:
+             out = method.apply(layer, x[:rows])
+             assert torch.equal(out, full_ref[:rows]), f"linear apply rows={rows}"
++
++
++@pytest.mark.parametrize("tp_size,part_n", [(4, 448), (3, 608)])
++def test_sharded_wqa_wkv_and_strided_attention_front_match_replicated(tp_size, part_n):
++    """Column-sharded target ``fused_wqa_wkv`` (448 rows/rank at TP4; 608 rows/rank
++    padded to 1824 at TP3 with a zero-copy ``[:, :1792]`` strided slice) matches the
++    replicated 1792-row projection and ``attention_front`` bit for bit."""
++    from vllm.models.deepseek_v4_1.tilelang.front import attention_front
++    from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
++
++    k = 5120
++    weight, exps, _ = _block32_weight(1792, k, 29)
++    weight_sf = pack_scale_words(exps)
++    if tp_size * part_n > 1792:
++        pad = tp_size * part_n - 1792
++        w_pad = torch.cat(
++            [
++                weight,
++                torch.zeros((pad, k), dtype=weight.dtype, device=DEVICE),
++            ],
++            dim=0,
++        )
++        s_pad = torch.cat(
++            [
++                exps,
++                torch.full((pad // 32, exps.shape[1]), 0x7F, dtype=exps.dtype, device=DEVICE),
++            ],
++            dim=0,
++        )
++    else:
++        w_pad, s_pad = weight, exps
++
++    shards = [
++        (
++            w_pad[r * part_n : (r + 1) * part_n].contiguous(),
++            pack_scale_words(s_pad[r * (part_n // 32) : (r + 1) * (part_n // 32)].contiguous()),
++        )
++        for r in range(tp_size)
++    ]
++
++    x = torch.randn((256, k), generator=_gen(31), device=DEVICE).bfloat16()
++    xq, sf, _ = _mxfp8(x)
++    words = sf.contiguous().view(torch.uint32)
++
++    ref_prefill = mxfp8_gemm(1792, k, **fp8_prefill_config(1792, k))
++    shard_prefill = mxfp8_gemm(part_n, k, **fp8_prefill_config(part_n, k))
++    full_ref = torch.empty((256, 1792), dtype=torch.bfloat16, device=DEVICE)
++    ref_prefill(xq, weight, words, weight_sf, full_ref)
++    shard_outs = []
++    for w_s, sf_s in shards:
++        o = torch.empty((256, part_n), dtype=torch.bfloat16, device=DEVICE)
++        shard_prefill(xq, w_s, words, sf_s, o)
++        shard_outs.append(o)
++    cat_prefill = torch.cat(shard_outs, dim=1)[:, :1792]
++    assert torch.equal(cat_prefill, full_ref)
++
++    for block_M in DECODE_TILE_ROWS:
++        k_ref = mxfp8_gemm_decode(
++            1792, k, **fp8_decode_config(1792, k, block_M), padded_rows=True
++        )
++        k_shard = mxfp8_gemm_decode(
++            part_n, k, **fp8_decode_config(part_n, k, block_M), padded_rows=True
++        )
++        rows = min(6, block_M)
++        out_ref = torch.empty((rows, 1792), dtype=torch.bfloat16, device=DEVICE)
++        k_ref(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out_ref)
++        parts = []
++        for w_s, sf_s in shards:
++            o = torch.empty((rows, part_n), dtype=torch.bfloat16, device=DEVICE)
++            k_shard(xq[:DECODE_ROWS], w_s, words[:DECODE_ROWS], sf_s, o)
++            parts.append(o)
++        cat_decode = torch.cat(parts, dim=1)[:, :1792]
++        assert torch.equal(cat_decode, out_ref)
++
++    # Verify attention_front on the strided TP3 view (stride 1824) matches contiguous.
++    rows = 6
++    gen = _gen(37)
++    qw = (torch.rand((1280,), generator=gen, device=DEVICE) + 0.5).bfloat16()
++    kvw = (torch.rand((512,), generator=gen, device=DEVICE) + 0.5).bfloat16()
++    positions = torch.arange(rows, dtype=torch.int64, device=DEVICE)
++    cos_sin = torch.randn((32, 64), generator=gen, device=DEVICE, dtype=torch.float32)
++    slots = torch.arange(rows, dtype=torch.int64, device=DEVICE)
++    cache_ref = torch.zeros((2, 128 * 528), dtype=torch.uint8, device=DEVICE)
++    cache_shd = torch.zeros_like(cache_ref)
++    qn_ref = torch.empty((rows, 1280), dtype=torch.bfloat16, device=DEVICE)
++    qn_shd = torch.empty_like(qn_ref)
++    kv_ref = torch.empty((rows, 512), dtype=torch.bfloat16, device=DEVICE)
++    kv_shd = torch.empty_like(kv_ref)
++    qc_ref = empty_mxfp8(qn_ref)
++    qc_shd = empty_mxfp8(qn_shd)
++
++    attention_front(
++        out_ref, qw, kvw, 1e-6, positions, cos_sin, cache_ref, slots, 128,
++        qn_ref, qc_ref.values, qc_ref.scales, kv_ref,
++    )
++    attention_front(
++        cat_decode, qw, kvw, 1e-6, positions, cos_sin, cache_shd, slots, 128,
++        qn_shd, qc_shd.values, qc_shd.scales, kv_shd,
++    )
++    assert torch.equal(qn_shd, qn_ref)
++    assert torch.equal(kv_shd, kv_ref)
++    assert torch.equal(qc_shd.values[:rows], qc_ref.values[:rows])
++    assert torch.equal(qc_shd.scales[:rows], qc_ref.scales[:rows])
++    assert torch.equal(cache_shd, cache_ref)
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index d6f82917b..d949481e8 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -561,3 +561,202 @@ def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypat
+     assert len(key_writes) == 1
+     assert key_writes[0][0] is partials
+ 
++
++@pytest.mark.parametrize("tp_size,expected_part", [(1, 1792), (3, 608), (4, 448)])
++def test_padded_merged_column_parallel_linear_shards_contiguously(
++    monkeypatch, tp_size, expected_part
++):
++    """``_PaddedMergedColumnParallelLinear`` stacks ``[wq_a (1280), wkv (512)]`` into one
++    contiguous 1792-row logical matrix, pads to a multiple of ``tp_size * 32`` (1824 at
++    TP3 with zero weights and 0x7F unit UE8M0 scales in the trailing 32 rows), and
++    all-gathers + slices back to 1792 columns."""
++    from vllm.config import VllmConfig, set_current_vllm_config
++    from vllm.distributed import parallel_state
++    from vllm.model_executor.layers import linear as linear_mod
++    from vllm.models.deepseek_v4_1.attention import _PaddedMergedColumnParallelLinear
++    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
++
++    quant_config = DeepseekV41FP8Config(
++        is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
++    )
++    k = 64
++    wq_a = torch.arange(1280 * k, dtype=torch.uint8).reshape(1280, k).view(
++        torch.float8_e4m3fn
++    )
++    wkv = torch.arange(512 * k, dtype=torch.uint8).reshape(512, k).view(
++        torch.float8_e4m3fn
++    )
++    sq_a = (
++        torch.arange(40 * 2, dtype=torch.uint8)
++        .reshape(40, 2)
++        .clamp(1, 250)
++        .view(torch.float8_e8m0fnu)
++    )
++    skv = (
++        torch.arange(16 * 2, dtype=torch.uint8)
++        .reshape(16, 2)
++        .clamp(1, 250)
++        .view(torch.float8_e8m0fnu)
++    )
++    full_w = torch.cat([wq_a.view(torch.uint8), wkv.view(torch.uint8)], dim=0)
++    full_s = torch.cat([sq_a.view(torch.uint8), skv.view(torch.uint8)], dim=0)
++
++    ranks = []
++    with set_current_vllm_config(VllmConfig()):
++        for rank in range(tp_size):
++            monkeypatch.setattr(
++                parallel_state,
++                "_TP",
++                SimpleNamespace(rank_in_group=rank, world_size=tp_size),
++            )
++            layer = _PaddedMergedColumnParallelLinear(
++                k,
++                [1280, 512],
++                bias=False,
++                gather_output=True,
++                quant_config=quant_config,
++                tp_rank=rank,
++                tp_size=tp_size,
++                prefix=f"test.r{rank}.fused_wqa_wkv",
++            )
++            assert layer.output_size_per_partition == expected_part
++            layer.weight.weight_loader(layer.weight, wq_a, 0)
++            layer.weight.weight_loader(layer.weight, wkv, 1)
++            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, sq_a, 0)
++            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, skv, 1)
++            ranks.append(layer)
++
++    cat_w = torch.cat([r.weight.view(torch.uint8) for r in ranks], dim=0)
++    cat_s = torch.cat([r.weight_scale_inv.view(torch.uint8) for r in ranks], dim=0)
++    assert torch.equal(cat_w[:1792], full_w)
++    assert torch.equal(cat_s[:56], full_s)
++    if tp_size == 3:
++        assert not cat_w[1792:].any()
++        assert (cat_s[56:] == 0x7F).all()
++
++    for r in ranks:
++        r.quant_method = SimpleNamespace(
++            apply=lambda lyr, x, bias=None: x @ lyr.weight.view(torch.uint8).float().T
++        )
++    monkeypatch.setattr(
++        linear_mod,
++        "tensor_model_parallel_all_gather",
++        lambda local_out: torch.cat(
++            [
++                r.quant_method.apply(r, torch.ones(5, k))
++                for r in ranks
++            ],
++            dim=-1,
++        ),
++    )
++    out, bias = ranks[0](torch.ones(5, k))
++    assert bias is None
++    assert out.shape == (5, 1792)
++    if tp_size == 3:
++        assert out.stride() == (1824, 1)
++    expected = torch.ones(5, k) @ full_w.float().T
++    torch.testing.assert_close(out, expected, rtol=0, atol=0)
++
++
++def test_sp_prefill_with_sharded_fused_wqa_wkv_gathers_mxfp8(monkeypatch):
++    """When ``fused_wqa_wkv`` is column-sharded across TP (``tp_size > 1``), SP prefill
++    without a compressor gathers the already-cast local ``MXFP8Rows`` and local
++    ``indexer.weights_proj`` in one ``gather_mxfp8`` call, skipping ``sp_rows.gather``
++    and a second ``cast_mxfp8`` on ``hidden_states``."""
++    from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
++
++    module = _tilelang_layer(layer_id=5)
++    module._ready = True
++    module.q_lora_rank = 16
++    module.n_local_heads = 2
++    module._l2pf_wo = None
++    module._l2pf_comp = None
++    module.swa_cache_layer = SimpleNamespace(prefix="swa")
++
++    local_x = torch.ones((4, 32), dtype=torch.bfloat16)
++    local_q = MXFP8Rows(
++        rows=local_x,
++        values=torch.ones((64, 32), dtype=torch.uint8),
++        scales=torch.ones((64, 1), dtype=torch.uint8),
++    )
++    gathered_x = torch.ones((10, 32), dtype=torch.bfloat16)
++    gathered_q = MXFP8Rows(
++        rows=gathered_x,
++        values=torch.ones((64, 32), dtype=torch.uint8),
++        scales=torch.ones((64, 1), dtype=torch.uint8),
++    )
++    gathered_w = torch.full((10, 4), 3.0, dtype=torch.bfloat16)
++    events = []
++
++    class _FakeSPRows:
++        num_tokens = 10
++        start = 4
++        real_rows = 4
++
++        def gather(self, _):
++            raise AssertionError("BF16 gather should not run when local MXFP8 is provided")
++
++        def gather_mxfp8(self, x_q, *extra):
++            events.append(("gather_mxfp8", x_q is local_q, len(extra)))
++            return (gathered_q, gathered_w)
++
++    def sharded_wqa_wkv(h):
++        events.append(("fused_wqa_wkv", h is gathered_x, provided_mxfp8(h) is gathered_q))
++        return torch.ones((10, 16 + 512), dtype=torch.bfloat16), None
++
++    sharded_wqa_wkv.tp_size = 4
++    module.fused_wqa_wkv = sharded_wqa_wkv
++    module._front = lambda qr_kv, pos, sp: None
++    module.q_norm = lambda x: x.contiguous()
++    module.kv_norm = lambda x: x.contiguous()
++    monkeypatch.setattr(
++        kernels,
++        "cast_mxfp8",
++        lambda rows: (
++            events.append(("cast_mxfp8", tuple(rows.shape))),
++            MXFP8Rows(
++                rows,
++                torch.ones((64, rows.shape[1]), dtype=torch.uint8),
++                torch.ones((64, 1), dtype=torch.uint8),
++            ),
++        )[1],
++    )
++    module.wq_b = lambda qr: torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16)
++    module._rope = lambda x, pos, role: x
++    module._cache_context_kv = lambda kv, pos: None
++    module.indexer = SimpleNamespace(
++        heads=4,
++        wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
++        weights_proj=lambda h: (
++            events.append(("weights_proj", tuple(h.shape))),
++            torch.ones((h.shape[0], 4), dtype=torch.bfloat16),
++        )[1],
++    )
++    module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
++    seen_index_weights = []
++
++    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
++        seen_index_weights.append(index_query[2])
++        output.zero_()
++
++    module.forward_mqa = check_forward_mqa
++    module._o_proj = lambda output, sp_rows=None: torch.zeros((4, 32), dtype=torch.bfloat16)
++    metadata = {"swa": SimpleNamespace(is_decode=False)}
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
++    with kernels.mxfp8_inputs(local_q):
++        out = module._forward(torch.arange(10), local_x)
++    assert out.shape == (4, 32)
++    assert events == [
++        ("weights_proj", (4, 32)),
++        ("gather_mxfp8", True, 1),
++        ("fused_wqa_wkv", True, True),
++        ("cast_mxfp8", (10, 16)),
++    ]
++    assert len(seen_index_weights) == 1
++    torch.testing.assert_close(seen_index_weights[0], gathered_w[4:8], rtol=0, atol=0)
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cb063d495..4e7838133 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -22,12 +22,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+     LinearMethodBase,
+-    MergedColumnParallelLinear,
+     ReplicatedLinear,
+     RowParallelLinear,
+     UnquantizedLinearMethod,
+ )
++from vllm.model_executor.parameter import BlockQuantScaleParameter
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.models.deepseek_v4_1 import kernels, l2_prefetch, sp_prefill
+ from vllm.models.deepseek_v4_1.ced import ced_decoder_start
+ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+@@ -153,6 +154,162 @@ class _WOProjectionWeightMethod(LinearMethodBase):
+         raise RuntimeError("V4.1 WO weights are consumed only by the fused projection")
+ 
+ 
++class _PaddedMergedColumnParallelLinear(ColumnParallelLinear):
++    """Contiguously column-sharded merged projection padded to 32-row block scales.
++
++    Unlike ``MergedColumnParallelLinear``, which shards each logical output tensor
++    separately (and interleaves their shards across TP ranks), this layer stacks
++    ``output_sizes`` into one logical ``sum(output_sizes)``-row weight, pads the
++    total output rows to a multiple of ``tp_size * 32`` (with zero weights and unit
++    scales in any trailing pad rows), and gives each TP rank a single contiguous
++    slice of rows. ``all_gather(dim=-1)`` reconstructs the merged output in logical
++    order, sliced back to ``sum(output_sizes)`` columns.
++    """
++
++    def __init__(
++        self,
++        input_size: int,
++        output_sizes: list[int],
++        bias: bool = False,
++        gather_output: bool = True,
++        skip_bias_add: bool = False,
++        params_dtype: torch.dtype | None = None,
++        quant_config=None,
++        prefix: str = "",
++        *,
++        return_bias: bool = True,
++        disable_tp: bool = False,
++        tp_rank: int | None = None,
++        tp_size: int | None = None,
++    ):
++        if bias:
++            raise ValueError("_PaddedMergedColumnParallelLinear does not support bias")
++        if any(size % 32 != 0 for size in output_sizes):
++            raise ValueError(
++                f"merged output_sizes {output_sizes} must be multiples of 32"
++            )
++        self.logical_output_sizes = list(output_sizes)
++        self.logical_output_size = sum(output_sizes)
++        world_size = (
++            1
++            if disable_tp
++            else (
++                tp_size
++                if tp_size is not None
++                else get_tensor_model_parallel_world_size()
++            )
++        )
++        block = world_size * 32
++        padded_output_size = cdiv(self.logical_output_size, block) * block
++        super().__init__(
++            input_size=input_size,
++            output_size=padded_output_size,
++            bias=False,
++            gather_output=gather_output,
++            skip_bias_add=skip_bias_add,
++            params_dtype=params_dtype,
++            quant_config=quant_config,
++            prefix=prefix,
++            return_bias=return_bias,
++            disable_tp=disable_tp,
++            tp_rank=tp_rank,
++            tp_size=tp_size,
++        )
++        self._init_pad_rows()
++
++    def _init_pad_rows(self, param: nn.Parameter | None = None) -> None:
++        rank_start = self.tp_rank * self.output_size_per_partition
++        rank_end = rank_start + self.output_size_per_partition
++        if rank_end <= self.logical_output_size:
++            return
++        pad_start = max(0, self.logical_output_size - rank_start)
++        targets = (
++            (param,)
++            if param is not None
++            else tuple(
++                p
++                for p in (
++                    getattr(self, "weight", None),
++                    getattr(self, "weight_scale_inv", None),
++                )
++                if p is not None
++            )
++        )
++        for p in targets:
++            if p.data.device.type == "meta":
++                continue
++            if isinstance(p, BlockQuantScaleParameter) or p is getattr(
++                self, "weight_scale_inv", None
++            ):
++                block_n = getattr(self, "weight_block_size", [32, 32])[0]
++                row0 = pad_start // block_n
++                if p.dtype == torch.float8_e8m0fnu:
++                    p.data.view(torch.uint8)[row0:].fill_(0x7F)
++                else:
++                    p.data[row0:].fill_(1.0)
++            else:
++                p.data[pad_start:].zero_()
++
++    def weight_loader(
++        self,
++        param: nn.Parameter,
++        loaded_weight: torch.Tensor,
++        loaded_shard_id: int | None = None,
++    ) -> None:
++        if loaded_shard_id is None:
++            logical_start = 0
++            logical_size = self.logical_output_size
++        else:
++            if not (
++                isinstance(loaded_shard_id, int)
++                and 0 <= loaded_shard_id < len(self.logical_output_sizes)
++            ):
++                raise ValueError(
++                    f"Shard id should be between 0 and {len(self.logical_output_sizes) - 1}. "
++                    f"Got shard id {loaded_shard_id}."
++                )
++            logical_start = sum(self.logical_output_sizes[:loaded_shard_id])
++            logical_size = self.logical_output_sizes[loaded_shard_id]
++        logical_end = logical_start + logical_size
++        output_dim = getattr(param, "output_dim", 0)
++        is_scale = isinstance(param, BlockQuantScaleParameter) or param is getattr(
++            self, "weight_scale_inv", None
++        )
++        block_n = getattr(self, "weight_block_size", [32, 32])[0] if is_scale else 1
++        shard_start = logical_start // block_n
++        shard_end = logical_end // block_n
++        if loaded_weight.shape[output_dim] != shard_end - shard_start:
++            raise ValueError(
++                f"Expected shard {loaded_shard_id} output size "
++                f"{shard_end - shard_start}, got {loaded_weight.shape[output_dim]}"
++            )
++        part_rows = self.output_size_per_partition // block_n
++        rank_start = self.tp_rank * part_rows
++        rank_end = rank_start + part_rows
++        copy_start = max(shard_start, rank_start)
++        copy_end = min(shard_end, rank_end)
++        if copy_start < copy_end:
++            copy_len = copy_end - copy_start
++            dst = param.data.narrow(output_dim, copy_start - rank_start, copy_len)
++            src = loaded_weight.narrow(output_dim, copy_start - shard_start, copy_len)
++            copy_weight(dst, src)
++        if rank_end > self.logical_output_size // block_n:
++            self._init_pad_rows(param)
++
++    weight_loader_v2 = weight_loader
++
++    def forward(self, input_):
++        output = super().forward(input_)
++        if self.output_size == self.logical_output_size or (
++            not self.gather_output and self.tp_size > 1
++        ):
++            return output
++        if self.return_bias:
++            out, bias = output
++            return out[..., : self.logical_output_size], bias
++        return output[..., : self.logical_output_size]
++
++
+ class DeepseekV4Indexer(nn.Module):
+     def __init__(self, config, prefix, *, owns_k, k_cache, ratio):
+         super().__init__()
+@@ -317,12 +474,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
+             requires_grad=False,
+         )
+-        self.fused_wqa_wkv = MergedColumnParallelLinear(
++        self.fused_wqa_wkv = _PaddedMergedColumnParallelLinear(
+             hf.hidden_size,
+             [hf.q_lora_rank, 512],
+             bias=False,
++            gather_output=True,
+             quant_config=vllm_config.quant_config,
+-            disable_tp=True,
++            disable_tp=self.is_draft,
+             prefix=f"{prefix}.fused_wqa_wkv",
+         )
+         self.q_norm = kernels.rms_norm(hf.q_lora_rank, hf.rms_norm_eps)
+@@ -890,19 +1048,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         index_weights = None
+         front = None
+         if sp_rows is not None and self.compressor is None:
+-            # Sequence-parallel prefill without a compressor: the row-wise front
+-            # (projection, norms, index weights) runs on this rank's rows, and
+-            # its product, narrower than the hidden state, is gathered.
+-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+-            del qr_kv
+-            parts = self._gather_front(sp_rows, hidden_states, qr, kv)
+-            qr, kv = parts[0], parts[1]
+-            if self.indexer is not None:
+-                index_weights = parts[2]
+-            del parts
+-            hidden_states = None
+-            rows = sp_rows.num_tokens
++            if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1:
++                # Sequence-parallel prefill without a compressor when fused_wqa_wkv
++                # is replicated: the row-wise front (projection, norms, index weights)
++                # runs on this rank's rows, and its product is gathered.
++                qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++                qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++                del qr_kv
++                parts = self._gather_front(sp_rows, hidden_states, qr, kv)
++                qr, kv = parts[0], parts[1]
++                if self.indexer is not None:
++                    index_weights = parts[2]
++                del parts
++                hidden_states = None
++                rows = sp_rows.num_tokens
++            else:
++                # Column-sharded fused_wqa_wkv: gather the local MXFP8 rows (and
++                # local index head weights) in one grouped collective, run the
++                # sharded projection across TP, and release the hidden state.
++                local_q = kernels.try_provided_mxfp8(hidden_states)
++                extra = (
++                    (self.indexer.weights_proj(hidden_states),)
++                    if self.indexer is not None
++                    else ()
++                )
++                if local_q is not None:
++                    gathered, *rest = sp_rows.gather_mxfp8(local_q, *extra)
++                    hidden_states = gathered.rows
++                elif extra:
++                    hidden_states, *rest = sp_rows.gather_many(hidden_states, *extra)
++                    gathered = kernels.cast_mxfp8(hidden_states)
++                else:
++                    hidden_states = sp_rows.gather(hidden_states)
++                    gathered = kernels.cast_mxfp8(hidden_states)
++                    rest = []
++                if rest:
++                    (index_weights,) = rest
++                rows = hidden_states.shape[0]
++                with kernels.mxfp8_inputs(gathered):
++                    qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++                del gathered
++                hidden_states = None
++                qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++                del qr_kv
++                qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         else:
+             gathered = None
+             if sp_rows is not None:
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 9d7016cd5..278257128 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -99,6 +99,13 @@ def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+     return provide_mxfp8(rows)
+ 
+ 
++def try_provided_mxfp8(rows: torch.Tensor):
++    """The handed-over MXFP8 cast of ``rows`` if active, else None."""
++    from .tilelang.linear import try_provided_mxfp8
++
++    return try_provided_mxfp8(rows)
++
++
+ @contextlib.contextmanager
+ def sp_moe_inputs(
+     sp_rows,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index cfd58315c..5f22a1fcd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -110,7 +110,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+     last = k["num_thread_vec"] - 1  # the vector index (of four) holding the rotation
+     record = RECORD_BYTES["swa"]
+     width = Q_LATENT + KV_LATENT
+-    M, Mq = T.dynamic("M, Mq")
++    M, Mq, qa_stride = T.dynamic("M, Mq, qa_stride")
+     sf_shape = get_sf_shape((M, Q_LATENT), out_config)
+     positions_max = T.dynamic("positions_max")
+     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
+@@ -198,7 +198,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+ 
+     @T.prim_func
+     def attention_front(
+-        qa_kv: T.Tensor((M, width), T.bfloat16),
++        qa_kv: T.StridedTensor((M, width), (qa_stride, 1), T.bfloat16),
+         q_weight: T.Tensor((Q_LATENT,), T.bfloat16),
+         kv_weight: T.Tensor((KV_LATENT,), T.bfloat16),
+         positions: T.Tensor((M,), T.int64),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 414922944..e4fef5aa6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1260,6 +1260,19 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         32: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
++    # TP4 (448 x 5120) and TP3 (608 x 5120, 1792 padded to 1824) column-sharded
++    # target fused Q-A/KV.
++    (448, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=4),
++        32: dict(block_N=32, block_K=256, num_stages=4),
++        64: dict(block_N=32, block_K=256, num_stages=4),
++    },
++    (608, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=4),
++        32: dict(block_N=32, block_K=256, num_stages=4),
++        64: dict(block_N=32, block_K=256, num_stages=4),
++    },
++    # TP4 shared expert: gate/up and down.
+     (1152, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
+@@ -1453,6 +1466,8 @@ def split_row_tile(rows: int) -> int:
+ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+     (1792, 5120): {96: 32, 128: 64},
+     (1536, 5120): {128: 64},
++    (448, 5120): {96: 32, 128: 64},
++    (608, 5120): {96: 32, 128: 64},
+     (1152, 5120): {128: 64},
+     (1024, 5120): {128: 64},
+     (768, 5120): {128: 64},
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index d86f3b559..3f3210880 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -187,6 +187,9 @@ def optional_provided_mxfp8(x: torch.Tensor) -> MXFP8Rows | None:
+     return None
+ 
+ 
++try_provided_mxfp8 = optional_provided_mxfp8
++
++
+ def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+     """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
+     holder keeps them alive, so no other tensor can be at that address. A projection
+@@ -861,4 +864,5 @@ __all__ = [
+     "provide_mxfp8",
+     "provided_mxfp8",
+     "slice_mxfp8",
++    "try_provided_mxfp8",
+ ]

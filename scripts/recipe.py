@@ -56,7 +56,38 @@ SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_ca
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
 SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "environment", "host",
-              "benchmark_reference", "notes"}
+              "engram_on_disk", "benchmark_reference", "notes"}
+SWITCHED_STRIP_RING_KEYS = (
+    "NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
+    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
+    "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
+    "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
+    "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT",
+)
+# sparknet's direct / oneshot-switched fabric settings (replacing tp4-ring's 4-channel ring values).
+SWITCHED_DIRECT_ENV = {
+    "NCCL_BUFFSIZE": "1048576",
+    "NCCL_CUMEM_ENABLE": "0",
+    "NCCL_MAX_NCHANNELS": "8",
+    "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
+}
+
+
+def _apply_switched_direct_env(target: dict, explicit_env: dict, unset: list[str] | tuple[str, ...] = ()) -> None:
+    env = target.get("environment")
+    if not isinstance(env, dict):
+        return
+    unset_env = {path.split(".", 1)[1] for path in unset if path.startswith("environment.")}
+    for key in SWITCHED_STRIP_RING_KEYS:
+        if key not in explicit_env:
+            env.pop(key, None)
+    transport = target.get("fabric", {}).get("transport")
+    for key, value in SWITCHED_DIRECT_ENV.items():
+        if key.startswith("SPARKNET_") and transport == "nccl-switched":
+            continue
+        if key not in explicit_env and key not in unset_env:
+            env[key] = value
 
 
 def is_recipe(cluster: dict) -> bool:
@@ -137,12 +168,7 @@ def shape_entry(recipe: dict, name: str) -> dict:
             merged[key] = copy.deepcopy(value)
     if (merged.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        explicit_env = entry.get("environment", {})
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
-            if key not in explicit_env:
-                merged.get("environment", {}).pop(key, None)
+        _apply_switched_direct_env(merged, entry.get("environment", {}))
     if "benchmark_reference" not in entry:
         # A variant is qualified by its own release benchmark, never through its base.
         merged.pop("benchmark_reference", None)
@@ -258,6 +284,34 @@ def _with_generation_defaults(cluster: dict) -> None:
     cluster["serve_args"] = args
 
 
+def engram_on_disk(recipe: dict, shape: dict) -> bool:
+    """Whether ``shape`` keeps the Engram tables on disk (default True)."""
+    sizing = shape.get("sizing", {})
+    if "engram_on_disk" in sizing:
+        on_disk = sizing["engram_on_disk"]
+    elif "engram_on_disk" in shape:
+        on_disk = shape["engram_on_disk"]
+    else:
+        on_disk = recipe.get("engram_on_disk", True)
+    if not isinstance(on_disk, bool):
+        raise SystemExit("engram_on_disk must be a boolean")
+    return on_disk
+
+
+def _with_engram_on_disk(cluster: dict, on_disk: bool) -> None:
+    """Render ``engram_on_disk`` into ``--engram-config``'s ``table_memory``."""
+    if not isinstance(on_disk, bool):
+        raise SystemExit("engram_on_disk must be a boolean")
+    args = list(cluster["serve_args"])
+    if "--engram-config" in args:
+        at = args.index("--engram-config") + 1
+        if at < len(args):
+            engram = json.loads(args[at])
+            engram["table_memory"] = "disk" if on_disk else "device"
+            args[at] = json.dumps(engram, separators=(",", ":"))
+    cluster["serve_args"] = args
+
+
 def values(recipe: dict, shape: dict) -> dict[str, str]:
     """The placeholders of ``serve_args`` for one shape."""
     sizing = shape["sizing"]
@@ -266,12 +320,15 @@ def values(recipe: dict, shape: dict) -> dict[str, str]:
         raise SystemExit(f"shape sizing lacks {', '.join(missing)}")
     nodes, drafts = int(shape["nodes"]), int(recipe["drafts"])
     rows = int(sizing["max_num_seqs"]) * (1 + drafts)
+    on_disk = engram_on_disk(recipe, shape)
     derived = {
         "tensor_parallel_size": nodes,
         "max_cudagraph_capture_size": rows,
         "cudagraph_capture_sizes": json.dumps(capture_sizes(rows), separators=(",", ":")),
         "long_prefill_token_threshold": int(sizing["max_num_batched_tokens"]) - rows,
         "drafts": drafts,
+        "engram_on_disk": str(on_disk).lower(),
+        "engram_table_memory": "disk" if on_disk else "device",
     }
     return {key: str(value) for key, value in {**sizing, **derived}.items()}
 
@@ -280,7 +337,7 @@ def resolve(recipe: dict, name: str) -> dict:
     """The concrete cluster configuration of shape ``name``."""
     shape = shape_entry(recipe, name)
     cluster = {key: copy.deepcopy(value) for key, value in recipe.items()
-               if key not in ("shapes", "drafts", "default_shape")}
+               if key not in ("shapes", "drafts", "engram_on_disk", "default_shape")}
     cluster["schema_version"] = 1
     cluster["shape"] = name
     fill = values(recipe, shape)
@@ -288,6 +345,7 @@ def resolve(recipe: dict, name: str) -> dict:
         cluster["serve_args"] = [string.Template(arg).substitute(fill) for arg in recipe["serve_args"]]
     except KeyError as error:
         raise SystemExit(f"serve_args names ${{{error.args[0]}}}, which no shape value defines") from error
+    _with_engram_on_disk(cluster, engram_on_disk(recipe, shape))
     cluster["environment"] = {**recipe["environment"], **shape.get("environment", {})}
     overlap = set(recipe["environment"]) & set(shape.get("environment", {}))
     if overlap:
@@ -344,6 +402,8 @@ def overlay(arm: dict, base: dict) -> dict:
         _with_model_mounts(cluster)
     if "generation_defaults" in arm.get("set", {}):
         _with_generation_defaults(cluster)
+    if "engram_on_disk" in sets:
+        _with_engram_on_disk(cluster, cluster.pop("engram_on_disk"))
     for dotted in arm.get("unset", []):
         *parents, last = dotted.split(".")
         node = cluster
@@ -354,14 +414,13 @@ def overlay(arm: dict, base: dict) -> dict:
         del node[last]
     for key in ("shape", "benchmark_reference"):
         cluster.pop(key, None)
+    if "notes" in arm:
+        cluster["notes"] = arm["notes"]
+    else:
+        cluster.pop("notes", None)
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
-        explicit_env = sets.get("environment", {})
-        for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-                    "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
-                    "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
-            if key not in explicit_env:
-                cluster.get("environment", {}).pop(key, None)
+        _apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
     if base.get("glp") or cluster.get("glp"):
         # Rendered again whatever the arm changed: a serve_args or mount list it sets
         # replaces the base's, which held the rendering.

@@ -1,0 +1,806 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:16:44 +0100
+Subject: [PATCH 667/667] perf(dsv41): fuse mhc.post into engram_post_gate and
+ chain Engram gates on PDL (#833)
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |   4 +
+ .../test_deepseek_v41_tilelang_engram.py      |  83 +++++
+ tests/models/test_deepseek_v4_1_engram.py     | 111 +++++++
+ vllm/models/deepseek_v4_1/common/engram.py    | 101 +++++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  23 +-
+ vllm/models/deepseek_v4_1/tilelang/engram.py  | 313 ++++++++++++++++++
+ 6 files changed, 621 insertions(+), 14 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 7f04ad9cb..f0c2ad3c6 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -35,6 +35,10 @@ CHAIN = {
+     "cache_writer",
+     "compress",
+     "compress_gather_partial_state",
++    "engram_gate",
++    "engram_gate_blocked",
++    "engram_post_gate",
++    "engram_post_gate_blocked",
+     "gemm_bf16_partials",
+     "gemm_bf16_splitk",
+     "gemm_fp8w_bf16",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram.py b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+index e7e4b8665..faa749257 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+@@ -24,10 +24,15 @@ from vllm.models.deepseek_v4_1.tilelang.engram import (  # noqa: E402
+     CLAMP,
+     engram_gate,
+     engram_gate_blocked,
++    engram_post_gate,
++    engram_post_gate_blocked,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.engram_hash import (  # noqa: E402
+     IMAGE_SENTINEL,
+ )
++from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
++    _mhc_post,
++)
+ 
+ DEVICE = "cuda"
+ HC, DIM, EPS = 4, 5120, 1e-6
+@@ -133,3 +138,81 @@ def test_blocked_kv_gives_the_packed_bits(images, blocks, block_cols, rows):
+     engram_gate_blocked(x, blocked, weight, ids, blocked_out, EPS, HC)
+     torch.cuda.synchronize()
+     assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))
++
++
++
++def _post_inputs(rows, seed=19):
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    layer_out = torch.randn((rows, DIM), generator=gen, device=DEVICE).bfloat16()
++    residual = torch.randn((rows, HC, DIM), generator=gen, device=DEVICE).bfloat16()
++    post = torch.rand((rows, HC), generator=gen, device=DEVICE, dtype=torch.float32) * 2
++    comb = torch.rand(
++        (rows, HC, HC), generator=gen, device=DEVICE, dtype=torch.float32
++    )
++    comb = comb / comb.sum(dim=-1, keepdim=True)
++    return layer_out, residual, post, comb
++
++
++@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("images", [True, False])
++def test_engram_post_gate_matches_post_then_gate_bits(images, ids_dtype):
++    """Fused ``engram_post_gate`` produces bit-identical output to ``mhc.post``
++    followed by ``engram_gate`` across all token counts and image sentinel masks."""
++    max_rows = max(ROWS)
++    _, kv, weight, ids = _inputs(max_rows, seed=23, images=images, ids_dtype=ids_dtype)
++    layer_out, residual, post, comb = _post_inputs(max_rows, seed=29)
++    reconstructed = torch.empty_like(residual)
++    _mhc_post(layer_out, residual, post, comb, reconstructed)
++    expected = torch.empty_like(residual)
++    engram_gate(
++        reconstructed.view(max_rows, HC * DIM),
++        kv,
++        weight,
++        ids,
++        expected.view(max_rows, HC * DIM),
++        EPS,
++        HC,
++    )
++    for rows in ROWS:
++        actual = torch.full_like(residual, float("nan"))
++        engram_post_gate(
++            layer_out[:rows],
++            residual[:rows],
++            post[:rows],
++            comb[:rows],
++            kv[:rows],
++            weight,
++            ids[:rows],
++            actual[:rows],
++            EPS,
++            HC,
++        )
++        assert torch.equal(
++            actual[:rows].view(torch.int16), expected[:rows].view(torch.int16)
++        ), f"rows={rows}"
++        assert actual[rows:].isnan().all(), f"rows={rows} wrote past its rows"
++
++
++@pytest.mark.parametrize("images", [False, True])
++@pytest.mark.parametrize("blocks, block_cols", [(3, 8544), (4, 6400)])
++@pytest.mark.parametrize("rows", [6, 300])
++def test_engram_post_gate_blocked_matches_packed_bits(images, blocks, block_cols, rows):
++    """Fused ``engram_post_gate_blocked`` produces bit-identical output to
++    ``engram_post_gate`` on packed ``kv``."""
++    _, kv, weight, ids = _inputs(rows, seed=31, images=images)
++    layer_out, residual, post, comb = _post_inputs(rows, seed=37)
++    width = (HC + 1) * DIM
++    padded = torch.zeros((rows + 3, blocks * block_cols), device=DEVICE).bfloat16()
++    padded[:rows, :width] = kv
++    padded[rows:] = NAN
++    blocked = padded.view(rows + 3, blocks, block_cols).transpose(0, 1).contiguous()
++    packed_out = torch.empty_like(residual)
++    blocked_out = torch.empty_like(residual)
++    engram_post_gate(
++        layer_out, residual, post, comb, kv, weight, ids, packed_out, EPS, HC
++    )
++    engram_post_gate_blocked(
++        layer_out, residual, post, comb, blocked, weight, ids, blocked_out, EPS, HC
++    )
++    torch.cuda.synchronize()
++    assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 538d0fc11..33be3b228 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1168,3 +1168,114 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+     if 24 % tp_size == 0:
+         assert rows.data_ptr() == gathered[0].data_ptr()
++
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@torch.inference_mode()
++def test_engram_forward_fuses_mhc_post_and_gate(dist_init):
++    """Engram.forward with previous_output, post_mix, and res_mix fuses mhc.post
++    into engram_post_gate and produces bit-identical output to standalone mhc.post
++    followed by Engram.forward."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
++    from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
++
++    device = torch.device("cuda", torch.cuda.current_device())
++    capacity, hidden, streams = 9, HIDDEN, 4
++    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
++    caps = native.Caps(
++        device=device,
++        max_tokens=capacity,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=1,
++        tp_rank=0,
++    )
++    layout = SimpleNamespace(
++        caps=(caps,),
++        lookup_plans=(None,),
++        geometry=geometry,
++        table_memory="device",
++        projection_tp=False,
++    )
++    config = SimpleNamespace(hidden_size=hidden, hc_mult=streams, rms_norm_eps=1e-3)
++    old_dtype = torch.get_default_dtype()
++    try:
++        torch.set_default_dtype(torch.bfloat16)
++        with torch.device(device):
++            module = Engram(config, None, layout, 0, False, "engram_fused_post_test")
++    finally:
++        torch.set_default_dtype(old_dtype)
++    module.q_weight.fill_(0.5)
++    module.k_weight.fill_(0.25)
++    module.wkv.weight.normal_(std=0.01)
++    module.embed_tokens.weight.fill_(2)
++    module.embed_tokens.weight_scale_inv.fill_(127)
++    module.process_weights_after_loading()
++
++    ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
++    module.prepare_embeddings(ids)
++    gen = torch.Generator(device=device).manual_seed(43)
++    layer_out = torch.randn(
++        (capacity, hidden), generator=gen, device=device, dtype=torch.bfloat16
++    )
++    residual = torch.randn(
++        (capacity, streams, hidden), generator=gen, device=device, dtype=torch.bfloat16
++    )
++    post_mix = torch.rand(
++        (capacity, streams), generator=gen, device=device, dtype=torch.float32
++    )
++    res_mix = torch.rand(
++        (capacity, streams, streams), generator=gen, device=device, dtype=torch.float32
++    )
++    token_ids = torch.full((capacity,), 7, dtype=torch.int32, device=device)
++    token_ids[2] = IMAGE_SENTINEL
++    token_ids[6] = IMAGE_SENTINEL
++
++    reconstructed = torch.empty_like(residual)
++    _mhc_post(layer_out, residual, post_mix, res_mix, reconstructed)
++    expected = module(reconstructed, ids, token_ids)
++    actual = module(
++        residual,
++        ids,
++        token_ids,
++        previous_output=layer_out,
++        post_mix=post_mix,
++        res_mix=res_mix,
++    )
++    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
++
++    # Also verify RankOrderParts input and SP prefill with trailing pad rows.
++    half = (layer_out.float() * 0.5).bfloat16()
++    parts = RankOrderParts(torch.stack((half, layer_out - half)))
++    reconstructed_parts = torch.empty_like(residual)
++    _mhc_post(parts.sum(), residual, post_mix, res_mix, reconstructed_parts)
++    for rank in range(2):
++        sp_layout = sp_prefill.SPRows(capacity, 2, rank)
++        local_rec = sp_layout.local_slice(reconstructed_parts)
++        local_res = sp_layout.local_slice(residual)
++        local_post = sp_layout.local_slice(post_mix)
++        local_comb = sp_layout.local_slice(res_mix)
++        local_parts = RankOrderParts(
++            torch.stack(
++                (
++                    sp_layout.local_slice(parts.packed[0]),
++                    sp_layout.local_slice(parts.packed[1]),
++                )
++            )
++        )
++        expected_sp = module(local_rec, ids, token_ids, sp_rows=sp_layout)
++        actual_sp = module(
++            local_res,
++            ids,
++            token_ids,
++            sp_rows=sp_layout,
++            previous_output=local_parts,
++            post_mix=local_post,
++            res_mix=local_comb,
++        )
++        assert torch.equal(actual_sp.view(torch.int16), expected_sp.view(torch.int16))
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 0dce94892..c357f6e5a 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -704,6 +704,8 @@ class ParallelEngramEmbedding(nn.Module):
+ 
+ 
+ class Engram(nn.Module):
++    supports_fused_post = True
++
+     def __init__(
+         self,
+         config,
+@@ -798,18 +800,24 @@ class Engram(nn.Module):
+         return ()
+ 
+     def declare_kernels(self) -> None:
+-        """Declare the TileLang gate: on packed rows always, and on the column blocks
+-        of a column-parallel projection when the model runs prefill sequence
+-        parallel (the blocked gate, one block per rank). The model passes the
+-        step's int32 token ids, the gate finding the image sentinel itself."""
++        """Declare the TileLang gate (both standalone and fused with ``mhc.post``):
++        on packed rows always, and on the column blocks of a column-parallel
++        projection when the model runs prefill sequence parallel (the blocked gate,
++        one block per rank). The model passes the step's int32 token ids, the gate
++        finding the image sentinel itself."""
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+         from vllm.models.deepseek_v4_1.tilelang.engram import (
+             engram_gate_blocked_kernel,
+             engram_gate_kernel,
++            engram_post_gate_blocked_kernel,
++            engram_post_gate_kernel,
+         )
+ 
+         calls = [
+-            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32")
++            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32"),
++            prepare.call(
++                engram_post_gate_kernel, self.hc_mult, self.dim, self.eps, "int32"
++            ),
+         ]
+         sequence_parallel = (
+             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
+@@ -821,6 +829,8 @@ class Engram(nn.Module):
+             key = columns.copy_columns_key(self.hc_mult * self.dim, torch.bfloat16)
+             calls.append(prepare.call(columns.copy_columns_kernel, *key))
+         if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
++            world_size = get_tensor_model_parallel_world_size()
++            block_cols = self.wkv.output_size_per_partition
+             calls.append(
+                 prepare.call(
+                     engram_gate_blocked_kernel,
+@@ -828,8 +838,19 @@ class Engram(nn.Module):
+                     self.dim,
+                     self.eps,
+                     "int32",
+-                    get_tensor_model_parallel_world_size(),
+-                    self.wkv.output_size_per_partition,
++                    world_size,
++                    block_cols,
++                )
++            )
++            calls.append(
++                prepare.call(
++                    engram_post_gate_blocked_kernel,
++                    self.hc_mult,
++                    self.dim,
++                    self.eps,
++                    "int32",
++                    world_size,
++                    block_cols,
+                 )
+             )
+         prepare.declare(lambda: calls)
+@@ -863,11 +884,24 @@ class Engram(nn.Module):
+         self._disk_prepared_tokens = num_tokens
+         self._disk_prepared = True
+ 
+-    def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
++    def forward(
++        self,
++        hidden_states,
++        hash_ids,
++        token_mask=None,
++        sp_rows=None,
++        *,
++        previous_output=None,
++        post_mix=None,
++        res_mix=None,
++    ):
+         """Gate ``hidden_states`` with this layer's Engram rows.
+ 
+         ``token_mask`` is the step's token ids (the image sentinel's rows pass
+-        through).
++        through). When ``previous_output``, ``post_mix`` and ``res_mix`` are
++        given, reconstructs ``hidden_states`` via ``mhc.post`` inside the gate
++        kernel in a single launch without writing or reading an intermediate
++        multi-stream residual tensor.
+ 
+         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
+         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
+@@ -903,6 +937,55 @@ class Engram(nn.Module):
+             kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
+             del rows
+             kv_start = 0 if sp_rows is None else sp_rows.start
++        if previous_output is not None:
++            from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++            from vllm.models.deepseek_v4_1.tilelang.engram import (
++                engram_post_gate,
++                engram_post_gate_blocked,
++            )
++
++            if isinstance(previous_output, RankOrderParts):
++                previous_output = previous_output.sum()
++            out = torch.empty_like(hidden_states)
++            residual_in = hidden_states
++            mix_out = out
++            if sp_rows is not None:
++                start, real = sp_rows.start, sp_rows.real_rows
++                if real < hidden_states.shape[0]:
++                    from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
++
++                    _mhc_post(
++                        previous_output[real:],
++                        hidden_states[real:],
++                        post_mix[real:],
++                        res_mix[real:],
++                        out[real:],
++                    )
++                if real == 0:
++                    return out
++                previous_output = previous_output[:real]
++                residual_in = hidden_states[:real]
++                post_mix = post_mix[:real]
++                res_mix = res_mix[:real]
++                mix_out = out[:real]
++                if not blocked:
++                    kv = kv[kv_start : kv_start + real]
++                if token_mask is not None:
++                    token_mask = token_mask[start : start + real]
++            post_gate = engram_post_gate_blocked if blocked else engram_post_gate
++            post_gate(
++                previous_output,
++                residual_in,
++                post_mix,
++                res_mix,
++                kv,
++                self.norm_weights,
++                token_mask,
++                mix_out,
++                self.eps,
++                self.hc_mult,
++            )
++            return out
+         state = hidden_states.flatten(1)
+         out = torch.empty_like(state)
+         mix_out = out
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 6331f5ce8..88663a15b 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -353,20 +353,33 @@ class DeepseekV4DecoderLayer(nn.Module):
+         apply_engram = self.engram is not None and engram_hashes is not None
+         if residual is None:
+             residual = x
+-        elif apply_engram:
+-            # Engram mutates the reconstructed residual; do not fuse across it.
+-            residual = self.mhc.post(x, residual, post_mix, res_mix)
+-            previous_output = None
+         if apply_engram:
++            fuse_engram_post = (
++                previous_output is not None
++                and residual.ndim == 3
++                and getattr(self.engram, "supports_fused_post", False)
++            )
++            if previous_output is not None and not fuse_engram_post:
++                # Fallback when Engram is a mock or 2D residual.
++                residual = self.mhc.post(x, residual, post_mix, res_mix)
++                previous_output = None
+             if residual.ndim == 2:
+                 residual = (
+                     residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
+                 )
++            engram_kwargs = {"sp_rows": sp_rows}
++            if fuse_engram_post:
++                engram_kwargs.update(
++                    previous_output=previous_output,
++                    post_mix=post_mix,
++                    res_mix=res_mix,
++                )
++                previous_output = None
+             residual = self.engram(
+                 residual,
+                 engram_hashes[:, self.engram.layer_hash_index],
+                 engram_mask,
+-                sp_rows=sp_rows,
++                **engram_kwargs,
+             )
+         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
+         pre_kwargs = {}
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+index e8035366a..6c832cf2b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -25,12 +25,42 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import pdl
+ from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
+ 
+ # Gate magnitudes below this clamp to it before the square root.
+ CLAMP = 1e-6
+ 
+ 
++@T.macro
++def _reconstruct_stream(
++    layer_out, residual, post, comb, xs, t, h, tx, chunks, threads, vec, hc_mult
++):
++    """Reconstruct stream ``h`` of token ``t`` from ``layer_out`` and ``residual`` in
++    registers using ``post_streams``' exact FP32 FMA sequence, rounded to BF16."""
++    xv = T.alloc_local((vec,), T.bfloat16)
++    rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
++    pm = T.alloc_local((1,), T.float32)
++    cm = T.alloc_local((hc_mult,), T.float32)
++    p_acc = T.alloc_var(T.float32)
++    pm[0] = post[t, h]
++    for m in T.unroll(hc_mult):
++        cm[m] = comb[t, m, h]
++    for c in T.serial(chunks):
++        col = (c * threads + tx) * vec
++        for i in T.vectorized(vec):
++            xv[i] = layer_out[t, col + i]
++        for m in T.unroll(hc_mult):
++            for i in T.vectorized(vec):
++                rv[m * vec + i] = residual[t, m, col + i]
++        for i in T.unroll(vec):
++            p_acc = cm[0] * T.cast(rv[i], T.float32)
++            p_acc = T.fma(pm[0], T.cast(xv[i], T.float32), p_acc)
++            for m in T.unroll(1, hc_mult):
++                p_acc = T.fma(cm[m], T.cast(rv[m * vec + i], T.float32), p_acc)
++            xs[c * vec + i] = T.cast(T.cast(p_acc, T.bfloat16), T.float32)
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def engram_gate_kernel(
+     hc_mult: int,
+@@ -55,6 +85,7 @@ def engram_gate_kernel(
+         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+     ):
+         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             xs = T.alloc_local((chunks * vec,), T.float32)
+             vs = T.alloc_local((chunks * vec,), T.float32)
+@@ -180,6 +211,7 @@ def engram_gate_blocked_kernel(
+         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+     ):
+         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
+             tx = T.get_thread_binding()
+             xs = T.alloc_local((chunks * vec,), T.float32)
+             vs = T.alloc_local((chunks * vec,), T.float32)
+@@ -279,10 +311,291 @@ def engram_gate_blocked(
+     )
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_post_gate_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    threads: int = 256,
++    vec: int = 4,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_post_gate(
++        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            _reconstruct_stream(
++                layer_out,
++                residual,
++                post,
++                comb,
++                xs,
++                t,
++                h,
++                tx,
++                chunks,
++                threads,
++                vec,
++                hc_mult,
++            )
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[t, hc_mult, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[t, h, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_post_gate
++
++
++def engram_post_gate(
++    layer_out: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """Reconstruct ``residual`` via ``mhc.post(layer_out, residual, post, comb)`` and
++    gate it with ``kv`` and ``weight`` into ``out`` in a single launch, without
++    writing or reading the intermediate multi-stream residual."""
++    tokens = residual.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    kernel = engram_post_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
++    kernel(
++        layer_out.view(tokens, hidden),
++        residual.view(tokens, hc_mult, hidden),
++        post.view(tokens, hc_mult),
++        comb.view(tokens, hc_mult, hc_mult),
++        kv.view(tokens, hc_mult + 1, hidden),
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_post_gate_blocked_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    blocks: int,
++    block_cols: int,
++    threads: int = 256,
++    vec: int = 4,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert block_cols % vec == 0 and blocks * block_cols >= (hc_mult + 1) * hidden
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def engram_post_gate_blocked(
++        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            _reconstruct_stream(
++                layer_out,
++                residual,
++                post,
++                comb,
++                xs,
++                t,
++                h,
++                tx,
++                chunks,
++                threads,
++                vec,
++                hc_mult,
++            )
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    value = hc_mult * hidden + (c * threads + tx) * vec
++                    key = h * hidden + (c * threads + tx) * vec
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[
++                            value // block_cols, t, value % block_cols + i
++                        ]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[key // block_cols, t, key % block_cols + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_post_gate_blocked
++
++
++def engram_post_gate_blocked(
++    layer_out: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """``engram_post_gate`` with ``kv`` as column blocks ``[N, rows, C]``."""
++    tokens = residual.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    blocks, _, block_cols = kv.shape
++    kernel = engram_post_gate_blocked_kernel(
++        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
++    )
++    kernel(
++        layer_out.view(tokens, hidden),
++        residual.view(tokens, hc_mult, hidden),
++        post.view(tokens, hc_mult),
++        comb.view(tokens, hc_mult, hc_mult),
++        kv,
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
+ __all__ = [
+     "CLAMP",
+     "engram_gate",
+     "engram_gate_blocked",
+     "engram_gate_blocked_kernel",
+     "engram_gate_kernel",
++    "engram_post_gate",
++    "engram_post_gate_blocked",
++    "engram_post_gate_blocked_kernel",
++    "engram_post_gate_kernel",
+ ]

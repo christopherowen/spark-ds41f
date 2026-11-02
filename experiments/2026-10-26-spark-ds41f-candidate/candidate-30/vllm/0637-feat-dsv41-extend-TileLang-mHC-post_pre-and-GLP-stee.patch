@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vedcsolution <226183072+vedcsolution@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:01:54 +0100
+Subject: [PATCH 0637/0528] feat(dsv41): extend TileLang mHC post_pre and GLP
+ steer to 2..8 ranks
+
+Use MAX_RANK_ORDER_WORLD (8) in project_streams, project_and_finalize_streams, and glp_steer_kernel, and extend test_post_pre_adds_rank_order_parts and test_post_of_rank_order_parts_matches_tile_kernels across world sizes 2..8.
+---
+ tests/kernels/test_deepseek_v41_tilelang_mhc.py | 4 ++--
+ vllm/models/deepseek_v4_1/tilelang/glp.py       | 3 ++-
+ vllm/models/deepseek_v4_1/tilelang/mhc.py       | 9 ++++++---
+ 3 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 235284e19..21fd2c224 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -191,7 +191,7 @@ def test_post_pre_matches_reference(mhc, tokens):
+     _check(actual, _reference(actual[0], fn, scale, base, incoming, weight), tokens)
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", [2, 3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("tokens", [1, 9, 64, 300])
+ def test_post_pre_adds_rank_order_parts(mhc, world, tokens):
+     """Unreduced partials give exactly the result of their rank-order sum."""
+@@ -485,7 +485,7 @@ def test_collapse_writes_the_sink_column(mhc, tokens, column):
+     _assert_bits_equal(columns, state[:, :, column].float(), "columns: ")
+ 
+ 
+-@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("world", [2, 3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+ def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):
+     """The ranks' unreduced partials are summed in rank order first (RankOrderParts),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+index ee087c2c4..ceb573aa5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/glp.py
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -37,6 +37,7 @@ import tilelang.language as T
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.collectives import MAX_RANK_ORDER_WORLD
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@@ -44,7 +45,7 @@ def glp_steer_kernel(
+     hc_mult: int, hidden: int, world: int, threads: int = 320, vec: int = 8
+ ):
+     assert hidden % (threads * vec) == 0 and threads % 32 == 0
+-    assert 1 <= world <= 4
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD
+     chunks = hidden // (threads * vec)
+     warps = threads // 32
+     span = chunks * vec
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 06200f436..5c04bd965 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -54,7 +54,10 @@ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+-from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++from vllm.models.deepseek_v4_1.tilelang.collectives import (
++    MAX_RANK_ORDER_WORLD,
++    RankOrderParts,
++)
+ from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
+ from vllm.models.deepseek_v4_1.tilelang.linear import (
+     MXFP8Rows,
+@@ -123,7 +126,7 @@ def project_streams(
+     collapse is rounded to BF16, with its sum of squares ``Q``.
+     """
+     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
+-    assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD and (world == 1 or mode == "post_pre")
+     assert not with_aux or mode == "post_pre"
+     splits = hidden_size // block_H
+     streams = 1 if mode == "broadcast" else MULT
+@@ -536,7 +539,7 @@ def project_and_finalize_streams(
+     token tile reduces ``S``, ``P`` and ``Q`` in split order and runs ``finalize``'s
+     mix split, Sinkhorn, collapse RMSNorm and MXFP8 cast for the tile's tokens."""
+     assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
+-    assert 1 <= world <= 4 and (world == 1 or mode == "post_pre")
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD and (world == 1 or mode == "post_pre")
+     assert not with_aux or mode == "post_pre"
+     assert hidden_size % VEC == 0 and block_M % 2 == 0
+     splits = hidden_size // block_H

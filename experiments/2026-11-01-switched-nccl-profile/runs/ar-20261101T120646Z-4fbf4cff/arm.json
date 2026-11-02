@@ -1,0 +1,21 @@
+{
+ "notes": "The candidate the harness boots. Ablation of sparknet's switched NCCL profile from the best stack: direct exchange (spark-ds41f:1030-direct) with tp4-switched's own NCCL settings (4 channels, 4 MiB buffers, cumem on, 2 MiB all-gather cap), NVFP4 draft heads with five drafts, adaptive verification row cost 0.01, and a 32,768-token prefill budget. VLLM_SERVER_DEV_MODE=1 exposes the engine grid's collective RPC.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp4-switched"
+ },
+ "set": {
+  "environment": {
+   "VLLM_SERVER_DEV_MODE": "1",
+   "VLLM_DS41_DRAFT_NVFP4_HEAD": "1",
+   "VLLM_DS41_MARKOV_NVFP4": "1"
+  }
+ },
+ "serve_options": {
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":4,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.01}",
+  "--max-cudagraph-capture-size": "96",
+  "--compilation-config": "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,64,72,80,88,96]}",
+  "--long-prefill-token-threshold": "32672",
+  "--max-num-batched-tokens": "32768"
+ }
+}

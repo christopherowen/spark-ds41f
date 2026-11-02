@@ -1,0 +1,736 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:51:36 +0100
+Subject: [PATCH 0643/0528] perf(dsv41): fuse DSpark context join+cast, chain
+ columns PDL, and vectorize packed vocab decode
+
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |   6 +
+ .../test_deepseek_v41_tilelang_columns.py     |  30 +++
+ ...st_deepseek_v41_tilelang_dspark_context.py |  62 ++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  44 ++++-
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 180 ++++++++++++++++++
+ .../deepseek_v4_1/tilelang/dspark_context.py  |   4 +
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  25 ++-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  94 +++++++--
+ 8 files changed, 418 insertions(+), 27 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 73aa2f494..f4e02db80 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -23,6 +23,12 @@ reader.
+ import re
+ 
+ CHAIN = {
++    "zero_packs",
++    "vocab_greedy_finish",
++    "split_columns",
++    "join_columns_and_cast_mxfp8",
++    "copy_columns",
++    "context_inputs",
+     "activation_swiglu_clamp",
+     "activation_swiglu_clamp_cast",
+     "attention_front",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_columns.py b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+index cb4b7d2f7..b7a255f02 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_columns.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+@@ -79,6 +79,36 @@ def test_join_columns_like_torch_cat(parts, rows):
+     assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
+ 
+ 
++@pytest.mark.parametrize("parts", [3, 2])
++@pytest.mark.parametrize("rows", [1, 5, 96, 512])
++def test_join_columns_and_cast_mxfp8_matches_join_then_cast(parts, rows):
++    """Fused join_columns_and_cast_mxfp8 produces identical BF16 joined rows
++    and identical MXFP8 values and packed UE8M0 scales to join_columns + cast_mxfp8."""
++    from vllm.models.deepseek_v4_1 import kernels
++
++    width = 5120
++    states = []
++    for i in range(parts):
++        gen = torch.Generator(device=DEVICE).manual_seed(rows + 19 * i)
++        x = torch.randn(rows, width, generator=gen, device=DEVICE, dtype=torch.bfloat16)
++        if rows:
++            x[0, :3] = torch.tensor(
++                [0.0, 128.0, -0.00390625], device=DEVICE, dtype=torch.bfloat16
++            )
++        states.append(x)
++    out_ref = _rows(rows, parts * width, rows + 77)
++    out_fused = out_ref.clone()
++    ref_joined = columns.join_columns(states, out_ref)
++    ref_cast = kernels.cast_mxfp8(ref_joined)
++    fused_cast = columns.join_columns_and_cast_mxfp8(states, out_fused)
++    assert fused_cast.rows.data_ptr() == out_fused.data_ptr()
++    assert torch.equal(_bits(out_fused), _bits(ref_joined))
++    assert torch.equal(
++        fused_cast.values[:rows].view(torch.uint8), ref_cast.values[:rows].view(torch.uint8)
++    )
++    assert torch.equal(fused_cast.scales[:rows], ref_cast.scales[:rows])
++
++
+ @pytest.mark.parametrize(
+     "shape, dtype",
+     [
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index a296471a5..c530e27e2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -303,3 +303,65 @@ def test_combine_and_precompute_context_kv_fuses_cast_into_main_norm(monkeypatch
+         assert layer_idx == i
+         assert torch.equal(kv_raw, main_x[:, :512] + i)
+         assert pos is positions and slot is slots[i]
++
++def test_combine_aux_hidden_states_into_fuses_join_and_cast_mxfp8(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1 import kernels
++    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4Model
++    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
++    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
++
++    gen = torch.Generator(device=DEVICE).manual_seed(42)
++    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
++    norm.with_cast = True
++    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
++
++    seen_provided = []
++
++    class MainProj:
++        tilelang_mxfp8_input = True
++
++        def __call__(self, x):
++            seen_provided.append(provided_mxfp8(x))
++            return x[:, :WIDTH] * 0.5 + x[:, WIDTH : 2 * WIDTH] * 0.25
++
++    class KvProj:
++        tilelang_mxfp8_input = True
++
++        def __call__(self, x):
++            seen_provided.append(provided_mxfp8(x))
++            return x[:, :512]
++
++    model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
++    torch.nn.Module.__init__(model)
++    model.hidden_size = WIDTH
++    model.main_proj = MainProj()
++    model.main_norm = norm
++    model._context_kv_projections = [KvProj()]
++    model._context_main_cast = None
++    model.layers = [
++        SimpleNamespace(
++            attn=SimpleNamespace(insert_raw_context_kv=lambda kv_raw, pos, slots: None)
++        )
++    ]
++
++    casts = []
++    monkeypatch.setattr(kernels, "cast_mxfp8", lambda x: casts.append(x))
++
++    rows = 12
++    aux_states = [
++        torch.randn(rows, WIDTH, generator=gen, device=DEVICE, dtype=torch.bfloat16)
++        for _ in range(3)
++    ]
++    out = torch.empty(rows, WIDTH, dtype=torch.bfloat16, device=DEVICE)
++    model.combine_aux_hidden_states_into(aux_states, out)
++    assert model._context_main_cast is not None
++    assert model._context_main_cast.rows.data_ptr() == out.data_ptr()
++    assert seen_provided[0].values.shape[1] == 3 * WIDTH
++
++    positions = torch.arange(rows, dtype=torch.int64, device=DEVICE)
++    slots = [torch.arange(rows, dtype=torch.int64, device=DEVICE)]
++    model.precompute_and_store_context_kv(out, positions, slots)
++    assert not casts
++    assert seen_provided[1].values.shape[1] == WIDTH
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 4a50071e7..1a65f7cd0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -215,17 +215,27 @@ class DSparkDeepseekV4Model(nn.Module):
+             self.hidden_size, vllm_config.model_config.dtype
+         )
+         # combine_aux_hidden_states_into: the eager context step's join.
++        join_widths = (self.hidden_size,) * len(self.target_layer_ids)
+         join_key = columns.split_columns_key(
+-            (self.hidden_size,) * len(self.target_layer_ids),
++            join_widths,
+             vllm_config.model_config.dtype,
+             join=True,
+         )
+-        prepare.declare(
+-            lambda: [
+-                prepare.call(dspark_context.context_inputs_kernel, *context_key),
+-                prepare.call(columns.split_columns_kernel, *join_key),
+-            ]
+-        )
++        calls = [
++            prepare.call(dspark_context.context_inputs_kernel, *context_key),
++            prepare.call(columns.split_columns_kernel, *join_key),
++        ]
++        if (
++            vllm_config.model_config.dtype == torch.bfloat16
++            and self.hidden_size % 128 == 0
++        ):
++            join_cast_key = columns.join_columns_and_cast_mxfp8_key(join_widths)
++            calls.append(
++                prepare.call(
++                    columns.join_columns_and_cast_mxfp8_kernel, *join_cast_key
++                )
++            )
++        prepare.declare(lambda: calls)
+         self._context_kv_projections: list = []
+ 
+         self.num_dspark_layers = (
+@@ -364,7 +374,17 @@ class DSparkDeepseekV4Model(nn.Module):
+         speculator's copy into its context buffer, gone)."""
+         rows = out.shape[0]
+         joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
+-        columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
++        parts = [aux[:rows] for aux in aux_hidden_states]
++        if (
++            joined.dtype == torch.bfloat16
++            and self.hidden_size % 128 == 0
++            and _casts_main_proj_input(self)
++        ):
++            joined_cast = columns.join_columns_and_cast_mxfp8(parts, joined)
++            with kernels.mxfp8_inputs(joined_cast):
++                self.combine_hidden_states(joined, out=out)
++            return
++        columns.join_columns(parts, joined)
+         self.combine_hidden_states(joined, out=out)
+ 
+     @torch.inference_mode()
+@@ -460,6 +480,14 @@ class DSparkDeepseekV4Model(nn.Module):
+         return hidden_states
+ 
+ 
++def _casts_main_proj_input(model: object) -> bool:
++    main_proj = getattr(model, "main_proj", None)
++    if getattr(main_proj, "tilelang_mxfp8_input", False):
++        return True
++    quant_method = getattr(main_proj, "quant_method", None)
++    return type(quant_method).__name__ == "TileLangFP8LinearMethod"
++
++
+ def _casts_context_main_x(model: object) -> bool:
+     return any(
+         getattr(proj, "tilelang_mxfp8_input", False)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index 3dc715438..5c78e414c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -19,6 +19,7 @@ from functools import cache
+ 
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import pdl
+ from vllm.tilelang_utils import T, tilelang
+ 
+ _THREADS = 128
+@@ -36,6 +37,9 @@ _PASS = {
+ # The destinations are const-qualified pointers: TileLang declares a buffer written
+ # only through these calls read-only.
+ _HEADER = r"""
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
+ __device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s) {
+   *reinterpret_cast<uint4*>(const_cast<void*>(d)) = *reinterpret_cast<const uint4*>(s);
+ }
+@@ -43,9 +47,66 @@ __device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s)
+ __device__ __forceinline__ void vllm_columns_zero_b128(const void* d) {
+   *reinterpret_cast<uint4*>(const_cast<void*>(d)) = make_uint4(0u, 0u, 0u, 0u);
+ }
++
++__device__ __forceinline__ void vllm_columns_join_and_cast_8(
++    const void* dst_bf16_ptr,
++    const void* src_bf16_ptr,
++    const void* dst_fp8_ptr,
++    const void* dst_sf_u32_ptr,
++    int lane) {
++  const uint4 raw = *reinterpret_cast<const uint4*>(src_bf16_ptr);
++  *reinterpret_cast<uint4*>(const_cast<void*>(dst_bf16_ptr)) = raw;
++
++  const __nv_bfloat162* bf2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
++  const float2 f01 = __bfloat1622float2(bf2[0]);
++  const float2 f23 = __bfloat1622float2(bf2[1]);
++  const float2 f45 = __bfloat1622float2(bf2[2]);
++  const float2 f67 = __bfloat1622float2(bf2[3]);
++
++  float amax0 = fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)),
++                      fmaxf(fabsf(f23.x), fabsf(f23.y)));
++  float amax1 = fmaxf(fmaxf(fabsf(f45.x), fabsf(f45.y)),
++                      fmaxf(fabsf(f67.x), fabsf(f67.y)));
++  float amax = fmaxf(amax0, amax1);
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++
++  const float scale_inv = fmaxf(amax, 1e-4f) * (1.0f / 448.0f);
++  const unsigned int bits = __float_as_uint(scale_inv);
++  const unsigned int rounded_bits = (bits + 0x007FFFFFu) & 0x7F800000u;
++  const unsigned int ue8m0_byte = (rounded_bits >> 23) & 0xFFu;
++  const float inv_scale = __uint_as_float((254u - ue8m0_byte) << 23);
++
++  const float2 q01 = make_float2(f01.x * inv_scale, f01.y * inv_scale);
++  const float2 q23 = make_float2(f23.x * inv_scale, f23.y * inv_scale);
++  const float2 q45 = make_float2(f45.x * inv_scale, f45.y * inv_scale);
++  const float2 q67 = make_float2(f67.x * inv_scale, f67.y * inv_scale);
++  const __nv_fp8x2_storage_t p01 =
++      __nv_cvt_float2_to_fp8x2(q01, __NV_SATFINITE, __NV_E4M3);
++  const __nv_fp8x2_storage_t p23 =
++      __nv_cvt_float2_to_fp8x2(q23, __NV_SATFINITE, __NV_E4M3);
++  const __nv_fp8x2_storage_t p45 =
++      __nv_cvt_float2_to_fp8x2(q45, __NV_SATFINITE, __NV_E4M3);
++  const __nv_fp8x2_storage_t p67 =
++      __nv_cvt_float2_to_fp8x2(q67, __NV_SATFINITE, __NV_E4M3);
++  *reinterpret_cast<uint2*>(const_cast<void*>(dst_fp8_ptr)) = make_uint2(
++      (unsigned int)p01 | ((unsigned int)p23 << 16),
++      (unsigned int)p45 | ((unsigned int)p67 << 16));
++
++  const int half_base = lane & 16;
++  const unsigned int b0 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 0);
++  const unsigned int b1 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 4);
++  const unsigned int b2 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 8);
++  const unsigned int b3 = __shfl_sync(0xffffffffu, ue8m0_byte, half_base + 12);
++  if ((lane & 15) == 0) {
++    *reinterpret_cast<unsigned int*>(const_cast<void*>(dst_sf_u32_ptr)) =
++        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
++  }
++}
+ """
+ 
+ 
++
+ def _vector(dtype: str) -> int:
+     return _VECTOR_BYTES // {"bfloat16": 2, "float16": 2, "float32": 4}[dtype]
+ 
+@@ -70,6 +131,7 @@ def copy_columns_kernel(width: int, dtype: str):
+     ):
+         # Rows on the grid's x axis (no 65535 limit), column blocks on y.
+         with T.Kernel(rows, T.ceildiv(width, span), threads=_THREADS) as (row, bx):
++            pdl.chain()
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
+             if col < width:
+@@ -92,6 +154,7 @@ def zero_packs_kernel():
+     @T.prim_func
+     def zero_packs(out: T.Tensor((words,), T.int32), packs: T.int32):
+         with T.Kernel(T.ceildiv(packs, _THREADS), threads=_THREADS) as bx:
++            pdl.chain()
+             T.import_source(_HEADER)
+             p = bx * _THREADS + T.get_thread_binding()
+             if p < packs:
+@@ -141,6 +204,7 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool =
+         rows: T.int32,
+     ):
+         with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
++            pdl.chain()
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
+             # The whole row's address inline in each call: bound to a variable it
+@@ -163,6 +227,74 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool =
+     return split_columns
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def join_columns_and_cast_mxfp8_kernel(widths: tuple[int, int, int]):
++    """Join two or three BF16 parts side by side into ``out`` while emitting
++    ``out``'s MXFP8 (E4M3 + packed UE8M0) cast in the same launch."""
++    if any(width % 128 for width in widths) or not widths[0] or not widths[1]:
++        raise ValueError(f"widths {widths} must be 128-element aligned")
++    w0, w1, w2 = widths
++    total = w0 + w1 + w2
++    sf_words = total // 128
++    span = _THREADS * 8
++    out_rows, rows0, rows1, rows2, val_rows, sf_rows = T.dynamic(
++        "out_rows, rows0, rows1, rows2, val_rows, sf_rows"
++    )
++
++    @T.prim_func
++    def join_columns_and_cast_mxfp8(
++        out: T.Tensor((out_rows, total), T.bfloat16),
++        in0: T.Tensor((rows0, w0), T.bfloat16),
++        in1: T.Tensor((rows1, w1), T.bfloat16),
++        in2: T.Tensor((rows2, max(w2, 128)), T.bfloat16),
++        values: T.Tensor((val_rows, total), T.float8_e4m3fn),
++        scales: T.Tensor((sf_rows, sf_words), T.uint32),
++        rows: T.int32,
++    ):
++        with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
++            pdl.wait()
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            col = bx * span + tx * 8
++            sf_col = bx * 8 + (tx >> 4)
++            lane = tx & 31
++            if col < w0:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_join_and_cast_8",
++                    T.address_of(out[row, col]),
++                    T.address_of(in0[row, col]),
++                    T.address_of(values[row, col]),
++                    T.address_of(scales[row, sf_col]),
++                    lane,
++                )
++            elif col < w0 + w1:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_join_and_cast_8",
++                    T.address_of(out[row, col]),
++                    T.address_of(in1[row, col - w0]),
++                    T.address_of(values[row, col]),
++                    T.address_of(scales[row, sf_col]),
++                    lane,
++                )
++            elif col < total:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_join_and_cast_8",
++                    T.address_of(out[row, col]),
++                    T.address_of(in2[row, col - w0 - w1]),
++                    T.address_of(values[row, col]),
++                    T.address_of(scales[row, sf_col]),
++                    lane,
++                )
++
++            if rows == 1:
++                pdl.trigger()
++
++    return join_columns_and_cast_mxfp8
++
++
+ @cache
+ def _bound(split: bool, *key):
+     """The kernel of ``key``, resolved once (after the kernel cache freezes, an
+@@ -170,6 +302,12 @@ def _bound(split: bool, *key):
+     return (split_columns_kernel if split else copy_columns_kernel)(*key)
+ 
+ 
++@cache
++def _bound_join_cast(*key):
++    """The ``join_columns_and_cast_mxfp8_kernel`` of ``key``, resolved once."""
++    return join_columns_and_cast_mxfp8_kernel(*key)
++
++
+ def _check(*tensors: torch.Tensor) -> str:
+     dtype = tensors[0].dtype
+     vector = _VECTOR_BYTES // tensors[0].element_size()
+@@ -195,6 +333,10 @@ def split_columns_key(
+     return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype], join)
+ 
+ 
++def join_columns_and_cast_mxfp8_key(widths: tuple[int, ...]) -> tuple:
++    return (tuple(widths) + (0,) * (3 - len(widths)),)
++
++
+ def copy_columns(src: torch.Tensor, dst: torch.Tensor) -> None:
+     """``dst.copy_(src)`` for 2-D views of 16-byte aligned rows."""
+     if src.shape != dst.shape:
+@@ -242,6 +384,41 @@ def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
++def join_columns_and_cast_mxfp8(parts: list[torch.Tensor], out: torch.Tensor):
++    """``join_columns(parts, out)`` fused with ``cast_mxfp8(out)`` in one launch."""
++    from .linear import empty_mxfp8
++
++    widths = tuple(part.shape[-1] for part in parts)
++    if len(parts) not in (2, 3) or out.shape != (parts[0].shape[0], sum(widths)):
++        raise ValueError(f"cannot join {widths} into {tuple(out.shape)}")
++    if not all(t.is_contiguous() for t in (out, *parts)) or any(
++        part.shape[0] != out.shape[0] for part in parts
++    ):
++        raise ValueError(
++            "join_columns_and_cast_mxfp8 joins contiguous parts of the same rows"
++        )
++    if out.dtype != torch.bfloat16 or any(w % 128 for w in widths):
++        raise ValueError(
++            "join_columns_and_cast_mxfp8 requires 128-element aligned BF16 parts"
++        )
++    _check(out, *parts)
++    cast = empty_mxfp8(out)
++    rows = out.shape[0]
++    if rows:
++        third = parts[2] if len(parts) == 3 else parts[0].view(-1, 128)
++        key = join_columns_and_cast_mxfp8_key(widths)
++        _bound_join_cast(*key)(
++            out,
++            parts[0],
++            parts[1],
++            third,
++            cast.values[:rows],
++            cast.scales[:rows].view(torch.uint32),
++            rows,
++        )
++    return cast
++
++
+ __all__ = [
+     "zero_",
+     "zero_packs_kernel",
+@@ -249,6 +426,9 @@ __all__ = [
+     "copy_columns_kernel",
+     "copy_columns_key",
+     "join_columns",
++    "join_columns_and_cast_mxfp8",
++    "join_columns_and_cast_mxfp8_kernel",
++    "join_columns_and_cast_mxfp8_key",
+     "split_columns",
+     "split_columns_kernel",
+     "split_columns_key",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/dspark_context.py b/vllm/models/deepseek_v4_1/tilelang/dspark_context.py
+index 030316318..1e65d17ac 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/dspark_context.py
++++ b/vllm/models/deepseek_v4_1/tilelang/dspark_context.py
+@@ -18,9 +18,11 @@ from functools import cache
+ 
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import pdl
+ from vllm.tilelang_utils import T, tilelang
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ 
++
+ NUM_SOURCES = 3  # dspark_target_layer_ids of DeepSeek V4.1 Flash
+ _THREADS = 128
+ _VECTOR_BYTES = 16
+@@ -77,7 +79,9 @@ def context_inputs_kernel(width: int, dtype: str):
+             bx,
+             row,
+         ):
++            pdl.chain()
+             T.import_source(_HEADER)
++
+             tx = T.get_thread_binding()
+             col = bx * span + tx * vector
+             if col < width:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 95b007fc4..9f6145759 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -178,19 +178,29 @@ def provide_mxfp8(rows: MXFP8Rows):
+         _PROVIDED.pop()
+ 
+ 
++def optional_provided_mxfp8(x: torch.Tensor) -> MXFP8Rows | None:
++    """The handed-over cast of ``x`` when a producer provided one via
++    ``provide_mxfp8``, else ``None``."""
++    for rows in reversed(_PROVIDED):
++        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
++            return rows
++    return None
++
++
+ def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+     """The handed-over cast of ``x``: rows at ``x``'s address, of ``x``'s shape. The
+     holder keeps them alive, so no other tensor can be at that address. A projection
+     whose input arrives without its cast fails here: it has no cast of its own."""
+-    for rows in reversed(_PROVIDED):
+-        if rows.rows.data_ptr() == x.data_ptr() and rows.rows.shape == x.shape:
+-            return rows
++    rows = optional_provided_mxfp8(x)
++    if rows is not None:
++        return rows
+     raise RuntimeError(
+         f"no MXFP8 cast was handed over for these {tuple(x.shape)} rows: the "
+         "projection reads its input's cast from the input's producer (provide_mxfp8)"
+     )
+ 
+ 
++
+ # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+ # row in twice the time of a 16-row tile; every height gives the same
+ # partials bit for bit, so each row count takes the smallest tile that fits.
+@@ -255,8 +265,12 @@ def _block32_linear(
+         x = x.reshape(-1, k)
+         out = out.view(x.shape[0], n)
+     rows = x.shape[0]
+-    if layer.tilelang_mxfp8_input:
+-        provided = provided_mxfp8(x)
++    provided = (
++        provided_mxfp8(x)
++        if layer.tilelang_mxfp8_input
++        else (optional_provided_mxfp8(x) if layer.tilelang_groups == 1 else None)
++    )
++    if provided is not None:
+         if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+             _block32_split_mxfp8(
+                 layer, provided.values, provided.scales, out.view(rows, n), scratch
+@@ -266,6 +280,7 @@ def _block32_linear(
+                 layer, provided.values, provided.scales, out.view(rows, n), rows
+             )
+         return
++
+     if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
+         _block32_split(layer, x, out, scratch)
+         return
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index a34c433d1..ea85f4210 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -32,7 +32,7 @@ from vllm.v1.worker.workspace import (
+     is_workspace_manager_initialized,
+ )
+ 
+-from . import prepare
++from . import pdl, prepare
+ from .gemm import bf16_gemm, bf16_gemm_decode
+ 
+ GROUP = 128  # columns per code group
+@@ -109,6 +109,59 @@ def _decode(low, code, base_minus_one):
+ _GREEDY_HEADER = r"""
+ #include <math_constants.h>
+ 
++template <int BASE_MINUS_ONE>
++__device__ __forceinline__ void vllm_vocab_decode_vec16(
++    const void* __restrict__ low_a_ptr,
++    const void* __restrict__ low_b_ptr,
++    const void* __restrict__ codes_ptr,
++    void* __restrict__ out_a_ptr,
++    void* __restrict__ out_b_ptr) {
++  const uint4 low_a4 = *reinterpret_cast<const uint4*>(low_a_ptr);
++  const uint4 low_b4 = *reinterpret_cast<const uint4*>(low_b_ptr);
++  const uint4 codes4 = *reinterpret_cast<const uint4*>(codes_ptr);
++  const unsigned int* la = reinterpret_cast<const unsigned int*>(&low_a4);
++  const unsigned int* lb = reinterpret_cast<const unsigned int*>(&low_b4);
++  const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
++  unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
++  unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
++  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
++
++  #pragma unroll
++  for (int w = 0; w < 4; ++w) {
++    const unsigned int c_word = cd[w];
++    const unsigned int la_word = la[w];
++    const unsigned int lb_word = lb[w];
++
++    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
++    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
++
++    const unsigned int ca01 = c01 & 0x000F000Fu;
++    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
++    const unsigned int ca23 = c23 & 0x000F000Fu;
++    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
++
++    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
++    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
++
++    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
++    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
++    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
++    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
++
++    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
++    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
++    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
++    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
++
++    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
++    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
++    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
++    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
++  }
++}
++
+ __device__ __forceinline__ int vllm_vocab_first_argmax_keep(
+     float av, int ai, float bv, int bi) {
+   const bool a_nan = av != av;
+@@ -265,6 +318,7 @@ def packed_vocab_projection(
+         with T.Kernel(
+             T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+         ) as (by, bx):
++            T.import_source(_GREEDY_HEADER)
+             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
+             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
+             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
+@@ -291,7 +345,7 @@ def packed_vocab_projection(
+                 # 16 of its high half, which share 16 code bytes.
+                 for step in T.serial(T.ceildiv(items, threads)):
+                     item = step * threads + tx
+-                    if item < items:
++                    if items % threads == 0 or item < items:
+                         j = item // (step_groups * slices)
+                         g = item // slices % step_groups
+                         c = item % slices * VEC
+@@ -301,9 +355,15 @@ def packed_vocab_projection(
+                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
+                         for v in T.vectorized(VEC):
+                             codes[v] = code_shared[j, g * HALF + c + v]
+-                        for v in T.unroll(VEC):
+-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
+-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + c + v] = out_a[v]
+                         for v in T.vectorized(VEC):
+@@ -393,6 +453,7 @@ def packed_vocab_greedy_partials(
+             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
+             C_shared = T.alloc_shared((block_M, block_N), T.float32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_round = T.alloc_fragment((block_M, block_N), out_dtype)
+             low_a = T.alloc_local((VEC,), T.uint8)
+             low_b = T.alloc_local((VEC,), T.uint8)
+             codes = T.alloc_local((VEC,), T.uint8)
+@@ -410,7 +471,7 @@ def packed_vocab_greedy_partials(
+                 T.copy(W[bx * block_N, K + s * (STEP // 2)], code_shared)
+                 for step in T.serial(T.ceildiv(items, threads)):
+                     item = step * threads + tx
+-                    if item < items:
++                    if items % threads == 0 or item < items:
+                         j = item // (step_groups * slices)
+                         g = item // slices % step_groups
+                         c = item % slices * VEC
+@@ -420,9 +481,15 @@ def packed_vocab_greedy_partials(
+                             low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
+                         for v in T.vectorized(VEC):
+                             codes[v] = code_shared[j, g * HALF + c + v]
+-                        for v in T.unroll(VEC):
+-                            out_a[v] = _decode(low_a[v], codes[v] & 0xF, base_minus_one)
+-                            out_b[v] = _decode(low_b[v], codes[v] >> 4, base_minus_one)
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + c + v] = out_a[v]
+                         for v in T.vectorized(VEC):
+@@ -449,11 +516,9 @@ def packed_vocab_greedy_partials(
+                             C_local[i, j] = C_local[i, j] + value * T.Cast(
+                                 T.float32, A[token, column]
+                             )
+-            if out_dtype == T.bfloat16:
+-                for i, j in T.Parallel(block_M, block_N):
+-                    C_local[i, j] = T.Cast(
+-                        T.float32, T.Cast(T.bfloat16, C_local[i, j])
+-                    )
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
+             T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+@@ -495,6 +560,7 @@ def finish_vocab_greedy_pairs(
+         vocab_start: T.int32,
+     ):
+         with T.Kernel(M, threads=threads) as (row,):
++            pdl.chain()
+             T.import_source(_GREEDY_HEADER)
+             smem_v = T.alloc_shared((warps,), T.float32)
+             smem_i = T.alloc_shared((warps,), T.int32)

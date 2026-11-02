@@ -3,7 +3,7 @@
 
 usage: make_series.py VLLM_REPO
 
-Candidate 25's series (../candidate-25/vllm/series) ends at 65864cb57 (patch_head e625eb146). Every commit
+Candidate 25's series (../candidate-25/vllm/series) ends at 65864cb57 (patch_head 0ec630907). Every commit
 listed below is written to vllm/ as one patch, numbered from 0628 in
 application order. vllm/series lists candidate-25's patches, their paths
 relative to this folder, then these. Nothing that exists is overwritten.
@@ -16,11 +16,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PREVIOUS = HERE.parent / "candidate-25/vllm/series"
 BASE = "65864cb57"  # vLLM candidate-25 head
-HEAD = "9c3ca6b56"  # vLLM candidate-26 head
+HEAD = "0ec630907"  # vLLM candidate-26 head
 PATCHES = [
-    ('327865e09', 628),  # dsv41: preload dispatch metadata before PDL wait in moe_swiglu_cast and FC2 (#803)
-    ('0a3f32aea', 629),  # dsv41: preload static weights and step metadata before PDL wait in front/rope/indexer/mhc (#804)
-    ('9c3ca6b56', 630),  # dsv41: preload step metadata and norm weight before PDL wait in compressor (#808)
+    ('acaac7baa', 628),  # dsv41: preload dispatch metadata before PDL wait in moe_swiglu_cast and FC2 (#803)
+    ('3048e227b', 629),  # dsv41: preload static weights and step metadata before PDL wait in front/rope/indexer/mhc (#804)
+    ('0ec630907', 630),  # dsv41: preload step metadata and norm weight before PDL wait in compressor (#808)
 ]
 
 

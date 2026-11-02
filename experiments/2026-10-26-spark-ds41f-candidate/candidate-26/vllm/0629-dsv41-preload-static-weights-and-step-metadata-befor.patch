@@ -5,25 +5,24 @@ Subject: [PATCH 629/629] dsv41: preload static weights and step metadata
  before PDL wait in front/rope/indexer/mhc
 
 ---
- tests/kernels/deepseek_v41_pdl_sources.py     |  5 ++
+ tests/kernels/deepseek_v41_pdl_sources.py     |  4 ++
  vllm/models/deepseek_v4_1/tilelang/front.py   | 54 +++++++++++------
- vllm/models/deepseek_v4_1/tilelang/indexer.py | 60 ++++++++++++-------
- vllm/models/deepseek_v4_1/tilelang/mhc.py     | 12 ++--
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 59 ++++++++++++-------
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  6 +-
  vllm/models/deepseek_v4_1/tilelang/rope.py    |  3 +-
- 5 files changed, 86 insertions(+), 48 deletions(-)
+ 5 files changed, 81 insertions(+), 45 deletions(-)
 
 diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
-index cc97b9fa8..58aa61152 100644
+index cc97b9fa8..76d85d07a 100644
 --- a/tests/kernels/deepseek_v41_pdl_sources.py
 +++ b/tests/kernels/deepseek_v41_pdl_sources.py
-@@ -68,8 +68,13 @@ EXEMPT = {"pdl_early_reader"}
+@@ -68,8 +68,12 @@ EXEMPT = {"pdl_early_reader"}
  # Predecessor-independent weights and RoPE/sink metadata that may be pre-loaded
  # before cudaGridDependencySynchronize().
  EARLY_PARAMETERS: dict[str, set[str]] = {
 +    "attention_front": {"cos_sin", "kv_weight", "positions", "q_weight", "slots"},
 +    "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
 +    "mhc_post": {"comb", "post", "residual"},
-+    "mhc_post_collapse": {"comb", "mix", "post", "residual"},
      "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
      "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
 +    "rope": {"cos_sin", "positions"},
@@ -146,10 +145,10 @@ index 58bac0e86..cfd58315c 100644
                          if (slot >= 0) & (page < pages):
                              base = (slot % page_size) * record
 diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
-index abd8927cd..70bb9dd7a 100644
+index abd8927cd..47fea8b69 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
-@@ -455,15 +455,14 @@ def mxfp4_quantize_v41(
+@@ -455,23 +455,32 @@ def mxfp4_quantize_v41(
      @T.macro
      def body(X, Positions, CosSin, Q, S, Slots, Pool):
          with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
@@ -158,7 +157,7 @@ index abd8927cd..70bb9dd7a 100644
              g = bx * threads + tx
              row, k = g // groups, g % groups
              vals = T.alloc_local([SF_BLOCK], T.bfloat16)
-+            cs = T.alloc_local([SF_BLOCK], T.float32)
++            pos_l = T.alloc_local([1], T.int64)
 +            slot_l = T.alloc_local([1], T.int64)
              amax = T.alloc_var(T.float32)
              if row < rows:
@@ -167,13 +166,14 @@ index abd8927cd..70bb9dd7a 100644
                  if rope_heads > 0:
                      if k >= start_group:
                          token = row // rope_heads
-@@ -473,11 +472,22 @@ def mxfp4_quantize_v41(
-                             else Positions[token]
+-                        pos = (
++                        pos_l[0] = T.cast(
+                             Positions[token] // ratio * ratio
+                             if ratio > 1
+-                            else Positions[token]
++                            else Positions[token],
++                            T.int64,
                          )
-                         pair_base = (k - start_group) * half
-+                        for i in T.unroll(half):
-+                            cs[i] = CosSin[pos, pair_base + i]
-+                            cs[half + i] = CosSin[pos, rope_half + pair_base + i]
 +                if paged:
 +                    slot_l[0] = Slots[row]
 +            pdl.chain()
@@ -182,17 +182,11 @@ index abd8927cd..70bb9dd7a 100644
 +                    vals[i] = X[row, k * SF_BLOCK + i]
 +                if rope_heads > 0:
 +                    if k >= start_group:
++                        pos = pos_l[0]
+                         pair_base = (k - start_group) * half
                          for i in T.unroll(half):
                              first = T.cast(vals[2 * i], T.float32)
-                             second = T.cast(vals[2 * i + 1], T.float32)
--                            cosine = CosSin[pos, pair_base + i]
--                            sine = CosSin[pos, rope_half + pair_base + i]
-+                            cosine = cs[i]
-+                            sine = cs[half + i]
-                             vals[2 * i] = T.cast(
-                                 T.ieee_fmaf(first, cosine, -(second * sine)),
-                                 T.bfloat16,
-@@ -497,7 +507,7 @@ def mxfp4_quantize_v41(
+@@ -497,7 +506,7 @@ def mxfp4_quantize_v41(
                      T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
                  )
                  if paged:
@@ -201,7 +195,7 @@ index abd8927cd..70bb9dd7a 100644
                      page, token = slot // page_size, slot % page_size
                      if (slot >= 0) & (page < pool_pages):
                          for i in T.serial(half):
-@@ -641,7 +651,6 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -641,7 +650,6 @@ def mxfp4_norm_rope_quantize_v41(
          ),
      ):
          with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
@@ -209,7 +203,7 @@ index abd8927cd..70bb9dd7a 100644
              tid = T.get_thread_binding()
              k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
              k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
-@@ -660,14 +669,33 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -660,14 +668,33 @@ def mxfp4_norm_rope_quantize_v41(
              )
              k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
              k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
@@ -244,7 +238,7 @@ index abd8927cd..70bb9dd7a 100644
              T.clear(sum_local)
              for vi in T.unroll(k["num_thread_vec"]):
                  token_offset = (vi * kt + lane) * _VEC
-@@ -700,28 +728,16 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -700,28 +727,16 @@ def mxfp4_norm_rope_quantize_v41(
                  init=T.rsqrt(k_sum_fragment[row_id, lane] / INDEX_DIM + eps),
              )
              for vi in T.unroll(k["num_thread_vec"]):
@@ -274,7 +268,7 @@ index abd8927cd..70bb9dd7a 100644
                  for j in T.unroll(pairs):
                      first = T.cast(k_y[1, 2 * j], T.float32)
                      second = T.cast(k_y[1, 2 * j + 1], T.float32)
-@@ -743,7 +759,7 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -743,7 +758,7 @@ def mxfp4_norm_rope_quantize_v41(
                  amax = T.max(amax, T.shfl_xor(amax, 1))
                  amax = T.max(amax, T.shfl_xor(amax, 2))
                  if token_id < rows:
@@ -284,7 +278,7 @@ index abd8927cd..70bb9dd7a 100644
                      tok = slot % page_size
                      if (slot >= 0) & (page < pool_pages):
 diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
-index a388e7f5d..9d5c5dab9 100644
+index a388e7f5d..7b33ff2da 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
 @@ -817,7 +817,6 @@ def post_streams(hidden_size: int, threads: int = 128):
@@ -299,29 +293,6 @@ index a388e7f5d..9d5c5dab9 100644
              for m in T.unroll(MULT):
                  for n in T.vectorized(MULT):
                      cm[m * MULT + n] = comb[token, m, n]
--            for v in T.vectorized(VEC):
--                xv[v] = x[token, col + v]
-             for m in T.unroll(MULT):
-                 for v in T.vectorized(VEC):
-                     rv[m * VEC + v] = residual[token, m, col + v]
-+            pdl.chain()
-+            for v in T.vectorized(VEC):
-+                xv[v] = x[token, col + v]
-             for n in T.unroll(MULT):
-                 for v in T.unroll(VEC):
-                     acc = cm[n] * T.Cast(T.float32, rv[v])
-@@ -873,7 +873,6 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
-         out: T.Tensor((M, hidden_size), T.bfloat16),
-     ):
-         with T.Kernel(M * blocks, threads=threads) as pid:
--            pdl.chain()
-             token = pid // blocks
-             col = (pid % blocks * threads + T.get_thread_binding()) * VEC
-             xv = T.alloc_local((VEC,), T.bfloat16)
-@@ -891,11 +890,12 @@ def post_collapse_streams(hidden_size: int, threads: int = 128):
-                     cm[m * MULT + n] = comb[token, m, n]
-             for m in T.vectorized(MULT):
-                 mv[m] = mix[token, m]
 -            for v in T.vectorized(VEC):
 -                xv[v] = x[token, col + v]
              for m in T.unroll(MULT):

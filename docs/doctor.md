@@ -53,7 +53,7 @@ repository. Every one is an error unless marked **warn**.
 | Memory guards | a guard value is missing or not positive; the startup guard is not larger than the steady guard; `host.memguard_warn_gib` is not a non-negative integer, or is not 0 and not larger than the steady guard |
 | Deployment | `repository`, `path`, `ready_url` or `ready_timeout_seconds` is empty; `launch_enabled` is not true or false |
 | Sources | a revision is not a full commit SHA; a tracking ref or upstream is missing; a patch series or patch file is missing; a patch set's fingerprint differs from the source manifest; TileLang is listed without TileKernels (or the reverse) |
-| Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet |
+| Image identity | the image's expected tree labels do not match the source manifest; a sparknet transport runs on an image without sparknet; a sparknet configuration that pins no GID slot runs on a sparknet before 0.5.0 |
 | GLP steering | a `glp` field is malformed: `repo` is not `<owner>/<name>`, `revision` not a full commit SHA, `file` not a `.gguf` name, `sha256` not 64 hex digits; `glp.served_model_name` is not served exactly once after the first `--served-model-name` (the first is the stock model every tool and probe uses); `WEIGHTLESS_STEER_*` is set without a `glp` block |
 | Secrets | a tracked file is named `.env`, `id_rsa`, `id_ed25519` or `credentials.json`, or ends in `.pem`, `.key`, `.local.env` or `.local.json` |
 | Watchlist | **warn**: `docs/inspiration.md` is missing, or a watched reference is absent from it |
@@ -82,6 +82,7 @@ revert it.
 | Unused desktop services | warn | Bluetooth, CUPS, snapd, fwupd's refresh timer and the DGX Dashboard hold memory; the dashboard's update checks peak near 850 MiB | `sudo systemctl disable --now …` (`scripts/host-recovery apply` does the same) |
 | NVMe interrupt coalescing off | warn | Engram's small direct disk reads wait for the coalescing timer | `sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable` |
 | NVMe APST: no sleep state of 5 ms or more to wake before 1 s idle, nor of 20 ms or more before 30 s | warn | the first Engram read after a pause waits for the drive to wake (11 ms from PS3, 46 ms from PS4) | `nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000` ([setup](setup.md#nvme-power-states-apst)) |
+| Onboard Wi-Fi radio off and control plane (`management_ip` / `control_ip`, `*_SOCKET_IFNAME`) not on a wireless interface | warn | the control plane sends packets every decode step; Wi-Fi tail latency stalls the step ([#712](https://github.com/christopherowen/spark-ds41f/issues/712)) | `sudo nmcli radio wifi off`, or move `control_ip` / `*_SOCKET_IFNAME` onto wired or ConnectX-7 links |
 | Fan-floor control: DKMS module (version 0.1.4), loaded module, cooling device | warn, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
 | `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
 
@@ -115,11 +116,14 @@ with one another.
 | Check | Severity | Fix |
 | --- | --- | --- |
 | Every RDMA device in `roce_peer_hcas` exists | error | check cabling and `rdma link` |
-| The configured GID index (3 by default) holds the device's IPv4 RoCE v2 address | error | if the GID moved to another slot, re-activate the interface with `nmcli` while nothing uses RDMA |
-| That address is in the cable's `roce_subnets` network | error | check the interface address and the cable it is on |
+| Each device's port carries exactly one IPv4 RoCE v2 GID, in its cable's `roce_subnets` network, at any index (and none outside it, which NCCL could take instead) | error | check the interface address and the cable it is on |
+| Any GID slot a library is still fixed to (`NCCL_IB_GID_INDEX`, an earlier sparknet's `SPARKNET_ROCE_GID_INDEX`) holds that IPv4 RoCE v2 GID | error | if the GID moved to another slot, re-activate the interface with `nmcli` while nothing uses RDMA |
 
-A GID moves when a link flaps while RDMA resources still hold the old entry;
-NCCL then fails with an unhandled system error.
+The kernel files a re-added address in the next free slot, so a link flap while
+RDMA resources still hold the old entry moves the IPv4 RoCE v2 GID (from 3 to 4
+on dgx2 and dgx4 when dgx1 rebooted under a starting service). NCCL with
+`NCCL_IB_GID_INDEX` unset and sparknet 0.5.0 find the GID by address; a library
+fixed to the old slot fails (NCCL with an unhandled system error).
 
 ### Service
 
@@ -173,7 +177,7 @@ a start cannot survive, on every node, and refuses to launch on any failure:
 - each node's checkout is at the same commit, clean, and its `origin` is the
   deployment repository;
 - the profile's kernel requirements (above);
-- the RDMA devices, GID index and cable subnets (above). On more than one node,
+- the RDMA devices, their GIDs, any pinned GID slot and the cable subnets (above). On more than one node,
   every RoCE interface the profile uses needs its `roce_subnets` entry: without
   it the start could not tell a triangle from a ring;
 - `bin/spark doctor` passes on the node itself;
