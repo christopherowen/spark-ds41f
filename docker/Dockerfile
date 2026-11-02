@@ -141,6 +141,10 @@ RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /wor
 # top; a lock without it builds the TileLang runtime on this stage directly.
 FROM ${BASE_IMAGE} AS runtime-core
 
+# No usage reporting: vLLM's usage stats (stats.vllm.ai) stay off in every image and
+# every container started from it, whatever the deployment's environment.
+ENV VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+
 ARG BASE_IMAGE_NAME=unrecorded
 ARG BASE_IMAGE_DIGEST=unrecorded
 ARG VLLM_UPSTREAM=unrecorded
