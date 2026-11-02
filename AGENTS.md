@@ -65,8 +65,10 @@ plans unless `--apply` is supplied, and every `--apply` needs `--cluster-config`
 named: read the plan's `live:` and `shape:` lines first. Never pass
 `--change-shape` to get past a refusal unless the shape change is the intent. Never deploy with rsync or copy a dirty
 working tree: publish one commit, require clean node checkouts, and detach every
-node at that exact commit. Do not bypass the coordinated start with a one-rank
-launch script.
+node at that exact commit. `cluster sync` also copies the profile's image from the
+head to every node that lacks it. A `cluster start` plan runs the full preflight; when
+a node differs from the head, it ends with the `cluster sync --apply` that repairs it.
+Do not bypass the coordinated start with a one-rank launch script.
 
 ## Shared cluster windows
 

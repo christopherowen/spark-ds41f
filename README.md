@@ -837,7 +837,8 @@ not establish a loading slowdown. Plain `doctor` remains local.
 
 `build prepare` writes only under ignored `.work/build/`; see
 [docker/README.md](docker/README.md). `cluster sync` fetches a published commit and detaches every clean node
-checkout at that exact revision; it never copies a working tree or ignored files.
+checkout at that exact revision; it never copies a working tree or ignored files other than the site's
+node map. It then copies the image the profile names from the head to each node whose image layers differ.
 A commit counts as published when a branch on `origin` contains it. The
 promoted configuration sets `deployment.branch: main`, so production deploys
 only from `main`; experiment configurations omit the field, so they stay

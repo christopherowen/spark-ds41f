@@ -194,6 +194,17 @@ changes, and says when `--apply` would refuse; `--verbose` adds each rank's
 `docker run`. Each container is labelled `spark.cluster-config=<profile>`, so the
 next plan can name the profile that stops it.
 
+The plan also runs the checks above, which only read, so every problem `--apply`
+would stop on shows before it. When a node's checkout, profile or image differs
+from the head's, the list ends with the command that repairs them all:
+
+```
+fix: bin/spark --cluster-config <profile> cluster sync --apply gives every node this commit and its image
+```
+
+A profile that no commit carries (an ignored `*.local.json`) reaches no other
+node: commit and publish it.
+
 Then it arms a 5 GiB startup memory guard on every node before any container
 starts, starts the ranks, waits for the API, and switches to the 3 GiB steady
 guard. A node whose available memory falls below the guard has its container

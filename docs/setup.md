@@ -475,7 +475,8 @@ clone it. A start refuses a read-write mount whose source a node cannot write
 should name `{checkout}` too.
 
 `bin/spark --cluster-config <profile> cluster sync --apply` moves every node's checkout to the head's
-commit and copies the head's node map to the others.
+commit, copies the head's node map to the others, and copies the profile's image from the head to
+every node whose image layers differ.
 
 Commands that change the nodes need the configuration named with
 `--cluster-config` before the subcommand, for example
@@ -594,7 +595,8 @@ an existing tag, and runs a GPU import smoke test. The first build takes
 longer because it builds TileLang and TileKernels. More detail is in
 [docker/README.md](../docker/README.md).
 
-Copy the image to the other nodes in your node map and confirm the same image layers everywhere:
+`cluster sync` (step 7) copies the image to the other nodes in your node map and checks that
+every node has the same image layers. To copy it without a sync, or to copy another tag:
 
 ```sh
 bin/spark --cluster-config config/cluster.json build distribute --apply

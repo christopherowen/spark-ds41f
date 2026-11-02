@@ -49,18 +49,112 @@ def deployment_order(nodes: dict) -> list[dict]:
     return workers + heads
 
 
+class Drift(str):
+    """A start problem that `cluster sync --apply` repairs: a node's checkout, profile or
+    image is not the one this checkout deploys."""
+
+
+def sync_command(cluster_config: str) -> str:
+    return f"bin/spark --cluster-config {cluster_config} cluster sync --apply"
+
+
+def local_deployment_problems(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
+    """This checkout's findings for a deployment: its doctor's, and any uncommitted file."""
+    findings = list(local_doctor(cluster, nodes, upstreams))
+    if repository_dirty():
+        findings.append("deployment requires a clean local repository")
+    return findings
+
+
 def require_local_deployment_state(cluster: dict, nodes: dict, upstreams: dict) -> str:
-    problems, warnings = split_findings(local_doctor(cluster, nodes, upstreams))
+    problems, warnings = split_findings(local_deployment_problems(cluster, nodes, upstreams))
     for warning in warnings:
         print(f"WARN: {warning}", file=sys.stderr)
-    dirty = repository_dirty()
-    if dirty:
-        problems.append("deployment requires a clean local repository")
     if problems:
         for problem in problems:
             print(f"ERROR: {problem}", file=sys.stderr)
         raise SystemExit(1)
     return repository_revision()
+
+
+def profile_committed(revision: str, cluster_config: str) -> bool:
+    result = subprocess.run(["git", "cat-file", "-e", f"{revision}:{cluster_config}"], cwd=ROOT,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return result.returncode == 0
+
+
+def missing_profile(node: dict, cluster_config: str) -> str:
+    """A node lacks a profile the deployed commit does not carry: an ignored *.local.json
+    profile stays on its host."""
+    return (f"{node['name']}: has no {cluster_config}, and the deployed commit does not carry it; a node "
+            "receives only committed files and the site map, so commit the profile, publish it and sync")
+
+
+def image_layers(nodes: dict, node: dict, tag: str) -> list[str]:
+    """The tag's layers on a node, or [] when the node lacks it.
+
+    The layers (uncompressed content digests, in order) of one image are the same on every
+    node whatever its storage. The image ID is not: Docker's containerd image store names an
+    image by its manifest, the overlay2 driver by its config, so a faithful copy between the
+    two changes the ID (#488)."""
+    result = run_ssh(nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}")
+    return json.loads(result.stdout) if result.returncode == 0 else []
+
+
+def local_image(cluster: dict, tag: str, cluster_config: str) -> tuple[list[str], str | None]:
+    """This host's layers of the tag, and why they must not be copied to the nodes (None
+    when they may): the host lacks the tag, or holds another build than the profile expects."""
+    result = subprocess.run(["docker", "image", "inspect", tag], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        detail = result.stderr.strip()
+        if "no such image" in detail.lower():
+            return [], (f"{tag} is not built on this host: "
+                        f"bin/spark --cluster-config {cluster_config} build image --apply")
+        return [], f"cannot inspect {tag} on this host: {detail}"
+    image = json.loads(result.stdout)[0]
+    if tag == cluster["container"]["image"]:
+        labels = image["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"].get("expected_labels", {}).items():
+            if labels.get(key) != wanted:
+                return [], (f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
+                            f"the profile expects {wanted!r}): remove it and build it again")
+    return image["RootFS"]["Layers"], None
+
+
+def image_copies(cluster: dict, nodes: dict, cluster_config: str) -> tuple[list[str], str | None, list[dict]]:
+    """The profile's image on this host: its layers, why they must not be copied (or None),
+    and the nodes whose copy differs, inspected concurrently."""
+    tag = cluster["container"]["image"]
+    layers, problem = local_image(cluster, tag, cluster_config)
+    if problem:
+        return layers, problem, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        found = list(pool.map(lambda node: image_layers(nodes, node, tag), nodes["nodes"]))
+    return layers, None, [node for node, held in zip(nodes["nodes"], found) if held != layers]
+
+
+def load_image(nodes: dict, node: dict, tag: str, layers: list[str]) -> str | None:
+    """Copy this host's tag to a node over its transfer link and check the node's layers;
+    None on success, else the failure."""
+    target = transfer_target(nodes, node)
+    pipeline = (
+        f"docker save {shlex.quote(tag)} | "
+        f"ssh {shlex.join(ssh_options())} {shlex.quote(target)} docker load"
+    )
+    result = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", pipeline],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        return f"{node['name']}: failed to load {tag}: {detail}"
+    if image_layers(nodes, node, tag) != layers:
+        return f"{node['name']}: image layers for {tag} do not match after load"
+    return None
 
 
 # The repository was renamed from spark3-vllm-ds41f on 2026-10-05. Configurations
@@ -174,9 +268,9 @@ def node_runtime_problems(
     except RuntimeError as error:
         return [str(error)]
     if remote_revision != revision:
-        problems.append(
+        problems.append(Drift(
             f"{node['name']}: checkout {remote_revision} differs from deployment {revision}"
-        )
+        ))
     if normalized_repository_url(remote_origin) != normalized_repository_url(
         cluster["deployment"]["repository"]
     ):
@@ -198,17 +292,25 @@ def node_runtime_problems(
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
     problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
     problems.extend(unrecorded_subnet_problems(nodes, node, hcas))
-    doctor = run_ssh(
-        nodes,
-        node,
-        f"{repo}/bin/spark",
-        "--cluster-config",
-        cluster_config,
-        "doctor",
-    )
-    if doctor.returncode:
-        detail = doctor.stdout.strip() or doctor.stderr.strip()
-        problems.append(f"{node['name']}: repository doctor failed: {detail}")
+    if run_ssh(nodes, node, "test", "-f", f"{repo}/{cluster_config}").returncode:
+        # The node's doctor would only fail on the missing file.
+        problems.append(
+            Drift(f"{node['name']}: has no {cluster_config}")
+            if profile_committed(revision, cluster_config)
+            else missing_profile(node, cluster_config)
+        )
+    else:
+        doctor = run_ssh(
+            nodes,
+            node,
+            f"{repo}/bin/spark",
+            "--cluster-config",
+            cluster_config,
+            "doctor",
+        )
+        if doctor.returncode:
+            detail = doctor.stdout.strip() or doctor.stderr.strip()
+            problems.append(f"{node['name']}: repository doctor failed: {detail}")
     mounts = run_ssh(nodes, node, "sh", "-c", mount_test_script(cluster))
     for line in mounts.stdout.splitlines():
         mode, _, source = line.partition(" ")
@@ -222,24 +324,29 @@ def node_runtime_problems(
         "inspect",
         cluster["container"]["image"],
     )
+    # Sync copies the image from the head (where start and sync run) to the other nodes;
+    # a head without the right build needs a build instead.
     if image.returncode:
         if "permission denied" in image.stderr.lower() and "docker.sock" in image.stderr:
             problems.append(
                 f"{node['name']}: cannot inspect Docker image {cluster['container']['image']}: "
                 f"{docker_error_detail(node['name'], image.stderr)}"
             )
-        else:
+        elif node["head"]:
             problems.append(
-                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}; build it: "
+                f"bin/spark --cluster-config {cluster_config} build image --apply"
             )
+        else:
+            problems.append(Drift(
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+            ))
     else:
         labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
         for key, wanted in cluster["container"]["expected_labels"].items():
             if labels.get(key) != wanted:
-                problems.append(
-                    f"{node['name']}: image label {key}={labels.get(key)!r}, "
-                    f"expected {wanted!r}"
-                )
+                finding = f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
+                problems.append(finding if node["head"] else Drift(finding))
     existing = run_ssh(nodes, node, "docker", "inspect", name)
     if existing.returncode == 0 and not allow_existing:
         problems.append(
@@ -262,6 +369,64 @@ def node_runtime_problems(
     return problems
 
 
+def start_findings(
+    cluster: dict, nodes: dict, upstreams: dict, *, allow_existing: bool, cluster_config: str
+) -> list[str]:
+    """Every check a start makes before it touches a node: this checkout's, then each node's
+    against this checkout's commit. They only read, so the plan makes them too."""
+    return [
+        *local_deployment_problems(cluster, nodes, upstreams),
+        *remote_runtime_problems(cluster, nodes, repository_revision(),
+                                 allow_existing=allow_existing, cluster_config=cluster_config),
+    ]
+
+
+def report_start_findings(findings: list[str], cluster_config: str, file) -> bool:
+    """Print a start's warnings and problems, then the command that repairs node drift;
+    True when nothing blocks the start."""
+    problems, warnings = split_findings(findings)
+    for warning in warnings:
+        print(f"WARN: {warning}", file=file)
+    for problem in problems:
+        print(f"ERROR: {problem}", file=file)
+    if any(isinstance(problem, Drift) for problem in problems):
+        print(f"fix: {sync_command(cluster_config)} gives every node this commit and its image", file=file)
+    return not problems
+
+
+def image_plan(tag: str, problem: str | None, differ: list[dict]) -> str:
+    if problem:
+        return f"image: not copied: {problem}"
+    if not differ:
+        return f"image: every node has this host's {tag}"
+    return f"image: copy {tag} from this host to {', '.join(node['name'] for node in differ)}"
+
+
+def sync_image(args: argparse.Namespace, revision: str, cluster_config: str) -> int:
+    """Copy the image the deployed profile names to every node whose copy differs from this
+    host's. A host without a copy to give only warns: a build may follow the sync."""
+    if repository_revision() != revision:
+        print(f"WARN: this checkout is not at {revision}, so the image its profile names is not "
+              "copied; sync again from a checkout at that commit", file=sys.stderr)
+        return 0
+    # Read again: the checkout can be ROOT, and the deployed profile may name another image.
+    cluster, nodes, _ = configuration(args)
+    tag = cluster["container"]["image"]
+    layers, problem, differ = image_copies(cluster, nodes, cluster_config)
+    if problem:
+        print(f"WARN: image not copied: {problem}", file=sys.stderr)
+        return 0
+    for node in differ:
+        started = time.monotonic()
+        failure = load_image(nodes, node, tag, layers)
+        if failure:
+            print(f"ERROR: {failure}", file=sys.stderr)
+            return 1
+        print(f"{node['name']}: loaded {tag} in {time.monotonic() - started:.0f} s", flush=True)
+    print(f"every node holds {tag}")
+    return 0
+
+
 def command_cluster_sync(args: argparse.Namespace) -> int:
     require_named_profile(args)
     cluster, nodes, upstreams = configuration(args)
@@ -275,6 +440,12 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
     for node in nodes["nodes"]:
         print(f"{node['name']}: fetch origin and detach {path} at {revision}")
     if not args.apply:
+        if revision == repository_revision():
+            _, problem, differ = image_copies(cluster, nodes, config_relative)
+            print(image_plan(cluster["container"]["image"], problem, differ))
+        else:
+            print(f"image: then copy the one {config_relative} names at {revision} from this host "
+                  "to every node whose copy differs")
         print("plan only; pass --apply to synchronize")
         return 0
 
@@ -309,6 +480,7 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
         )
 
     previous: dict[str, str] = {}
+    committed = profile_committed(revision, config_relative)
     for node in nodes["nodes"]:
         try:
             old_revision, remote_origin, dirty = remote_repository_state(
@@ -316,6 +488,9 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
             )
         except RuntimeError as error:
             raise SystemExit(str(error)) from error
+        # Each node's doctor runs this profile after the checkout.
+        if not committed and run_ssh(nodes, node, "test", "-f", f"{path}/{config_relative}").returncode:
+            raise SystemExit(missing_profile(node, config_relative))
         if dirty:
             raise SystemExit(
                 f"{node['name']}: checkout is dirty; preserve or remove its changes explicitly"
@@ -387,7 +562,7 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
         return 1
 
     print(f"all nodes now use deployment commit {revision}")
-    return 0
+    return sync_image(args, revision, config_relative)
 
 
 def stop_memguard(cluster: dict, nodes: dict, node: dict) -> subprocess.CompletedProcess[str]:
@@ -797,27 +972,20 @@ def command_cluster_start(args: argparse.Namespace) -> int:
     if not args.apply:
         if refusal:
             print(f"--apply would refuse: {refusal}")
+        if unreachable is None:
+            findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                                      cluster_config=config_relative)
+            print("preflight: " + ("--apply would refuse:" if split_findings(findings)[0] else "clean"))
+            report_start_findings(findings, config_relative, sys.stdout)
         print("plan only; pass --apply to start the cluster (--verbose prints each docker command)")
         return 0
     if refusal:
         print(f"ERROR: {refusal}", file=sys.stderr)
         return 1
 
-    revision = require_local_deployment_state(cluster, nodes, upstreams)
-    problems, warnings = split_findings(
-        remote_runtime_problems(
-            cluster,
-            nodes,
-            revision,
-            allow_existing=args.replace,
-            cluster_config=config_relative,
-        )
-    )
-    for warning in warnings:
-        print(f"WARN: {warning}", file=sys.stderr)
-    if problems:
-        for problem in problems:
-            print(f"ERROR: {problem}", file=sys.stderr)
+    findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                              cluster_config=config_relative)
+    if not report_start_findings(findings, config_relative, sys.stderr):
         return 1
 
     backup_suffix = f"pre-{int(time.time())}"
