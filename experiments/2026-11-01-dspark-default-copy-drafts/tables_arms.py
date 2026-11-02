@@ -36,7 +36,7 @@ for arm in ARMS:
                   f"{record['tokens_per_step']:.3f} tokens/step, {record['failed']} failed")
         elif "exit" in record:
             print(f"  single-stream suite: exit {record['exit']} ({record['output']})")
-    for stem in ("census", "census-c8"):
+    for stem in ("census", "census-c8", "census-c16"):
         for record in lines(stem, arm):
             print(f"  {stem} {record['node']}: {record['nonfinite']} NONFINITE lines, "
                   f"{len(record['trouble'])} assert/traceback lines")
