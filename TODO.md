@@ -753,6 +753,10 @@ Don't repeat these without a new reason:
   bidirectional NCCL rings (no general gain); streaming the relay in 32-64 KiB
   chunks (a consistent bulk penalty, `experiments/2026-10-03-relay-progress`);
   GPUNetIO direct mode (dgx1 rebooted; the runner now rejects it).
+- **Kernels:** `step_groups=2` for the packed head's 64-row tile (#771): the same
+  bits, but slower at TP3 at every row count (projection +15 to +153 µs per call)
+  and at TP4 from 45 rows, on candidate-37
+  (`experiments/2026-11-02-dspark-markov-greedy-fusion`).
 - **Drivers:** R610 and CUDA 13.3 libraries
   (`experiments/2026-10-02-driver-cuda-refresh`): no consistent gain, and stock
   R610 faults on large copies with 64 KiB pages.
