@@ -13,13 +13,18 @@ sp5–sp7. Not promoted; no recipe change.
   rows past each slot's device-side draft limit (`CopyDrafter.slot_draft_limits.gpu`),
   with dead rows on or off. The host read stays 0612's: nothing waits.
 - **Patch:** [vllm/0001-fix-copy-drafts-kill-verification-rows-past-the-devi.patch](vllm/0001-fix-copy-drafts-kill-verification-rows-past-the-devi.patch).
-  It is vLLM `6f6ec8071` on `5b7cfa37f`, tree `afa120c4`, branch
+  It is vLLM `cc2b18de2` on `5b7cfa37f`, tree `afa120c4`, branch
   `copy-device-limit` in `/tmp/vllm-device-limit` on sp8. It applies cleanly to a
   fresh `5b7cfa37f` tree and would go next in the series after 0676, in place of
   #856's patch.
 - **Alternative to** [#856](https://github.com/christopherowen/spark-ds41f/pull/856)
   (vLLM `8bb508091`): its host wait fixed the operator's crash but costs −0.73% ±0.12%
   in paired single-stream decode on sp5–sp7 (lab run `limit-sync-cost-sp`).
+- **Design:** Jordi Posthumus, the operator of #852. They found the cause, measured
+  it, and proposed this device-side clamp in #855 (commit `c30d6b6`): the device
+  limits decide, the rows past them are dead, and those rows take the last sampled
+  token as their input id. This experiment completes it (below, *The operator's
+  patches*). The commit message credits them.
 
 ## The bug
 
@@ -141,6 +146,63 @@ GPU, and the two-GPU tests skip there.
   changed eligible drafts. Equal CRCs across sp5, sp6 and sp7 mean the ranks read
   alike; unequal ones locate a divergence.
 
+## The operator's patches (#855, reviewed, not run)
+
+Their branch `JordiPosthumus:copy-limit-sync`, commit `c30d6b6`, holds
+`experiments/2026-11-02-copy-drafter-limit-sync/repro/patches/`. Each patch was
+read, none was run.
+
+- **0004, the device clamp.** This experiment builds on its design. It has two parts:
+  - `CopyDrafter.propose` zeroes `confidences` at columns from
+    `slot_draft_limits.gpu[idx_mapping]` on. This changes nothing:
+    - `copy_select` already writes confidence 0 past `offered` (a copy) and past the
+      block (DSpark), and the device limit is exactly `offered` or the block.
+    - The mask adds a gather, a compare and a masked fill to every step.
+    - Its test sets the tail to 0.9 before `propose` and asserts 0 after. But
+      `copy_select` overwrites every column below the lookahead, so the assertion
+      holds on candidate-37 too.
+  - The combine writes the input ids after the dead-row cut, the last sampled token
+    for every row from the cut on, but only with dead rows.
+    - Without dead rows (the threshold unset or 0, or a batch sharder) the
+      combine is candidate-37's. The placeholder rows still route live with `-1`
+      ids: #852's configuration.
+    - With dead rows, candidate-37 already kills those rows (their confidence is
+      0). The change is then the ids of dead rows, including rows dead by survival
+      inside the proposal, whose bits now differ from candidate-37's.
+    - It also moves the stores behind the survival scan, which the kernel had
+      issued first so they wait on nothing.
+
+  This version clamps the cut to the device limit in both kernels and rewrites
+  only the ids past the limit. It masks no confidences. Its stale-wide test fails
+  on candidate-37 (*Evidence*).
+
+  Their validation ran one run per arm at m=8: 8 concurrent streams, a 10,456-token
+  prompt, host sync 126.05 tok/s, device clamp 159.90. That is not #852's
+  deterministic sequence (copy probe, then the single-stream suite), and their
+  dead-row setting isn't recorded. With the threshold at 0, 0004 leaves the combine
+  as candidate-37's, so a clean run there doesn't isolate the clamp.
+- **0002, the stale-limit counter.** It prints on every `sync_slot_draft_limits` call
+  that finds the copy in flight, from any caller (`add_request`, the budget,
+  `prepare_alloc`), and on an alloc-ring reuse. Its 1,209 therefore counts calls,
+  not budget reads. Nor does it say whether a read changed eligible drafts.
+  [overlay/limit-reads](overlay/limit-reads/) counts the budget's reads only, and
+  resolves each against the copy once it lands.
+- **0003, the `-1` → `0` control.** It pads `copy_select`'s drafts with 0, and the m=8
+  repro still crashed. Placeholder rows routed live don't explain that well: with an
+  id of 0 at a valid position, a live row is an ordinary token.
+
+  A rank-dependent layout (*Tensor-parallel invariance*) would explain it.
+  - At one stream, two ranks' layouts agree up to the shorter one's rows and differ
+    past them. The first rows past the shorter layout are the placeholder rows:
+    #849's block [4] is rows 8–9, and draft 8 is the first placeholder of an
+    8-draft copy.
+  - The tensor-parallel reductions then sum different rows there.
+  - If so, this clamp keeps those rows from the router at one stream, but not the
+    misaligned rows of later requests at several streams. Only a layout every rank
+    decides alike fixes that: #856's wait, or a budget without the racy read.
+
+  This is a hypothesis, not a measurement. The repro arms' per-rank CRCs test it.
+
 ## The census hides the race
 
 #842's census overlay reads its flag with `.item()` after sampling and after the
@@ -181,6 +243,12 @@ budget below its scheduled drafts. None fails. The new tests:
     the cut is 8, and a target that accepted every row still commits 9. The test
     also shows candidate-37's step with dead rows off: the same rows live, with `-1`
     ids. That is #852's path.
+
+    The test fails on candidate-37. Run there with the device limits handed to the
+    manager after construction (candidate-37's constructor has no such argument),
+    it fails at row 9 (`-1 != 50300`), with dead rows off and on
+    (`runs/unit-c37-stale-wide.txt`). Run unchanged there, it fails on the
+    constructor argument.
   - `test_current_host_limits_leave_the_step_bit_identical[0.0, 0.2]`: over a copy
     and its doubling (8 then 16 drafts), the fix's rows, input ids, logits rows,
     offsets, padding and commit count equal candidate-37's (and the cut, with dead
@@ -345,10 +413,10 @@ memory per arm.
 - **The producer of the non-finite logits:** which kernel turns a routed placeholder
   row non-finite. The operator reports that ids of 0 instead of `-1` still crash.
   The fix makes those rows padding whatever the cause.
-- **The operator's own device-side clamp** (#855, commit `c30d6b6`, posted to #852 at
-  22:58Z): neither run nor reviewed here. As described, it zeroes the confidences
-  past the device limit and goes through dead rows, so it needs dead rows on. This
-  change covers dead rows off as well.
+- **A layout every rank decides alike.** The host budget reading no host limits
+  (`slot_draft_limits=None` at the manager) leaves the device limits to do the
+  clamping, and would test the layout hypothesis in the same window. It is a second
+  variable and is not prepared.
 
 ## Conclusion
 

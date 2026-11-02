@@ -1,4 +1,4 @@
-From 6f6ec80710807e04974080c46c38d7f45d098f7d Mon Sep 17 00:00:00 2001
+From cc2b18de270e77b8921b7ceaef76f0c64b287b04 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 23:34:56 +0000
 Subject: [PATCH] fix(copy-drafts): kill verification rows past the device's
@@ -32,6 +32,16 @@ row past the limit is ever accepted. The runner declares the cut and combine
 variants with copy drafts. The host keeps 0612's non-blocking read: nothing
 waits.
 
+Design: Jordi Posthumus (#852, #855) found the cause, measured it (stale-limit
+reads, the -1 -> 0 control) and proposed the device-side clamp this change
+completes (#855, c30d6b6): the device limits rather than the host's decide,
+the rows past them are dead, and they take the request's last sampled token
+as their input id. This version also clamps without dead rows, where those
+rows were routed live. It clamps the cut to the limit instead of zeroing the
+confidences past it (copy_select already writes 0 there). It rewrites only the
+ids past the limit, so rows dead by survival within a proposal keep their
+bits.
+
 Quality: where the host's limits are current no row is past the device limit,
 and every step's input ids, padding, logits rows and commit counts are the same
 bits (the cut equals the request's drafts, so no clamp binds). Where they are
@@ -52,8 +62,10 @@ Tests:
   nothing; the declared combine variants are the launched ones.
 - tests/v1/spec_decode/test_copy_drafts.py, through a CopyDrafter and the
   adaptive verification manager: a stale wider host limit routes no
-  placeholder row, with dead rows off and on; current host limits leave the
-  step bit for bit as before; a stale narrower limit still under-admits.
+  placeholder row, with dead rows off and on (on the unpatched code, with the
+  limits handed to the manager, its rows past the limit keep -1 ids and, with
+  dead rows off, stay live: the test fails there); current host limits leave
+  the step bit for bit as before; a stale narrower limit still under-admits.
   0612's test that sync_slot_draft_limits never blocks is kept.
 - tests/v1/spec_decode/test_adaptive_verification.py: dead_row_args carries
   the device limits.
