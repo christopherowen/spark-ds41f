@@ -34,7 +34,8 @@ placeholders, not in the copy drafts tensor.
 
 ## Fix
 
-`vllm/0001-Fix-CopyDrafter-stale-slot-draft-limits.patch`:
+`repro/patches/0001-slot-draft-limits.patch` (a `git format-patch` commit on
+candidate-37's patch head `5b7cfa37f`, tree `af0fb152`):
 
 - `sync_slot_draft_limits` synchronizes the queued D2H event before copying the
   staging buffer. The copy is small and was queued before the drafter ran, so the
@@ -60,6 +61,22 @@ placeholders, not in the copy drafts tensor.
 - m=16 in the live gateway pool (since 17:36Z): gateway traffic plus five
   30k-token real-agent-transcript requests (512-token completions), no asserts,
   engine healthy. The unfixed arm died within minutes on the same pool.
+- m=8 in the live gateway pool: 64 minutes, 280 requests, 0 asserts, 0
+  inference failures, 51.4% spec-decode acceptance.
+
+## Reproduction
+
+`repro/README.md` is the full record: base commit, image digest, profile,
+boot/probe/suite commands, the run matrix, raw receipt logs, and the
+instrumentation / `-1`→`0` control patches. Raw receipts are under
+`repro/receipts/`; the profile is under `repro/profiles/`.
+
+## Status
+
+The host-sync patch is the validated diagnosis/fix used on our rings. The
+upstream review asks for a device-side clamp so the pinned non-blocking test
+stays green; that is the intended merge form. This record is the repro for the
+host-sync diagnosis.
 
 ## Integration
 

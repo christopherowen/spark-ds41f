@@ -1,0 +1,40 @@
+From 69b2f478e9e254e1d597543330332df7a734ef6d Mon Sep 17 00:00:00 2001
+From: Jordi Posthumus <JordiPosthumus@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:18:18 -0400
+Subject: [PATCH] spec_decode: pad copy-draft rows with 0 instead of -1
+ (control)
+
+Base: candidate-37 vLLM patch head 5b7cfa37f (tree af0fb152).
+
+Control only, not for merge. Replaces the -1 placeholder padding in the copy
+kernel with 0. The m=8 repro still crashed with this control, which placed the
+bad rows in the scheduler placeholders rather than the drafts tensor.
+---
+ vllm/v1/worker/gpu/spec_decode/tilelang_copy.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 6a4df89..f98dc1b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -251,7 +251,7 @@ def copy_select_kernel(
+                                 history[slot, start + T.min(col, chosen[1] - 1)],
+                                 T.int64,
+                             ),
+-                            T.int64(-1),
++                            T.int64(0),
+                         )
+                         confidences[r, col] = T.if_then_else(
+                             col < chosen[1], estimate[0], T.float32(0)
+@@ -268,7 +268,7 @@ def copy_select_kernel(
+                         drafts[r, col] = T.if_then_else(
+                             col < block,
+                             dspark_drafts[r, T.min(col, block - 1)],
+-                            T.int64(-1),
++                            T.int64(0),
+                         )
+                         confidences[r, col] = value
+                         planned[r, col] = value
+-- 
+2.56.0
+

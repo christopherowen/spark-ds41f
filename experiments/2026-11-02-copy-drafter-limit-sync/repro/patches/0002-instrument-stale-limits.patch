@@ -1,0 +1,40 @@
+From 747f6f99cea9fbe2d942be78b2af1d105b5995b4 Mon Sep 17 00:00:00 2001
+From: Jordi Posthumus <JordiPosthumus@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:18:18 -0400
+Subject: [PATCH] spec_decode: instrument stale slot draft limits
+
+Base: candidate-37 vLLM patch head 5b7cfa37f (tree af0fb152).
+
+Diagnostic only, not for merge. Counts every sync_slot_draft_limits call whose
+queued D2H event has not completed, and logs the count before the device assert.
+On the m=8 repro this measured 1,209 stale reads before the crash, with zero
+alloc-ring reuses.
+---
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30..11d7a68 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -111,6 +111,8 @@ class CopyDrafter:
+         self._new_rows: list[int] = []
+ 
+     def sync_slot_draft_limits(self) -> np.ndarray:
++        if self._limits_event is not None and not self._limits_event.query():
++            print("COPY_DEBUG_STALE_LIMIT", flush=True)
+         if self._limits_event is not None and self._limits_event.query():
+             np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
+             if self._pending_limit_resets:
+@@ -205,6 +207,8 @@ class CopyDrafter:
+         """Queue async D2H copy of this step's ``alloc`` and ``slot_draft_limits``
+         using pre-allocated ring buffers and events."""
+         idx = self._ring_idx
++        if not self._ring_events[idx].query():
++            print("COPY_DEBUG_RING_REUSE", idx, flush=True)
+         alloc_buf = self._alloc_buffers[idx]
+         limits_staging = self._limits_staging[idx]
+         event = self._ring_events[idx]
+-- 
+2.56.0
+

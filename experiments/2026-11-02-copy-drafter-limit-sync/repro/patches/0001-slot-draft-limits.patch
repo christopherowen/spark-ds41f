@@ -1,3 +1,31 @@
+From 13253fdcdf9a8f06ba0ff1911ed8809d653674e2 Mon Sep 17 00:00:00 2001
+From: Jordi Posthumus <JordiPosthumus@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:17:55 -0400
+Subject: [PATCH] spec_decode: publish the current step's slot draft limits
+
+Base: candidate-37 vLLM patch head 5b7cfa37f (tree af0fb152).
+
+Rationale: sync_slot_draft_limits kept the previous proposal's host limits when
+the async D2H copy was still in flight. Adaptive verification could then verify
+rows the current proposal did not have (the scheduler's -1 placeholders),
+producing non-finite MoE gate logits under async scheduling. Synchronize the
+queued event before publishing the staged limits.
+
+Quality: the copy is small and is queued before the drafter. The m=16 paired
+single-stream run is level (63.58 vs 64.683 tok/s, -1.7%, CI95 2.78%); copy and
+edit tokens/step are unchanged, tool rises 6.083->6.232. The m=8 deterministic
+crash is fixed.
+
+Tests: adds a regression test that a pending event must be waited on and the
+staged limits published. Run tests/v1/spec_decode/test_copy_drafts.py.
+
+Upstream: independent of 0676 and of #842's defaulting change; applies to the
+candidate-37 series.
+---
+ tests/v1/spec_decode/test_copy_drafts.py      | 34 +++++++++++++++++++
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py |  6 +++-
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
 diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
 index f25ee92..af7a9bf 100644
 --- a/tests/v1/spec_decode/test_copy_drafts.py
@@ -64,3 +92,6 @@ index d6a2c30..0fd5f0c 100644
              np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
              if self._pending_limit_resets:
                  self.slot_draft_limits.np[self._pending_limit_resets] = self.lookahead
+-- 
+2.56.0
+
