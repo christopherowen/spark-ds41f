@@ -152,48 +152,40 @@ before for every row, padding rows included, so the target's verification rows,
 their count and their padding are those of candidate-37.
 
 Not covered: a serving soak with real concurrent traffic and mixed prompt lengths
-where the token budget binds (the lesson of #842, whose arm crashed in the MoE
-router only under production traffic). That needs a cluster window, and it has not
-been run.
+where the token budget binds. That is the lesson of #842, whose arm crashed in the MoE
+router only under production traffic. It is queued on sp5..sp7 (below).
 
-### Serving soak: planned, not run
+### Serving soak on sp5..sp7 (queued; results pending)
 
-The arm is [`tp3-soak-dev.json`](tp3-soak-dev.json): candidate-37's dev arm at
-`tp3-triangle` with 0677's three runtime files mounted over the image's
-candidate-37 copies ([`overlay/vllm`](overlay/vllm), from vLLM `3b7884972`). That is
-0677's runtime tree on the image digest every rank already holds (`c4c59de1` on
-dgx1..dgx3). `deployment.branch` is unset so the unmerged experiment commit
-(`6c221d47`) deploys.
+A first attempt on dgx1..dgx3 (2026-11-02, about 18:00 CET) was blocked: this
+session's permissions refused `scripts/lab.py window open` before anything changed.
+No hold was written, and dgx1..dgx3 stayed serving candidate-36. That block stands:
+dgx1..dgx3 keep serving candidate-36.
 
-The workload is servebench's `release-tp3`, about 70 minutes:
+The soak moved to sp5..sp7 (`tp3-switched`), into the one lab window the owner
+authorized there. The #842 session holds that window and queues this spec beside the
+other traffic soaks. This session runs no cluster command.
 
-- 8 and 4 streams in closed loops, and Poisson arrivals;
-- a cold 131K prompt prefilling under 3, 6 and 7 decode streams, so the token budget
-  binds and rows are padded;
-- prefill from 32K to 1M;
-- a failed request fails its step.
-
-On 2026-11-02 the cluster was idle and served candidate-36
-(`candidate-36/tp3-dev.json`), with no hold or request. The window open was refused
-by this session's permission system before anything changed. On dgx1, in the
-deployment checkout:
-
-```sh
-scripts/lab.py window open --production-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json --note "PR 854 serving soak"
-git fetch -q origin && git checkout -q --detach 6c221d47
-setsid -f python3 experiments/2026-11-02-dspark-markov-greedy-fusion/scripts/hold_heartbeat.py "PR 854 soak" > ~/spark-heartbeat.log 2>&1 < /dev/null
-bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json cluster sync --apply
-bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json cluster start --replace --apply
-bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json bench --suite release-tp3 --label 0677-soak --compare none --output results/private/suites/pr854-soak/0677
-# then restore what served
-git checkout -q --detach origin/main
-bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json cluster sync --revision origin/main --apply
-touch ~/spark-heartbeat.stop
-scripts/lab.py window close
-```
-
-Pass: every step completes with no failed request, and no engine error
-(`gate logits contain nan or inf`, device asserts) in any rank's log.
+- Arm: [`tp3-switched-soak-dev.json`](tp3-switched-soak-dev.json). It extends the
+  profile sp5..sp7 serve, `config/candidate-37-tp3-switched-dev.local.json`
+  (node-local, git-ignored, sha256 `92b1712d...`, identical on the three nodes):
+  candidate-37 at `tp3-switched` with the dev-mode collective RPC, image digest
+  `e1ee7b19...` on sp5..sp8. The arm keeps the cache mount and adds 0677's three
+  runtime files over the image's candidate-37 copies
+  ([`overlay/vllm`](overlay/vllm), from vLLM `3b7884972`). The recipe still adds the
+  hub and GLP mounts, so the arm changes nothing else. On that image the three files
+  are candidate-37's (`5b7cfa37`) versions, checked by SHA-256 on sp8, so the overlay
+  gives 0677's runtime tree.
+- Spec: [`soak-tp3-switched.json`](soak-tp3-switched.json): a `sync` job, then one
+  boot measured with servebench's `release-tp3` (about 70 minutes). That suite runs
+  8- and 4-stream closed loops and Poisson arrivals. It prefills a cold 131K prompt
+  under 3, 6 and 7 decode streams, so the token budget binds and rows are padded, and
+  it prefills from 32K to 1M. A failed request fails its step. One boot is enough for
+  a functional soak; the suite's timings are not a verdict.
+- Dry run (`scripts/lab.py run soak-tp3-switched.json --dry-run --production-config
+  config/candidate-37-tp3-switched-dev.local.json`): 5 steps, no problems.
+- Pass: every step completes, and no rank logs `gate logits contain nan or inf` or a
+  device assert.
 
 ## Draft-step microbenchmark (sp8, FP32 logits, top-2 off)
 
@@ -346,9 +338,9 @@ on TP3 (+0.4–0.6 µs per position). With the shard hot in L2 for the whole loo
 faster beyond. These are microbenchmark deltas on one rank. No end-to-end run was
 made; at one request the difference is about 0.03% of a 10 ms decode step.
 
-Before it is called ready, it needs a serving soak on a candidate image: real
+Before it is called ready, it needs the serving soak queued on sp5..sp7 (above):
 concurrent traffic, mixed prompt lengths, the token budget binding. The
-functional soak above is clean but does not replace it. Promotion is the owner's
+functional soak is clean but does not replace it. Promotion is the owner's
 decision with a candidate screen. Follow-ups, each its own experiment:
 
 - The 1–2-request overhead is the fused epilogue and the 1,010–1,348-tile finish.
