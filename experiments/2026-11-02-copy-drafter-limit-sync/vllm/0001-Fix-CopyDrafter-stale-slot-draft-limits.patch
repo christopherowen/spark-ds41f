@@ -1,0 +1,66 @@
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee92..af7a9bf 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -24,6 +24,8 @@ design's walk, and temperature-0 output with and without copy drafts.
+   over prompts that copy a lot, a little and not at all.
+ """
+ 
++from types import SimpleNamespace
++
+ import numpy as np
+ import pytest
+ import torch
+@@ -918,3 +920,35 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+     limits = drafter.sync_slot_draft_limits()
+     assert limits.shape == (MAX_REQS,)
++
++def test_sync_slot_draft_limits_waits_for_the_queued_copy():
++    """The host limits must be the current step's, not the previous one's.
++
++    ``attach_async_output`` queues a D2H copy and stores its event; the next
++    step's budget must wait for that copy instead of reading the stale host
++    values. A stale, wider limit verifies rows the current proposal does not
++    have, and those rows' ``-1`` placeholders NaN the router.
++    """
++
++    class _Event:
++        def __init__(self):
++            self.synchronized = False
++
++        def query(self):
++            return self.synchronized
++
++        def synchronize(self):
++            self.synchronized = True
++
++    drafter = CopyDrafter.__new__(CopyDrafter)
++    event = _Event()
++    drafter._limits_event = event
++    drafter._limits_staging_np = np.array([7, 8], dtype=np.int32)
++    drafter.slot_draft_limits = SimpleNamespace(np=np.zeros(2, dtype=np.int32))
++    drafter.lookahead = 16
++    drafter._pending_limit_resets = []
++
++    limits = drafter.sync_slot_draft_limits()
++
++    assert event.synchronized
++    assert limits.tolist() == [7, 8]
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30..0fd5f0c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -111,7 +111,11 @@ class CopyDrafter:
+         self._new_rows: list[int] = []
+ 
+     def sync_slot_draft_limits(self) -> np.ndarray:
+-        if self._limits_event is not None and self._limits_event.query():
++        # Correctness: the host copy must be the current step's limits, not a
++        # stale value from an earlier proposal. Wait for the D2H copy queued by
++        # attach_async_output (it is small and was queued before the drafter).
++        if self._limits_event is not None:
++            self._limits_event.synchronize()
+             np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
+             if self._pending_limit_resets:
+                 self.slot_draft_limits.np[self._pending_limit_resets] = self.lookahead
