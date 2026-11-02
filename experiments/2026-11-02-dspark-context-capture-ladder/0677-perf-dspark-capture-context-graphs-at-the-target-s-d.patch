@@ -1,0 +1,288 @@
+From 5340c9e2fa07287a66d30b448000f11199b517ee Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:46:18 +0100
+Subject: [PATCH] perf(dspark): capture context graphs at the target's decode
+ graph sizes
+
+DSparkContextCudaGraphs captured powers of two plus the limit, so a
+full-depth decode step (1 + 5 rows a request) padded 6 -> 8, 24 -> 32
+and 48 -> 64 rows through main_proj (and its TP all_gather), main_norm
+and the three draft layers' KV projection, norm, RoPE and cache write.
+The context graph runs at the target step's live row count; capture
+the row counts of the target's own FULL decode graphs instead: the
+compilation config's capture ladder and the token totals of
+dense_varlen_decode_shapes (every one- and two-request total, every
+full-depth step) at one request's verification width, up to the
+context limit, which stays captured.
+
+Base: candidate-37 patch head 5b7cfa37 (local-inference-lab/vllm
+19f2c20e plus the series). Supersedes the unmerged ladder of the
+2026-10-31 dspark-context-cudagraph-ladder experiment, which kept
+powers of two and its own copy of the decode shapes.
+
+Quality: none. The context rows are the same; padded rows past the
+step remain PAD-slotted and are never written to the cache. No new
+kernel shape: every size is a row count the declared row tiles serve.
+
+Graphs: the target's decode graph count below the limit, 23 at
+tp3-triangle (was 7) and 35 at tp4-ring (was 8), in the shared graph
+pool.
+
+Tests: tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+checks the sizes against a target CudaGraphManager planned as the
+model runner plans it (tp3-triangle, tp4-ring, copy-draft width), and
+that every decode step the target runs as a FULL graph replays a
+context graph no wider than the target's.
+
+Upstream: local; DSpark V4.1 is not in vllm-project/vllm.
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 165 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  45 +++--
+ 2 files changed, 200 insertions(+), 10 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index c530e27e2..16fd00509 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -365,3 +365,168 @@ def test_combine_aux_hidden_states_into_fuses_join_and_cast_mxfp8(monkeypatch):
+     model.precompute_and_store_context_kv(out, positions, slots)
+     assert not casts
+     assert seen_provided[1].values.shape[1] == WIDTH
++
++
++def _recipe_ladder(rows):
++    # The deployment recipe's capture ladder (scripts/recipe.py capture_sizes).
++    ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, rows + 1, 8)]
++    return [*(size for size in ladder if size < rows), rows]
++
++
++def _decode_config(max_num_seqs, capture_sizes, drafts=5, verification=5):
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    from vllm.config import (
++        CompilationConfig,
++        ParallelConfig,
++        SchedulerConfig,
++        VllmConfig,
++    )
++
++    compilation_config = CompilationConfig(
++        cudagraph_mode="FULL_AND_PIECEWISE", cudagraph_capture_sizes=capture_sizes
++    )
++    compilation_config.max_cudagraph_capture_size = capture_sizes[-1]
++    compilation_config.post_init_cudagraph_sizes()
++    vllm_config = MagicMock(spec=VllmConfig)
++    vllm_config.compilation_config = compilation_config
++    vllm_config.scheduler_config = SchedulerConfig.default_factory(
++        max_num_seqs=max_num_seqs
++    )
++    vllm_config.parallel_config = ParallelConfig()
++    vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=False)
++    vllm_config.num_speculative_tokens = drafts
++    vllm_config.num_verification_tokens = verification
++    speculative_config = MagicMock()
++    speculative_config.uses_acceptance_length_adaptation.return_value = False
++    speculative_config.uses_batch_size_dynamic_speculative_decoding.return_value = (
++        False
++    )
++    vllm_config.speculative_config = speculative_config
++    return vllm_config
++
++
++def _no_graph_pool(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu import cudagraph_utils
++
++    monkeypatch.setattr(
++        cudagraph_utils,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(
++        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
++    )
++
++
++def _target_manager(vllm_config, decode_query_len):
++    """The target's graphs as the model runner plans them under adaptive
++    verification: FULL variable-length decode graphs beside piecewise mixed ones."""
++    from vllm.config.compilation import CUDAGraphMode
++    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
++
++    manager = CudaGraphManager(
++        vllm_config,
++        torch.device("cpu"),
++        CUDAGraphMode.FULL_AND_PIECEWISE,
++        decode_query_len=decode_query_len,
++        varlen_decode=True,
++    )
++    manager._graphs_captured = True
++    return manager
++
++
++def _context_graphs(vllm_config, limit):
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkContextCudaGraphs
++
++    model = SimpleNamespace(
++        config=SimpleNamespace(hidden_size=8, dspark_target_layer_ids=[0, 1, 2])
++    )
++    graphs = DSparkContextCudaGraphs(
++        model,
++        vllm_config,
++        torch.zeros(limit + 4, 8, dtype=torch.bfloat16),
++        torch.zeros(limit + 4, dtype=torch.int64),
++        torch.zeros(1, limit + 4, dtype=torch.int64),
++        None,
++        limit,
++    )
++    graphs.manager._graphs_captured = True
++    return graphs
++
++
++@pytest.mark.parametrize(
++    "max_num_seqs,rows,verification",
++    [(8, 48, 5), (16, 96, 5), (8, 48, 8)],
++    ids=["tp3-triangle", "tp4-ring", "copy-drafts"],
++)
++def test_context_capture_sizes_are_the_target_decode_graph_sizes(
++    monkeypatch, max_num_seqs, rows, verification
++):
++    """The context graphs capture exactly the row counts of the target's FULL
++    decode graphs below the largest decode step, derived from the same capture
++    ladder and dense decode shapes: one source, so the two cannot drift."""
++    from vllm.config.compilation import CUDAGraphMode
++    from vllm.models.deepseek_v4_1.nvidia.dspark import _context_capture_sizes
++
++    _no_graph_pool(monkeypatch)
++    vllm_config = _decode_config(
++        max_num_seqs, _recipe_ladder(rows), verification=verification
++    )
++    target = _target_manager(vllm_config, 1 + verification)
++    target_sizes = {
++        desc.num_tokens for desc in target._capture_descs[CUDAGraphMode.FULL]
++    }
++    for limit in (rows, rows - 7):
++        sizes = _context_capture_sizes(vllm_config, limit)
++        assert sizes == sorted({n for n in target_sizes if n <= limit} | {limit})
++    assert _context_capture_sizes(vllm_config, 0) == []
++    if (max_num_seqs, verification) == (8, 5):
++        # TP3: 23 graphs, every one- and two-request total and every full-depth
++        # step exact, where powers of two captured 7.
++        assert _context_capture_sizes(vllm_config, rows) == [
++            *range(1, 13), 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 48
++        ]
++
++
++@pytest.mark.parametrize(
++    "max_num_seqs,rows", [(8, 48), (16, 96)], ids=["tp3-triangle", "tp4-ring"]
++)
++def test_context_graphs_pad_decode_rows_no_further_than_the_target(
++    monkeypatch, max_num_seqs, rows
++):
++    """Every decode step the target runs as a FULL graph replays a context graph
++    no wider than the target's: full-depth steps (6 rows a request) and every one-
++    and two-request total (adaptive verification trims drafts) exactly."""
++    from vllm.config.compilation import CUDAGraphMode
++
++    _no_graph_pool(monkeypatch)
++    vllm_config = _decode_config(max_num_seqs, _recipe_ladder(rows))
++    target = _target_manager(vllm_config, 6)
++    graphs = _context_graphs(vllm_config, rows)
++    sizes = graphs.manager.compilation_config.cudagraph_capture_sizes
++    assert graphs.manager.compilation_config.max_cudagraph_capture_size == rows
++    assert graphs.aux.shape[0] == rows
++
++    def context_rows(num_tokens):
++        desc = graphs.manager.dispatch(1, num_tokens, None, 0)
++        assert desc.cg_mode == CUDAGraphMode.FULL
++        return desc.num_tokens
++
++    for num_reqs in range(1, max_num_seqs + 1):
++        assert context_rows(6 * num_reqs) == 6 * num_reqs
++        for num_tokens in range(num_reqs, 6 * num_reqs + 1):
++            desc = target.dispatch(num_reqs, num_tokens, None, 0, max_query_len=6)
++            assert desc.cg_mode == CUDAGraphMode.FULL
++            assert num_tokens <= context_rows(num_tokens) <= desc.num_tokens
++            if num_reqs <= 2:
++                assert context_rows(num_tokens) == num_tokens
++    assert graphs.manager.dispatch(1, rows + 1, None, 0).cg_mode == (
++        CUDAGraphMode.NONE
++    )
++    assert len(graphs.manager._capture_descs[CUDAGraphMode.FULL]) == len(sizes)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 68efca1d1..4b811286e 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -41,7 +41,10 @@ from vllm.model_executor.models.utils import maybe_prefix
+ from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
++from vllm.v1.worker.gpu.cudagraph_utils import (
++    CudaGraphManager,
++    dense_varlen_decode_shapes,
++)
+ 
+ from .. import kernels, l2_prefetch
+ from ..tilelang import columns, dspark_context, prepare
+@@ -74,6 +77,36 @@ def _context_kv_projection(attn: nn.Module):
+     return projection
+ 
+ 
++def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
++    """The context graphs' row counts: the target's decode graph sizes up to ``limit``.
++
++    A context graph runs at the target step's live row count. The target captures
++    its FULL decode graphs at the capture ladder and at every exact low-concurrency
++    and full-depth speculative total (``dense_varlen_decode_shapes`` at one
++    request's verification width), so these sizes pad the context no further than
++    the target pads itself: a full-depth step keeps its 6, 24 or 48 rows through
++    main_proj, its gather and the draft layers' KV front instead of 8, 32 or 64.
++    The count is the target's own decode graph count below ``limit``, which is
++    always captured: the largest decode step.
++    """
++    if limit <= 0:
++        return []
++    decode_query_len = 1 + vllm_config.num_verification_tokens
++    sizes = {limit}
++    sizes.update(
++        num_tokens
++        for _, num_tokens in dense_varlen_decode_shapes(
++            vllm_config.scheduler_config.max_num_seqs, decode_query_len, limit
++        )
++    )
++    sizes.update(
++        size
++        for size in vllm_config.compilation_config.cudagraph_capture_sizes or ()
++        if size <= limit
++    )
++    return sorted(sizes)
++
++
+ class DSparkContextCudaGraphs:
+     """Serial, draft-workspace-lane owner for auxiliary projection and KV prep.
+ 
+@@ -104,15 +137,7 @@ class DSparkContextCudaGraphs:
+             hidden_states.shape[0],
+             vllm_config.compilation_config.max_cudagraph_capture_size,
+         )
+-        # Powers of two bound padding to less than 2x, independent of live rows.
+-        capacities = []
+-        capacity = 1
+-
+-        while capacity < limit:
+-            capacities.append(capacity)
+-            capacity *= 2
+-        if limit > 0:
+-            capacities.append(limit)
++        capacities = _context_capture_sizes(vllm_config, limit)
+         self.aux = torch.zeros(
+             (limit, self.width * self.num_aux),
+             dtype=hidden_states.dtype,
+-- 
+2.43.0
+
