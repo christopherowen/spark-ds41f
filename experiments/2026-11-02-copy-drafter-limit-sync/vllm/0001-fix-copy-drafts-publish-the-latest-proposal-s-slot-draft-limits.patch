@@ -1,0 +1,202 @@
+From 8bb50809166ec7e097edcf36d750ec28c070c3ec Mon Sep 17 00:00:00 2001
+From: Jordi Posthumus <jordi.posthumus@gmail.com>
+Date: Mon, 2 Nov 2026 21:02:45 +0000
+Subject: [PATCH] fix(copy-drafts): publish the latest proposal's slot draft
+ limits before the budget reads them
+
+Base: candidate-37's patch head 5b7cfa37f (vLLM tree af0fb152), on 0612
+(#687, #619), which made sync_slot_draft_limits non-blocking. From #855,
+with 0612's test reconciled and the reset bookkeeping it no longer needs
+removed.
+
+Rationale. 0612 mirrored the copy drafter's per-slot draft limits to the
+host without waiting, so the adaptive budget could cap a stale wide
+schedule without an event sync stall: until the copy landed, the host
+kept the previous values. Under load it often had not landed. On a
+three-node ring 1,209 stale reads preceded the engine's death at
+min_match=8 (#852). A stale limit wider than the latest proposal makes
+the budget verify rows the proposal does not have, the scheduler's -1
+placeholders. With dead-row marking on (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU
+above 0, no batch sharder) those rows carry confidence 0 and are padding
+the router skips; with it off they are routed as live rows and their
+gate logits are non-finite, which trips route_partials' device assert.
+A stale limit narrower than the proposal admits fewer of its drafts.
+sync_slot_draft_limits now waits for the copy (small, queued before the
+drafter runs) and publishes it. add_request no longer has to replay
+resets over a copy that lands later, so that bookkeeping goes.
+
+Quality implications. The verified rows always match the latest
+proposal: no placeholder row is verified whatever the dead-row setting,
+and a narrow stale limit no longer drops drafts. Sampling and acceptance
+rules are unchanged. The host now waits each step for the limit copy,
+which lands once the previous step's target forward and sampling are
+done, so its preparation of the next step overlaps less with the GPU. On
+the ring that reproduced #852 (the operator's measurements, #855): the
+m=8 crash on 2 of 2 boots is gone; copy-probe tokens per step are
+unchanged for copy and edit, tool 6.636 -> 6.905 at m=8 and 6.083 ->
+6.232 at m=16; single stream 63.87 against 64.90 and 63.58 against 64.68
+tok/s (-1.6% and -1.7%, CI95 2.8%). Not yet measured here: a paired
+single-stream verdict, and 8 and 16 streams.
+
+Tests. tests/v1/spec_decode/test_copy_drafts.py: the host limits wait
+for a queued copy and are the staged ones; a request added while a copy
+is in flight keeps its reset; the stale-wide test keeps its placeholder
+and doubling checks and drops its assertion that the sync never blocks.
+test_copy_drafts.py, tests/v1/core/test_copy_drafts_scheduler.py and
+tests/v1/spec_decode/test_adaptive_verification.py on candidate-37's
+image: 71 passed, 1 skipped (candidate-37: 69 passed, 1 skipped).
+
+Upstream status: local, on the local patch 0612; not submitted.
+---
+ tests/v1/spec_decode/test_copy_drafts.py      | 62 +++++++++++++++----
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py | 18 +++---
+ 2 files changed, 59 insertions(+), 21 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee920f..f99189ee0 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -24,6 +24,8 @@ design's walk, and temperature-0 output with and without copy drafts.
+   over prompts that copy a lot, a little and not at all.
+ """
+ 
++from types import SimpleNamespace
++
+ import numpy as np
+ import pytest
+ import torch
+@@ -857,12 +859,11 @@ def test_prepare_alloc_skips_incomplete_prefill_requests():
+     torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])
+ 
+ 
+-def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync():
++def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap():
+     """When async scheduling allocates 16 draft rows from 2 steps back while the
+     previous step only offered 8 copy drafts, columns 8..15 are -1 placeholders
+-    (rejected even when the target argmax is token 0), accepting all 8 valid
+-    copy drafts still doubles the cap to 16, and sync_slot_draft_limits never
+-    calls synchronize() on an in-flight CUDA event."""
++    (rejected even when the target argmax is token 0), and accepting all 8 valid
++    copy drafts still doubles the cap to 16."""
+     rng = np.random.default_rng(19)
+     states = _request_state(8192)
+     drafter = _drafter(states)
+@@ -907,14 +908,51 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     assert int(drafter.int_state[slot, 0]) == 1
+     assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
+ 
+-    # In-flight event: sync_slot_draft_limits queries without synchronizing.
+-    class InFlightEvent:
+-        def query(self) -> bool:
+-            return False
+ 
+-        def synchronize(self) -> None:
+-            raise AssertionError("sync_slot_draft_limits must not block on GPU")
++class _QueuedCopy:
++    """A D2H copy still in flight: query() is False until synchronize()."""
++
++    def __init__(self):
++        self.synchronized = False
++
++    def query(self) -> bool:
++        return self.synchronized
++
++    def synchronize(self) -> None:
++        self.synchronized = True
++
++
++def _limits_drafter(staged):
++    drafter = CopyDrafter.__new__(CopyDrafter)
++    drafter.lookahead = LOOKAHEAD
++    drafter.slot_draft_limits = SimpleNamespace(np=np.zeros(len(staged), dtype=np.int32))
++    drafter._limits_staging_np = np.array(staged, dtype=np.int32)
++    drafter._limits_event = _QueuedCopy()
++    drafter._new_rows = []
++    return drafter
++
++
++def test_sync_slot_draft_limits_waits_for_the_queued_copy():
++    """The host limits are the latest proposal's, never an earlier one's (#852).
+ 
+-    drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
++    attach_async_output queues a D2H copy of the limits and keeps its event; the
++    next budget waits for that copy rather than reading the previous values. A
++    stale, wider limit verified rows the proposal does not have, the scheduler's
++    -1 placeholders, and without dead-row marking they reached the MoE router.
++    """
++    drafter = _limits_drafter([7, 8])
++    event = drafter._limits_event
+     limits = drafter.sync_slot_draft_limits()
+-    assert limits.shape == (MAX_REQS,)
++    assert event.synchronized
++    assert limits.tolist() == [7, 8]
++    assert drafter._limits_event is None
++
++
++def test_add_request_resets_its_slot_after_the_queued_copy():
++    """A request added while a copy is in flight keeps its reset: the copy is
++    published first, then the new slot's limit is the full lookahead."""
++    drafter = _limits_drafter([3, 5])
++    drafter.add_request(1)
++    assert drafter.slot_draft_limits.np.tolist() == [3, LOOKAHEAD]
++    assert drafter._new_rows == [1]
++    assert drafter.sync_slot_draft_limits().tolist() == [3, LOOKAHEAD]
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30b6..18a1610be 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -97,7 +97,11 @@ class CopyDrafter:
+         self.alloc = self._alloc_buffers[0].gpu
+         self._select_alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         # Actual valid draft count per slot from the latest proposal, mirrored to
+-        # host non-blockingly so the adaptive budget caps stale wide schedules.
++        # host so the next step's adaptive budget admits exactly the drafts that
++        # proposal has. The host waits for the copy (sync_slot_draft_limits): a
++        # mirror left stale under load let the budget verify rows past the
++        # proposal, the scheduler's -1 placeholders, which reach the MoE router
++        # as live rows without dead-row marking and give non-finite gate logits.
+         self.slot_draft_limits = CpuGpuBuffer(
+             max_reqs, dtype=torch.int32, device=device
+         )
+@@ -105,17 +109,16 @@ class CopyDrafter:
+         self.slot_draft_limits.gpu.fill_(self.lookahead)
+         self._limits_event: torch.cuda.Event | None = None
+         self._limits_staging_np: np.ndarray = self._limits_staging[0].np
+-        self._pending_limit_resets: list[int] = []
+         # A step that verified no drafts: nothing to judge.
+         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         self._new_rows: list[int] = []
+ 
+     def sync_slot_draft_limits(self) -> np.ndarray:
+-        if self._limits_event is not None and self._limits_event.query():
++        """The latest proposal's draft limits on the host. Waits for their copy
++        (attach_async_output): it is small and queued before the drafter runs."""
++        if self._limits_event is not None:
++            self._limits_event.synchronize()
+             np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
+-            if self._pending_limit_resets:
+-                self.slot_draft_limits.np[self._pending_limit_resets] = self.lookahead
+-                self._pending_limit_resets.clear()
+             self._limits_event = None
+         return self.slot_draft_limits.np
+ 
+@@ -133,8 +136,6 @@ class CopyDrafter:
+ 
+     def add_request(self, req_idx: int) -> None:
+         self.sync_slot_draft_limits()[req_idx] = self.lookahead
+-        if self._limits_event is not None:
+-            self._pending_limit_resets.append(req_idx)
+         self._new_rows.append(req_idx)
+ 
+     def apply_staged_writes(self) -> None:
+@@ -219,7 +220,6 @@ class CopyDrafter:
+         )
+         self._limits_staging_np = limits_staging.np
+         self._limits_event = event
+-        self._pending_limit_resets.clear()
+ 
+     def propose(
+         self,
+-- 
+2.43.0
+
