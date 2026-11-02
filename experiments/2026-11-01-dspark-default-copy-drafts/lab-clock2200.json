@@ -1,0 +1,24 @@
+{
+ "experiment": "experiments/2026-11-01-dspark-default-copy-drafts",
+ "run": "copy-nan-repro-2200-sp",
+ "jobs": [
+  {"kind": "sync"},
+  {"kind": "gpu_clocks", "lock_mhz": [2200, 2200]},
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench": false,
+   "arms": [
+    {"config": "experiments/2026-11-01-dspark-default-copy-drafts/repro/arm-c37-census-m8.json", "label": "c37-m8-2200"}
+   ],
+   "extras": [
+    ["experiments/2026-10-23-next-release/acceptance/copy_probe.py", ["--prompts", "3"], "copy-probe"],
+    ["experiments/2026-11-01-dspark-default-copy-drafts/repro/suite_single_stream.py", ["c37-m8", "{run}"], "single-stream"],
+    ["experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py", ["{label}"], "census"],
+    ["scripts/distinct_streams.py", ["--streams", "16", "--samples", "3", "--tokens", "1024"], "c16-distinct"],
+    ["experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py", ["{label}"], "census-c16"]
+   ]
+  },
+  {"kind": "gpu_clocks", "reset": true}
+ ]
+}
