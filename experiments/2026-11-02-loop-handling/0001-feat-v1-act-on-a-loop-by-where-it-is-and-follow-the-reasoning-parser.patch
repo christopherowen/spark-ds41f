@@ -1,4 +1,4 @@
-From 6698d7467426d675b10839cd5c1fe885bd809cff Mon Sep 17 00:00:00 2001
+From 050e8b1cce5f7c0a52e7f4a03e0691c47d542025 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:09:11 +0000
 Subject: [PATCH] feat(v1): act on a loop by where it is, and follow the
@@ -21,10 +21,16 @@ handling now depends on where the loop is:
   the request instead of leaving the loop unchecked until max_tokens;
 - in the answer after a reasoning loop: stop at the first loop (the context
   is already degenerate);
-- in the answer of a request whose reasoning did not loop: stop only a loop
-  that persists OUTPUT_LOOP_PERSIST (256) tokens past its first detection
-  (gaps up to 16) and then leaves fewer than one distinct token in ten
-  among the answer's last 512 tokens.
+- in the answer of a request whose reasoning did not loop: stop token soup
+  (one token over 60% of the answer's last 512 tokens, in a run or more
+  every 32 tokens) once it has persisted OUTPUT_SOUP_PERSIST (256) tokens
+  past its first detection; stop any other loop only after
+  OUTPUT_LOOP_PERSIST (2048) tokens, and only if it leaves fewer than one
+  distinct token in ten among the answer's last 512 tokens. Detections up
+  to OUTPUT_LOOP_GAP (64) tokens apart count as one loop. Legitimate
+  periodic output is long at real token counts (a 256-zero C array is 780
+  tokens, a 16x16 matrix 792), and a soak on hardware stopped a 128-zero
+  array at its 292nd of 396 tokens under a single 256-token horizon.
 
 A token-soup rule joins the detector: one token at 60% or more of the last
 32-64 tokens, with at most one distinct token per eight. It catches the
@@ -51,50 +57,70 @@ answer's last 512 tokens, within 512 tokens of its start); requests whose
 legitimate answer repeats are no longer cut. Replayed over 3,618 chunks
 (5.84M tokens) of real code and documentation as visible answers,
 candidate-37 stops 31 and this stops none; as reasoning both break 31, and
-the token-soup rule adds none. The detector costs 8.1 us a token against
+the token-soup rule adds none. Replayed with the real tokenizer, legitimate
+repetition up to about 2,000 tokens is kept ('hello' 200 times, 128-, 256-
+and 512-zero arrays, a 16x16 matrix, separators, a 200-row table; candidate-37
+stops each within 37 tokens); the production soup stops 415 tokens after it
+starts and an exactly periodic runaway after about 2,070. The detector costs 8.1 us a token against
 7.7 us (single core, recorded outputs).
 
 Tests. tests/v1/core/test_repetition_detection.py: token soup (the
 incident shape, interjections of new tokens, alternations and prose that
 must not match), the parser-following markers, the forced-end grace, the
-answer's persistence and diversity, and known trigger shapes (the 736-token
-production run, separator rules of 199 and 300 tokens in varied output,
-requested repetition of 200 words, a 128-zero array, the "Let me do it."
-stall). The scheduler and output suites fail exactly as they do on
+answer's two horizons and diversity, and known trigger shapes (the
+production soup, separator rules of 199 and 300 tokens in varied output,
+requested repetition at real token counts: 200 words, a 512-zero array, a
+16x16 matrix, a 200-row table; the "Let me do it." stall). The scheduler and output suites fail exactly as they do on
 candidate-37 (the offline hub lacks facebook/opt-125m).
 
 Upstream status: local, on the local patches 0656 and 0674; not submitted.
 ---
- tests/v1/core/test_repetition_detection.py | 228 ++++++++++++++++++++-
+ tests/v1/core/test_repetition_detection.py | 272 ++++++++++++++++++++-
  vllm/v1/core/sched/scheduler.py            |  20 ++
- vllm/v1/core/sched/utils.py                | 164 +++++++++++----
- vllm/v1/request.py                         |  39 +++-
- 4 files changed, 400 insertions(+), 51 deletions(-)
+ vllm/v1/core/sched/utils.py                | 193 ++++++++++++---
+ vllm/v1/request.py                         |  39 ++-
+ 4 files changed, 467 insertions(+), 57 deletions(-)
 
 diff --git a/tests/v1/core/test_repetition_detection.py b/tests/v1/core/test_repetition_detection.py
-index aa7d90141..ed2d95900 100644
+index aa7d90141..7857acd64 100644
 --- a/tests/v1/core/test_repetition_detection.py
 +++ b/tests/v1/core/test_repetition_detection.py
-@@ -4,6 +4,9 @@ import pytest
+@@ -4,6 +4,10 @@ import pytest
  
  from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
  from vllm.v1.core.sched.utils import (
 +    FORCED_REASONING_END_GRACE,
 +    OUTPUT_LOOP_PERSIST,
++    OUTPUT_SOUP_PERSIST,
 +    _find_dominant_token_window,
      check_sequence_repetition,
      check_stop,
      detect_thinking_loop,
-@@ -471,7 +474,7 @@ class TestRepetitionDetectionIntegration:
+@@ -459,26 +463,31 @@ class TestRepetitionDetectionIntegration:
+         req_post = Request(
+             request_id="natural-post-think-loop",
+             prompt_token_ids=[1, 2, 128805, 198],
+-            sampling_params=SamplingParams(max_tokens=512),
++            sampling_params=SamplingParams(max_tokens=4096),
+             pooling_params=None,
+         )
+         for tok in [301, 302, 303, 128806]:
+             prev_out = len(req_post._output_token_ids)
+             req_post.append_output_token_ids(tok)
+             req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
+-            assert not check_stop(req_post, max_model_len=2048)
++            assert not check_stop(req_post, max_model_len=8192)
+         assert req_post.thinking_loop_breaks == 0
          assert req_post.thinking_output_start == -1
  
          stopped = False
 -        for tok in let_me_do_it * 4:
-+        for tok in let_me_do_it * 60:
++        for tok in let_me_do_it * 400:
              prev_out = len(req_post._output_token_ids)
              req_post.append_output_token_ids(tok)
              req_post.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
-@@ -479,6 +482,11 @@ class TestRepetitionDetectionIntegration:
+-            if check_stop(req_post, max_model_len=2048):
++            if check_stop(req_post, max_model_len=8192):
                  stopped = True
                  break
          assert stopped
@@ -106,16 +132,39 @@ index aa7d90141..ed2d95900 100644
          assert not req_post.force_thinking_end
          assert req_post.status == RequestStatus.FINISHED_REPETITION
          assert req_post.stop_reason == "repetition_detected"
-@@ -501,7 +509,7 @@ class TestRepetitionDetectionIntegration:
+@@ -487,7 +496,7 @@ class TestRepetitionDetectionIntegration:
+         for init_kwargs in (
+             {"prompt_token_ids": [1, 2, 128804, 128806]},
+             {"reasoning_ended": True},
+-            {"sampling_params": SamplingParams(max_tokens=512, thinking_token_budget=0)},
++            {"sampling_params": SamplingParams(max_tokens=4096, thinking_token_budget=0)},
+             {"reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking": False}}},
+             {"reasoning_parser_kwargs": {"chat_template_kwargs": {"enable_thinking": False}}},
+             {"reasoning_parser_kwargs": {"reasoning_effort": "none"}},
+@@ -495,19 +504,19 @@ class TestRepetitionDetectionIntegration:
+             req = Request(
+                 request_id="think-off-default-loop",
+                 prompt_token_ids=init_kwargs.get("prompt_token_ids", [1, 2, 128805, 198]),
+-                sampling_params=init_kwargs.get("sampling_params", SamplingParams(max_tokens=512)),
++                sampling_params=init_kwargs.get("sampling_params", SamplingParams(max_tokens=4096)),
+                 pooling_params=None,
+                 reasoning_ended=init_kwargs.get("reasoning_ended"),
                  reasoning_parser_kwargs=init_kwargs.get("reasoning_parser_kwargs"),
              )
              stopped = False
 -            for tok in let_me_do_it * 4:
-+            for tok in let_me_do_it * 60:
++            for tok in let_me_do_it * 400:
                  prev_out = len(req._output_token_ids)
                  req.append_output_token_ids(tok)
                  req.update_reasoning_markers(start_ids, end_ids, prev_num_output=prev_out)
-@@ -619,3 +627,219 @@ class TestRepetitionDetectionIntegration:
+                 assert req.thinking_disabled
+                 assert not req.force_thinking_end
+-                if check_stop(req, max_model_len=2048):
++                if check_stop(req, max_model_len=8192):
+                     stopped = True
+                     break
+             assert stopped
+@@ -619,3 +628,250 @@ class TestRepetitionDetectionIntegration:
              assert req.thinking_loop_breaks == 0
              assert req.last_loop_info is None
              assert req.copy_draft_alloc == 6
@@ -239,12 +288,12 @@ index aa7d90141..ed2d95900 100644
 +        zeros = [44, 48] * 100  # ", 0" x 100: detected from the 24th token
 +        assert self._feed(req, zeros) is None
 +        assert req.output_loop_since >= 0
-+        tail = list(range(2000, 2040))
++        tail = list(range(2000, 2080))
 +        assert self._feed(req, tail) is None
 +        assert req.output_loop_since == -1
 +
 +        loop_start = req.num_output_tokens
-+        fed = self._feed(req, [101, 102, 103, 104, 13, 198] * 100)
++        fed = self._feed(req, [101, 102, 103, 104, 13, 198] * 400)
 +        assert fed is not None
 +        assert req.status == RequestStatus.FINISHED_REPETITION
 +        assert req.output_loop_since > loop_start
@@ -285,18 +334,43 @@ index aa7d90141..ed2d95900 100644
 +        rng = random.Random(seed)
 +        return [rng.randrange(1000, 60000) for _ in range(n)]
 +
++    @staticmethod
++    def _soup(n, seed):
++        """The 2026-11-01 production collapse (#787): ' Vila' in runs of 3 to
++        12 with interjections of one to three other tokens."""
++        import random
++
++        vila, cone = 125221, [96830, 6289, 88227, 100308, 92036, 68908, 3221]
++        rng = random.Random(seed)
++        soup = []
++        while len(soup) < n:
++            if rng.random() < 0.62:
++                soup += [vila] * rng.randint(3, 12)
++            else:
++                soup += [rng.choice(cone) for _ in range(rng.randint(1, 3))]
++        return soup[:n]
++
 +    def test_known_trigger_single_token_attractor_in_answer(self):
-+        """The 2026-11-01 production collapse (#787): a 736-token run of ' Vila'
-+        in the visible answer after normal output. It stops once the run
-+        dominates the answer's last 512 tokens, long before the 736 tokens."""
-+        vila = 125221
-+        req = self._answer_request("vila-736")
++        """The production collapse in the visible answer after normal output
++        stops soon after it starts, long before its 736 tokens of ' Vila'."""
++        req = self._answer_request("vila-soup")
 +        assert self._feed(req, self._varied(1500, 1)) is None
-+        run_start = req.num_output_tokens
-+        fed = self._feed(req, [vila] * 736)
++        fed = self._feed(req, self._soup(2330, 6))
 +        assert fed is not None
 +        assert req.status == RequestStatus.FINISHED_REPETITION
-+        assert OUTPUT_LOOP_PERSIST < fed <= 512
++        assert OUTPUT_SOUP_PERSIST < fed <= 512
++
++    def test_periodic_loop_in_healthy_answer_stops_late(self):
++        """An exactly periodic loop (a run of one token, a repeated phrase)
++        stops only once it has persisted OUTPUT_LOOP_PERSIST tokens: before
++        that it may still be legitimate output."""
++        for name, loop in {"run": [125221], "phrase": [101, 102, 103, 104, 13, 198]}.items():
++            req = self._answer_request(name)
++            assert self._feed(req, self._varied(300, 7)) is None
++            fed = self._feed(req, loop * (3000 // len(loop)))
++            assert fed is not None, name
++            assert req.num_output_tokens - req.output_loop_since == OUTPUT_LOOP_PERSIST
++            assert req.status == RequestStatus.FINISHED_REPETITION
 +
 +    def test_known_trigger_separator_rule_in_varied_answer_is_kept(self):
 +        """Legitimate messages in the same sessions carried 199-token runs of
@@ -309,12 +383,18 @@ index aa7d90141..ed2d95900 100644
 +            assert not req.is_finished()
 +
 +    def test_known_trigger_requested_repetition_is_kept(self):
-+        """'Repeat hello 200 times', a 128-zero C array and an answer that is
-+        one token 100 times: legitimate, bounded, never stopped."""
-+        hello, comma, zero = 23714, 11, 15
++        """Requested repetition at its real token counts: 'hello' 200 times, a
++        512-zero C array (three tokens a zero: 1,548 tokens), a 16x16 matrix
++        of ones (792 tokens), a 200-row table and an answer that is one token
++        100 times: legitimate, bounded, never stopped. The 2026-11-02 soak
++        stopped a 128-zero array at its 292nd of 396 tokens."""
++        hello, comma, space, zero, one = 23714, 11, 223, 15, 16
++        open_row, close_row = [262, 58], [1592, 198]
 +        cases = {
 +            "hello-200": [hello] * 200,
-+            "zeros-128": [comma, zero] * 128,
++            "zeros-512": [zero, comma, space] * 512,
++            "ones-16x16": (open_row + [one, comma, space] * 16 + close_row) * 16,
++            "table-200": [t for i in range(200) for t in (124, 2000 + i, 124, zero, 124, 198)],
 +            "one-token-100": [hello] * 100,
 +        }
 +        for name, stream in cases.items():
@@ -372,10 +452,16 @@ index 317ce3acc..c90e485d9 100644
                  loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
                      "unknown",
 diff --git a/vllm/v1/core/sched/utils.py b/vllm/v1/core/sched/utils.py
-index fa8527184..e44b779ed 100644
+index fa8527184..bd884aa96 100644
 --- a/vllm/v1/core/sched/utils.py
 +++ b/vllm/v1/core/sched/utils.py
-@@ -6,6 +6,20 @@ from collections.abc import Sequence
+@@ -1,11 +1,32 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
++from collections import Counter
+ from collections.abc import Sequence
+ 
  from vllm.sampling_params import RepetitionDetectionParams
  from vllm.v1.request import Request, RequestStatus
  
@@ -384,19 +470,25 @@ index fa8527184..e44b779ed 100644
 +# verification width (drafts and copy drafts).
 +FORCED_REASONING_END_GRACE = 64
 +# Output tokens a loop in a healthy answer must persist past its first
-+# detection before the request stops, and the longest gap between detections
-+# that still counts as the same loop.
-+OUTPUT_LOOP_PERSIST = 256
-+OUTPUT_LOOP_GAP = 16
-+# ... and the answer's last OUTPUT_LOOP_WINDOW tokens must then hold fewer
-+# than one distinct token in OUTPUT_LOOP_MAX_DISTINCT_INV.
++# detection before the request stops. Token soup (one token dominating the
++# answer's last OUTPUT_LOOP_WINDOW tokens in many short runs, the collapse
++# seen in production) stops soon. Any other loop stops only long after
++# legitimate periodic output (a zero-filled array, a matrix, a table rule)
++# would have ended: a 256-zero C array is 780 tokens, a 16x16 matrix 792. And
++# the longest gap between detections that still counts as the same loop.
++OUTPUT_SOUP_PERSIST = 256
++OUTPUT_LOOP_PERSIST = 2048
++OUTPUT_LOOP_GAP = 64
++# ... and a loop that is not token soup must then leave fewer than one
++# distinct token in OUTPUT_LOOP_MAX_DISTINCT_INV among the answer's last
++# OUTPUT_LOOP_WINDOW tokens.
 +OUTPUT_LOOP_WINDOW = 512
 +OUTPUT_LOOP_MAX_DISTINCT_INV = 10
 +
  
  def _has_repeating_pattern(
      token_ids: Sequence[int],
-@@ -130,6 +144,42 @@ def _has_windowed_repeating_pattern(
+@@ -130,6 +151,42 @@ def _has_windowed_repeating_pattern(
      )
  
  
@@ -439,7 +531,7 @@ index fa8527184..e44b779ed 100644
  def detect_thinking_loop(
      token_ids: Sequence[int],
      start_idx: int = 0,
-@@ -144,6 +194,9 @@ def detect_thinking_loop(
+@@ -144,6 +201,9 @@ def detect_thinking_loop(
      3. Interspersed/windowed phrase loops (pattern length 5..64 repeated >= 5
         times within a 160-token window with >= 1 contiguous pair and covering
         >= 60% of the span).
@@ -449,7 +541,7 @@ index fa8527184..e44b779ed 100644
      """
      seq = getattr(token_ids, "_x", token_ids)
      avail = len(seq) - start_idx
-@@ -176,6 +229,10 @@ def detect_thinking_loop(
+@@ -176,6 +236,10 @@ def detect_thinking_loop(
      )
      if win_match is not None:
          return ("windowed_phrase", win_match[0], win_match[1])
@@ -460,7 +552,7 @@ index fa8527184..e44b779ed 100644
      return None
  
  
-@@ -326,7 +383,16 @@ def check_stop(
+@@ -326,7 +390,16 @@ def check_stop(
  
      if request.thinking_output_start >= 0:
          if request.force_thinking_end:
@@ -478,7 +570,7 @@ index fa8527184..e44b779ed 100644
          start_idx = request.thinking_output_start
          loop_info: tuple[str, int, int] | None = None
          if repetition_detection is not None and check_sequence_repetition(
-@@ -339,48 +405,66 @@ def check_stop(
+@@ -339,48 +412,88 @@ def check_stop(
              loop_info = detect_thinking_loop(
                  request._output_token_ids, start_idx=start_idx
              )
@@ -531,7 +623,8 @@ index fa8527184..e44b779ed 100644
 +    # The visible answer of a request whose reasoning did not loop. Legitimate
 +    # answers repeat too (a zero-filled array, a table rule, a file written
 +    # through a tool call) and then move on; a degenerate loop does not. Stop
-+    # only a loop that persists and dominates the answer's last
++    # only a loop that persists (token soup OUTPUT_SOUP_PERSIST tokens, any
++    # other loop OUTPUT_LOOP_PERSIST) and dominates the answer's last
 +    # OUTPUT_LOOP_WINDOW tokens, so a false detection costs nothing: a long
 +    # run inside otherwise varied output (a 199-token separator rule in a
 +    # message whose distinct-token ratio is 0.8) is never stopped.
@@ -555,16 +648,21 @@ index fa8527184..e44b779ed 100644
 -                request.stop_reason = "repetition_detected"
 -                return True
 +            request.output_loop_since = -1
-+        return False
+         return False
 +    if request.output_loop_since < 0:
 +        request.output_loop_since = num_output
 +    request.output_loop_last = num_output
 +    request.last_loop_info = loop_info
-+    if num_output - request.output_loop_since < OUTPUT_LOOP_PERSIST:
-         return False
++    persisted = num_output - request.output_loop_since
++    if persisted < OUTPUT_SOUP_PERSIST:
++        return False
 +    window = request._output_token_ids[
 +        max(start_idx, num_output - OUTPUT_LOOP_WINDOW) : num_output
 +    ]
++    if _is_token_soup(window):
++        return _finish_repetition(request)
++    if persisted < OUTPUT_LOOP_PERSIST:
++        return False
 +    if len(set(window)) * OUTPUT_LOOP_MAX_DISTINCT_INV >= len(window):
 +        return False
 +    return _finish_repetition(request)
@@ -580,6 +678,22 @@ index fa8527184..e44b779ed 100644
 -            return True
  
 -    return False
++def _is_token_soup(window: Sequence[int]) -> bool:
++    """One token over 60% of the window, broken into many short runs (one run
++    or more every 32 tokens) by interjections: the collapse seen in production.
++    One long run (a separator rule) and an exactly periodic array (no token
++    over half of it) are not."""
++    dominant, count = Counter(window).most_common(1)[0]
++    if count * 5 < len(window) * 3:
++        return False
++    runs = sum(
++        1
++        for i, token in enumerate(window)
++        if token == dominant and (i == 0 or window[i - 1] != dominant)
++    )
++    return runs * 32 >= len(window)
++
++
 +def _finish_repetition(request: Request) -> bool:
 +    request.status = RequestStatus.FINISHED_REPETITION
 +    request.stop_reason = "repetition_detected"
