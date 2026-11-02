@@ -1,0 +1,1087 @@
+From 6f6ec80710807e04974080c46c38d7f45d098f7d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:34:56 +0000
+Subject: [PATCH] fix(copy-drafts): kill verification rows past the device's
+ draft limits
+
+Base: candidate-37's patch head 5b7cfa37f (tree af0fb152), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series. The
+alternative to 8bb508091 (#856), which makes the host wait for the limit copy.
+
+Rationale (#852): patch 0612 made CopyDrafter.sync_slot_draft_limits publish
+the host's per-slot draft limits only once their copy has landed, so the
+adaptive budget can read an older proposal's limits. A stale limit wider than
+the current proposal lets the step verify rows the proposal does not have, its
+-1 placeholders. With dead rows off (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU unset or
+0) they are routed live, and route_partials asserts on non-finite gate logits.
+
+The device's limits (slot_draft_limits.gpu) are always the current proposal's:
+copy_alloc writes them before the drafter runs, on the stream every later
+step's input preparation runs on. The draft combine now takes them
+(DeadRows.limits) whenever copy drafts are on, with or without dead rows:
+- a decoding request's cut is at most its slot's limit (the survival cut
+  clamped to it, or without dead rows its drafts up to it, a thread a request
+  as the plain combine);
+- the rows from the cut on are padding, which route_partials and the MoE
+  dispatch skip;
+- a row past the limit takes the request's last sampled token as its input id
+  instead of -1.
+The cut then clamps what the request commits (the token counts, block
+verification's end of block, the acceptance estimator's observations), so no
+row past the limit is ever accepted. The runner declares the cut and combine
+variants with copy drafts. The host keeps 0612's non-blocking read: nothing
+waits.
+
+Quality: where the host's limits are current no row is past the device limit,
+and every step's input ids, padding, logits rows and commit counts are the same
+bits (the cut equals the request's drafts, so no clamp binds). Where they are
+stale and wider, the extra rows are padding and the request commits at most
+the proposal's drafts and the bonus; temperature-0 text is unchanged. Where
+they are stale and narrower, drafts are still left out: the device can only
+remove rows the host scheduled (#856's wait fixes that; this does not). Copy
+drafts with block verification on its Triton kernels (FP64 draws, a watermark)
+are now refused at kernel declaration, as dead rows are: those kernels cannot
+end a block at a cut. Given the same layout every rank marks the same rows:
+the device limits are computed alike on every rank from the same histories and
+verification. The layout itself still comes from each rank's own host read,
+which this change does not touch.
+
+Tests:
+- tests/v1/worker/test_gpu_tilelang_inputs.py: the draft limits against a host
+  reference, with and without dead rows; limits no request reaches change
+  nothing; the declared combine variants are the launched ones.
+- tests/v1/spec_decode/test_copy_drafts.py, through a CopyDrafter and the
+  adaptive verification manager: a stale wider host limit routes no
+  placeholder row, with dead rows off and on; current host limits leave the
+  step bit for bit as before; a stale narrower limit still under-admits.
+  0612's test that sync_slot_draft_limits never blocks is kept.
+- tests/v1/spec_decode/test_adaptive_verification.py: dead_row_args carries
+  the device limits.
+- tests/v1/worker/test_prepare_kernels.py: the cut and combine variants are
+  declared with copy drafts and dead rows off.
+
+Upstream status: local (spark-ds41f). Copy drafts, adaptive verification's
+dead rows and the TileLang input kernels are local patches.
+---
+ .../spec_decode/test_adaptive_verification.py |  21 ++
+ tests/v1/spec_decode/test_copy_drafts.py      | 224 ++++++++++++++++++
+ tests/v1/worker/test_gpu_tilelang_inputs.py   | 140 +++++++++++
+ tests/v1/worker/test_prepare_kernels.py       |  34 ++-
+ vllm/v1/worker/gpu/input_batch.py             |  19 +-
+ vllm/v1/worker/gpu/model_runner.py            |  24 +-
+ .../gpu/spec_decode/adaptive_verification.py  |  20 +-
+ .../gpu/spec_decode/rejection_sampler.py      |  10 +-
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 173 +++++++++++---
+ 9 files changed, 605 insertions(+), 60 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 75080c8b8..66a02f86b 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -734,6 +734,27 @@ def test_slot_draft_limits_cap_stale_wide_scheduled_drafts():
+     assert tokens == 6
+ 
+ 
++def test_dead_row_args_carry_the_device_draft_limits():
++    """With copy drafts the draft combine always takes the device's draft limits,
++    with dead rows (their threshold) or without (no threshold); without either it
++    marks no rows."""
++    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
++    manager._confidence_probs = torch.ones(2, 4)
++    manager._dead_row_cut = torch.zeros(2, dtype=torch.int32)
++    is_padding = torch.zeros(8, dtype=torch.bool)
++    limits = torch.full((2,), 4, dtype=torch.int32)
++    manager.dead_rows_tau = 0.0
++    assert manager.dead_row_args(is_padding, 1) is None
++    manager._device_draft_limits = limits
++    dead = manager.dead_row_args(is_padding, 1)
++    assert dead is not None and dead.log_tau is None and dead.limits is limits
++    assert dead.is_padding is is_padding and dead.cut.shape == (1,)
++    manager.dead_rows_tau = 0.2
++    dead = manager.dead_row_args(is_padding, 2)
++    assert dead is not None and dead.limits is limits and dead.cut.shape == (2,)
++    assert dead.log_tau == pytest.approx(np.log(0.2))
++
++
+ def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes(
+     monkeypatch,
+ ):
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee920f..c28ec738a 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -918,3 +918,227 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+     limits = drafter.sync_slot_draft_limits()
+     assert limits.shape == (MAX_REQS,)
++
++
++class _InFlightEvent:
++    """A limit copy that has not landed: the host keeps the previous limits."""
++
++    def query(self) -> bool:
++        return False
++
++    def synchronize(self) -> None:
++        raise AssertionError("sync_slot_draft_limits must not block on GPU")
++
++
++def _manager(monkeypatch, states, drafter, *, device_limits, tau):
++    """The runner's adaptive verification manager beside ``drafter``: the host
++    budget reads its non-blocking limits, the draft combine (with
++    ``device_limits``) its device ones. One rank."""
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive
++
++    monkeypatch.setattr(adaptive, "get_tp_group", lambda: SimpleNamespace(world_size=1))
++    manager = adaptive.AdaptiveVerificationManager(
++        states,
++        torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE),
++        num_bonus_tokens=1,
++        max_total_logits=4096,
++        row_cost=0.035,
++        planned_confidences=True,
++        num_draft_steps=BLOCK,
++        slot_draft_limits=drafter.sync_slot_draft_limits,
++        device_draft_limits=drafter.slot_draft_limits.gpu if device_limits else None,
++    )
++    manager.dead_rows_tau = tau
++    return manager
++
++
++def _propose(states, drafter, managers, idx, num_sampled, verified):
++    """A copy proposal as the runner makes it after a step: the allocation and
++    device limits, the drafts into the request state, and the confidences
++    published twice, so the host budget reads this proposal's planned ones."""
++    from types import SimpleNamespace
++
++    dspark_drafts = torch.zeros((1, BLOCK), dtype=torch.int64, device=DEVICE)
++    dspark_conf = torch.full((1, BLOCK), 0.5, device=DEVICE)
++    drafter.prepare_alloc(idx, num_sampled, verified, None)
++    drafts, confidences, planned = drafter.propose(
++        idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
++    )
++    states.draft_tokens[idx] = drafts
++    batch = SimpleNamespace(num_reqs=1, idx_mapping=idx)
++    for manager in managers:
++        for _ in range(2):
++            manager.record_confidences(confidences, batch, planned=planned)
++    return drafts[0].tolist()
++
++
++def _verify_step(states, manager, idx, scheduled):
++    """One verification step as the runner prepares it: the host budget over
++    ``scheduled`` scheduler placeholders, the device's allocation of it, the draft
++    combine with the manager's dead rows, and the commit count of a target that
++    takes every row's input as its next token."""
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.input_batch import (
++        combine_sampled_and_draft_tokens,
++        get_num_sampled_and_rejected,
++    )
++
++    num_tokens = manager.get_num_tokens({"req": 1 + scheduled}, {"req": [-1] * scheduled})
++    eligible = manager._batch_budget[0]["req"]
++    cu_num_logits, query_start_loc, budget, _, _ = manager.reallocate_drafts(
++        ["req"], idx
++    )
++    num_logits = 1 + budget
++    prefill = int(states.prefill_len.np[int(idx[0])])
++    seq_lens = torch.tensor([prefill + num_tokens], dtype=torch.int32, device=DEVICE)
++    input_ids = torch.full((num_tokens,), -7, dtype=torch.int32, device=DEVICE)
++    is_padding = torch.zeros(num_tokens, dtype=torch.bool, device=DEVICE)
++    dead_rows = manager.dead_row_args(is_padding, 1)
++    logits_indices = combine_sampled_and_draft_tokens(
++        input_ids, idx, states.last_sampled_tokens, query_start_loc[:2], seq_lens,
++        states.prefill_len.gpu, states.draft_tokens, cu_num_logits, num_logits, 1,
++        dead_rows=dead_rows,
++    )  # fmt: skip
++    cut = None if dead_rows is None else dead_rows.cut
++    committed, _ = get_num_sampled_and_rejected(
++        torch.full((1,), num_logits, dtype=torch.int32, device=DEVICE),
++        seq_lens,
++        cu_num_logits,
++        idx,
++        states.prefill_len.gpu,
++        dead_row_cut=cut,
++    )
++    torch.accelerator.synchronize()
++    return SimpleNamespace(
++        eligible=eligible,
++        rows=num_tokens,
++        input_ids=input_ids.tolist(),
++        is_padding=is_padding.tolist(),
++        logits_indices=logits_indices.tolist(),
++        cu_num_logits=cu_num_logits.tolist(),
++        cut=None if cut is None else cut.tolist(),
++        committed=int(committed[0]),
++    )
++
++
++def _copy_request(states, drafter, managers, seed):
++    """A decoding request whose context repeats a 32-token span: its first
++    proposal copies INITIAL drafts (columns past them are -1)."""
++    rng = np.random.default_rng(seed)
++    repeated = np.tile(rng.integers(1, VOCAB, 32), 6).tolist()
++    slot = _set_history(states, "req", repeated[:96])
++    states.num_computed_tokens_np[slot] = 96
++    states.last_sampled_tokens[slot] = repeated[95]
++    drafter.add_request(slot)
++    drafter.apply_staged_writes()
++    for manager in managers:
++        manager.add_request(slot)
++        manager.apply_staged_writes()
++    return slot, repeated
++
++
++@pytest.mark.parametrize("tau", [0.0, 0.2])
++def test_stale_wide_host_limit_routes_no_placeholder_row(monkeypatch, tau):
++    """The host still holds an older proposal's wider limit (its copy has not
++    landed, and the read does not wait), so the step verifies 16 rows of an
++    8-draft copy. The device limit is the current proposal's: the rows of drafts
++    8 to 15 (the -1 placeholders) are padding, which routed MoE skips, with the
++    request's last sampled token as their input; the request commits at most the
++    8 drafts and the bonus, whatever the target makes of those rows. With dead
++    rows off, candidate-37's combine routed those rows live with -1 ids."""
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    fix = _manager(monkeypatch, states, drafter, device_limits=True, tau=tau)
++    c37 = _manager(monkeypatch, states, drafter, device_limits=False, tau=tau)
++    slot, repeated = _copy_request(states, drafter, [fix, c37], 23)
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    one = torch.ones(1, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    drafts = _propose(states, drafter, [fix, c37], idx, one, zero)
++    assert int(drafter.slot_draft_limits.gpu[slot]) == INITIAL
++    assert drafts[INITIAL:] == [-1] * (LOOKAHEAD - INITIAL)
++    drafter._limits_event = _InFlightEvent()  # type: ignore[assignment]
++    assert int(drafter.sync_slot_draft_limits()[slot]) == LOOKAHEAD  # stale, wide
++
++    step = _verify_step(states, fix, idx, LOOKAHEAD)
++    assert step.eligible == LOOKAHEAD and step.rows == 1 + LOOKAHEAD
++    last = repeated[95]
++    assert step.input_ids == [last, *drafts[:INITIAL]] + [last] * (LOOKAHEAD - INITIAL)
++    assert step.is_padding == [False] * (1 + INITIAL) + [True] * (LOOKAHEAD - INITIAL)
++    assert step.cut == [INITIAL]
++    assert step.committed == INITIAL + 1
++    assert step.logits_indices == list(range(1 + LOOKAHEAD))
++
++    before = _verify_step(states, c37, idx, LOOKAHEAD)
++    assert before.rows == step.rows
++    assert before.input_ids[1 + INITIAL :] == [-1] * (LOOKAHEAD - INITIAL)
++    if tau == 0:
++        assert not any(before.is_padding)  # the placeholders routed live
++    else:
++        assert before.is_padding == step.is_padding  # dead rows by survival
++
++
++@pytest.mark.parametrize("tau", [0.0, 0.2])
++def test_current_host_limits_leave_the_step_bit_identical(monkeypatch, tau):
++    """Where the host's limits are the current proposal's, no row is past the
++    device limit: the step's ids, padding, logits rows and commit count are
++    candidate-37's, bit for bit, with dead rows on and off."""
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    fix = _manager(monkeypatch, states, drafter, device_limits=True, tau=tau)
++    c37 = _manager(monkeypatch, states, drafter, device_limits=False, tau=tau)
++    slot, repeated = _copy_request(states, drafter, [fix, c37], 29)
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    one = torch.ones(1, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    for step_num in range(2):
++        _propose(states, drafter, [fix, c37], idx, one, zero)
++        # The limit copy landed: the host's limits are the device's.
++        drafter.slot_draft_limits.np[:] = drafter.slot_draft_limits.gpu.cpu().numpy()
++        ours = _verify_step(states, fix, idx, LOOKAHEAD)
++        theirs = _verify_step(states, c37, idx, LOOKAHEAD)
++        assert ours.eligible == INITIAL * (1 + step_num)
++        for field in ("rows", "input_ids", "logits_indices", "cu_num_logits"):
++            assert getattr(ours, field) == getattr(theirs, field), field
++        assert ours.is_padding == theirs.is_padding
++        assert ours.committed == theirs.committed == ours.rows
++        if tau > 0:
++            assert ours.cut == theirs.cut
++        # The whole copy accepted: the next proposal doubles its cap.
++        _set_history(states, "req", repeated[: 96 + 9 * (step_num + 1)])
++        states.last_sampled_tokens[slot] = repeated[96 + 9 * (step_num + 1) - 1]
++        one = torch.full((1,), INITIAL + 1, dtype=torch.int32, device=DEVICE)
++        zero = torch.full((1,), INITIAL, dtype=torch.int32, device=DEVICE)
++
++
++def test_stale_narrow_host_limit_still_under_admits(monkeypatch):
++    """The device limit only removes rows: when the host holds an older, narrower
++    limit (8) than the current proposal's (16 after its cap doubled), the step
++    verifies 8 of the 16 drafts, as without device limits."""
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    fix = _manager(monkeypatch, states, drafter, device_limits=True, tau=0.0)
++    slot, repeated = _copy_request(states, drafter, [fix], 31)
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    one = torch.ones(1, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    _propose(states, drafter, [fix], idx, one, zero)
++    drafter.slot_draft_limits.np[slot] = INITIAL  # landed: the 8-draft copy's
++    # All 8 accepted; the next proposal copies 16, and its limit copy is in flight.
++    _set_history(states, "req", repeated[: 96 + INITIAL + 1])
++    states.last_sampled_tokens[slot] = repeated[96 + INITIAL]
++    num_sampled = torch.full((1,), INITIAL + 1, dtype=torch.int32, device=DEVICE)
++    verified = torch.full((1,), INITIAL, dtype=torch.int32, device=DEVICE)
++    drafts = _propose(states, drafter, [fix], idx, num_sampled, verified)
++    assert int(drafter.slot_draft_limits.gpu[slot]) == 2 * INITIAL
++    assert -1 not in drafts
++    drafter._limits_event = _InFlightEvent()  # type: ignore[assignment]
++
++    step = _verify_step(states, fix, idx, LOOKAHEAD)
++    assert step.eligible == INITIAL and step.rows == 1 + INITIAL
++    assert step.input_ids[1:] == drafts[:INITIAL]
++    assert not any(step.is_padding)
++    assert step.cut == [INITIAL]
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index e09d95352..2d81c3b71 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -696,6 +696,146 @@ def test_combine_dead_rows(num_reqs):
+                 assert torch.equal(r, o), tau
+ 
+ 
++def _limit_ref(ids, padding, cut, args, num_new, limits, survival):
++    """The draft limits applied on the host to a combine without them: a decoding
++    request's cut at most its slot's limit (its drafts without survival), the rows
++    from the cut on padding, and the rows past the limit its last sampled token.
++    Any other request's cut never clamps (the block plus one)."""
++    _, idx, last, starts, seq_lens, prefill_len, draft_tokens, cu = args
++    ids, padding, cut = ids.cpu(), padding.cpu(), cut.cpu()
++    idx, last, starts, cu = idx.cpu(), last.cpu(), starts.cpu(), cu.cpu()
++    seq_lens, prefill_len, limits = seq_lens.cpu(), prefill_len.cpu(), limits.cpu()
++    if not survival:
++        cut[:] = triton.next_power_of_2(draft_tokens.shape[-1] + num_new) + 1
++    for b in range(idx.shape[0]):
++        req = int(idx[b])
++        num_drafts = int(cu[b + 1] - cu[b]) - num_new
++        if not (int(seq_lens[b]) > int(prefill_len[req]) and num_drafts > 0):
++            continue
++        limit = int(limits[req])
++        live = int(cut[b]) if survival else num_drafts
++        cut[b] = min(live, limit)
++        first = int(starts[b + 1]) - num_drafts
++        padding[first + int(cut[b]) : first + num_drafts] = True
++        if limit < num_drafts:
++            ids[first + limit : first + num_drafts] = int(last[req, 0])
++    return ids, padding, cut
++
++
++@pytest.mark.parametrize("num_reqs", [1, 3, 8, 16])
++@pytest.mark.parametrize("survival", [False, True])
++def test_combine_draft_limits(num_reqs, survival):
++    """Copy drafts' draft limits, with and without dead rows: a decoding request's
++    rows past its slot's limit are padding with its last sampled token as their
++    input, its cut is at most the limit, and the logits indices are unchanged.
++    Limits no request reaches change nothing: the ids, padding and logits indices
++    of the combine without them, and its cut (its drafts without dead rows)."""
++    gen = _gen(num_reqs + 40)
++    drafts, num_new = 16, 1
++    starts, cu, seq_lens, prefill_len, num_logits, tokens = _combine_case(
++        num_reqs, drafts, num_new, gen
++    )
++    idx = _idx(num_reqs, gen)
++    last = _randint(0, 1 << 17, (MAX_REQS, 1), gen, torch.int64)
++    # A proposal's drafts past its own are -1 (copy_select's padding).
++    draft_tokens = _randint(-1, 1 << 17, (MAX_REQS, drafts), gen, torch.int64)
++    confidence = torch.rand(MAX_REQS, drafts, generator=gen, device=DEVICE) ** 0.1
++    tau = math.log(0.2) if survival else None
++    args = (None, idx, last, starts, seq_lens, prefill_len, draft_tokens, cu)
++
++    def run(limits):
++        ids = _garbage((tokens + 8,), torch.int32, _gen(1))
++        padding = torch.zeros(tokens + 8, dtype=torch.bool, device=DEVICE)
++        padding[::3] = True
++        cut = _garbage((num_reqs,), torch.int32, _gen(2))
++        dead = ib.DeadRows(confidence, padding, cut, tau, limits)
++        if not survival and limits is None:
++            dead = None
++        logits = _combine_ours((ids, *args[1:]), num_logits, num_new, dead)
++        torch.accelerator.synchronize()
++        return ids, padding, cut, logits
++
++    plain = run(None)
++    for limits in (
++        _randint(0, drafts + 2, (MAX_REQS,), gen),
++        torch.zeros(MAX_REQS, dtype=torch.int32, device=DEVICE),
++        torch.full((MAX_REQS,), 5, dtype=torch.int32, device=DEVICE),
++    ):
++        ids, padding, cut, logits = run(limits)
++        ref = _limit_ref(*plain[:3], args, num_new, limits, survival)
++        assert torch.equal(ids.cpu(), ref[0])
++        assert torch.equal(padding.cpu(), ref[1])
++        assert torch.equal(cut.cpu(), ref[2])
++        assert torch.equal(logits, plain[3])
++
++    # Current limits: no request has drafts past its slot's limit.
++    current = torch.full((MAX_REQS,), drafts, dtype=torch.int32, device=DEVICE)
++    ids, padding, cut, logits = run(current)
++    assert torch.equal(ids, plain[0])
++    assert torch.equal(padding, plain[1])
++    assert torch.equal(logits, plain[3])
++    if survival:
++        assert torch.equal(cut, plain[2])
++    else:
++        num_drafts = (cu[1:] - cu[:-1] - num_new).cpu()
++        decoding = (seq_lens.cpu() > prefill_len.cpu()[idx.cpu()]) & (num_drafts > 0)
++        block = triton.next_power_of_2(drafts + num_new)
++        expected = torch.where(decoding, num_drafts, block + 1).to(torch.int32)
++        assert torch.equal(cut.cpu(), expected)
++
++
++@pytest.mark.parametrize("survival", [False, True])
++@pytest.mark.parametrize("draft_limits", [False, True])
++def test_declared_combine_variants(monkeypatch, survival, draft_limits):
++    """The combines a step launches (without drafts, and a verification step's
++    with its dead rows and draft limits) are the ones the runner declares."""
++    launched = set()
++    original = tli._kernel
++
++    def record(factory, *key):
++        if factory is tli.combine_sampled_and_draft_tokens_kernel:
++            launched.add(key)
++        return original(factory, *key)
++
++    monkeypatch.setattr(tli, "_kernel", record)
++    gen = _gen(7)
++    starts, cu, seq_lens, prefill_len, num_logits, tokens = _combine_case(
++        4, DRAFTS, 1, gen
++    )
++    ids = torch.zeros(tokens, dtype=torch.int32, device=DEVICE)
++    last = torch.zeros((MAX_REQS, 1), dtype=torch.int64, device=DEVICE)
++    drafts = torch.zeros((MAX_REQS, DRAFTS), dtype=torch.int64, device=DEVICE)
++    dead = ib.DeadRows(
++        torch.ones(MAX_REQS, DRAFTS, device=DEVICE),
++        torch.zeros(tokens, dtype=torch.bool, device=DEVICE),
++        torch.zeros(4, dtype=torch.int32, device=DEVICE),
++        math.log(0.2) if survival else None,
++        torch.ones(MAX_REQS, dtype=torch.int32, device=DEVICE)
++        if draft_limits
++        else None,
++    )
++    for dead_rows in (None, dead if survival or draft_limits else None):
++        ib.combine_sampled_and_draft_tokens(
++            ids, _idx(4, gen), last, starts, seq_lens, prefill_len, drafts, cu,
++            num_logits, 1, dead_rows,
++        )  # fmt: skip
++    torch.accelerator.synchronize()
++    declared = {
++        args
++        for function, args, _ in tli.input_batch_calls(
++            num_lookahead=1,
++            num_speculative_steps=DRAFTS,
++            num_new_sampled_tokens=1,
++            dead_rows=survival,
++            draft_limits=draft_limits,
++            sampled_widths=(1,),
++            commits=((True, True, False),),
++        )
++        if function is tli.combine_sampled_and_draft_tokens_kernel
++    }
++    assert launched == declared
++
++
+ @pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+ @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+ def test_expand_idx_mapping(num_reqs, idx_dtype):
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 8e77d19d2..72fcbb9a7 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -207,8 +207,10 @@ def test_sink_declares_ranks_for_dense_alternate_rows(monkeypatch):
+ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+     """Verification caps its counts at the dead-row cut inside the resampled-token
+     insertion; whether a step can have dead rows comes from the speculator's flag
+-    and the environment, so the capped insertion is declared during preparation,
+-    before ``initialize_kv_cache`` builds the adaptive verification manager."""
++    and the environment, and with copy drafts from their draft limits (dead rows
++    or not), so the capped insertion and the combine's variants are declared
++    during preparation, before ``initialize_kv_cache`` builds the adaptive
++    verification manager."""
+     import torch
+ 
+     import vllm.v1.core.kv_cache_utils as kv_cache_utils
+@@ -226,10 +228,20 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+         "add_kv_sharing_layers_to_kv_cache_groups",
+         "get_shared_kv_cache_layers",
+         "select_kernel_block_sizes",
+-        "declare_input_batch_kernels",
+-        "register_input_batch_warmups",
+     ):
+         monkeypatch.setattr(runner_module, name, lambda *_, **__: None)
++    inputs: list[dict] = []
++    counts: list[dict] = []
++    monkeypatch.setattr(
++        runner_module,
++        "declare_input_batch_kernels",
++        lambda **kwargs: inputs.append(kwargs),
++    )
++    monkeypatch.setattr(
++        runner_module,
++        "register_input_batch_warmups",
++        lambda **kwargs: counts.append(kwargs),
++    )
+     monkeypatch.setattr(runner_module.envs, "VLLM_MOE_SKIP_PADDING", False)
+     monkeypatch.setattr(tilelang_inputs, "declare", lambda calls: None)
+     monkeypatch.setattr(Sampler, "register_warmups", lambda self, **_: None)
+@@ -246,7 +258,7 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+     processor.head_dtype = torch.bfloat16
+     language_model = SimpleNamespace(lm_head=head, logits_processor=processor)
+     steps = 5
+-    for enabled in (True, False):
++    for enabled, copy_drafts in ((True, False), (False, False), (False, True)):
+         monkeypatch.setattr(runner_module, "dead_rows_enabled", lambda e=enabled: e)
+         runner = SimpleNamespace(
+             vllm_config=SimpleNamespace(use_request_boundary_checkpoints=False),
+@@ -256,7 +268,9 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+                 enable_adaptive_verification=True, draft_logits=None
+             ),
+             adaptive_verification=None,  # built later, by initialize_kv_cache
+-            copy_drafter=None,
++            copy_drafter=SimpleNamespace(register_warmups=lambda: None)
++            if copy_drafts
++            else None,
+             batch_sharder=None,
+             num_speculative_steps=steps,
+             draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
+@@ -279,8 +293,12 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+             _greedy_verification_available=lambda: False,
+         )
+         runner_module.GPUModelRunner.declare_step_kernels(runner)
+-        assert declared.pop()["dead_rows"] is enabled
+-    assert not declared
++        assert declared.pop()["dead_rows"] is (enabled or copy_drafts)
++        assert counts.pop() == {"dead_rows": enabled or copy_drafts}
++        declared_inputs = inputs.pop()
++        assert declared_inputs["dead_rows"] is enabled
++        assert declared_inputs["draft_limits"] is copy_drafts
++    assert not declared and not inputs and not counts
+ 
+ 
+ def test_bounded_moe_and_router_declarations_omit_unreachable_cold_boot_kernels():
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index b2d271713..13784bcd4 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -433,13 +433,18 @@ class DeadRows(NamedTuple):
+     confidence: per-slot draft confidences, [max_num_reqs, num_steps].
+     is_padding: the batch's padding flags; dead rows are set in place.
+     cut: per-request output, the number of live drafts.
+-    log_tau: log of the survival threshold below which a row is dead.
++    log_tau: log of the survival threshold below which a row is dead; None when
++        survival marks none (only ``limits`` do).
++    limits: with copy drafts, the drafts each slot's current proposal has
++        ([max_num_reqs] int32, ``CopyDrafter.slot_draft_limits.gpu``): rows past
++        a slot's limit are dead too, and take its last sampled token as input.
+     """
+ 
+     confidence: torch.Tensor
+     is_padding: torch.Tensor
+     cut: torch.Tensor
+-    log_tau: float
++    log_tau: float | None
++    limits: torch.Tensor | None = None
+ 
+ 
+ def combine_sampled_and_draft_tokens(
+@@ -456,7 +461,8 @@ def combine_sampled_and_draft_tokens(
+     dead_rows: "DeadRows | None" = None,
+     out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
++    """``dead_rows`` marks low-survival draft rows, and rows past a copy proposal's
++    drafts, as padding (see DeadRows)."""
+     assert num_new_sampled_tokens in (0, 1), (
+         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
+     )
+@@ -628,12 +634,14 @@ def declare_input_batch_kernels(
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
+     draft_widths: Sequence[int] = (),
++    draft_limits: bool = False,
+ ) -> None:
+     """Declare the TileLang kernels that prepare a step's inputs from the request
+     states and commit its sampled tokens: prefill inputs (``num_lookahead`` tokens
+     ahead), positions and sequence lengths, the draft combine (with its dead-row
+-    variant when adaptive verification marks dead rows), the logits index expansion
+-    when drafting, and the commit of sampled tokens of each of ``sampled_widths``
++    variant when adaptive verification marks dead rows, and the copy drafter's
++    draft limits with ``draft_limits``), the logits index expansion when drafting,
++    and the commit of sampled tokens of each of ``sampled_widths``
+     columns (one from the sampler, ``num_speculative_steps + 1`` from
+     verification) in each of the rank's ``commits``: whether it updates
+     output-token counts, has the step's query starts and records request-boundary
+@@ -650,6 +658,7 @@ def declare_input_batch_kernels(
+             sampled_widths=sampled_widths,
+             commits=commits,
+             draft_widths=draft_widths,
++            draft_limits=draft_limits,
+         )
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 26992d545..be261c109 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -838,6 +838,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
++            device_draft_limits=(
++                self.copy_drafter.slot_draft_limits.gpu
++                if self.copy_drafter is not None
++                else None
++            ),
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+@@ -1913,8 +1918,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
+-        # Dead verification rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU) are marked inside
+-        # the draft combine; sample() clamps committed tokens to live rows.
++        # Dead verification rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU, and with copy
++        # drafts the rows past a proposal's drafts) are marked inside the draft
++        # combine; sample() clamps committed tokens to live rows.
+         dead_rows = None
+         if adaptive_verification is not None and self.batch_sharder is None:
+             dead_rows = adaptive_verification.dead_row_args(
+@@ -2246,7 +2252,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # The manager is built with the KV cache, after preparation; the
+         # speculator's flag is what decides it exists.
+         adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
+-        dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
++        # Rows below the survival threshold, and with copy drafts the rows past a
++        # proposal's drafts (the copy drafter's device limits), end each request's
++        # verification at a cut.
++        survival = adaptive and dead_rows_enabled() and self.batch_sharder is None
++        draft_limits = (
++            adaptive
++            and getattr(self, "copy_drafter", None) is not None
++            and self.batch_sharder is None
++        )
++        dead_rows = survival or draft_limits
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+             # A stage before the last commits what the last stage sampled.
+@@ -2261,7 +2276,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_lookahead=self.req_states.next_prefill_tokens.shape[0],
+             num_speculative_steps=self.req_states.draft_tokens.shape[-1],
+             num_new_sampled_tokens=self.model_state.num_new_sampled_tokens_per_step,
+-            dead_rows=dead_rows,
++            dead_rows=survival,
++            draft_limits=draft_limits,
+             draft_widths=(
+                 (num_draft_steps, self.req_states.draft_tokens.shape[-1])
+                 if 0 < num_draft_steps < self.req_states.draft_tokens.shape[-1]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 13c923ca7..6404d141e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -30,6 +30,8 @@ logger = init_logger(__name__)
+ # as padding, so routed MoE skips them, and the request commits at most one
+ # token past its last live row. Decided on device, inside the draft combine,
+ # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
++# With copy drafts, the rows past a slot's draft limit (drafts its current
++# proposal does not have) are dead whatever the threshold (DeadRows.limits).
+ _DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_DEAD_ROWS_TAU", "0"))
+ 
+ 
+@@ -90,12 +92,17 @@ class AdaptiveVerificationManager:
+         slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+         *,
+         tp_invariant_confidence: bool = False,
++        device_draft_limits: torch.Tensor | None = None,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+         self.num_draft_steps = num_draft_steps or self.num_speculative_steps
+         self.step_steps = self.num_speculative_steps
++        # The host's limits may be an older proposal's (CopyDrafter publishes
++        # them once their copy lands, without waiting); the device's are the
++        # current proposal's, and the draft combine kills the rows past them.
+         self._slot_draft_limits = slot_draft_limits
++        self._device_draft_limits = device_draft_limits
+         device = req_states.device
+         self._copy_stream = torch.cuda.Stream(device)
+ 
+@@ -417,16 +424,19 @@ class AdaptiveVerificationManager:
+     def dead_row_args(self, is_padding: torch.Tensor, num_reqs: int) -> DeadRows | None:
+         """Arguments for the fused dead-row marking, or None when disabled.
+ 
+-        The confidences are the current drafts', broadcast from rank 0, so
+-        every rank marks the same rows.
++        The confidences are the current drafts', broadcast from rank 0, and the
++        copy drafter's device limits are computed alike on every rank from the
++        same histories and verification, so every rank marks the same rows.
+         """
+-        if self.dead_rows_tau <= 0:
++        limits = getattr(self, "_device_draft_limits", None)
++        if self.dead_rows_tau <= 0 and limits is None:
+             return None
+         return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            float(np.log(self.dead_rows_tau)),
++            float(np.log(self.dead_rows_tau)) if self.dead_rows_tau > 0 else None,
++            limits,
+         )
+ 
+     def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+@@ -518,6 +528,7 @@ def maybe_create_adaptive_verification_manager(
+     planned_confidences: bool = False,
+     slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+     tp_invariant_confidence: bool = False,
++    device_draft_limits: torch.Tensor | None = None,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -594,6 +605,7 @@ def maybe_create_adaptive_verification_manager(
+         or None,
+         slot_draft_limits=slot_draft_limits,
+         tp_invariant_confidence=tp_invariant_confidence,
++        device_draft_limits=device_draft_limits,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 463022c3a..5e72c48d3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -133,10 +133,12 @@ class RejectionSampler:
+         )
+         if dead_rows and self.use_block_verification and triton_only:
+             raise ValueError(
+-                "Adaptive verification's dead rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU) "
+-                "need block verification's TileLang kernels, which end each block at "
+-                "its cut: one-hot drafts (draft_sample_method greedy), FP32 draws and "
+-                "no watermark. Set the threshold to 0 or use standard verification."
++                "Adaptive verification's dead rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU, "
++                "and with copy drafts the rows past a proposal's drafts) need block "
++                "verification's TileLang kernels, which end each block at its cut: "
++                "one-hot drafts (draft_sample_method greedy), FP32 draws and no "
++                "watermark. Set the threshold to 0 and leave copy drafts off, or use "
++                "standard verification."
+             )
+         limits = (
+             (False, True) if dead_rows and not self.use_block_verification else (False,)
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 436c94e57..154972212 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -1413,7 +1413,7 @@ def prepare_pos_seq_lens_kernel(idx_dtype: str):
+ # where Triton gives a finite log).
+ @tilelang.jit(pass_configs=_PASS)
+ def combine_sampled_and_draft_tokens_kernel(
+-    drafts: int, num_new: int, dead_rows: bool, idx_dtype: str
++    drafts: int, num_new: int, dead_rows: bool, draft_limits: bool, idx_dtype: str
+ ):
+     """A request's logits indices, and for a decoding request its last sampled
+     token and its drafts into the input ids; ``drafts`` is the draft tokens' width
+@@ -1425,7 +1425,13 @@ def combine_sampled_and_draft_tokens_kernel(
+     strides 1, 2, 4, ...), the cut counts the drafts whose survival is at least
+     ``log_tau``, and rows of drafts past it become padding. Without dead rows a
+     thread takes a request; with them a block does (its first thread), which is
+-    how the scan's chain of logs and sums ran fastest."""
++    how the scan's chain of logs and sums ran fastest.
++
++    With ``draft_limits`` (copy drafts) the cut is also at most the request's slot
++    limit, the drafts its current proposal has: a row past it verifies a draft the
++    proposal does not have (a host budget that read an older proposal's limit
++    scheduled it), so it is padding and takes the request's last sampled token as
++    its input id. Without dead rows the cut is the drafts up to the limit."""
+     block = _next_power_of_2(drafts + num_new)
+     if dead_rows and block > 32:
+         raise ValueError("dead rows scan at most one warp of drafts")
+@@ -1444,13 +1450,14 @@ def combine_sampled_and_draft_tokens_kernel(
+     conf_stride = T.dynamic("conf_stride")
+     padding_len = T.dynamic("padding_len")
+     cut_len = T.dynamic("cut_len")
++    limit_rows = T.dynamic("limit_rows")
+     scan_strides = tuple(1 << i for i in range(max(block - 1, 0).bit_length()))
+ 
+     @T.macro
+     def request(
+         b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens, prefill_len,
+         draft_tokens, cu_num_logits, logits_indices, confidence, is_padding, dead_cut,
+-        log_tau,
++        log_tau, limits,
+     ):  # fmt: skip
+         req = T.alloc_var(T.int64, init=T.cast(idx_mapping[b], T.int64))
+         first = T.alloc_var(T.int32, init=cu_num_logits[b])
+@@ -1459,6 +1466,8 @@ def combine_sampled_and_draft_tokens_kernel(
+         seq = T.alloc_var(T.int32, init=seq_lens[b])
+         prefill = T.alloc_var(T.int32, init=prefill_len[req])
+         last = T.alloc_var(T.int64, init=last_sampled[req])
++        if draft_limits:
++            limit = T.alloc_var(T.int32, init=limits[req])
+         num_logits = end - first
+         num_drafts = num_logits - num_new
+         # Only the drafts there are: a prefill chunk's request waits on none.
+@@ -1490,38 +1499,79 @@ def combine_sampled_and_draft_tokens_kernel(
+                 decoding & (seq - num_logits >= prefill),
+             )  # fmt: skip
+         for j in T.unroll(drafts):
++            if draft_limits:
++                # Past the slot's limit, a valid id for the padding row.
++                token = T.if_then_else(j < limit, tokens[j], last)
++            else:
++                token = tokens[j]
+             T.call_extern(
+                 "handle", "vllm_store_if_b32",
+                 T.address_of(input_ids[query_end - num_drafts + j]),
+-                T.cast(tokens[j], T.int32), decoding & (j < num_drafts),
++                T.cast(token, T.int32), decoding & (j < num_drafts),
+             )  # fmt: skip
+-        if dead_rows:
++        if dead_rows or draft_limits:
+             # Requests without drafts are never clamped.
+             cut = T.alloc_var(T.int32, init=block + 1)
+             if seq > prefill and num_drafts > 0:
+-                survival = T.alloc_local((block,), T.float32)
+-                for j in tuple(range(block)):
+-                    if j < drafts:
+-                        survival[j] = T.log(
+-                            T.if_then_else(j < num_drafts, confs[j], T.float32(1.0))
+-                        )
+-                    else:
+-                        survival[j] = T.log(T.float32(1.0))
+-                for stride in scan_strides:
+-                    # Descending, so each lane adds its neighbour's sum of the
+-                    # previous stage, as the warp's shuffles do.
+-                    for j in tuple(range(block - 1, stride - 1, -1)):
+-                        survival[j] = survival[j - stride] + survival[j]
+-                cut = 0
+-                for j in tuple(range(block)):
+-                    if survival[j] >= log_tau and j < num_drafts:
+-                        cut = cut + 1
++                if dead_rows:
++                    survival = T.alloc_local((block,), T.float32)
++                    for j in tuple(range(block)):
++                        if j < drafts:
++                            survival[j] = T.log(
++                                T.if_then_else(
++                                    j < num_drafts, confs[j], T.float32(1.0)
++                                )
++                            )
++                        else:
++                            survival[j] = T.log(T.float32(1.0))
++                    for stride in scan_strides:
++                        # Descending, so each lane adds its neighbour's sum of the
++                        # previous stage, as the warp's shuffles do.
++                        for j in tuple(range(block - 1, stride - 1, -1)):
++                            survival[j] = survival[j - stride] + survival[j]
++                    cut = 0
++                    for j in tuple(range(block)):
++                        if survival[j] >= log_tau and j < num_drafts:
++                            cut = cut + 1
++                    if draft_limits:
++                        cut = T.min(cut, limit)
++                else:
++                    cut = T.min(num_drafts, limit)
+                 for j in T.unroll(block):
+                     if j < num_drafts and j >= cut:
+                         is_padding[query_end - num_drafts + j] = T.uint8(1)
+             dead_cut[b] = cut
+ 
++    if not dead_rows and not draft_limits:
++
++        @T.prim_func
++        def combine_sampled_and_draft_tokens(
++            input_ids: T.Tensor((ids_len,), T.int32),
++            idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++            last_sampled: T.Tensor((sampled_len,), T.int64),
++            query_start_loc: T.Tensor((starts_len,), T.int32),
++            seq_lens: T.Tensor((seq_len,), T.int32),
++            prefill_len: T.Tensor((prefill_rows,), T.int32),
++            draft_tokens: T.StridedTensor(
++                (draft_rows, drafts), (draft_stride, 1), T.int64
++            ),
++            cu_num_logits: T.Tensor((cu_len,), T.int32),
++            logits_indices: T.Tensor((logits_len,), T.int64),
++        ):
++            with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
++                T.import_source(_LOAD_IF + _STORE_IF)
++                b = bx * _REQUESTS + T.get_thread_binding()
++                if b < num_reqs:
++                    request(
++                        b, input_ids, idx_mapping, last_sampled, query_start_loc,
++                        seq_lens, prefill_len, draft_tokens, cu_num_logits,
++                        logits_indices, None, None, None, None, None,
++                    )  # fmt: skip
++
++        return combine_sampled_and_draft_tokens
++
+     if not dead_rows:
++        # The limits alone: a thread a request, as without them.
+ 
+         @T.prim_func
+         def combine_sampled_and_draft_tokens(
+@@ -1536,6 +1586,9 @@ def combine_sampled_and_draft_tokens_kernel(
+             ),
+             cu_num_logits: T.Tensor((cu_len,), T.int32),
+             logits_indices: T.Tensor((logits_len,), T.int64),
++            is_padding: T.Tensor((padding_len,), T.uint8),
++            dead_cut: T.Tensor((cut_len,), T.int32),
++            limits: T.Tensor((limit_rows,), T.int32),
+         ):
+             with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
+                 T.import_source(_LOAD_IF + _STORE_IF)
+@@ -1544,7 +1597,41 @@ def combine_sampled_and_draft_tokens_kernel(
+                     request(
+                         b, input_ids, idx_mapping, last_sampled, query_start_loc,
+                         seq_lens, prefill_len, draft_tokens, cu_num_logits,
+-                        logits_indices, None, None, None, None,
++                        logits_indices, None, is_padding, dead_cut, None, limits,
++                    )  # fmt: skip
++
++        return combine_sampled_and_draft_tokens
++
++    if not draft_limits:
++
++        @T.prim_func
++        def combine_sampled_and_draft_tokens(
++            input_ids: T.Tensor((ids_len,), T.int32),
++            idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++            last_sampled: T.Tensor((sampled_len,), T.int64),
++            query_start_loc: T.Tensor((starts_len,), T.int32),
++            seq_lens: T.Tensor((seq_len,), T.int32),
++            prefill_len: T.Tensor((prefill_rows,), T.int32),
++            draft_tokens: T.StridedTensor(
++                (draft_rows, drafts), (draft_stride, 1), T.int64
++            ),
++            cu_num_logits: T.Tensor((cu_len,), T.int32),
++            logits_indices: T.Tensor((logits_len,), T.int64),
++            confidence: T.StridedTensor(
++                (conf_rows, conf_cols), (conf_stride, 1), T.float32
++            ),
++            is_padding: T.Tensor((padding_len,), T.uint8),
++            dead_cut: T.Tensor((cut_len,), T.int32),
++            log_tau: T.float32,
++        ):
++            with T.Kernel(num_reqs, threads=32) as b:
++                T.import_source(_LOAD_IF + _STORE_IF)
++                if T.get_thread_binding() == 0:
++                    request(
++                        b, input_ids, idx_mapping, last_sampled, query_start_loc,
++                        seq_lens, prefill_len, draft_tokens, cu_num_logits,
++                        logits_indices, confidence, is_padding, dead_cut, log_tau,
++                        None,
+                     )  # fmt: skip
+ 
+         return combine_sampled_and_draft_tokens
+@@ -1566,6 +1653,7 @@ def combine_sampled_and_draft_tokens_kernel(
+         is_padding: T.Tensor((padding_len,), T.uint8),
+         dead_cut: T.Tensor((cut_len,), T.int32),
+         log_tau: T.float32,
++        limits: T.Tensor((limit_rows,), T.int32),
+     ):
+         with T.Kernel(num_reqs, threads=32) as b:
+             T.import_source(_LOAD_IF + _STORE_IF)
+@@ -1573,7 +1661,7 @@ def combine_sampled_and_draft_tokens_kernel(
+                 request(
+                     b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
+                     prefill_len, draft_tokens, cu_num_logits, logits_indices,
+-                    confidence, is_padding, dead_cut, log_tau,
++                    confidence, is_padding, dead_cut, log_tau, limits,
+                 )  # fmt: skip
+ 
+     return combine_sampled_and_draft_tokens
+@@ -1960,10 +2048,17 @@ def combine_key(
+     num_speculative_steps: int,
+     num_new_sampled_tokens: int,
+     dead_rows: bool,
++    draft_limits: bool,
+     idx_dtype: str,
+ ) -> tuple:
+     # The kernel's Triton BLOCK_SIZE covers the last sampled token and every draft.
+-    return (num_speculative_steps, num_new_sampled_tokens, dead_rows, idx_dtype)
++    return (
++        num_speculative_steps,
++        num_new_sampled_tokens,
++        dead_rows,
++        draft_limits,
++        idx_dtype,
++    )
+ 
+ 
+ def expand_idx_mapping_key(max_expand_len: int, idx_dtype: str) -> tuple:
+@@ -2039,8 +2134,10 @@ def combine_sampled_and_draft_tokens(
+     """``dead_rows``: ``input_batch.DeadRows`` or None."""
+     if idx_mapping.shape[0] == 0:
+         return
++    survival = dead_rows is not None and dead_rows.log_tau is not None
++    limits = None if dead_rows is None else dead_rows.limits
+     key = combine_key(
+-        draft_tokens.shape[-1], num_new_sampled_tokens, dead_rows is not None,
++        draft_tokens.shape[-1], num_new_sampled_tokens, survival, limits is not None,
+         _DTYPES[idx_mapping.dtype],
+     )  # fmt: skip
+     args = [
+@@ -2054,13 +2151,14 @@ def combine_sampled_and_draft_tokens(
+         _as(cu_num_logits, torch.int32),
+         logits_indices,
+     ]
++    if survival:
++        args.append(_as(dead_rows.confidence, torch.float32))
+     if dead_rows is not None:
+-        args += [
+-            _as(dead_rows.confidence, torch.float32),
+-            dead_rows.is_padding.view(torch.uint8),
+-            dead_rows.cut,
+-            dead_rows.log_tau,
+-        ]
++        args += [dead_rows.is_padding.view(torch.uint8), dead_rows.cut]
++    if survival:
++        args.append(dead_rows.log_tau)
++    if limits is not None:
++        args.append(_as(limits, torch.int32))
+     _kernel(combine_sampled_and_draft_tokens_kernel, *key)(*args)
+ 
+ 
+@@ -3001,11 +3099,13 @@ def input_batch_calls(
+     sampled_widths: Sequence[int],
+     commits: Sequence[tuple[bool, bool, bool]],
+     draft_widths: Sequence[int] = (),
++    draft_limits: bool = False,
+ ) -> list:
+     """The step-input kernels for the runner's buffers: prefill inputs, positions
+     and sequence lengths, the draft combine (with its dead-row variant when
+-    adaptive verification marks dead rows), the logits index expansion when
+-    drafting, and the commit of ``sampled_widths``-column sampled tokens for each
++    adaptive verification marks dead rows, and the copy drafter's draft limits
++    with ``draft_limits``), the logits index expansion when drafting, and the
++    commit of ``sampled_widths``-column sampled tokens for each
+     ``(bin_counts, has_query, boundary)`` of ``commits``."""
+     calls = [
+         _call(
+@@ -3014,8 +3114,10 @@ def input_batch_calls(
+         ),
+         _call(prepare_pos_seq_lens_kernel, *prepare_pos_seq_lens_key(RUNNER_IDX_DTYPE)),
+     ]
++    # A step without drafts combines without either; a verification step with both.
++    variants = dict.fromkeys(((False, False), (dead_rows, draft_limits)))
+     for steps in dict.fromkeys(draft_widths or (num_speculative_steps,)):
+-        for dead in (False, True) if dead_rows else (False,):
++        for dead, limits in variants:
+             calls.append(
+                 _call(
+                     combine_sampled_and_draft_tokens_kernel,
+@@ -3023,6 +3125,7 @@ def input_batch_calls(
+                         steps,
+                         num_new_sampled_tokens,
+                         dead,
++                        limits,
+                         RUNNER_IDX_DTYPE,
+                     ),
+                 )
+-- 
+2.43.0
+
