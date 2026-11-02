@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import sys
 import tempfile
 import threading
 import unittest
@@ -15,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def load(name: str, path: str):
@@ -25,9 +28,21 @@ def load(name: str, path: str):
 
 
 agentx = load("agentx_under_test", "scripts/agentx.py")
-lab = load("lab_for_agentx", "scripts/lab.py")
+from spark_ds41f import lab
 # Host-independent: the shipped example node map, never the real hold and request files.
-lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
+SITE_NODES = mock.patch.object(
+    lab.spark, "site_nodes", side_effect=lambda: lab.spark.read_json("config/nodes.example.json")
+)
+
+
+def setUpModule() -> None:
+    SITE_NODES.start()
+
+
+def tearDownModule() -> None:
+    SITE_NODES.stop()
+
+
 _STATE = tempfile.TemporaryDirectory()
 lab.HOLD = Path(_STATE.name) / "spark-hold.json"
 lab.LEGACY_HOLD = Path(_STATE.name) / "spark3-hold.json"

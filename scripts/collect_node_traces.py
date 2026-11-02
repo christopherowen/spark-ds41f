@@ -13,8 +13,6 @@ in memory across boots. Prints one JSON line with what it collected.
 """
 
 import argparse
-import importlib.machinery
-import importlib.util
 import json
 import shlex
 import subprocess
@@ -22,10 +20,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
-_spec = importlib.util.spec_from_loader("spark", _loader)
-spark = importlib.util.module_from_spec(_spec)
-_loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 
 TRACE_GLOB = "/dev/shm/sparknet-trace-r*-p*.bin"
 

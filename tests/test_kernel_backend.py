@@ -6,22 +6,20 @@ import contextlib
 import copy
 import functools
 import glob
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark_kernel_backend_test", str(ROOT / "bin/spark"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-spark = importlib.util.module_from_spec(spec)
-loader.exec_module(spark)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import spark_ds41f as spark
 kernel_backend = spark.kernel_backend
 source_labels = spark.source_labels
 
