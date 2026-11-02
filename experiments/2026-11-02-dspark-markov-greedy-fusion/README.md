@@ -153,8 +153,47 @@ their count and their padding are those of candidate-37.
 
 Not covered: a serving soak with real concurrent traffic and mixed prompt lengths
 where the token budget binds (the lesson of #842, whose arm crashed in the MoE
-router only under production traffic). That needs an image with 0677 and a
-cluster window, and it has not been run.
+router only under production traffic). That needs a cluster window, and it has not
+been run.
+
+### Serving soak: planned, not run
+
+The arm is [`tp3-soak-dev.json`](tp3-soak-dev.json): candidate-37's dev arm at
+`tp3-triangle` with 0677's three runtime files mounted over the image's
+candidate-37 copies ([`overlay/vllm`](overlay/vllm), from vLLM `3b7884972`). That is
+0677's runtime tree on the image digest every rank already holds (`c4c59de1` on
+dgx1..dgx3). `deployment.branch` is unset so the unmerged experiment commit
+(`6c221d47`) deploys.
+
+The workload is servebench's `release-tp3`, about 70 minutes:
+
+- 8 and 4 streams in closed loops, and Poisson arrivals;
+- a cold 131K prompt prefilling under 3, 6 and 7 decode streams, so the token budget
+  binds and rows are padded;
+- prefill from 32K to 1M;
+- a failed request fails its step.
+
+On 2026-11-02 the cluster was idle and served candidate-36
+(`candidate-36/tp3-dev.json`), with no hold or request. The window open was refused
+by this session's permission system before anything changed. On dgx1, in the
+deployment checkout:
+
+```sh
+scripts/lab.py window open --production-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json --note "PR 854 serving soak"
+git fetch -q origin && git checkout -q --detach 6c221d47
+setsid -f python3 experiments/2026-11-02-dspark-markov-greedy-fusion/scripts/hold_heartbeat.py "PR 854 soak" > ~/spark-heartbeat.log 2>&1 < /dev/null
+bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json cluster sync --apply
+bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json cluster start --replace --apply
+bin/spark --cluster-config experiments/2026-11-02-dspark-markov-greedy-fusion/tp3-soak-dev.json bench --suite release-tp3 --label 0677-soak --compare none --output results/private/suites/pr854-soak/0677
+# then restore what served
+git checkout -q --detach origin/main
+bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json cluster sync --revision origin/main --apply
+touch ~/spark-heartbeat.stop
+scripts/lab.py window close
+```
+
+Pass: every step completes with no failed request, and no engine error
+(`gate logits contain nan or inf`, device asserts) in any rank's log.
 
 ## Draft-step microbenchmark (sp8, FP32 logits, top-2 off)
 
