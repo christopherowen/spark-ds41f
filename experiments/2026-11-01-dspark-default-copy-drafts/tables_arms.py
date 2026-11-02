@@ -29,8 +29,13 @@ for arm in ARMS:
     print(f"== {arm}")
     for record in lines("copy-probe", arm):
         print(f"  copy probe: {json.dumps(record)[:240]}")
+    # The suite's own servebench lines come first; the extra's exit record is last.
     for record in lines("single-stream", arm):
-        print(f"  single-stream suite: exit {record['exit']} ({record['output']})")
+        if record.get("summary") == "servebench closed":
+            print(f"  single-stream suite: {record['tps_mean']:.2f} tok/s, "
+                  f"{record['tokens_per_step']:.3f} tokens/step, {record['failed']} failed")
+        elif "exit" in record:
+            print(f"  single-stream suite: exit {record['exit']} ({record['output']})")
     for stem in ("census", "census-c8"):
         for record in lines(stem, arm):
             print(f"  {stem} {record['node']}: {record['nonfinite']} NONFINITE lines, "

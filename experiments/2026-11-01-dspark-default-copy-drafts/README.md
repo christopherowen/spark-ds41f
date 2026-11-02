@@ -182,7 +182,7 @@ too. Each of its blocks routes two rows (`warps=2`), so #849's block [4] is rows
 - Which copied inputs or row layouts produce a non-finite activation at all. That
   needs the model, so the operator's repro or a cluster window.
 
-## Crash repro: the census and two arms (prepared; nothing run on a serving cluster)
+## Crash repro: the census and two arms
 
 **Census** ([`census/0001-diag-dsv41-record-non-finite-MoE-gate-rows-instead-.patch`](census/0001-diag-dsv41-record-non-finite-MoE-gate-rows-instead-.patch)).
 vLLM `cb46d6c82` on candidate-37's `5b7cfa37f` (tree `00d1e4ea`), its own commit,
@@ -332,18 +332,107 @@ in [`runs/`](runs/).
   remaining format and lint findings in those files are candidate-37's own lines,
   left untouched.
 
+### Lab window on sp5-sp7 (tp3-switched), 2026-11-02
+
+**Setup.** The owner authorized the window ("Open a lab window", then "Add them"
+for the soaks); the user confirmed it in this session.
+- 17:13Z: `cluster sync --apply` with `config/candidate-37-tp3-switched-dev.local.json`
+  (plan read first). All three nodes clean and detached at main `2e0f01c2`.
+- 17:14:48Z: `window open` with that production profile, window
+  `spark-0013-1793639688`.
+- Queue, runner detached on sp5 (`results/private/lab/queue-842.log`):
+  1. `lab-repro.json`;
+  2. `lab-clock2200.json` (main `7084d2bd`), inserted after the repro;
+  3. #848, #854 and #853's soaks.
+- The arms serve on `e1ee7b19` with the census overlays mounted (checked in the
+  containers). The serve arguments carry `copy_drafts` m=8, 6,155 tokens,
+  capture 59 and threshold 6,096.
+
+**Arm 1, `c37-m8` (candidate-37 + census, m=8), boot 17:15:36Z:** #852 did not
+reproduce.
+- `copy_probe --prompts 3` matches the operator's m=8 numbers: copy 16.37, edit
+  15.75, tool 6.91, prose 2.65 tokens per step.
+- The `single-stream` suite (sha `7c59b27e8503`) ran its 60 s warm-up and all 10
+  windows: 60.08 tok/s (CI ±5.4%), 2.27 tokens per step, 0 failed.
+- 8 distinct streams × 1,024 tokens: 153.69 tok/s (CI ±0.1%), exit 0.
+- **Census:**
+  - After the suite, checked by hand on sp5, sp6 and sp7 (`docker logs |
+    grep`): 0 NONFINITE lines, 0 assert or traceback lines. No gate row went
+    non-finite in the probe or the suite.
+  - The extra's own census records for this arm are **invalid**. `census_logs.py`
+    as first published (`2e0f01c2`) resolved the site default's node map, so it
+    read `docker logs` of sp1-sp4's serving containers. Those were read-only log
+    reads, with no other effect.
+  - The 8-stream load has **no valid census**: arm 2's boot replaced the
+    container before it was read.
+  - Fixed in `3ae1b273` (main `78acd0e5`): the census takes the window's
+    production profile from the hold. Read-only followers on sp5-sp7 now keep
+    every serving container's log by id (`/tmp/842-census/`).
+
+**Arm 2, `no0676-m8` (candidate-37 with 0676 reverted + census, m=8), boot
+17:28:35Z:** clean too.
+- The copy probe matches arm 1 exactly (copy 16.367, edit 15.745, tool 6.905,
+  prose 2.651).
+- Suite: 59.93 tok/s (CI ±5.3%), 2.27 tokens per step, 0 failed.
+- 8 streams: 153.44 tok/s (CI ±0.05%).
+- Census: complete container logs from the followers (`6f69c3adcda6`,
+  `067b4750b93a`, `8a18587eec25`): 0 NONFINITE and 0 assert or traceback lines
+  on sp5, sp6 and sp7, through probe, suite and 8 streams. The extra's own
+  records are again invalid (sp1-sp4): this job ran the first collector.
+- The table step raised `KeyError: 'exit'`: the suite's output file carries
+  servebench's own lines before the extra's record. The data is unaffected;
+  `tables_arms.py` is fixed on this branch.
+
+**So #852 does not reproduce here.** On sp5-sp7 (tp3-switched, unlocked clocks,
+image `e1ee7b19`, 4K-page `7.0.0-1024-nvidia` kernels), the operator's exact m=8
+sequence passes on candidate-37 with and without 0676. No gate logit went
+non-finite. Untested differences from their ring:
+- the fabric (ring there, switched here);
+- a 2,200 MHz clock lock;
+- their own build of tree `af0fb152`;
+- kernel and page size;
+- their real agent traffic.
+
+**The 2,200 MHz pass** (`lab-clock2200.json`, job 17:41:04Z) failed before
+booting. It locked the SM clocks at 2,200 MHz on all three nodes, then raised
+`FileNotFoundError` on `~/spark-lab/gpu-clocks-locked.json.tmp`: `~/spark-lab/`
+did not exist on sp5, and the lab does not create it (a `lab.py` follow-up). The
+run ended without its reset, and the queue moved on to #848. I reset the clocks
+by hand at about 17:42Z (`sudo -n nvidia-smi -rgc` on sp5-sp7), while #848's
+first arm was still booting (17:41:43Z), so #848 measures unlocked.
+`~/spark-lab/` was created on sp5, and the identical spec (sha `f7da0e41`) was
+requeued after #848.
+
+Follow-up, for after the window (a small fix with a test, done separately; not
+patched during the window, whose runner has the code loaded):
+- `scripts/lab.py`'s `gpu_clocks` lock writes its marker
+  (`GPU_CLOCKS_MARKER = LAB_HOME / "gpu-clocks-locked.json"`) without creating
+  `LAB_HOME`;
+- a lock job that then raises leaves the clocks locked. The run ends without its
+  reset step and the queue continues, so the next job can run locked.
+
 ### Release gate
 
-Full gate (121 files) on dgx4 from 17:42 (dgx4 time), patch files over the
-candidate-37 image, the bundle's runner, environment and io_uring: still running
-at this commit. Recorded so far (chunks 0-2, 1,309 cases):
-- 46 failures, none in the changed code.
-- 11 in `test_deepseek_v41_tilelang_wo.py::test_grouped_gemm_equals_groups`
-  (`'Module' object has no attribute 'tilelang_key'`). Unpatched candidate-37
-  fails the same 11 (11 failed, 5 passed).
-- 35 in `test_deepseek_v41_engram_rows.py`: io_uring buffer registration failed,
-  "raise the locked-memory limit". The container ran at Docker's default 8 MiB
-  `memlock`; this file is rerun with `--ulimit memlock=-1`.
+`scripts/release_tests.py gate` at the patched tree: 121 files. The run used
+[`gate.sh`](gate.sh) on dgx4, 17:43-18:44 (dgx4 time): the bundle's runner and
+environment, with the patch's files over the candidate-37 image. Result:
+**7,316 passed, 172 failed, 166 skipped, 0 errors**
+([`runs/gate-full-results.jsonl`](runs/gate-full-results.jsonl)). No failure
+comes from the patch.
+
+| File | Failed | Cause | Control |
+|---|---:|---|---|
+| `tests/v1/worker/test_gpu_worker.py` | 62 | stand-in `SimpleNamespace` lacks `_roce_failure` | unpatched candidate-37: the same 62 |
+| `tests/v1/worker/test_gpu_model_runner_v2.py` | 20 | stand-in runner lacks `num_draft_steps` | unpatched: 21 failed with the next file |
+| `tests/v1/attention/test_b12x_v41_ced_metadata.py` | 1 | `DFlashSpeculator` lacks `_query_start_loc_cpu` | unpatched: the same |
+| `tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py` | 11 | `'Module' object has no attribute 'tilelang_key'` | unpatched: the same 11 |
+| `tests/model_executor/model_loader/test_direct_loader_cuda.py` | 36 | io_uring: Docker's 8 MiB `memlock` | patched with `--ulimit memlock=-1`: pass |
+| `tests/kernels/test_deepseek_v41_engram_rows.py` | 35 | the same | patched with `memlock=-1`: pass |
+| `tests/models/test_deepseek_v4_1_engram.py` | 7 | 6 the same; 1 `TypeError` at line 568 | patched with `memlock=-1`: 6 pass; the `TypeError` test fails on unpatched candidate-37 too |
+
+`gate.sh` passes `--security-opt seccomp=unconfined` but not `--ulimit
+memlock=-1`, which the lab's io_uring bundles need. The three io_uring files
+were rerun with it: 125 passed, 1 failed (the pre-existing `TypeError`).
 
 ### Microbenchmark (`bench_copy_kernels.py`)
 
