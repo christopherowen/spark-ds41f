@@ -8,6 +8,10 @@ It carries the shared CopyDrafter budget fix, removes the unused draft-limit mac
 and includes the selected loop, draft-kernel and test repairs. Its final image passes
 the release-test gate; distributed correctness and performance qualification remain separate
 from promotion. The promoted release remains spark-ds41f-1030.
+Loop work follows the candidate's
+[containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
+preserve requested effort, end looping reasoning once, and stop continued
+degeneration while protecting legitimate repeated answers.
 
 Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
 profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
