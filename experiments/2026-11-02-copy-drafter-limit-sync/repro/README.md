@@ -129,6 +129,39 @@ device files mounted. Use a stopped/dedicated container, not the serving one.
   #856's paired lab measured −0.4% at 8 streams. Do not read the cross-boot
   difference as a speedup.
 
+## c36 and per-rank controls (2026-11-03)
+
+Both controls ran on ring2 with copy8 and `TAU=0.2`; their site-local profiles
+(`site-cand36-ring2-copy8.local.json`, `site-cand37-ring2-copy8-rank.local.json`)
+are not committed.
+
+- **c36, no 0676:** probe clean; the single-stream suite died with the same
+  `route_partials` non-finite gate. So 0676 is not necessary for the crash.
+- **Per-rank counter on unfixed c37:** all three ranks logged the same window
+  before the crash: `reads=1024 stale=1021 consequential=49 wide_slots=11
+  placeholder_rows=118 narrow_slots=38 dropped_drafts=346 crc=f6fb6f91`.
+  The ranks read the same limits; the per-rank layout-divergence hypothesis is
+  not supported on this arm. The stale limits are real, and the dead-row
+  masking/cut did not keep the rows out of the gate.
+
+## Paired m=8 and single-stream (2026-11-03)
+
+Three boots on ring2, same image, copy8, `TAU=0.2`, same workload (8 concurrent,
+10,456-token prompt, 256 completion for m=8; single-stream suite sha
+`7c59b27e8503`):
+
+| arm | m=8 output tok/s (runs) | single-stream |
+|---|---|---|
+| host-sync A | 211.73 (warm), 271.77, 271.34 | 63.70 tok/s, 0 failed |
+| device 0004 B | 210.22 (warm), 267.85, 270.31 | **failed**, 6,254,028; same `route_partials` NaN |
+| host-sync C (repeat) | 210.87 (warm), 270.62, 271.19 | 64.01 tok/s, 0 failed |
+
+The two arms are the same at m=8 (~270 tok/s); the earlier 159.90 vs 126.05
+was not reproducible and was not a speedup. The host-sync arm passes the
+single-stream suite on both boots; the 0004 device precursor crashes it with
+the same gate NaN. Host-sync is the robust arm on this ring.
+
+
 ## Memory observations
 
 After the old engine stopped during the boot: MemAvailable 114.9 GiB (head),
@@ -152,6 +185,13 @@ occurs in the suite warm-up, not at load time.
 - `receipts/device8-m8.log`, `receipts/device8-hostsync-m8.log` — m=8 runs.
 - `receipts/device8-unit-tests.log` — 22 + 11 pass.
 - `receipts/device8-engine-head.log`, `device8-engine-workers-*.log` — engine logs.
+- `receipts/c36-engine-rank{0,1,2}.log`, `c36-suite.log`, `c36-probe.jsonl` —
+  c36 no-0676 control.
+- `receipts/rank-engine-rank{0,1,2}.log`, `rank-suite.log`, `rank-probe.jsonl` —
+  per-rank `COPY-LIMITS` counter.
+- `receipts/sync-a-m8-*.log`, `sync-a-suite.log`, `device-b-m8-*.log`,
+  `device-b-suite.log`, `device-b-engine-rank{0,1,2}.log`, `sync-c-m8-*.log`,
+  `sync-c-suite.log` — paired host-sync/device runs.
 
 The m=16 15:47:41Z full log was lost; the head excerpt is retained.
 

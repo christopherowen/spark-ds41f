@@ -99,11 +99,25 @@ Validated on ring2 (candidate-37, TP3, direct,
 Open: 0004's added confidence assertion is a guard, not a regression test;
 `copy_select` already writes 0 past `offered`, and #859's stale-wide test is
 the one that fails on unpatched c37. The clamp covers the dead-row path; the
-non-dead-row combine path still has no limit/padding mask. The crash arm did
-have TAU=0.2, so the dead-row gate should have masked the placeholder rows;
-why it did not is the unresolved part. #859's per-rank layout finding is the
-best explanation, and the `-1`→`0` control still crashing fits it. The paired
-lab suite and the NaN-producer diagnostic remain open; #856 ran its own.
+non-dead-row combine path still has no limit/padding mask.
+
+The 2026-11-03 controls changed the open explanation:
+
+- c36 (no 0676) also crashes with the same `route_partials` NaN; 0676 is not
+  necessary.
+- The per-rank counter on unfixed c37 at `TAU=0.2` logged the same CRC and the
+  same counts on all three ranks (`crc=f6fb6f91`, 1,021 stale reads, 118
+  placeholder rows, 346 dropped drafts). The ranks read alike; the per-rank
+  layout-divergence hypothesis is not supported on this arm.
+- Paired m=8: host-sync 271.77/271.34 and 270.62/271.19 output tok/s, single
+  stream 63.70 and 64.01 with 0 failures; device 0004 267.85/270.31, single
+  stream **failed** with the same NaN. The 159.90 vs 126.05 cross-boot reading
+  was not reproducible and was not a speedup.
+
+So the remaining question is why the dead-row masking/cut did not keep the
+stale placeholder rows out of the gate at `TAU=0.2`; it is not 0676 and not
+rank disagreement. Host-sync is the robust fix on this ring. #859's cut clamp
+is the device-side candidate, not validated on our hardware.
 
 ## Integration
 
