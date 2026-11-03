@@ -249,3 +249,31 @@ Both bundles ran on dgx4 in the image right after its gate (`runs/2026-11-03-dgx
 The same bundles in the first image (`runs/2026-11-03-dgx4/`, 04:20–04:22Z): 395 passed,
 1 skipped (the two-CUDA-device test), 0 failed in 130 s, and 234 passed with `230 kernels
 launched, 62 with PDL, 0 violations`.
+
+## Qualification at tp3-switched (sp5–sp7)
+
+The three spaceport nodes serve candidate-37 at the recipe's `tp3-switched` shape from a
+node-local profile (`config/candidate-37-tp3-switched-dev.local.json`). Candidate-38's is
+`config/candidate-38-tp3-switched-dev.local.json` on sp5, sp6 and sp7 (sha256 `461cfbe2…`):
+that profile with this candidate's image, expected trees and lock. The arms here extend it, as
+#860's arms extended candidate-37's: `tp3-switched-dev.json`, and `tp3-switched-copy-dev.json`
+with `tp3-copy.json`'s serve options. Both carry the dev-mode collective RPC, as the serving
+profile does, so this shape's gate digests are measured in dev mode (the triangle's `tp3.json`
+is not).
+
+- `candidate-tp3-switched.json` (run `candidate-38-tp3-switched`): `candidate-tp3.json`'s
+  extras on the two arms, with the ring's node names replaced (`probes.py --nodes
+  sp5,sp6,sp7`; `mem_snapshot.py` gains a `--nodes` option, the ring by default).
+- `release-tp3-switched.json` (run `candidate-38-release-tp3-switched`): the `release-tp3`,
+  `single-stream` and `sampled` suites on four boots, `candidate-38`, `candidate-38-copy`,
+  `candidate-38-copy-again`, `candidate-38-again`, so each measured arm has a boot and a repeat
+  boot and the paired verdict pairs the first and the last. The reference is
+  spark-ds41f-1030's recorded runs at this shape on sp5
+  (`results/private/suites/1030-tp3-switched-{release-tp3,single-stream,sampled}/1030`,
+  2026-11-01 05:52–07:19Z; suite digests `4f54f4b5…`, `7c59b27e…`, `ab647d38…`, the current
+  definitions), linked as `results/private/suites/references/1030-tp3-switched{,-single-stream,-sampled}`,
+  because the shape's `benchmark_reference` is a bench manifest, not a suite run. Candidates
+  27–37's runs beside them were made outside the lab, one boot each.
+
+Status: prepared 2026-11-03; the image's copy to the nodes and the runs are recorded below once
+they finish.
