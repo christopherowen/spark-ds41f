@@ -120,6 +120,25 @@ repeat boot. CopyDrafter's two performance boots remain pending. First-boot
 results do not constitute the final no-regression verdict. No recipe, lock or
 published baseline has been promoted or rewritten.
 
+The standard repeat's C4 TTFT p99 is 322.96 ms against the reference's
+310.59 ms (+3.98%, a direction-only flag without an interval); the first boot
+is 316.55 ms (+1.92%). Paired median TTFT is about 2.86% faster on both boots,
+and mean, p90 and p95 are also faster. The repeat's two slowest requests are
+adjacent indices 74/75, present in all runs, so unmatched prompts alone do not
+explain the flag. Preserve it while checking repeatability.
+
+`c4-tail-confirmation.json` adds two fresh boots of the identical standard
+recipe after the main standard phase, before CopyDrafter performance. Its
+`c4-tail-suite.json` copies the release suite's C8 and C4 steps unchanged;
+C8 supplies the preceding steady load. Compare each native step with its
+frozen reference and retain both new runs, including any adverse result.
+The lab's own two-arm table is an A/A check between the candidate boots,
+not a released-build comparison. These workload definitions are published,
+then exported byte-for-byte to the named private control path; the runtime
+checkouts remain clean at `cb657ab1`, and the runner records the separate
+workload commit and file hashes. The additional phase keeps the window open;
+the original final CopyDrafter phase still restores candidate 36.
+
 The recorded reference's 524K/1M prefill extension (`c06790ef`) retained the
 original shorter suite's outer elapsed time. Its actual stored prefill samples
 sum to 1,230.88 seconds rather than that index's 523.6 seconds. Comparisons use

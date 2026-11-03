@@ -53,6 +53,7 @@ def audit(snapshot):
             require(index["suite"] == definition and index["suite_sha256"] == suite.digest(definition), f"suite definition differs: {label}/{name}")
             require(index.get("finished_utc") and len(index["steps"]) == len(definition["steps"]), f"incomplete suite: {label}/{name}")
             require([(s["id"], s["command"], s["exit"]) for s in index["steps"]] == [(s["id"], s["command"], 0) for s in definition["steps"]], f"failed or different ordered steps: {label}/{name}")
+            require([s["output"] for s in index["steps"]] == [suite.output_name(s) for s in definition["steps"]], f"suite output names differ: {label}/{name}")
             metadata = index["metadata"]
             identity = metadata["identity"]
             require(not identity["live_problems"] and not identity["client_dirty"] and identity["client_commit"] == PIN, f"live/client mismatch: {label}/{name}")
@@ -144,7 +145,13 @@ def audit(snapshot):
         repeated = suite.compare(read_json, str(reference), str(b), judge)
         comparisons[name] = {"reference_to_boot1": changes, "reference_to_boot2": repeated, "boot1_to_boot2": aa, "headlines": suite.with_floor(changes, aa, floors=AA_FLOOR_PCT, reference_to_repeat=repeated)}
     adverse = [{"suite": name, **row} for name, comparison in comparisons.items() for row in comparison["headlines"] if row["verdict"] == "worse"]
-    return {"phase": phase, "evidence_passed": True, "verified_files": len(files), "deployment_commit": PIN, "tested_spec_sha256": sha(tested_spec), "image_id": IMAGE, "boots": boots, "identities": identities, "reference_files": references, "comparisons": comparisons, "adverse_headline_verdicts": adverse, "limitations": ["The release reference omits model text; candidate repeat comparisons retain it privately.", "524K and 1M reference prompts differ in actual token counts; retain the comparison warnings.", "The extended reference's outer prefill duration is stale; compare per-size samples.", "The standalone 524K/1M reference extension lacks its own all-rank deployment identity and conditions.", "Performance suites record deployment identity at suite entry, not a per-step rank-layout CRC."]}
+    adverse_rows = []
+    for name, comparison in comparisons.items():
+        for arm in ("reference_to_boot1", "reference_to_boot2"):
+            for step, outcome in comparison[arm]["steps"].items():
+                if "skipped" not in outcome:
+                    adverse_rows.extend({"suite": name, "comparison": arm, "step": step, **row} for row in outcome[1].get("rows", []) if row["verdict"].startswith("worse"))
+    return {"phase": phase, "evidence_passed": True, "verified_files": len(files), "deployment_commit": PIN, "tested_spec_sha256": sha(tested_spec), "image_id": IMAGE, "boots": boots, "identities": identities, "reference_files": references, "comparisons": comparisons, "adverse_headline_verdicts": adverse, "adverse_comparison_rows": adverse_rows, "limitations": ["The release reference omits model text; candidate repeat comparisons retain it privately.", "524K and 1M reference prompts differ in actual token counts; retain the comparison warnings.", "The extended reference's outer prefill duration is stale; compare per-size samples.", "The standalone 524K/1M reference extension lacks its own all-rank deployment identity and conditions.", "Performance suites record deployment identity at suite entry, not a per-step rank-layout CRC."]}
 
 
 def main():
