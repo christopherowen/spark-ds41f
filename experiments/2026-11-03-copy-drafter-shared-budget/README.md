@@ -15,9 +15,13 @@ run on sp5–sp7, in window `spark-0013-1793667996`:
 - **The parent session's diagnosis** (`shared-budget-diag-sp`):
   - with patch 0676 reverted, candidate-37 failed the same way, sooner;
   - with a census read every 32 steps, it found no non-finite row.
+- **The parent session's metadata census** (`shared-budget-diag2-sp`): with the
+  census's per-step work, candidate-37's ranks budgeted differently from the first
+  1,024 budgets on. Non-finite gate rows then appeared in both the target's and the
+  drafter's forwards within 2,048 steps.
 
-The NaN producer is not found yet (*The diagnosis job*). A metadata census
-(`lab-diag2.json`) is queued. Not promoted; no recipe change.
+The NaN producer is not named yet (*The metadata census*). `lab-diag3.json` is
+queued. Not promoted; no recipe change.
 
 This supersedes both earlier fixes, #856's host wait
 ([experiments/2026-11-02-copy-drafter-limit-sync](../2026-11-02-copy-drafter-limit-sync/))
@@ -128,9 +132,36 @@ metadata leaves it nothing to attend to.
   Without 0676 the row goes non-finite sooner.
 - The census records only non-finite values, so a finite-garbage row leaves no trace.
 
-None of this is shown yet; `lab-diag2.json` looks for such rows. The minimal arm's
-clean run does not show either that the shared budget never builds one: a
-finite-garbage row would leave no trace there either.
+None of this is shown yet. The minimal arm's clean run does not show either that the
+shared budget never builds such a row: a finite-garbage row would leave no trace
+there either.
+
+**The metadata census since** (*The metadata census*, below) adds two things.
+- **The ranks diverged.** With the census's work each step, candidate-37's ranks'
+  CRCs of their consequential stale reads differed in every window from the first
+  1,024 budgets on, with different counts (61, 41 and 42 after the suite).
+  - This is the per-rank divergence of the operator's report and of the two-rank
+    unit test, now on hardware. It was seen only under the census's timing, though.
+    That ordinary differences between hosts can do the same is an inference, not
+    measured.
+- **Non-finite gate rows followed early.** The first census read, 2,048 steps in,
+  found them on all three ranks:
+  - in the drafter's three MoE gates (DSpark's block);
+  - in the target's gates from layer 20 to 39;
+  - in some of its first layers, where the flagged rows differ by rank.
+
+  The copy probe's text had already changed: its copy and edit prompts gave 3,168
+  and 2,713 output tokens, against 4,550 and 4,566 in every other m=8 arm.
+
+The census cannot order those flags: it keeps them until it is read. So it does not
+say which forward, or which step, produced the first non-finite value. Nor does the
+divergence explain the plain repro, whose ranks agreed and which asserted only after
+8,192 budgets.
+
+The producer is not named yet. The metadata census's only record was startup's
+dummy batch, every row invalid by design, which it kept as its first hit. So it
+says nothing about real steps. `lab-diag3.json` (run `shared-budget-diag3-sp`, main
+`416393fe`) discards startup's hit and runs again, and may name the producer.
 
 The patch's rationale, one rank-wide budget, stands as a design property. The repro
 shows it fixes #852 here, but not why.
@@ -376,22 +407,104 @@ What follows from it:
   `.item()`, which lets limit copies land. Its stale sequence differs from the
   repro's from the first 1,024 budgets on, with 91 narrow slots against the repro's 6
   and a different edit probe (13.351 against 15.745). So its clean run does not test the
-  repro's layouts. `lab-diag2.json`'s census reads at the same cadence, so it may
-  change the race the same way.
+  repro's layouts. `lab-diag2.json`'s census then read every 2,048 steps instead
+  (below).
 - **Without 0676, the same stale sequence asserts sooner:** before 4,096 budgets,
   where with 0676 it asserted after 8,192. This fits a row that 0676 makes finite most
   of the time, which is the parent session's reading in the cause section.
-- **Queued:** run `shared-budget-diag2-sp` on main `3eed7862`, after the AgentX job,
-  expected about 05:50Z. Its arm,
-  [arm-diag2-c37-m8-nodead.json](arm-diag2-c37-m8-nodead.json), is candidate-37 at
-  m=8 with dead rows off, and carries:
-  - the non-finite census and the stale-read ring;
-  - a device-side census of the attention metadata in `sparse_mla.py`'s
-    `_build_tilelang`, for both the target's and the drafter's builders. It flags a
-    live row with a negative request index or position, or a `query_start_loc` end
-    that differs from the token count.
+- **Since run:** the metadata census, `shared-budget-diag2-sp`, below. Its census reads
+  every 2,048 steps rather than 32 (main `760614dd`).
 
-  Both are read every 32 steps, with the layouts around a hit.
+### The metadata census (`shared-budget-diag2-sp`)
+
+This is the parent session's job, run at `760614dd` from 04:22 to 04:41Z in the same
+window. It is one boot of
+[arm-diag2-c37-m8-nodead.json](arm-diag2-c37-m8-nodead.json): candidate-37 at m=8
+with dead rows off, carrying:
+- the non-finite census, whose router zeroes a flagged row's partials instead of
+  asserting;
+- the stale-read counter, with a ring of the last 64 consequential reads;
+- the metadata census in `sparse_mla.py`'s `_build_tilelang`, for the target's and
+  the drafter's builders. It flags a live row with a negative request index or
+  position, or a `query_start_loc` end that differs from the token count.
+
+Both censuses are read every 2,048 steps. The job ran the copy probe, the
+single-stream suite, then 8 and 16 streams, each followed by the census and the
+reads. The receipts are on sp5:
+- `results/private/determinism/shared-budget-diag2-sp/`;
+- `results/private/suites/shared-budget-diag2-sp-single-stream/`;
+- the table, `results/private/lab/shared-budget-diag2-sp-table.txt`.
+
+| | `diag2-c37-m8-nodead` | the repro's `c37-m8-nodead` |
+|---|---|---|
+| Copy probe (copy / edit / tool / prose) | **15.529 / 14.354** / 6.636 / 2.79 | 16.367 / 15.745 / 6.636 / 2.79 |
+| Copy / edit output tokens | **3,168 / 2,713** | 4,550 / 4,566 |
+| Single-stream suite | 55.73 tok/s, CI95 3.1%, 2.361 tokens/step, 0 failed | **died** |
+| 8 / 16 streams | 148.22 ±1.1% / 155.82 ±0.4% tok/s | engine already dead |
+| Asserts | none: the census zeroes flagged rows | `route_partials` on TP0 and TP2 |
+| Ranks' counter CRCs | **differ in every window**: 9 of 9 after the suite, 10 of 10 after 8 streams, 13 of 13 after 16 | equal in every window |
+
+The counter by rank:
+
+| | sp5 (TP0) | sp6 (TP1) | sp7 (TP2) |
+|---|---|---|---|
+| After the suite: 9,216 reads, 9,207 stale on each | 61 consequential; wider 51 slots / 407 rows; narrower 10 / 68 drafts | 41; 28 / 244; 13 / 98 | 42; 32 / 277; 10 / 73 |
+| After 16 streams: 13,312 reads, 13,301 stale on each | 692; 98 / 854; 626 / 6,573 | 669; 67 / 604; 634 / 6,642 | 669; 70 / 634; 631 / 6,617 |
+
+The first census read was at 04:28:18Z, census call 4,096, 2,048 steps in. On every
+rank, it flagged gate rows in both forwards:
+- **the drafter's** (`model.layers.40–42.ffn.gate`, DSpark's block): rows 0–4;
+- **the target's** (`language_model.model.layers.N.ffn.gate`):
+  - rows 0–16 of layers 20–39 on every rank;
+  - rows of its first layers that differ by rank: rows 0, 1 and 6–16 of layers 0–2
+    on sp5 and sp7 (sp7 without row 9), and rows 0–5 of layers 0–6 on sp6.
+
+Several things limit what the receipt says:
+- **No order in time.** A router's flags accumulate until the read, so the rows are a
+  union over 2,048 steps. They say neither which step nor which forward came first.
+- **The labels.** The lines read "NONFINITE drafter row" because the read came after
+  the drafter's forward; the label is the reading call's phase. The routers are
+  listed in registration order, the drafter's first. The parent session first read
+  the hit as the drafter's gate alone, with the target's recording nothing. The
+  layer names show the target's gates too.
+- **Truncation.** The census step keeps each node's first 400 NONFINITE lines, and
+  this read alone fills them. The list is cut within the target's layer 3 (sp5, sp7)
+  or layer 6 (sp6), so later layers are unknown, not clean. Later reads appear only
+  as counts: 1,084, 986 and 1,512 lines through the suite on sp5, sp6 and sp7.
+- **The step logged.** The layout logged with the hit, one request in slot 7 with 2
+  tokens, is the reading step's, not the hit's.
+
+The ring at that read holds every consequential read until then: 46 on sp5, 31 on
+sp6 and sp7. Each entry gives a slot, the eligible drafts the budget used, and those
+the landed limits gave.
+- **Slot 7's entries** have the budget at 16 where the landed limits gave 5, 5 where
+  they gave 1, and 8 or 5 where they gave 16. The host's mirror was a proposal or two
+  behind each time.
+- **The parent session's reading** of 16, 5 and 1 is a copy proposal's end, DSpark's
+  block, and a single draft.
+- **The rings differ by rank.** sp5 logged nine reads at 5 against 1 (reads
+  423–431); sp6 and sp7 logged one each.
+
+The metadata census recorded one hit, at call 1. That was startup's dummy batch: 6,155
+rows, all invalid by design. The census keeps only its first hit, so it says nothing
+about real steps. Main `416393fe` fixes this (the first real step discards startup's
+hit) for run `shared-budget-diag3-sp`
+([lab-diag3.json](lab-diag3.json)), queued behind this one.
+
+What follows from it:
+- **The census overlay shifts the race even at this cadence.** The ranks' CRCs
+  differ from the repro's, and from each other, from the first 1,024 budgets on. The
+  blocking read is now rare, so the shift comes from the per-step work: the device
+  census and the host's layout ring.
+- **Ranks that budget differently coincide with early non-finite rows.** With the
+  ranks diverged, non-finite gate rows appeared within the first 2,048 steps, and the
+  probe's temperature-0 text changed. With the ranks agreeing, the plain repro first
+  asserted after 8,192 budgets.
+- **It does not explain the plain repro.** There the ranks agreed by the counter: the
+  same CRCs of the consequential reads, and the same totals of the drafts those reads
+  changed.
+- **The producer is not named.** Neither forward is singled out, and the metadata
+  census saw no real step.
 
 ### Context: #856's and #859's runs on sp5–sp7
 
@@ -540,12 +653,20 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.js
   single boot, so its absence of a crash bounds a rate rather than proving zero.
 - **The cost's repeat:** candidate-37 had one boot of each kind in the cost run, so
   its side of the 8- and 16-stream comparison has no interval across boots.
-- **The NaN producer:** it is not live placeholder rows, not per-rank divergence, and
-  not a stale read alone (above). The lead is the parent session's reading: a live row
-  whose metadata leaves it nothing to attend to, which 0676 turns into a finite
-  output most of the time. `lab-diag2.json` is queued to look for such rows, with a
-  census at the cadence that changed the race in `lab-diag.json`. Until the producer
-  is found, the minimal fix is known to avoid the crash on this sequence, not why.
+- **The NaN producer** is not named.
+  - Live placeholder rows and a stale read alone are ruled out (above).
+  - Per-rank divergence coincided with early non-finite rows under the census's
+    timing (*The metadata census*), but the plain repro crashed without it.
+  - The parent session's lead, a live row whose metadata leaves it nothing to attend
+    to, is untested on real steps: diag2's metadata census kept only startup's dummy
+    batch. `lab-diag3.json` is queued.
+
+  Until the producer is found, the minimal fix is known to avoid the crash on this
+  sequence, but not why.
+- **Divergence without instrumentation:** not measured. The census's work split the
+  ranks' reads; whether ordinary host timing can do the same is open.
+- **The flagged layers past the receipt's 400-line cap,** and the later census
+  reads: not in the receipts.
 - **That the shared budget builds no such row:** not shown. A finite-garbage row
   would leave no trace in the minimal arm's run.
 - **The operator's ring:** their crash ran with dead rows on (their report); ours
@@ -569,11 +690,16 @@ speed is the same as candidate-37's (−0.08% ±0.09%, where #856's wait cost 0.
 and 16 streams are no slower, and the tool probe keeps 6.232 tokens per step against
 6.083.
 
-What the repro does not support is the reason given for the fix:
-- candidate-37's ranks agreed;
+What the repro alone does not support is the reason given for the fix:
+- candidate-37's ranks agreed there;
 - the minimal arm's live placeholder rows were harmless.
 
-The diagnosis job adds that a stale read alone does not produce a non-finite row,
-and that reverting 0676 makes the same stale sequence assert sooner. The lead is a
-live row with nothing to attend to, which the stale cap's layouts would build and
-0676 would usually hide; `lab-diag2.json` looks for it.
+The diagnosis jobs since add three things:
+- a stale read alone does not produce a non-finite row;
+- reverting 0676 makes the same stale sequence assert sooner;
+- with the census's work each step, candidate-37's ranks did budget differently on
+  hardware, and non-finite gate rows appeared in both forwards within 2,048 steps.
+
+The shared budget rules that divergence out by design: its layouts do not read the
+limits, and its ranks' layout CRCs were equal in every window. The producer itself
+is not named; `lab-diag3.json` may name it.
