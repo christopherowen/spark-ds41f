@@ -78,10 +78,12 @@ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 # Non-syncing census (experiments/2026-11-03-copy-drafter-shared-budget): the census
-# is read once every _CENSUS_EVERY calls (two calls a step), so the host seldom waits
-# on the GPU and the limit copy stays in flight as it does in production. The hit rows
+# is read once every _CENSUS_EVERY calls (two calls a step: every 2,048 steps), so
+# the host almost never waits on the GPU. A read every 32 steps was enough to change
+# the sequence of stale limit reads (the first diagnosis arm), so this cadence is far
+# rarer; the hits are kept on the device until read. The hit rows
 # accumulate on the device until read; the layout logged is the reading step's.
-_CENSUS_EVERY = 64
+_CENSUS_EVERY = 4096
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
@@ -718,11 +720,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.models.deepseek_v4_1 import sparse_mla as ds41_sparse_mla
 
         self._census_calls = getattr(self, "_census_calls", 0) + 1
+        if self._census_calls == 1:
+            # Startup's dummy batches (every row a placeholder) hit the metadata
+            # census by design; discard them so the first recorded hit is a real step.
+            ds41_sparse_mla.metadata_census()
+            ds41_router.nonfinite_census()
         ring = getattr(self, "_layout_ring", None)
         if ring is None:
             from collections import deque
 
-            ring = self._layout_ring = deque(maxlen=512)
+            ring = self._layout_ring = deque(maxlen=8192)
         copy = self.copy_drafter
         per_req = input_batch.num_draft_tokens_per_req
         ring.append((
