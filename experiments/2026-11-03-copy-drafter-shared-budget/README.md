@@ -4,15 +4,20 @@ Owner, 2026-11-03: "I don't like the performance loss, we should remove the
 device-side fix and do this correctly." Then: "get to the point you are ready for
 testing, stop and show me where it is."
 
-**Status:** the patch is unit-tested in candidate-37's image on sp8, and the repro
-has run on sp5–sp7 (window `spark-0013-1793667996`, run `shared-budget-repro-sp`).
-- **#852 reproduced on candidate-37** at min match 8 with dead rows off.
-- **The minimal arm ran the same sequence clean**, its ranks' layout CRCs equal in
-  every window.
+**Status:** the patch is unit-tested in candidate-37's image on sp8. Three jobs have
+run on sp5–sp7, in window `spark-0013-1793667996`:
+- **The repro** (`shared-budget-repro-sp`): #852 reproduced on candidate-37 at min
+  match 8 with dead rows off. The minimal arm ran the same sequence clean, its ranks'
+  layout CRCs equal in every window.
+- **The cost** (`shared-budget-cost-sp`): single-stream speed is the same as
+  candidate-37's (paired −0.08% ±0.09%, inside the 0.30% floor), and 8 and 16 streams
+  are no slower.
+- **The parent session's diagnosis** (`shared-budget-diag-sp`):
+  - with patch 0676 reverted, candidate-37 failed the same way, sooner;
+  - with a census read every 32 steps, it found no non-finite row.
 
-Neither of the two mechanisms considered so far explains the crash (*The repro on
-sp5–sp7*). The cost run (`lab-cost.json`) and the parent session's diagnosis job
-(`lab-diag.json`) are queued, with no results yet. Not promoted; no recipe change.
+The NaN producer is not found yet (*The diagnosis job*). A metadata census
+(`lab-diag2.json`) is queued. Not promoted; no recipe change.
 
 This supersedes both earlier fixes, #856's host wait
 ([experiments/2026-11-02-copy-drafter-limit-sync](../2026-11-02-copy-drafter-limit-sync/))
@@ -105,6 +110,28 @@ topology.
   the same stale limits and laid out the same steps. So per-rank divergence did not
   cause this crash either.
 
+**The diagnosis job since** (*The diagnosis job*, below) narrows it.
+- **Stale reads alone are not enough.** Stale reads of both kinds, mostly narrow
+  ones, ran through 11,264 budgets on candidate-37 with no non-finite row, once a
+  census read every 32 steps had changed their timing.
+- **Without patch 0676 the assert comes sooner.** With 0676 reverted, candidate-37
+  met the repro's stale reads: equal CRCs at 1,024, 2,048 and 3,072 budgets. Its TP2
+  rank asserted in `route_partials` between 3,072 and 4,096 budgets, where the repro
+  asserted only after 8,192.
+
+The parent session's reading of the three runs: the producer is a live row whose
+metadata leaves it nothing to attend to.
+- That is a negative request index or position, whose lengths `window_row` zeroes, or
+  a `query_start_loc` end short of the token count.
+- 0676 writes such a row's output as 0 and skips its output projection's input, so
+  the projection reads stale scratch. That is usually finite and eventually not.
+  Without 0676 the row goes non-finite sooner.
+- The census records only non-finite values, so a finite-garbage row leaves no trace.
+
+None of this is shown yet; `lab-diag2.json` looks for such rows. The minimal arm's
+clean run does not show either that the shared budget never builds one: a
+finite-garbage row would leave no trace there either.
+
 The patch's rationale, one rank-wide budget, stands as a design property. The repro
 shows it fixes #852 here, but not why.
 
@@ -121,10 +148,12 @@ shows it fixes #852 here, but not why.
     which routed them only on a stale read. `minimal-m8-nodead` did exactly that
     through #852's sequence and 8 and 16 streams, with no non-finite gate row. Live
     placeholder rows are not the producer on sp5–sp7.
-  - The extra rows cost compute on the steps after a copy shrinks. The cost spec
-    measures it.
+  - The extra rows cost compute on the steps after a copy shrinks. The cost run
+    found none measurable at m=16 with dead rows on: rows per step are 4.07 on both
+    builds, and single-stream speed is the same.
 - **Stale narrow limits no longer drop drafts.** On sp5–sp7, #856's run had
-  candidate-37 at 6.083 tool tokens per step against 6.232 with the wait.
+  candidate-37 at 6.083 tool tokens per step against 6.232 with the wait. The shared
+  budget gives 6.232 too (cost run, m=16), and 6.905 against 6.636 at m=8 (repro).
 - **Bit-identity.** Where candidate-37's host limit didn't bind (it was current and
   at least the scheduled drafts), every step is bit for bit candidate-37's. Where it
   bound, the step has more rows and the same temperature-0 text.
@@ -245,7 +274,7 @@ What it rules out, and what is left:
 - **Live placeholder rows** are not the producer: the minimal arm budgets more of
   them, live, and is clean.
 - **Per-rank layout divergence** is not the cause here: candidate-37's ranks agreed.
-- **The lead the parent session draws: the trimmed-budget path.** A stale limit
+- **The lead the parent session drew then: the trimmed-budget path.** A stale limit
   between the current proposal's drafts and the scheduled ones makes eligible drafts
   fewer than scheduled. That sends the step through `compact_batch` and
   `assign_draft_budget`, with the budget below the scheduled drafts. The minimal arm
@@ -253,18 +282,116 @@ What it rules out, and what is left:
 
   The trimmed path also exists in the minimal arm, whenever the planned confidences
   don't pay for every row. So it would have to be the stale cap's particular layouts
-  that break. This is not yet shown.
-- **Queued on main** (`c7563669`, `b28365c3`) in [lab-diag.json](lab-diag.json), run
-  `shared-budget-diag-sp`, to find the producer:
-  - [arm-diag-c37-m8-nodead.json](arm-diag-c37-m8-nodead.json):
-    candidate-37 with the non-finite census read every 32 steps rather than every
-    step, so the race stays as in serving. The router zeroes a non-finite row
-    instead of asserting, and every hit is logged with a ring of the last
-    consequential stale reads.
-  - [arm-no0676-c37-m8-nodead.json](arm-no0676-c37-m8-nodead.json): candidate-37
-    with patch 0676 reverted and no census.
+  that break. This is not yet shown, and the diagnosis job's reading (below) has
+  since replaced it as the lead.
+- **The parent session's diagnosis job** has run since: *The diagnosis job*, below.
 
-  Neither has results yet.
+### The cost run on sp5–sp7 (`shared-budget-cost-sp`)
+
+The run was in the same window, after the repro, with the arms of
+[lab-cost.json](lab-cost.json) at m=16 and the recipe's dead rows (0.2). The arms ran
+in the order minimal, candidate-37, minimal, each with one boot for the suite and
+another for the extras. The receipts are on sp5:
+- `results/private/suites/shared-budget-cost-sp/`;
+- `results/private/determinism/shared-budget-cost-sp/`;
+- the table, `results/private/lab/shared-budget-cost-sp-table.txt`;
+- the verdicts, in `results/private/lab/queue-860.log`.
+
+| | `minimal-m16` | `c37-m16` | `minimal-m16` repeat |
+|---|---|---|---|
+| Single-stream suite, tok/s (CI95) | 63.50 ±3.0% | 63.56 ±2.9% | 63.48 ±3.0% |
+| Tokens / rows per step | 2.259 / 4.07 | 2.259 / 4.07 | 2.259 / 4.07 |
+| Copy probe, tool tokens per step | **6.232** | 6.083 | **6.232** |
+| 8 streams, tok/s | 157.50 ±0.2% | 157.36 ±0.3% | 157.89 ±0.2% |
+| 16 streams, tok/s | 163.47 ±0.9% | 162.61 ±1.4% | 164.69 ±0.3% |
+
+- **The lab's paired verdict is "same":** −0.08% ±0.09% decode tok/s against
+  candidate-37. It is over both fix boots, with the recorded floor of 0.30%, a margin
+  of 0.32%, and a repeat of +0.01%.
+  - Alone, the first fix boot reads −0.11% ±0.05%, which its row calls worse on the
+    request interval without the floor.
+  - The repeat boot reads −0.06% ±0.14%, same.
+  - #856's host wait was −0.73% ±0.12% on the same suite.
+- **Draft acceptance is unchanged.** Rows per step, acceptance by position and the
+  copy, edit and prose probes (16.021, 15.322, 2.651) are identical on all three
+  boots.
+- **The tool drafts that candidate-37's stale narrow reads dropped come back:**
+  6.232 against 6.083, the same as with #856's wait.
+- **8 and 16 streams are no slower:** both fix boots are above candidate-37's single
+  boot.
+
+### The diagnosis job (`shared-budget-diag-sp`)
+
+This is the parent session's job, published on main (`c7563669`, `b28365c3`) and run at
+`b28365c3` from 02:31 to 02:55Z in the same window. Its arms of
+[lab-diag.json](lab-diag.json) are candidate-37 at m=8 with dead rows off, each with
+the stale-read counter. Each had one boot, which ran the copy probe, the single-stream
+suite, then 8 streams.
+- [arm-diag-c37-m8-nodead.json](arm-diag-c37-m8-nodead.json) adds the non-finite
+  census, read every 32 steps. The router zeroes a non-finite row instead of
+  asserting.
+- [arm-no0676-c37-m8-nodead.json](arm-no0676-c37-m8-nodead.json) reverts patch 0676
+  and has no census.
+
+The receipts are on sp5:
+- `results/private/determinism/shared-budget-diag-sp/`, which holds the census and
+  reads lines and the reverted arm's engine logs;
+- `results/private/suites/shared-budget-diag-sp-single-stream/`;
+- the table, `results/private/lab/shared-budget-diag-sp-table.txt`.
+
+| | `diag-c37-m8-nodead` (census) | `no0676-c37-m8-nodead` (0676 reverted) | the repro's `c37-m8-nodead` |
+|---|---|---|---|
+| Copy probe (copy / edit / tool / prose) | 16.367 / **13.351** / 6.636 / 2.79 | 16.367 / 15.745 / 6.636 / 2.79 | 16.367 / 15.745 / 6.636 / 2.79 |
+| Single-stream suite | 59.25 tok/s, CI95 5.7%, 2.377 tokens/step, 0 failed | **died**: 8.19 tok/s, 8,336,417 failed requests, suite exit 1 | **died**: 50.61 tok/s, 1,708,441 failed |
+| 8 streams | 153.71 tok/s ±0.2% | engine already dead | engine already dead |
+| Non-finite rows (census) | **0** on every node, through the suite and 8 streams | no census | no census |
+| Asserts | none | `route_partials: gate logits contain nan or inf` on sp7 (TP2) | the same, on sp5 (TP0) and sp7 (TP2) |
+| Budget reads | 11,264, no failure | failed between 3,072 (02:49:16Z) and 4,096 | failed after 8,192 (01:15:05Z) |
+| Counter CRCs | equal on all ranks, and differ from the repro's from 1,024 on | equal on all ranks, and equal to the repro's at 1,024, 2,048 and 3,072 | equal on all ranks |
+
+The census arm's counter, on every rank alike:
+
+| Budget reads | stale | consequential | wider: slots / placeholder rows | narrower: slots / dropped drafts |
+|---|---|---|---|---|
+| 9,216 (after the suite) | 8,922 (96.8%) | 111 | 20 / 185 | 91 / 959 |
+| 11,264 (after 8 streams) | 10,906 | 205 | 28 / 256 | 193 / 1,954 |
+
+The reverted arm's failure, from its engine logs:
+- **TP2 (sp7) asserted first.** The first 50 matching lines of its container log
+  are all `route_partials: gate logits contain nan or inf`.
+- **TP0's fault was a consequence.** On sp5 the `CUDA error: unspecified launch
+  failure` at 02:49:53Z came with the collective's report: "RoCE collective on rank 0
+  saw nothing from rank 2, HCA 0, for 10.000 s … the GPU was stopped there". So
+  TP0's launch failure was the stop that timeout imposed, not a fault of its own.
+- **sp6 (TP1)** lost the TCPStore and asserted nothing. That was also true in the
+  repro's crash.
+
+The parent session's first reading had the reverted arm faulting a kernel on TP0
+without a router assert. The logs show the router assert, on TP2.
+
+What follows from it:
+- **Stale reads alone are not enough.** The census arm budgeted stale reads of both
+  kinds, mostly narrow, with no non-finite row in 11,264 budgets.
+- **The census changes the race it watches.** Its read every 32 steps is a blocking
+  `.item()`, which lets limit copies land. Its stale sequence differs from the
+  repro's from the first 1,024 budgets on, with 91 narrow slots against the repro's 6
+  and a different edit probe (13.351 against 15.745). So its clean run does not test the
+  repro's layouts. `lab-diag2.json`'s census reads at the same cadence, so it may
+  change the race the same way.
+- **Without 0676, the same stale sequence asserts sooner:** before 4,096 budgets,
+  where with 0676 it asserted after 8,192. This fits a row that 0676 makes finite most
+  of the time, which is the parent session's reading in the cause section.
+- **Queued:** run `shared-budget-diag2-sp` on main `3eed7862`, after the AgentX job,
+  expected about 05:50Z. Its arm,
+  [arm-diag2-c37-m8-nodead.json](arm-diag2-c37-m8-nodead.json), is candidate-37 at
+  m=8 with dead rows off, and carries:
+  - the non-finite census and the stale-read ring;
+  - a device-side census of the attention metadata in `sparse_mla.py`'s
+    `_build_tilelang`, for both the target's and the drafter's builders. It flags a
+    live row with a negative request index or position, or a `query_start_loc` end
+    that differs from the token count.
+
+  Both are read every 32 steps, with the layouts around a hit.
 
 ### Context: #856's and #859's runs on sp5–sp7
 
@@ -300,8 +427,8 @@ These are not this experiment's runs. The figures come from their receipts on sp
 
 ## The specs
 
-`lab-repro.json` has run (*The repro on sp5–sp7*); `lab-cost.json` is queued. Both
-dry-run clean with `--production-config
+Both have run: `lab-repro.json` (*The repro on sp5–sp7*) and `lab-cost.json` (*The
+cost run on sp5–sp7*). Both dry-run clean with `--production-config
 config/candidate-37-tp3-switched-dev.local.json`. That is the profile sp5–sp7 serve
 (sha `92b1712d…`, node map `config/nodes-switched3.local.json` sha `0c508533…`); both
 files were copied from sp5 and not committed. `bin/spark --cluster-config <arm>
@@ -353,11 +480,13 @@ use host-only diagnostics.
 - the minimal arm passes the repro with no assert or non-finite gate row, and its
   ranks' CRCs agree in every window: **met** (one boot);
 - the paired single-stream verdict against candidate-37 is not worse beyond its CI:
-  pending (`lab-cost.json`);
-- the copy probe's tool tokens per step are at least candidate-37's: met at m=8
-  (6.905 against 6.636); m=16 pending;
-- 8 and 16 streams are within noise: pending. The repro's candidate-37 arm died
-  before its streams, so there is nothing to pair them with.
+  **met**, "same" at −0.08% ±0.09% over two fix boots, with the 0.30% floor (m=16);
+- the copy probe's tool tokens per step are at least candidate-37's: **met** at m=8
+  (6.905 against 6.636) and m=16 (6.232 on both boots against 6.083);
+- 8 and 16 streams are within noise: **met** at m=16, with both fix boots at or above
+  candidate-37's (157.50 and 157.89 against 157.36; 163.47 and 164.69 against
+  162.61). At m=8 the repro's candidate-37 arm died before its streams, so there is
+  nothing to pair them with.
 
 Tables: [tables_arms.py](tables_arms.py) `RUN ARM...` prints each arm's probe, suite,
 reads with the ranks' CRC agreement, and streams.
@@ -407,13 +536,18 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.js
 
 ## Not verified
 
-- **The cost:** `lab-cost.json` is queued.
 - **The repro's repeat:** one boot per arm so far. The minimal arm's clean run is a
   single boot, so its absence of a crash bounds a rate rather than proving zero.
-- **The NaN producer:** neither live placeholder rows nor per-rank divergence
-  (above). The trimmed-budget path is the lead; `lab-diag.json` is queued to find it.
-  Until it is found, the minimal fix is known to avoid the crash on this sequence,
-  not why.
+- **The cost's repeat:** candidate-37 had one boot of each kind in the cost run, so
+  its side of the 8- and 16-stream comparison has no interval across boots.
+- **The NaN producer:** it is not live placeholder rows, not per-rank divergence, and
+  not a stale read alone (above). The lead is the parent session's reading: a live row
+  whose metadata leaves it nothing to attend to, which 0676 turns into a finite
+  output most of the time. `lab-diag2.json` is queued to look for such rows, with a
+  census at the cadence that changed the race in `lab-diag.json`. Until the producer
+  is found, the minimal fix is known to avoid the crash on this sequence, not why.
+- **That the shared budget builds no such row:** not shown. A finite-garbage row
+  would leave no trace in the minimal arm's run.
 - **The operator's ring:** their crash ran with dead rows on (their report); ours
   ran with them off. Their paired run on ring2 is offered, not run.
 - **Patch 2** is unit-tested only. It is not measured and not in any arm.
@@ -430,9 +564,16 @@ The fix is one argument, without a host wait or a clamp. Unit tests show the lay
 agree across simulated ranks, and the text is the target's through copy growth,
 shrinkage and slot reuse.
 
+It costs nothing measurable. At m=16 with the recipe's dead rows, single-stream
+speed is the same as candidate-37's (−0.08% ±0.09%, where #856's wait cost 0.73%), 8
+and 16 streams are no slower, and the tool probe keeps 6.232 tokens per step against
+6.083.
+
 What the repro does not support is the reason given for the fix:
 - candidate-37's ranks agreed;
 - the minimal arm's live placeholder rows were harmless.
 
-The lead is that it works by keeping the budget off the stale cap's trimmed
-layouts; the diagnosis job tests that. Its cost is the other open measurement.
+The diagnosis job adds that a stale read alone does not produce a non-finite row,
+and that reverting 0676 makes the same stale sequence assert sooner. The lead is a
+live row with nothing to attend to, which the stale cap's layouts would build and
+0676 would usually hide; `lab-diag2.json` looks for it.
