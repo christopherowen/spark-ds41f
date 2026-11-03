@@ -111,6 +111,12 @@ def audit(snapshot):
             elif stem == "copy-probe":
                 require([r["category"] for r in rows] == ["prose", "copy", "edit", "tool"] and all(r["requests"] == 12 and r["errors"] == 0 and r["output_tokens"] > 0 for r in rows), f"copy probe failed: {label}")
                 final = {"categories": [{k: v for k, v in r.items() if k not in ("suffix", "dspark_acceptance_by_position")} for r in rows]}
+            elif stem == "memory":
+                ranks = {r["node"]: r for r in rows if r["node"] in NODES}
+                require(set(ranks) == set(NODES), f"memory snapshot omits a rank: {label}")
+                require(all(r["mem_available_gib"] > 0 and r["mem_total_gib"] > 0 and r["container"] for r in ranks.values()), f"memory snapshot failed on a rank: {label}")
+                # The legacy extra also reads dgx4; it is an observer, not a TP rank.
+                final = {"ranks": ranks, "other_observations": [r for r in rows if r["node"] not in NODES]}
             elif stem == "trace":
                 trace = load(raw / final["output"])
                 require(len(trace["requests"]) > 12 and all(not r.get("error") and r.get("completion_tokens") == 256 for r in trace["requests"]), f"latency trace request failed: {label}")
