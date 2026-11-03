@@ -1,0 +1,40 @@
+# sp8 (GB10, one GPU), 2026-11-03, image spark-ds41f:candidate-37 (sha256:e1ee7b1953b1...), one container at a time.
+# Files: tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py
+#        tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py
+# The patched tree's changed files mounted read-only over /opt/spark-ds41f/candidate/vllm (run_image.sh).
+
+== candidate-37 (nothing mounted)
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+77 passed, 1 skipped, 14 warnings in 47.60s
+== patch 1 (72abb31ff: the budget without host draft limits)
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+79 passed, 1 skipped, 14 warnings in 57.02s
+== patch 1 + patch 2 (88982f34e: the cleanup)
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+79 passed, 1 skipped, 14 warnings in 57.69s
+
+# tests/v1/worker/test_async_verified_draft_counts.py tests/v1/worker/test_gpu_model_runner_v2.py
+# (AsyncOutput, which patch 2 changes): candidate-37 fails 20 of them already (stand-in runners
+# without num_draft_steps, copy_drafter, ...); the same 20 fail with both patches.
+== candidate-37: 20 failed, 22 passed, 14 warnings in 13.29s
+== patch 1 + patch 2: 20 failed, 22 passed, 14 warnings in 12.37s; the failed list is identical:
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_capture_uses_recovered_accepted_state[False-False]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_capture_uses_recovered_accepted_state[False-True]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_capture_uses_recovered_accepted_state[True-False]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_capture_uses_recovered_accepted_state[True-True]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_logits_only_dispatches_pending_cache_tasks[False]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_boundary_logits_only_dispatches_pending_cache_tasks[True]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-False-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[False-True-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV41ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForCausalLM]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up[True-False-DeepseekV4ForConditionalGeneration]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[align-prefix-cache]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table[no-prefix-cache-with-speculation]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[0]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_pipeline_drafts_do_not_depend_on_boundary_checkpoints[2]
+FAILED tests/v1/worker/test_gpu_model_runner_v2.py::test_qsa_circular_group_uses_custom_slot_mapping
