@@ -1,0 +1,98 @@
+From 913c74e99a08610c57efc17a5912ad481ebb9be4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 687/687] test(cudagraph-profiling): model the driver's free memory
+ in the native capture measurement
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: test_profile_cudagraph_memory_frees_throwaway_pool[0] asserted
+native_after - native_before >= 0 on profile_cudagraph_memory's native
+measurement, total - free - torch reserved, read from the driver before and
+after a fake capture. On GB10 the device's memory is the host's
+(get_device_properties().is_integrated), and the driver's free reading moves
+with the host while the process allocates nothing: 41 MiB and 64 MiB of spread
+over 16 readings in 3 s, in two probes on an idle dgx4 in the same image. So a
+zero native delta
+cannot be asserted as a sign: the test passed once and failed twice in
+candidate-38's gate runs, and the 256 MiB case passed on its margin.
+
+The test now models the driver's free memory as total - torch reserved - the
+test's own cudaMalloc (which still runs, as does the cudaFree), so the native
+delta is exact: == native_bytes for both parametrizations. The rest of the test
+is unchanged: the graphs' memory is measured and the throwaway pool released.
+
+Quality: no runtime change. The same drift is in production's
+cudagraph_native_memory_profile; _determine_available_memory clamps the
+retained native capture at 0 and bounds it by the measured and late-persistent
+memory, so it moves the KV budget by tens of MiB at most.
+
+Tests: tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py in
+spark-ds41f:candidate-38 on dgx4 (GB10): 36 passed, three runs in a row (the
+[0] case passed once and failed twice in the record's three runs).
+
+Upstream status: the file is Local Inference Lab's (LIL); the measurement is
+theirs too, and the unified-memory drift would be worth reporting to them.
+---
+ ...gpu_model_runner_v2_cudagraph_profiling.py | 20 +++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+index 1ac4002821..cefb8aab5d 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+@@ -815,12 +815,27 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+     allocation_bytes = 64 << 20
+     memory: dict[str, int] = {}
+     native_pointer = None
++    native_allocated = 0
+ 
+     torch.accelerator.synchronize()
+     gc.collect()
+     torch.accelerator.empty_cache()
+     memory["before"] = torch.accelerator.memory_reserved()
+ 
++    # The driver's free-memory reading is the one input of the native measurement
++    # the test does not control, and on a device whose memory is the host's (GB10)
++    # it moves with the host while nothing is allocated: 41 MiB of spread over 3 s
++    # on an idle node. Model it as what this process holds, Torch's reservations
++    # and the test's own cudaMalloc, so the native delta is exact; the cudaMalloc
++    # and cudaFree below still run against the driver.
++    _, total_memory = torch.accelerator.get_memory_info()
++
++    def memory_info():
++        reserved = torch.accelerator.memory_reserved()
++        return total_memory - reserved - native_allocated, total_memory
++
++    monkeypatch.setattr(torch.accelerator, "get_memory_info", memory_info)
++
+     def _init(r):
+         r.events.append("init")
+         kv_cache = torch.empty(allocation_bytes, dtype=torch.uint8, device="cuda")
+@@ -835,11 +850,12 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+         )
+ 
+     def _capture_model(*, profile_only: bool = False) -> int:
+-        nonlocal native_pointer
++        nonlocal native_pointer, native_allocated
+         before_free = torch.accelerator.get_memory_info()[0]
+         if native_bytes:
+             error, native_pointer = runtime.cudaMalloc(native_bytes)
+             assert error == runtime.cudaError_t.cudaSuccess
++            native_allocated = native_bytes
+         for owner in (
+             runner.cudagraph_manager,
+             runner.speculator.cudagraph_manager,
+@@ -867,7 +883,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+         assert memory["after"] == memory["before"]
+         native_before, native_after, measured = runner.cudagraph_native_memory_profile
+         assert measured == graph_estimate == memory["measured"]
+-        assert native_after - native_before >= native_bytes
++        assert native_after - native_before == native_bytes
+     finally:
+         if native_pointer is not None:
+             assert (
+-- 
+2.54.0 (Apple Git-157)
+

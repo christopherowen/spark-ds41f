@@ -1,0 +1,155 @@
+From 89f7cbdbb2e81edac973364a4b43473eb4394224 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 685/687] test(gpu-model-runner): the stand-in runners carry what
+ the runner now reads
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: six tests build GPUModelRunner stand-ins (GPUModelRunner.__new__ or
+a SimpleNamespace) that lacked attributes the series gave the code under test,
+and failed at the first read. Each gets what the real runner holds:
+
+- postprocess_sampled trims sampled rows to num_draft_steps + 1 (copy drafts'
+  wide verification, e8c696282): test_boundary_capture_uses_recovered_accepted_
+  state sets num_draft_steps = num_speculative_steps = 3, one bonus token and
+  three drafts, so its four sampled columns are kept whole.
+- initialize_kv_cache reads copy_drafter (planned confidences for the adaptive
+  verification manager, e8c696282): test_qsa_circular_group_uses_custom_slot_
+  mapping sets None.
+- initialize_kv_cache computes the block-table geometry through
+  _block_table_max_model_len, _block_table_width and _group_cp_size on itself
+  (e57a0d844): test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table
+  binds the runner's methods to its SimpleNamespace.
+- execute_model reads uniform_decode_query_len (the uniform-decode dispatch,
+  e8c696282) and, after a logits-only restore, the DP sync's skip_drafts
+  (7d3263647) and num_draft_steps for the spec tokens to schedule:
+  test_boundary_logits_only_dispatches_pending_cache_tasks sets 1, a sync that
+  does not skip drafts, and 0.
+- _profile_deepseek_v4_attention binds one block per KV cache group besides the
+  null block, from get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec()):
+  test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up gives
+  the runner a config and a spec, patches get_kv_cache_groups to return two
+  groups, checks it was asked with them, and expects num_blocks=3 (it expected
+  1, the single block the profile bound before).
+- sample_tokens reads sink (the sink sampler, 2d832d876):
+  test_pipeline_drafts_do_not_depend_on_boundary_checkpoints sets None.
+
+Quality: no runtime change; a test-only patch.
+
+Tests: tests/v1/worker/test_gpu_model_runner_v2.py in spark-ds41f:candidate-38
+on dgx4 (GB10): 40 passed (was 20 passed, 20 failed).
+
+Upstream status: the file is Local Inference Lab's (LIL); the fixes follow the
+series' own changes to the runner and are not for upstream.
+---
+ tests/v1/worker/test_gpu_model_runner_v2.py | 32 ++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index dee6bd24ae..a1d3a6ff2a 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import contextlib
+-from types import SimpleNamespace
++from types import MethodType, SimpleNamespace
+ from weakref import ref
+ 
+ import numpy as np
+@@ -57,6 +57,8 @@ def test_boundary_capture_uses_recovered_accepted_state(
+     events = []
+     runner = GPUModelRunner.__new__(GPUModelRunner)
+     runner.is_last_pp_rank = False
++    # One bonus token and the drafter's three drafts: the sampled rows are kept whole.
++    runner.num_draft_steps = runner.num_speculative_steps = 3
+     runner.cache_config = SimpleNamespace(use_kda_recoverssm=recovery)
+     runner.req_states = SimpleNamespace(
+         num_computed_tokens=SimpleNamespace(gpu=torch.tensor([19])),
+@@ -123,6 +125,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+     )
+     runner.speculator = None
+     runner.speculative_config = None
++    runner.copy_drafter = None
+     runner.req_states = []
+     runner.input_buffers = SimpleNamespace(query_start_loc=None)
+     runner.vocab_size = 1
+@@ -248,6 +251,9 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
+         vllm_config=vllm_config,
+         parallel_config=parallel_config,
+     )
++    # The block-table geometry helpers initialize_kv_cache calls on itself.
++    for name in ("_block_table_max_model_len", "_block_table_width", "_group_cp_size"):
++        setattr(runner, name, MethodType(getattr(GPUModelRunner, name), runner))
+ 
+     class _CapturedWidths(Exception):
+         pass
+@@ -456,7 +462,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
+         },
+     )
+     dispatched_tasks = []
+-    dp_sync = object()
++    # The DP sync carries whether the step skips its drafts.
++    dp_sync = SimpleNamespace(skip_drafts=False)
+     cudagraph_stats = object()
+     scheduler_output = SimpleNamespace(
+         boundary_logits_only=True,
+@@ -502,6 +509,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
+         parallel_config=SimpleNamespace(),
+         observability_config=SimpleNamespace(cudagraph_metrics=cudagraph_metrics),
+         num_speculative_steps=0,
++        num_draft_steps=0,
++        uniform_decode_query_len=1,
+         decode_query_len=1,
+         cudagraph_manager=None,
+         gather_batch_req_state=lambda *args: (SimpleNamespace(num_tokens=1), 1),
+@@ -653,9 +662,21 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+     init_fails: bool,
+     dummy_run_fails: bool,
+ ):
++    from vllm.v1.core import kv_cache_utils
++
+     runner = GPUModelRunner.__new__(GPUModelRunner)
+     runner.model_config = SimpleNamespace(architecture=architecture)
+     runner.max_num_tokens = 4096
++    runner.vllm_config = vllm_config = object()
++    kv_cache_spec = object()
++    runner.get_kv_cache_spec = lambda: kv_cache_spec
++    groups = [object(), object()]
++    group_calls: list[object] = []
++    monkeypatch.setattr(
++        kv_cache_utils,
++        "get_kv_cache_groups",
++        lambda config, spec: group_calls.append((config, spec)) or groups,
++    )
+     events: list[object] = []
+ 
+     def init_kv(_, *, num_blocks=None):
+@@ -694,9 +715,11 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+     else:
+         runner._profile_deepseek_v4_attention(prepare)
+ 
+-    assert events[0] == ("init-kv", 1)
++    # The null block and one block per KV cache group of the model's spec.
++    assert group_calls == [(vllm_config, kv_cache_spec)]
++    assert events[0] == ("init-kv", 1 + len(groups))
+     if init_fails:
+-        assert events == [("init-kv", 1), "cleanup"]
++        assert events == [("init-kv", 1 + len(groups)), "cleanup"]
+     else:
+         assert events[1] == "prepare"
+         assert events[2] == (
+@@ -828,6 +851,7 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+         output_copy_stream=None,
+         check_ep_fault=False,
+         speculator=None,
++        sink=None,
+         num_speculative_steps=num_speculative_steps,
+         device=torch.device("cpu"),
+         postprocess_sampled=Mock(),
+-- 
+2.54.0 (Apple Git-157)
+
