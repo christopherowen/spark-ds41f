@@ -19,9 +19,14 @@ run on sp5–sp7, in window `spark-0013-1793667996`:
   census's per-step work, candidate-37's ranks budgeted differently from the first
   1,024 budgets on. Non-finite gate rows then appeared in both the target's and the
   drafter's forwards within 2,048 steps.
+- **Two reruns** (`shared-budget-diag3-sp`, `shared-budget-diag4-sp`):
+  - diag3 repeated diag2's picture, and its metadata census again kept only a
+    warm-up batch;
+  - diag4 died a minute into serving, with no census window completed.
 
-The NaN producer is not named yet (*The metadata census*). `lab-diag3.json` is
-queued. Not promoted; no recipe change.
+The NaN producer is not named (*The reruns*), and no further diagnosis is queued.
+Naming the kernel is a follow-up outside #860 (*Not verified*). Not promoted; no
+recipe change.
 
 This supersedes both earlier fixes, #856's host wait
 ([experiments/2026-11-02-copy-drafter-limit-sync](../2026-11-02-copy-drafter-limit-sync/))
@@ -158,10 +163,10 @@ say which forward, or which step, produced the first non-finite value. Nor does 
 divergence explain the plain repro, whose ranks agreed and which asserted only after
 8,192 budgets.
 
-The producer is not named yet. The metadata census's only record was startup's
-dummy batch, every row invalid by design, which it kept as its first hit. So it
-says nothing about real steps. `lab-diag3.json` (run `shared-budget-diag3-sp`, main
-`416393fe`) discards startup's hit and runs again, and may name the producer.
+The producer is not named. Two runs of the metadata census kept only a startup or
+warm-up batch as their first hit: every row of those is invalid by design. So it says
+nothing about real steps. A third run, with those batches ignored, died a minute in
+(*The reruns*).
 
 The patch's rationale, one rank-wide budget, stands as a design property. The repro
 shows it fixes #852 here, but not why.
@@ -487,9 +492,8 @@ the landed limits gave.
 
 The metadata census recorded one hit, at call 1. That was startup's dummy batch: 6,155
 rows, all invalid by design. The census keeps only its first hit, so it says nothing
-about real steps. Main `416393fe` fixes this (the first real step discards startup's
-hit) for run `shared-budget-diag3-sp`
-([lab-diag3.json](lab-diag3.json)), queued behind this one.
+about real steps. Main `416393fe` changed it for `shared-budget-diag3-sp` (*The
+reruns*): the first real step discards startup's hit.
 
 What follows from it:
 - **The census overlay shifts the race even at this cadence.** The ranks' CRCs
@@ -505,6 +509,72 @@ What follows from it:
   changed.
 - **The producer is not named.** Neither forward is singled out, and the metadata
   census saw no real step.
+
+### The reruns (`shared-budget-diag3-sp`, `shared-budget-diag4-sp`)
+
+These are the parent session's last two jobs in the window, each one boot of
+[arm-diag2-c37-m8-nodead.json](arm-diag2-c37-m8-nodead.json) with the census overlay
+at a later main. The receipts are on sp5:
+- `results/private/determinism/shared-budget-diag3-sp/` and
+  `…/shared-budget-diag4-sp/`, the latter with each step's engine logs;
+- the tables, `results/private/lab/shared-budget-diag3-sp-table.txt` and
+  `…-diag4-sp-table.txt`;
+- the queue log, `results/private/lab/queue-860.log`.
+
+The runs:
+- **diag3** ran at `416393fe` from 04:41 to 05:00Z. The first real step discards
+  startup's metadata hits.
+- **diag4** ran at `c26ed0a4` from 05:00 to 05:14Z. The metadata census ignores
+  batches whose rows are all invalid, and each rank logs a running CRC of its
+  budgeted steps' layouts every 1,024 steps.
+
+| | diag2 (above) | diag3 | diag4 |
+|---|---|---|---|
+| Copy probe, copy / edit tokens per step | 15.529 / 14.354 | 15.539 / 13.685 | 14.833 / **died** |
+| Copy / edit output tokens (other m=8 arms: 4,550 / 4,566) | 3,168 / 2,713 | 3,372 / 2,736 | 3,188 / 1,251 from 1 of 3 prompts |
+| Single-stream suite | 55.73 tok/s, CI95 3.1%, 0 failed | 55.73 tok/s, CI95 3.1%, 0 failed | engine dead |
+| 8 / 16 streams, tok/s | 148.22 ±1.1% / 155.82 ±0.4% | 148.97 ±0.6% / 153.92 ±0.1% | engine dead |
+| Ranks' counter CRCs | differ in 9/9, 10/10, 13/13 windows | differ in 9/9, 10/10, 14/14 windows | no window completed |
+| Metadata census's hit | call 1, startup's batch | call 225, a warm-up batch | none logged |
+
+**diag3.** It repeats diag2's picture.
+- **The ranks diverged** from the first 1,024 budgets on.
+  - After the suite: 62, 37 and 42 consequential reads on sp5, sp6 and sp7.
+  - After 16 streams: 911, 886 and 892, with 853, 860 and 858 narrower slots and
+    8,734, 8,797 and 8,780 dropped drafts.
+- **The metadata census's first hit was a warm-up batch:** call 225, request
+  `_warmup_greedy_`, builder 29, all 59 rows invalid. Again no real step was recorded.
+- **The first non-finite census read** (04:47:20Z, 2,048 steps in) flagged the same
+  routers on every rank as diag2's did:
+  - DSpark's `model.layers.40–42`, rows 0–4;
+  - the target's layers 20–39, rows 0–16;
+  - the target's layers 0 and 1, rows 0–16, and layer 2 from row 0.
+
+  The receipt's 400 lines end within layer 2 on all three ranks. The parent session
+  read these lines as the drafter's layer 40 alone; the layer names say otherwise,
+  as in diag2. The full container logs went with the boot.
+
+**diag4.** The engine died at 05:03:58Z, a minute after the cluster was ready
+(05:02:58Z).
+- **When:** during the copy probe's second edit prompt. The copy prompts and the
+  first edit prompt had completed; the remaining edit prompt and the three tool
+  prompts got HTTP 500 from the dead engine.
+- **The first silent rank was TP1 (sp6).** sp5 (TP0) and sp7 (TP2) both raised
+  `CUDA error: unspecified launch failure`, each with the collective's report:
+  "RoCE collective on rank 0 [rank 2] saw nothing from rank 1, HCA 0, for 10.000 s …
+  at sequence 115676; the GPU was stopped there". So rank 1 stopped answering a
+  collective about 05:03:48Z. sp6's log has no error at all, and its last line is
+  05:03:18Z.
+- **What the traceback shows.** It is sp5's and sp7's, in a target MoE layer of the
+  sequence-parallel prefill path: `model.py:452` (`sp_moe_inputs`), `route_local`,
+  `_census_rows` (`router.py:1092`). That is where those GPUs were when they were
+  stopped. It says nothing about which kernel failed, or how, on rank 1.
+- **Nothing else was logged:** no `nan or inf` assert or NONFINITE line on any rank,
+  and no COPY-LIMITS or layout CRC line. No census window of 1,024 steps completed.
+
+Whether diag4's instrumentation or the stale cap made rank 1 fail is undetermined.
+The 0676-reverted arm also died with a launch failure that followed a peer's
+collective timeout, but there the silent rank had asserted.
 
 ### Context: #856's and #859's runs on sp5–sp7
 
@@ -653,16 +723,24 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.js
   single boot, so its absence of a crash bounds a rate rather than proving zero.
 - **The cost's repeat:** candidate-37 had one boot of each kind in the cost run, so
   its side of the 8- and 16-stream comparison has no interval across boots.
-- **The NaN producer** is not named.
+- **The kernel that first produces the non-finite value inside a stale-cap step is
+  not named.**
   - Live placeholder rows and a stale read alone are ruled out (above).
   - Per-rank divergence coincided with early non-finite rows under the census's
     timing (*The metadata census*), but the plain repro crashed without it.
   - The parent session's lead, a live row whose metadata leaves it nothing to attend
-    to, is untested on real steps: diag2's metadata census kept only startup's dummy
-    batch. `lab-diag3.json` is queued.
+    to, is untested on real steps. Two metadata censuses kept only startup or warm-up
+    batches, and the third died a minute in (*The reruns*).
+  - A per-rank row census cannot see a cross-rank layout mismatch: each rank's rows
+    can be valid on their own while the ranks lay out different steps.
+  - Naming the kernel needs either a run with synchronized launches
+    (`CUDA_LAUNCH_BLOCKING=1` or compute-sanitizer), or a cross-rank comparison of
+    each step's layout. **Both are follow-ups outside #860.**
 
-  Until the producer is found, the minimal fix is known to avoid the crash on this
+  Until the kernel is named, the minimal fix is known to avoid the crash on this
   sequence, but not why.
+- **diag4's death:** whether its instrumentation or the stale cap caused it is
+  undetermined. Rank 1 went silent with no error logged.
 - **Divergence without instrumentation:** not measured. The census's work split the
   ranks' reads; whether ordinary host timing can do the same is open.
 - **The flagged layers past the receipt's 400-line cap,** and the later census
@@ -701,5 +779,9 @@ The diagnosis jobs since add three things:
   hardware, and non-finite gate rows appeared in both forwards within 2,048 steps.
 
 The shared budget rules that divergence out by design: its layouts do not read the
-limits, and its ranks' layout CRCs were equal in every window. The producer itself
-is not named; `lab-diag3.json` may name it.
+limits, and its ranks' layout CRCs were equal in every window.
+
+The kernel that first produces the non-finite value is not named. Two reruns did not
+name it: diag3 repeated diag2, and diag4 died a minute in. Naming it needs
+synchronized launches or a cross-rank comparison of each step's layout, both
+follow-ups outside #860.
