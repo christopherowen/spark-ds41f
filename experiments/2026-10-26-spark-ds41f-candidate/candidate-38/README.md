@@ -17,6 +17,61 @@ demonstrates the unequal-layout defect and a stale-receive-buffer corruption
 mechanism. Its last host preparation records do not prove which GPU forward
 produced the original NaN.
 
+## Loop containment
+
+The selected loop work is the server-side containment path in `0656`, `0674`
+and `0679`. These are successive changes to one implementation. Keep the tested
+candidate-38 source and its regression tests as the basis for qualification.
+
+| State | Action |
+| --- | --- |
+| Repetition inside reasoning | Force reasoning to end once through the existing thinking-budget path; stop if the end has not landed within 64 output tokens. |
+| Repetition after a reasoning-loop intervention | Stop the request with the repetition finish reason. |
+| Repetition in an otherwise healthy visible answer | Require sustained degeneration before stopping; retain the persistence and diversity checks that protect arrays, tables, repeated text and tool payloads. |
+
+The table describes default detection. Explicit `repetition_detection` settings
+retain their existing semantics, including the opt-out used for controlled
+comparisons. Detection reads committed output tokens and follows the reasoning
+parser's marker transitions. Keep the detection/intervention/completion receipts.
+A forced reasoning end is containment; successful task completion still needs
+its own assessment.
+
+Preserve the requested effort and existing alias semantics. The separate
+[`#862`](https://github.com/christopherowen/spark-ds41f/pull/862) proposal to map
+`max`/`ultra` to 85 is retired from the candidate plan. It was never included here.
+Its branch and experiment evidence remain historical records; neither an 85
+ceiling nor another client retry or rewrite is part of this containment path.
+
+The [two-boot reproduction](../../2026-11-03-candidate-38-reproduction/README.md#loop-result)
+shows seeded sustainment at efforts 100 and 75 with detection off, and containment
+with the default detector. The clean fixture's tokens are unchanged by the
+detector. This supports the containment behavior without establishing the cause
+of spontaneous onset or its absence in longer sessions.
+
+Remaining work is focused:
+
+1. Check the reported long-context canary in
+   [`#864`](https://github.com/christopherowen/spark-ds41f/issues/864) and a long
+   compacted tool session on this candidate, preserving exact requests, model
+   identity, sampling settings and detector receipts. The report's 83K-token
+   canary is from an older rc10 build; it is not a candidate-38 reproduction.
+   Separate onset, containment, and the usefulness of the resulting answer or
+   tool call. GPU runs still need an authorized window and a repeat boot.
+2. Keep the existing legitimate-repetition and marker-transition regressions,
+   plus the focused seeded/default/off/clean checks, when changing this path.
+   The answer safeguards address observed false positives and are not cleanup
+   candidates merely because the policy can be described simply.
+3. Complete the candidate's broader inference and release/performance gates
+   against the recorded release references. The diagnostic runs below are not
+   a no-regression performance verdict.
+
+The onset/root-cause question stays open under #864. Broader effort, precision,
+activation or DSpark sweeps are investigations to justify from a concrete
+reproduction, not additional fixes required by the containment design. Earlier
+experiments and unpublished work remain preserved; they are not deployment inputs.
+
+## Patch series
+
 Added patches (`0677..0687`). Each is the `git format-patch` commit its pull request made on
 `5b7cfa37f` (`0677..0681`, the candidate's changes) or on `753354cf4`, 0681's head
 (`0682..0687`, the release gate's test fixes), taken from the pull request's branch byte for
