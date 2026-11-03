@@ -71,6 +71,33 @@ candidate-37's with the name changed. `candidate-tp3.json`, `release-tp3.json` a
 build profile. Qualification is queued by the parent session; nothing here was started on a
 serving node.
 
+## Checks
+
+- `bin/spark --cluster-config <arm> doctor`: configuration OK for `tp3.json`, `tp3-dev.json`,
+  `tp3-copy.json`, `tp3-copy-dev.json` and `tp3-8192.json`. `tp4.json` and `image-dgx4.json`
+  report `cluster and upstream locks name different baselines`, as candidate-37's do: rc14's
+  ring recipe names spark-ds41f-1025 (the ring's last qualified baseline) and the lock is
+  generated from spark-ds41f-1030. Setting the ring arm's baseline to 1030 instead fails the
+  1030 recipe's `NCCL_IB_HCA` rule, so the arm stays as candidate-37's. The build does not read
+  this check.
+- `git diff --check`: clean, for the repository change and for the vLLM series (`5b7cfa37f` to
+  `753354cf4`).
+- The repository's unit suite (`python3 -m unittest discover -s tests -t .`): 626 tests OK,
+  5 skipped.
+- `scripts/release_tests.py check` for `19f2c20ed..753354cf4`: 197 selected test files, 135
+  gate, 62 excluded, 0 problems. It was not clean before: 22 files the series changes were
+  unclassified, all of them already at candidate-37's head (one, the loop detector's
+  `tests/v1/core/test_repetition_detection.py`, also changed by 0679). They are triaged in
+  `config/release-tests.json` from a run of the 21 inherited ones in candidate-37's image on
+  dgx4 (`c38-triage-probe`, 173 s): 15 join the gate (each passes there, or its tests needing
+  hub models skip offline), the Anthropic Messages conversion test joins the gate with its 8
+  `async def` tests deselected (the image has no pytest-asyncio or anyio, so pytest fails them
+  unrun), and 7 are excluded for the environment: three import a module the image does not
+  install (`multiprocess`, `pytest_asyncio`, `scipy`), four have every test skip for a Hugging
+  Face download.
+- `scripts/release_tests.py gate`: 136 gate files, 12 deselected tests
+  (`release-tests-gate-manifest.json`); the bundle is `bundles/release-tests`.
+
 ## Image
 
 Built on dgx4 from this commit (`bin/spark --cluster-config
