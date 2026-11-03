@@ -14,6 +14,25 @@ from servebench import behaviour, suite  # noqa: E402
 from servebench.__main__ import compare_results, read_json  # noqa: E402
 from scripts.servebench_suite_table import AA_FLOOR_PCT  # noqa: E402
 
+TAIL_WORKLOAD = "f9a52375d956692f7ad71bd678b312cbebdcac17"
+
+
+def compare_prefix(reference, candidate, judge):
+    """Compare unchanged native prefix steps individually; leave the reference intact."""
+    base, selected = load(reference / "suite.json"), load(candidate / "suite.json")
+    require(selected["suite"]["steps"] == base["suite"]["steps"][:4], "confirmation is not the unchanged release prefix")
+    require([s["id"] for s in selected["steps"]] == [s["id"] for s in base["steps"][:4]], "confirmation prefix IDs differ")
+    steps = {}
+    for b, c in zip(base["steps"], selected["steps"]):
+        require(b["exit"] == c["exit"] == 0, "prefix contains a failed step")
+        paths = reference / b["output"], candidate / c["output"]
+        if not all(p.is_file() for p in paths):
+            require(b["id"] == "model" and not paths[0].exists() and paths[1].is_file(), "unexpected missing prefix output")
+            steps[b["id"]] = {"skipped": "released model text is not retained"}
+        else:
+            steps[b["id"]] = judge(*(read_json(str(p)) for p in paths))
+    return {"suite": selected["suite"]["name"], "subset_of_reference": base["suite"]["name"], "steps": steps}
+
 
 def audit(snapshot):
     receipt = load(snapshot / "receipt.json")
@@ -27,10 +46,12 @@ def audit(snapshot):
         data = path.read_bytes()
         require(len(data) == item["size"] and sha(data) == item["sha256"], f"artifact hash differs: {name}")
     phase = receipt["phase"]
-    require(phase in ("release-default", "release-copy"), "not a performance phase")
-    spec_path = Path(__file__).parent / (phase + ".json")
+    require(phase in ("release-default", "release-copy", "c4-tail"), "not a performance phase")
+    tail = phase == "c4-tail"
+    workload_commit = TAIL_WORKLOAD if tail else PIN
+    spec_path = Path(__file__).parent / ("c4-tail-confirmation.json" if tail else phase + ".json")
     relative = str(spec_path.relative_to(ROOT))
-    tested_spec = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{PIN}:{relative}"])
+    tested_spec = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{workload_commit}:{relative}"])
     require(tested_spec == spec_path.read_bytes(), "spec differs from tested commit")
     spec = load(spec_path)
     require(receipt["run"] == spec["run"], "run identity differs")
@@ -38,18 +59,28 @@ def audit(snapshot):
     command = load(raw / "control" / (phase + ".command.json"))
     result = load(raw / "control" / (phase + ".result.json"))
     require(command["deployment_commit"] == result["deployment_commit"] == PIN and result["exit_code"] == 0, "phase failed or source differs")
-    require(command["argv"] == result["argv"] and relative in command["argv"], "phase command differs")
+    expected_argument = str(Path(job["suite"]).with_name(spec_path.name)) if tail else relative
+    require(command["argv"] == result["argv"] and expected_argument in command["argv"], "phase command differs")
     require(sha((raw / "control" / (phase + ".log")).read_bytes()) == result["log_sha256"], "phase log differs")
+    if tail:
+        require(command["workload_commit"] == result["workload_commit"] == TAIL_WORKLOAD, "confirmation workload source differs")
+        require((raw / "control" / spec_path.name).read_bytes() == tested_spec, "exported confirmation plan differs")
+        suite_path = spec_path.with_name("c4-tail-suite.json")
+        tested_suite = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{TAIL_WORKLOAD}:{suite_path.relative_to(ROOT)}"])
+        require((raw / "control/c4-tail-suite.json").read_bytes() == suite_path.read_bytes() == tested_suite, "exported confirmation suite differs")
+        require(command["workload_sha256"] == result["workload_sha256"] == {spec_path.name: sha(tested_spec), suite_path.name: sha(tested_suite)}, "confirmation workload hashes differ")
+        require(sha((raw / "control/tail_runner.py").read_bytes()) == command["runner_sha256"] == result["runner_sha256"], "confirmation runner differs")
+    names = ["tp3-c4-tail-confirmation"] if tail else job["suite"]
     boots, directories, identities = [], {}, []
     for arm in job["arms"]:
         label = arm["label"]
         observations, started = {}, None
-        for number, name in enumerate(job["suite"]):
+        for number, name in enumerate(names):
             suffix = "" if number == 0 else "-" + name
             directory = raw / "results/private/suites" / (spec["run"] + suffix) / label
             directories[label, name] = directory
             index = load(directory / "suite.json")
-            definition = suite.load(name)
+            definition = load(raw / "control/c4-tail-suite.json") if tail else suite.load(name)
             require(index["suite"] == definition and index["suite_sha256"] == suite.digest(definition), f"suite definition differs: {label}/{name}")
             require(index.get("finished_utc") and len(index["steps"]) == len(definition["steps"]), f"incomplete suite: {label}/{name}")
             require([(s["id"], s["command"], s["exit"]) for s in index["steps"]] == [(s["id"], s["command"], 0) for s in definition["steps"]], f"failed or different ordered steps: {label}/{name}")
@@ -134,15 +165,15 @@ def audit(snapshot):
     comparisons, references = {}, {}
     first, repeat = [arm["label"] for arm in job["arms"]]
     judge = lambda a, b: compare_results(a, b, 3.0)
-    for number, name in enumerate(job["suite"]):
-        reference = ROOT / (job["reference"] + ("-" + name if number else ""))
+    for number, name in enumerate(names):
+        reference = ROOT / ((job.get("reference") or "manifests/suites/2026-10-30-spark-ds41f-1030-tp3") + ("-" + name if number else ""))
         references[name] = {str(p.relative_to(ROOT)): sha(p.read_bytes()) for p in reference.iterdir() if p.is_file()}
         for relative, digest in references[name].items():
             require(sha(subprocess.check_output(["git", "-C", str(ROOT), "show", f"{PIN}:{relative}"])) == digest, f"reference changed since test publication: {relative}")
         a, b = directories[first, name], directories[repeat, name]
-        changes = suite.compare(read_json, str(reference), str(a), judge)
+        changes = compare_prefix(reference, a, judge) if tail else suite.compare(read_json, str(reference), str(a), judge)
         aa = suite.compare(read_json, str(a), str(b), judge)
-        repeated = suite.compare(read_json, str(reference), str(b), judge)
+        repeated = compare_prefix(reference, b, judge) if tail else suite.compare(read_json, str(reference), str(b), judge)
         comparisons[name] = {"reference_to_boot1": changes, "reference_to_boot2": repeated, "boot1_to_boot2": aa, "headlines": suite.with_floor(changes, aa, floors=AA_FLOOR_PCT, reference_to_repeat=repeated)}
     adverse = [{"suite": name, **row} for name, comparison in comparisons.items() for row in comparison["headlines"] if row["verdict"] == "worse"]
     adverse_rows = []
@@ -151,7 +182,21 @@ def audit(snapshot):
             for step, outcome in comparison[arm]["steps"].items():
                 if "skipped" not in outcome:
                     adverse_rows.extend({"suite": name, "comparison": arm, "step": step, **row} for row in outcome[1].get("rows", []) if row["verdict"].startswith("worse"))
-    return {"phase": phase, "evidence_passed": True, "verified_files": len(files), "deployment_commit": PIN, "tested_spec_sha256": sha(tested_spec), "image_id": IMAGE, "boots": boots, "identities": identities, "reference_files": references, "comparisons": comparisons, "adverse_headline_verdicts": adverse, "adverse_comparison_rows": adverse_rows, "limitations": ["The release reference omits model text; candidate repeat comparisons retain it privately.", "524K and 1M reference prompts differ in actual token counts; retain the comparison warnings.", "The extended reference's outer prefill duration is stale; compare per-size samples.", "The standalone 524K/1M reference extension lacks its own all-rank deployment identity and conditions.", "Performance suites record deployment identity at suite entry, not a per-step rank-layout CRC."]}
+    return {
+        "phase": phase, "evidence_passed": True, "verified_files": len(files),
+        "deployment_commit": PIN, "workload_commit": workload_commit,
+        "tested_spec_sha256": sha(tested_spec), "image_id": IMAGE,
+        "boots": boots, "identities": identities, "reference_files": references,
+        "comparisons": comparisons, "adverse_headline_verdicts": adverse,
+        "adverse_comparison_rows": adverse_rows,
+        "limitations": [
+            "The release reference omits model text; candidate repeat comparisons retain it privately.",
+            "524K and 1M reference prompts differ in actual token counts; retain the comparison warnings.",
+            "The extended reference's outer prefill duration is stale; compare per-size samples.",
+            "The standalone 524K/1M reference extension lacks its own all-rank deployment identity and conditions.",
+            "Performance suites record deployment identity at suite entry, not a per-step rank-layout CRC.",
+        ],
+    }
 
 
 def main():
