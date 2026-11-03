@@ -24,9 +24,10 @@ run on sp5–sp7, in window `spark-0013-1793667996`:
     warm-up batch;
   - diag4 died a minute into serving, with no census window completed.
 
-The NaN producer is not named (*The reruns*), and no further diagnosis is queued.
-Naming the kernel is a follow-up outside #860 (*Not verified*). Not promoted; no
-recipe change.
+The NaN producer is not named (*The reruns*). One more diagnosis is prepared and not
+run: a per-step record of every rank's layout that outlives the engine (*The layout
+ring*), to compare the ranks at the steps before the assert, which the counter's
+windows never reached. Not promoted; no recipe change.
 
 This supersedes both earlier fixes, #856's host wait
 ([experiments/2026-11-02-copy-drafter-limit-sync](../2026-11-02-copy-drafter-limit-sync/))
@@ -576,6 +577,83 @@ Whether diag4's instrumentation or the stale cap made rank 1 fail is undetermine
 The 0676-reverted arm also died with a launch failure that followed a peer's
 collective timeout, but there the silent rank had asserted.
 
+### The layout ring (`shared-budget-ring-sp`, prepared)
+
+Owner, 2026-11-03: "Keep digging." This job is prepared, dry-run and checked, and not
+run: it needs a window on sp5–sp7.
+
+**The gap it closes.** The repro's claim that candidate-37's ranks agreed rests on the
+counter's windows, and the last window closed before the crash:
+- the ranks' `COPY-LIMITS reads=8192` lines are at 01:15:05Z on sp5, sp6 and sp7, with
+  equal CRCs;
+- the asserts are at 01:15:39Z, 34 s and several hundred budgets later, and nothing of
+  those budgets was logged;
+- the 0676-reverted arm is the same: equal CRCs at 3,072 reads, the assert before
+  4,096.
+
+So a divergence in the last steps before each crash is unrecorded, not ruled out. Two
+more readings of the receipts fit a per-rank divergence and are not shown by them:
+- In both crashes, TP0 and TP2 asserted and TP1 did not. `route_partials` sums a
+  gate's split-K partials `P[shard, row]` across the shards and checks the sum once a
+  row; a row its routing mask marks as padding returns before the check. A row that is
+  live on two ranks and padding on the third is checked on the two.
+- Without 0676, an inactive row's attention is computed on nothing. With it, its
+  output is 0. Rows that other ranks hold live would sum a non-finite partial without
+  0676 and a wrong finite one with it. That fits the reverted arm asserting sooner.
+
+Both are readings. The ring is the measurement.
+
+**What it records.** [overlay/layout-ring](overlay/layout-ring/)'s `model_runner.py`
+is candidate-37's runner with one call in `prepare_inputs`, after the batch is
+compacted and before the query starts are built. Each rank writes one 40-byte record a
+prepared step to `/cache/spark-ds41f/layout-ring/rank<r>.bin` on its node (the
+checkout's `cache/`, which the profile mounts read-write), with `os.pwrite`: no
+buffering, no device sync, a few microseconds. The fields:
+- the step, the token count and the padded count the dispatch chose, the request
+  count;
+- CRCs of the compacted per-request token counts, of the scheduler's drafts per
+  request and of the budget's eligible drafts per request;
+- the draft budget;
+- the counter's cumulative budget reads and stale reads, which tie a record to the
+  `COPY-LIMITS` windows.
+
+The step index is rank-invariant: every rank prepares the same scheduler outputs.
+The files outlive the engine, so [layout_ring_logs.py](layout_ring_logs.py) reads
+them after the crash as after a clean workload: one line a node, and one line that
+compares the ranks at equal steps, with the steps whose layouts differ (by field), the
+first with its neighbours, each rank's last records, and the steps whose stale-read
+counts differ.
+
+**The arm and the spec.**
+- [arm-ring-c37-m8-nodead.json](arm-ring-c37-m8-nodead.json) is the repro's
+  `arm-c37-m8-nodead` (candidate-37, m=8, dead rows off, the stale-read counter) plus
+  the ring's `model_runner.py`. No census, no device sync: the repro's timing, a
+  `pwrite` a step apart.
+- [lab-ring.json](lab-ring.json), run `shared-budget-ring-sp`: the repro's sequence,
+  one boot, with the ring read after the suite and after each streams step. Dry-runs
+  clean with the window's profile, and `bin/spark --cluster-config
+  arm-ring-c37-m8-nodead.json doctor` reports configuration OK.
+- [layout_ring_check.py](layout_ring_check.py), in candidate-37's image on sp8 with
+  the overlay mounted: 9 records of 40 bytes, equal sequences give equal records, one
+  changed eligible count changes only its CRC, a step without drafts records no budget,
+  and the counter's reads accumulate (`LAYOUT-RING /tmp/.../rank2.bin | layout ring
+  OK`).
+- [tables_arms.py](tables_arms.py) prints the comparison beside the counter's.
+
+**Outcomes, written before the run.**
+- The ranks' records differ at steps before the assert, with the counter's stale-read
+  counts differing there: the per-rank stale read laid out different steps, and the
+  crash follows the divergence. Which field differs says how: `padded` means the
+  ranks ran different graphs, so their collectives disagreed in size; `eligible_crc`
+  or `tokens` alone means equal sizes and rows that hold different tokens, summed
+  across the shards. Then the first non-finite value is made where the ranks' rows
+  are first combined, and the kernel question becomes which combine that is.
+- The ranks' records are equal through the last common step, and the assert follows
+  anyway: the producer is on one rank, and the metadata census (*The metadata
+  census*), with its warm-up problem fixed, is the next instrument.
+- The engine does not crash: the pwrite shifted the timing. The ring still says
+  whether the ranks diverged without a census's work.
+
 ### Context: #856's and #859's runs on sp5–sp7
 
 These are not this experiment's runs. The figures come from their receipts on sp5
@@ -659,6 +737,11 @@ use host-only diagnostics.
     1's, and nothing else.
   - [arm-c37-m16.json](arm-c37-m16.json) mounts nothing.
 
+- [lab-ring.json](lab-ring.json), run `shared-budget-ring-sp` (*The layout ring*): the
+  repro's sequence on [arm-ring-c37-m8-nodead.json](arm-ring-c37-m8-nodead.json), one
+  boot, with [layout_ring_logs.py](layout_ring_logs.py) after the suite and after each
+  streams step. It dry-runs clean with the same profile. Not run.
+
 **Acceptance criteria**, set before running, with where each stands:
 - the minimal arm passes the repro with no assert or non-finite gate row, and its
   ranks' CRCs agree in every window: **met** (one boot);
@@ -706,6 +789,9 @@ installed copy, is imported:
 docker run --rm --gpus all -v $PWD:/x:ro \
   -v $PWD/overlay/minimal-crc/vllm/v1/worker/gpu/model_runner.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py:ro \
   -w /opt/spark-ds41f/candidate/vllm --entrypoint python3 spark-ds41f:candidate-37 /x/layout_census_check.py
+docker run --rm --gpus all -v $PWD:/x:ro \
+  -v $PWD/overlay/layout-ring/vllm/v1/worker/gpu/model_runner.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py:ro \
+  -w /opt/spark-ds41f/candidate/vllm --entrypoint python3 spark-ds41f:candidate-37 /x/layout_ring_check.py
 ```
 
 The dry runs:
@@ -714,6 +800,8 @@ The dry runs:
 scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-repro.json \
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
 scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.json \
+  --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-ring.json \
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
 ```
 
@@ -735,7 +823,12 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.js
     can be valid on their own while the ranks lay out different steps.
   - Naming the kernel needs either a run with synchronized launches
     (`CUDA_LAUNCH_BLOCKING=1` or compute-sanitizer), or a cross-rank comparison of
-    each step's layout. **Both are follow-ups outside #860.**
+    each step's layout. The comparison is prepared and not run (*The layout ring*:
+    `lab-ring.json`, one boot in a sp5–sp7 window); the synchronized-launch run is a
+    follow-up outside #860.
+  - The repro's "ranks agreed" holds through 8,192 budgets, the last counter window
+    before the assert, and the reverted arm's through 3,072. The steps between are
+    unrecorded (*The layout ring*).
 
   Until the kernel is named, the minimal fix is known to avoid the crash on this
   sequence, but not why.
@@ -782,6 +875,7 @@ The shared budget rules that divergence out by design: its layouts do not read t
 limits, and its ranks' layout CRCs were equal in every window.
 
 The kernel that first produces the non-finite value is not named. Two reruns did not
-name it: diag3 repeated diag2, and diag4 died a minute in. Naming it needs
-synchronized launches or a cross-rank comparison of each step's layout, both
-follow-ups outside #860.
+name it: diag3 repeated diag2, and diag4 died a minute in. The cross-rank comparison
+of each step's layout is prepared as the layout ring and waits for a window; the
+repro's "ranks agreed" is evidenced only to its last counter window, 34 s before the
+assert. A run with synchronized launches remains a follow-up outside #860.
