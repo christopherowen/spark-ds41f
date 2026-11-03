@@ -1,0 +1,110 @@
+From 826073855de13469968128aa94ae7ee0787e0230 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopher@owen.dev>
+Date: Tue, 3 Nov 2026 08:47:53 +0100
+Subject: [PATCH] feat(dsv41): serve max and ultra effort aliases at 85
+
+The max and ultra reasoning-effort aliases now render the Reasoning
+Effort: 85 prefix instead of 100. At 100 the 1017 checkpoint's exhaustive-
+restatement regime becomes a self-sustaining repetition attractor
+(experiments/2026-11-03-loop-onset: identical tasks reason 5-13x longer at
+100 and restate instead of concluding), so the named maximum is lowered at
+the request boundary rather than refused. Explicit integer efforts are
+served exactly as requested; low/high/xhigh/minimal/medium, thinking on/off,
+and invalid-effort rejection are unchanged, and the encoder still renders
+any budget it is given.
+
+Upstream base: candidate-37 series head 5b7cfa37fe. Local deployment policy,
+not submitted upstream.
+---
+ tests/tokenizers_/test_deepseek_v41.py | 26 +++++++++++++++++++++-----
+ vllm/tokenizers/deepseek_v41.py        |  9 +++++++++
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 8cb8ef7571..42f089b7e9 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -62,12 +62,14 @@ def test_reference_encoder_fixtures(case_id):
+         ("low", 50),
+         ("high", 75),
+         ("xhigh", 75),
+-        ("max", 100),
++        ("max", 85),
+         ("minimal", 50),
+         ("medium", 75),
+-        ("ultra", 100),
++        ("ultra", 85),
+         (1, 1),
+         (42, 42),
++        (85, 85),
++        (86, 86),
+         (100, 100),
+     ],
+ )
+@@ -82,6 +84,20 @@ def test_numeric_reasoning_effort(effort, budget):
+     )
+ 
+ 
++def test_max_and_ultra_aliases_serve_the_deployment_ceiling():
++    """The named maximums render the deployment ceiling budget instead of 100,
++    so a client asking for maximum thoroughness cannot re-enter the repetition
++    regime the ceiling exists to avoid. Explicit integers are served as
++    requested."""
++    for effort in ("max", "ultra"):
++        assert "Reasoning Effort: 85 " in render(
++            [{"role": "user", "content": "question"}], reasoning_effort=effort
++        )
++    assert "Reasoning Effort: 100 " in render(
++        [{"role": "user", "content": "question"}], reasoning_effort=100
++    )
++
++
+ @pytest.mark.parametrize("effort", ["auto", "Medium", -1, 0, 101, True, 1.5, []])
+ def test_invalid_effort_is_a_request_error(effort):
+     with pytest.raises(ValueError, match="reasoning_effort"):
+@@ -89,12 +105,12 @@ def test_invalid_effort_is_a_request_error(effort):
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("effort", "budget"), [("minimal", 50), ("medium", 75), ("ultra", 100)]
++    ("effort", "budget"), [("minimal", 50), ("medium", 75), ("ultra", 85)]
+ )
+ def test_api_effort_aliases_render_the_api_budgets(effort, budget):
+     """The DeepSeek API's aliases, as an OpenAI-style client sends them, render
+-    the budget of the name they alias (minimal as low, medium as high, ultra as
+-    max) and turn thinking on."""
++    the budget of the name they alias (minimal as low, medium as high, ultra
++    capped to the deployment ceiling) and turn thinking on."""
+     request = ChatCompletionRequest(
+         model="deepseek-ai/DeepSeek-V4.1-Flash",
+         messages=[{"role": "user", "content": "question"}],
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index ff12f72151..9d4db1620d 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -27,6 +27,13 @@ from .protocol import TokenizerLike
+ # Keys whose values are protocol identifiers, never rendered request text.
+ _PROTOCOL_KEYS = frozenset({"role", "type"})
+ 
++# Deployment policy: the budget the max/ultra aliases serve. At 100 the 1017
++# checkpoint's exhaustive-restatement regime becomes a self-sustaining
++# repetition attractor (experiments/2026-11-03-loop-onset), so the named
++# maximum is lowered here rather than refused. Explicit integers are served
++# as requested.
++REASONING_EFFORT_ALIAS_CEILING = 85
++
+ 
+ class _ControlSpellings:
+     """Keeps control-token spellings written in request text out of the vocabulary.
+@@ -366,6 +373,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                     "high, xhigh, max, ultra, or an integer within [1, 100] in "
+                     "chat_template_kwargs"
+                 )
++            if effort in ("max", "ultra"):
++                effort = REASONING_EFFORT_ALIAS_CEILING
+ 
+             add_generation_prompt = kwargs.get("add_generation_prompt")
+             continue_final_message = bool(kwargs.get("continue_final_message"))
+-- 
+2.54.0 (Apple Git-157)
+

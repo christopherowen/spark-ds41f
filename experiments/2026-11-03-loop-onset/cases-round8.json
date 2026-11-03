@@ -1,0 +1,920 @@
+[
+ {
+  "name": "samp-100-seed0",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 100
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 0
+  }
+ },
+ {
+  "name": "samp-100-seed1",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 100
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 1
+  }
+ },
+ {
+  "name": "samp-100-seed2",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 100
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 2
+  }
+ },
+ {
+  "name": "samp-75-seed0",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 75
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 0
+  }
+ },
+ {
+  "name": "samp-75-seed1",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 75
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 1
+  }
+ },
+ {
+  "name": "samp-75-seed2",
+  "path": "/v1/chat/completions",
+  "body": {
+   "model": "deepseek-v4.1-flash",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+    },
+    {
+     "role": "user",
+     "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+    },
+    {
+     "role": "user",
+     "content": "Please re-verify that conclusion carefully before we file it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 1: check the artifact line, then each commit mapping, then the reporter. Reading the artifact line again first.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "read_artifact",
+        "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "job 552 line 23 (unchanged): head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 1: the artifact line confirms reporter dana, head crash fix a41f, ring restore coverage bg_92. Conclusion unchanged."
+    },
+    {
+     "role": "user",
+     "content": "Once more, with extra care - audit every item individually."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Re-verification round 2, item by item: item 1 the artifact line, item 2 the a41f mapping, item 3 the bg_92 coverage, item 4 the reporter. Checking each in turn.",
+     "tool_calls": [
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "gh_api",
+        "arguments": "{\"path\": \"commits/a41f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_3",
+     "content": "commit a41f: 'Fix head crash in restore_ring teardown'; author: dana; reviewed-by: mira; refs job 552"
+    },
+    {
+     "role": "assistant",
+     "content": "Re-verified round 2 item 1: a41f fixes the head crash, authored by dana. Items 2-4 remain as confirmed in round 1. Conclusion unchanged: a41f head crash fix, bg_92 ring restore coverage, reporter dana."
+    },
+    {
+     "role": "user",
+     "content": "Final audit round. You have already checked every item three times and every fact is confirmed in the transcript above. Do NOT call any tools this time - reason it through internally. Go over every step once more at maximum thoroughness, one item at a time, and do not stop until every single step has been re-confirmed internally. Only then state the final conclusion."
+    }
+   ],
+   "temperature": 1.0,
+   "max_tokens": 6000,
+   "return_token_ids": true,
+   "logprobs": true,
+   "top_logprobs": 5,
+   "repetition_detection": {
+    "max_pattern_size": 0,
+    "min_pattern_size": 0,
+    "min_count": 0
+   },
+   "chat_template_kwargs": {
+    "thinking": true,
+    "reasoning_effort": 75
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_artifact",
+      "description": "Read lines of a CI job artifact",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "job": {
+         "type": "string"
+        },
+        "lines": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "gh_api",
+      "description": "Query the repository API for pulls, commits or comments",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cache_salt": "e7290091902f4ed2947a55ab28ef2632",
+   "top_p": 1.0,
+   "seed": 2
+  }
+ }
+]

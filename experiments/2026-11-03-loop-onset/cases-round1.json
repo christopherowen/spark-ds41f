@@ -1,0 +1,232 @@
+[
+  {
+    "name": "plain-100",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "deepseek-v4.1-flash",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A warehouse has three conveyor lines A, B, C fed by one shared sorter. The sorter runs a fixed cycle: it serves A, then B, then C, then repeats. Serving a line takes 4 minutes, except every third time it serves B it takes 7 minutes due to a mandatory clean. Line A receives 120 crates/hour, line B 90, line C 60; each line's buffer holds 40 crates and overflows if the backlog exceeds that while the line is waiting. A shift starts at 08:00 with all buffers empty and the sorter starting its cycle at A. Work out exactly, minute by minute if needed, whether any buffer overflows before 10:00, and if so which line first and at what time. Reason at full thoroughness before answering; verify each accumulation step."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 6000,
+      "return_token_ids": true,
+      "logprobs": true,
+      "top_logprobs": 5,
+      "repetition_detection": {
+        "max_pattern_size": 0,
+        "min_pattern_size": 0,
+        "min_count": 0
+      },
+      "chat_template_kwargs": {
+        "thinking": true,
+        "reasoning_effort": 100
+      }
+    }
+  },
+  {
+    "name": "plain-75",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "deepseek-v4.1-flash",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A warehouse has three conveyor lines A, B, C fed by one shared sorter. The sorter runs a fixed cycle: it serves A, then B, then C, then repeats. Serving a line takes 4 minutes, except every third time it serves B it takes 7 minutes due to a mandatory clean. Line A receives 120 crates/hour, line B 90, line C 60; each line's buffer holds 40 crates and overflows if the backlog exceeds that while the line is waiting. A shift starts at 08:00 with all buffers empty and the sorter starting its cycle at A. Work out exactly, minute by minute if needed, whether any buffer overflows before 10:00, and if so which line first and at what time. Reason at full thoroughness before answering; verify each accumulation step."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 6000,
+      "return_token_ids": true,
+      "logprobs": true,
+      "top_logprobs": 5,
+      "repetition_detection": {
+        "max_pattern_size": 0,
+        "min_pattern_size": 0,
+        "min_count": 0
+      },
+      "chat_template_kwargs": {
+        "thinking": true,
+        "reasoning_effort": 75
+      }
+    }
+  },
+  {
+    "name": "verify-100",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "deepseek-v4.1-flash",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+        },
+        {
+          "role": "user",
+          "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first, then the PR list.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "read_artifact",
+                "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+        },
+        {
+          "role": "assistant",
+          "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+        },
+        {
+          "role": "user",
+          "content": "Before I close the ticket, re-verify every step of that conclusion at maximum thoroughness. Check the artifact line, the commit mapping and the reporter again, one item at a time, and do not stop until every step has been verified."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_artifact",
+            "description": "Read lines of a CI job artifact",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "job": {"type": "string"},
+                "lines": {"type": "string"}
+              }
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "gh_api",
+            "description": "Query the repository API for pulls, commits or comments",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string"}
+              }
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 6000,
+      "return_token_ids": true,
+      "logprobs": true,
+      "top_logprobs": 5,
+      "repetition_detection": {
+        "max_pattern_size": 0,
+        "min_pattern_size": 0,
+        "min_count": 0
+      },
+      "chat_template_kwargs": {
+        "thinking": true,
+        "reasoning_effort": 100
+      }
+    }
+  },
+  {
+    "name": "verify-75",
+    "path": "/v1/chat/completions",
+    "body": {
+      "model": "deepseek-v4.1-flash",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful release-verification agent. Use the tools when you need facts; never guess."
+        },
+        {
+          "role": "user",
+          "content": "The nightly verify job failed on spark-ds41f. Find out which commit fixed the head crash, whether the ring restore path is covered, and who reported the crash."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning": "The nightly log points at job 552. I need the crash line, then the fix commit and the ring restore coverage. Let me read the artifact first, then the PR list.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "read_artifact",
+                "arguments": "{\"job\": \"552\", \"lines\": \"23-23\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "job 552 line 23: head crash in restore_ring() at bg_92 teardown; reporter: dana; fix candidates: a41f (head crash), bg_92 (ring restore)"
+        },
+        {
+          "role": "assistant",
+          "content": "The head crash was fixed by commit a41f, the ring restore path is covered by bg_92, and the crash was reported by dana."
+        },
+        {
+          "role": "user",
+          "content": "Before I close the ticket, re-verify every step of that conclusion at maximum thoroughness. Check the artifact line, the commit mapping and the reporter again, one item at a time, and do not stop until every step has been verified."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_artifact",
+            "description": "Read lines of a CI job artifact",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "job": {"type": "string"},
+                "lines": {"type": "string"}
+              }
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "gh_api",
+            "description": "Query the repository API for pulls, commits or comments",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string"}
+              }
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 6000,
+      "return_token_ids": true,
+      "logprobs": true,
+      "top_logprobs": 5,
+      "repetition_detection": {
+        "max_pattern_size": 0,
+        "min_pattern_size": 0,
+        "min_count": 0
+      },
+      "chat_template_kwargs": {
+        "thinking": true,
+        "reasoning_effort": 75
+      }
+    }
+  }
+]
