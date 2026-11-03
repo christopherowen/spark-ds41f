@@ -160,8 +160,8 @@ exited on truncated input. Both transfers then completed successfully; a separat
 comparison and the complete archive audit passed. Its failed collection-attempt
 receipt is retained with the controls; it was not a failed GPU measurement.
 
-The focused confirmation is running; CopyDrafter's two performance boots remain
-pending. No recipe, lock or published baseline has been promoted or rewritten.
+The focused confirmation is complete; CopyDrafter's two performance boots are
+running. No recipe, lock or published baseline has been promoted or rewritten.
 
 The standard repeat's C4 TTFT p99 is 322.96 ms against the reference's
 310.59 ms (+3.98%, a direction-only flag without an interval); the first boot
@@ -203,6 +203,64 @@ then exported byte-for-byte to the named private control path; the runtime
 checkouts remain clean at `cb657ab1`, and the runner records the separate
 workload commit and file hashes. The additional phase keeps the window open;
 the original final CopyDrafter phase still restores candidate 36.
+
+Both focused boots completed all four steps successfully, with the exact
+published prefix workload and unchanged runtime source/image. C4 p99 is
+314.90/324.10 ms (+1.39%/+4.35% against the frozen reference); the second
+confirmation repeats the adverse direction. Paired median TTFT improves
+2.87%/3.10%, and paired C4 decode improves 3.93%/4.09%. This retains a
+tail-latency concern without establishing a candidate-specific regression:
+the archived released repeat is 322.91 ms, and neither p99 comparison supplies
+an interval. Do not substitute that repeat as the reference or erase the flag.
+The [native confirmation records](runs/2026-11-03-dgx1-3/performance-c4-tail/)
+include both runs. Startup minima are 7.067/10.241/10.161 GiB and
+7.495/10.149/10.250 GiB; runtime minima are 7.64/10.53/10.53 GiB and
+7.95/10.90/10.77 GiB. Neither run halted, grew swap, recorded thermal
+slowdown or failed to restore its fan state.
+
+The two original released model files were recovered from the recorded 1030
+TP3 runs during the idle gap, without sending inference requests. Their source
+sizes, timestamps and hashes were stable during transfer; the archived suite
+identity names the released image on all three ranks. The
+[historical model comparison](runs/2026-11-03-dgx1-3/historical-model-comparison-standard-tail/)
+checks the same prompt and scored-output contexts against each released boot.
+All four standard/confirmation model runs match both released records:
+256/256 greedy outputs, no finish-reason changes, identical selected-token
+probabilities and recorded top-20 distributions over 65,536 positions (KL zero).
+Every selected and top-20 log probability is finite. The complete model corpora
+remain private; the executed comparison source, summaries and hash receipts are
+published. This supplements the immutable main analysis, whose release-reference
+limitation refers to the published reference's omitted model text.
+
+The [previous-candidate comparison](runs/2026-11-03-dgx1-3/previous-candidates/)
+uses the archived candidate-36 and candidate-37 standard runs from November 1,
+including the same three full suite definitions despite their `screen-tp3` run
+names. Every recorded step exited zero, all ranks name one image per candidate,
+the clients were clean, and conditions show no halt, swap growth or thermal
+slowdown. Their client `servebench` sources are identical to the current ones.
+Each prior candidate has only one recorded boot here; these are supplementary
+comparisons, not repeat-boot qualification of those candidates or their copy path.
+
+| Metric | Change vs candidate 37 | Change vs candidate 36 |
+| --- | ---: | ---: |
+| Fixed-row grid step time | −0.01% | −3.57% |
+| Greedy paired decode C8 / C4 / C1 | −0.16% / +0.09% / +0.04% | +0.44% / +0.40% / −0.06% |
+| Sampled paired decode C16 / C8 / C1 | +0.50% / +0.51% / −0.00% | +0.04% / +0.96% / −0.04% |
+| Prefill 32K / 131K / 262K / 524K / 1M, first boot | −0.21% / −0.01% / −0.00% / +0.07% / +0.07% | −0.91% / −0.83% / −0.64% / −0.65% / −0.55% |
+| 131K prefill beside 3 streams, first boot | −0.14% | −1.41% |
+
+The normal throughput headlines are all `same` versus candidate 37. Versus
+candidate 36, the table flags first-boot prefill at 32K, 131K and 524K, and
+131K prefill beside three streams; the repeat has the same direction at these
+points. Candidate 37 is already essentially level with candidate 38 on them.
+Individual adverse grid/latency rows remain in the complete comparison:
+candidate 37's C4 p99 is 297.24 ms, so the main candidate-38 boots are
+6.50%/8.65% higher; paired C4 median TTFT is 1.09%/1.87% higher, with the
+repeat crossing its within-run interval. The C36 comparison also flags some
+individual grid shapes and first-boot short-request latency during prefill.
+The aggregate grid or decode headline does not erase those observations.
+The prior native identity is used here because the older candidate README and
+summary JSON contain copied metadata; those summaries are not deployment proof.
 
 The recorded reference's 524K/1M prefill extension (`c06790ef`) retained the
 original shorter suite's outer elapsed time. Its actual stored prefill samples
