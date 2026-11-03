@@ -308,9 +308,26 @@ rebased onto this patch instead:
 - With copy drafts the default (#842), every greedy adaptive DSpark deployment runs
   the `draft_limits` combine.
 
+### The race on sp5–sp7 (#856's cost run)
+
+These are not this experiment's runs; the numbers come from the receipts of #856's
+census-free run `limit-sync-cost-sp` on sp5
+(`results/private/determinism/limit-sync-cost-sp/copy-probe-*.jsonl`). The copy probe
+at m=16, with the recipe's dead rows, in tokens per step:
+
+| Arm | copy | edit | tool | prose |
+|---|---|---|---|---|
+| candidate-37 (`c37-m16-c`) | 16.021 | 15.322 | 6.083 (84 drafts) | 2.651 |
+| #856's wait (`fix-m16-c`, `fix-m16-c-repeat`) | 16.021 | 15.322 | 6.232 (82 drafts) | 2.651 |
+
+These are the operator's m=16 numbers. The host's limit read goes stale on sp5–sp7
+too, and a stale narrow read drops tool drafts there. This change leaves that loss
+in place; #856 removes it. Its census-free repro below measures how often each
+happens.
+
 ## Prepared, not run
 
-Both specs dry-run clean with `--production-config
+The specs dry-run clean with `--production-config
 config/candidate-37-tp3-switched-dev.local.json`, the profile sp5–sp7 serve (sha
 `92b1712d…`, node map `config/nodes-switched3.local.json` sha `0c508533…`, copied from
 sp5 for the dry runs and not committed). They need an owner-authorized window.
@@ -349,6 +366,43 @@ sp5 for the dry runs and not committed). They need an owner-authorized window.
   The arm order is fix, candidate-37, fix again, so each comparison has a repeat boot:
   [arm-fix-m16.json](arm-fix-m16.json) against [arm-c37-m16.json](arm-c37-m16.json).
   The candidate-37 arm is #856's `arm-c37-m16.json` (same serve options).
+
+- [lab-repro-rank.json](lab-repro-rank.json), run `device-limit-repro-rank-sp`
+  (parent session's request, 2026-11-03; queued only if the owner says so). It tests
+  the rank-dependent layout hypothesis (*The operator's patches*, 0003). It has one
+  arm, [arm-rank-m8-nodead.json](arm-rank-m8-nodead.json): the fix with the host
+  budget reading no host limits.
+  - The overlay is [overlay/fix-rank](overlay/fix-rank/)'s `model_runner.py`: the
+    fix's, with `slot_draft_limits=None` at the manager. Every rank then budgets from
+    the scheduler's drafts and the planned confidences, which they all hold alike.
+    The device limits clamp whatever the budget admits past a proposal.
+  - The stale-read counter has nothing to count here, so the arm doesn't mount it.
+    Instead each rank logs a CRC of its budgeted layouts every 1,024 budgets: the token
+    count and every request's eligible drafts, as `COPY-LIMITS reads=N layout=1
+    crc=…`. The same extras and table parse it.
+  - It is a second variable on top of the fix, so it gets its own spec.
+  - Mounts, environment, serve options and extras are `fix-m8-nodead`'s, apart from
+    the model runner and the counter. So it compares directly with the two arms of
+    `lab-repro.json`.
+
+  Outcomes:
+  - Candidate-37 crashes, the fix still asserts or its ranks' CRCs disagree at
+    several streams, and this arm stays clean with agreeing CRCs: the layout is the
+    mechanism, and the owner's choice is between #856's wait and this budget.
+  - All three clean: either the race doesn't reach the router here, or this window's
+    load didn't trigger it.
+  - The arm also shows what a budget without the host's limit costs in rows. Its
+    tokens per step and streams compare with the other arms', though cost needs
+    `lab-cost.json`'s paired runs to decide.
+
+  Checked on sp8 in the image, as for the fix:
+  - [layout_census_check.py](layout_census_check.py): equal step sequences give equal
+    CRCs, one changed draft count changes it, and the line comes every 1,024 budgets;
+  - with the arm's five files mounted, `test_copy_drafts.py`,
+    `test_adaptive_verification.py`, `test_prepare_kernels.py` and `test_dead_rows.py`
+    give 76 passed, 1 skipped.
+
+  `bin/spark doctor`: configuration OK.
 
 The fix arms mount [overlay/fix](overlay/fix/): the patch's five vLLM files,
 byte-identical to the patched tree, over the shared image, so every rank keeps one
@@ -394,6 +448,19 @@ scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-repro.js
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
 scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-cost.json \
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-repro-rank.json \
+  --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+```
+
+The overlay checks run in the image with the image's own `PYTHONPATH`, which puts
+`/opt/spark-ds41f/candidate/vllm` ahead of the installed copy. With `PYTHONPATH`
+overridden, a script imports the installed copy; pytest, run from the tree, does not.
+For example, with the rank arm's model runner over the fix's files:
+
+```bash
+docker run --rm --gpus all -v $PWD:/x:ro -v $RANK_MODEL_RUNNER:$V/vllm/v1/worker/gpu/model_runner.py:ro \
+  <the fix's other four files mounted likewise> -w $V --entrypoint python3 \
+  spark-ds41f:candidate-37 /x/layout_census_check.py
 ```
 
 After a window: `tables_arms.py RUN ARM...` prints each arm's probe, suite, limit reads
@@ -413,10 +480,9 @@ memory per arm.
 - **The producer of the non-finite logits:** which kernel turns a routed placeholder
   row non-finite. The operator reports that ids of 0 instead of `-1` still crash.
   The fix makes those rows padding whatever the cause.
-- **A layout every rank decides alike.** The host budget reading no host limits
-  (`slot_draft_limits=None` at the manager) leaves the device limits to do the
-  clamping, and would test the layout hypothesis in the same window. It is a second
-  variable and is not prepared.
+- **A layout every rank decides alike:** prepared as `lab-repro-rank.json`, not run.
+  Its cost in rows against the fix is unmeasured. It admits every scheduled draft the
+  planned confidences pay for, and the clamp pads the ones a narrowed proposal lacks.
 
 ## Conclusion
 
@@ -433,6 +499,6 @@ It leaves two things as candidate-37 has them:
 
 #856's wait fixes both, at −0.73% ±0.12% single-stream on sp5–sp7. This change should
 cost nothing measurable: it changes no layout, and adds a load and a min per request
-to the combine. The prepared runs measure that, and whether the race happens on
-sp5–sp7 at all. The choice between this, #856, or this plus a host budget that every
+to the combine. The prepared runs measure that. #856's cost run already shows the
+race happens on sp5–sp7. The choice between this, #856, or this plus a host budget that every
 rank computes alike, is the owner's once they have run.
