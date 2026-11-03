@@ -43,11 +43,14 @@ def _meta_census(builder, cm) -> None:
     bad = (builder.reqs[:nt] < 0) | (builder.positions[:nt] < 0)
     any_bad = bad.any()
     qsl_end = cm.query_start_loc[nr].to(torch.int64)
-    hit = any_bad | (qsl_end != nt)
+    # A batch with every row invalid is a dummy or warm-up batch (startup, graph
+    # capture); a stale-cap hit leaves a few rows invalid, not all of them.
+    bad_count = bad.sum().to(torch.int64)
+    hit = (any_bad & (bad_count < nt)) | (qsl_end != nt)
     const = lambda v: torch.full((), int(v), dtype=torch.int64, device=device)  # noqa: E731
     first_bad = torch.where(any_bad, bad.to(torch.int32).argmax().to(torch.int64), const(-1))
     record = torch.stack([const(1), _META_CALLS[0], qsl_end, const(nt), first_bad, const(nr),
-                          const(getattr(builder, "_census_id", -1)), bad.sum().to(torch.int64)])
+                          const(getattr(builder, "_census_id", -1)), bad_count])
     unset = _META_FIRST[0] == 0
     _META_FIRST.copy_(torch.where(unset & hit, record, _META_FIRST))
 
