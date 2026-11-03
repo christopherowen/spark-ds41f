@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The device-limit runs' receipts for each arm: copy probe, single-stream suite, the
-host limit reads of every rank (overlay/limit-reads), and distinct concurrent streams.
+host limit reads of every rank (overlay/limit-reads), the ranks' per-step layouts
+compared (overlay/layout-ring), and distinct concurrent streams.
 
 usage: tables_arms.py RUN ARM [ARM...]   (from the deployment checkout; RUN names
        results/private/determinism/RUN/)
@@ -48,6 +49,17 @@ for arm in ARMS:
             differ = sorted(int(w) for w in shared if len({c[w] for c in crcs}) > 1)
             print(f"  {stem} ranks: {len(shared)} shared windows, CRCs differ in "
                   f"{len(differ)}{' (first at reads=' + str(differ[0]) + ')' if differ else ''}")
+    for stem in ("ring", "ring-c8", "ring-c16"):
+        # overlay/layout-ring (layout_ring_logs.py): the ranks' per-step layouts compared.
+        for record in lines(stem, arm):
+            if "compare" not in record:
+                continue
+            c = record["compare"]
+            kinds = " ".join(f"{k}={v}" for k, v in c["kinds"].items() if v)
+            print(f"  {stem}: records {c['records']}, {c['common']} common steps, "
+                  f"{c['divergent']} differ ({kinds or '-'})"
+                  f"{', first at step ' + str(c['first']) if c['first'] is not None else ''}; "
+                  f"stale-read counts differ at {c['stale_mismatch']} steps")
     for stem in ("c8-distinct", "c16-distinct"):
         s = [r for r in lines(stem, arm) if "tps_mean" in r]
         if s:
