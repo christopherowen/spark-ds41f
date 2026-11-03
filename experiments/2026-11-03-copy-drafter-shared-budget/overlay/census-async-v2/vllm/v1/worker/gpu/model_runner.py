@@ -741,6 +741,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             None if per_req is None else [int(x) for x in per_req],
             dict(copy._reads) if copy is not None and hasattr(copy, "_reads") else None,
         ))
+        if not drafter and not str(input_batch.req_ids[0]).startswith("_warmup"):
+            # Every rank's layout of each budgeted step, as a running CRC over the
+            # step's token count and admitted draft rows, logged every 1,024 steps in
+            # a line the census collector keeps. Ranks whose CRCs differ laid out the
+            # same steps differently: their collectives then sum mismatched rows.
+            import zlib
+
+            self._layout_steps = getattr(self, "_layout_steps", 0) + 1
+            self._layout_crc = zlib.crc32(
+                f"{input_batch.num_tokens}:{input_batch.num_draft_tokens}".encode(),
+                getattr(self, "_layout_crc", 0),
+            )
+            if self._layout_steps % 1024 == 0:
+                logger.error(
+                    "NONFINITE-LAYOUT steps=%d crc=%08x", self._layout_steps, self._layout_crc
+                )
         if self._census_calls % _CENSUS_EVERY:
             return
         with gpu_sync_allowed():
