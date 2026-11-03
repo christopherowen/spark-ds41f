@@ -1,0 +1,87 @@
+{
+ "experiment": "experiments/2026-11-03-copy-drafter-shared-budget",
+ "run": "shared-budget-repro-sp",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench": false,
+   "arms": [
+    {
+     "config": "arm-c37-m8-nodead.json",
+     "label": "c37-m8-nodead"
+    },
+    {
+     "config": "arm-minimal-m8-nodead.json",
+     "label": "minimal-m8-nodead"
+    }
+   ],
+   "extras": [
+    [
+     "experiments/2026-10-23-next-release/acceptance/copy_probe.py",
+     [
+      "--prompts",
+      "3"
+     ],
+     "copy-probe"
+    ],
+    [
+     "suite_single_stream.py",
+     [
+      "{label}",
+      "{run}"
+     ],
+     "single-stream"
+    ],
+    [
+     "limit_reads_logs.py",
+     [
+      "{label}"
+     ],
+     "reads"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "3",
+      "--tokens",
+      "1024"
+     ],
+     "c8-distinct"
+    ],
+    [
+     "limit_reads_logs.py",
+     [
+      "{label}"
+     ],
+     "reads-c8"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "16",
+      "--samples",
+      "3",
+      "--tokens",
+      "1024"
+     ],
+     "c16-distinct"
+    ],
+    [
+     "limit_reads_logs.py",
+     [
+      "{label}"
+     ],
+     "reads-c16"
+    ]
+   ]
+  }
+ ]
+}
