@@ -403,6 +403,62 @@ sp5 for the dry runs and not committed). They need an owner-authorized window.
     give 76 passed, 1 skipped.
 
   `bin/spark doctor`: configuration OK.
+- **The minimal fix** (parent session's request, 2026-11-03; prepared, not queued; the
+  owner hasn't chosen). It is candidate-37 with only `slot_draft_limits=None` at the
+  adaptive verification manager, and no device clamp:
+  [overlay/none](overlay/none/)'s `model_runner.py`.
+  - By diff, that file differs from candidate-37's only in that argument, `import
+    zlib`, and the rank arm's host-only layout CRC (the method and its call after the
+    budget).
+  - The budget then comes from the scheduler's draft counts and the confidence
+    snapshot. `record_confidences` waits for that snapshot and broadcasts it from rank
+    0 (or it is rank-invariant by construction), so every rank lays out the same step
+    without a wait.
+  - It keeps candidate-37's placeholder handling: the `-1` drafts, their rejection, and
+    dead rows.
+
+  What changes, besides the layout:
+  - Without the host cap, the step verifies the scheduled rows whenever the planned
+    confidences pay for them. That includes the `-1` placeholders of a proposal that
+    narrowed after a rejection or a lost copy, not only on a stale read.
+  - With the recipe's dead rows those rows have confidence 0 and are dead (padding).
+    With dead rows off they route live, more often than on candidate-37.
+  - So `none-m8-nodead` separates the hypotheses sharply. If placeholder rows routed
+    live are the mechanism, it should crash sooner than candidate-37; if the layout
+    is, it stays clean with agreeing CRCs.
+  - As a fix it relies on dead rows being on. A deployment that leaves the threshold
+    unset would be more exposed than on candidate-37.
+  - A stale narrow read can no longer drop drafts: there is no host cap.
+
+  Its arms:
+  - [arm-none-m8-nodead.json](arm-none-m8-nodead.json): the threshold at 0, m=8.
+  - [arm-none-m16.json](arm-none-m16.json): the recipe's dead rows, m=16. Only the CRC
+    separates it from candidate-37 plus the one argument. The CRC adds no device sync
+    and costs 1.2–1.7 µs of host time a budgeted step at 1 to 16 requests
+    ([layout_census_cost.py](layout_census_cost.py)), under 0.02% of a step, so it
+    stays in.
+
+  Both mount only that file. Their serve options are `c37-m8-nodead`'s and `c37-m16`'s.
+
+  Its specs, both dry-run clean, with doctor OK for both arms:
+  - [lab-repro-none.json](lab-repro-none.json), run `device-limit-repro-none-sp`:
+    `c37-m8-nodead` (the counter arm, unchanged), then `none-m8-nodead`, with
+    `lab-repro.json`'s extras.
+  - [lab-cost-none.json](lab-cost-none.json), run `device-limit-cost-none-sp`:
+    `lab-cost.json`'s jobs with none-m16, c37-m16, none-m16 (the paired single-stream
+    suite), then the same order for the copy probe and 8 and 16 streams.
+
+  Tests (sp8, candidate-37's image; [runs/unit-none.txt](runs/unit-none.txt)):
+  - [test_none_rank_budgets.py](test_none_rank_budgets.py), on candidate-37's own vLLM:
+    2 passed. It sets up two ranks with the same histories, proposals and
+    confidences; rank 0's limit copy has landed and rank 1's is in flight.
+    - Under candidate-37's wiring, rank 0 caps the copy at its 8 drafts and rank 1 at
+      the stale 16, so their token counts and query starts differ.
+    - Under the none wiring, the token count, budget, query starts and logits offsets
+      are equal.
+  - Candidate-37's `test_copy_drafts.py`, `test_copy_drafts_scheduler.py`,
+    `test_adaptive_verification.py` and `test_prepare_kernels.py`: 77 passed, 1
+    skipped with overlay/none mounted, the same as without it.
 
 The fix arms mount [overlay/fix](overlay/fix/): the patch's five vLLM files,
 byte-identical to the patched tree, over the shared image, so every rank keeps one
@@ -450,6 +506,18 @@ scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-cost.jso
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
 scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-repro-rank.json \
   --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-repro-none.json \
+  --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+scripts/lab.py run experiments/2026-11-02-copy-drafter-device-limit/lab-cost-none.json \
+  --dry-run --production-config config/candidate-37-tp3-switched-dev.local.json
+```
+
+The two-rank test runs in the image with nothing else mounted:
+
+```bash
+docker run --rm --gpus all --ipc=host -v $PWD:/x:ro -w /opt/spark-ds41f/candidate/vllm \
+  --entrypoint python3 spark-ds41f:candidate-37 -m pytest -q -p no:cacheprovider \
+  /x/test_none_rank_budgets.py
 ```
 
 The overlay checks run in the image with the image's own `PYTHONPATH`, which puts
@@ -480,7 +548,9 @@ memory per arm.
 - **The producer of the non-finite logits:** which kernel turns a routed placeholder
   row non-finite. The operator reports that ids of 0 instead of `-1` still crash.
   The fix makes those rows padding whatever the cause.
-- **A layout every rank decides alike:** prepared as `lab-repro-rank.json`, not run.
+- **A layout every rank decides alike:** prepared as `lab-repro-rank.json` (with the
+  clamp), and as the minimal fix's `lab-repro-none.json` and `lab-cost-none.json`
+  (without it); none of them run.
   Its cost in rows against the fix is unmeasured. It admits every scheduled draft the
   planned confidences pay for, and the clamp pads the ones a narrowed proposal lacks.
 
