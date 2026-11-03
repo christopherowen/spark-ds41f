@@ -1,0 +1,353 @@
+From 72abb31ff3e9924c01e32a0dd4f5143fc7519e21 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:26:32 +0000
+Subject: [PATCH 677/687] fix(copy-drafts): budget verification from what every
+ rank holds alike
+
+Base: candidate-37's patch head 5b7cfa37f (tree af0fb152), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series.
+
+Rationale (#852): the adaptive budget capped each request's scheduled drafts
+with CopyDrafter's host mirror of the per-slot draft limits. Patch 0612 made
+that mirror non-blocking: sync_slot_draft_limits publishes the latest
+proposal's limits only once their copy has landed, and otherwise keeps an
+older proposal's. Each rank reads its own mirror at its own moment, and nothing
+makes the ranks agree on it. So the budget (the step's token count, its drafts
+per request and the device layout made from them) could depend on the rank and
+on when a copy landed. The budget's other inputs are rank-wide: the
+scheduler's draft counts, and the confidence snapshot, which
+record_confidences waits for and broadcasts from rank 0 (or which is
+rank-invariant by construction). The runner now gives the manager no host
+limits (slot_draft_limits=None), so every rank lays out the same step, and no
+host waits.
+
+Quality: placeholder drafts (-1 past a proposal's drafts), their rejection,
+sampling, dead rows and the copy machinery are candidate-37's. The budget may
+now verify more rows than the latest proposal has. When the proposal narrowed
+below the rows the scheduler laid out (a rejected or lost copy), the step
+verifies its -1 placeholders where the planned confidences pay for them.
+Verification rejects them, so the committed tokens are the target's.
+- With dead rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU above 0, the recipe's 0.2)
+  they have confidence 0 and are padding, which the router skips.
+- Without dead rows they are routed live, more often than candidate-37 routed
+  them (there only on a stale read).
+A stale narrow limit no longer drops drafts. Where candidate-37's host limit
+did not bind (it was current and at least the scheduled drafts), every step is
+bit for bit candidate-37's. Where it bound, the step has more rows and the
+same temperature-0 text. DSpark's confidences come from the checkpoint's head,
+not an online estimator, so the extra rows teach the budget nothing, and the
+copy state counts at most a copy's own drafts (0612's min with pending).
+
+Credit: Jordi Posthumus (#852, #855) diagnosed the cause: 0612's non-blocking
+limit read lets the budget act on an older proposal's limits.
+
+Tests (tests/v1/spec_decode/test_copy_drafts.py):
+- test_ranks_budget_alike_whenever_their_limit_copies_land: two ranks with the
+  same histories, proposals and confidence snapshot, one's limit copy landed
+  and the other's in flight. Without host limits they budget the same step
+  and device layout; with them (candidate-37's wiring) they split.
+- test_verification_through_copy_growth_shrinkage_and_slot_reuse: two
+  requests in one slot, decoded through the copy drafter, the budget, the
+  draft combine and greedy verification. Copies grow past the initial cap; a
+  rejected copy's next proposal is narrower than its step, whose -1
+  placeholders are verified and rejected; the committed text is the target's
+  greedy text.
+- 0612's test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_
+  without_sync is unchanged.
+In candidate-37's image, test_copy_drafts.py, test_copy_drafts_scheduler.py,
+test_adaptive_verification.py and test_prepare_kernels.py go from 77 to 79
+passed, with 1 skipped (the two-GPU test).
+
+Upstream status: local (spark-ds41f). Copy drafts and adaptive verification's
+budget are local patches.
+---
+ tests/v1/spec_decode/test_copy_drafts.py | 253 +++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py       |  11 +-
+ 2 files changed, 259 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index f25ee920f..19a7d4604 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -918,3 +918,256 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+     limits = drafter.sync_slot_draft_limits()
+     assert limits.shape == (MAX_REQS,)
++
++
++# --- The shared budget: what every rank holds alike -------------------------------
++
++
++class _InFlightEvent:
++    """A limit copy that has not landed: the host keeps the previous limits."""
++
++    def query(self) -> bool:
++        return False
++
++    def synchronize(self) -> None:
++        raise AssertionError("sync_slot_draft_limits must not block on GPU")
++
++
++def _manager(states, drafter, *, host_limits: bool):
++    """The adaptive verification manager as the runner builds it beside a copy
++    drafter: without host limits (``slot_draft_limits=None``), or, candidate-37's
++    wiring, with the drafter's non-blocking host limits. One rank."""
++    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++        AdaptiveVerificationManager,
++    )
++
++    manager = AdaptiveVerificationManager(
++        states,
++        torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE),
++        num_bonus_tokens=1,
++        max_total_logits=4096,
++        row_cost=0.035,
++        planned_confidences=True,
++        num_draft_steps=BLOCK,
++        slot_draft_limits=drafter.sync_slot_draft_limits if host_limits else None,
++    )
++    manager.dead_rows_tau = 0.0
++    return manager
++
++
++def _one_rank(host_limits: bool, landed: bool):
++    """One rank after the step that proposed a copy for "copy" (its history repeats)
++    and DSpark's block for "prose", budgeting the next step, which the scheduler
++    laid out at 16 rows for the copy (an earlier allocation) and the block for the
++    other. Its limit copy has ``landed`` or is still in flight."""
++    from types import SimpleNamespace
++
++    rng = np.random.default_rng(3)
++    histories = {
++        "copy": np.tile(rng.integers(1, VOCAB, 32), 6).tolist()[:96],
++        "prose": rng.integers(1, VOCAB, 96).tolist(),
++    }
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    manager = _manager(states, drafter, host_limits=host_limits)
++    slots = [_set_history(states, req_id, h) for req_id, h in histories.items()]
++    for slot in slots:
++        states.num_computed_tokens_np[slot] = 96
++        drafter.add_request(slot)
++        manager.add_request(slot)
++    drafter.apply_staged_writes()
++    manager.apply_staged_writes()
++    idx = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
++    one = torch.ones(2, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++    dspark_drafts = torch.zeros((2, BLOCK), dtype=torch.int64, device=DEVICE)
++    dspark_conf = torch.full((2, BLOCK), 0.5, device=DEVICE)
++    drafter.prepare_alloc(idx, one, zero, None)
++    _, confidences, planned = drafter.propose(
++        idx, dspark_drafts, dspark_conf, one, zero, None, matched=True
++    )
++    batch = SimpleNamespace(num_reqs=2, idx_mapping=idx)
++    for _ in range(2):  # the budget reads the snapshot of the record before last
++        manager.record_confidences(confidences, batch, planned=planned)
++    if landed:
++        drafter.slot_draft_limits.np[:] = drafter.slot_draft_limits.gpu.cpu().numpy()
++    else:
++        drafter._limits_event = _InFlightEvent()  # type: ignore[assignment]
++    num_tokens = manager.get_num_tokens(
++        {"copy": 1 + LOOKAHEAD, "prose": 1 + BLOCK},
++        {"copy": [-1] * LOOKAHEAD, "prose": [-1] * BLOCK},
++    )
++    eligible = dict(manager._batch_budget[0])
++    cu_num_logits, query_start_loc, budget, _, _ = manager.reallocate_drafts(
++        list(histories), idx
++    )
++    torch.accelerator.synchronize()
++    return SimpleNamespace(
++        limits=drafter.slot_draft_limits.gpu[idx].tolist(),
++        num_tokens=num_tokens,
++        eligible=eligible,
++        budget=budget,
++        query_start_loc=query_start_loc[:3].tolist(),
++        cu_num_logits=cu_num_logits.tolist(),
++    )
++
++
++def test_ranks_budget_alike_whenever_their_limit_copies_land(monkeypatch):
++    """Two tensor-parallel ranks hold the same histories, proposals and confidence
++    snapshot, but one's limit copy has landed when it budgets and the other's is in
++    flight. Without host limits they budget the same step, the same drafts per
++    request and the same device layout. With them (candidate-37's wiring) the
++    landed rank caps the copy at its 8 drafts and the other at the stale 16, and
++    the two lay out different steps."""
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.spec_decode import adaptive_verification
++
++    monkeypatch.setattr(
++        adaptive_verification, "get_tp_group", lambda: SimpleNamespace(world_size=1)
++    )
++    landed, in_flight = _one_rank(False, True), _one_rank(False, False)
++    assert landed.limits == in_flight.limits == [INITIAL, BLOCK]
++    assert landed.eligible == in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
++    for field in ("num_tokens", "budget", "query_start_loc", "cu_num_logits"):
++        assert getattr(landed, field) == getattr(in_flight, field), field
++
++    landed, in_flight = _one_rank(True, True), _one_rank(True, False)
++    assert landed.eligible == {"copy": INITIAL, "prose": BLOCK}
++    assert in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
++    assert landed.num_tokens != in_flight.num_tokens
++    assert landed.query_start_loc != in_flight.query_start_loc
++
++
++def _decode_with_shared_budget(states, drafter, manager, target, req_id, prompt, count):
++    """Decode ``count`` tokens of one request as the runner verifies them with the
++    shared budget: the scheduler lays out each step from the allocation the proposal
++    before it reported, the budget admits drafts from the confidence snapshot
++    alone, the draft combine writes the step's input ids from the request state,
++    and greedy verification commits the target's tokens. Returns the tokens and,
++    per step, the proposal's drafts and the input ids its rows verified."""
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.input_batch import combine_sampled_and_draft_tokens
++
++    slot = _set_history(states, req_id, prompt)  # its prefill: the prompt
++    drafter.add_request(slot)
++    manager.add_request(slot)
++    drafter.apply_staged_writes()
++    manager.apply_staged_writes()
++    prefill = len(prompt)
++    text = list(map(int, prompt))
++    text.append(target.next(text))  # the token its prefill sampled
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    batch = SimpleNamespace(num_reqs=1, idx_mapping=idx)
++    num_sampled = torch.ones(1, dtype=torch.int32, device=DEVICE)
++    verified = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    reported = [BLOCK]  # each proposal's allocation; the first step's is the block
++    out, steps = [], []
++
++    def propose() -> int:
++        _set_history(states, req_id, text)
++        states.num_computed_tokens_np[slot] = len(text) - 1
++        states.last_sampled_tokens[slot] = text[-1]
++        # DSpark-like drafts: the target's own next tokens, wrong now and then.
++        ctx, guess = list(text), []
++        for j in range(BLOCK):
++            t = target.next(ctx)
++            guess.append((t + 1) % VOCAB if (len(ctx) + j) % 4 == 3 else t)
++            ctx.append(guess[-1])
++        dspark = torch.tensor([guess], dtype=torch.int64, device=DEVICE)
++        conf = torch.full((1, BLOCK), 0.5, device=DEVICE)
++        drafter.prepare_alloc(idx, num_sampled, verified, None)
++        drafts, confidences, planned = drafter.propose(
++            idx, dspark, conf, num_sampled, verified, None, matched=True
++        )
++        states.draft_tokens[idx] = drafts
++        manager.record_confidences(confidences, batch, planned=planned)
++        reported.append(int(drafter.alloc[0]))
++        return int(drafter.slot_draft_limits.gpu[slot])
++
++    width = propose()
++    while len(out) < count:
++        scheduled = reported[-2]
++        num_tokens = manager.get_num_tokens(
++            {req_id: 1 + scheduled}, {req_id: [-1] * scheduled}
++        )
++        cu_num_logits, query_start_loc, budget, _, _ = manager.reallocate_drafts(
++            [req_id], idx
++        )
++        input_ids = torch.full((num_tokens,), -7, dtype=torch.int32, device=DEVICE)
++        seq_lens = torch.tensor(
++            [len(text) - 1 + num_tokens], dtype=torch.int32, device=DEVICE
++        )
++        combine_sampled_and_draft_tokens(
++            input_ids, idx, states.last_sampled_tokens, query_start_loc[:2],
++            seq_lens, states.prefill_len.gpu, states.draft_tokens, cu_num_logits,
++            1 + budget, 1,
++        )  # fmt: skip
++        assert len(text) - 1 >= prefill
++        inputs = input_ids.tolist()
++        assert inputs[0] == text[-1] and len(inputs) == 1 + budget
++        drafts = inputs[1:]
++        rows = [target.next(text + drafts[:k]) for k in range(budget + 1)]
++        committed = _greedy_verify([rows], [drafts], [text[-1]])[0]
++        steps.append(SimpleNamespace(width=width, drafts=drafts, committed=committed))
++        text += committed
++        out += committed
++        num_sampled = torch.tensor([len(committed)], dtype=torch.int32, device=DEVICE)
++        verified = torch.tensor([budget], dtype=torch.int32, device=DEVICE)
++        width = propose()
++    return out[:count], steps
++
++
++def test_verification_through_copy_growth_shrinkage_and_slot_reuse(monkeypatch):
++    """With the shared budget, a request's steps verify the scheduler's rows
++    whatever its latest proposal offers. Its copies grow past the initial cap, and
++    after a rejection its proposal shrinks below the step the scheduler laid
++    out: the step then verifies the proposal's -1 placeholders, which greedy
++    verification rejects. The committed text is the target's own greedy text,
++    and a request that takes the slot next starts afresh and decodes its own."""
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.spec_decode import adaptive_verification
++
++    monkeypatch.setattr(
++        adaptive_verification, "get_tp_group", lambda: SimpleNamespace(world_size=1)
++    )
++    rng = np.random.default_rng(13)
++    states = _request_state(8192)
++    drafter = _drafter(states)
++    manager = _manager(states, drafter, host_limits=False)
++
++    def prompt_for(target):
++        """R, t, Y, R: with the token the prefill samples (t again, an order-2
++        target's next token after R), the context ends with the R, t it began
++        with, so its first copy proposes Y, which the target does not follow."""
++        span = rng.integers(1, VOCAB, 24).tolist()
++        t = target.next(span)
++        return span + [t] + rng.integers(1, VOCAB, 10).tolist() + span
++
++    # Each target soon cycles, so its later copies are accepted and grow.
++    targets = [("a", ToyTarget(1, order=2, table=97)), ("b", ToyTarget(4, order=2, table=31))]
++    slots, widths = set(), []
++    for req_id, target in targets:
++        prompt = prompt_for(target)
++        count = 400
++        out, steps = _decode_with_shared_budget(
++            states, drafter, manager, target, req_id, prompt, count
++        )
++        slots.add(states.req_id_to_index[req_id])
++        assert out == target.greedy(prompt, count + 1)[1:]
++        assert -1 not in out
++        # The copies grew past the initial cap (to the lookahead, or to the
++        # target's cycle), and some step's proposal had shrunk below the rows it
++        # verified: their inputs are the -1 placeholders.
++        widths.append(max(s.width for s in steps))
++        assert widths[-1] > INITIAL
++        shrunk = [s for s in steps if len(s.drafts) > s.width]
++        assert shrunk
++        for s in shrunk:
++            assert s.drafts[s.width :] == [-1] * (len(s.drafts) - s.width)
++            assert len(s.committed) <= s.width + 1
++        states.remove_request(req_id)
++    assert LOOKAHEAD in widths
++    assert len(slots) == 1  # "b" took "a"'s slot
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 26992d545..c49fef168 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -830,11 +830,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+             planned_confidences=self.copy_drafter is not None,
+-            slot_draft_limits=(
+-                self.copy_drafter.sync_slot_draft_limits
+-                if self.copy_drafter is not None
+-                else None
+-            ),
++            # No host draft limits: each rank's non-blocking mirror of them may
++            # still hold an older proposal's, so the budget, and with it the step's
++            # layout, would depend on the rank and on when the copy landed (#852).
++            # It reads what every rank holds alike: the scheduler's drafts and the
++            # confidence snapshot (synchronized, and broadcast from rank 0).
++            slot_draft_limits=None,
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
+-- 
+2.43.0
+

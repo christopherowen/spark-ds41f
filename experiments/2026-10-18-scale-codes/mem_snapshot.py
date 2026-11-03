@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Each node's memory once the arm serves (a lab extras script).
 
-usage: mem_snapshot.py URL --label LABEL
+usage: mem_snapshot.py URL --label LABEL [--nodes dgx1,dgx2,dgx3,dgx4]
 
 For every node of the production node map: MemAvailable from /proc/meminfo, and the
 running serving container's own startup lines (weight loading, the KV cache size, CUDA
@@ -46,8 +46,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("url")
     ap.add_argument("--label", required=True)
+    ap.add_argument("--nodes", default=",".join(NODES), help="the nodes to read (default: the ring)")
     args = ap.parse_args()
-    for node in NODES:
+    for node in args.nodes.split(","):
         meminfo = run(node, "grep -E '^(MemAvailable|MemTotal):' /proc/meminfo")
         kib = {k: int(v) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", meminfo, re.MULTILINE)}
         container = serving_container(node)

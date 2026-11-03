@@ -3,6 +3,12 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
+The next candidate is [candidate-38](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md).
+It carries the shared CopyDrafter budget fix, removes the unused draft-limit machinery,
+and includes the selected loop, draft-kernel and test repairs. Its final image passes
+the release-test gate; distributed correctness and performance qualification remain separate
+from promotion. The promoted release remains spark-ds41f-1030.
+
 Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
 profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is

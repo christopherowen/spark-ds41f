@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "purpose": "Preserved existing CopyDrafter failure evidence; no GPU workload or serving-state change performed during collection.",
+  "collected_at_utc": "2026-11-03T01:58:45.737085+00:00",
+  "local_base_commit": "b28365c38a74c966032dcf558d8d1bb0a282d4b6",
+  "source": {
+    "host": "sp5",
+    "root": "/home/chris/projects/spark-ds41f",
+    "deployment_commit": "86b56b816cee5e5d0661c8f079d5f9b78ceb1f17",
+    "run": "shared-budget-repro-sp",
+    "window": "spark-0013-1793667996",
+    "profile_identities": [
+      {
+        "source_path": "/home/chris/projects/spark-ds41f/config/candidate-37-tp3-switched-dev.local.json",
+        "sha256": "92b1712daca32e68efcf4da99c4abd2dd5f7b2025d4c34d9bc0ebb6e33020f9c",
+        "bytes": 1270
+      },
+      {
+        "source_path": "/home/chris/projects/spark-ds41f/config/nodes-switched3.local.json",
+        "sha256": "0c5085332439a15c4529ab3cdef429ed5872be01029f3e01bf069a6e6dd545d7",
+        "bytes": 1160
+      }
+    ]
+  },
+  "reproduction": {
+    "spec": "experiments/2026-11-03-copy-drafter-shared-budget/lab-repro.json",
+    "arms": [
+      "c37-m8-nodead",
+      "minimal-m8-nodead"
+    ],
+    "ordered_workloads": [
+      "copy_probe.py --prompts 3",
+      "suite_single_stream.py (exact command construction preserved in source snapshot)",
+      "distinct_streams.py --streams 8 --samples 3 --tokens 1024",
+      "distinct_streams.py --streams 16 --samples 3 --tokens 1024"
+    ],
+    "conditions": [
+      "copy drafts min_match=8, initial_drafts=8, max_drafts=16",
+      "dead-row threshold 0",
+      "same candidate-37 image; baseline mounts limit-read counters; minimal arm mounts shared-budget/layout-CRC model_runner"
+    ],
+    "command_authority": "Preserved lab spec, arm files, suite helper and queue log; this manifest is not a command to rerun."
+  },
+  "observations": [
+    {
+      "fact": "Baseline single-stream receipt reports failed=[c1]; first saved head-engine assertion is route_partials gate logits contain nan or inf at line 352. Python propagation is at 01:15:39 UTC through output event synchronization.",
+      "files": [
+        "single-stream-c37-m8-nodead.jsonl",
+        "c8-distinct-c37-m8-nodead.jsonl.engine-sp5.log"
+      ]
+    },
+    {
+      "fact": "sp7 log also contains the router assertion; sp6 saved log contains no matching assertion. No first-producer tensor trace or target-versus-drafter attribution is present in these logs."
+    },
+    {
+      "fact": "Each c16 baseline engine log has the same SHA256 as its c8 counterpart; these are saved copies of one failed engine, not independent crash reproductions."
+    },
+    {
+      "fact": "Baseline counter snapshots match across three ranks through 8192 reads. The preserved counter source hashes consequential read indices, not actual layouts."
+    },
+    {
+      "fact": "Minimal-arm single-stream receipt reports failed=[]; saved eight/sixteen-stream receipts complete, and fourteen layout-CRC windows through 14336 reads match across ranks without recorded trouble."
+    }
+  ],
+  "artifacts": [
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/copy-probe-c37-m8-nodead.jsonl",
+      "bytes": 2668,
+      "sha256": "ce01b6e11a45b13e6ca33660e68dbfd86e53fb0b83390e8c546d202c43bab48b",
+      "mtime_ns": 1793668198997744763,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/copy-probe-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/single-stream-c37-m8-nodead.jsonl",
+      "bytes": 10986,
+      "sha256": "4e815eb99b54636e5668cd736dce6c7fbe975257a1dfb9c15f5077f5563fee94",
+      "mtime_ns": 1793668602931340069,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/single-stream-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-c37-m8-nodead.jsonl",
+      "bytes": 8612,
+      "sha256": "35a9cb65a49d7f1ad305916933d9b27cc2cf3236d06da22b043c87d4f002ea4d",
+      "mtime_ns": 1793668603095340074,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-c8-c37-m8-nodead.jsonl",
+      "bytes": 8612,
+      "sha256": "35a9cb65a49d7f1ad305916933d9b27cc2cf3236d06da22b043c87d4f002ea4d",
+      "mtime_ns": 1793668603405340085,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-c8-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-c16-c37-m8-nodead.jsonl",
+      "bytes": 8612,
+      "sha256": "35a9cb65a49d7f1ad305916933d9b27cc2cf3236d06da22b043c87d4f002ea4d",
+      "mtime_ns": 1793668604355340117,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-c16-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl",
+      "bytes": 2696,
+      "sha256": "1b9e89e2feda1fe80f63b9e47dae1fed9953c4deea83c5a7bbe49a8f2cdc9b43",
+      "mtime_ns": 1793668603190340077,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl",
+      "bytes": 2696,
+      "sha256": "1b9e89e2feda1fe80f63b9e47dae1fed9953c4deea83c5a7bbe49a8f2cdc9b43",
+      "mtime_ns": 1793668603486340087,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/copy-probe-minimal-m8-nodead.jsonl",
+      "bytes": 2666,
+      "sha256": "cab991fa036072162124a0220550249e86f6fd44402f5016d1884e0259ff901c",
+      "mtime_ns": 1793668793815408240,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/copy-probe-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/single-stream-minimal-m8-nodead.jsonl",
+      "bytes": 11014,
+      "sha256": "d11ede7dbf0c40781312c0b54b8888eda82d1fdc7a6447022a06255962f4eece",
+      "mtime_ns": 1793669190432828275,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/single-stream-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-minimal-m8-nodead.jsonl",
+      "bytes": 1095,
+      "sha256": "5d210b18b15f97ce4bab8de8efd3684f82807b658d9a1b567122172b63f837d3",
+      "mtime_ns": 1793669190559828451,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-c8-minimal-m8-nodead.jsonl",
+      "bytes": 1164,
+      "sha256": "c2a9aa9b25ac5f5f9ad296a4c28e693635a2401983d415776b933276995169ac",
+      "mtime_ns": 1793669342261050419,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-c8-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/reads-c16-minimal-m8-nodead.jsonl",
+      "bytes": 1371,
+      "sha256": "cfc2c276fb769c7289429693dcc1d8ee99a6d7bef07775760973488e7464e6a3",
+      "mtime_ns": 1793669641507774159,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/reads-c16-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c8-distinct-minimal-m8-nodead.jsonl",
+      "bytes": 620,
+      "sha256": "d9813dd63f894c6b4179fab7f24e7c8b023e50c599182cff64a9a9b10ef12959",
+      "mtime_ns": 1793669342119050200,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c8-distinct-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c16-distinct-minimal-m8-nodead.jsonl",
+      "bytes": 632,
+      "sha256": "1beb26adfbd04fcfef6d16d974415a405fc3ec06d870061d05ccd3df35caba6f",
+      "mtime_ns": 1793669641358772691,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c16-distinct-minimal-m8-nodead.jsonl"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp5.log",
+      "bytes": 414156,
+      "sha256": "2b0159df277f19d9c854a2785a01c2b1c15f91ba22858f38ebd4cbd93537e66c",
+      "mtime_ns": 1793668603236340079,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp5.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp6.log",
+      "bytes": 163939,
+      "sha256": "a0e912ef90e4d7fac16117053e77d93e8f450a44ac4792c59486c05816234859",
+      "mtime_ns": 1793668603260593632,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp6.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp7.log",
+      "bytes": 297879,
+      "sha256": "987cc724e958aeb708fda83f7979113ba84fbb55357e58a9ba3ee869cf815b27",
+      "mtime_ns": 1793668603284772705,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c8-distinct-c37-m8-nodead.jsonl.engine-sp7.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp5.log",
+      "bytes": 414156,
+      "sha256": "2b0159df277f19d9c854a2785a01c2b1c15f91ba22858f38ebd4cbd93537e66c",
+      "mtime_ns": 1793668603538054025,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp5.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp6.log",
+      "bytes": 163939,
+      "sha256": "a0e912ef90e4d7fac16117053e77d93e8f450a44ac4792c59486c05816234859",
+      "mtime_ns": 1793668603559014810,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp6.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp7.log",
+      "bytes": 297879,
+      "sha256": "987cc724e958aeb708fda83f7979113ba84fbb55357e58a9ba3ee869cf815b27",
+      "mtime_ns": 1793668603586489642,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/determinism/shared-budget-repro-sp/c16-distinct-c37-m8-nodead.jsonl.engine-sp7.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/lab-repro.json",
+      "bytes": 1298,
+      "sha256": "b9abebc60d7a667dff3cbf42cf1602fc0b6ecbe5ac54d732666f3035d0f08b37",
+      "mtime_ns": 1793667917028155017,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/lab-repro.json"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/arm-c37-m8-nodead.json",
+      "bytes": 1591,
+      "sha256": "866ba2ae9095620265ab25c24ec11b2f144039d0e881b65a87dfcc5346376fb1",
+      "mtime_ns": 1793667917028155017,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/arm-c37-m8-nodead.json"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/arm-minimal-m8-nodead.json",
+      "bytes": 1551,
+      "sha256": "544e68697909857ac3d8c59fa375717ef0adc24456b8f7fce8af8c0aec12bcc1",
+      "mtime_ns": 1793667917028155017,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/arm-minimal-m8-nodead.json"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/suite_single_stream.py",
+      "bytes": 1144,
+      "sha256": "fcacc431fa1925ce26bbfdce73ce2c63aa1418b934b4cd4e51afcfebe26325fc",
+      "mtime_ns": 1793667917030059518,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/suite_single_stream.py"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/limit_reads_logs.py",
+      "bytes": 2211,
+      "sha256": "9946f828512eb36d04d50c2abc5558840a00e926bf9497a1ceb09bdcc5947730",
+      "mtime_ns": 1793667917028155017,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/limit_reads_logs.py"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/overlay/limit-reads/vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+      "bytes": 15155,
+      "sha256": "b2311ee1349f4cb62bd8752bedb52347bd5ab7304ca651ee5a7d9867a66e6b44",
+      "mtime_ns": 1793667917028722693,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/overlay/limit-reads/vllm/v1/worker/gpu/spec_decode/copy_drafts.py"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/experiments/2026-11-03-copy-drafter-shared-budget/overlay/minimal-crc/vllm/v1/worker/gpu/model_runner.py",
+      "bytes": 176021,
+      "sha256": "bdb68254f3248a4b9e06ebcd50c2465517faa49158774fcf455a1bbb3925f1e0",
+      "mtime_ns": 1793667917029161779,
+      "local_path": "results/private/copy-fault-forensics/sp5/experiments/2026-11-03-copy-drafter-shared-budget/overlay/minimal-crc/vllm/v1/worker/gpu/model_runner.py"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/lab/queue-860.log",
+      "bytes": 44263,
+      "sha256": "f37f759d223ba910fe5f15da8f8ad778a4b662945fb4ee834065d2c0da851c8c",
+      "mtime_ns": 1793670761256562470,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/lab/queue-860.log"
+    },
+    {
+      "source_path": "/home/chris/projects/spark-ds41f/results/private/lab/overlays-shared-budget-repro-sp.txt",
+      "bytes": 154,
+      "sha256": "bad6a0a54e3ccc9effe4b0eb73fc6b13ab83fbe240d57452c013ac2e8c5db641",
+      "mtime_ns": 1793668604376437126,
+      "local_path": "results/private/copy-fault-forensics/sp5/results/private/lab/overlays-shared-budget-repro-sp.txt"
+    }
+  ],
+  "missing_requested_artifacts": [],
+  "sp8_readonly_inventory": {
+    "local_path": "results/private/copy-fault-forensics/sp8-readonly-inventory.json",
+    "sha256": "5e746c416eebefa1001ad9c893195bdc228c3d9b8dc67b0f69e1da176aaeb44f",
+    "image_id": "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+    "vllm_patch_head": "5b7cfa37fee42f96bfafbe09b7d30e8c0eda8575",
+    "vllm_tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "compute_sanitizer_version": "2025.3.1.0 (build 36400806)",
+    "gpu_process_query_returncode": 0,
+    "gpu_process_query_stdout": ""
+  },
+  "limits": [
+    "Raw receipts are ignored local files and are not embedded in this tracked manifest.",
+    "Source queue log is a snapshot of an active file, hashed over the captured bytes.",
+    "No producer, memory error or rank divergence at the failing step has been established by this collection."
+  ]
+}

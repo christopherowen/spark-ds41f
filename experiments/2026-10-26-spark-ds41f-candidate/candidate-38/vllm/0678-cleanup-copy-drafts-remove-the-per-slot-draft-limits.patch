@@ -1,0 +1,591 @@
+From 88982f34ed34cced53ae4ce54b1b9a9befd4fa66 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:47:49 +0000
+Subject: [PATCH 678/687] cleanup(copy-drafts): remove the per-slot draft limits
+ nothing reads
+
+Base: the previous commit (the budget without host draft limits), on
+candidate-37's patch head 5b7cfa37f.
+
+Rationale: once the adaptive budget reads no host draft limits, nothing reads
+the per-slot draft limits at all. This removes them:
+- CopyDrafter's host mirror (slot_draft_limits), its staging ring and event,
+  sync_slot_draft_limits, and add_request's reset of the mirror (with the
+  resets it replayed over a later copy);
+- the limits' copy in AsyncOutput.attach_copy_draft_alloc;
+- the device buffer and copy_alloc's write of it (tilelang_copy);
+- AdaptiveVerificationManager's slot_draft_limits argument, and the runner's
+  None for it.
+The asynchronous delivery of the allocation to the scheduler (the alloc ring,
+its events and attach_copy_draft_alloc) is unchanged.
+
+Quality: no change to any step. The budget already took the scheduler's
+drafts, and no kernel read the device limits. copy_alloc writes one value less
+per request, and the host does one event query and copy less per step.
+
+Tests: test_copy_drafts.py and test_adaptive_verification.py lose the
+assertions on the removed limits. The stale-wide test keeps its placeholder
+and doubling checks; its sync_slot_draft_limits check goes, as the read is
+gone. test_slot_draft_limits_cap_stale_wide_scheduled_drafts becomes
+test_the_budget_takes_the_schedulers_drafts, and the two-rank test keeps its
+equal budgets. In candidate-37's image, test_copy_drafts.py,
+test_copy_drafts_scheduler.py, test_adaptive_verification.py and
+test_prepare_kernels.py give 79 passed, 1 skipped (the two-GPU test), as with
+the previous commit alone.
+
+Upstream status: local (spark-ds41f). Prepared as a separate commit and not
+measured: the experiment measures the previous commit alone.
+---
+ .../spec_decode/test_adaptive_verification.py | 18 ++--
+ tests/v1/spec_decode/test_copy_drafts.py      | 87 +++++--------------
+ vllm/v1/worker/gpu/async_utils.py             |  9 --
+ vllm/v1/worker/gpu/model_runner.py            |  6 --
+ .../gpu/spec_decode/adaptive_verification.py  | 15 +---
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py | 58 ++-----------
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 11 +--
+ 7 files changed, 46 insertions(+), 158 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 75080c8b8..8ea5b6045 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -709,29 +709,27 @@ def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
+     assert observed_rejected.tolist() == [0, 1, 0]
+ 
+ 
+-def test_slot_draft_limits_cap_stale_wide_scheduled_drafts():
++def test_the_budget_takes_the_schedulers_drafts():
+     # Step t reported alloc=16 and planned_confidences[0:16]=0.95, so the
+-    # scheduler laid out 16 draft placeholders for Step t+2. When Step t+1
+-    # rejects the copy and falls back to DSpark (5 valid drafts, columns 5:16
+-    # zero-padded), slot_draft_limits[slot]=5 caps Step t+2's eligible drafts to
+-    # 5 so zero-padded slots are never budgeted or verified.
++    # scheduler laid out 16 draft placeholders for Step t+2. Whatever Step t+1
++    # proposes, the budget takes the scheduler's 16 (the rows past a narrower
++    # proposal verify its -1 placeholders, which verification rejects): no rank's
++    # own view of the latest proposal enters the step's layout.
+     manager = make_manager(
+         np.full((2, 16), 0.95, dtype=np.float32),
+         row_cost=0.02,
+     )
+     manager.num_draft_steps = 5
+-    limits = np.array([5, 16], dtype=np.int32)
+-    manager._slot_draft_limits = lambda: limits
+ 
+     tokens = manager.get_num_tokens(
+         {"low": 17},
+         {"low": [-1] * 16},
+     )
+     valid_drafts, num_non_draft_tokens, draft_budget = manager._batch_budget
+-    assert valid_drafts == {"low": 5}
++    assert valid_drafts == {"low": 16}
+     assert num_non_draft_tokens == {"low": 1}
+-    assert draft_budget == 5
+-    assert tokens == 6
++    assert draft_budget == 16
++    assert tokens == 17
+ 
+ 
+ def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes(
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index 19a7d4604..9191a210f 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -635,9 +635,8 @@ def test_a_slot_starts_afresh_with_each_request():
+     assert int(drafter.alloc[0]) == 2 * INITIAL
+ 
+ 
+-def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
+-    """prepare_alloc computes the same alloc as propose before DSpark runs and
+-    writes each slot's valid draft count to slot_draft_limits."""
++def test_prepare_alloc_matches_propose():
++    """prepare_alloc computes the same alloc as propose before DSpark runs."""
+     rng = np.random.default_rng(7)
+     states = _request_state(8192)
+     drafter = _drafter(states)
+@@ -658,8 +657,6 @@ def test_prepare_alloc_matches_propose_and_updates_slot_draft_limits():
+     )
+     drafter.prepare_alloc(idx, one, zero, None)
+     early_alloc = drafter.alloc[:2].clone()
+-    assert int(drafter.slot_draft_limits.gpu[slot_copy]) == INITIAL
+-    assert int(drafter.slot_draft_limits.gpu[slot_prose]) == BLOCK
+ 
+     drafts, confidences, planned = drafter.propose(
+         idx, *dspark, one, zero, None, matched=True
+@@ -851,18 +848,16 @@ def test_prepare_alloc_skips_incomplete_prefill_requests():
+     assert int(drafter.int_state[s0, 1]) == INITIAL
+     assert int(drafter.int_state[s1, 1]) == 0
+     assert int(drafter.alloc[1]) == BLOCK
+-    assert int(drafter.slot_draft_limits.gpu[s1]) == BLOCK
+     assert drafts[1, :BLOCK].tolist() == dspark_drafts[1].tolist()
+     assert drafts[1, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
+     torch.testing.assert_close(confs[1, :BLOCK], dspark_conf[1])
+ 
+ 
+-def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync():
++def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap():
+     """When async scheduling allocates 16 draft rows from 2 steps back while the
+     previous step only offered 8 copy drafts, columns 8..15 are -1 placeholders
+-    (rejected even when the target argmax is token 0), accepting all 8 valid
+-    copy drafts still doubles the cap to 16, and sync_slot_draft_limits never
+-    calls synchronize() on an in-flight CUDA event."""
++    (rejected even when the target argmax is token 0), and accepting all 8 valid
++    copy drafts still doubles the cap to 16."""
+     rng = np.random.default_rng(19)
+     states = _request_state(8192)
+     drafter = _drafter(states)
+@@ -900,43 +895,19 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_
+     num_sampled = torch.tensor([INITIAL + 1], dtype=torch.int32, device=DEVICE)
+     verified = torch.tensor([LOOKAHEAD], dtype=torch.int32, device=DEVICE)
+     drafter.prepare_alloc(idx, num_sampled, verified, None)
+-    assert int(drafter.slot_draft_limits.gpu[slot]) == 2 * INITIAL
+     _, _, _ = drafter.propose(
+         idx, dspark_drafts, dspark_conf, num_sampled, verified, None, matched=True
+     )
+     assert int(drafter.int_state[slot, 0]) == 1
+     assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
+ 
+-    # In-flight event: sync_slot_draft_limits queries without synchronizing.
+-    class InFlightEvent:
+-        def query(self) -> bool:
+-            return False
+-
+-        def synchronize(self) -> None:
+-            raise AssertionError("sync_slot_draft_limits must not block on GPU")
+-
+-    drafter._limits_event = InFlightEvent()  # type: ignore[assignment]
+-    limits = drafter.sync_slot_draft_limits()
+-    assert limits.shape == (MAX_REQS,)
+-
+ 
+ # --- The shared budget: what every rank holds alike -------------------------------
+ 
+ 
+-class _InFlightEvent:
+-    """A limit copy that has not landed: the host keeps the previous limits."""
+-
+-    def query(self) -> bool:
+-        return False
+-
+-    def synchronize(self) -> None:
+-        raise AssertionError("sync_slot_draft_limits must not block on GPU")
+-
+-
+-def _manager(states, drafter, *, host_limits: bool):
++def _manager(states):
+     """The adaptive verification manager as the runner builds it beside a copy
+-    drafter: without host limits (``slot_draft_limits=None``), or, candidate-37's
+-    wiring, with the drafter's non-blocking host limits. One rank."""
++    drafter. One rank."""
+     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+         AdaptiveVerificationManager,
+     )
+@@ -949,17 +920,16 @@ def _manager(states, drafter, *, host_limits: bool):
+         row_cost=0.035,
+         planned_confidences=True,
+         num_draft_steps=BLOCK,
+-        slot_draft_limits=drafter.sync_slot_draft_limits if host_limits else None,
+     )
+     manager.dead_rows_tau = 0.0
+     return manager
+ 
+ 
+-def _one_rank(host_limits: bool, landed: bool):
++def _one_rank():
+     """One rank after the step that proposed a copy for "copy" (its history repeats)
+     and DSpark's block for "prose", budgeting the next step, which the scheduler
+     laid out at 16 rows for the copy (an earlier allocation) and the block for the
+-    other. Its limit copy has ``landed`` or is still in flight."""
++    other."""
+     from types import SimpleNamespace
+ 
+     rng = np.random.default_rng(3)
+@@ -969,7 +939,7 @@ def _one_rank(host_limits: bool, landed: bool):
+     }
+     states = _request_state(8192)
+     drafter = _drafter(states)
+-    manager = _manager(states, drafter, host_limits=host_limits)
++    manager = _manager(states)
+     slots = [_set_history(states, req_id, h) for req_id, h in histories.items()]
+     for slot in slots:
+         states.num_computed_tokens_np[slot] = 96
+@@ -989,10 +959,6 @@ def _one_rank(host_limits: bool, landed: bool):
+     batch = SimpleNamespace(num_reqs=2, idx_mapping=idx)
+     for _ in range(2):  # the budget reads the snapshot of the record before last
+         manager.record_confidences(confidences, batch, planned=planned)
+-    if landed:
+-        drafter.slot_draft_limits.np[:] = drafter.slot_draft_limits.gpu.cpu().numpy()
+-    else:
+-        drafter._limits_event = _InFlightEvent()  # type: ignore[assignment]
+     num_tokens = manager.get_num_tokens(
+         {"copy": 1 + LOOKAHEAD, "prose": 1 + BLOCK},
+         {"copy": [-1] * LOOKAHEAD, "prose": [-1] * BLOCK},
+@@ -1003,7 +969,7 @@ def _one_rank(host_limits: bool, landed: bool):
+     )
+     torch.accelerator.synchronize()
+     return SimpleNamespace(
+-        limits=drafter.slot_draft_limits.gpu[idx].tolist(),
++        offered=drafter.int_state[idx, 1].tolist(),
+         num_tokens=num_tokens,
+         eligible=eligible,
+         budget=budget,
+@@ -1012,13 +978,11 @@ def _one_rank(host_limits: bool, landed: bool):
+     )
+ 
+ 
+-def test_ranks_budget_alike_whenever_their_limit_copies_land(monkeypatch):
+-    """Two tensor-parallel ranks hold the same histories, proposals and confidence
+-    snapshot, but one's limit copy has landed when it budgets and the other's is in
+-    flight. Without host limits they budget the same step, the same drafts per
+-    request and the same device layout. With them (candidate-37's wiring) the
+-    landed rank caps the copy at its 8 drafts and the other at the stale 16, and
+-    the two lay out different steps."""
++def test_ranks_budget_the_schedulers_drafts_alike(monkeypatch):
++    """The budget reads the scheduler's drafts and the confidence snapshot, which
++    every tensor-parallel rank holds alike, and no state of a rank's own: a copy
++    that offers 8 drafts in a step laid out for 16 is budgeted at the 16, and two
++    ranks budget the same step, drafts per request and device layout."""
+     from types import SimpleNamespace
+ 
+     from vllm.v1.worker.gpu.spec_decode import adaptive_verification
+@@ -1026,17 +990,11 @@ def test_ranks_budget_alike_whenever_their_limit_copies_land(monkeypatch):
+     monkeypatch.setattr(
+         adaptive_verification, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+     )
+-    landed, in_flight = _one_rank(False, True), _one_rank(False, False)
+-    assert landed.limits == in_flight.limits == [INITIAL, BLOCK]
+-    assert landed.eligible == in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
++    first, second = _one_rank(), _one_rank()
++    assert first.offered == second.offered == [INITIAL, 0]
++    assert first.eligible == second.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
+     for field in ("num_tokens", "budget", "query_start_loc", "cu_num_logits"):
+-        assert getattr(landed, field) == getattr(in_flight, field), field
+-
+-    landed, in_flight = _one_rank(True, True), _one_rank(True, False)
+-    assert landed.eligible == {"copy": INITIAL, "prose": BLOCK}
+-    assert in_flight.eligible == {"copy": LOOKAHEAD, "prose": BLOCK}
+-    assert landed.num_tokens != in_flight.num_tokens
+-    assert landed.query_start_loc != in_flight.query_start_loc
++        assert getattr(first, field) == getattr(second, field), field
+ 
+ 
+ def _decode_with_shared_budget(states, drafter, manager, target, req_id, prompt, count):
+@@ -1084,7 +1042,8 @@ def _decode_with_shared_budget(states, drafter, manager, target, req_id, prompt,
+         states.draft_tokens[idx] = drafts
+         manager.record_confidences(confidences, batch, planned=planned)
+         reported.append(int(drafter.alloc[0]))
+-        return int(drafter.slot_draft_limits.gpu[slot])
++        # The proposal's drafts: a copy's offered ones, else DSpark's block.
++        return int(drafter.int_state[slot, 1]) or BLOCK
+ 
+     width = propose()
+     while len(out) < count:
+@@ -1136,7 +1095,7 @@ def test_verification_through_copy_growth_shrinkage_and_slot_reuse(monkeypatch):
+     rng = np.random.default_rng(13)
+     states = _request_state(8192)
+     drafter = _drafter(states)
+-    manager = _manager(states, drafter, host_limits=False)
++    manager = _manager(states)
+ 
+     def prompt_for(target):
+         """R, t, Y, R: with the token the prefill samples (t again, an order-2
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index a617e8623..40f29c650 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -216,11 +216,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         copy_draft_alloc: Any,
+         copy_stream: torch.cuda.Stream,
+         main_stream: torch.cuda.Stream,
+-        slot_draft_limits: Any = None,
+         *,
+         num_reqs: int | None = None,
+-        slot_draft_limits_gpu: torch.Tensor | None = None,
+-        slot_draft_limits_cpu: torch.Tensor | None = None,
+         alloc_event: torch.cuda.Event | None = None,
+     ) -> None:
+         """Copy the copy drafter's per-request allocation (``[num_reqs]`` int32),
+@@ -239,18 +236,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                 copy_stream.wait_stream(main_stream)
+                 copy_draft_alloc.copy_to_cpu(n)
+                 self.copy_draft_alloc_np = copy_draft_alloc.np[:n]
+-                if slot_draft_limits_gpu is not None and slot_draft_limits_cpu is not None:
+-                    slot_draft_limits_cpu.copy_(slot_draft_limits_gpu, non_blocking=True)
+-                elif slot_draft_limits is not None:
+-                    slot_draft_limits.copy_to_cpu()
+                 self.copy_draft_alloc_event.record(copy_stream)
+             return
+         self.copy_draft_alloc = copy_draft_alloc.clone()
+         with stream(copy_stream, main_stream):
+             copy_stream.wait_stream(main_stream)
+             self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
+-            if slot_draft_limits is not None:
+-                slot_draft_limits.copy_to_cpu()
+             self.copy_draft_alloc_event.record(copy_stream)
+ 
+     def get_output(self) -> ModelRunnerOutput:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c49fef168..36f419dde 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -830,12 +830,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+             planned_confidences=self.copy_drafter is not None,
+-            # No host draft limits: each rank's non-blocking mirror of them may
+-            # still hold an older proposal's, so the budget, and with it the step's
+-            # layout, would depend on the rank and on when the copy landed (#852).
+-            # It reads what every rank holds alike: the scheduler's drafts and the
+-            # confidence snapshot (synchronized, and broadcast from rank 0).
+-            slot_draft_limits=None,
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 13c923ca7..525722439 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -87,7 +87,6 @@ class AdaptiveVerificationManager:
+         row_cost: float,
+         planned_confidences: bool = False,
+         num_draft_steps: int | None = None,
+-        slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+         *,
+         tp_invariant_confidence: bool = False,
+     ):
+@@ -95,7 +94,6 @@ class AdaptiveVerificationManager:
+         self.num_speculative_steps = req_states.num_speculative_steps
+         self.num_draft_steps = num_draft_steps or self.num_speculative_steps
+         self.step_steps = self.num_speculative_steps
+-        self._slot_draft_limits = slot_draft_limits
+         device = req_states.device
+         self._copy_stream = torch.cuda.Stream(device)
+ 
+@@ -303,13 +301,10 @@ class AdaptiveVerificationManager:
+             dtype=np.int32,
+             count=len(req_ids),
+         )
+-        slot_limits = getattr(self, "_slot_draft_limits", None)
+-        if callable(slot_limits):
+-            slot_limits = slot_limits()
+-        if slot_limits is not None:
+-            eligible_drafts = np.minimum(scheduled_drafts, slot_limits[slots])
+-        else:
+-            eligible_drafts = scheduled_drafts
++        # The scheduler's drafts, not a rank's own view of the latest proposal:
++        # the budget reads only what every rank holds alike (these and the
++        # confidence snapshot), so every rank lays out the same step (#852).
++        eligible_drafts = scheduled_drafts
+         num_draft_steps = getattr(self, "num_draft_steps", self.num_speculative_steps)
+         step_steps = (
+             num_draft_steps
+@@ -516,7 +511,6 @@ def maybe_create_adaptive_verification_manager(
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+     planned_confidences: bool = False,
+-    slot_draft_limits: Callable[[], np.ndarray] | np.ndarray | None = None,
+     tp_invariant_confidence: bool = False,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+@@ -592,7 +586,6 @@ def maybe_create_adaptive_verification_manager(
+             None,
+         )
+         or None,
+-        slot_draft_limits=slot_draft_limits,
+         tp_invariant_confidence=tp_invariant_confidence,
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index d6a2c30b6..aeab41846 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -25,7 +25,6 @@ envelope), and the planned confidences the budget reads at that step.
+ 
+ from typing import Any
+ 
+-import numpy as np
+ import torch
+ 
+ from vllm.config.speculative import CopyDraftsConfig
+@@ -78,47 +77,22 @@ class CopyDrafter:
+         )
+         self.planned = torch.zeros_like(self.confidences)
+         # Ring of pre-allocated buffers and events for async output delivery of
+-        # alloc and slot_draft_limits without per-step tensor or event allocation.
++        # alloc without per-step tensor or event allocation.
+         self._ring_size = 3
+         self._ring_idx = 0
+         self._alloc_buffers = [
+             CpuGpuBuffer(max_reqs, dtype=torch.int32, device=device)
+             for _ in range(self._ring_size)
+         ]
+-        self._limits_staging = [
+-            CpuGpuBuffer(max_reqs, dtype=torch.int32, device=device)
+-            for _ in range(self._ring_size)
+-        ]
+-        for buf in self._limits_staging:
+-            buf.np.fill(self.lookahead)
+         self._ring_events = [
+             torch.cuda.Event(blocking=True) for _ in range(self._ring_size)
+         ]
+         self.alloc = self._alloc_buffers[0].gpu
+         self._select_alloc = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+-        # Actual valid draft count per slot from the latest proposal, mirrored to
+-        # host non-blockingly so the adaptive budget caps stale wide schedules.
+-        self.slot_draft_limits = CpuGpuBuffer(
+-            max_reqs, dtype=torch.int32, device=device
+-        )
+-        self.slot_draft_limits.np.fill(self.lookahead)
+-        self.slot_draft_limits.gpu.fill_(self.lookahead)
+-        self._limits_event: torch.cuda.Event | None = None
+-        self._limits_staging_np: np.ndarray = self._limits_staging[0].np
+-        self._pending_limit_resets: list[int] = []
+         # A step that verified no drafts: nothing to judge.
+         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         self._new_rows: list[int] = []
+ 
+-    def sync_slot_draft_limits(self) -> np.ndarray:
+-        if self._limits_event is not None and self._limits_event.query():
+-            np.copyto(self.slot_draft_limits.np, self._limits_staging_np)
+-            if self._pending_limit_resets:
+-                self.slot_draft_limits.np[self._pending_limit_resets] = self.lookahead
+-                self._pending_limit_resets.clear()
+-            self._limits_event = None
+-        return self.slot_draft_limits.np
+-
+     def register_warmups(self) -> None:
+         """Declare the copy kernels and the copy state's reset."""
+         tilelang_inputs.declare(
+@@ -132,9 +106,6 @@ class CopyDrafter:
+         )
+ 
+     def add_request(self, req_idx: int) -> None:
+-        self.sync_slot_draft_limits()[req_idx] = self.lookahead
+-        if self._limits_event is not None:
+-            self._pending_limit_resets.append(req_idx)
+         self._new_rows.append(req_idx)
+ 
+     def apply_staged_writes(self) -> None:
+@@ -146,9 +117,6 @@ class CopyDrafter:
+             )
+             tilelang_inputs.fill_rows(rows, self.int_state, 0)
+             tilelang_inputs.fill_rows(rows, self.float_state, 0.0)
+-            tilelang_inputs.fill_rows(
+-                rows, self.slot_draft_limits.gpu[:, None], self.lookahead
+-            )
+             self._new_rows.clear()
+ 
+     def prepare_alloc(
+@@ -160,10 +128,9 @@ class CopyDrafter:
+         *,
+         match_idx_mapping: torch.Tensor | None = None,
+     ) -> None:
+-        """Match the batch's updated histories and write ``alloc[:num_reqs]`` and
+-        ``slot_draft_limits.gpu`` before the drafter runs, so the async output
+-        copy does not wait behind the drafter."""
+-        self.sync_slot_draft_limits()
++        """Match the batch's updated histories and write ``alloc[:num_reqs]``
++        before the drafter runs, so the async output copy does not wait behind the
++        drafter."""
+         self._ring_idx = (self._ring_idx + 1) % self._ring_size
+         self.alloc = self._alloc_buffers[self._ring_idx].gpu
+         num_reqs = idx_mapping.shape[0]
+@@ -188,7 +155,6 @@ class CopyDrafter:
+             verified if dead_row_cut is None else dead_row_cut,
+             self.int_state,
+             self.alloc[:num_reqs],
+-            self.slot_draft_limits.gpu,
+             self.min_match,
+             self.lookahead,
+             self.num_draft_steps,
+@@ -202,24 +168,16 @@ class CopyDrafter:
+         copy_stream: torch.cuda.Stream,
+         main_stream: torch.cuda.Stream,
+     ) -> None:
+-        """Queue async D2H copy of this step's ``alloc`` and ``slot_draft_limits``
+-        using pre-allocated ring buffers and events."""
++        """Queue async D2H copy of this step's ``alloc`` using pre-allocated ring
++        buffers and events."""
+         idx = self._ring_idx
+-        alloc_buf = self._alloc_buffers[idx]
+-        limits_staging = self._limits_staging[idx]
+-        event = self._ring_events[idx]
+         async_output.attach_copy_draft_alloc(
+-            alloc_buf,
++            self._alloc_buffers[idx],
+             copy_stream,
+             main_stream,
+             num_reqs=num_reqs,
+-            slot_draft_limits_gpu=self.slot_draft_limits.gpu,
+-            slot_draft_limits_cpu=limits_staging.cpu,
+-            alloc_event=event,
++            alloc_event=self._ring_events[idx],
+         )
+-        self._limits_staging_np = limits_staging.np
+-        self._limits_event = event
+-        self._pending_limit_resets.clear()
+ 
+     def propose(
+         self,
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 6a4df890e..a27f6a477 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -284,7 +284,7 @@ def copy_alloc_kernel(
+     initial: int,
+     idx_dtype: str,
+ ):
+-    """The copy allocation and per-slot valid draft count before the drafter runs."""
++    """The copy allocation before the drafter runs."""
+     count = num_levels(min_match)
+     num_reqs = T.dynamic("num_reqs")
+     total_rows = T.dynamic("total_rows")
+@@ -300,7 +300,6 @@ def copy_alloc_kernel(
+         cut: T.Tensor((num_reqs,), T.int32),
+         int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
+         alloc: T.Tensor((num_reqs,), T.int32),
+-        slot_limits: T.Tensor((state_rows,), T.int32),
+     ):
+         with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
+             tx = T.get_thread_binding()
+@@ -324,12 +323,10 @@ def copy_alloc_kernel(
+                         )
+                 cap = T.min(T.int32(initial) << doublings, lookahead)
+                 distance = total_len[slot] - source
+-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+                 after = T.if_then_else(
+                     source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+                 )
+                 alloc[r] = T.max(after, block)
+-                slot_limits[slot] = T.if_then_else(source >= 0, offered, block)
+ 
+     return copy_alloc
+ 
+@@ -353,14 +350,13 @@ def copy_alloc(
+     cut: torch.Tensor,
+     int_state: torch.Tensor,
+     alloc: torch.Tensor,
+-    slot_limits: torch.Tensor,
+     min_match: int,
+     lookahead: int,
+     block: int,
+     initial: int,
+ ) -> None:
+-    """``alloc[:num_reqs]`` and ``slot_limits[idx_mapping]`` from ``sources`` and
+-    the current copy state (read-only), before the drafter proposes."""
++    """``alloc[:num_reqs]`` from ``sources`` and the current copy state
++    (read-only), before the drafter proposes."""
+     num_reqs = idx_mapping.shape[0]
+     if not num_reqs:
+         return
+@@ -374,7 +370,6 @@ def copy_alloc(
+         cut,
+         int_state,
+         alloc,
+-        slot_limits,
+     )
+ 
+ 
+-- 
+2.43.0
+
