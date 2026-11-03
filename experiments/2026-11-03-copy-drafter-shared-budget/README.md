@@ -65,6 +65,33 @@ and #859's device clamp
   made the rows past the device limit safe but kept the rank-local read. This keeps
   candidate-37's step and drops only the read.
 
+**Which mechanism: the operator's report.** This is their report, not our
+measurement
+([#855, comment 6592146119](https://github.com/christopherowen/spark-ds41f/pull/855#issuecomment-6592146119),
+2026-11-03 00:32Z). It points at the per-rank layout rather than placeholder rows
+routed live.
+- Their crashing ring2 candidate-37 arm ran with
+  `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`:
+  - inherited from `releases/spark-ds41f-1030/cluster.json`;
+  - confirmed in the live ring2 container's environment;
+  - no ring2 candidate-37 arm had it unset.
+
+  The crashed boot's own environment was not captured.
+- At 0.2 the dead-row gate makes placeholder rows padding, which the router skips.
+  So live placeholders should not have reached the gate's assert, yet the arm
+  crashed.
+- Their `-1` → `0` control, valid ids in those rows, still crashed.
+- Both fit ranks that laid out different steps: rows summed across ranks that hold
+  different tokens. Neither fits a live placeholder row.
+- They withdraw their device-clamp speedup reading (159.90 against 126.05 tok/s:
+  two boots, not paired). They call their patch 0004 a precursor.
+
+The caveat: no per-rank diagnostic has run on an unfixed arm, on their ring or ours.
+That run would settle it, and it is `lab-repro.json`'s first arm (`c37-m8-nodead`,
+whose counter logs a per-rank CRC of the budget reads that changed eligible drafts).
+They have offered a paired run on ring2 in a window, which would add a second
+topology.
+
 ## Quality implications
 
 - **More placeholder rows.** The budget may verify more rows than the latest
@@ -75,8 +102,9 @@ and #859's device clamp
   - With dead rows on (the recipe's `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`) they have
     confidence 0 and are padding, which the router skips.
   - **With dead rows off they are routed live**, more often than on candidate-37,
-    which routed them only on a stale read. If live placeholder rows are what
-    produce #852's non-finite gate logits, `minimal-m8-nodead` will show it.
+    which routed them only on a stale read. The operator's report (*Rationale*) says
+    their crash happened with dead rows on, which argues against live placeholders
+    as the cause. If they are a cause anyway, `minimal-m8-nodead` will show it.
   - The extra rows cost compute on the steps after a copy shrinks. The cost spec
     measures it.
 - **Stale narrow limits no longer drop drafts.** On sp5–sp7, #856's run had
@@ -290,6 +318,9 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-cost.js
 - **Rank agreement on real ranks:** the unit test simulates two ranks on one GPU;
   sp8 has one GPU, so the two-GPU test skips. The repro's per-rank CRCs are the
   first multi-rank evidence.
+- **The mechanism:** the operator's report favours the per-rank layout, but no
+  per-rank diagnostic has run on an unfixed arm (`c37-m8-nodead` here; ring2 on
+  their offer).
 - **Whether live placeholder rows produce non-finite logits** on our cluster, with
   dead rows off. `minimal-m8-nodead` shows it.
 - **Patch 2** is unit-tested only. It is not measured and not in any arm.
