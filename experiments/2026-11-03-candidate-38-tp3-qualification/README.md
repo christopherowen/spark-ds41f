@@ -134,3 +134,6 @@ its original 17:33:45 UTC start. It used only the two large sizes. The generator
 seeds documents by size index, so its indices 0/1 select different documents
 from the full suite's indices 3/4. These points are token-rate comparisons over
 nearby lengths rather than exact prompt matches.
+The standalone extension also lacks its own all-rank deployment identity and
+conditions block; the earlier suite's metadata does not establish these for the
+later measurement. Preserve that provenance limit when using the two points.
