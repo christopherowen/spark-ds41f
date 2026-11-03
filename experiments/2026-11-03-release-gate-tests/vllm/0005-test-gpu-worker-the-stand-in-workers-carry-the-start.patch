@@ -1,0 +1,91 @@
+From 2e975048a97dece92b4e5f0ba5879942fa842be4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 5/6] test(gpu-worker): the stand-in workers carry the startup
+ and collective hooks
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: four tests build Worker stand-ins (SimpleNamespace) that lacked what
+the worker reads around the code under test, and failed at the first read,
+_roce_failure:
+
+- execute_model, determine_available_memory and compile_or_warm_up_model run
+  under _collective_cause(self._roce_failure), which names a stopped one-shot
+  collective as an error's cause (dfb93679e, aaebbf88d): every stand-in gets
+  _roce_failure=lambda: None, no failure to report.
+- determine_available_memory delegates to _determine_available_memory
+  (aaebbf88d), which prepares the kernels and meets the ranks before profiling
+  (_prepare_kernels, _startup_rendezvous; 63f390bc7, dfb93679e):
+  test_cudagraph_memory_profile_prepares_and_releases_b12x_state binds the
+  worker's _determine_available_memory to its stand-in (as the warm-up tests
+  bind _compile_or_warm_up_model_after_preparation) and gives it no-op
+  preparation and rendezvous.
+- the warm-up meets the ranks after kernel_warmup and stops the startup
+  heartbeat at its end (63f390bc7): test_post_capture_recommendation_counts_
+  measured_graph_memory_once and test_serving_thread_count_is_set_before_warmup
+  get _startup_rendezvous and _startup_heartbeat=None, as
+  test_compile_or_warm_up_logs_startup_memory_breakdown (111c5be7e) already has.
+
+Quality: no runtime change; a test-only patch.
+
+Tests: tests/v1/worker/test_gpu_worker.py in spark-ds41f:candidate-38 on dgx4
+(GB10): 96 passed (was 34 passed, 62 failed).
+
+Upstream status: the file is Local Inference Lab's (LIL); the fixes follow the
+series' own changes to the worker and are not for upstream.
+---
+ tests/v1/worker/test_gpu_worker.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 28232f55b4..7ce5175399 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -499,6 +499,7 @@ def test_execute_model_waits_previous_pp_send_before_forward(
+         model_runner=SimpleNamespace(execute_model=run_model),
+         annotate_profile=lambda scheduler_output: nullcontext(),
+         _pp_send_work=[previous_tensor_send],
++        _roce_failure=lambda: None,
+     )
+     scheduler_output = SimpleNamespace(
+         total_num_scheduled_tokens=4, num_scheduled_tokens={"r0": 4}
+@@ -591,6 +592,14 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
+                 cudagraph_capture_sizes=[8, 4],
+             )
+         ),
++        # Kernel preparation and the ranks' rendezvous precede the profile; the
++        # one-shot collectives' failure report names a stopped GPU, not memory.
++        _prepare_kernels=lambda: None,
++        _startup_rendezvous=lambda phase: None,
++        _roce_failure=lambda: None,
++    )
++    worker._determine_available_memory = lambda: (
++        gpu_worker.Worker._determine_available_memory(worker)
+     )
+ 
+     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+@@ -693,6 +702,9 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
+         observability_config=SimpleNamespace(
+             jit_monitor_mode="off", jit_monitor_verbose=False
+         ),
++        _roce_failure=lambda: None,
++        _startup_rendezvous=lambda stage: None,
++        _startup_heartbeat=None,
+     )
+     saved = []
+     monkeypatch.setattr(
+@@ -751,6 +763,9 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+         observability_config=SimpleNamespace(
+             jit_monitor_mode="off", jit_monitor_verbose=False
+         ),
++        _roce_failure=lambda: None,
++        _startup_rendezvous=lambda stage: None,
++        _startup_heartbeat=None,
+     )
+     monkeypatch.setattr(
+         gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+-- 
+2.54.0 (Apple Git-157)
+

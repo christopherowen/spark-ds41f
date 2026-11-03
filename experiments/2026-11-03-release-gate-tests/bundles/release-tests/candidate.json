@@ -1,0 +1,61 @@
+{
+  "description": "Release tests (candidate-38 with the release-gate test fixes): the manifest's vLLM test files in the image, the six fixed files mounted over the image's copies; chunked with timeouts; per-test outcomes under /c/release-tests.",
+  "image": "spark-ds41f:candidate-38",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "PYTHONPATH": "/b",
+    "TILELANG_CACHE_DIR": "/c/tilelang-release-tests",
+    "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test",
+    "DIRECT_IO_TEST_DIR": "/c/direct-io-test"
+  },
+  "workdir": "vllm",
+  "io_uring": true,
+  "argv": [
+    "/b/release_test_runner.py",
+    "/b/manifest.json",
+    "/c/release-tests/candidate-38-gate-tests"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "manifest.json",
+      "/b/manifest.json"
+    ],
+    [
+      "release_test_runner.py",
+      "/b/release_test_runner.py"
+    ],
+    [
+      "tblib_stub.py",
+      "/b/tblib_stub.py"
+    ],
+    [
+      "offline_skip.py",
+      "/b/offline_skip.py"
+    ],
+    [
+      "tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py"
+    ],
+    [
+      "tests/models/test_deepseek_v4_1_engram.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_engram.py"
+    ],
+    [
+      "tests/v1/attention/test_b12x_v41_ced_metadata.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/attention/test_b12x_v41_ced_metadata.py"
+    ],
+    [
+      "tests/v1/worker/test_gpu_model_runner_v2.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_model_runner_v2.py"
+    ],
+    [
+      "tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py"
+    ],
+    [
+      "tests/v1/worker/test_gpu_worker.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_worker.py"
+    ]
+  ]
+}

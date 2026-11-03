@@ -1,0 +1,46 @@
+From e5987aaf4a0bb5a75cd148f272f52197e6ff2689 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 3/6] test(ced-metadata): give the DFlash speculator stand-in
+ its host metadata staging
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: test_dspark_compact_context_preserves_query_anchor_and_rejections
+builds a DFlashSpeculator with __new__ and sets what propose reads. #763
+(6efba0add, no redundant host work during DSpark full CUDA graph replay) made
+the speculator stage the draft attention metadata's query starts and
+sequence-length upper bounds in two host buffers that __init__ allocates
+(_query_start_loc_cpu, max_num_reqs + 1 int32; _draft_seq_lens_cpu_upper_bound,
+max_num_reqs int32), which the stand-in lacked, so propose failed at the first
+one. The stand-in now carries both, sized for its max_num_reqs of 4.
+
+Quality: no runtime change; a test-only patch.
+
+Tests: tests/v1/attention/test_b12x_v41_ced_metadata.py in
+spark-ds41f:candidate-38 on dgx4 (GB10): 39 passed (was 38 passed, 1 failed).
+
+Upstream status: not applicable; the CED metadata tests are this deployment's.
+---
+ tests/v1/attention/test_b12x_v41_ced_metadata.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 95c153bb64..f15aab4ed2 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -661,6 +661,10 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
+     proposer._group_causal = False
+     proposer.arange = torch.arange(5, dtype=torch.int32)
+     proposer.arange_np = np.arange(5, dtype=np.int32)
++    # The speculator's host staging of the draft attention metadata: query starts
++    # (max_num_reqs + 1) and sequence-length upper bounds (max_num_reqs).
++    proposer._query_start_loc_cpu = torch.zeros(5, dtype=torch.int32)
++    proposer._draft_seq_lens_cpu_upper_bound = torch.zeros(4, dtype=torch.int32)
+     proposer.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
+     proposer.idx_mapping = batch.idx_mapping
+     proposer.attn_groups = []
+-- 
+2.54.0 (Apple Git-157)
+

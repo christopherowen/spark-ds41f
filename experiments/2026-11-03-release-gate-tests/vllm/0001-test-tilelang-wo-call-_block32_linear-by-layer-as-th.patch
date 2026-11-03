@@ -1,0 +1,56 @@
+From a1a4f086db0a106fbc9c2b91bd49ebfbeee2bbc1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 1/6] test(tilelang-wo): call _block32_linear by layer, as the
+ custom-op cleanup left it
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: test_grouped_gemm_equals_groups called
+_block32_linear(x, out, layer.tilelang_key, scratch). The custom-op cleanup
+(1f3dc7c14, 2026-10-31) removed the torch.library custom op and its _LAYERS
+registry, so a layer has no tilelang_key and _block32_linear takes the layer
+itself: _block32_linear(layer, x, out, scratch). The test's eleven row counts
+failed at the attribute read, and its claim (one grouped launch gives each
+group's ordinary GEMM bit for bit) went unchecked from that commit on; it last
+passed whole at candidate-12.
+
+Quality: no runtime change; a test-only patch.
+
+Tests: tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py in
+spark-ds41f:candidate-38 on dgx4 (GB10): 16 passed (was 5 passed, 11 failed).
+
+Upstream status: not applicable; the TileLang WO projection and its tests are
+this deployment's.
+---
+ tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index a433883b46..9cecbaf153 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -140,7 +140,7 @@ def test_grouped_gemm_equals_groups(count, default_vllm_config):
+     scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
+     out = torch.empty((count, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
+     with use_preallocated_workspace(scratch):
+-        _block32_linear(x, out, grouped.tilelang_key, scratch)
++        _block32_linear(grouped, x, out, scratch)
+         for g in range(GROUPS):
+             part = nn.Module()
+             part.weight = grouped.weight[g * RANK : (g + 1) * RANK]
+@@ -151,9 +151,9 @@ def test_grouped_gemm_equals_groups(count, default_vllm_config):
+             _declare_block32(part)
+             single = torch.empty((count, RANK), dtype=torch.bfloat16, device=DEVICE)
+             _block32_linear(
++                part,
+                 x[:, g * width : (g + 1) * width].contiguous(),
+                 single,
+-                part.tilelang_key,
+                 scratch,
+             )
+             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
+-- 
+2.54.0 (Apple Git-157)
+
