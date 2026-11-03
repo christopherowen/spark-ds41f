@@ -170,6 +170,14 @@ and mean, p90 and p95 are also faster. The repeat's two slowest requests are
 adjacent indices 74/75, present in all runs, so unmatched prompts alone do not
 explain the flag. Preserve it while checking repeatability.
 
+The [archived 1030 A/A pair](runs/2026-11-03-dgx1-3/historical-1030-c4-aa/receipt.json)
+provides context: its C4 p99 is 310.59/322.91 ms (+3.97%), with the same C4
+workload and release image `7918fd61` on all three ranks. The first archived
+point's parsed JSON equals the frozen reference exactly; their serialization
+differs. Candidate 38's flagged repeat is 322.96 ms. This is one historical
+repeat pair, not a calibrated p99 confidence bound. The frozen reference and
+the candidate's original direction flag remain unchanged.
+
 `c4-tail-confirmation.json` adds two fresh boots of the identical standard
 recipe after the main standard phase, before CopyDrafter performance. Its
 `c4-tail-suite.json` copies the release suite's first four steps unchanged:
