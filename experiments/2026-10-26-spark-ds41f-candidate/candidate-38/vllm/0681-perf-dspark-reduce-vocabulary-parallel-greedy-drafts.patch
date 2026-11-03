@@ -1,0 +1,954 @@
+From 3b788497205988b8674faac1de38192dfea8da77 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:09:26 +0100
+Subject: [PATCH 681/681] perf(dspark): reduce vocabulary-parallel greedy drafts in the
+ Markov projection
+
+The vocabulary-parallel greedy draft steps (TP > 1) materialized each
+position's Markov bias shard ([requests, shard] in the head dtype) through
+markov_bias_local, then reduced base + bias with greedy_markov_shard_pair.
+The fused kernels that add the base logits and reduce each vocabulary tile
+in the projection's epilogue (packed_vocab_markov_greedy_partials and
+bf16_vocab_markov_greedy_partials, with finish_vocab_greedy_pairs) were
+declared and compiled at kernel preparation but never called.
+
+- DSparkSpeculator._sample_sequential reduces each draft position through
+  DSparkDeepseekV4ForCausalLM.markov_greedy_pairs_local
+  (project_head_markov_greedy_pairs into the speculator's shard pairs).
+  markov_bias_local and draft_logits_local_layout, used only by the
+  materialized path, are gone.
+- register_warmups declares only the selections, and raises at kernel
+  preparation when the Markov head does not fuse (fuses_markov_greedy: a
+  TileLang packed or BF16 head, no logit scale or soft cap; an NVFP4 Markov
+  head has no fused projection): no untested fallback.
+- finish_vocab_greedy_pairs(top2=True) writes the runner-up that
+  greedy_markov_shard_pair(top2=True) reports, to the bit: its partials keep
+  one maximum per 2048-column part (GREEDY_PART), so its runner-up is the
+  best maximum of the row's other parts; the fused finish reduces the tiles
+  outside the pair's part. Each Markov head declares both finishes.
+- Only Markov heads (tilelang_markov_head) declare the fused greedy kernels:
+  prepare_bf16_head no longer compiles them for every BF16 head.
+
+Bit-exact with the materialized path: same values, first-index ties, NaNs,
+runner-ups, margins and next-step embeddings (tests below).
+
+Tests:
+- tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py: packed and
+  BF16 Markov heads at the TP4 (32320) and TP3 (43136, last rank 43008)
+  shards and a partial-tile shard, BF16 and FP32 logits, top-2 on and off,
+  1..64 rows, ties within and across parts, duplicate weight rows, NaNs and
+  -inf rows, all four pair columns compared as bits against
+  greedy_markov_shard_pair on the materialized bias; only Markov heads
+  declare the kernels.
+- tests/v1/worker/test_dspark_greedy_markov.py: DSparkSpeculator's
+  five-position vocabulary-parallel loop through the fused projection draws
+  the tokens, runner-ups, margins and Markov embeddings that the
+  materialized bias and greedy_markov_shard_pair draw (TP4 and TP3 last-rank
+  shards, BF16 and FP32, top-2 on and off, 1..48 requests); kernel
+  preparation raises for a Markov head without the fused projection.
+---
+ .../test_deepseek_v41_tilelang_vocab.py       | 130 ++++++++--
+ tests/v1/worker/test_dspark_greedy_markov.py  | 199 +++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  56 +++-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   | 239 ++++++++++++------
+ .../gpu/spec_decode/dspark/speculator.py      |  44 ++--
+ 5 files changed, 525 insertions(+), 143 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index beb7a14e4..de68bda33 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -504,46 +504,67 @@ def test_nvfp4_online_linear_method_tilelang_without_b12x(monkeypatch):
+         assert torch.equal(logits, out)
+ 
+ 
+-@pytest.mark.parametrize("n", [32320, 43092])
+-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+-def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_dtype):
++# DS4.1's Markov projection (K = 256) shards: padded rows, then (real rows, first
++# global index) of a first and a last rank; "odd" ends in a partial tile.
++MARKOV_SHARDS = {
++    "tp4": (32320, ((32320, 0), (32320, 96960))),
++    "tp3": (43136, ((43136, 0), (43008, 86272))),
++    "odd": (1000, ((1000, 0), (963, 32320))),
++}
++MARKOV_ROWS = (1, 2, 3, 5, 8, 16, 17, 31, 33, 48, 64)
++
++
++def _markov_greedy_inputs(n, k, dtype, seed):
++    """Markov embeddings and a strided draft position of base logits whose first
++    rows hold exact ties (in a 2048-column part, across parts, and through
++    duplicate weight rows), NaNs and a row of -inf."""
++    generator = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
++    base_3d = torch.randn(64, 5, n, generator=generator, device=DEVICE, dtype=dtype)
++    base = base_3d[:, 2]
++
++    def put(row, columns, values):
++        for column, value in zip(columns, values):
++            if column < n:
++                base[row, column] = value
++
++    x[:3] = 0  # a zero bias: the base logits decide
++    base[0] = -1.0
++    put(0, (7, 13, 2053, 4105), (5.0,) * 4)
++    base[1] = -1.0
++    put(1, (40, 41, 6145), (6.0, 5.5, 5.0))  # the runner-up shares the max's part
++    put(2, (900, n - 20), (float("nan"),) * 2)
++    base[3] = -float("inf")
++    put(4, (5, 100, 500), (20.0,) * 3)  # duplicate weight rows: equal biases
++    return x, base_3d
++
++
++def _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2):
++    """The fused pairs (with ``top2``, and runner-ups) of every row count are the
++    bits ``greedy_markov_shard_pair`` writes from the materialized bias, and
++    neither writes the slack columns without ``top2``."""
+     from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+         greedy_markov_shard_pair,
+         scratch_shape,
+     )
+ 
+-    k = 256
+-    weight = _head(n, k, seed=n + 303)
+-    weight[100] = weight[5]
+-    weight[500] = weight[5]
+-    layer = _packed_layer(weight)
+-    layer.tilelang_max_rows = 64
+-    layer.tilelang_markov_head = True
+-    prepare_packed_head(layer, out_dtype)
+-    assert hasattr(layer, "tilelang_vocab_markov_greedy")
+-    generator = torch.Generator(device=DEVICE).manual_seed(n + 404)
+-    x = torch.randn(64, k, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+-    base_3d = torch.randn(
+-        64, 5, n, generator=generator, device=DEVICE, dtype=out_dtype
+-    )
+-    for vocab, vocab_start in ((n, 0), (n - 37, 32320)):
+-        for rows in (1, 5, 16, 17, 33, 64):
++    for vocab, vocab_start in shards:
++        for rows in MARKOV_ROWS:
+             part = x[:rows].contiguous()
+             base_step = base_3d[:rows, 2]
+             bias = project_head(layer, part)
+-            expected = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
++            expected = torch.full((rows, 4), -7.0, dtype=torch.float32, device=DEVICE)
+             shape = scratch_shape(rows, vocab)
+-            values = torch.empty(shape, dtype=torch.float32, device=DEVICE)
+-            indices = torch.empty(shape, dtype=torch.int32, device=DEVICE)
+             greedy_markov_shard_pair(
+                 base_step[:, :vocab],
+                 bias[:, :vocab],
+                 vocab_start,
+                 expected,
+-                values,
+-                indices,
++                torch.empty(shape, dtype=torch.float32, device=DEVICE),
++                torch.empty(shape, dtype=torch.int32, device=DEVICE),
++                top2=top2,
+             )
+-            actual = torch.empty((rows, 4), dtype=torch.float32, device=DEVICE)
++            actual = torch.full_like(expected, -7.0)
+             project_head_markov_greedy_pairs(
+                 layer,
+                 part,
+@@ -551,5 +572,62 @@ def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(n, out_d
+                 vocab=vocab,
+                 vocab_start=vocab_start,
+                 out=actual,
++                top2=top2,
+             )
+-            assert torch.equal(actual[:, :2], expected[:, :2]), (rows, vocab, out_dtype)
++            assert torch.equal(
++                actual.view(torch.int32), expected.view(torch.int32)
++            ), (rows, vocab, top2)
++
++
++@pytest.mark.parametrize("top2", [False, True])
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("shape", sorted(MARKOV_SHARDS))
++def test_packed_head_markov_greedy_pairs_match_greedy_markov_shard_pair(
++    shape, out_dtype, top2
++):
++    from vllm.v1.worker.gpu.spec_decode.dspark import greedy
++
++    assert packed_format.GREEDY_PART == greedy._BLOCK
++    n, shards = MARKOV_SHARDS[shape]
++    k = 256
++    weight = _head(n, k, seed=n + 303)
++    weight[100] = weight[5]
++    weight[500] = weight[5]
++    layer = _packed_layer(weight)
++    layer.tilelang_max_rows = 64
++    layer.tilelang_markov_head = True
++    prepare_packed_head(layer, out_dtype)
++    assert set(layer.tilelang_vocab_markov_greedy) == {16, 32, 64}
++    x, base_3d = _markov_greedy_inputs(n, k, out_dtype, seed=n + 404)
++    _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2)
++
++
++@pytest.mark.parametrize("top2", [False, True])
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("shape", sorted(MARKOV_SHARDS))
++def test_bf16_head_markov_greedy_pairs_match_greedy_markov_shard_pair(
++    shape, out_dtype, top2
++):
++    n, shards = MARKOV_SHARDS[shape]
++    k = 256
++    generator = torch.Generator(device=DEVICE).manual_seed(n + 505)
++    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
++    weight[100] = weight[5]
++    weight[500] = weight[5]
++    layer = SimpleNamespace(
++        weight=weight, tilelang_max_rows=64, tilelang_markov_head=True
++    )
++    prepare_bf16_head(layer, out_dtype)
++    assert set(layer.tilelang_vocab_markov_greedy) == {16, 32, 64}
++    x, base_3d = _markov_greedy_inputs(n, k, out_dtype, seed=n + 606)
++    _assert_markov_greedy_pairs_exact(layer, x, base_3d, shards, top2)
++
++
++def test_only_markov_heads_declare_markov_greedy_pairs():
++    weight = _head(1000, 256, seed=17)
++    packed, bf16 = _packed_layer(weight), SimpleNamespace(weight=weight)
++    prepare_packed_head(packed)
++    prepare_bf16_head(bf16)
++    assert hasattr(packed, "tilelang_vocab_greedy")
++    assert not hasattr(packed, "tilelang_vocab_markov_greedy")
++    assert not hasattr(bf16, "tilelang_vocab_markov_greedy")
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 1b248db97..71ba57763 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -85,6 +85,205 @@ def test_sequential_sharded_sampling_preserves_each_token(
+     )
+ 
+ 
++def _vocab_parallel_speculator(model, rows, n_spec, rank, top2, device):
++    """A DSpark speculator's state for the vocabulary-parallel greedy steps, one
++    rank's pairs standing in for their all-gather."""
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++    generator = torch.Generator(device=device).manual_seed(rows)
++    draft_tokens = torch.full((rows, n_spec), -1, dtype=torch.int64, device=device)
++    shape = scratch_shape(rows, 129280)
++    spec = SimpleNamespace(
++        _draft_topk=None,
++        num_speculative_steps=n_spec,
++        sample_from_anchor=True,
++        model=model,
++        use_confidence_head=False,
++        input_buffers=SimpleNamespace(
++            input_ids=torch.randint(
++                0, 129280, (rows * n_spec,), generator=generator, device=device,
++                dtype=torch.int32,
++            )
++        ),
++        _anchor_idx=torch.arange(rows, device=device) * n_spec,
++        sample_idx_mapping=torch.arange(rows * n_spec, device=device),
++        sample_pos=torch.arange(rows * n_spec, device=device),
++        draft_tokens=draft_tokens,
++        draft_logits=None,
++        acceptance_estimator=None,
++        _enable_top2_branch=top2,
++        _top2_branch_margin=0.25 if top2 else 0.0,
++        _top2_branch_weight=1.0,
++        _markov_conf_weight=torch.randn(
++            rank, generator=generator, device=device
++        ),
++        _greedy_shard_pairs=torch.full((rows, 4), -7.0, device=device),
++        _greedy_partial_values=torch.empty(shape, device=device),
++        _greedy_partial_indices=torch.empty(shape, dtype=torch.int32, device=device),
++        _markov_step_embed=torch.empty(
++            (rows, rank), dtype=torch.bfloat16, device=device
++        ),
++        _markov_confidence_embeds=torch.empty(
++            (rows, n_spec, rank), dtype=torch.bfloat16, device=device
++        ),
++        draft_runner_up_tokens=torch.zeros_like(draft_tokens),
++        draft_top2_margins=torch.zeros((rows, n_spec), device=device),
++    )
++    spec._vocab_parallel_greedy = MethodType(
++        DSparkSpeculator._vocab_parallel_greedy, spec
++    )
++    spec._markov_table = MethodType(DSparkSpeculator._markov_table, spec)
++    return spec
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("top2", [False, True])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize(
++    "padded,shard_vocab,vocab_start",
++    [(32320, 32320, 96960), (43136, 43008, 86272)],
++    ids=["tp4", "tp3"],
++)
++def test_fused_markov_greedy_steps_match_materialized_bias(
++    padded, shard_vocab, vocab_start, dtype, top2, monkeypatch
++):
++    """Every vocabulary-parallel greedy step through the Markov projection's
++    fused reduction draws the tokens, runner-ups, margins and next-step
++    embeddings that the materialized bias and ``greedy_markov_shard_pair`` draw."""
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_device_capability_family(120):
++        pytest.skip("TileLang V4.1 kernels target SM120/SM121")
++    pytest.importorskip("tilelang")
++    from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
++    from vllm.models.deepseek_v4_1.tilelang import vocab
++    from vllm.v1.worker.gpu.spec_decode.dspark import speculator
++    from vllm.v1.worker.gpu.spec_decode.dspark.greedy import greedy_markov_shard_pair
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++    monkeypatch.setattr(
++        speculator, "tensor_model_parallel_all_gather", lambda pairs, dim: pairs
++    )
++    device, n_spec, rank, max_rows = "cuda", 5, 256, 48
++    generator = torch.Generator(device=device).manual_seed(padded)
++    w2 = torch.randn(padded, rank, generator=generator, device=device)
++    w2 = (w2 * 0.05).bfloat16()
++    w2[shard_vocab - 1] = w2[3]  # equal biases at both ends of the shard
++    packed = vocab.pack_bf16_weight(w2)
++    head = SimpleNamespace(
++        weight=packed.values,
++        weight_exception_rows=packed.exception_rows,
++        weight_exception_entries=packed.exception_entries,
++        weight_row_offsets=packed.row_offsets,
++        packed_bf16_in_features=rank,
++        packed_bf16_exponent_base=packed.exponent_base,
++        tilelang_max_rows=max_rows,
++        tilelang_markov_head=True,
++    )
++    vocab.prepare_packed_head(head, dtype)
++    table = torch.randn(129280, rank, generator=generator, device=device)
++    table = (table * 0.5).bfloat16()
++    base = torch.randn(
++        max_rows * n_spec, padded, generator=generator, device=device
++    ).to(dtype)
++    base[::7, 3] = base[::7, shard_vocab - 1] = 9.0  # exact ties across the shard
++
++    def materialized(markov_embed, base_logits, pairs, *, top2):
++        """The reduction before the fusion: the shard's bias, then its pairs."""
++        bias = vocab.project_head(head, markov_embed)
++        shape = scratch_shape(pairs.shape[0], shard_vocab)
++        greedy_markov_shard_pair(
++            base_logits[:, :shard_vocab],
++            bias[:, :shard_vocab],
++            vocab_start,
++            pairs,
++            torch.empty(shape, device=device),
++            torch.empty(shape, dtype=torch.int32, device=device),
++            top2=top2,
++        )
++
++    model = SimpleNamespace(
++        supports_local_draft_argmax=lambda: False,
++        vocab_parallel_greedy=True,
++        draft_id_to_target_id=None,
++        draft_vocab_shard=(vocab_start, shard_vocab),
++        compute_draft_logits_local=lambda hidden: base[: hidden.shape[0]],
++        markov_embed_table=lambda: table,
++        model=SimpleNamespace(markov_head=SimpleNamespace(markov_w2=head)),
++    )
++    fused_pairs = MethodType(
++        DSparkDeepseekV4ForCausalLM.markov_greedy_pairs_local, model
++    )
++    hidden = torch.empty((max_rows * n_spec, 8), device=device)
++    for rows in (1, 2, 5, 8, 16, 17, 33, 48):
++        drafted = []
++        for pairs_of in (materialized, fused_pairs):
++            model.markov_greedy_pairs_local = pairs_of
++            spec = _vocab_parallel_speculator(model, rows, n_spec, rank, top2, device)
++            DSparkSpeculator._sample_sequential(spec, rows, hidden)
++            drafted.append(
++                (
++                    spec.draft_tokens,
++                    spec.draft_runner_up_tokens,
++                    spec.draft_top2_margins.view(torch.int32),
++                    spec._markov_step_embed.view(torch.int16),
++                    spec._markov_confidence_embeds.view(torch.int16),
++                )
++            )
++        for materialized_out, fused_out in zip(*drafted):
++            assert torch.equal(fused_out, materialized_out), (rows, dtype, top2)
++        tokens = drafted[0][0]
++        in_shard = (tokens >= vocab_start) & (tokens < vocab_start + shard_vocab)
++        assert bool(in_shard.all())
++        if rows >= 8:
++            # The drafts differ: the steps compared more than one token.
++            assert tokens.unique().numel() > n_spec
++
++
++@pytest.mark.parametrize("fuses", [False, True])
++def test_vocab_parallel_warmups_need_the_fused_markov_projection(fuses, monkeypatch):
++    """Kernel preparation fails for a Markov head without the fused projection,
++    and otherwise declares each draft position's selection alone."""
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++    from vllm.v1.worker.gpu.spec_decode.dspark import speculator
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++    monkeypatch.setattr(
++        DFlashSpeculator, "register_warmups", lambda self, layouts: None
++    )
++    monkeypatch.setattr(speculator, "get_tensor_model_parallel_world_size", lambda: 3)
++    selections = []
++    monkeypatch.setattr(
++        speculator,
++        "register_select_first_argmax_warmup",
++        lambda **kwargs: selections.append(kwargs),
++    )
++    spec = object.__new__(DSparkSpeculator)
++    spec.__dict__.update(
++        _draft_topk=None,
++        num_speculative_steps=5,
++        sample_from_anchor=True,
++        draft_logits=None,
++        acceptance_estimator=None,
++        _enable_top2_branch=False,
++        draft_tokens=torch.zeros((4, 5), dtype=torch.int64),
++        model=SimpleNamespace(
++            supports_local_draft_argmax=lambda: False,
++            vocab_parallel_greedy=True,
++            draft_id_to_target_id=None,
++            fuses_markov_greedy=fuses,
++            markov_embed_table=lambda: None,
++        ),
++    )
++    if not fuses:
++        with pytest.raises(RuntimeError, match="Markov projection"):
++            spec.register_warmups([])
++        assert selections == []
++        return
++    spec.register_warmups([])
++    assert [kwargs["ranks"] for kwargs in selections] == [3] * 5
++
++
+ @pytest.mark.parametrize("base_vocab,bias_vocab", [(2049, 2048), (2048, 2049)])
+ def test_greedy_markov_rejects_mismatched_vocabulary_before_dispatch(
+     base_vocab, bias_vocab
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 68efca1d1..53fef5fc8 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -30,7 +30,11 @@ from vllm.model_executor.layers.fused_moe import (
+     fused_moe_make_expert_params_mapping,
+ )
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+-from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.logits_processor import (
++    LogitsProcessor,
++    _is_packed_head,
++    _is_plain_bf16_head,
++)
+ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.qwen3_dspark import (
+@@ -679,21 +683,45 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+             self.lm_head, self.model.norm(hidden_states), skip_gather=True
+         )
+ 
+-    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+-        return self.logits_processor(
+-            self.model.markov_head.markov_w2, markov_embed, skip_gather=True
+-        )
+-
+     @property
+-    def draft_logits_local_layout(self) -> tuple[torch.dtype, int, int]:
+-        """(dtype, draft logits row width, Markov bias row width) of the fresh
+-        tensors ``compute_draft_logits_local`` and ``markov_bias_local`` return:
+-        both heads write the head dtype, one padded vocabulary shard per row."""
+-        assert self.lm_head is not None
++    def fuses_markov_greedy(self) -> bool:
++        """Whether ``markov_greedy_pairs_local`` can run: a TileLang packed or
++        BF16 Markov head declares the fused projection (an NVFP4 one does not),
++        and nothing scales or caps the bias."""
++        w2 = self.model.markov_head.markov_w2
++        processor = self.logits_processor
+         return (
+-            self.logits_processor.head_dtype,
+-            self.lm_head.num_embeddings_per_partition,
+-            self.model.markov_head.markov_w2.num_embeddings_per_partition,
++            processor.use_tilelang_vocab_projection
++            and processor.scale == 1.0
++            and processor.soft_cap is None
++            and (_is_packed_head(w2) or _is_plain_bf16_head(w2))
++        )
++
++    def markov_greedy_pairs_local(
++        self,
++        markov_embed: torch.Tensor,
++        base_logits: torch.Tensor,
++        pairs: torch.Tensor,
++        *,
++        top2: bool = False,
++    ) -> None:
++        """Each row's ``(max, global index)`` of this rank's shard of
++        ``base_logits`` ([requests, padded shard], any row stride) plus the Markov
++        bias of ``markov_embed``, into the first two columns of ``pairs`` (with
++        ``top2``, the runner-up ``greedy_markov_shard_pair`` reports into the
++        other two), without the bias tensor: the Markov projection adds the base
++        logits and reduces each vocabulary tile in its epilogue."""
++        from ..tilelang.vocab import project_head_markov_greedy_pairs
++
++        vocab_start, shard_vocab = self.draft_vocab_shard
++        project_head_markov_greedy_pairs(
++            self.model.markov_head.markov_w2,
++            markov_embed,
++            base_logits,
++            vocab=shard_vocab,
++            vocab_start=vocab_start,
++            out=pairs,
++            top2=top2,
+         )
+ 
+     def apply_markov_bias_gathered(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 1711d028b..1f9f311ec 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -48,6 +48,10 @@ ROW_TILES = (16, 32, 64, 128)
+ NVFP4_GROUP = 16  # columns per FP8 E4M3 scale byte in NVFP4
+ NVFP4_PACKED = NVFP4_GROUP // 2  # packed E2M1 bytes per NVFP4 group
+ SHARED_MEMORY = 101_376  # dynamic shared memory per block on SM120 / SM121
++# dspark.greedy._BLOCK: greedy_markov_shard_pair keeps one partial per part of
++# this many shard columns, so the runner-up of its top-2 pairs is the best
++# maximum of the row's other parts. Vocabulary tiles divide it.
++GREEDY_PART = 2048
+ 
+ 
+ def nvfp4_shared_memory_bytes(
+@@ -669,6 +673,87 @@ __device__ __forceinline__ void vllm_vocab_finish_argmax(
+     }
+   }
+ }
++
++// The block's first maximum of ``count`` (value, shard index) partials outside
++// the PART-column part ``skip_part`` (-1: none), in every thread.
++template <int THREADS, int PART>
++__device__ __forceinline__ void vllm_vocab_block_first_argmax(
++    const float* __restrict__ vals,
++    const int* __restrict__ idxs,
++    int count, int skip_part, int tx,
++    float* __restrict__ smem_v, int* __restrict__ smem_i,
++    float& out_v, int& out_i) {
++  float best_v = -CUDART_INF_F;
++  int best_i = 2147483647;
++  for (int t = tx; t < count; t += THREADS) {
++    const float v = vals[t];
++    const int idx = idxs[t];
++    if (idx / PART != skip_part &&
++        vllm_vocab_first_argmax_keep(v, idx, best_v, best_i)) {
++      best_v = v;
++      best_i = idx;
++    }
++  }
++  const int lane = tx & 31;
++  const int warp_id = tx >> 5;
++  constexpr int WARPS = THREADS >> 5;
++  #pragma unroll
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset);
++    const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset);
++    if (vllm_vocab_first_argmax_keep(ov, oi, best_v, best_i)) {
++      best_v = ov;
++      best_i = oi;
++    }
++  }
++  if (lane == 0) {
++    smem_v[warp_id] = best_v;
++    smem_i[warp_id] = best_i;
++  }
++  __syncthreads();
++  best_v = smem_v[0];
++  best_i = smem_i[0];
++  #pragma unroll
++  for (int w = 1; w < WARPS; ++w) {
++    if (vllm_vocab_first_argmax_keep(smem_v[w], smem_i[w], best_v, best_i)) {
++      best_v = smem_v[w];
++      best_i = smem_i[w];
++    }
++  }
++  __syncthreads();
++  out_v = best_v;
++  out_i = best_i;
++}
++
++// vllm_vocab_finish_argmax and the row's runner-up as
++// dspark.greedy.greedy_markov_shard_pair(top2=True) reports it: the first
++// maximum of the tiles outside the pair's PART-column part, into columns 2 and
++// 3 (index 2**30 when the shard has no other part).
++template <int THREADS, int PAIR_WIDTH, int PART>
++__device__ __forceinline__ void vllm_vocab_finish_argmax_top2(
++    const float* __restrict__ partial_vals,
++    const int* __restrict__ partial_idxs,
++    float* __restrict__ pairs,
++    int row, int num_tiles, int vocab_start, int tx,
++    float* __restrict__ smem_v, int* __restrict__ smem_i) {
++  const int base = row * num_tiles;
++  float best_v, second_v;
++  int best_i, second_i;
++  vllm_vocab_block_first_argmax<THREADS, PART>(
++      partial_vals + base, partial_idxs + base, num_tiles, -1, tx, smem_v, smem_i,
++      best_v, best_i);
++  vllm_vocab_block_first_argmax<THREADS, PART>(
++      partial_vals + base, partial_idxs + base, num_tiles, best_i / PART, tx,
++      smem_v, smem_i, second_v, second_i);
++  if (tx == 0) {
++    pairs[row * PAIR_WIDTH + 0] = best_v;
++    pairs[row * PAIR_WIDTH + 1] = (float)(best_i + vocab_start);
++    pairs[row * PAIR_WIDTH + 2] = second_v;
++    pairs[row * PAIR_WIDTH + 3] = second_i < 2147483647
++                                      ? (float)(second_i + vocab_start)
++                                      : (float)(1 << 30);
++  }
++}
+ """
+ 
+ 
+@@ -1199,10 +1284,20 @@ def finish_vocab_greedy_pairs(
+     num_tiles: int,
+     pair_width: int = 4,
+     threads: int = 256,
++    top2: bool = False,
+ ):
+     """Reduce per-tile ``(max, shard index)`` partials into each row's ``(max, global
+-    index)`` pair in the first two columns of ``pairs[M, pair_width]``."""
++    index)`` pair in the first two columns of ``pairs[M, pair_width]``; with
++    ``top2``, also the runner-up ``greedy_markov_shard_pair(top2=True)`` reports
++    (the best maximum of the row's other ``GREEDY_PART``-column parts) in columns
++    2 and 3."""
++    assert not top2 or pair_width >= 4
+     warps = threads // 32
++    finish = (
++        f"vllm_vocab_finish_argmax_top2<{threads}, {pair_width}, {GREEDY_PART}>"
++        if top2
++        else f"vllm_vocab_finish_argmax<{threads}, {pair_width}>"
++    )
+     M = T.dynamic("M")
+ 
+     @T.prim_func
+@@ -1220,7 +1315,7 @@ def finish_vocab_greedy_pairs(
+             tx = T.get_thread_binding()
+             T.call_extern(
+                 "handle",
+-                f"vllm_vocab_finish_argmax<{threads}, {pair_width}>",
++                finish,
+                 T.address_of(partial_vals[0, 0]),
+                 T.address_of(partial_idxs[0, 0]),
+                 T.address_of(pairs[0, 0]),
+@@ -1554,6 +1649,18 @@ def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     return kernels
+ 
+ 
++def _markov_greedy_finishes(finishes: dict, num_tiles: int) -> None:
++    """The pair finish of ``num_tiles`` partials (the call the other greedy heads
++    declare) and its top-2 variant, keyed ``(num_tiles, top2)``."""
++    finishes.setdefault(
++        (num_tiles, False), prepare.call(finish_vocab_greedy_pairs, num_tiles)
++    )
++    finishes.setdefault(
++        (num_tiles, True),
++        prepare.call(finish_vocab_greedy_pairs, num_tiles, top2=True),
++    )
++
++
+ def _packed_head_markov_greedy_kernels(
+     layer: nn.Module, out_dtype: torch.dtype
+ ) -> dict:
+@@ -1562,9 +1669,11 @@ def _packed_head_markov_greedy_kernels(
+     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
+     partials = {}
+     finishes = {}
++    tiles = {}
+     for block_M in _head_row_tiles(layer):
+         config = tile_config(block_M, k)
+-        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
++        assert GREEDY_PART % config["block_N"] == 0
++        tiles[block_M] = (n + config["block_N"] - 1) // config["block_N"]
+         partials[block_M] = prepare.call(
+             packed_vocab_markov_greedy_partials,
+             n,
+@@ -1574,11 +1683,8 @@ def _packed_head_markov_greedy_kernels(
+             out_dtype=_OUT[out_dtype],
+             **config,
+         )
+-        finishes.setdefault(
+-            num_tiles,
+-            prepare.call(finish_vocab_greedy_pairs, num_tiles),
+-        )
+-    return {"partials": partials, "finishes": finishes}
++        _markov_greedy_finishes(finishes, tiles[block_M])
++    return {"partials": partials, "finishes": finishes, "tiles": tiles}
+ 
+ 
+ def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+@@ -1587,12 +1693,14 @@ def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+     n, k = map(int, layer.weight.shape)
+     partials = {}
+     finishes = {}
++    tiles = {}
+     for block_M in _head_row_tiles(layer):
+         config = dict(BF16_HEAD_CONFIGS[block_M])
+         if k % config["block_K"]:
+             config["block_K"] = 64
+         stages = 1 if k <= config["block_K"] else 2
+-        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
++        assert GREEDY_PART % config["block_N"] == 0
++        tiles[block_M] = (n + config["block_N"] - 1) // config["block_N"]
+         partials[block_M] = prepare.call(
+             bf16_vocab_markov_greedy_partials,
+             n,
+@@ -1602,11 +1710,36 @@ def _bf16_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
+             out_dtype=_OUT[out_dtype],
+             **config,
+         )
+-        finishes.setdefault(
+-            num_tiles,
+-            prepare.call(finish_vocab_greedy_pairs, num_tiles),
+-        )
+-    return {"partials": partials, "finishes": finishes}
++        _markov_greedy_finishes(finishes, tiles[block_M])
++    return {"partials": partials, "finishes": finishes, "tiles": tiles}
++
++
++def _declare_markov_greedy(layer: nn.Module, kernels: dict) -> None:
++    """Declare a Markov head's fused greedy calls, bound as
++    ``layer.tilelang_vocab_markov_greedy[block_M]`` = (partials, pair finish,
++    top-2 finish, tiles)."""
++    partials = kernels["partials"]
++    finishes = kernels["finishes"]
++    tiles = kernels["tiles"]
++
++    def bind() -> None:
++        compiled = {
++            key: function(*args, **kwargs)
++            for key, (function, args, kwargs) in finishes.items()
++        }
++        layer.tilelang_vocab_markov_greedy = {
++            block_M: (
++                function(*args, **kwargs),
++                compiled[tiles[block_M], False],
++                compiled[tiles[block_M], True],
++                tiles[block_M],
++            )
++            for block_M, (function, args, kwargs) in partials.items()
++        }
++
++    prepare.declare(
++        lambda: list(partials.values()) + list(finishes.values()), bind=bind
++    )
+ 
+ 
+ def _declare_head(layer: nn.Module, kernels: dict, out_dtype: torch.dtype) -> None:
+@@ -1656,32 +1789,8 @@ def prepare_packed_head(
+         bind=bind_greedy,
+     )
+     if getattr(layer, "tilelang_markov_head", False):
+-        markov = _packed_head_markov_greedy_kernels(layer, out_dtype)
+-        m_partials = markov["partials"]
+-        m_finishes = markov["finishes"]
+-
+-        def bind_markov_greedy() -> None:
+-            n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
+-            compiled_finishes = {
+-                num_tiles: function(*args, **kwargs)
+-                for num_tiles, (function, args, kwargs) in m_finishes.items()
+-            }
+-            layer.tilelang_vocab_markov_greedy = {
+-                block_M: (
+-                    function(*args, **kwargs),
+-                    compiled_finishes[
+-                        (n + tile_config(block_M, k)["block_N"] - 1)
+-                        // tile_config(block_M, k)["block_N"]
+-                    ],
+-                    (n + tile_config(block_M, k)["block_N"] - 1)
+-                    // tile_config(block_M, k)["block_N"],
+-                )
+-                for block_M, (function, args, kwargs) in m_partials.items()
+-            }
+-
+-        prepare.declare(
+-            lambda: list(m_partials.values()) + list(m_finishes.values()),
+-            bind=bind_markov_greedy,
++        _declare_markov_greedy(
++            layer, _packed_head_markov_greedy_kernels(layer, out_dtype)
+         )
+ 
+ 
+@@ -1725,36 +1834,11 @@ def prepare_nvfp4_head(
+ def prepare_bf16_head(
+     layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+ ) -> None:
+-    """Declare a BF16 head's projection and fused Markov greedy pairs for every
+-    token tile, writing ``out_dtype``."""
++    """Declare a BF16 head's projection for every token tile, writing
++    ``out_dtype``, and a Markov head's fused Markov greedy pairs."""
+     _declare_head(layer, _bf16_head_kernels(layer, out_dtype), out_dtype)
+-    greedy = _bf16_head_greedy_kernels(layer, out_dtype)
+-    partials = greedy["partials"]
+-    finishes = greedy["finishes"]
+-
+-    def bind_greedy() -> None:
+-        n = int(layer.weight.shape[0])
+-        compiled_finishes = {
+-            num_tiles: function(*args, **kwargs)
+-            for num_tiles, (function, args, kwargs) in finishes.items()
+-        }
+-        layer.tilelang_vocab_markov_greedy = {
+-            block_M: (
+-                function(*args, **kwargs),
+-                compiled_finishes[
+-                    (n + BF16_HEAD_CONFIGS[block_M]["block_N"] - 1)
+-                    // BF16_HEAD_CONFIGS[block_M]["block_N"]
+-                ],
+-                (n + BF16_HEAD_CONFIGS[block_M]["block_N"] - 1)
+-                // BF16_HEAD_CONFIGS[block_M]["block_N"],
+-            )
+-            for block_M, (function, args, kwargs) in partials.items()
+-        }
+-
+-    prepare.declare(
+-        lambda: list(partials.values()) + list(finishes.values()),
+-        bind=bind_greedy,
+-    )
++    if getattr(layer, "tilelang_markov_head", False):
++        _declare_markov_greedy(layer, _bf16_head_greedy_kernels(layer, out_dtype))
+ 
+ 
+ def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+@@ -1913,20 +1997,24 @@ def project_head_markov_greedy_pairs(
+     vocab_start: int = 0,
+     pair_width: int = 4,
+     out: torch.Tensor | None = None,
++    *,
++    top2: bool = False,
+ ) -> torch.Tensor:
+     """Each row's ``(max, global index)`` pair of ``base_logits + x @ W^T``
+     through a prepared Markov head over its ``vocab`` real columns starting
+     at ``vocab_start``, written into the first two columns of ``[rows, pair_width]``
+-    FP32 without materializing the Markov bias tensor."""
++    FP32 without materializing the Markov bias tensor: the pairs
++    ``greedy_markov_shard_pair`` writes from the materialized bias, to the bit
++    (with ``top2``, its runner-up in columns 2 and 3 too)."""
+     if not x.is_contiguous():
+         x = x.contiguous()
+     rows = x.shape[0]
+     n = int(layer.weight.shape[0])
+     if vocab is None:
+         vocab = n
+-    partials_kernel, finish_kernel, num_tiles = layer.tilelang_vocab_markov_greedy[
+-        row_tile(rows)
+-    ]
++    partials_kernel, finish_kernel, finish_top2_kernel, num_tiles = (
++        layer.tilelang_vocab_markov_greedy[row_tile(rows)]
++    )
+     partial_vals, partial_idxs, pairs = _vocab_greedy_buffers(
+         layer,
+         rows,
+@@ -1956,12 +2044,15 @@ def project_head_markov_greedy_pairs(
+             partial_idxs,
+             vocab,
+         )
+-    finish_kernel(partial_vals, partial_idxs, pairs, vocab_start)
++    (finish_top2_kernel if top2 else finish_kernel)(
++        partial_vals, partial_idxs, pairs, vocab_start
++    )
+     return pairs
+ 
+ 
+ __all__ = [
+     "BF16_HEAD_CONFIGS",
++    "GREEDY_PART",
+     "GROUP",
+     "NVFP4_GROUP",
+     "PackedBf16Weight",
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index dc6940283..952632a2f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -42,9 +42,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DraftBlockTableLayout,
+ )
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+-    greedy_markov_shard_pair,
+     markov_anchor_embed,
+-    register_greedy_markov_shard_pair_warmup,
+     register_sample_greedy_markov_warmup,
+     register_select_first_argmax_warmup,
+     sample_greedy_markov,
+@@ -300,11 +298,11 @@ class DSparkSpeculator(DFlashSpeculator):
+         self, block_table_layouts: Sequence[DraftBlockTableLayout]
+     ) -> None:
+         """Also register the greedy reduction of each draft position: the
+-        vocabulary-parallel one, whose base logits and Markov bias are this rank's
+-        shards, written in the draft head's dtype (draft position ``i`` is column
+-        ``i`` of both the base logits' ``[requests, positions, shard]`` view and
+-        the draft tokens); or the full-vocabulary one, when no logits cache,
+-        vocabulary map or estimator needs the logits."""
++        vocabulary-parallel one's selection over the ranks' shard pairs (draft
++        position ``i`` is column ``i`` of the draft tokens; the Markov head
++        declares the fused projection that reduces each shard, and a head
++        without one fails here); or the full-vocabulary one, when no logits
++        cache, vocabulary map or estimator needs the logits."""
+         super().register_warmups(block_table_layouts)
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         if self._draft_topk is not None:
+@@ -322,21 +320,15 @@ class DSparkSpeculator(DFlashSpeculator):
+                     dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
+                 )
+             return
+-        vocab_start, shard_vocab = self.model.draft_vocab_shard
+-        dtype, head_width, markov_width = self.model.draft_logits_local_layout
++        if not self.model.fuses_markov_greedy:
++            raise RuntimeError(
++                "Vocabulary-parallel greedy drafts reduce each shard in the Markov "
++                "projection's epilogue, which only a TileLang packed or BF16 Markov "
++                "head without a logit scale or soft cap declares"
++            )
+         n_spec = self.num_speculative_steps
+         use_top2 = self._enable_top2_branch
+         for i in range(n_spec):
+-            register_greedy_markov_shard_pair_warmup(
+-                base_dtype=dtype,
+-                base_stride=n_spec * head_width,
+-                base_aligned=i * head_width * dtype.itemsize % 16 == 0,
+-                bias_dtype=dtype,
+-                bias_stride=markov_width,
+-                vocab=shard_vocab,
+-                vocab_start=vocab_start,
+-                top2=use_top2,
+-            )
+             register_select_first_argmax_warmup(
+                 ranks=get_tensor_model_parallel_world_size(),
+                 output_dtype=self.draft_tokens.dtype,
+@@ -403,7 +395,6 @@ class DSparkSpeculator(DFlashSpeculator):
+         if local_head:
+             base_logits = self.model.compute_local_draft_logits(sample_hidden)
+         elif vocab_parallel:
+-            vocab_start, shard_vocab = self.model.draft_vocab_shard
+             base_logits = self.model.compute_draft_logits_local(sample_hidden)
+         else:
+             base_logits = self.model.compute_draft_logits(sample_hidden)
+@@ -458,16 +449,11 @@ class DSparkSpeculator(DFlashSpeculator):
+                 continue
+             if vocab_parallel:
+                 use_top2 = self._enable_top2_branch
+-                bias = self.model.markov_bias_local(markov_embed)
+                 pairs = self._greedy_shard_pairs[:num_reqs]
+-                greedy_markov_shard_pair(
+-                    base_logits[:, i, :shard_vocab],
+-                    bias[:, :shard_vocab],
+-                    vocab_start,
+-                    pairs,
+-                    self._greedy_partial_values,
+-                    self._greedy_partial_indices,
+-                    top2=use_top2,
++                # The Markov projection adds the base logits and reduces this
++                # rank's shard: no bias tensor.
++                self.model.markov_greedy_pairs_local(
++                    markov_embed, base_logits[:, i], pairs, top2=use_top2
+                 )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                 has_embed = table is not None and i + 1 < n_spec
+-- 
+2.43.0
+
