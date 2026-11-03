@@ -1,0 +1,73 @@
+{
+  "purpose": "isolated numerical-instrumentation capability controls; not a failing-model reproducer",
+  "nixnan": {
+    "repository": "https://github.com/parfloat/nixnan",
+    "commit": "55a6587441f8521dad67d20b6421d5220e6eef0f",
+    "url": "https://api.github.com/repos/parfloat/nixnan/tarball/55a6587441f8521dad67d20b6421d5220e6eef0f",
+    "archive_sha256": "7f67ecab09550a9b94229f2b1dfdd4f16d37e38ab88751167a5cc22736b1282d",
+    "gpu_fpx": "detector/analyzer sources bundled by this exact Nixnan snapshot"
+  },
+  "nvbit": {
+    "release": "1.8.1",
+    "architecture": "aarch64",
+    "url": "https://github.com/NVlabs/NVBit/releases/download/v1.8.1/nvbit-Linux-aarch64-1.8.1.tar.bz2",
+    "archive_sha256": "d1701e1fdcb1a9661b561accf8da817d911f6123977eacfd903f704f29b0ab0f"
+  },
+  "json": {
+    "release": "3.12.0",
+    "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp",
+    "sha256": "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63"
+  },
+  "build": {
+    "architecture": "sm_121",
+    "language": "C++17",
+    "source_changes": false,
+    "adaptations": [
+      "Use ARM64 NVBit 1.8.1 instead of upstream default x86 NVBit 1.8",
+      "Direct compiler invocations; no upstream make/download/install scripts",
+      "Omit maxrregcount=24 following NVBit 1.8.1 for CUDA >=12.3"
+    ]
+  },
+  "fixture": {
+    "file": "nvbit_control.cu",
+    "modes": {
+      "clean": "initialized +4 yields +2; detector must report no NaN",
+      "nan": "initialized -4 yields NaN; detector must identify a floating-point instruction in nvbit_numerical_control"
+    },
+    "resources": "one thread, two four-byte allocations; checker own storage additional",
+    "not_proven": [
+      "CUDA Graph instrumentation",
+      "Blackwell tensor instruction coverage",
+      "production first bad producer",
+      "absence of concurrency defects"
+    ],
+    "purpose": "additional partial-warp checker control; Nixnan shuffles inactive lanes, so use full-warp fixture for initial capability checks"
+  },
+  "gpu_fpx_original_notices": {
+    "repository": "https://github.com/LLNL/GPU-FPX",
+    "commit": "5d964b80717cd99aaae4dcd7aac238907ab6fe93",
+    "url": "https://api.github.com/repos/LLNL/GPU-FPX/tarball/5d964b80717cd99aaae4dcd7aac238907ab6fe93",
+    "sha256": "7b18be51eb7b3d362de44f0e76c12b889cf12c3318bbbb0575c80a3bb12c18cd",
+    "retained": [
+      "LICENSE",
+      "NOTICE"
+    ],
+    "compiled": false
+  },
+  "warp_fixture": {
+    "file": "nvbit_warp_control.cu",
+    "resources": "32 threads, two initialized 128-byte allocations, disjoint output elements",
+    "launch_modes": [
+      "direct",
+      "extended",
+      "capture",
+      "graph"
+    ],
+    "expected": "Every mode returns 0 and correct_lanes=32/32; instrumentation must report NaN only for nan mode, in nvbit_warp_numerical_control",
+    "not_proven": [
+      "programmatic dependent launch attributes",
+      "full model concurrency",
+      "arbitrary masked-lane checker correctness"
+    ]
+  }
+}

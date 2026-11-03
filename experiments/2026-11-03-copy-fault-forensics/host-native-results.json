@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-03",
+  "source": {
+    "repository": "https://github.com/christopherowen/dgx-spark-networking",
+    "revision": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
+    "archive_sha256": "bc14035ed17671247a2ce3f64040e8eb98772c00f1fc82dc35241461e5b61061",
+    "sha256": {
+      "sparknet/oneshot/_roce_proxy.c": "256c711c72bc15fd51ed5177edb777742d2123398221e64790d5cfe5a34083f7",
+      "tests/oneshot_sim/simulate.c": "33b759782f15cf936d11e3d86c86b1f4d12f0f0ac1206b33f691e65672e4fbe0",
+      "tests/oneshot_sim/infiniband/verbs.h": "4b17ffd95b196dcb63af979c761f30d1c42e7f6be2105e9b3b0cd8f8a1d89826",
+      "tests/test_oneshot_cpu.py": "f265d84cb2d6870b7a0a4701187f66f95effc3aefd002b4c11e6da1730fdae2b"
+    }
+  },
+  "fixtures_sha256": {
+    "native_proxy_payload.c": "4048d64c933cf9c972ec74688cb513b0b60554b54cf09998851277d8b095024c",
+    "native_sanitizer_control.c": "834a79347d643e35192334cb3c0f7e11942dd7ffb204a9f620a30082906abff3"
+  },
+  "host": {
+    "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+    "runtime": "Apple clang sanitizer runtimes linked into the test binaries; otool library inventory in control-results.json"
+  },
+  "build_flags": [
+    "-O1",
+    "-g",
+    "-std=gnu11",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-pthread"
+  ],
+  "sanitizer_configurations": {
+    "asan-ubsan": "-fsanitize=address,undefined",
+    "tsan": "-fsanitize=thread"
+  },
+  "positive_controls": {
+    "runtime_options": {
+      "ASAN_OPTIONS": "halt_on_error=1:abort_on_error=0:exitcode=86",
+      "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:exitcode=87",
+      "TSAN_OPTIONS": "halt_on_error=1:exitcode=88"
+    },
+    "note": "Record actual exits: the combined Apple runtime used87 for ASan, and TSan terminated by SIGABRT(-6). Findings, not requested exit codes alone, qualify these controls.",
+    "runs": [
+      {
+        "name": "control-asan-ubsan-clean",
+        "exit": 0,
+        "finding": "",
+        "log": "results/private/copy-fault-forensics/sparknet-host-native/control-asan-ubsan-clean.log"
+      },
+      {
+        "name": "control-asan-ubsan-asan",
+        "exit": 87,
+        "finding": "AddressSanitizer: heap-buffer-overflow (one-int allocation, read one int beyond it)",
+        "log": "results/private/copy-fault-forensics/sparknet-host-native/control-asan-ubsan-asan.log"
+      },
+      {
+        "name": "control-asan-ubsan-ubsan",
+        "exit": 87,
+        "finding": "UndefinedBehaviorSanitizer: signed integer overflow, INT_MAX + 1 at native_sanitizer_control.c:38",
+        "log": "results/private/copy-fault-forensics/sparknet-host-native/control-asan-ubsan-ubsan.log"
+      },
+      {
+        "name": "control-tsan-clean",
+        "exit": 0,
+        "finding": "",
+        "log": "results/private/copy-fault-forensics/sparknet-host-native/control-tsan-clean.log"
+      },
+      {
+        "name": "control-tsan-tsan",
+        "exit": -6,
+        "finding": "ThreadSanitizer: data race (two threads incrementing an unprotected counter)",
+        "log": "results/private/copy-fault-forensics/sparknet-host-native/control-tsan-tsan.log"
+      }
+    ]
+  },
+  "unchanged_simulator": [
+    {
+      "configuration": "asan-ubsan",
+      "build_exit": 0,
+      "exit": 0,
+      "elapsed_seconds": 5.693930792000174,
+      "collectives": 31000,
+      "writes": 1469644,
+      "stdout": "PASS: direct3/ring4/mesh4, 1/2/4 paths, 31000 collectives, broadcast+exchange, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors, thread placement, GID selection by address (1469644 writes)",
+      "sanitizer_findings": 0
+    },
+    {
+      "configuration": "tsan",
+      "build_exit": 0,
+      "exit": 0,
+      "elapsed_seconds": 22.836835791997146,
+      "collectives": 31000,
+      "writes": 1469644,
+      "stdout": "PASS: direct3/ring4/mesh4, 1/2/4 paths, 31000 collectives, broadcast+exchange, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors, thread placement, GID selection by address (1469644 writes)",
+      "sanitizer_findings": 0
+    }
+  ],
+  "payload_controls": [
+    {
+      "configuration": "asan-ubsan",
+      "build_exit": 0,
+      "run_exit": 0,
+      "outputs": [
+        {
+          "short_sender": false,
+          "old_integer": false,
+          "receiver_rows": 17,
+          "sender_rows": 17,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 0,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": true,
+          "old_integer": false,
+          "receiver_rows": 17,
+          "sender_rows": 6,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 56320,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": false,
+          "old_integer": true,
+          "receiver_rows": 17,
+          "sender_rows": 17,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 0,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": true,
+          "old_integer": true,
+          "receiver_rows": 17,
+          "sender_rows": 6,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 56320,
+          "nan_bit_patterns": 56320
+        }
+      ],
+      "sanitizer_findings": 0
+    },
+    {
+      "configuration": "tsan",
+      "build_exit": 0,
+      "run_exit": 0,
+      "outputs": [
+        {
+          "short_sender": false,
+          "old_integer": false,
+          "receiver_rows": 17,
+          "sender_rows": 17,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 0,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": true,
+          "old_integer": false,
+          "receiver_rows": 17,
+          "sender_rows": 6,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 56320,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": false,
+          "old_integer": true,
+          "receiver_rows": 17,
+          "sender_rows": 17,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 0,
+          "nan_bit_patterns": 0
+        },
+        {
+          "short_sender": true,
+          "old_integer": true,
+          "receiver_rows": 17,
+          "sender_rows": 6,
+          "row_width": 5120,
+          "sequence_flags": 3,
+          "stale_bf16_elements": 56320,
+          "nan_bit_patterns": 56320
+        }
+      ],
+      "sanitizer_findings": 0
+    }
+  ],
+  "conclusion": "The exact host posting code accepts locally valid but unequal payload lengths, advances all sequence flags, and leaves a previous two-slot payload tail intact. Native sanitizers report no fault because all reads/writes remain in initialized allocated memory. This is a demonstrated mechanism, not a capture of production tail contents.",
+  "limitations": [
+    "Host Apple arm64 execution, not Linux HCA/NIC/GPU execution; Linux-only thread placement path is not run.",
+    "Unchanged simulator substitutes fake verbs and GPU endpoints; it does not qualify NIC coherence, GPU memory ordering, actual memory registration or generated GPU instructions.",
+    "Narrow payload test calls actual post_op and fake FIFO delivery without proxy threads or doorbell publication; the unchanged simulator separately exercises proxy threads and missed doorbells.",
+    "Narrow controls reuse slot1 at sequences1 and3 with actual17x5120 BF16 payload sizes; all-ones and finite prior payloads are specified controls, not captured production bytes.",
+    "The source of production rank-count divergence and the first actual NaN-producing operation require contemporaneous runtime evidence. Other kernel defects are not excluded."
+  ],
+  "raw_receipts_directory": "results/private/copy-fault-forensics/sparknet-host-native",
+  "raw_receipts_sha256": {
+    "asan-ubsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "asan-ubsan-run.json": "71f3bd070b47c4158b85f40bfc086104236584fdd5c7c528007f3e7623691b71",
+    "asan-ubsan-run.log": "fe27add53853a6ade355dede54195b14d6ae9987df67710c365322e36511e18f",
+    "control-asan-ubsan-asan.log": "de9ba9458f9c3cc4310dcf9a951fa3ec1caa29f6307af1c6305c5d3cbca3f040",
+    "control-asan-ubsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "control-asan-ubsan-clean.log": "531a66e5bf7b853f745584ed0408836522008aedaa1e7d4d4dc2e830b80a4531",
+    "control-asan-ubsan-ubsan.log": "2af016f104ab37dc1dde9ee3c47d49f29b7b2fbdbc9dc9946763cd36ed8d1311",
+    "control-results.json": "4c2fff6a6b6b4f971cdad6e7b2564f1cbebcd868b554f9eec7542280e137a2e8",
+    "control-tsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "control-tsan-clean.log": "531a66e5bf7b853f745584ed0408836522008aedaa1e7d4d4dc2e830b80a4531",
+    "control-tsan-tsan.log": "544d9c2565772fec1afaf013b9148493c4dfbd1875cef04b6681335b61877d25",
+    "inventory.json": "41e19503b53fa4f031f128033ac79cd72ac17d652d6a1417b466152266ebe347",
+    "payload-asan-ubsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "payload-asan-ubsan-run.log": "c0abf75129adea98a61c4e0508ed3abca6aab86fe9b3d60988347072012974c1",
+    "payload-results.json": "8b1a95f6be203b432db4d23be68f95054bd160ea941eb9ac03055740c56dd4b0",
+    "payload-tsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "payload-tsan-run.log": "c0abf75129adea98a61c4e0508ed3abca6aab86fe9b3d60988347072012974c1",
+    "tsan-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tsan-run.json": "ec82a338a65e3832a0c5de5a7521ce19f510a667147cd8e605eda1191a707c3c",
+    "tsan-run.log": "fe27add53853a6ade355dede54195b14d6ae9987df67710c365322e36511e18f"
+  }
+}

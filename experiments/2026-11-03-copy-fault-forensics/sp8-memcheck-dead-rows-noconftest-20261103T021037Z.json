@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "run_id": "sp8-memcheck-dead-rows-noconftest-20261103T021037Z",
+  "base_deployment_commit": "b28365c38a74c966032dcf558d8d1bb0a282d4b6",
+  "intent": "Run the existing candidate-37 dead-row input-combine tests under memcheck.",
+  "intended_variable": "Sanitizer instrumentation and disabled PyTorch allocator caching on unchanged candidate-37 runtime source.",
+  "source": {
+    "host_alias": "sp8",
+    "hostname": "spark-0016",
+    "image": "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+    "vllm_patch_head": "5b7cfa37fee42f96bfafbe09b7d30e8c0eda8575",
+    "vllm_tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "git_metadata": "Absent in exported image; immutable image ID, recorded labels and actual imported file hashes retained.",
+    "source_overlays": [],
+    "dependencies_installed": false,
+    "selected_imported_files": [
+      {
+        "module": "tests.v1.worker.test_dead_rows",
+        "path": "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dead_rows.py",
+        "sha256": "097aa80482a040f5753d6d9d6d88b09dfbbb658aa7702bc2c3882f2680c49abc"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.input_batch",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/input_batch.py",
+        "sha256": "1ab6eccef4d4d3de1cf0cab4df4503d396bc5029e50c63ecb7637db898a8c339"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.tilelang_inputs",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py",
+        "sha256": "be6c93c468ca14dc645353f7a0069ef8f464b7dee356fb035e7abd269c3626f7"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.tilelang_token_counts",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_token_counts.py",
+        "sha256": "c92397b9d6b745bba1eb5a6a6d3d1af66884c49ff22dd22af40dbf4e1d89a0a4"
+      }
+    ],
+    "all_imported_files_manifest": "imported-files.json",
+    "imported_files_count": 598
+  },
+  "toolchain": {
+    "compute_sanitizer": "2025.3.1.0 (build 36400806) public-release",
+    "nvcc": "13.0.88",
+    "gpu_and_driver": "NVIDIA GB10, 580.178.04, [N/A], [N/A]"
+  },
+  "guards": {
+    "dgx1_hold_absent_before_launch": true,
+    "sp8_hold_absent_under_lock": true,
+    "exclusive_nonblocking_lock": "/tmp/spark-lab-gpu.lock",
+    "preflight_containers": "",
+    "preflight_gpu_compute_processes": "",
+    "memory_limit_bytes": 25769803776,
+    "memory_swap_limit_bytes": 25769803776,
+    "shm_limit_bytes": 1073741824,
+    "wall_limit_seconds": 600,
+    "network": "none",
+    "sanitizer_mount_readonly": true,
+    "serving_or_cluster_operations": false
+  },
+  "harness_adjustment": {
+    "option": "--noconftest",
+    "option_verified_in_image_help": true,
+    "omitted": "All conftest.py files, including root conftest with missing tblib import, HTTP reset, cleanup/dynamo reset and logging restoration. Selected tests take no required fixtures and allocate their own inputs.",
+    "runtime_code_modified": false,
+    "import_manifest_wrapper": "pytest.main plus recording imported module paths and SHA256 after test completion; wrapper preserved in exact argv."
+  },
+  "execution": {
+    "started_utc": "2026-11-03T02:10:37.192971+00:00",
+    "ended_utc": "2026-11-03T02:10:51.499173+00:00",
+    "elapsed_seconds": 14.306204675987829,
+    "container": "copy-fault-memcheck-20261103t021037z",
+    "argv": [
+      "docker",
+      "run",
+      "--name",
+      "copy-fault-memcheck-20261103t021037z",
+      "--gpus=all",
+      "--memory=24g",
+      "--memory-swap=24g",
+      "--shm-size=1g",
+      "--network=none",
+      "--ulimit",
+      "core=0",
+      "--mount",
+      "type=bind,source=/home/chris/spark-lab/copy-fault-forensics/memcheck-dead-rows-noconftest-20261103T021037Z,target=/out",
+      "--mount",
+      "type=bind,source=/usr/local/cuda-13.0/compute-sanitizer,target=/opt/compute-sanitizer,readonly",
+      "--env",
+      "PYTORCH_NO_CUDA_MEMORY_CACHING=1",
+      "--env",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "--workdir",
+      "/opt/spark-ds41f/candidate/vllm",
+      "--entrypoint",
+      "/bin/bash",
+      "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+      "-lc",
+      "set -eu\nunset CUDA_LAUNCH_BLOCKING\n/opt/compute-sanitizer/compute-sanitizer --version\nnvcc --version\nprintf 'SOURCE_ROOT=%s\n' \"$PWD\"\nif test -d .git; then git rev-parse HEAD; git status --porcelain; else printf 'SOURCE_IDENTITY=exported image source, no Git metadata\n'; fi\nsha256sum tests/v1/worker/test_dead_rows.py vllm/v1/worker/gpu/input_batch.py\nprintf 'RELEVANT_ENVIRONMENT\n'\npython3 -c 'import json,os; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith((\"CUDA_\",\"PYTORCH_\",\"VLLM_\",\"SPARK_DS41F_\",\"TILELANG_\",\"NCCL_\"))},sort_keys=True,indent=2))'\npython3 -m pytest --noconftest --help > /out/pytest-help.txt\ngrep -F -- --noconftest /out/pytest-help.txt\nexec /opt/compute-sanitizer/compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 --log-file /out/memcheck-dead-rows.%p.log python3 -c 'import hashlib,json,pathlib,sys\nimport pytest\ntry:\n    result=pytest.main(['\"'\"'--noconftest'\"'\"','\"'\"'-q'\"'\"','\"'\"'-rA'\"'\"',*sys.argv[1:]])\nfinally:\n    files=[]\n    for name,module in sorted(sys.modules.items()):\n        path=getattr(module,'\"'\"'__file__'\"'\"',None)\n        if path and (name.startswith('\"'\"'vllm.'\"'\"') or '\"'\"'test_dead_rows'\"'\"' in name or name in ('\"'\"'torch'\"'\"','\"'\"'tilelang'\"'\"','\"'\"'tvm_ffi'\"'\"','\"'\"'pytest'\"'\"')):\n            p=pathlib.Path(path)\n            if p.is_file(): files.append({'\"'\"'module'\"'\"':name,'\"'\"'path'\"'\"':str(p),'\"'\"'sha256'\"'\"':hashlib.sha256(p.read_bytes()).hexdigest()})\n    pathlib.Path('\"'\"'/out/imported-files.json'\"'\"').write_text(json.dumps(files,indent=2)+'\"'\"'\\n'\"'\"')\nsys.exit(result)\n' tests/v1/worker/test_dead_rows.py::test_dead_rows_mark_rows_past_the_survival_cut tests/v1/worker/test_dead_rows.py::test_dead_row_cut_clamps_committed_tokens\n"
+    ],
+    "selectors": [
+      "tests/v1/worker/test_dead_rows.py::test_dead_rows_mark_rows_past_the_survival_cut",
+      "tests/v1/worker/test_dead_rows.py::test_dead_row_cut_clamps_committed_tokens"
+    ],
+    "exit_code": 0,
+    "timed_out": false,
+    "oom_killed": false,
+    "tests_passed": 2,
+    "tests_skipped": 0,
+    "sanitizer_reports": [
+      {
+        "file": "memcheck-dead-rows.1.log",
+        "error_summaries": [
+          0
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+      }
+    ]
+  },
+  "positive_control_validation": {
+    "run_id": "sp8-sanitizer-controls-20261103T021256Z",
+    "fixture_sha256": "ae0efde3795470ff0b92b8fe3f25cd6257d3354491278082920abc8c27aa7a82",
+    "memcheck_clean": "exit 0, zero errors",
+    "memcheck_oob": "exit 86, invalid global read at sanitizer_control.cu:16; subsequent launch failure reported",
+    "initcheck_clean": "exit 0, zero errors",
+    "initcheck_uninitialized": "exit 86, uninitialized global memory read at sanitizer_control.cu:16"
+  },
+  "memory_observations": {
+    "cap_enforced_by_container": true,
+    "oom_killed": false,
+    "peak_memory": "Not sampled. Before/after /proc/meminfo retained in raw receipts."
+  },
+  "cleanup": {
+    "own_container_removed": true,
+    "post_containers": "",
+    "post_gpu_compute_processes": "",
+    "other_containers_or_services_changed": false
+  },
+  "conclusion": "The selected standalone tests passed with no reported sanitizer errors. Scope is these inputs and kernels only; no neural target/DSpark forward, distributed rank layout or failing-step replay was exercised. Instrumentation changes timing, so this does not exclude a timing-dependent serving fault or establish its first nonfinite producer.",
+  "evidence": {
+    "remote_directory": "/home/chris/spark-lab/copy-fault-forensics/memcheck-dead-rows-noconftest-20261103T021037Z",
+    "local_directory": "results/private/copy-fault-forensics/sp8/memcheck-dead-rows-noconftest-20261103T021037Z",
+    "artifacts": [
+      {
+        "file": "command.json",
+        "bytes": 4169,
+        "sha256": "07cab0c642924164d04d8aae51123844459eeacc375a8546f95bab507b864475"
+      },
+      {
+        "file": "container-state.json",
+        "bytes": 873,
+        "sha256": "f2cec12399f55b71797e88f3f9c2ff01a4655efd61060fafad72b98a766c63dc"
+      },
+      {
+        "file": "image-identity.json",
+        "bytes": 8330,
+        "sha256": "e0b1342b4f64b7394e16e2618a1f51c550d45bee43803f9091812330cf9c5326"
+      },
+      {
+        "file": "imported-files.json",
+        "bytes": 139156,
+        "sha256": "1ce991d8d5c8bdf2a595ce2863b47b5aa5438ef1f18c2314713974ea9cd560cf"
+      },
+      {
+        "file": "memcheck-dead-rows.1.log",
+        "bytes": 62,
+        "sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425"
+      },
+      {
+        "file": "preflight.json",
+        "bytes": 1905,
+        "sha256": "2da7b10abee962d7cd30a738a3cf9172d1f94c5c1dc9b16652147ebbe0344ad3"
+      },
+      {
+        "file": "pytest-help.txt",
+        "bytes": 20730,
+        "sha256": "966310fb7dfd81ea8e88df226cad4d1df5b485b5d6396bdde934316aa399a849"
+      },
+      {
+        "file": "result.json",
+        "bytes": 2085,
+        "sha256": "58d86d20d2fcd3ee8a275491e90a2f20b4547da9616134ac4cc3379a19e8f5d3"
+      },
+      {
+        "file": "sha256.json",
+        "bytes": 820,
+        "sha256": "18c54171d6596a295ffabe4a3ac3f47b04d8c951d79fa5f61fd9b4f29c1c1994"
+      },
+      {
+        "file": "stdout-stderr.log",
+        "bytes": 3647,
+        "sha256": "f1cb5e684efe54de1d3716966871d26284261b5fb9535ccba8495d0662bb59c4"
+      }
+    ],
+    "remote_sha256_manifest_verified": true
+  }
+}
