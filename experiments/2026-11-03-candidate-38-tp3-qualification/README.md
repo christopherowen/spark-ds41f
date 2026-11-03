@@ -70,4 +70,67 @@ Do not change host settings within the comparison. No hold was present on dgx1
 or dgx4 during initial read-only inspection. The site's ignored node map is
 preserved and is not replaced with this workstation's same-named file.
 
-Status: prepared; runs and errors will be recorded when executed.
+## Execution and functional evidence
+
+Executed from published deployment `cb657ab1f5dba4e7cca48a48b0c2fe4e8d4a711f`
+on dgx1–3, with clean detached checkouts and the site's existing node map.
+The image above was distributed unchanged from dgx4; all three image IDs,
+layer lists and Config hashes agree. Window `dgx1-1793730237` opened at
+2026-11-03 18:23:57 UTC against the candidate-36 restore profile above.
+
+Both functional phases completed. Every ordered script and collector exited
+zero: 38 for the standard recipe and 12 for CopyDrafter, across two fresh boots
+of each. All twelve complete rank logs have no recorded CUDA, gate-logit,
+assertion or engine-death faults. The copied archives and individual files are
+hash-bound by the receipts under [runs/2026-11-03-dgx1-3](runs/2026-11-03-dgx1-3/).
+`analyze_functional.py` verifies the actual exits, requests, summaries, memory,
+runtime identity and repeat boots; seven corrupted-evidence controls were
+rejected even after their file and archive hashes were refreshed.
+
+| Recipe / boot | API ready | Minimum available GiB: dgx1 / dgx2 / dgx3 |
+| --- | ---: | ---: |
+| Standard, first | 118.3 s | 8.034 / 9.820 / 11.017 |
+| Standard, repeat | 101.4 s | 7.617 / 10.953 / 10.901 |
+| CopyDrafter, first | 114.3 s | 7.149 / 9.418 / 10.272 |
+| CopyDrafter, repeat | 105.7 s | 6.546 / 10.146 / 9.744 |
+
+The standard matrix covers wide greedy token/logprob determinism, the 16K
+prompt, distinct streams, API controls, fixed-length TTFT traces, sink probes,
+prompt logprobs, images and CED cross-shape repeats. Deterministic summaries
+repeat across boots. The CopyDrafter token/logprob, seeded-sampling and image
+records agree with the standard recipe on both boots. Its copy/prose/edit/tool
+probe completed 48 requests and 43,023 output tokens per boot with zero errors;
+the copy category produced about 16.03 tokens per engine step, exercising wide
+copy verification. The original harness retains aggregate probe counters rather
+than full generated text, so this is not a full-token correctness proof for all
+copy-probe outputs.
+
+Seeded sampling remains batch-dependent: the c8 digest differs from isolated
+generation, while the isolated repeat agrees. All three rows exactly match
+saved candidate-17 standard and CopyDrafter records. The sampled c8 penalties
+control also changed between boots, as previously documented. These observations
+are retained as limitations; they are not described as batch invariance.
+The legacy memory extra additionally read dgx4 without running GPU work there;
+its observation is recorded separately from the three TP ranks.
+
+## Performance status
+
+The standard recipe's release and companion suites are running, followed by its
+repeat boot. CopyDrafter's two performance boots remain pending. First-boot
+results do not constitute the final no-regression verdict. No recipe, lock or
+published baseline has been promoted or rewritten.
+
+The recorded reference's 524K/1M prefill extension (`c06790ef`) retained the
+original shorter suite's outer elapsed time. Its actual stored prefill samples
+sum to 1,230.88 seconds rather than that index's 523.6 seconds. Comparisons use
+the per-size samples, with the discrepancy recorded in
+[reference-duration-note.json](runs/2026-11-03-dgx1-3/reference-duration-note.json).
+The largest two sizes also have different actual prompt counts (reference /
+candidate first boot: 533,290 / 522,774 and 1,000,466 / 994,697). Keep these
+warnings alongside the token-rate comparisons; the reference is unchanged.
+The [native extension receipt](runs/2026-11-03-dgx1-3/reference-extension-native.json),
+recovered from dgx1, contains exactly the reference's six extended samples and
+its original 17:33:45 UTC start. It used only the two large sizes. The generator
+seeds documents by size index, so its indices 0/1 select different documents
+from the full suite's indices 3/4. These points are token-rate comparisons over
+nearby lengths rather than exact prompt matches.
