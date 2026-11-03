@@ -275,5 +275,15 @@ is not).
   because the shape's `benchmark_reference` is a bench manifest, not a suite run. Candidates
   27–37's runs beside them were made outside the lab, one boot each.
 
-Status: prepared 2026-11-03; the image's copy to the nodes and the runs are recorded below once
-they finish.
+**Image on the nodes.** `spark-ds41f:candidate-38` on sp5, sp6 and sp7 is dgx4's build, not a
+rebuild. dgx4 reaches the spaceport hosts only through a relay at about 1.7 MB/s, and the nodes
+already held 39 of the image's 57 layers (candidate-37's base; every host runs the containerd
+image store, where `docker save` writes compressed blobs by digest), so what shipped was `docker
+save`'s OCI layout with the 18 layer blobs the nodes lacked, the config and the manifests: 24
+blobs, 831,180,800 bytes, sha256 `436d8b7b…`, dgx4 to sp5 through the Mac (12:32–12:42Z), then
+sp5 to sp8, sp6 and sp7 over their LAN. `docker load` took the shared layers from each store.
+sp8 was loaded first as the trial. On dgx4, sp5, sp6, sp7 and sp8 the image is ID
+`sha256:213ba4df68d0…`, labels `local.spark-ds41f.vllm.tree=c061e5f6…` and
+`.sparknet.tree=8cc28a5c…`, and the layer list's digest `a5f28f19…` is the same.
+
+Status: prepared 2026-11-03, image on the nodes; the runs are recorded below once they finish.
