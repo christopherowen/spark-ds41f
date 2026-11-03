@@ -14,27 +14,42 @@ step work.
   `spark-ds41f:candidate-37` (label `local.spark-ds41f.vllm.patch-head`
   `5b7cfa37...`), on dgx4 and sp8 (GB10, 48 SMs).
 - **Patch:** [`0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch`](0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch),
-  one commit (`0c017c680`, tree `458b91a205f2154f1718552fb212cf6edaa0c004`) on
-  that head plus [#856](https://github.com/christopherowen/spark-ds41f/pull/856)'s
-  fix for #852 (vLLM `8bb508091`, tree `a751f693`: `sync_slot_draft_limits`
-  waits for the limit copy and publishes it). Its message states base,
-  rationale, quality, tests and upstream status.
-  - It replaces the earlier `0001-dspark-default-copy-drafts.patch` of this PR,
-    which was written on candidate-27 and kept the option.
-  - It also replaces this PR's first candidate-37 version (`bc71d8191`, tree
-    `9f9c6d73`, directly on `5b7cfa37f`), which still read the host limits
-    without waiting.
+  one commit (`9b8f05a35`, tree `949f829d6eba853ea7f53238669fe5d439782eda`) on
+  that head plus [#860](https://github.com/christopherowen/spark-ds41f/pull/860)'s
+  two commits, in order (`experiments/2026-11-03-copy-drafter-shared-budget/vllm/`
+  on #860's branch):
+  - `72abb31ff` (tree `58882ab9`), #852's fix: the adaptive budget reads no host
+    draft limits (`slot_draft_limits=None`), so every rank budgets from the
+    scheduler's drafts and the confidence snapshot;
+  - `88982f34e` (tree `f473423c`): the per-slot draft limits are removed (host
+    mirror, staging ring, event, `sync_slot_draft_limits`, device buffer and
+    `copy_alloc`'s write).
+
+  Its message states base, rationale, quality, tests and upstream status. This is
+  candidate-39's #842, staged on candidate-38 (#860, #848, #853, #854). It
+  replaces three earlier versions:
+  - the earlier `0001-dspark-default-copy-drafts.patch` of this PR, which was
+    written on candidate-27 and kept the option;
+  - this PR's first candidate-37 version (`bc71d8191`, tree `9f9c6d73`, directly
+    on `5b7cfa37f`), which still read the host limits without waiting; it is this
+    version's starting point;
+  - the rebase on #856 (`0c017c680`, tree `458b91a2`), which kept #856's
+    blocking limit wait. The owner dropped #856's wait and #859's device clamp
+    for their cost ("I don't like the performance loss").
 - **Variable:** copy drafts on wherever DSpark verifies greedy drafts adaptively.
   At the cluster this is candidate-37's copy arms run from the plain recipe. The
   rework of the step's copy work is bit-identical in its outputs and is measured
   here at kernel level.
 
-> **Status: blocked. Not ready to merge or default.** Copy drafts on candidate-37
-> crash an operator's engine under real traffic (#852; below, *Unfavourable: the
-> crash*). This patch computes the same proposals as candidate-37's copy arm. Its
-> kernel and c1 results cannot clear it of the crash. An sp5-sp7 lab window
-> running the operator's exact sequence did not reproduce it (*Lab window on
-> sp5-sp7*).
+> **Status: rebased on #860, unit-tested; not measured at the cluster on that
+> base.** Copy drafts on candidate-37 crash an operator's engine under real
+> traffic (#852; below, *Unfavourable: the crash*). This patch computes the same
+> proposals as candidate-37's copy arm. Its kernel and c1 results cannot clear it
+> of the crash. An sp5-sp7 lab window running the operator's exact sequence with
+> dead rows on did not reproduce it (*Lab window on sp5-sp7*). #860's window
+> reproduced it on candidate-37 with dead rows off and ran #860's fix clean
+> (its README has the runs). This patch now sits on that fix; its own cluster run
+> comes with candidate-39.
 
 ## Unfavourable: the crash (operator's TP3 ring, 2026-11-02)
 
@@ -109,7 +124,8 @@ run candidate-37 with copy drafts at that envelope.
 3. **One copy pass, beside DSpark.**
    - `copy_alloc` now updates the copy state from the step's verification and
      records the choice (source, offered drafts, next drafts, acceptance estimate)
-     beside the allocation and the slot's valid draft count.
+     beside the allocation. (On candidate-37 it also wrote the slot's valid draft
+     count; #860 removes those limits, and this patch writes none.)
    - `copy_apply` writes the proposals from that choice once DSpark has drafted.
    - `copy_select` is removed: it repeated the chunk reduction and the state
      update after DSpark (candidate-37 computed the state twice, discarding
@@ -117,6 +133,8 @@ run candidate-37 with copy drafts at that envelope.
    - `prepare_alloc` runs `copy_match` and `copy_alloc` on the output copy stream
      after postprocess, beside DSpark's draft forward. The allocation's copy to
      the host follows on the same stream; `propose` makes the main stream wait.
+     The allocation is the only result the host reads, through #860's alloc ring
+     as before.
      Nothing DSpark runs reads or writes what they touch (history, lengths, copy
      state). Every input stays alive until `propose`'s wait, so no allocation can
      be reused under them.
@@ -276,30 +294,44 @@ config/candidate-37-tp3-switched-dev.local.json cluster sync`.
 The tree (dgx4; any clone that has `19f2c20ed`):
 
 ```bash
-# candidate-37's series, #856's fix, then this patch, in a fresh repository
+# candidate-37's series, #860's two patches, then this patch, in a fresh repository
 git init fresh && cd fresh
 git fetch --depth 1 --no-tags /path/to/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
 git switch -c spark/build FETCH_HEAD
 # each patch of ../2026-10-26-spark-ds41f-candidate/candidate-37/vllm/series in order
 git am --committer-date-is-author-date <series patches...>            # tree af0fb152
-# #856 (branch copy-drafter-limit-sync), the same change as vLLM 8bb508091
+# #860 (branch copy-drafter-shared-budget), vLLM 72abb31ff and 88982f34e
+V=../2026-11-03-copy-drafter-shared-budget/vllm
 git am --committer-date-is-author-date \
-  ../2026-11-02-copy-drafter-limit-sync/vllm/0001-fix-copy-drafts-publish-the-latest-proposal-s-slot-draft-limits.patch  # tree a751f693
+  $V/0001-fix-copy-drafts-budget-verification-from-what-every-.patch   # tree 58882ab9
+git am --committer-date-is-author-date \
+  $V/0002-cleanup-copy-drafts-remove-the-per-slot-draft-limits.patch  # tree f473423c
 git am --committer-date-is-author-date 0001-perf-dspark-copy-drafts-as-the-one-behaviour-of-gree.patch
-git rev-parse HEAD^{tree}                                              # 458b91a2
+git rev-parse HEAD^{tree}                                              # 949f829d
 git diff --check HEAD~1 HEAD
 ```
 
-[`run_image.sh`](run_image.sh) runs a command in `spark-ds41f:candidate-37` with
-the patch's files (`git diff --name-only 5b7cfa37f` of the tree) mounted read-only
-over `/opt/spark-ds41f/candidate/vllm`. The tblib stand-in
-(`scripts/release_tests/tblib_stub.py`) is mounted on `PYTHONPATH`:
+On dgx4 these trees are in `/tmp/842-final/vllm`:
+- `copy-shared-budget`: #860's two commits, fetched from sp8's
+  `/tmp/vllm-shared-budget` by bundle;
+- `dspark-copy-drafts-default-on-860`: this patch, `9b8f05a35`.
+
+`/tmp/842-final/fresh` checks the patch files, as above.
+
+[`run_image.sh`](run_image.sh) runs a command in `spark-ds41f:candidate-37`. It
+mounts the files that differ from `5b7cfa37f` (`git diff --name-only 5b7cfa37f` of
+the tree, so #860's files too) read-only over `/opt/spark-ds41f/candidate/vllm`.
+The tblib stand-in (`scripts/release_tests/tblib_stub.py`) is mounted on
+`PYTHONPATH`:
 
 ```bash
 TREE=/tmp/842-final/vllm ./run_image.sh "python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub \
   tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_copy_drafts.py \
-  tests/v1/spec_decode/test_adaptive_verification.py"
+  tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py"
 ```
+
+The fourth file is the one #860's count includes. The runs on #856 and on
+candidate-37 below ran the first three only.
 
 The microbenchmark ([`bench_copy_kernels.py`](bench_copy_kernels.py)) puts
 candidate-37's own `tilelang_copy.py` from the image beside it as
@@ -323,9 +355,53 @@ image tree). `MANIFEST=` selects a subset.
 All runs are kept below, unfavourable and failed ones included. The raw JSON is
 in [`runs/`](runs/).
 
-### Unit tests (dgx4, 2026-11-02)
+### Unit tests (dgx4, 2026-11-02 and 2026-11-03)
 
-**On #856 (this patch's base, rebased 2026-11-02; tree `458b91a2`):**
+**On #860 (this patch's base, rebased 2026-11-03; `9b8f05a35`, tree `949f829d`):**
+- Started from the first version (`bc71d8191`), cherry-picked onto
+  `88982f34e`. The conflicts were in `copy_drafts.py`, `tilelang_copy.py` and
+  `test_copy_drafts.py`, where #860 removed the per-slot limits that version
+  still wrote. They resolve to this patch's step work without any limit:
+  - `copy_alloc` takes no `slot_limits` and writes none;
+  - `prepare_alloc` reads no host limits;
+  - nothing reads `slot_draft_limits.gpu`.
+
+  `git grep` finds no `slot_draft_limits`, `slot_limits`, `sync_slot_draft_limits`
+  or limit staging anywhere in `vllm/` or `tests/`.
+- Tests adapted:
+  - The kernel helpers and the CUDA-graph test no longer pass or check a
+    limits buffer.
+  - The prepare_alloc test becomes `test_prepare_alloc_writes_alloc_before_propose`.
+  - The stale-wide test drops its limit check, as #860's cleanup does.
+  - #860's two shared-budget tests run through this patch's `propose(idx_mapping,
+    drafts, confidences)`.
+  - The side-stream test keeps everything but the limits: the proposals,
+    allocation and copy state equal the drafter-stream run's, with the side
+    stream held busy.
+  - The #856 rebase's `test_side_stream_limits_reach_the_host_as_the_latest_proposals`
+    is gone with the mirror it tested.
+- The first run failed: **3 failed, 81 passed, 1 skipped**. The kernel tests'
+  helpers still passed `copy_alloc` a limits buffer (`TypeError: copy_alloc()
+  takes 15 positional arguments but 16 were given`), so they were fixed and the
+  commit amended.
+- `test_copy_drafts_scheduler.py`, `test_copy_drafts.py`,
+  `test_adaptive_verification.py` and `test_prepare_kernels.py` in the
+  candidate-37 image: **84 passed, 1 skipped** (the two-GPU test). #860 alone,
+  the same four files on dgx4: **79 passed, 1 skipped**, as #860 reports from
+  sp8.
+- Mutation check: `propose` without its wait for the side stream fails
+  `test_side_stream_prepare_alloc_matches_the_drafters_stream` only
+  (`test_copy_drafts.py`: 1 failed, 24 passed).
+- Outputs: [`runs/unit-on-860.txt`](runs/unit-on-860.txt) (this patch, the
+  failed first run, #860 alone, the mutation). dgx4 was otherwise idle (no
+  compute process, no other container).
+- Fresh tree: candidate-37's `af0fb152` with #860's patch files gives `58882ab9`
+  and `f473423c`, and this patch file then gives `949f829d`. `git diff --check`
+  is clean.
+- vLLM `ruff` 0.14.0: no finding in this patch's hunks. The two E501s in
+  `test_copy_drafts.py` are candidate-37's line and #860's line.
+
+**On #856 (superseded; rebased 2026-11-02; tree `458b91a2`):**
 - `test_copy_drafts.py`, `test_copy_drafts_scheduler.py` and
   `test_adaptive_verification.py` in the candidate-37 image: **77 passed, 1
   skipped** (the two-GPU test). #856 alone gives 71 passed, 1 skipped.
@@ -510,6 +586,8 @@ patched during the window, whose runner has the code loaded):
 
 ### Release gate
 
+Run on the first version (`bc71d8191` on candidate-37), not rerun on #860.
+
 `scripts/release_tests.py gate` at the patched tree: 121 files. The run used
 [`gate.sh`](gate.sh) on dgx4, 17:43-18:44 (dgx4 time): the bundle's runner and
 environment, with the patch's files over the candidate-37 image. Result:
@@ -532,6 +610,12 @@ memlock=-1`, which the lab's io_uring bundles need. The three io_uring files
 were rerun with it: 125 passed, 1 failed (the pre-existing `TypeError`).
 
 ### Microbenchmark (`bench_copy_kernels.py`)
+
+Run on the first version (`bc71d8191` on candidate-37), not rerun on #860. In
+both arms #860 drops the same thing: `copy_alloc`'s one store per request of the
+slot's limit, and the limits' copy to the host. The other kernels and the
+patch's copy work are unchanged by the rebase. The bench script still passes
+the limits buffer, so it runs only against candidate-37's kernels.
 
 Every case runs base (candidate-37's kernels) and patch alternated (ABBA) in one
 process; each measurement was run twice, in separate processes, on an otherwise
@@ -675,8 +759,10 @@ computes them (bit-identically), crash an operator's TP3 engine:
 - under real traffic at m=16;
 - reproducibly at m=8 on single-stream.
 
-The patch stays on this PR as the finished mechanism for when the crash is
-understood and fixed:
+#860's fix is now this patch's base (unit-tested here, 84 passed). Whether
+copy drafts on that base are clear of the crash is candidate-38's and
+candidate-39's to show at the cluster. The patch stays on this PR as the
+finished mechanism:
 - no option, and the old arms' `copy_drafts` JSON is refused;
 - the recipe's plain shapes reach the copy envelope (6,155 / 16,395 tokens,
   capture to 59 / 107) with unchanged chunk boundaries;
@@ -697,14 +783,16 @@ post to the operator are yours):
    - The sp5-sp7 window could not reproduce it: #852's exact sequence is clean on
      tp3-switched with and without 0676, at unlocked clocks and at 2,200 MHz,
      under 1, 8 and 16 streams, with dead rows on.
-   - The operator's claimed cause, #855, taken in as
-     [#856](https://github.com/christopherowen/spark-ds41f/pull/856): a stale
-     host limit admits `-1` placeholder rows, which dead rows would mask. #856's
-     blocking limit sync is this patch's base now.
-   - #856's own window (`lab-repro.json`: dead rows off, candidate-37 against
-     the fix, with the census) is the test.
-2. #856's cost (`lab-cost.json`: paired single-stream verdict, 8 and 16 streams).
-3. Then this patch on #856 in a candidate image, with the plain `tp3.json` /
+   - The operator's claimed cause, #855, was first taken in as
+     [#856](https://github.com/christopherowen/spark-ds41f/pull/856) (a blocking
+     limit sync), then #859 (a device clamp). The owner dropped both for their
+     cost.
+   - [#860](https://github.com/christopherowen/spark-ds41f/pull/860) is the fix
+     now, and this patch's base: the budget reads no host limits, and the limits
+     are removed. Its window reproduced #852 on candidate-37 (m=8, dead rows off)
+     and ran the fix clean; its README has the runs and the open lead.
+2. #860 ships in candidate-38 (with #848, #853 and #854), without #842.
+3. Then this patch as candidate-39 on candidate-38, with the plain `tp3.json` /
    `tp4.json`, and a concurrent soak where the token budget binds (mixed prompt
    lengths, copy-dense and tool-like prompts, several streams).
 
