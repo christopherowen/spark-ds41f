@@ -115,15 +115,53 @@ its observation is recorded separately from the three TP ranks.
 
 ## Performance status
 
-The standard recipe's first performance boot completed all 13 steps with zero
-step failures. Its repeat is running. The two model runs have 256/256 identical
-greedy responses and identical distributions over 65,536 scored positions
-(KL zero); all selected and top-20 log probabilities are finite. The fixed-row
-grid is 16.64% / 16.97% shorter than the reference; paired decode at C8 is
-+3.30% / +3.22%, and at C4 +4.33% / +4.13%. These are point results while the
-complete repeat and final tables remain pending. CopyDrafter's two performance
-boots remain pending. No recipe, lock or published baseline has been promoted
-or rewritten.
+The standard recipe's two performance boots are complete: 26 ordered suite
+steps, all exiting zero. Their 2,460 closed-loop/Poisson request-table records
+have zero failed, rejected, foreign or approximate-timing requests and all
+produce 256 tokens. Prefill has all 15 successful samples per boot; every stall
+point reports three successful repeats. The two model runs have 256/256
+identical greedy responses and identical recorded top-20 distributions over
+65,536 scored positions (KL zero); all selected and top-20 log probabilities
+are finite.
+
+The normal tables include the candidate's repeat and the recorded A/A floor.
+Their paired rows average the two candidate boots. No headline verdict is worse;
+the C4 p99 direction below remains unresolved. Each decision margin includes
+the protocol's within-run interval and boot allowance.
+
+| Metric | Change vs recorded 1030 | Decision margin | Verdict |
+| --- | ---: | ---: | --- |
+| Fixed-row grid step time | −16.64% | 0.52% | better |
+| Greedy decode C8 | +3.26% | 0.60% | better |
+| Greedy decode C4 | +4.23% | 0.58% | better |
+| Greedy decode C1 | +4.93% | 0.32% | better |
+| Sampled decode C16 | +3.07% | 1.50% | better |
+| Sampled decode C8 | +3.86% | 1.39% | better |
+| Sampled decode C1 | +4.95% | 0.31% | better |
+| Prefill 32K / 131K / 262K | +4.22% / +4.57% / +4.21% | 1.07% / 0.80% / 0.74% | better |
+| Prefill 524K | +3.46% | 0.51% | better, reference caveat below |
+| Prefill 1M | −0.11% | 0.71% | same, reference caveat below |
+
+Startup minima (dgx1/2/3) are 6.903/10.369/10.491 GiB and
+7.342/10.426/10.407 GiB; readiness is 101.4/103.5 seconds. Runtime minima over
+the three suites are 6.56/10.35/10.26 GiB and 6.86/10.14/10.18 GiB. No suite
+halted, grew swap, recorded thermal slowdown or failed to restore its fan state.
+
+The [native timing records and tables](runs/2026-11-03-dgx1-3/performance-default/)
+are copied byte-for-byte from the completed phase. The analysis verifies its
+60 archived files, exact source/image identity, distinct repeat boot, every
+step exit, requests, finite scores, memory and conditions. All eight
+[semantic corruption controls](runs/2026-11-03-dgx1-3/performance-audit-controls/results.json)
+are rejected for the expected reason with refreshed file and archive hashes.
+The executed control source is archived beside that receipt. Private model
+corpora and raw logs retain their hashes in the source receipt.
+One offline model comparison began before its two file transfers completed and
+exited on truncated input. Both transfers then completed successfully; a separate
+comparison and the complete archive audit passed. Its failed collection-attempt
+receipt is retained with the controls; it was not a failed GPU measurement.
+
+The focused confirmation is running; CopyDrafter's two performance boots remain
+pending. No recipe, lock or published baseline has been promoted or rewritten.
 
 The standard repeat's C4 TTFT p99 is 322.96 ms against the reference's
 310.59 ms (+3.98%, a direction-only flag without an interval); the first boot
