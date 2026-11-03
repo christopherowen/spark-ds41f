@@ -9,9 +9,10 @@ this series. Their experiment records remain historical evidence. #860's two
 patches, #848/#853/#854's runtime changes and #863's test repairs are carried forward
 here; #842's default-enablement change remains separate.
 
-This is an unpromoted candidate. The final image's release-test gate passes, but the
-combined build still needs distributed boot/repeat, inference and performance
-qualification. The [fault investigation](../../2026-11-03-copy-fault-forensics/README.md)
+This is an unpromoted candidate. The final image's release-test gate passes, and
+focused loop and CopyDrafter reproductions completed on TP3 switched, each with
+a fresh boot and repeat boot. Broader inference and release/performance
+qualification remains pending. The [fault investigation](../../2026-11-03-copy-fault-forensics/README.md)
 demonstrates the unequal-layout defect and a stale-receive-buffer corruption
 mechanism. Its last host preparation records do not prove which GPU forward
 produced the original NaN.
@@ -119,8 +120,9 @@ six files mounted over candidate-38's first image: 8,069 passed, 360 skipped, 0 
 (`experiments/2026-11-03-release-gate-tests/runs/2026-11-03-dgx4/`). That run is #863's
 evidence for the fixes; this candidate's gate is the run in its own image, below.
 
-Not included: `#842` (CopyDrafter on by default; it needs rebasing onto #860 and its own
-qualification, and is staged for candidate-39), `#856` and `#859` (superseded by #860).
+Not included: `#842` (CopyDrafter on by default; its latest patch already incorporates
+#860's fix and cleanup, but its additional changes still need their own qualification
+and are staged for candidate-39), `#856` and `#859` (superseded by #860).
 
 vLLM tree: `c061e5f6931306fa4655ba531428f639c365bf10` (patch head
 `1f33102547e4da5c64712390604695d1abd577c4`; 572 patches; patch set `55370020…`). `git diff
@@ -137,8 +139,8 @@ frozen recipes) with the image, its expected trees and this folder's lock, as ca
 do; `tp3-dev.json`, `tp3-copy.json`, `tp3-copy-dev.json` and `tp3-8192.json` are
 candidate-37's with the name changed. `candidate-tp3.json`, `release-tp3.json` and
 `screen-tp3.json` are candidate-37's gates with the labels renamed. `image-dgx4.json` is the
-build profile. Qualification is queued by the parent session; nothing here was started on a
-serving node.
+build profile. These broader qualification suites remain pending; the focused
+TP3-switched reproduction below uses its own tracked arms.
 
 ## Checks
 
@@ -308,4 +310,14 @@ sp8 was loaded first as the trial. On dgx4, sp5, sp6, sp7 and sp8 the image is I
 `sha256:213ba4df68d0…`, labels `local.spark-ds41f.vllm.tree=c061e5f6…` and
 `.sparknet.tree=8cc28a5c…`, and the layer list's digest `a5f28f19…` is the same.
 
-Status: prepared 2026-11-03, image on the nodes; the runs are recorded below once they finish.
+The broader candidate/release suites above remain pending. The separate
+[focused reproduction](../../2026-11-03-candidate-38-reproduction/README.md)
+completed on 2026-11-03 at deployment commit `806c5797`, using the unchanged final
+image and no source overlays. Both loop boots reproduced seeded sustainment at
+effort 100 and 75 with detection off; the default detector forced a reasoning end.
+The bounded clean fixture did not develop a new loop. Both CopyDrafter boots
+completed the original copy-probe/single-stream sequence and eight-/sixteen-client
+stress without a captured NaN assertion, worker failure or request error.
+No per-step rank-layout recorder was present, and these diagnostic rates do not
+establish a release performance comparison. Candidate-37 was restored on all
+three nodes, verified, and the test window closed.
