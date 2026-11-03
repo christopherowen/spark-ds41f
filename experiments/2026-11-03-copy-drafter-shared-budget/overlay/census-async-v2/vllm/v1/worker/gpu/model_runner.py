@@ -720,6 +720,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.models.deepseek_v4_1 import sparse_mla as ds41_sparse_mla
 
         self._census_calls = getattr(self, "_census_calls", 0) + 1
+        if self._census_calls == 1:
+            # Startup's dummy batches (every row a placeholder) hit the metadata
+            # census by design; discard them so the first recorded hit is a real step.
+            ds41_sparse_mla.metadata_census()
+            ds41_router.nonfinite_census()
         ring = getattr(self, "_layout_ring", None)
         if ring is None:
             from collections import deque
