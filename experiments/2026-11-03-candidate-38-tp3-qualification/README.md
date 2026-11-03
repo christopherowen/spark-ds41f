@@ -115,10 +115,15 @@ its observation is recorded separately from the three TP ranks.
 
 ## Performance status
 
-The standard recipe's release and companion suites are running, followed by its
-repeat boot. CopyDrafter's two performance boots remain pending. First-boot
-results do not constitute the final no-regression verdict. No recipe, lock or
-published baseline has been promoted or rewritten.
+The standard recipe's first performance boot completed all 13 steps with zero
+step failures. Its repeat is running. The two model runs have 256/256 identical
+greedy responses and identical distributions over 65,536 scored positions
+(KL zero); all selected and top-20 log probabilities are finite. The fixed-row
+grid is 16.64% / 16.97% shorter than the reference; paired decode at C8 is
++3.30% / +3.22%, and at C4 +4.33% / +4.13%. These are point results while the
+complete repeat and final tables remain pending. CopyDrafter's two performance
+boots remain pending. No recipe, lock or published baseline has been promoted
+or rewritten.
 
 The standard repeat's C4 TTFT p99 is 322.96 ms against the reference's
 310.59 ms (+3.98%, a direction-only flag without an interval); the first boot
