@@ -24,10 +24,16 @@ run on sp5–sp7, in window `spark-0013-1793667996`:
     warm-up batch;
   - diag4 died a minute into serving, with no census window completed.
 
-The NaN producer is not named (*The reruns*). One more diagnosis is prepared and not
-run: a per-step record of every rank's layout that outlives the engine (*The layout
-ring*), to compare the ranks at the steps before the assert, which the counter's
-windows never reached. Not promoted; no recipe change.
+- **The layout ring** (`shared-budget-ring-sp`): a per-step record of every rank's
+  layout that outlives the engine. Candidate-37 crashed again, and the crash step was
+  the one step of 5,340 whose layout differed across the ranks: a copy proposal of 16
+  drafts that two ranks' stale mirrors admitted and the third's capped at 5, so two
+  ranks ran the 17-token graph and one the 6-token graph. The repeat boot crashed the
+  same way at its own last step, 6,373 steps in, with the same rank lagging. That is
+  #852's mechanism, measured twice; the repro's "ranks agreed" held only through the
+  counter's last window, which closed 7 s before each assert.
+
+Not promoted; no recipe change.
 
 This supersedes both earlier fixes, #856's host wait
 ([experiments/2026-11-02-copy-drafter-limit-sync](../2026-11-02-copy-drafter-limit-sync/))
@@ -111,14 +117,15 @@ The caveat: no per-rank diagnostic had run on an unfixed arm, on their ring or o
 They have offered a paired run on ring2 in a window, which would add a second
 topology.
 
-**Our repro since (below) agrees on one point and not the other.**
+**Our repro since (below) agreed on one point and seemed to disagree on the other.**
 - On placeholders it agrees: the minimal arm verifies more `-1` rows, routed live
   with dead rows off, and stays clean. So live placeholder rows are not the NaN
   producer here.
-- On the layout it disagrees. On candidate-37's crashing arm the three ranks'
-  CRCs of the consequential stale reads were equal in every window: the ranks read
-  the same stale limits and laid out the same steps. So per-rank divergence did not
-  cause this crash either.
+- On the layout it seemed to disagree: on candidate-37's crashing arm the three
+  ranks' CRCs of the consequential stale reads were equal in every window. But the
+  last window closed 34 s before the assert, and the layout ring (*The layout ring*)
+  then showed the crash step itself laid out differently on the ranks. The operator's
+  report stands.
 
 **The diagnosis job since** (*The diagnosis job*, below) narrows it.
 - **Stale reads alone are not enough.** Stale reads of both kinds, mostly narrow
@@ -577,10 +584,11 @@ Whether diag4's instrumentation or the stale cap made rank 1 fail is undetermine
 The 0676-reverted arm also died with a launch failure that followed a peer's
 collective timeout, but there the silent rank had asserted.
 
-### The layout ring (`shared-budget-ring-sp`, prepared)
+### The layout ring (`shared-budget-ring-sp`, `shared-budget-ring2-sp`)
 
-Owner, 2026-11-03: "Keep digging." This job is prepared, dry-run and checked, and not
-run: it needs a window on sp5–sp7.
+Owner, 2026-11-03: "Keep digging." Then: "Open the window." This is the parent
+session's job, run in window `spark-0013-1793692440` on sp5–sp7 from 07:54Z, at main
+`74409a7e` (the first boot) and `c2bb2ebb` (the repeat).
 
 **The gap it closes.** The repro's claim that candidate-37's ranks agreed rests on the
 counter's windows, and the last window closed before the crash:
@@ -591,17 +599,7 @@ counter's windows, and the last window closed before the crash:
 - the 0676-reverted arm is the same: equal CRCs at 3,072 reads, the assert before
   4,096.
 
-So a divergence in the last steps before each crash is unrecorded, not ruled out. Two
-more readings of the receipts fit a per-rank divergence and are not shown by them:
-- In both crashes, TP0 and TP2 asserted and TP1 did not. `route_partials` sums a
-  gate's split-K partials `P[shard, row]` across the shards and checks the sum once a
-  row; a row its routing mask marks as padding returns before the check. A row that is
-  live on two ranks and padding on the third is checked on the two.
-- Without 0676, an inactive row's attention is computed on nothing. With it, its
-  output is 0. Rows that other ranks hold live would sum a non-finite partial without
-  0676 and a wrong finite one with it. That fits the reverted arm asserting sooner.
-
-Both are readings. The ring is the measurement.
+So a divergence in the last steps before each crash was unrecorded, not ruled out.
 
 **What it records.** [overlay/layout-ring](overlay/layout-ring/)'s `model_runner.py`
 is candidate-37's runner with one call in `prepare_inputs`, after the batch is
@@ -640,19 +638,109 @@ counts differ.
   OK`).
 - [tables_arms.py](tables_arms.py) prints the comparison beside the counter's.
 
+**The arm and the spec.**
+- [arm-ring-c37-m8-nodead.json](arm-ring-c37-m8-nodead.json) is the repro's
+  `arm-c37-m8-nodead` (candidate-37, m=8, dead rows off, the stale-read counter) plus
+  the ring's `model_runner.py`. No census, no device sync: the repro's timing, a
+  `pwrite` a step apart.
+- [lab-ring.json](lab-ring.json), run `shared-budget-ring-sp`, and
+  [lab-ring-2.json](lab-ring-2.json), run `shared-budget-ring2-sp`, its repeat boot:
+  the repro's sequence, one boot each, with the ring read after the suite and after
+  each streams step.
+- [layout_ring_check.py](layout_ring_check.py), in candidate-37's image on sp8 with
+  the overlay mounted: 9 records of 40 bytes, equal sequences give equal records, one
+  changed eligible count changes only its CRC, a step without drafts records no budget,
+  and the counter's reads accumulate (`LAYOUT-RING /tmp/.../rank2.bin | layout ring
+  OK`).
+- [tables_arms.py](tables_arms.py) prints the comparison beside the counter's.
+
 **Outcomes, written before the run.**
-- The ranks' records differ at steps before the assert, with the counter's stale-read
-  counts differing there: the per-rank stale read laid out different steps, and the
-  crash follows the divergence. Which field differs says how: `padded` means the
-  ranks ran different graphs, so their collectives disagreed in size; `eligible_crc`
-  or `tokens` alone means equal sizes and rows that hold different tokens, summed
-  across the shards. Then the first non-finite value is made where the ranks' rows
-  are first combined, and the kernel question becomes which combine that is.
+- The ranks' records differ at steps before the assert: the per-rank stale read laid
+  out different steps, and the crash follows the divergence. Which field differs says
+  how: `padded` means the ranks ran different graphs, so their collectives disagreed
+  in size; `eligible_crc` or `tokens` alone means equal sizes and rows that hold
+  different tokens, summed across the shards.
 - The ranks' records are equal through the last common step, and the assert follows
-  anyway: the producer is on one rank, and the metadata census (*The metadata
-  census*), with its warm-up problem fixed, is the next instrument.
+  anyway: the producer is on one rank, and the metadata census is the next
+  instrument.
 - The engine does not crash: the pwrite shifted the timing. The ring still says
   whether the ranks diverged without a census's work.
+
+**The first boot** (07:54 to 08:07Z). The receipts are on sp5:
+`results/private/determinism/shared-budget-ring-sp/` (the ring's and the counter's JSON
+lines, and the engine logs kept with the streams steps),
+`results/private/suites/shared-budget-ring-sp-single-stream/`, and the table
+`results/private/lab/shared-budget-ring-sp-table.txt`.
+
+| | `ring-c37-m8-nodead` | the repro's `c37-m8-nodead` |
+|---|---|---|
+| Copy probe (copy / edit / tool / prose) | 16.367 / 15.745 / 6.636 / 2.79; 4,550 / 4,566 output tokens | the same |
+| Single-stream suite | **died**: 20.13 tok/s, 6,663,222 failed, exit 1 | died |
+| Asserts | `route_partials: gate logits contain nan or inf` on sp5 (TP0) and sp7 (TP2); none on sp6 (TP1), which lost the TCPStore at 08:02:45Z | the same pattern |
+| Counter windows | 5 (5,120 reads), the last at 08:02:38Z; CRCs equal on all ranks; 34 consequential (28 wider / 278 rows, 6 narrower / 48 drafts) | 8, equal |
+| Ring records | **5,340 on each rank; 5,339 steps equal; step 5,339, the last, differs** | – |
+| Repeat boot (below) | died at step 6,372, the only divergent step of 6,373 | – |
+
+The probe's text and timing are the repro's, so the pwrite changed nothing visible.
+The crash is 7 s and 159 budgets after the last counter window, inside its blind spot
+again. The ring's last five steps, one request in the batch throughout (the counter's
+`reads` and `stale` are cumulative; CRCs are of one-element arrays):
+
+| Step | TP0 (sp5) | TP1 (sp6) | TP2 (sp7) |
+|---|---|---|---|
+| 5,335 | 5 tokens, graph 5, scheduled 5 drafts, eligible 5, budget 4 | the same | the same |
+| 5,336–5,338 | 6 tokens, graph 6, scheduled 5, eligible 5, budget 5 | the same | the same |
+| **5,339** | **17 tokens, graph 17, scheduled 16, eligible 16, budget 16** | **6 tokens, graph 6, scheduled 16, eligible 5, budget 5** | **17 tokens, graph 17, scheduled 16, eligible 16, budget 16** |
+
+Every rank's budget read was stale at every one of these steps (5,274 of 5,279 reads
+were, on each rank alike), and the counter's stale counts agree on all three. What
+differed is which older copy each mirror held. At step 5,339 the scheduler laid out a
+copy proposal of 16 drafts; TP0's and TP2's mirrors gave 16, TP1's gave 5, the block
+before. So TP0 and TP2 prepared a 17-row step and ran the 17-token graph, and TP1
+prepared a 6-row step and ran the 6-token graph, for the same scheduler output.
+
+What follows from it:
+- **The crash step is a divergent step, and the only one.** The 5,339 steps before it
+  laid out alike on all ranks, and the one step that did not is the one that
+  asserted. The repeat boot repeats this at 6,372 of 6,373.
+- **The ranks ran different graphs.** `padded` differs (17 against 6), so every
+  collective of that forward disagreed in size across the ranks: rows 6–16 exist on
+  TP0 and TP2 and not on TP1. The two 17-row ranks asserted in `route_partials`, where
+  a row's gate logits are the sum of the shards' partials; the 6-row rank asserted
+  nothing and lost its peers. This is the pattern of both earlier crashes.
+- **It is the operator's mechanism** (#855, comment 6592146119): the per-rank layout,
+  not a live placeholder row. The repro's "ranks agreed" was true of the counter's
+  windows, which the crash never reached.
+- **No kernel is at fault.** The first non-finite value is made where the shards' rows
+  are combined for a step they did not lay out alike. Which collective delivers what
+  to the 17-row ranks for rows 6–16 is not instrumented; the rows have no
+  counterpart on TP1.
+- **The counter could not see it.** Its stale flag was the same on every rank, and
+  its CRC of consequential reads would have differed at read 5,279, but the next
+  window, 6,144, never came.
+
+**The repeat boot** (`shared-budget-ring2-sp`, 08:10 to 08:21Z, main `c2bb2ebb`; receipts
+in `results/private/determinism/shared-budget-ring2-sp/`,
+`results/private/suites/shared-budget-ring2-sp-single-stream/` and
+`results/private/lab/shared-budget-ring2-sp-table.txt` on sp5) gave the same picture:
+- the copy probe is identical (16.367 / 15.745 / 6.636 / 2.79; 4,550 / 4,566 tokens);
+- the suite died: 29.10 tok/s, 5,271,210 failed, exit 1;
+- asserts on sp5 (TP0, 352 lines) and sp7 (TP2, 226); none on sp6 (TP1), which lost
+  the TCPStore at 08:18:08Z;
+- the counter's last window, 6,144 reads, is at 08:18:01Z with equal CRCs; the crash
+  is 7 s and 157 budgets later;
+- **6,373 records on each rank; 6,372 steps equal; the last, 6,372, differs**, and
+  in the same way:
+
+| Step | TP0 (sp5) | TP1 (sp6) | TP2 (sp7) |
+|---|---|---|---|
+| 6,368 | 4 tokens, graph 4, scheduled 5, eligible 5, budget 3 | the same | the same |
+| 6,369–6,371 | 6 tokens, graph 6, scheduled 5, eligible 5, budget 5 | the same | the same |
+| **6,372** | **17 tokens, graph 17, scheduled 16, eligible 16, budget 16** | **6 tokens, graph 6, scheduled 16, eligible 5, budget 5** | **17 tokens, graph 17, scheduled 16, eligible 16, budget 16** |
+
+Two boots, the same step shape (a 16-draft copy proposal after DSpark's block of 5),
+the same lagging rank (TP1), the same two ranks asserting. The crash step is the only
+divergent step in both, 5,340 and 6,373 steps in.
 
 ### Context: #856's and #859's runs on sp5–sp7
 
@@ -821,14 +909,20 @@ scripts/lab.py run experiments/2026-11-03-copy-drafter-shared-budget/lab-ring.js
     batches, and the third died a minute in (*The reruns*).
   - A per-rank row census cannot see a cross-rank layout mismatch: each rank's rows
     can be valid on their own while the ranks lay out different steps.
-  - Naming the kernel needs either a run with synchronized launches
-    (`CUDA_LAUNCH_BLOCKING=1` or compute-sanitizer), or a cross-rank comparison of
-    each step's layout. The comparison is prepared and not run (*The layout ring*:
-    `lab-ring.json`, one boot in a sp5–sp7 window); the synchronized-launch run is a
-    follow-up outside #860.
+  - The cross-rank comparison has since run (*The layout ring*): the crash step was
+    laid out differently on the ranks, with different graph sizes, and no other step
+    was. The first non-finite value is made where the shards' rows are combined for a
+    step they did not lay out alike; which collective delivers what to the rows the
+    small rank never computed is not instrumented. A run with synchronized launches
+    would name that collective; it is a follow-up outside #860, and the fix does not
+    depend on it.
   - The repro's "ranks agreed" holds through 8,192 budgets, the last counter window
-    before the assert, and the reverted arm's through 3,072. The steps between are
-    unrecorded (*The layout ring*).
+    before the assert, and the reverted arm's through 3,072. The ring run's agreed
+    through 5,338 and diverged at 5,339, the crash step; the repeat boot's through
+    6,371 and diverged at 6,372, its crash step.
+  - **Why TP1 lags** in both boots is not measured: its mirror held the older limit
+    each time. A host difference between sp6 and the others (its copy lands later, or
+    its budget runs earlier) is the reading.
 
   Until the kernel is named, the minimal fix is known to avoid the crash on this
   sequence, but not why.
@@ -874,8 +968,12 @@ The diagnosis jobs since add three things:
 The shared budget rules that divergence out by design: its layouts do not read the
 limits, and its ranks' layout CRCs were equal in every window.
 
-The kernel that first produces the non-finite value is not named. Two reruns did not
-name it: diag3 repeated diag2, and diag4 died a minute in. The cross-rank comparison
-of each step's layout is prepared as the layout ring and waits for a window; the
-repro's "ranks agreed" is evidenced only to its last counter window, 34 s before the
-assert. A run with synchronized launches remains a follow-up outside #860.
+The layout ring then measured the mechanism, twice: candidate-37 crashed again in both
+boots, and each crash step was the only one of its run (5,340 and 6,373 steps) laid
+out differently across the ranks. A copy proposal
+of 16 drafts met mirrors that said 16 on two ranks and 5 on the third, so two ranks
+ran the 17-token graph and one the 6-token graph for the same scheduler output, and
+the two asserted in `route_partials`. There is no single-rank NaN producer to name:
+the first non-finite value is made where the shards' rows are combined for a step
+the ranks did not lay out alike. The shared budget removes that step by
+construction, and its ranks' layouts were equal in every window of its runs.
