@@ -1,0 +1,37 @@
+{
+  "notes": "External site, second stage: spark-ds41f-1030 at tp4-ring on the recipe's own host, 7.0.0-1019-nvidia-64k with memory saver 0.4.1 (DKMS, signed with a site key enrolled in MOK), and the recipe's tp4-ring sizing except the batch budget: 8,192 (long-prefill threshold 8,096). The recipe's 16,384 was measured first (runs/1030-64k-16384); at 16,384 a short request beside a 545K cold prefill streamed at 2.3-2.9 s per chunk, so the site chose 8,192. Same model, name and image cap as the first stage. host.fan_control false (ASUS Ascent GX10). Site policy: scripts/memguard.sh warns instead of killing the container.",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp4-ring"
+  },
+  "set": {
+    "models": {
+      "site-1017": {
+        "snapshot": "{home}/ds41f-1017/snapshot",
+        "blobs": "{home}/ds41f-1017/blobs",
+        "notes": "DeepSeek-V4.1-Flash-1017 rev 1bae0e10, every LFS file sha256-verified; workers read the blobs over read-only NFS from the head, Engram shards 47/48 local."
+      }
+    },
+    "model": "site-1017",
+    "host": {
+      "home": "/home/admin",
+      "fan_control": false
+    },
+    "distributed": {
+      "master_addr": "192.0.2.1"
+    },
+    "deployment": {
+      "repository": "/home/admin/ds41f/origin.git",
+      "launch_enabled": true
+    }
+  },
+  "serve_options": {
+    "--max-num-batched-tokens": "8192",
+    "--long-prefill-token-threshold": "8096",
+    "--limit-mm-per-prompt": "{\"image\":64}"
+  },
+  "unset": [
+    "glp",
+    "deployment.branch"
+  ]
+}

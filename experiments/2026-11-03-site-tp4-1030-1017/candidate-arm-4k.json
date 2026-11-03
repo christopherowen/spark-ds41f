@@ -1,0 +1,42 @@
+{
+  "notes": "External site, first stage: spark-ds41f-1030 at tp4-ring on the stock 4 KiB kernel 6.17.0-1032-nvidia without the memory saver (started with --unqualified-shape). Serves stock DeepSeek-V4.1-Flash-1017 rev 1bae0e10 from a snapshot whose shards link over read-only NFS to the head's copy (shards 47/48, the Engram tables, local on every node) as one name; the GLP second name is unset; 64 images per prompt (chat clients resend history images). Batch budget 8,192 (long-prefill threshold 8,096), the r6u value. host.fan_control false: the boards are ASUS Ascent GX10, not NVIDIA's P4242. Site policy: scripts/memguard.sh warns instead of killing the container.",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp4-ring"
+  },
+  "set": {
+    "models": {
+      "site-1017": {
+        "snapshot": "{home}/ds41f-1017/snapshot",
+        "blobs": "{home}/ds41f-1017/blobs",
+        "notes": "DeepSeek-V4.1-Flash-1017 rev 1bae0e10, every LFS file sha256-verified; workers read the blobs over read-only NFS from the head, Engram shards 47/48 local."
+      }
+    },
+    "model": "site-1017",
+    "host": {
+      "home": "/home/admin",
+      "fan_control": false,
+      "kernel": {
+        "release": "6.17.0-1032-nvidia",
+        "page_size": 4096,
+        "memory_saver_required": false
+      }
+    },
+    "distributed": {
+      "master_addr": "192.0.2.1"
+    },
+    "deployment": {
+      "repository": "/home/admin/ds41f/origin.git",
+      "launch_enabled": true
+    }
+  },
+  "serve_options": {
+    "--max-num-batched-tokens": "8192",
+    "--long-prefill-token-threshold": "8096",
+    "--limit-mm-per-prompt": "{\"image\":64}"
+  },
+  "unset": [
+    "glp",
+    "deployment.branch"
+  ]
+}
