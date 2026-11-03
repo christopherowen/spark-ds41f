@@ -178,6 +178,17 @@ differs. Candidate 38's flagged repeat is 322.96 ms. This is one historical
 repeat pair, not a calibrated p99 confidence bound. The frozen reference and
 the candidate's original direction flag remain unchanged.
 
+The [client compatibility check](runs/2026-11-03-dgx1-3/client-compatibility/client-compatibility-check.json)
+records the client-code differences since the reference. Model scoring, engine,
+prefill, prompt, statistics and Prometheus modules are unchanged. The stream
+reader now also counts usage-only/control-token chunks. Independent server
+generation counters corroborate the observed window-throughput changes within
+0.039 percentage points across all 14 point/boot comparisons. In each C1
+comparison, all 72 paired requests have equal first-token counts and chunk
+counts. The sampled seed-default addition is inactive here because the suite
+already specifies seed 0. Raw timing directions and the original reference
+are retained.
+
 `c4-tail-confirmation.json` adds two fresh boots of the identical standard
 recipe after the main standard phase, before CopyDrafter performance. Its
 `c4-tail-suite.json` copies the release suite's first four steps unchanged:
