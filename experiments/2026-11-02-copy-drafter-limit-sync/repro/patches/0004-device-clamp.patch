@@ -1,7 +1,23 @@
 From a3a09856b8c58a2bc656cb7793914f435517b703 Mon Sep 17 00:00:00 2001
-From: dev <dev@localhost>
+From: Jordi Posthumus <jordi.posthumus@gmail.com>
 Date: Mon, 2 Nov 2026 17:37:54 -0400
 Subject: [PATCH] spec_decode: clamp stale draft rows on device
+
+`CopyDrafter.sync_slot_draft_limits` is non-blocking (0612), so the host
+mirror can be a proposal behind. Adaptive verification then reads a stale
+wider limit and verifies scheduler placeholder rows.
+
+The device limits are written before the drafter runs, so clamp the proposal
+to them: zero confidence past the limit, and in the dead-row combine path
+write the last sampled token for rows past the cut. This keeps 0612's no-wait
+design.
+
+Base: vLLM 5b7cfa37f (tree af0fb152), candidate-37.
+Scope: covers the dead-row path; the non-dead combine path is not masked.
+Tests: test_copy_drafts.py 22 passed; test_copy_drafts_scheduler.py 11 passed.
+The added confidence assertion is a guard, not a regression test
+(`copy_select` already zeroes past `offered`).
+Upstream: #855; the complete device-side form is #859.
 
 ---
  tests/v1/spec_decode/test_copy_drafts.py      |  5 ++-

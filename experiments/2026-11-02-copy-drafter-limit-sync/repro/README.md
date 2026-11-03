@@ -1,17 +1,20 @@
 # Repro: CopyDrafter stale slot draft limits (c37 direct ring)
 
 This is the reproducibility package for the crash in #852, the host-sync
-diagnosis, and the device-side clamp in PR #855. It is written so the same
-sequence can be re-run on another ring.
+diagnosis, and the device-side clamp that #855 introduced; #859 is the
+complete device-side form. It is written so the same sequence can be re-run on
+another ring.
 
 ## Base and image
 
 - vLLM base: candidate-37 patch head `5b7cfa37f` (tree `af0fb152`), from
   `experiments/2026-10-26-spark-ds41f-candidate/candidate-37/tp3.json`.
-- Profile: `profiles/site-cand37-ring2-copy8-sync.local.json` (ring2, TP3,
-  envelope 6155 / capture 59 / long-prefill 6096). The device arm uses
-  `profiles/site-cand37-ring2-copy8-device.local.json`, which adds the
-  `copy_drafts.py` and `tilelang_inputs.py` mounts on all three ranks.
+- Profiles: the sync arm uses the site-local
+  `profiles/site-cand37-ring2-copy8-sync.local.json` (ring2, TP3, envelope
+  6155 / capture 59 / long-prefill 6096). The device arm is the committed,
+  site-neutral `profiles/copy8-device.arm.json`, extended with the site's nodes
+  config and master address; it adds the `copy_drafts.py` and
+  `tilelang_inputs.py` mounts on all three ranks.
 - Image: `spark-ds41f:candidate-37-af0fb152`, local id
   `sha256:2241b8f1ae65c0230f4c75a64f5cfc2a202216ccf4906448002ccd8cc88ec476`.
   The upstream image id (`e1ee7b1953b1…`) differs despite the same vLLM tree,
@@ -32,7 +35,7 @@ sequence can be re-run on another ring.
 | dbg8 | copy8 + bounds/debug overlay |
 | sync8 / sync8full | copy8 + patch 0001 (host-sync fix) |
 | sync16full | `min_match=16` + patch 0001 |
-| device8 | copy8 + patch 0004 (device confidence/cut clamp) |
+| device8 | copy8 + patch 0004 (device confidence/cut clamp; precursor, #859 completes it) |
 
 The profile mounts the fix file over
 `vllm/v1/worker/gpu/spec_decode/copy_drafts.py`; the instrumentation and pad0
@@ -68,7 +71,7 @@ original 240-second-cut run is `sync8`; `sync8full` uses no client timeout.
 | sync8 (m=8 + fix, 240 s) | — | client cut at 240 s; engine **alive**, no assert |
 | sync8full (m=8 + fix) | copy 16.360, edit 15.792, tool 6.905, prose 2.651 | **pass**, 63.867 tok/s, 2.2589 tok/step |
 | sync16full (m=16 + fix) | copy 16.014, edit 15.315, tool 6.232, prose 2.651 | **pass**, 63.58 tok/s (−1.7% vs 64.683, CI95 2.78) |
-| device8 (m=8 + device clamp) | 8 concurrent, 10,456-token prompt, 256 completion: **159.90 output tok/s** vs 126.05 host-sync; unit 22 + 11 passed; no assert |
+| device8 (m=8 + device clamp) | 8 concurrent, 10,456-token prompt, 256 completion: **159.90 output tok/s** vs 126.05 host-sync; unit 22 + 11 passed; no assert. Cross-boot, not paired: #856's paired lab measured −0.4% at 8 streams, so treat this as observational, not a speedup. |
 
 `sync8full` suite: `{"tps_mean": 63.8667, "ci95_pct": 2.773, "tpot_p50_ms":
 15.551, "failed": 0}`. `sync16full`: `{"tps_mean": 63.58, "ci95_pct": 2.783,
@@ -108,16 +111,23 @@ device files mounted. Use a stopped/dedicated container, not the serving one.
 
 ### Device arm (2026-11-02)
 
-- Profile: `profiles/site-cand37-ring2-copy8-device.local.json` (copy8 +
-  `0004-device-clamp.patch`; device files mounted on all three ranks).
+- Profile: `profiles/copy8-device.arm.json` (site-neutral; extend it with the
+  site's nodes config and master address; the rendered site profile is not
+  committed). It mounts `0004-device-clamp.patch`'s two files on all three
+  ranks.
 - Image: `spark-ds41f:candidate-37-af0fb152`; base `5b7cfa37f` / `af0fb152`.
-- `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2` (rendered launch line).
+- `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`; confirmed in the live container
+  environment, not only the profile chain.
 - Unit: `test_copy_drafts.py` 22 passed; `test_copy_drafts_scheduler.py` 11
-  passed (see `receipts/device8-*`).
+  passed (see `receipts/device8-*`). Caveat: 0004's added confidence assertion
+  is a guard, not a regression test; `copy_select` already writes 0 past
+  `offered`. #859's stale-wide test is the one that fails on unpatched c37.
 - m=8: 8 concurrent, 10,456-token prompt, 256 completion; 12.81 s wall,
   2,048 completion tokens, 159.90 output tok/s; no assert/non-finite gate.
 - Host-sync m=8 baseline (same workload, previous boot): 16.25 s,
-  126.05 output tok/s.
+  126.05 output tok/s. The two arms are different boots, not a paired run;
+  #856's paired lab measured −0.4% at 8 streams. Do not read the cross-boot
+  difference as a speedup.
 
 ## Memory observations
 

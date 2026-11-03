@@ -1,0 +1,61 @@
+{
+ "notes": "Site-neutral device-clamp arm: candidate-37 copy8 + patch 0004. Extend this with the site's nodes config and master address; it carries no site addresses itself.",
+ "extends": {
+  "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-37/tp3.json"
+ },
+ "set": {
+  "host": {
+   "home": "$HOME",
+   "startup_memguard_gib": 4,
+   "fan_control": false
+  },
+  "shapes": {
+   "tp3-triangle": {
+    "sizing": {
+     "max_model_len": 1048576,
+     "max_num_seqs": 8,
+     "max_num_batched_tokens": 8192,
+     "kv_cache_memory_bytes": 5268045824,
+     "prefix_cache_retention_interval": 512
+    }
+   }
+  },
+  "environment": {
+   "VLLM_MAX_IMAGE_PIXELS": "16777216"
+  },
+  "deployment": {
+   "path": "{home}/<checkout>"
+  },
+  "container": {
+   "image": "spark-ds41f:candidate-37-af0fb152",
+   "expected_labels": {
+    "local.spark-ds41f.vllm.tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+   },
+   "mounts": [
+    [
+     "$HOME/copy-debug/device/copy_drafts.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+     "ro"
+    ],
+    [
+     "$HOME/copy-debug/device/tilelang_inputs.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py",
+     "ro"
+    ]
+   ]
+  }
+ },
+ "serve_options": {
+  "--limit-mm-per-prompt": "{}",
+  "--max-num-batched-tokens": "6155",
+  "--long-prefill-token-threshold": "6096",
+  "--max-num-seqs": "8",
+  "--max-cudagraph-capture-size": "59",
+  "--compilation-config": "{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"custom_ops\": [\"all\"], \"cudagraph_capture_sizes\": [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 59]}",
+  "--speculative-config": "{\"method\": \"dspark\", \"num_speculative_tokens\": 5, \"draft_tensor_parallel_size\": 3, \"attention_backend\": \"TILELANG\", \"draft_sample_method\": \"greedy\", \"rejection_sample_method\": \"block\", \"enable_adaptive_verification\": true, \"adaptive_verification_row_cost\": 0.035, \"copy_drafts\": {\"min_match\": 8, \"initial_drafts\": 8, \"max_drafts\": 16}}"
+ },
+ "unset": [
+  "glp"
+ ]
+}

@@ -73,13 +73,14 @@ instrumentation / `-1`→`0` control patches. Raw receipts are under
 
 ## Status
 
-The host-sync patch is the validated diagnosis/fix used on our rings. The
-upstream review (#855) holds the non-blocking D2H invariant, so the merge form
-is the device-side clamp in `repro/patches/0004-device-clamp.patch` (same
-candidate-37 base; it supersedes 0001 rather than stacking on it):
-`CopyDrafter.propose` zeroes confidence past the device limit, and the combine's
-dead-row gate writes the last sampled token for rows past the cut. The host sync
-is reverted; the pinned `test_stale_wide_allocation_...` path stays non-blocking.
+The host-sync patch (#856) is the measured fix: it waits for the queued limit
+copy, so the host never reads a stale limit, and it removes the per-rank layout
+disagreement too. The device-side form that keeps 0612's no-wait design is
+#859; it clamps without dead rows, clamps the cut rather than confidence, and
+its stale-wide test fails on candidate-37. This experiment's 0004 is the
+precursor: it zeroes confidence past the device limit, and the combine's
+dead-row gate rewrites ids only under `dead_rows`, so it covers the dead-row
+path (TAU=0.2, confirmed in the live container) but not the non-dead path.
 
 Validated on ring2 (candidate-37, TP3, direct,
 `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2`):
@@ -89,16 +90,20 @@ Validated on ring2 (candidate-37, TP3, direct,
 - `tests/v1/core/test_copy_drafts_scheduler.py`: **11 passed**.
 - m=8 copy-dense workload (8 concurrent, 10,456-token prompt, 256 completion):
   **159.90 output tok/s** vs **126.05** on the host-sync arm; no engine assert
-  and no non-finite MoE gate in the head log.
-- The device profile is `config/site-cand37-ring2-copy8-device.local.json`;
-  the device files are mounted over `copy_drafts.py` and `tilelang_inputs.py`
-  on all three ranks.
+  and no non-finite MoE gate in the head log. These are different boots, not a
+  paired run; #856's paired lab measured −0.4% at 8 streams, so the cross-boot
+  gap is not a speedup verdict.
+- The device arm is `repro/profiles/copy8-device.arm.json` (site-neutral); the
+  rendered site profile is not committed.
 
-Open: the clamp covers the dead-row path, which is the production recipe. The
-non-dead-row combine path still has no limit/padding mask, so the review's
-"with or without dead rows" is only half-covered. The paired lab suite and the
-NaN-producer diagnostic are not yet run. The host-sync ring remains the fallback
-if the device arm regresses.
+Open: 0004's added confidence assertion is a guard, not a regression test;
+`copy_select` already writes 0 past `offered`, and #859's stale-wide test is
+the one that fails on unpatched c37. The clamp covers the dead-row path; the
+non-dead-row combine path still has no limit/padding mask. The crash arm did
+have TAU=0.2, so the dead-row gate should have masked the placeholder rows;
+why it did not is the unresolved part. #859's per-rank layout finding is the
+best explanation, and the `-1`→`0` control still crashing fits it. The paired
+lab suite and the NaN-producer diagnostic remain open; #856 ran its own.
 
 ## Integration
 
