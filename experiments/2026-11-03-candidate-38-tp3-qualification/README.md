@@ -279,3 +279,10 @@ nearby lengths rather than exact prompt matches.
 The standalone extension also lacks its own all-rank deployment identity and
 conditions block; the earlier suite's metadata does not establish these for the
 later measurement. Preserve that provenance limit when using the two points.
+
+Local validation is recorded in [local-validation](runs/2026-11-03-dgx1-3/local-validation/):
+the promoted configuration and both candidate dev profiles pass `bin/spark doctor`,
+and all 626 repository tests pass without skips using the hash-pinned bench-client
+dependencies. The initial command named an absent worktree virtual environment;
+the next check passed with five validator-dependent skips. Both attempts are
+retained alongside the complete successful check. They did not affect GPU work.
