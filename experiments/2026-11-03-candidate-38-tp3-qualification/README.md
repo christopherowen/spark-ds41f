@@ -134,8 +134,11 @@ explain the flag. Preserve it while checking repeatability.
 
 `c4-tail-confirmation.json` adds two fresh boots of the identical standard
 recipe after the main standard phase, before CopyDrafter performance. Its
-`c4-tail-suite.json` copies the release suite's C8 and C4 steps unchanged;
-C8 supplies the preceding steady load. Compare each native step with its
+`c4-tail-suite.json` copies the release suite's first four steps unchanged:
+model/scoring, grid, C8 and C4. This retains the same model/scoring and grid
+conditioning before C8 supplies the preceding steady load. The earlier
+published two-step plan was expanded before execution; no run was discarded.
+Compare each native step with its
 frozen reference and retain both new runs, including any adverse result.
 The lab's own two-arm table is an A/A check between the candidate boots,
 not a released-build comparison. These workload definitions are published,

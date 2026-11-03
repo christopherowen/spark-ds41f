@@ -1,8 +1,26 @@
 {
   "name": "tp3-c4-tail-confirmation",
   "version": 1,
-  "description": "Confirm the candidate C4 TTFT p99 direction. Replay the unchanged release-tp3 C8 and C4 steps in order, with the same prompts, seed, durations and sampling. C8 restores the preceding steady load; retain all runs and compare individual step artifacts with the frozen TP3 reference.",
+  "description": "Confirm the candidate C4 TTFT p99 direction by replaying the unchanged release-tp3 model, grid, C8 and C4 prefix on each fresh boot. This retains the model/scoring and fixed-row conditioning before the preceding C8 steady load. Retain all runs and compare individual step artifacts with the frozen TP3 reference.",
   "steps": [
+    {
+      "id": "model",
+      "command": "model",
+      "args": {
+        "concurrency": 8,
+        "max_tokens": 256,
+        "top": 20
+      }
+    },
+    {
+      "id": "grid",
+      "command": "engine",
+      "args": {
+        "replays": 100,
+        "settle": 1,
+        "max_requests": 8
+      }
+    },
     {
       "id": "c8",
       "command": "run",
