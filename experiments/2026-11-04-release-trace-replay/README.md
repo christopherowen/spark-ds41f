@@ -58,7 +58,10 @@ existing candidate-38 image and verify its layer list, source labels and image
 identity on every rank. Use the normal image-distribution helper. Inspect
 the sync/start/stop plans and their live/shape lines before every apply.
 
-Install and fetch the pinned harness/corpus on sp1 between windows:
+The pinned harness was installed and all 393 traces fetched on sp1 between
+windows; the corpus is loadable offline. `runs/preflight/client-setup.json`
+records the checks. The large tokenization/replay preparation remains for the
+authorized window. Exact setup commands:
 
 ```sh
 python3 scripts/agentx.py install
