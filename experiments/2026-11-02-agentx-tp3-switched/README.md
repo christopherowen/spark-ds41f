@@ -15,6 +15,12 @@ ever been installed and stub-tested on dgx1 (`experiments/2026-10-25-agentx`).
 - [lab-agentx.json](lab-agentx.json), run `agentx-c37-tp3-switched`: points 4
   and 8 (TP3 serves 8 sequences), each a fresh boot, a 15 s clean check, then
   3,600 s measured. About 2.5 to 3 hours with the in-window prepare.
+- The arm sets `host.home` to `/home/chris`. The lab's `agentx` job
+  (`agentx_target` in `spark_ds41f/lab.py`) reads the profile without the node map, so
+  it misses `read_cluster`'s rewrite of the recipe's `/home/swank` to
+  `/home/<ssh_user>`, which `bin/spark` gets. Without it the job looks for the hub cache
+  under `/home/swank` on sp5, where it doesn't exist. That's a lab bug, for the lab's
+  own fix.
 
 ## Setup on sp5, between windows (no hold)
 
