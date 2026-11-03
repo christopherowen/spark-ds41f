@@ -2,6 +2,20 @@
 
 Base: `candidate-37` (`0001..0676`, vLLM patch head `5b7cfa37f`, tree `af0fb152`; `sparknet` `1fd6a1f`).
 
+Candidate-38 carries the selected CopyDrafter solution: shared verification budgets
+(`0677`) and removal of the unused per-slot limit machinery (`0678`). The host-wait
+and device-clamp implementations from #855/#856/#859 are superseded; neither is in
+this series. Their experiment records remain historical evidence. #860's two
+patches, #848/#853/#854's runtime changes and #863's test repairs are carried forward
+here; #842's default-enablement change remains separate.
+
+This is an unpromoted candidate. The final image's release-test gate passes, but the
+combined build still needs distributed boot/repeat, inference and performance
+qualification. The [fault investigation](../../2026-11-03-copy-fault-forensics/README.md)
+demonstrates the unequal-layout defect and a stale-receive-buffer corruption
+mechanism. Its last host preparation records do not prove which GPU forward
+produced the original NaN.
+
 Added patches (`0677..0687`). Each is the `git format-patch` commit its pull request made on
 `5b7cfa37f` (`0677..0681`, the candidate's changes) or on `753354cf4`, 0681's head
 (`0682..0687`, the release gate's test fixes), taken from the pull request's branch byte for
@@ -22,8 +36,9 @@ in this order:
   removes what 0677 left unread: the host mirror, its staging ring and event,
   `sync_slot_draft_limits`, the limits' copy in `attach_copy_draft_alloc`, the device buffer and
   the manager's `slot_draft_limits` argument. Unit-tested only (the same 79 passed, 1 skipped
-  with both patches); not measured and in no arm of #860. Included as a harmless architectural
-  cleanup, under the owner's rule.
+  with both patches); not performance-measured and in no arm of #860. The final
+  combined source is covered by this candidate's own unit gate below; its serving
+  cost and behavior must be qualified with the rest of the candidate.
 - `0679-feat-v1-act-on-a-loop-by-where-it-is-and-follow-the-.patch` (`#848`, vLLM `050e8b1cc`, v2):
   `check_stop` acts on a detected loop by where it is. Inside reasoning it ends the reasoning (a
   forced end that has not landed within 64 tokens stops the request); in the answer after a
@@ -129,17 +144,22 @@ serving node.
 
 - `bin/spark --cluster-config <arm> doctor` (configuration, not `--live`; rerun after `0687`):
   configuration OK for `tp3.json`, `tp3-dev.json`, `tp3-copy.json`, `tp3-copy-dev.json` and
-  `tp3-8192.json`. `tp4.json` and `image-dgx4.json` report two errors, `cluster and upstream
-  locks name different baselines` and `NCCL_IB_HCA is rendered from the node map and the
-  transport; remove it from the environment`; candidate-37's `tp4.json` reports the same two,
-  from this worktree and from the main checkout, and rc14's `rc-tp4.json` itself passes. rc14's
-  ring recipe names spark-ds41f-1025 (the ring's last qualified baseline) and sets
-  `NCCL_IB_HCA`, while the candidate lock is generated from spark-ds41f-1030, whose recipe
-  renders that variable; setting the ring arm's baseline to 1030 instead does not clear the
-  `NCCL_IB_HCA` error, so the arm stays as candidate-37's. The build does not read this check.
+  `tp3-8192.json`. The consolidation check also passes `tp4.json` and
+  `image-dgx4.json`: their inherited baseline now names 1030, matching this candidate's
+  lock, and the redundant `NCCL_IB_HCA` input is removed. The node-map renderer already
+  supplied that variable; the environment rendered for every ring rank is unchanged.
+  [Before/after checks](runs/2026-11-03-consolidation/profile-check.json) retain the
+  two original doctor failures and verify the correction changes no image, source,
+  serving arguments or rendered environment. Frozen releases and candidate-37 are unchanged.
 - `git diff --check`: clean, for the repository change and for the vLLM series (`5b7cfa37f` to
   `753354cf4`, and `753354cf4` to `1f3310254`).
-- The repository's unit suite (`python3 -m unittest discover -s tests -t .`): 626 tests OK, 5 skipped (44 s, after this change).
+- The repository's unit suite (`python3 -m unittest discover -s tests -t .`): 626 tests OK, 5 skipped (38.740 s, consolidation working tree; [receipt](runs/2026-11-03-consolidation/repository-tests.json)).
+- Consolidation replayed all 572 patches from the pinned upstream base and reproduced
+  the locked head, tree and patch-set digest. The 23 changed Python files compile;
+  the removed per-slot limit identifiers are absent from runtime and tests. The
+  existing final build inputs also pass a fresh read-only `build check` on dgx4.
+  [Consolidation receipts](runs/2026-11-03-consolidation/README.md) separate these
+  checks from the final image's recorded GPU gate and pending serving qualification.
 - `scripts/release_tests.py check` for `19f2c20ed..1f3310254`: 197 selected test files, 135
   gate, 62 excluded, 0 problems (the same at `753354cf4`; the six files `0682..0687` change
   were gate files already). It was not clean before: 22 files the series changes were
@@ -159,7 +179,8 @@ serving node.
 
 Built on dgx4 from this folder's commit (`bin/spark --cluster-config
 experiments/2026-10-26-spark-ds41f-candidate/candidate-38/image-dgx4.json build prepare`,
-`build check`, `build image --apply`), tag `spark-ds41f:candidate-38`. Not copied anywhere.
+`build check`, `build image --apply`), tag `spark-ds41f:candidate-38`. The final image
+was subsequently copied unchanged to sp5–sp8 for qualification, as recorded below.
 
 The candidate was built twice. The arm's `container.expected_labels` must match the image's
 `local.spark-ds41f.vllm.tree` label (`bin/spark cluster start` and `doctor` refuse an image
@@ -192,7 +213,8 @@ test receipts for that build; the earlier run keeps its identity).
   `local.spark-ds41f.vllm.tree=c061e5f69313…`, `.vllm.patch-head=1f33102547e4…`,
   `.sparknet.tree=8cc28a5cd3e6…`, `.tilelang.tree=222b895d04ee…`,
   `.tile_kernels.tree=cb2fa41c8af2…`, `.nccl.tree=6af10aa730a6…`, `.b12x.tree=1a647a311ca5…`.
-  The image has no registry digest: it is on dgx4 only, under no other tag.
+  The image has no registry digest; its content-addressed image ID above identifies
+  the build. It is now also present unchanged on sp5–sp8, as recorded below.
 
 The other sources are candidate-37's in both builds: NCCL `eeacf1c6` (tree `6af10aa7`), B12X
 `69e5795e` (`1a647a31`), TileLang `a0e66d71` (`222b895d`), TileKernels `edfa64d0` (`cb2fa41c`),
