@@ -44,8 +44,10 @@ Added patches (`0677..0681`). Each is the `git format-patch` commit its pull req
   bias shard; top-2 is reproduced bit for bit; no fallback (kernel preparation raises for a
   Markov head that does not fuse). Measured on sp8 with the patch's files mounted over
   candidate-37's image: 234 tests passed with the PDL sources plugin (0 violations); the
-  CUDA-graph-captured draft step (`chain`, cold) is −2.0 to −12.7 µs at TP3 from 2 requests
-  and −2.9 to −16.4 µs at TP4 from 3, +0.4–0.6 µs per position at one request on TP3; a
+  CUDA-graph-captured draft step (`chain`, cold) is −2.0 to −12.7 µs at TP3 and −2.9 to
+  −16.4 µs at TP4 from 3 requests, even at 2, and +0.4–0.6 µs per position at one request
+  on TP3; with the shard hot in L2 it is 1–8 µs slower per step at the recipe's request
+  counts, about 0.03% of a decode step at one request; a
   9,000-step functional soak under the draft workspace lane had 0 mismatches. No serving soak
   with real traffic has run.
 
@@ -104,13 +106,64 @@ Built on dgx4 from this commit (`bin/spark --cluster-config
 experiments/2026-10-26-spark-ds41f-candidate/candidate-38/image-dgx4.json build prepare`,
 `build check`, `build image --apply`), tag `spark-ds41f:candidate-38`. Not copied anywhere.
 
-- Fresh tree: pending.
-- Image ID: pending.
+- Fresh tree (dgx4, 2026-11-03 03:17Z, `build prepare --lock` from commit `ef78db56`): the
+  series applied to `19f2c20ed` in `.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-8d0ef291`
+  and reproduced patch head `753354cf4ed0` and tree `37b34b8f9e36`; `--lock` changed no file
+  (the lock, manifest and arms already carried these identifiers); `build check`: build inputs
+  OK. The other sources are candidate-37's: NCCL `eeacf1c6` (tree `6af10aa7`), B12X `69e5795e`
+  (`1a647a31`), TileLang `a0e66d71` (`222b895d`), TileKernels `edfa64d0` (`cb2fa41c`), sparknet
+  `1fd6a1fb` (`8cc28a5c`), CUTLASS v4.7.1.
+- Image (dgx4, `build image --apply` from commit `f3100c53`, 03:21–03:29Z): tag
+  `spark-ds41f:candidate-38`, **ID `sha256:4ce47c40be9ec06719ace4e7d98b3dd9837f7e2ee2ab4ba1a6c43efb90fb8b83`**
+  (10.5 GB), built in 470 s with 8 compile jobs, lowest MemAvailable 78.7 GiB (receipt
+  `.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-8d0ef291/images/4ce47c40be9ec067.json`).
+  The GPU import smoke, the TileLang import smoke and the sparknet import smoke passed. Labels:
+  `local.spark-ds41f.vllm.tree=37b34b8f9e36…`, `.vllm.patch-head=753354cf4ed0…`,
+  `.sparknet.tree=8cc28a5cd3e6…`, `.tilelang.tree=222b895d04ee…`,
+  `.tile_kernels.tree=cb2fa41c8af2…`, `.nccl.tree=6af10aa730a6…`, `.b12x.tree=1a647a311ca5…`.
+  The image has no registry digest: it is on dgx4 only, under no other tag.
 
 ## Release tests
 
-Pending.
+The gate bundle ran on dgx4 in the image (`scripts/lab.py kernel-local bundles/release-tests`,
+03:30–04:20Z, no serving container there; `runs/2026-11-03-dgx4/release-tests/`): **136 files,
+7,973 passed, 360 skipped, 96 failed in 6 files; the verdict is FAIL and kernel-local exits 1.**
+None of the six files is one the five new patches change, and each failure is candidate-37's:
+the same six files rerun in `spark-ds41f:candidate-37` on dgx4 right after the gate (the same
+runner and test files, `runs/2026-11-03-dgx4/failing-files-on-candidate-37/`) fail with the
+same 96 test ids and messages. Rerun in candidate-38's image
+(`runs/2026-11-03-dgx4/failing-files-rerun/`) they fail with 95: the one that differs is a
+measurement test that passes or fails on either image.
+
+| File | Failed / passed | Why |
+|---|---|---|
+| `tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py` | 11 / 5 | `test_grouped_gemm_equals_groups[*]` reads `tilelang_key` from the WO modules; the series' custom-op cleanup (`1f3dc7c14`, 2026-10-31) removed it and the test was not updated (passed 16/16 at candidate-12) |
+| `tests/models/test_deepseek_v4_1_engram.py` | 1 / 42 | `test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows`: after a row file is truncated, `disk_rows.failure()` stays `None` for 30 s, so the test's `in` check raises `TypeError`; the same failure was reported on candidate-36's image in #846 |
+| `tests/v1/attention/test_b12x_v41_ced_metadata.py` | 1 / 38 | `test_dspark_compact_context_preserves_query_anchor_and_rejections`: its `DFlashSpeculator` stand-in lacks `_query_start_loc_cpu`, which #763 (`6efba0add`) made the speculator read |
+| `tests/v1/worker/test_gpu_model_runner_v2.py` | 20 / 20 | the stand-in runners lack `num_draft_steps`, `copy_drafter` (the copy-drafts patches), `vllm_config`, `_block_table_max_model_len`, `uniform_decode_query_len` and `sink`; #860's record lists the same 20 on candidate-37 |
+| `tests/v1/worker/test_gpu_worker.py` | 62 / 34 | the stand-in workers lack `_roce_failure`, which `execute_model` and the warm-up read since the stopped-collective naming (`dfb93679e`, `aaebbf88d`) and the memory breakdown (`111c5be7e`) |
+| `tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py` | 1 / 35 | `test_profile_cudagraph_memory_frees_throwaway_pool[0]`: a subprocess asserts `native_after - native_before >= 0` on the driver's free-memory reading around a fake capture; it passed in the triage probe on candidate-37's image (03:12Z), failed in this gate and in the candidate-37 rerun, and passed in the candidate-38 rerun |
+
+So the image fails no test that candidate-37's image passes. The 95 deterministic failures are
+test stand-ins and one test left behind by candidate-37's series (and earlier candidates'), not
+runtime defects; fixing those tests is its own change. Until then the gate does not exit 0 on
+this series.
+
+Skips: 360, the offline classes (Hugging Face models the image lacks, ROCm-only, two GPUs).
 
 ## Unit evidence
 
-Pending.
+Both bundles ran on dgx4 in the image right after the gate (`runs/2026-11-03-dgx4/`):
+
+- `bundles/unit-evidence` (the runner over the files the five patches' experiments name;
+  04:20–04:22Z): **395 passed, 1 skipped, 0 failed** in 130 s. Per file:
+  `test_repetition_detection.py` 40 (#848), `test_copy_drafts.py` 24 and
+  `test_copy_drafts_scheduler.py` 11 and `test_adaptive_verification.py` 36 + 1 skipped (the
+  two-CUDA-device test) and `test_prepare_kernels.py` 8 (#860), `test_deepseek_v41_tilelang_dspark_context.py`
+  24 and `test_cudagraph_manager.py` 26 (#853), `test_deepseek_v41_tilelang_vocab.py` 72,
+  `test_dspark_greedy_markov.py` 48, `test_dspark_vocab_parallel.py` 17,
+  `test_greedy_verification.py` 18 and `test_deepseek_v4_1_sp_prefill.py` 71 (#854).
+- `bundles/unit-evidence-pdl` (#854's own command: its six files under
+  `tests.kernels.deepseek_v41_pdl_sources`, `--noconftest`; 04:22Z): **234 passed** in 22 s, as
+  on candidate-37 with the patch mounted; `PDL sources: 230 kernels launched, 62 with PDL, 0
+  violations`.
