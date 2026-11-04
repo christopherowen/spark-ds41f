@@ -1,0 +1,12 @@
+run c38-spaceport-tp4-boot-b: 8 steps; production experiments/2026-11-04-release-trace-replay/candidate-37.json
+  1. unless this host has rebuilt semianalysis_cc_traces_weka_062126 for seed 42: stop serving, then scripts/agentx.py prepare --in-window --tokenizer deepseek-ai/DeepSeek-V4.1-Flash-1017 --tokenizer-revision 1bae0e1088993b9b82de08f59de5be5a34e42170 --hf-hub-cache /home/chris/.cache/huggingface/hub --dataset semianalysis_cc_traces_weka_062126 --seed 42 --model deepseek-v4.1-flash
+  2. boot experiments/2026-11-04-release-trace-replay/candidate-38.json (c38-boot-b-c16)
+  3. bin/spark --cluster-config experiments/2026-11-04-release-trace-replay/candidate-38.json workload --duration 15 --label 'c38-boot-b-c16 clean' --json results/private/agentx/c38-spaceport-tp4-boot-b/c38-boot-b-c16/clean.json: no request may finish, run or wait
+  4. agentx c38-boot-b-c16: 16 sessions, 3600 s measured, semianalysis_cc_traces_weka_062126 seed 42 > results/private/agentx/c38-spaceport-tp4-boot-b/c38-boot-b-c16
+  5. boot experiments/2026-11-04-release-trace-replay/candidate-38.json (c38-boot-b-c8)
+  6. bin/spark --cluster-config experiments/2026-11-04-release-trace-replay/candidate-38.json workload --duration 15 --label 'c38-boot-b-c8 clean' --json results/private/agentx/c38-spaceport-tp4-boot-b/c38-boot-b-c8/clean.json: no request may finish, run or wait
+  7. agentx c38-boot-b-c8: 8 sessions, 3600 s measured, semianalysis_cc_traces_weka_062126 seed 42 > results/private/agentx/c38-spaceport-tp4-boot-b/c38-boot-b-c8
+  8. python3 scripts/agentx.py table c38-spaceport-tp4-boot-b c38-boot-b-c16 c38-boot-b-c8 > results/private/lab/c38-spaceport-tp4-boot-b-table.txt
+  problem: the AgentX harness is not installed at /Users/christopherowen/spark-lab/agentx/venv-1.0.7 (scripts/agentx.py install)
+  problem: semianalysis_cc_traces_weka_062126 is not fetched on this host (/home/chris/.cache/huggingface/hub/datasets--semianalysisai--cc-traces-weka-062126/snapshots/23f152f6f0f9399a85901b89a6458def0ef16729/traces.jsonl): scripts/agentx.py fetch, between windows
+  problem: the tokenizer /home/chris/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170/tokenizer.json is not on this host
