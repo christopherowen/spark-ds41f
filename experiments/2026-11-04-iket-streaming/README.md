@@ -130,9 +130,12 @@ boots (`final`) also pass with those bounds explicitly unknown: 5,920 records
 through 63 reusable slots. Streaming does not require a static bound.
 
 Sparknet's four kernel families compile for triangle, ring and switched layouts
-(12 operation/topology cases). `network-all` executes allreduce, allgather,
+(12 operation/topology cases per dtype). `network-after-wait` and `network-bf16`
+execute allreduce, allgather,
 reduce-scatter and exchange three times each with a local fake peer supplying
-delayed payloads/flags. Two plain and two streaming boots match exact references.
+delayed payloads/flags. Two plain and two streaming boots per dtype match exact
+references (float32 and the model's BF16 payload type). Each streamed boot records
+312 events, with 48 lifetime pairs and 108 phase pairs.
 Staging, proxy doorbell/tail, flag waits, reduction and gather phases are present.
 The global TileLang callback covers sparknet before its prepare/freeze step;
 no sparknet source or pin change is required. This checks the actual GPU kernels,
@@ -213,5 +216,16 @@ remain on sp8 under `/home/chris/spark-lab/iket-streaming-20261104/`. The captur
 files are too large for this repository. `collect_receipts.py` regenerates the
 portable receipt from that directory. No published baseline was rerun or edited.
 
-Final BF16 networking and regression checks are in progress. No performance claim
-or promotion.
+Final validation passes: two full boots; eight successful transport stress boots
+and two expected disk-full failures; four float32 networking boots; four BF16
+networking boots; two standalone-command boots; and four final vision/all-events
+boots. `runs/closure.json` confirms the reservation and request are released and
+the test container is gone. Both serving leaders return HTTP 200 on `/health`
+(`runs/serving-health.json`).
+
+This remains an unpromoted, opt-in TileLang phase collector. NVIDIA's separate
+SASS collector retains its fixed pool. Before release, qualify actual multi-node
+NIC/proxy/fail-stop behavior and review an equivalent normal-runtime/compiler
+repair for the producer race exposed by tracing. The current producer repair is
+applied during instrumentation; ordinary runtime kernels are unchanged. No
+performance claim or promotion is made here.
