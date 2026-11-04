@@ -1,7 +1,8 @@
 # Qualification sequence
 
-These are measurement candidates. No image has been built, no target GPU test
-has run, and no serving improvement or release acceptance is claimed.
+These are measurement candidates. The standalone FP8 GPU screen ran and rejected
+all three tested Huffman layouts. Neither isolated serving image has been built;
+no serving improvement or release acceptance is claimed.
 
 ## Source identities
 
@@ -11,7 +12,7 @@ vLLM tree `ea1281f880e7535e3d87725be0156a8e38fc2fb2`.
 | Variable | Canonical patch head | Tree | Proposed immutable image |
 | --- | --- | --- | --- |
 | Expert scales | `30e56e093b33a9f45d6f58d032d65ed5055a2105` | `c3a9bf4be9b672f11c99f0c3098778a901dbae99` | `spark-ds41f:memory-scales-c3a9bf4be9b6` |
-| Engram rows | `24fa42dfed8a55e33ed97532a4a3ac0707be20fd` | `833cd629a486fdc78e21cf8d06c916e3f4932ceb` | `spark-ds41f:memory-engram-833cd629a486` |
+| Engram rows | `16d457afbbf774ebe45bcd4b5862c8f4e9c4377b` | `c40fbd1b553c0f0bf0ae72e0d12082f564e769b0` | `spark-ds41f:memory-engram-c40fbd1b553c` |
 
 Fresh canonical preparation reproduced both locked heads and trees. A verified
 local Git object cache supplied objects missing from an upstream partial fetch;
@@ -27,7 +28,7 @@ bin/spark --cluster-config experiments/2026-11-04-lossless-memory/expert-scales/
 bin/spark --cluster-config experiments/2026-11-04-lossless-memory/engram/tp3.json doctor
 
 python3 scripts/release_tests.py check .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-edba9f62/src/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 30e56e093b33a9f45d6f58d032d65ed5055a2105 experiments/2026-11-04-lossless-memory/release-tests.json
-python3 scripts/release_tests.py check .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-586802d8/src/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 24fa42dfed8a55e33ed97532a4a3ac0707be20fd experiments/2026-11-04-lossless-memory/release-tests.json
+python3 scripts/release_tests.py check .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-5ff90bcb/src/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 16d457afbbf774ebe45bcd4b5862c8f4e9c4377b experiments/2026-11-04-lossless-memory/release-tests.json
 ```
 
 The successful preparations supplied the existing verified object cache through
@@ -40,6 +41,13 @@ absent paths and retains all 132 gate files present in this source. Classificati
 checks pass for both candidates (170 selected files, zero problems). Global test
 classification is unchanged. The generated `full-gate` bundles execute the full
 catalog; the smaller `bundle` directories are initial component screens.
+
+The Engram arm adds a guard for invalid negative column deltas before signed
+subtraction. `engram/check_row_plan.c` reproduced the original overflow under
+UndefinedBehaviorSanitizer (exit 134), then passed with the guard (exit 0).
+It also checks all bytes of 1,025 valid packed rows, including page splits.
+`runs/engram-c-bounds/` preserves both logs and exact commands. This portable
+check substitutes neither Linux direct-I/O nor the native GPU regression tests.
 
 ## Operations
 
@@ -113,8 +121,9 @@ the claimed benefit. A capacity gain is reported as capacity, not invented TPS.
 
 ## Remaining conditional work
 
-- FP8: the GPU decoder is an uncompiled probe. Even a faster byte consumer does
-  not qualify a fused GEMM. Port only a measured viable layout, retain exact
+- FP8: all three tested GPU Huffman decoders were byte exact and slower than
+  their paired raw consumers. Reject these layouts. Even a faster future byte
+  consumer would not qualify a fused GEMM. Port only a measured viable layout, retain exact
   accumulation order, then give that new image its own full serving qualification.
 - Cold prefix: the store is a bounded CPU prototype. First export only written,
   fenced checkpoint records from a real workload. Include every group and
