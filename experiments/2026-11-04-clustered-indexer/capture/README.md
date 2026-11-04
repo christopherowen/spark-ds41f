@@ -3,15 +3,20 @@
 This arm is instrumentation, not a performance candidate. It extends the exact
 candidate-36 profile the lab window originally found serving. Its patch adds an
 explicitly armed one-shot hook before the dense indexer search. It copies one
-query from each of three distinct cache pools and only its readable key pages, remaps their page table, zeroes the unused
-last-page tail and atomically saves the tensors **outside Git**. Each rank gets
-one file per captured pool. It changes no scorer arithmetic or model weights. Capturing and
+query from each of three distinct cache pools and only written key/scale prefixes. Duplicate physical pages are
+deduplicated using their maximum readable prefix; the saved remainder is initialized
+without reading its device tail. It remaps the compact saved page table and atomically saves the tensors **outside Git**. Each rank gets
+one file per captured pool. Native planned width, active limit, source-block
+interface, physical page IDs, byte stride and alignment are retained. Replay
+reconstructs that sparse address geometry within an explicit 8 GiB span budget;
+a larger span is a reported refusal, never silently compacted. It changes no scorer arithmetic or model weights. Capturing and
 synchronizing perturb timing; no performance conclusion comes from this arm.
 
 The candidate-36 series was freshly applied: 558 patches reproduce tree
 `cc0fdf582d0bddff71c6a853e237bc9e87587832`. The ordered `series` applies after
 that tree. The executable `overlay` copies match that patch. The capture
-profile passes local doctor; hardware capture remains untested.
+profile uses an isolated checkout and passes local doctor; synthetic capture/layout
+checks are prepared, while real hardware capture remains untested.
 
 Use this only in an owner-authorized window. Restore the production profile
 recorded by that window, which may have changed since this arm was prepared.
@@ -35,7 +40,8 @@ Do not arm the capture during startup's dummy/profile inputs.
 5. Close the window through the lab, verifying the prior serving profile and
    clearing the hold. In a subsequent authorized idle-node job, run the
    `replay` bundle twice in fresh containers. It compares all selected keys,
-   checks each cluster bound against the full scores and times only the
+   checks each cluster bound and evaluated BF16 score bit, verifies source blocks
+when published, and tests graph visibility rollback/empty/restore. It times only the
    candidate, including envelope rebuilding, selection and compaction.
 
 A positive result justifies designing persistent metadata and CSA state ownership.

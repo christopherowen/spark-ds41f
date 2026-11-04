@@ -9,7 +9,7 @@ import torch
 _captured = set()
 
 
-def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size):
+def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size, candidate_blocks=False):
     directory = os.environ.get('VLLM_DS41_CLUSTER_CAPTURE')
     if not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
         return
@@ -18,21 +18,28 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
     key = pool.data_ptr()
     if key in _captured or len(_captured) >= 3:
         return
-    limit = min(int(active[0].item()), width)
+    limit = max(min(int(active[0].item()), width), 0)
     row = int(lengths.argmax().item())
     extent = min(int(lengths[row].item()), limit)
     if extent < 8192:
         return
-    # Only one query and the cache pages it can read. No whole-pool host copy.
+    # Copy only written byte prefixes. Reading a whole final page and clearing
+    # its tail afterwards would still read unwritten device memory.
     logical_pages = (extent + page_size - 1) // page_size
-    ids = table[row, :logical_pages].long()
+    logical_ids = table[row, :logical_pages].detach().cpu().long()
+    ids, inverse = torch.unique(logical_ids, sorted=True, return_inverse=True)
     from .indexer import page_bytes
     nbytes = page_bytes(page_size)
-    selected = pool[:, :nbytes].index_select(0, ids)
-    tail = extent % page_size
-    if tail:
-        selected[-1, tail * 64:page_size * 64] = 0
-        selected[-1, page_size * 64 + tail * 4:] = 0
+    byte_pool = pool.view(torch.uint8)
+    prefixes = [0] * len(ids)
+    for logical, compact in enumerate(inverse.tolist()):
+        prefixes[compact] = max(prefixes[compact], min(page_size, extent - logical * page_size))
+    selected = torch.zeros((len(ids), nbytes), dtype=torch.uint8)
+    for compact, (physical, count) in enumerate(zip(ids.tolist(), prefixes)):
+        selected[compact, :count * 64].copy_(byte_pool[physical, :count * 64].detach().cpu())
+        start = page_size * 64
+        selected[compact, start:start + count * 4].copy_(
+            byte_pool[physical, start:start + count * 4].detach().cpu())
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     pool_ordinal = len(_captured)
     target = Path(directory, f'rank-{rank}-pool-{pool_ordinal}.pt')
@@ -42,12 +49,24 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
         'q': q[row:row+1].detach().cpu(),
         'scales': scales[row:row+1].detach().cpu(),
         'weights': weights[row:row+1].detach().cpu(),
-        'pool': selected.detach().cpu(),
-        'table': torch.arange(logical_pages, dtype=torch.int32).view(1, -1),
+        'pool': selected,
+        'table': inverse.to(torch.int32).view(1, -1),
         'lengths': torch.tensor([extent], dtype=torch.int32),
-        'active': torch.tensor([logical_pages * page_size], dtype=torch.int32),
+        'active': torch.tensor([limit], dtype=torch.int32),
         'page_size': page_size,
-        'width': logical_pages * page_size,
+        'width': width,
+        'candidate_blocks': bool(candidate_blocks),
+        'schema_version': 2,
+        'layout': {
+            'pool_pages': byte_pool.shape[0],
+            'row_stride_bytes': byte_pool.stride(0),
+            'alignment_mod_256': byte_pool.data_ptr() % 256,
+            'query_rows': q.shape[0],
+            'captured_row': row,
+            'table_columns': table.shape[1],
+            'physical_ids': ids,
+            'written_prefixes': prefixes,
+        },
         'rank': rank,
         'pool_ordinal': pool_ordinal,
         'source': 'candidate-36, tree cc0fdf582d0bddff71c6a853e237bc9e87587832',

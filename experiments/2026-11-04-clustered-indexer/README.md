@@ -140,8 +140,8 @@ sharing metadata changes candidate medians from 7.046 / 7.047 ms to
 0.767 / 0.767 ms. For random rows they change from 13.383 / 13.466 ms to
 3.498 / 3.530 ms. Metadata tensors shrink from 128 MiB to 1 MiB and the
 harness allocation peak from 181.3 MiB to 64.8 MiB. These are test allocations,
-not serving memory or admission measurements. Boundary-row and dedicated
-sanitizer screens are prepared next. No persistent cache metadata is used.
+not serving memory or admission measurements. Six fixtures including the 1/256-row boundaries now pass twice; dedicated
+initcheck and memcheck pass all six, and racecheck passes two bounded fixtures. No persistent cache metadata is used.
 
 All native sp8 jobs have returned their host reservation. No serving state,
 image tag, production configuration or immutable baseline changed. Complete
@@ -163,7 +163,10 @@ position avoid scatter races and initialization fills. Small planned domains
 use the native source plan directly and are correctness-only, never timed.
 
 `source-handoff.json` records the variable. Its CPU oracle and fresh patch/source
-checks pass; GPU validation is still pending. The harness compares all immediate
+checks pass. Two eight-case source runs, seven-case initcheck and memcheck,
+and two-case racecheck all pass. Source bounds currently retain every visible
+key even on the separable fixture: preserving the larger block handoff is a
+stricter requirement. This unfavorable pruning result is retained. The harness compares all immediate
 keys, every handoff block and count, BF16 score bits, following reindex output,
 graph visibility changes and late cache mutations. There is no serving dispatch.
 
@@ -175,99 +178,46 @@ This search series references that patch and tested executable directly.
 Historical receipts retain the old paths and exact commits at which they ran.
 The attention experiment is stacked on that independent fix for review.
 
-## Isolated sp8 continuation
+## Reproduce the isolated sp8 screens
 
-The owner selected sp8 (spark-0016) for continued work. `sp8.json` freezes its
-existing image identity separately from dgx4's. Source hashes and compiler
-versions were checked before use. Each `sp8-*` bundle pins that exact image ID.
-No serving state, production configuration or image tag is changed.
+`sp8.json` pins spark-0016's existing image separately from dgx4. Every
+`sp8-*` bundle pins that exact ID and mounts the recorded source files. The
+published clean detached checkout is
+`/home/chris/spark-lab/checkouts/clustered-indexer`.
 
-`sp8-control` times the archived **unreleased candidate** reduction with the same
-harness and fixtures; it does not time the released scorer. Two fresh control
-and candidate graph runs test the one envelope resource change on the same host.
-Endpoint identity, exact selection, visibility replay and sanitizer gates remain
-required. New receipts are recorded separately from the earlier dgx4 results.
-
-The isolated batch runner uses the existing lab's bundle construction and verdicts,
-with a host reservation and GPU lock, 16 GiB container cap, 24 GiB host memory floor,
-thermal observation and heartbeat. It stops only its uniquely named test container.
-Each job refuses an existing result path and records the complete command and
-mounted input hashes. Use the published clean checkout on sp8:
+The runner uses the existing lab bundle construction and verdicts, a native
+host reservation and GPU lock, a 16 GiB container cap, a 24 GiB host memory floor,
+thermal observations and a heartbeat. It stops only its own named container,
+yields between jobs when another task requests the host, and refuses existing
+result paths. All completed jobs return the reservation. Exact reproduction
+commands are retained in each native `command.json` and `verdict.json`.
 
 ```sh
-python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-control:sp8-control-01 sp8-control:sp8-control-02 sp8-graph:sp8-stream-01 sp8-graph:sp8-stream-02 sp8-profile:sp8-profile-01 sp8-initcheck:sp8-initcheck-01 sp8-memcheck:sp8-memcheck-01 sp8-racecheck:sp8-racecheck-01
+python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-source:source-a sp8-source:source-b sp8-source-initcheck:source-init sp8-source-memcheck:source-mem sp8-source-racecheck:source-race
+python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-grouped:group-a sp8-grouped:group-b sp8-grouped-initcheck:group-init sp8-grouped-memcheck:group-mem sp8-grouped-racecheck:group-race
 ```
 
-## Optional tensor-core interval bounds
+## Separate screened variables
 
-`vllm/0004-tensor-interval-bounds.patch` changes the bound execution only, after
-separately screening the streamed envelope. The scalar bound stays the default.
-The explicit `--matrix-bounds` candidate computes `q+ @ upper + q- @ lower` and
-`abs(q) @ max(abs(lower), abs(upper))` with BF16 tensor cores and FP32 accumulation.
-Every certified decoded FP4 coordinate is exactly representable in BF16, so this
-introduces no input rounding. Metadata stays in its original format. Exceptional
-clusters are explicitly tagged and get an infinite bound; NaN/Inf metadata never
-enters a matrix product. The final indexer scorer and attention arithmetic stay
-unchanged.
+- `resource-layout.json` and patch 0003: stream the same visible keys with only
+  two endpoints per coordinate instead of two 64-by-128 register fragments.
+  Endpoints are bitwise equal to the frozen unreleased prototype.
+- `matrix-bounds.json` and patch 0004: BF16 tensor products with FP32 accumulation
+  compute `q+ @ upper + q- @ lower` and the absolute norm. Decoded certified FP4
+  values are exactly representable in BF16. Exceptional metadata is tagged and
+  never enters a product. The split sum has at most 256 terms; `2*gamma(255)`
+  still leaves more than 100 times slack inside the existing `A/256` allowance.
+  Scalar bounds remain the original API default.
+- `grouped-metadata.json` and patch 0005: an explicit API for one cache owner and
+  1–256 queries. Fresh metadata through the maximum extent bounds all shorter
+  rows. Reduction and safe per-row table expansion are included in timing.
+  Arbitrary mixed-owner requests are not accepted. The grouped API is separate
+  from source handoff and neither is registered in serving.
+- `source-handoff.json` and patch 0006: jointly preserve native immediate keys
+  and source-block output; never qualify a source layer using keys alone.
 
-The split dot has at most 256 terms. Using `2*gamma(255)` for its comparison with
-the scorer, and `(1-gamma(127))*A` for the computed absolute norm, still leaves
-more than a factor of 100 inside the existing `A/256` allowance, including its
-addition rounding. All certified products and sums remain normal and finite.
-The same BF16 monotonicity and ordered head-sum argument applies. The CPU gate
-checks all 784 decoded code/scale values for exact BF16 representation and checks
-split-bound dominance under signed weights and cancellation. Hardware arithmetic
-and exact-selection gates remain required before this path can qualify.
-
-`matrix-bounds.json` records the one variable and completed synthetic gates. Its results must
-be compared with the streamed scalar candidate on the same sp8 runtime, in two
-fresh processes, keeping all failed runs. Earlier scalar results do not qualify
-this optional path.
-
-The first sp8 archived-candidate control completed at source commit `cf24a61c`:
-12 cases pass, retaining every archived selected-position digest, including graph
-visibility changes. Its native command, input hashes, timings and memory
-observations are in `runs/sp8-control-01/`; `sp8-results.json` summarizes them.
-The batch returned sp8 at that job boundary when another authorized task requested
-it. Its request was preserved. This is one control process only; no speedup or
-qualification of the streamed or tensor-core candidates is inferred from it.
-
-The streamed candidate then passed all **20 cases in two fresh graph containers**
-(`sp8-stream-01` and `sp8-stream-02`), including the new cancellation, smallest
-and largest certified scales, subnormal/unsupported encodings and weight gates.
-Both interval endpoints match the archived reduction, and all common selected
-positions retain their archived digests. The repeated control also passes all
-20 cases. At 262,143 keys, complete candidate graph medians are:
-
-| Input | Archived prototype, two processes | Streamed prototype, two processes |
-| --- | --- | --- |
-| Separable | 3.591 / 3.583 ms | 0.769 / 0.791 ms |
-| Random | 5.678 / 5.694 ms | 1.070 / 1.092 ms |
-
-The ratios of process medians span 4.53–4.67 and 5.20–5.32 respectively, comparing
-two **unreleased prototypes on the same sp8 runtime**. No released timing is
-repeated. `sp8-results.json` includes raw ranges and deliberately wide Student-t
-intervals across the two process medians, with the small-sample assumption stated.
-No production or end-to-end gain is established. Dedicated profiling and
-sanitizer repeats for the streamed candidate remain pending, as do all GPU gates
-for the optional tensor-core bounds.
-
-## Optional metadata sharing within one cache owner
-
-`vllm/0005-share-owned-snapshot.patch` introduces a separate grouped API for
-1–256 queries and one explicitly supplied owner page table. Each invocation
-rebuilds metadata once through the maximum visible query extent. That superset
-bounds every shorter query, while the final scorer still reads only that query's
-visible keys. Extent reduction and safe expansion of the native page table are
-included in candidate cost. There is no persistent metadata or inferred identity.
-Graph replay must rebuild after length rollback, empty domains and key mutation.
-
-The comparison is `sp8-grouped` versus `sp8-group-control`, both using tensor-core
-bounds. It includes 8, 32 and 128 queries on the same owner, native full-score
-bound checks and graph/mutation gates. Its hardware execution remains pending.
-The grouped API does not accept arbitrary mixed-request rows and is not wired
-into serving. Correct integration must use the runtime's cache ownership.
-
-A separate integration gate must preserve the native source layer's candidate
-block list and count as well as its immediate top-512 keys. Those blocks feed
-later reindex layers; a top-512-only snapshot check cannot qualify that handoff.
+Real model capture and replay are described in `capture/README.md`. Timing a
+compact copy can change cache behavior, so the diagnostic now records and
+reconstructs native physical page IDs, byte stride, pointer alignment, planned
+width and active limit. A synthetic capture/layout initialization gate must pass
+before collecting real operands. Raw activations and prompts stay outside Git.

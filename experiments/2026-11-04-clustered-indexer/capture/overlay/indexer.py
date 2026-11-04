@@ -1728,7 +1728,7 @@ class IndexerV41Plan:
         if not self.candidates:
             from .clustered_capture import maybe_capture
             maybe_capture(q_packed, q_scales, weights, pool, page_table, lengths,
-                          active, self.width, self.page_size)
+                          active, self.width, self.page_size, self.candidate_blocks)
         rows = q_packed.shape[0]
         buffers = _take(scratch, self.scratch_specs(rows))
         scores, values = buffers[:2]
