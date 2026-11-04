@@ -269,7 +269,7 @@ differs only in cabling, transport and memory sizing):
   (NVIDIA/nccl#2393) and the four-node switchless ring patches (bidirectional rings, balanced
   channels);
 - DeepSeek-V4.1-Flash-1017 (`1bae0e10`) native FP8/FP4/BF16 weights, with the TileLang vision
-  tower loaded (up to four images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
+  tower loaded (up to 67 images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
   see [images per request](docs/current-state.md#images-per-request)), served under both
   `deepseek-v4.1-flash` and the per-request GLP-steered `deepseek-v4.1-flash-weightless`
   (`0541-0542`, msuiche's 39-layer vector for 1017); the output head is stored in an exact 12-bit

@@ -1,0 +1,227 @@
+INFO 11-04 16:42:43 [importing.py:74] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 11-04 16:42:43 [importing.py:98] Triton not installed or not compatible; certain GPU-related functions will not be available.
+.........................................................F.............F [ 88%]
+FFFFFFFF.                                                                [100%]CPU declaration harness: CUDA context remained uninitialized
+
+=================================== FAILURES ===================================
+________ test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast _________
+
+    def test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast():
+        from vllm.models.deepseek_v4_1 import kernels
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+        from vllm.models.deepseek_v4_1.tilelang.router import provided_routes
+    
+        layout = sp_prefill.SPRows(10, 3, 0)  # local_rows = 4
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        x_q = MXFP8Rows(
+            rows=x,
+            values=torch.ones((128, 64), dtype=torch.uint8),
+            scales=torch.ones((128, 2), dtype=torch.uint8),
+        )
+        input_ids = torch.arange(10, dtype=torch.int64)
+        local_w = torch.ones((4, 6), dtype=torch.float32)
+        local_ids = torch.zeros((4, 6), dtype=torch.int64)
+        full_q = MXFP8Rows(
+            rows=torch.empty((10, 64), dtype=torch.bfloat16),
+            values=torch.ones((128, 64), dtype=torch.uint8),
+            scales=torch.ones((128, 2), dtype=torch.uint8),
+        )
+        full_w = torch.ones((10, 6), dtype=torch.float32)
+        full_ids = torch.zeros((10, 6), dtype=torch.int64)
+        seen = []
+    
+        class _FakeSPRows:
+            def gather(self, _):
+                raise AssertionError("BF16 gather should not run when x_q is present")
+    
+            def gather_mxfp8(self, q, *extra):
+                seen.append(("gather_mxfp8", q is x_q, len(extra)))
+                return (full_q, full_w, full_ids) if extra else (full_q,)
+    
+        fake_sp_rows = _FakeSPRows()
+    
+        def route_local(local_x, sp_rows, *, input_ids=None):
+            seen.append(("route_local", local_x is x, sp_rows is fake_sp_rows, input_ids))
+            return local_w, local_ids
+    
+        ffn = SimpleNamespace(
+            experts=SimpleNamespace(router=SimpleNamespace(route_local=route_local))
+        )
+        with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn, input_ids) as rows:
+            assert rows is full_q.rows
+            assert provided_mxfp8(rows) is full_q
+            assert provided_routes(rows) == (full_w, full_ids)
+        with pytest.raises(RuntimeError):
+            provided_mxfp8(full_q.rows)
+        assert provided_routes(full_q.rows) is None
+        assert seen == [
+            ("route_local", True, True, input_ids),
+            ("gather_mxfp8", True, 2),
+        ]
+    
+        # Neither missing input is a request for an alternate execution path.
+        with pytest.raises(ValueError, match="producer-provided MXFP8"):
+>           with kernels.sp_moe_inputs(fake_sp_rows, x, None, ffn, input_ids):
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:461: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/kernels.py:129: in sp_moe_inputs
+    rows = sp_rows.gather(x)
+           ^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.models.test_deepseek_v4_1_sp_prefill.test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast.<locals>._FakeSPRows object at 0xf5ab9952f920>
+_ = tensor([[-0.7734, -0.3379,  0.8750,  0.9609, -0.9531, -0.0547, -1.6328,  1.5703,
+         -0.4863, -1.8203, -0.1641,  ...1.0703,
+          1.4609, -0.4902,  1.1875, -0.4941, -2.1094,  0.7148,  1.8906, -0.2578]],
+       dtype=torch.bfloat16)
+
+    def gather(self, _):
+>       raise AssertionError("BF16 gather should not run when x_q is present")
+E       AssertionError: BF16 gather should not run when x_q is present
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:432: AssertionError
+_ test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_ENGRAM_OVERLAP] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5abcac404a0>
+name = 'VLLM_DS41_ENGRAM_OVERLAP', value = '0'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_MARKOV_NVFP4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5ab98fcbcb0>
+name = 'VLLM_DS41_MARKOV_NVFP4', value = '0'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_DRAFT_NVFP4_HEAD] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5ab98632d80>
+name = 'VLLM_DS41_DRAFT_NVFP4_HEAD', value = '0'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_ENGRAM_OVERLAP] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5ab995ad040>
+name = 'VLLM_DS41_ENGRAM_OVERLAP', value = '1'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_MARKOV_NVFP4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5ab986300b0>
+name = 'VLLM_DS41_MARKOV_NVFP4', value = '1'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_DRAFT_NVFP4_HEAD] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf5ab985bbb30>
+name = 'VLLM_DS41_DRAFT_NVFP4_HEAD', value = '1'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
+        for setting in RETIRED:
+            monkeypatch.delenv(setting, raising=False)
+        monkeypatch.setenv(name, value)
+>       with pytest.raises(ValueError, match=name):
+E       Failed: DID NOT RAISE ValueError
+
+tests/models/test_deepseek_v41_serving_contract.py:25: Failed
+_ test_retired_setting_is_not_an_environment_option[VLLM_DS41_ENGRAM_OVERLAP] __
+
+name = 'VLLM_DS41_ENGRAM_OVERLAP'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    def test_retired_setting_is_not_an_environment_option(name):
+>       assert name not in envs.environment_variables
+E       AssertionError: assert 'VLLM_DS41_ENGRAM_OVERLAP' not in {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...}
+E        +  where {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...} = envs.environment_variables
+
+tests/models/test_deepseek_v41_serving_contract.py:31: AssertionError
+__ test_retired_setting_is_not_an_environment_option[VLLM_DS41_MARKOV_NVFP4] ___
+
+name = 'VLLM_DS41_MARKOV_NVFP4'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    def test_retired_setting_is_not_an_environment_option(name):
+>       assert name not in envs.environment_variables
+E       AssertionError: assert 'VLLM_DS41_MARKOV_NVFP4' not in {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...}
+E        +  where {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...} = envs.environment_variables
+
+tests/models/test_deepseek_v41_serving_contract.py:31: AssertionError
+_ test_retired_setting_is_not_an_environment_option[VLLM_DS41_DRAFT_NVFP4_HEAD] _
+
+name = 'VLLM_DS41_DRAFT_NVFP4_HEAD'
+
+    @pytest.mark.parametrize("name", RETIRED)
+    def test_retired_setting_is_not_an_environment_option(name):
+>       assert name not in envs.environment_variables
+E       AssertionError: assert 'VLLM_DS41_DRAFT_NVFP4_HEAD' not in {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...}
+E        +  where {'VLLM_KIMI_L2_PREFETCH': <function <lambda> at 0xf5abd91a5e40>, 'VLLM_TARGET_DEVICE': <function <lambda> at 0xf5abd91...5f80>, 'VLLM_FLOAT32_MATMUL_PRECISION': <function env_with_choices.<locals>._get_validated_env at 0xf5abd91a6020>, ...} = envs.environment_variables
+
+tests/models/test_deepseek_v41_serving_contract.py:31: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../dev::test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_ENGRAM_OVERLAP]
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_MARKOV_NVFP4]
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[0-VLLM_DS41_DRAFT_NVFP4_HEAD]
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_ENGRAM_OVERLAP]
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_MARKOV_NVFP4]
+FAILED ../../../../dev::test_retired_setting_is_rejected_before_model_setup[1-VLLM_DS41_DRAFT_NVFP4_HEAD]
+FAILED ../../../../dev::test_retired_setting_is_not_an_environment_option[VLLM_DS41_ENGRAM_OVERLAP]
+FAILED ../../../../dev::test_retired_setting_is_not_an_environment_option[VLLM_DS41_MARKOV_NVFP4]
+FAILED ../../../../dev::test_retired_setting_is_not_an_environment_option[VLLM_DS41_DRAFT_NVFP4_HEAD]
+10 failed, 71 passed, 14 warnings in 9.15s

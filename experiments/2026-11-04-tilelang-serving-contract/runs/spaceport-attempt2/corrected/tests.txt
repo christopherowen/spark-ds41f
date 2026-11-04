@@ -1,0 +1,967 @@
+..............................................................FFFFFFFFF. [ 88%]
+........F                                                                [100%]
+=================================== FAILURES ===================================
+__________________ test_engram_gates_only_the_real_local_rows __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93362385f40>
+
+    def test_engram_gates_only_the_real_local_rows(monkeypatch):
+        # Engram's geometry and token map are b12x's; its gate is TileLang's.
+        pytest.importorskip("b12x")
+        pytest.importorskip("tilelang")
+        from vllm.models.deepseek_v4_1.common import engram as engram_ops
+>       from vllm.models.deepseek_v4_1.tilelang import columns
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:690: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """Column blocks of row-major tensors, copied in 16-byte vectors.
+    
+    Prefill sequence parallelism gathers an attention layer's row-wise front (the
+    normalized Q and KV halves of the fused projection and the indexer's head weights)
+    in one all-gather: the norms write their halves into the gather's buffer in place,
+    ``copy_columns`` puts the head weights beside them, and ``split_columns`` cuts the
+    gathered rows into one contiguous tensor a part. Torch's cat and three contiguous
+    copies, as two TileLang launches. ``join_columns`` is the split reversed: the
+    DSpark drafter's eager context step joins the target's auxiliary hidden states side
+    by side (torch's cat). A thread copies 16 bytes; the block widths are whole vectors,
+    so no vector straddles two parts.
+    """
+    
+    # No `from __future__ import annotations`: TileLang reads the prim_func
+    # annotations eagerly, and the symbolic shapes must resolve.
+    from functools import cache
+    
+    import torch
+    
+    from vllm.models.deepseek_v4_1.tilelang import pdl
+    from vllm.tilelang_utils import T, tilelang
+    
+    _THREADS = 128
+    _VECTOR_BYTES = 16
+    _DTYPES = {
+        torch.bfloat16: "bfloat16",
+        torch.float16: "float16",
+        torch.float32: "float32",
+    }
+    _PASS = {
+>       tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        ^^^^^^^^^^^^^^^^^^^^^^
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+E   AttributeError: 'NoneType' object has no attribute 'PassConfigKey'
+
+vllm/models/deepseek_v4_1/tilelang/columns.py:33: AttributeError
+________________ test_model_forward_matches_full_rows[False-9] _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf933623146b0>
+num_tokens = 9, use_embeds = False
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 11-04 16:40:11 [indexer_topk.py:29] Failed to import the DeepSelect extension (vllm._deepselect_C): libcuda.so.1: cannot open shared object file: No such file or directory
+------------------------------ Captured log call -------------------------------
+WARNING  vllm.model_executor.layers.indexer_topk:indexer_topk.py:29 Failed to import the DeepSelect extension (vllm._deepselect_C): libcuda.so.1: cannot open shared object file: No such file or directory
+________________ test_model_forward_matches_full_rows[False-10] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361fb0260>
+num_tokens = 10, use_embeds = False
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+________________ test_model_forward_matches_full_rows[False-11] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361ec4620>
+num_tokens = 11, use_embeds = False
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+_________________ test_model_forward_matches_full_rows[True-9] _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361eb7980>
+num_tokens = 9, use_embeds = True
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+________________ test_model_forward_matches_full_rows[True-10] _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361d4a6f0>
+num_tokens = 10, use_embeds = True
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+________________ test_model_forward_matches_full_rows[True-11] _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361ec41a0>
+num_tokens = 11, use_embeds = True
+
+    @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+    @pytest.mark.parametrize("use_embeds", (False, True))
+    def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:927: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+________________ test_dspark_tp_defaults_enabled_for_multi_rank ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361cf4320>
+
+    def test_dspark_tp_defaults_enabled_for_multi_rank(monkeypatch):
+>       from vllm.models.deepseek_v4_1.nvidia import dspark
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:998: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/dspark.py:46: in <module>
+    from vllm.v1.worker.gpu.cudagraph_utils import (
+vllm/v1/worker/gpu/cudagraph_utils.py:44: in <module>
+    from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+vllm/v1/worker/gpu/attn_utils.py:36: in <module>
+    from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+vllm/v1/worker/gpu/model_states/__init__.py:10: in <module>
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+vllm/v1/worker/gpu/model_states/interface.py:23: in <module>
+    from vllm.v1.worker.gpu.states import RequestState
+vllm/v1/worker/gpu/states.py:7: in <module>
+    from vllm.v1.worker.gpu import tilelang_inputs
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """TileLang kernels of the V2 model runner's input preparation.
+    
+    Integer and index bookkeeping launched every step, each the contract of the Triton
+    kernel it replaces, element for element, including which elements a launch writes
+    and which it leaves alone (the Triton kernels stay importable as the tests'
+    reference):
+    
+    - ``gather_block_tables``: ``block_table._gather_block_tables_kernel``
+    - ``compute_slot_mappings``: ``block_table._compute_slot_mappings_kernel``
+    - ``apply_staged_writes``: ``buffer_utils._apply_write_kernel``
+    - ``zero_kv_blocks``: ``worker.utils._zero_kv_blocks_kernel``
+    - ``fill_kv_blocks``: ``zero_kv_blocks`` storing a given word (the debug-only
+      ``VLLM_KV_CACHE_POISON`` check; it has no Triton original)
+    - ``prepare_prefill_inputs``: ``input_batch._prepare_prefill_inputs_kernel``
+    - ``prepare_pos_seq_lens``: ``input_batch._prepare_pos_seq_lens_kernel``
+    - ``combine_sampled_and_draft_tokens``:
+      ``input_batch._combine_sampled_and_draft_tokens_kernel``
+    - ``expand_idx_mapping``: ``input_batch._expand_idx_mapping_kernel``
+    - ``post_update``: ``input_batch._post_update_kernel``
+    - ``post_update_num_computed_tokens``:
+      ``input_batch._post_update_num_computed_tokens_kernel``
+    - ``prepare_dflash_inputs``: ``dflash.speculator._prepare_dflash_inputs_kernel``
+    
+    Integer arithmetic follows Triton's: C division and remainder (``truncdiv``,
+    ``truncmod``), int32 products where Triton multiplies int32 values, and stores that
+    truncate to the destination type. Every kernel has a device tensor argument, so it
+    launches on the caller's stream (graph capture included).
+    
+    Preparation: every launch is ``_kernel(factory, *key)`` with ``key`` from the same
+    key function the owner's declaration uses (``*_calls``), so the declared call and the
+    launched call cannot drift apart. Owners declare their calls through
+    ``prepare.declare`` (DeepSeek V4.1's TileLang preparation, the runner's
+    ``JitWarmupRegistry`` owner ``TILELANG``) where the Triton kernels registered their
+    warmups. After the kernel cache is frozen, a call that was not declared raises
+    ``KernelNotPreparedError`` at its first launch.
+    """
+    
+    # No `from __future__ import annotations`: TileLang reads the prim_func
+    # annotations eagerly, and the symbolic shapes must resolve.
+    from collections.abc import Callable, Sequence
+    from typing import Any
+    
+    import torch
+    
+    from vllm.tilelang_utils import T, tilelang
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.core.boundary_checkpoint import (
+        INSTRUCTION_CHECKPOINT_SLOT,
+        MAX_BOUNDARY_STOP_TOKENS,
+        NUM_BOUNDARY_CHECKPOINT_SLOTS,
+        PREFILL_TAIL_CHECKPOINT_SLOT,
+        PROMPT_CHECKPOINT_SLOT,
+        RESPONSE_CHECKPOINT_SLOT,
+    )
+    
+    _PASS = {
+>       tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        ^^^^^^^^^^^^^^^^^^^^^^
+        # Every access is guarded by the kernel's own masks, as in Triton; buffers
+        # reached through pointer tables have no meaningful extent to guard against.
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+        # A name bound to a load stays one load: with replay on (TileLang's default),
+        # IfStmtBinding re-substitutes binds under each guarded statement, and the
+        # combine kernel re-read its request's scalars after every store (47 loads where
+        # Triton's has 9).
+        "tl.if_stmt_binding_inline_replayable_binds": False,
+    }
+E   AttributeError: 'NoneType' object has no attribute 'PassConfigKey'
+
+vllm/v1/worker/gpu/tilelang_inputs.py:59: AttributeError
+___________ test_model_forward_sp_sink_columns_with_rank_order_parts ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361c34230>
+
+    def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+        pytest.importorskip("b12x")
+>       from vllm.models.deepseek_v4_1.nvidia import model as native
+
+tests/models/test_deepseek_v4_1_sp_prefill.py:1009: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/model.py:42: in <module>
+    from vllm.models.deepseek_v41.nvidia.model import (
+vllm/models/deepseek_v41/nvidia/model.py:66: in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+vllm/models/deepseek_v41/attention.py:29: in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+vllm/model_executor/layers/sparse_mqa_indexer.py:20: in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """DeepGEMM sparse MQA-logits path for the DeepSeek V4.1 two-level indexer.
+    
+    The candidate-source indexer publishes the top candidate blocks (in units of
+    ``candidate_block_size`` compressed positions). Instead of scoring every KV
+    position and masking the dense logits down to those blocks, this path scores
+    only the candidate tokens with DeepGEMM's sparse MQA logits kernels
+    (``fp8_fp4_(paged_)sparse_mqa_logits``, DeepGEMM >= 2.8, SM100 only), runs
+    DeepSelect's top-k directly on the bf16 logits they produce, and remaps the
+    selected columns back to request-local positions.
+    
+    Only the MXFP4 indexer cache is supported: the kernels require UE8M0-packed
+    (granularity-32) Q/KV scales, which is exactly the MXFP4 cache layout. The
+    FP8 indexer cache stores one fp32 scale per quant block instead.
+    
+    The functions here take caller-owned output buffers (``sparse_indices``,
+    ``end``, ``col_indices``) so the hot path allocates nothing; the indexer
+    metadata builder owns them.
+    """
+    
+    import importlib.util
+    
+    import torch
+    
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_topk,
+        get_deep_select_stride_requirement,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import tl, triton
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_sparse_mqa_logits,
+        fp8_fp4_sparse_mqa_logits,
+        get_paged_sparse_mqa_logits_metadata,
+        get_sparse_mqa_logits_metadata,
+    )
+    
+    # Sparse-block sizes (in tokens) supported by the DeepGEMM kernels.
+    SPARSE_BLOCK_KV_CHOICES = (16, 8)
+    
+    
+    def has_deep_select() -> bool:
+        """Whether the DeepSelect top-k extension is built and this GPU runs it."""
+        return (
+            importlib.util.find_spec("vllm._deepselect_C") is not None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        )
+    
+    
+    def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:
+        """Raise unless DeepSelect accepts the sparse logits layout.
+    
+        The sparse kernels return contiguous bf16 ``[rows, num_sparse_cols]``
+        logits and the top-k writes int32 ``[rows, topk_tokens]`` indices;
+        DeepSelect needs both row strides aligned (1024B / 32B on SM100).
+        """
+        in_align, out_align = get_deep_select_stride_requirement()
+        logits_row_bytes = num_sparse_cols * torch.bfloat16.itemsize
+        if num_sparse_cols >= 2**23 or logits_row_bytes % in_align != 0:
+            raise ValueError(
+                f"DeepSelect needs the sparse logits row ({num_sparse_cols} bf16 "
+                f"columns, {logits_row_bytes} B) to be {in_align}B-aligned."
+            )
+        if topk_tokens > 4096 or (topk_tokens * torch.int32.itemsize) % out_align != 0:
+            raise ValueError(
+                f"DeepSelect needs topk <= 4096 with a {out_align}B-aligned int32 "
+                f"output row, got topk={topk_tokens}."
+            )
+    
+    
+>   _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: 'NoneType' object is not callable
+
+vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py:73: TypeError
+_________________ test_dspark_uses_the_targets_vocabulary_head _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf93361d76e10>
+
+    def test_dspark_uses_the_targets_vocabulary_head(monkeypatch):
+        from torch import nn
+    
+>       from vllm.models.deepseek_v4_1.nvidia import dspark
+
+tests/models/test_deepseek_v41_serving_contract.py:37: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/nvidia/dspark.py:46: in <module>
+    from vllm.v1.worker.gpu.cudagraph_utils import (
+vllm/v1/worker/gpu/cudagraph_utils.py:44: in <module>
+    from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+vllm/v1/worker/gpu/attn_utils.py:36: in <module>
+    from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+vllm/v1/worker/gpu/model_states/__init__.py:10: in <module>
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+vllm/v1/worker/gpu/model_states/interface.py:23: in <module>
+    from vllm.v1.worker.gpu.states import RequestState
+vllm/v1/worker/gpu/states.py:7: in <module>
+    from vllm.v1.worker.gpu import tilelang_inputs
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """TileLang kernels of the V2 model runner's input preparation.
+    
+    Integer and index bookkeeping launched every step, each the contract of the Triton
+    kernel it replaces, element for element, including which elements a launch writes
+    and which it leaves alone (the Triton kernels stay importable as the tests'
+    reference):
+    
+    - ``gather_block_tables``: ``block_table._gather_block_tables_kernel``
+    - ``compute_slot_mappings``: ``block_table._compute_slot_mappings_kernel``
+    - ``apply_staged_writes``: ``buffer_utils._apply_write_kernel``
+    - ``zero_kv_blocks``: ``worker.utils._zero_kv_blocks_kernel``
+    - ``fill_kv_blocks``: ``zero_kv_blocks`` storing a given word (the debug-only
+      ``VLLM_KV_CACHE_POISON`` check; it has no Triton original)
+    - ``prepare_prefill_inputs``: ``input_batch._prepare_prefill_inputs_kernel``
+    - ``prepare_pos_seq_lens``: ``input_batch._prepare_pos_seq_lens_kernel``
+    - ``combine_sampled_and_draft_tokens``:
+      ``input_batch._combine_sampled_and_draft_tokens_kernel``
+    - ``expand_idx_mapping``: ``input_batch._expand_idx_mapping_kernel``
+    - ``post_update``: ``input_batch._post_update_kernel``
+    - ``post_update_num_computed_tokens``:
+      ``input_batch._post_update_num_computed_tokens_kernel``
+    - ``prepare_dflash_inputs``: ``dflash.speculator._prepare_dflash_inputs_kernel``
+    
+    Integer arithmetic follows Triton's: C division and remainder (``truncdiv``,
+    ``truncmod``), int32 products where Triton multiplies int32 values, and stores that
+    truncate to the destination type. Every kernel has a device tensor argument, so it
+    launches on the caller's stream (graph capture included).
+    
+    Preparation: every launch is ``_kernel(factory, *key)`` with ``key`` from the same
+    key function the owner's declaration uses (``*_calls``), so the declared call and the
+    launched call cannot drift apart. Owners declare their calls through
+    ``prepare.declare`` (DeepSeek V4.1's TileLang preparation, the runner's
+    ``JitWarmupRegistry`` owner ``TILELANG``) where the Triton kernels registered their
+    warmups. After the kernel cache is frozen, a call that was not declared raises
+    ``KernelNotPreparedError`` at its first launch.
+    """
+    
+    # No `from __future__ import annotations`: TileLang reads the prim_func
+    # annotations eagerly, and the symbolic shapes must resolve.
+    from collections.abc import Callable, Sequence
+    from typing import Any
+    
+    import torch
+    
+    from vllm.tilelang_utils import T, tilelang
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.core.boundary_checkpoint import (
+        INSTRUCTION_CHECKPOINT_SLOT,
+        MAX_BOUNDARY_STOP_TOKENS,
+        NUM_BOUNDARY_CHECKPOINT_SLOTS,
+        PREFILL_TAIL_CHECKPOINT_SLOT,
+        PROMPT_CHECKPOINT_SLOT,
+        RESPONSE_CHECKPOINT_SLOT,
+    )
+    
+    _PASS = {
+>       tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        ^^^^^^^^^^^^^^^^^^^^^^
+        # Every access is guarded by the kernel's own masks, as in Triton; buffers
+        # reached through pointer tables have no meaningful extent to guard against.
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+        # A name bound to a load stays one load: with replay on (TileLang's default),
+        # IfStmtBinding re-substitutes binds under each guarded statement, and the
+        # combine kernel re-read its request's scalars after every store (47 loads where
+        # Triton's has 9).
+        "tl.if_stmt_binding_inline_replayable_binds": False,
+    }
+E   AttributeError: 'NoneType' object has no attribute 'PassConfigKey'
+
+vllm/v1/worker/gpu/tilelang_inputs.py:59: AttributeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../dev::test_engram_gates_only_the_real_local_rows - Attribut...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[False-9] - TypeE...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[False-10] - Type...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[False-11] - Type...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[True-9] - TypeEr...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[True-10] - TypeE...
+FAILED ../../../../dev::test_model_forward_matches_full_rows[True-11] - TypeE...
+FAILED ../../../../dev::test_dspark_tp_defaults_enabled_for_multi_rank - Attr...
+FAILED ../../../../dev::test_model_forward_sp_sink_columns_with_rank_order_parts
+FAILED ../../../../dev::test_dspark_uses_the_targets_vocabulary_head - Attrib...
+10 failed, 71 passed, 14 warnings in 10.58s
