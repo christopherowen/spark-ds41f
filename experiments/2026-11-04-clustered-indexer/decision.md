@@ -24,3 +24,10 @@ The original window closed on 2026-11-04 at 08:23 UTC. The prior candidate-36 TP
 profile was already serving; no serving start, stop, restart or sync was performed.
 The hold was removed. A subsequent short idle-dgx4 window is requested; sp8's
 configured SSH route is currently unreachable. Foreign holds are preserved.
+
+The second standalone window completed the expanded repeat: all 12 output
+digests match. Memcheck reports 0 errors across 12 cases; racecheck reports
+0 hazards, 0 errors and 0 warnings across the 10 cases through 16K keys. It
+closed at 09:07:10 UTC after the next cluster request. Initcheck was not started.
+The new capture arm and real-model replay have not run, and no speed claim or
+serving integration is accepted on these synthetic results.

@@ -123,3 +123,12 @@ recover the exact recorded candidate-36 indexer. Full build inputs are absent;
 `build check` reports that the build tree is not prepared. The image was neither
 rebuilt nor modified. See `decision.md` for outstanding gates and the window's
 closure, and `capture/README.md` for the unexecuted real-input workflow.
+
+`runs/attempt-04` repeats all 12 expanded cases in a fresh container: every
+selected-position digest matches `attempt-03`. `memcheck-01` passes all 12 cases
+with **0 errors**; `racecheck-01` passes the 10 cases through 16K keys with
+**0 hazards, 0 errors and 0 warnings**. Sanitizer timings are excluded from
+performance interpretation. `provenance.json` records the exact published
+harness commit and command for every run and the sanitizer's version/hash.
+The second window closed at 09:07:10 UTC, again with the original profile
+already serving. Initcheck and real-input replay remain pending.
