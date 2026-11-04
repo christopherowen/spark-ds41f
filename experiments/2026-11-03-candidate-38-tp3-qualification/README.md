@@ -238,6 +238,9 @@ including the same three full suite definitions despite their `screen-tp3` run
 names. Every recorded step exited zero, all ranks name one image per candidate,
 the clients were clean, and conditions show no halt, swap growth or thermal
 slowdown. Their client `servebench` sources are identical to the current ones.
+Their [recorded profile hashes](runs/2026-11-03-dgx1-3/previous-candidates/source-validation.json)
+also match the raw files at the recorded client commits, and every rank's
+checkout and image agree with the expected archived candidate identity.
 Each prior candidate has only one recorded boot here; these are supplementary
 comparisons, not repeat-boot qualification of those candidates or their copy path.
 
@@ -286,6 +289,10 @@ and all 626 repository tests pass without skips using the hash-pinned bench-clie
 dependencies. The initial command named an absent worktree virtual environment;
 the next check passed with five validator-dependent skips. Both attempts are
 retained alongside the complete successful check. They did not affect GPU work.
+The [integration check](runs/2026-11-03-dgx1-3/local-validation/integration-summary.json)
+again passes all 626 tests without skips after bringing current main into the
+report branch. Its separate TP4 replay and AgentX stub changes do not alter the
+tested candidate, profiles, references or `servebench` sources.
 
 During the CopyDrafter repeat, workstation SSH to dgx1 stalled and a bounded
 connection timed out around 00:45 UTC on November 4. ICMP still worked;
