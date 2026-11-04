@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "scope": "preparation audit; no missing or unfavorable GPU run omitted",
+  "events": [
+    {
+      "operation": "full local unit suite before publishing the fixed FP8 matrix controller",
+      "outcome": "aborted after HEAD changed during the run",
+      "resolution": "held HEAD stable; 666 tests passed in 41.085 seconds",
+      "original_log": ".work/unit-screen-job.log",
+      "successful_log": ".work/unit-screen-job-stable.log"
+    },
+    {
+      "operation": "analyze original GPU receipts against the original version-1 CPU sample",
+      "outcome": "ValueError: GPU checkpoint tiles differ from the CPU screen",
+      "resolution": "no archived output created; preserved original CPU receipts and exported the version-2 workload separately; all 42 dense identities then match"
+    },
+    {
+      "operation": "read-only version-2 checkpoint export with collector --out /dev/stdout on dgx4",
+      "outcome": "FileExistsError: collector uses exclusive file creation; local redirected output empty",
+      "resolution": "published be6effa1 collector collect() called in memory and JSON streamed to stdout; new attempt2 filename; no checkpoint modification, CUDA or remote file written"
+    },
+    {
+      "operation": "read initial empty redirected export",
+      "outcome": "JSONDecodeError",
+      "resolution": "used validated attempt2 export; initial file retained outside Git"
+    },
+    {
+      "operation": "Engram negative INT64_MIN delta in original packed-row metadata",
+      "outcome": "UndefinedBehaviorSanitizer signed subtraction overflow; exit 134",
+      "resolution": "reject negative delta before subtraction; corrected fixture exits 0, 1025 valid rows preserve all bytes; native GPU tests pending"
+    }
+  ],
+  "cpu_v2": {
+    "source_commit": "be6effa1cdf3cb4974cfe204c44e74963b4dba7a",
+    "input_manifest_sha256": "947390bcff07bfcf377055c849554b78b65a96d33a7560383d6ea6f1bc2001fd",
+    "checkpoint_tiles": 46,
+    "dense_tiles": 42,
+    "disk_table_tiles": 4,
+    "independent_processes": 2,
+    "gpu_sample_identity_exact": true,
+    "repeats": 5,
+    "export_scope": "bounded CPU read-only export of pinned checkpoint; no target timing",
+    "screen_worktree": ".work/cpu-screen-be6",
+    "raw_input_committed": false,
+    "export_method": {
+      "published_path": "experiments/2026-11-04-lossless-memory/collect_weights.py",
+      "load": "exec(compile(published_source, \"published-collector\", \"exec\"), {\"__name__\": \"bounded_export\"})",
+      "function": "collect",
+      "arguments": [
+        "/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        24,
+        2
+      ],
+      "output": ".work/inputs/weight-tiles-be6effa1-attempt2.json"
+    },
+    "screen_commands": [
+      [
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/.venv312/bin/python",
+        "experiments/2026-11-04-lossless-memory/screen.py",
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/.work/inputs/weight-tiles-be6effa1-attempt2.json",
+        "--repeats",
+        "5",
+        "--out",
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/experiments/2026-11-04-lossless-memory/runs/fp8-local-v2-first.json"
+      ],
+      [
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/.venv312/bin/python",
+        "experiments/2026-11-04-lossless-memory/screen.py",
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/.work/inputs/weight-tiles-be6effa1-attempt2.json",
+        "--repeats",
+        "5",
+        "--out",
+        "/Users/christopherowen/projects/spark-ds41f-lossless-memory/experiments/2026-11-04-lossless-memory/runs/fp8-local-v2-repeat.json"
+      ]
+    ]
+  },
+  "engram": {
+    "canonical_head": "16d457afbbf774ebe45bcd4b5862c8f4e9c4377b",
+    "tree": "c40fbd1b553c0f0bf0ae72e0d12082f564e769b0",
+    "patchset_sha256": "5abfd6a8206e833be6c18e4becedb04c57400dee395fd707650686cdf944f46f",
+    "fresh_preparation_log_sha256": "ac32663ae385577b71855b1cb816ec9ce5b3b6ce518c677f982314c40edf0ca0",
+    "native_gpu_tests_run": false,
+    "image_built": false
+  },
+  "gpu_controller": {
+    "window": "dgx1-1793809624",
+    "completed": true,
+    "restored": true,
+    "hold_released": true,
+    "native_receipts": "fp8/gpu-results.json",
+    "decision": "reject all three measured Huffman layouts"
+  },
+  "serving_images_built": false,
+  "release_promoted": false,
+  "validation": {
+    "repository_unit_tests": 666,
+    "unit_seconds": 43.113,
+    "unit_exit": 0,
+    "doctors": [
+      "promoted",
+      "expert-scales/tp3",
+      "engram/tp3"
+    ],
+    "fresh_engram_classification": {
+      "selected_files": 170,
+      "problems": 0
+    },
+    "git_diff_check": "passed",
+    "full_build_check": "not applicable locally; only vLLM sources prepared, complete inputs absent"
+  }
+}
