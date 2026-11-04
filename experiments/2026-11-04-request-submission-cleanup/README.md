@@ -1,0 +1,76 @@
+# Release failed request submissions
+
+Base deployment commit: `776423633340053eb236fe6ebf82ef0cf01f82a3`.
+The affected host source is identical in candidate-38 and candidate-39.
+The immutable candidate-38 image and exact source hashes used for the isolated
+Spaceport checks are recorded in [base.json](base.json).
+
+## Source defect
+
+`AsyncLLM._add_request()` registers a request in `OutputProcessor` before
+awaiting the engine send. This ordering is needed for concurrent admission
+accounting. However, `generate()` receives its queue handle only after the
+entire `add_request()` call returns. A cancellation or send error between
+registration and that return leaves `generate()` with `q is None`, so its
+error handlers cannot abort the registered request. If the engine never
+received the request, no completion will arrive to remove it.
+
+The surviving `OutputProcessor.request_states` entry owns the prompt token IDs,
+prompt embeddings, detokenizer, output queue and associated state. Repeated
+failed submissions can therefore accumulate prompt history indefinitely while
+the engine reports no running requests. Partial `n > 1` submission also leaves
+sampling children and parent bookkeeping behind.
+
+This is a source-level leak path, shared with candidate-36. It is not proof that
+it caused all memory drift in [#884](https://github.com/christopherowen/spark-ds41f/issues/884),
+nor evidence of a candidate-38-only regression. The field report lacks process
+or allocation attribution. Successful benchmark boots do not settle that report.
+
+## One variable
+
+The [patch](vllm/0001-rollback-failed-submissions.patch) makes `add_request()`
+responsible for rolling back a submission that does not return its collector.
+It closes the collector and aborts through its original internal request ID,
+including every already registered sampling child. It preserves the initial
+submission exception if the abort notification also fails. Local removal takes
+place before that second send is awaited.
+
+Using the original internal ID is necessary: the input request may already be
+mutated to its last sampled child's ID, and unrelated requests may share the
+same external ID. Moving registration after the send would reintroduce the
+concurrent-admission race and is not the fix.
+
+The normal submission and completion paths, GPU work, logits, token selection,
+context capacity, allocator settings and serving guards are unchanged. This is
+not yet a measured performance or long-soak claim.
+
+## Isolated Spaceport validation
+
+Owner direction: keep the investigation read-only until an error is discovered
+and corrected; test corrected errors on Spaceport. No DGX test window is used.
+No serving cluster is stopped or restarted. Run CPU-only, bounded disposable
+containers on idle sp8, using one exact candidate image and published patch
+bytes. The running service is not patched.
+
+[run_tests.py](run_tests.py) verifies the image's original `async_llm.py` hash,
+then applies either the new tests alone (control) or the full correction. It
+runs the same ten CPU cases against real `AsyncLLM` and `OutputProcessor`
+objects with a deterministic engine-send stub and no model/tokenizer download.
+Cancellation is injected exactly while the send awaits; no timing race is
+required to expose the defect.
+
+Cases cover failed sends, repeated failed submissions, cancellation through
+`generate()` with one or three sampled outputs, reused external IDs, failure
+of the cleanup send, and ordinary successful completion. The repeated-failure
+case submits sixteen 65,536-token prompts to the same live frontend.
+
+The expected uncorrected result is eight failures and two successful normal-path
+controls. The corrected source must pass all ten without skips. Keep setup
+failures and every raw run under `runs/`; never relabel a collection error as
+the expected regression. Record image/source/patch/test identities and resource
+limits beside each invocation. These CPU cases qualify ownership cleanup, not
+end-to-end serving performance or the entire field failure.
+
+Upstream status: local, not submitted. No promoted configuration or immutable
+baseline changes. Candidate-39 integration is an isolated source recipe, pending
+its own image and serving qualification.

@@ -1,0 +1,303 @@
+From 1d33b4a99e7a6e080fc30da7d370badfad98e50e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 16:26:04 +0100
+Subject: [PATCH] fix(v1): roll back failed frontend request submissions
+
+Base: candidate-38 patch head 1f33102547e4da5c64712390604695d1abd577c4; the affected host code is unchanged in candidate-39.
+
+Registering locally before the async engine send is necessary for admission accounting, but a cancelled or failed send can leave that request retained forever: generate has not yet received its queue handle. Roll back the complete submission using the original internal queue ID, including partially submitted sampling children, and preserve the original failure if the abort notification also fails.
+
+Quality: healthy requests, decoding, token selection, context limits and GPU work are unchanged. Cleanup follows existing abort semantics and cannot abort an unrelated request that reuses the external ID.
+
+Tests: CPU regressions cover blocked-send cancellation through generate, failed sends, sampled children, repeated external IDs, abort-send failure and ordinary successful completion. Target validation is on Spaceport.
+
+Upstream status: local, not submitted.
+---
+ .../engine/test_request_submission_cleanup.py | 204 ++++++++++++++++++
+ vllm/v1/engine/async_llm.py                   |  58 +++--
+ 2 files changed, 242 insertions(+), 20 deletions(-)
+ create mode 100644 tests/v1/engine/test_request_submission_cleanup.py
+
+diff --git a/tests/v1/engine/test_request_submission_cleanup.py b/tests/v1/engine/test_request_submission_cleanup.py
+new file mode 100644
+index 0000000000..34ba891850
+--- /dev/null
++++ b/tests/v1/engine/test_request_submission_cleanup.py
+@@ -0,0 +1,204 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Submission failures must not retain frontend prompts or orphan sampled children."""
++
++import asyncio
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.sampling_params import SamplingParams
++from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
++from vllm.v1.engine.async_llm import AsyncLLM
++from vllm.v1.engine.output_processor import OutputProcessor
++
++pytestmark = pytest.mark.cpu_test
++
++
++class SubmissionCore:
++    def __init__(self):
++        self.resources = SimpleNamespace(engine_dead=False)
++        self.submitted = []
++        self.aborted = []
++        self.fail_at = None
++        self.block_at = None
++        self.abort_error = False
++        self.entered = asyncio.Event()
++        self.resume = asyncio.Event()
++
++    async def add_request_async(self, request):
++        self.submitted.append(request.request_id)
++        if len(self.submitted) == self.block_at:
++            self.entered.set()
++            await self.resume.wait()
++        if len(self.submitted) == self.fail_at:
++            raise RuntimeError("submission failed")
++
++    async def abort_requests_async(self, request_ids):
++        self.aborted.extend(request_ids)
++        if self.abort_error:
++            raise RuntimeError("abort send failed")
++
++    def shutdown(self, timeout=None):
++        pass
++
++
++def make_llm():
++    llm = AsyncLLM.__new__(AsyncLLM)
++    llm.engine_core = SubmissionCore()
++    llm.output_processor = OutputProcessor(None, log_stats=False)
++    llm.scheduler_config = SimpleNamespace(
++        max_num_queued_reqs=None, max_num_queued_tokens=None
++    )
++    llm.admission_stats = None
++    llm.vllm_config = SimpleNamespace(
++        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False)
++    )
++    llm.log_requests = False
++    llm.output_handler = None
++    llm._run_output_handler = lambda: None
++    llm._request_stall_warning_s = 0
++    llm._log_request_timeline = False
++    sequence = 0
++
++    def assign_request_id(request):
++        nonlocal sequence
++        sequence += 1
++        request.external_req_id = request.request_id
++        request.request_id = f"{request.request_id}-internal-{sequence}"
++
++    llm.input_processor = SimpleNamespace(assign_request_id=assign_request_id)
++    return llm
++
++
++def make_request(n=1, request_id="shared-external-id"):
++    return EngineCoreRequest(
++        request_id=request_id,
++        prompt_token_ids=list(range(65536)),
++        mm_features=None,
++        sampling_params=SamplingParams(n=n, max_tokens=16, detokenize=False),
++        pooling_params=None,
++        arrival_time=time.time(),
++        lora_request=None,
++        cache_salt=None,
++        data_parallel_rank=None,
++    )
++
++
++def assert_empty(llm):
++    processor = llm.output_processor
++    assert not processor.request_states
++    assert not processor.parent_requests
++    assert not processor.external_req_ids
++    assert processor.get_num_queued_tokens() == 0
++
++
++@pytest.mark.parametrize("abort_error", [False, True])
++def test_failed_submission_rolls_back_registered_prompt(abort_error):
++    async def run():
++        llm = make_llm()
++        llm.engine_core.fail_at = 1
++        llm.engine_core.abort_error = abort_error
++        request = make_request()
++        with pytest.raises(RuntimeError, match="^submission failed$"):
++            await llm.add_request(request.request_id, request, request.sampling_params)
++        assert_empty(llm)
++        assert llm.engine_core.aborted == llm.engine_core.submitted
++
++    asyncio.run(run())
++
++
++def test_repeated_failed_submissions_do_not_accumulate_prompt_history():
++    async def run():
++        llm = make_llm()
++        for index in range(16):
++            llm.engine_core.fail_at = len(llm.engine_core.submitted) + 1
++            request = make_request(request_id=f"failed-{index}")
++            with pytest.raises(RuntimeError, match="submission failed"):
++                await llm.add_request(
++                    request.request_id, request, request.sampling_params
++                )
++        # The uncorrected code retains sixteen prompts (1,048,576 token IDs)
++        # even though none reached the engine and no request can finish them.
++        assert_empty(llm)
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
++def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
++    async def run():
++        llm = make_llm()
++        llm.engine_core.block_at = block_at
++        request = make_request(n)
++        # Exercise generate(): its queue handle has not yet been assigned when
++        # cancellation interrupts add_request(). No engine output will arrive.
++        generator = llm.generate(
++            request, request.sampling_params, request.request_id
++        )
++        task = asyncio.create_task(anext(generator))
++        await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
++        assert len(llm.output_processor.request_states) == block_at
++        assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        await generator.aclose()
++        assert_empty(llm)
++        assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("n", [1, 3])
++def test_failure_does_not_abort_another_request_reusing_external_id(n):
++    async def run():
++        llm = make_llm()
++        first = make_request()
++        queue = await llm.add_request(
++            first.request_id, first, first.sampling_params
++        )
++        original_id = first.request_id
++        llm.engine_core.fail_at = 1 + n
++        request = make_request(n)
++        with pytest.raises(RuntimeError, match="submission failed"):
++            await llm.add_request(request.request_id, request, request.sampling_params)
++        assert set(llm.output_processor.request_states) == {original_id}
++        assert not llm.output_processor.parent_requests
++        assert llm.output_processor.external_req_ids == {
++            "shared-external-id": [original_id]
++        }
++        assert original_id not in llm.engine_core.aborted
++        await llm.abort(queue.request_id, internal=True)
++        assert_empty(llm)
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("n", [1, 3])
++def test_successful_submission_and_completion_keep_normal_cleanup(n):
++    async def run():
++        llm = make_llm()
++        request = make_request(n)
++        queue = await llm.add_request(
++            request.request_id, request, request.sampling_params
++        )
++        assert len(llm.output_processor.request_states) == n
++        assert not llm.engine_core.aborted
++        outputs = [
++            EngineCoreOutput(
++                request_id=internal_id,
++                new_token_ids=[1],
++                finish_reason=FinishReason.STOP,
++            )
++            for internal_id in llm.engine_core.submitted
++        ]
++        llm.output_processor.process_outputs(outputs)
++        assert_empty(llm)
++        result = await queue.get()
++        assert result.finished
++        assert len(result.outputs) == n
++        assert not llm.engine_core.aborted
++
++    asyncio.run(run())
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index cb0d8c89a3..32c2be34b5 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -485,27 +485,45 @@ class AsyncLLM(EngineClient):
+         # Create a new output collector for the request.
+         queue = RequestOutputCollector(params.output_kind, request.request_id)
+ 
+-        # Use cloned params that may have been updated in process_inputs()
+-        params = request.params
+-
+-        if is_pooling or params.n == 1:
+-            await self._add_request(request, prompt_text, None, 0, queue)
++        try:
++            # Use cloned params that may have been updated in process_inputs()
++            params = request.params
++
++            if is_pooling or params.n == 1:
++                await self._add_request(request, prompt_text, None, 0, queue)
++                return queue
++
++            parent_params = params
++            assert isinstance(parent_params, SamplingParams)
++
++            # Fan out child requests (for n>1).
++            parent_request = ParentRequest(request)
++            for idx in range(parent_params.n):
++                request_id, child_params = parent_request.get_child_info(idx)
++                child_request = request if idx == parent_params.n - 1 else copy(request)
++                child_request.request_id = request_id
++                child_request.sampling_params = child_params
++                await self._add_request(
++                    child_request, prompt_text, parent_request, idx, queue
++                )
+             return queue
+-
+-        parent_params = params
+-        assert isinstance(parent_params, SamplingParams)
+-
+-        # Fan out child requests (for n>1).
+-        parent_request = ParentRequest(request)
+-        for idx in range(parent_params.n):
+-            request_id, child_params = parent_request.get_child_info(idx)
+-            child_request = request if idx == parent_params.n - 1 else copy(request)
+-            child_request.request_id = request_id
+-            child_request.sampling_params = child_params
+-            await self._add_request(
+-                child_request, prompt_text, parent_request, idx, queue
+-            )
+-        return queue
++        except BaseException:
++            # Registration precedes the engine send's first await. Until this
++            # method returns, generate() has no queue handle with which to abort
++            # a cancelled or failed submission. Roll back all registered children
++            # through their original internal parent ID, even if request was
++            # mutated to the last child or an external ID was reused.
++            queue.close()
++            try:
++                await self.abort(queue.request_id, internal=True)
++            except (Exception, asyncio.CancelledError):
++                # abort() removes local state before attempting the engine send.
++                # Preserve the submission failure if that cleanup send also fails.
++                logger.exception(
++                    "Failed to notify the engine about failed submission %s",
++                    queue.request_id,
++                )
++            raise
+ 
+     async def _add_request(
+         self,
+-- 
+2.54.0 (Apple Git-157)
+
