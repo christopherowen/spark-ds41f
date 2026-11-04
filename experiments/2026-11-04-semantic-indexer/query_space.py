@@ -22,12 +22,21 @@ def query(data):
 def main():
     torch.set_num_threads(2)
     root = Path('/snapshots')
-    result = {'passed': True, 'scope': 'CPU held-out projection idea screen; no native GPU/output/performance qualification', 'cases': []}
+    result = {'passed': True, 'scope': 'CPU distinct-query projection idea screen; no native GPU/output/performance qualification',
+              'cases': [], 'skipped': []}
     for path in sorted(root.glob('rank-0-*.pt')):
         data = torch.load(path, map_location='cpu', weights_only=True)
         others = [torch.load(root/path.name.replace('rank-0-', f'rank-{rank}-'), map_location='cpu', weights_only=True)
                   for rank in (1, 2)]
         assert all(x['capture_context']['layer_id'] == data['capture_context']['layer_id'] for x in others)
+        duplicates = [rank for rank, other in zip((1, 2), others)
+                      if torch.equal(data['q'], other['q']) and torch.equal(data['scales'], other['scales'])]
+        if duplicates:
+            skipped = {'snapshot': path.name, 'reason': 'evaluated query appears in fit; rank split is not an independent query split',
+                       'matching_ranks': duplicates, 'excluded_from_projection_acceptance': True}
+            result['skipped'].append(skipped)
+            print(json.dumps(skipped), flush=True)
+            continue
         q, weights = query(data), data['weights'][0].double()
         train = torch.cat([query(x)*x['weights'][0].double().abs().sqrt()[:, None] for x in others])
         _, vectors = torch.linalg.eigh(train.T @ train)
@@ -79,7 +88,7 @@ def main():
                     'nominal_bytes_per_key': rank*2+8, 'cpu_bound_dominance': True}
             result['cases'].append(case)
             print(json.dumps(case), flush=True)
-    assert len(result['cases']) == 24
+    assert len(result['cases'])+6*len(result['skipped']) == 24
     print('RESULT '+json.dumps(result), flush=True)
 
 
