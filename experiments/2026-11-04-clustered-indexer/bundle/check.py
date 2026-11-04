@@ -59,7 +59,7 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
     return q, scales, weights, pool, table, lengths, active
 
 
-def check(width, extents, mode, repeats, *, unwritten_cache=False):
+def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=False):
     torch.cuda.reset_peak_memory_stats()
     args = inputs(width, extents, mode, unwritten_cache=unwritten_cache)
     candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
@@ -91,15 +91,47 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False):
         actual, evidence = candidate.run(*args)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         assert not torch.equal(actual, before), 'mutation did not change the reference winners'
+    graph = None
+    if cuda_graph:
+        # Capture the complete candidate, including metadata rebuild and
+        # compaction. The reference is used only for correctness outside it.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, evidence = candidate.run(*args)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        # Reuse the same graph/storage after a rollback and an empty active
+        # domain, then restore the original visibility. All counts are read
+        # on the device; no graph is recaptured for these changes.
+        saved_lengths = args[5].clone()
+        args[5].copy_(saved_lengths // 2)
+        args[6].fill_(width - 17)
+        reduced, _ = reference.run(*args)
+        graph.replay()
+        torch.testing.assert_close(actual, reduced, atol=0, rtol=0)
+        args[6].zero_()
+        empty, _ = reference.run(*args)
+        graph.replay()
+        torch.testing.assert_close(actual, empty, atol=0, rtol=0)
+        args[5].copy_(saved_lengths)
+        args[6].fill_(width)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     latencies = []
     for _ in range(repeats):
         torch.cuda.synchronize()
         start = time.perf_counter()
-        candidate.run(*args)
+        if graph is None:
+            candidate.run(*args)
+        else:
+            graph.replay()
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - start) * 1000)
     return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
             'unwritten_cache': unwritten_cache,
+            'execution': 'cuda-graph' if cuda_graph else 'eager',
+            'graph_dynamic_counts_identical': True if cuda_graph else None,
             'candidate_counts': evidence['candidate_counts'].cpu().tolist(),
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
             'candidate_wall_ms': latencies,
@@ -112,6 +144,7 @@ def main():
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--max-width', type=int, default=262144)
     parser.add_argument('--unwritten-cache', action='store_true')
+    parser.add_argument('--cuda-graph', action='store_true')
     options = parser.parse_args()
     result = {'schema_version': 1, 'torch': torch.__version__,
               'gpu': torch.cuda.get_device_name(), 'capability': torch.cuda.get_device_capability(),
@@ -134,7 +167,8 @@ def main():
             if width > options.max_width:
                 continue
             result['cases'].append(check(width, extents, mode, options.repeats,
-                                         unwritten_cache=options.unwritten_cache))
+                                         unwritten_cache=options.unwritten_cache,
+                                         cuda_graph=options.cuda_graph))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:
