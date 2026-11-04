@@ -286,3 +286,14 @@ and all 626 repository tests pass without skips using the hash-pinned bench-clie
 dependencies. The initial command named an absent worktree virtual environment;
 the next check passed with five validator-dependent skips. Both attempts are
 retained alongside the complete successful check. They did not affect GPU work.
+
+During the CopyDrafter repeat, workstation SSH to dgx1 stalled and a bounded
+connection timed out around 00:45 UTC on November 4. ICMP still worked;
+dgx2/dgx3 remained reachable, and dgx2 could reach dgx1 through both its LAN
+and SSH. The lab heartbeat and serving containers continued, and the delayed
+original status eventually returned successfully. Monitoring switched through
+dgx2 with the existing dgx1 host key. No node, benchmark input, host setting or
+job was changed or restarted. The repeat model/scoring step subsequently
+completed successfully. The [access incident receipts](runs/2026-11-03-dgx1-3/workstation-access/)
+retain this observation without attributing an unconfirmed transport cause to
+the candidate.
