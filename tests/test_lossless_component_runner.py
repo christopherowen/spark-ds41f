@@ -27,6 +27,7 @@ class ComponentTests(unittest.TestCase):
         self.management_failure = False
         self.restore_refused = False
         self.image_failure = True
+        self.plan_failure = False
         self.kernel_passes = False
         self.image = {"Id": "sha256:" + "a" * 64, "Layers": ["sha256:" + "b" * 64],
                       "Labels": {"local.spark-ds41f.vllm.tree": "c" * 40, "org.opencontainers.image.revision": "d" * 40}}
@@ -34,6 +35,7 @@ class ComponentTests(unittest.TestCase):
         self.nodes = {"nodes": [{"name": f"dgx{i}", "rank": i - 1, "head": i == 1} for i in (1, 2, 3)]}
         self.cluster = {"container": {"image": "candidate", "expected_labels": self.image["Labels"]}}
         self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": []})
+        self.write(self.here / "expert-scales/image.json", {"run": "image", "jobs": []})
         self.write(self.root / "build/images" / ("a" * 16 + ".json"),
                    {"image_id": self.image["Id"], "tag": "candidate", "compile_jobs": 2,
                     "min_available_gib": 80, "built_utc": "fixture", "deployment_commit": "d" * 40})
@@ -82,6 +84,8 @@ class ComponentTests(unittest.TestCase):
     def invoke(self):
         lab = SimpleNamespace(read_hold=lambda: self.hold, HOLD=self.root / "hold.json", now=lambda: "fixture",
                               window_should_close=lambda hold: None, published_problems=lambda: [],
+                              plan=lambda spec: [spec["run"]],
+                              plan_problems=lambda steps: ["missing configuration"] if self.plan_failure else [],
                               beat=lambda note: None, write_json_atomic=self.write, window_close=self.close,
                               production_live=lambda: True)
         spark = SimpleNamespace(configuration=lambda args: (self.cluster, self.nodes, {}), run_ssh=self.ssh,
@@ -100,6 +104,21 @@ class ComponentTests(unittest.TestCase):
         receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
         self.assertTrue(receipt["restored"])
         self.assertFalse(receipt["completed"])
+
+    def test_invalid_plan_cannot_reach_an_image_or_serving_operation(self):
+        self.plan_failure = True
+        self.assertEqual(self.invoke(), 1)
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertEqual(receipt["steps"], [])
+        self.assertTrue(receipt["preflight_problems"])
+        self.assertTrue(receipt["restored"])
+
+    def test_actual_image_plan_paths_resolve_before_window_operations(self):
+        for arm in ("expert-scales", "engram"):
+            spec = json.loads((HERE / arm / "image.json").read_text())
+            steps = runner.lab.plan(spec)
+            with patch.object(runner.lab, "arm_problems", return_value=[]):
+                self.assertEqual(runner.lab.plan_problems(steps), [])
 
     def test_foreign_window_on_entry_never_starts_or_closes(self):
         self.hold["holder"] = "foreign"
