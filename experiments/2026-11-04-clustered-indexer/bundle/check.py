@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+from pathlib import Path
 import time
 import traceback
 
@@ -59,7 +60,8 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
     return q, scales, weights, pool, table, lengths, active
 
 
-def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=False):
+def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=False,
+          profile_label=None):
     torch.cuda.reset_peak_memory_stats()
     args = inputs(width, extents, mode, unwritten_cache=unwritten_cache)
     candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
@@ -128,10 +130,33 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
             graph.replay()
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - start) * 1000)
+    trace = None
+    if profile_label:
+        target = Path('/c/clustered-indexer-profiles')
+        target.mkdir(parents=True, exist_ok=True)
+        trace = target / f'{profile_label}-{width}-{mode}.json'
+        if trace.exists():
+            raise RuntimeError(f'refusing to overwrite profiler evidence: {trace}')
+        # No reference call or bound audit belongs in this timing interval.
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False, profile_memory=False, with_stack=False,
+        ) as profiler:
+            for _ in range(3):
+                if graph is None:
+                    candidate.run(*args)
+                else:
+                    graph.replay()
+            torch.cuda.synchronize()
+        profiler.export_chrome_trace(str(trace))
+        print(profiler.key_averages().table(
+            sort_by='self_device_time_total', row_limit=40), flush=True)
     return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
             'unwritten_cache': unwritten_cache,
             'execution': 'cuda-graph' if cuda_graph else 'eager',
             'graph_dynamic_counts_identical': True if cuda_graph else None,
+            'candidate_trace': str(trace) if trace else None,
             'candidate_counts': evidence['candidate_counts'].cpu().tolist(),
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
             'candidate_wall_ms': latencies,
@@ -145,6 +170,7 @@ def main():
     parser.add_argument('--max-width', type=int, default=262144)
     parser.add_argument('--unwritten-cache', action='store_true')
     parser.add_argument('--cuda-graph', action='store_true')
+    parser.add_argument('--profile-label')
     options = parser.parse_args()
     result = {'schema_version': 1, 'torch': torch.__version__,
               'gpu': torch.cuda.get_device_name(), 'capability': torch.cuda.get_device_capability(),
@@ -168,7 +194,9 @@ def main():
                 continue
             result['cases'].append(check(width, extents, mode, options.repeats,
                                          unwritten_cache=options.unwritten_cache,
-                                         cuda_graph=options.cuda_graph))
+                                         cuda_graph=options.cuda_graph,
+                                         profile_label=(options.profile_label
+                                                        if width == options.max_width else None)))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:
