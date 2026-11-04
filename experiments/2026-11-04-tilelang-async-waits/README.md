@@ -83,3 +83,7 @@ Python files parse for Python 3.12. The complete local repository suite passes
 the TileLang source was prepared. No complete runtime image check is claimed.
 Exact commands and outputs remain under `runs/local/`; `validation.json` records
 the check boundaries. No GPU or serving operation was performed for PR creation.
+
+Local stdout/stderr files are bundled byte-for-byte in
+`runs/local/validation-output.tar.gz`; the JSON command receipts identify each
+archive member. Original `.log` files remain ignored and local.
