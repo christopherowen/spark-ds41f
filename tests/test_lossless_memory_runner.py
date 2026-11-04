@@ -1,6 +1,8 @@
 """Failure-path checks for owned cluster-window restoration, with no node calls."""
 
 import importlib.util
+import contextlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,6 +141,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.invoke(), 1)
         self.assertEqual(self.jobs, [])
         self.assertTrue(self.receipt()["restored"])
+
+    def test_fixed_field_plan_uses_distinct_first_repeat_bundles(self):
+        argv = ["run_fp8.py", "--window", "plan", "--format", "fixed-fields",
+                "--out", "results/private/fixed-field-plan"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+            self.assertEqual(runner.main(), 0)
+        specs = json.loads(output.getvalue())["specs"]
+        self.assertEqual(len(set(specs)), 6)
+        self.assertTrue(all("/fp8/fixed/" in path for path in specs))
+        self.assertTrue(any("512-repeat" in path for path in specs))
 
 
 if __name__ == "__main__":

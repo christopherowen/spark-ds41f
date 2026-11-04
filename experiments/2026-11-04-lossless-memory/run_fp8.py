@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from spark_ds41f import lab
-from fp8_results import summarize, validate
+from fp8_results import FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, validate
 
 HOLDER = "spark-lab: owner-authorized lossless FP8 decoder measurements"
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
@@ -24,16 +24,26 @@ RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.jso
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window", required=True)
-    parser.add_argument("--lanes", type=int, choices=(32, 64, 128), nargs="+", default=[32, 64, 128])
+    parser.add_argument("--format", choices=("huffman", "fixed-fields"), default="huffman")
+    parser.add_argument("--lanes", type=int, choices=(32, 64, 128, 256, 512), nargs="+")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+    fixed = args.format == "fixed-fields"
+    allowed = (128, 256, 512) if fixed else (32, 64, 128)
+    args.lanes = args.lanes if args.lanes is not None else list(allowed)
+    if not set(args.lanes).issubset(allowed):
+        parser.error("parallelism does not belong to the chosen format")
     if len(set(args.lanes)) != len(args.lanes):
         parser.error("lane counts must be distinct")
     out = (ROOT / args.out).resolve()
     if not out.is_relative_to(ROOT / "results/private"):
         parser.error("native receipts must stay under results/private")
-    specs = [HERE / "fp8" / f"kernel-{lanes}{suffix}.json"
+    spec_root = HERE / "fp8" / "fixed" if fixed else HERE / "fp8"
+    validation = {"axis": "threads", "exact_flag": FIXED_EXACT_FLAG,
+                  "sources": FIXED_SOURCES} if fixed else {}
+    summary_options = {key: value for key, value in validation.items() if key != "sources"}
+    specs = [spec_root / f"kernel-{lanes}{suffix}.json"
              for lanes in args.lanes for suffix in ("", "-repeat")]
     if not args.apply:
         print(json.dumps({"window": args.window, "restore": RESTORE,
@@ -54,6 +64,7 @@ def main():
     out.mkdir(parents=True)
     base = json.loads((HERE / "base.json").read_text())
     receipt = {"started": lab.now(), "window": args.window, "steps": [], "summaries": [],
+               "format": args.format,
                "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                "restored": False, "serving_performance_verified": False}
     done = threading.Event()
@@ -91,7 +102,7 @@ def main():
             for suffix in ("", "-repeat"):
                 if not owns():
                     raise RuntimeError("window changed or closure requested; preserve completed observations")
-                spec_path = HERE / "fp8" / f"kernel-{lanes}{suffix}.json"
+                spec_path = spec_root / f"kernel-{lanes}{suffix}.json"
                 spec = json.loads(spec_path.read_text())
                 step = {"spec": str(spec_path.relative_to(ROOT)), "started": lab.now()}
                 receipt["steps"].append(step)
@@ -129,11 +140,11 @@ def main():
                 native = json.loads(native_path.read_text())
                 lab.write_json_atomic(out / (spec["run"] + ".json"), native)
                 validate(native, verdicts["verdicts"][0], lanes=lanes,
-                         image=base["image_id"], revision=base["model_revision"])
+                         image=base["image_id"], revision=base["model_revision"], **validation)
                 pair.append(native)
                 step["qualified_microbenchmark"] = True
                 save()
-            receipt["summaries"].append(summarize(pair))
+            receipt["summaries"].append(summarize(pair, **summary_options))
             save()
         receipt["completed"] = True
         code = 0
