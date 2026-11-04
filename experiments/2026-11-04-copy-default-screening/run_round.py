@@ -60,7 +60,7 @@ def main():
         if process.returncode:
             detail = (OUT / record["log"]).read_text(errors="replace").lower()
             management_lost = management_lost or (argv[0] == "ssh" and process.returncode == 255) or any(
-                text in detail for text in ("ssh: connect", "cannot reach", "kex_exchange_identification", "connection timed out during banner exchange"))
+                text in detail for text in ("ssh: connect", "cannot reach", "kex_exchange_identification", "connection timed out during banner exchange", "memory telemetry stopped reporting", "memory telemetry did not start"))
             raise RuntimeError(f"{name} exited {process.returncode}")
     def cli(config, operation, action, *extra):
         argv = [sys.executable, "bin/spark", "--cluster-config", config, operation, action, *extra]

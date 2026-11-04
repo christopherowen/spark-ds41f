@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -54,6 +55,8 @@ def main():
             os.killpg(proc.pid, signal.SIGINT)
     def run(argv, name):
         nonlocal proc
+        if receipt["conditions"]["halted"]:
+            raise RuntimeError("guard halted before " + name)
         record = {"argv": argv, "started": lab.now(), "log": name + ".log"}
         receipt["steps"].append(record); save()
         with (OUT / record["log"]).open("w") as log:
@@ -100,6 +103,8 @@ def main():
         run(command, "release-tests")
         verdict = lab.verdict_from_lines((OUT / "release-tests.log").read_text().splitlines(), candidate)
         receipt["gate"] = verdict
+        receipt["gate_native_results"] = str(lab.compile_cache(candidate) / "release-tests/candidate-39")
+        shutil.copytree(receipt["gate_native_results"], OUT / "gate-results")
         if not verdict["passed"]:
             raise RuntimeError("release-test verdict failed")
         receipt["passed"] = True
