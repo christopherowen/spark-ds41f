@@ -293,9 +293,9 @@ def topk_log_softmax_kernel(
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
             if prefetch_ids:
-                T.assume(topk <= 32)
+                T.assume(topk <= threads)
                 # Reuse the reduction barriers; each thread later reads its own slot.
-                selected = T.alloc_shared((32,), T.float32)
+                selected = T.alloc_shared((threads,), T.float32)
                 if tx < topk:
                     selected[tx] = T.cast(logits[row, token_ids[row, tx]], T.float32)
             raw = T.alloc_local((per,), logits_dtype)

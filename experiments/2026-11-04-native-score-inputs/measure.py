@@ -108,7 +108,7 @@ if args.operation == "iket":
         "--timeout",
         "240",
         "--single-pass-max-ts",
-        "128",
+        "256",
         "--pool-gb",
         "0.25",
         "--skip-raw-data-dump",
@@ -152,13 +152,14 @@ if args.operation == "iket":
                     warps=len(launch["warpLifetimes"]),
                 )
             )
-    assert len(launches) == 40, (
-        f"expected 40 score/selection/rank launches: {len(launches)}"
+    assert len(launches) == 56, (
+        f"expected 56 score/selection/rank launches: {len(launches)}"
     )
     result = dict(
         identity,
         launches=launches,
         decoded_files=[str(p) for p in paths],
+        probe_numerics=json.loads((args.out / "probe/numerics.json").read_text()),
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -345,7 +346,6 @@ def cases():
 
 
 if args.operation == "pair":
-    from paired import classify, measure
     from vllm.v1.worker.gpu.sample import tilelang_logprob as current_scores
     from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
 
@@ -361,6 +361,13 @@ if args.operation == "pair":
     assert evidence["source_head"] == control_id["head"]
     qualified = {
         json.dumps(row["case"], sort_keys=True): row for row in evidence["cases"]
+    }
+    evidence7_path = HERE / "paired-results-v7.json"
+    evidence7_sha = hashlib.sha256(evidence7_path.read_bytes()).hexdigest()
+    evidence7 = json.loads(evidence7_path.read_text())
+    assert evidence7["prior_analysis_sha256"] == evidence_sha
+    qualified7 = {
+        json.dumps(row["case"], sort_keys=True): row for row in evidence7["cases"]
     }
     source_dir = args.out / "kernel-sources"
     source_dir.mkdir()
@@ -484,7 +491,23 @@ if args.operation == "pair":
         assert data_id == prior_case["boots"][1]["data"]
         assert reference_code == prior_programs["reference"]
         assert previous_code == prior_programs["candidate"]
-        if prior_case["passed"] and candidate_code == prior_programs["candidate"]:
+        match = None
+        for path, sha, previous_case in (
+            (evidence_path, evidence_sha, prior_case),
+            (
+                evidence7_path,
+                evidence7_sha,
+                qualified7[json.dumps(label, sort_keys=True)],
+            ),
+        ):
+            if previous_case["passed"] and all(
+                candidate_code == boot["programs"]["candidate"]
+                and reference_code == boot["programs"]["reference"]
+                for boot in previous_case["boots"]
+            ):
+                match = dict(evidence=path.name, sha256=sha)
+                break
+        if match:
             for launch in (reference_launch, candidate_launch, previous_launch):
                 out = launch()
                 torch.cuda.synchronize()
@@ -499,62 +522,13 @@ if args.operation == "pair":
                         previous=previous_code,
                         candidate=candidate_code,
                     ),
-                    transfer=dict(evidence=evidence_path.name, sha256=evidence_sha),
-                    gate=dict(status="equal_to_qualified_v6"),
+                    transfer=match,
+                    gate=dict(status="identical_qualified_program"),
                 )
             )
             (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
             continue
-        assert (
-            operation == "scores"
-            and label["layout"] == "transposed"
-            and label["rows"] > 1
-        ), "Unexpected changed or unqualified GPU program"
-        measured, outputs = measure(
-            dict(
-                reference=reference_launch,
-                candidate=candidate_launch,
-                previous=previous_launch,
-                null=reference_launch,
-            ),
-            flush,
-            seed,
-            expected,
-            rounds=args.rounds,
-        )
-        assert torch.equal(
-            outputs["candidate"].view(torch.int32),
-            outputs["reference"].view(torch.int32),
-        )
-        assert torch.equal(
-            outputs["previous"].view(torch.int32),
-            outputs["reference"].view(torch.int32),
-        )
-        summary = classify(
-            measured["log_ratios"]["candidate"], identical_program=same_program
-        )
-        rows.append(
-            dict(
-                case=label,
-                data=data_id,
-                same_program=same_program,
-                cuda_source_sha256=dict(
-                    reference=reference_code,
-                    previous=previous_code,
-                    candidate=candidate_code,
-                ),
-                measured=measured,
-                gate=summary,
-                previous_gate=classify(
-                    measured["log_ratios"]["previous"],
-                    identical_program=alias and previous_code == reference_code,
-                ),
-                null_control=classify(
-                    measured["log_ratios"]["null"], identical_program=True
-                ),
-            )
-        )
-        (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
+        raise AssertionError("Current GPU program has no matching qualified source")
     if selected is not None:
         assert {json.dumps(r["case"], sort_keys=True) for r in rows} == selected
     failed = [r["case"] for r in rows if r["gate"]["status"] == "not_proved"]
@@ -563,8 +537,9 @@ if args.operation == "pair":
         cases=rows,
         not_proved=failed,
         gate_passed=not failed,
-        rounds=args.rounds,
-        protocol=f"{args.rounds} balanced randomized mirrored rounds per changed case; exact qualified-code transfer for unchanged cases; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        timed_cases=0,
+        qualified_sources=dict(Counter(row["transfer"]["evidence"] for row in rows)),
+        protocol="Exact generated CUDA, reference program, input hashes and strides match a per-case program qualified on both prior boots; independent numerical outputs use the same destination. Unmatched programs are rejected; no new timings or regression tolerance.",
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")

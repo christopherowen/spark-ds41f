@@ -257,3 +257,28 @@ cover 31, 32 and 33 columns. There are eight changed cases to time for 480 round
 on each boot; every other case must prove exact code and input identity with
 a qualified v6 case. The rejected source's single unqualified v6 case is
 changed and must earn its own performance qualification.
+
+### Final program selection
+
+The v8 128-byte stage did not qualify the repeat BF16 96-row/21-column case.
+Patch 0009 retains the exact block-sized shared stage whose eight small-selection
+cases passed both v7 timing boots. Dispatch remains bounded to one warp. Larger
+selections retain the v6 native-stride program; their two-boot qualification is
+unchanged. This combines qualified programs, without a dtype/layout conversion.
+The shared tile follows the normalization thread-block size (4 KiB on chip);
+shrinking that tile changed generated code and did not qualify.
+
+The final run must recompile and numerically execute all 120 cases twice. Every
+reference and candidate CUDA hash, input hash and stride must match a previously
+qualified per-case program: 112 from v6 and eight from v7. No unmatched or
+unqualified program is accepted, and no new timing evidence is invented. The
+factory's AST and constants for the shared stage are identical to v7; the host
+metadata predicate selects it only for a one-warp selection. Full correctness
+(673 checks per boot) still runs on the final source.
+
+IKET now explicitly probes sliced and transposed ids, both native integer widths,
+masked/unmasked scores, eager/graph execution, and aligned vector loads over a
+16,385-token vocabulary. Its expected count is 56 launches per boot; four probe
+cases per boot explicitly dispatch the shared stage. The timestamp capacity is
+256 per sampled warp, within the same 0.25 GiB pool. These are bounded smoke
+checks of the new path, not a full-model serving-speed measurement.
