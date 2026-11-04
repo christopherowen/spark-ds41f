@@ -1,8 +1,8 @@
 # Candidate-38 trace replay on Spaceport TP4
 
-Requested 2026-11-04. Status: prepared; no GPU workload or serving change has
-started. Coordinated replacement, repeat boots and restoration need explicit
-owner authorization under the repository's agent guide.
+Requested 2026-11-04. The owner explicitly approved the full coordinated TP4
+window: sync, candidate replacement, four fresh-boot replay points and
+restoration of candidate-37. Execution receipts will record the outcome.
 
 ## Identity and intended variable
 
@@ -73,23 +73,26 @@ Keep its heartbeat and restoration watchdog active. Corpus preparation stops
 serving and runs within that window. Check every node below 55 C before
 every measurement, using the site's supported fan policy. Inspect minimum
 host memory and abort before crossing the serving memory guard margin.
-The specs use existing lab behavior; they do not themselves add the explicit
-20 GiB client-admission check or a per-point cooling step, so those checks
-remain execution prerequisites.
+`run_window.py` applies these checks to every point, uses the lab's reservation
+and watchdog, keeps the client within its existing 12 GiB scope, and cancels
+before any rank crosses the 4 GiB benchmark memory floor. It records native
+memory/thermal conditions and restores candidate-37 in its final cleanup.
+Every start and stop goes through the named profile and its reviewed plan;
+the unchanged TP4 shape needs no `--change-shape` option.
 
-On sp1, dry-run first, then run the two specs in one window:
+The two specs define the workloads. The executor adds the conditions and runs
+them in one window, stopping on a failed point for review. On sp1, from the
+clean, published commit used on all four ranks:
 
 ```sh
-python3 scripts/lab.py run experiments/2026-11-04-release-trace-replay/lab-boot-a.json --production-config experiments/2026-11-04-release-trace-replay/candidate-37.json --dry-run
-python3 scripts/lab.py run experiments/2026-11-04-release-trace-replay/lab-boot-b.json --production-config experiments/2026-11-04-release-trace-replay/candidate-37.json --dry-run
-python3 scripts/lab.py run experiments/2026-11-04-release-trace-replay/lab-boot-a.json --production-config experiments/2026-11-04-release-trace-replay/candidate-37.json --keep-open
-python3 scripts/lab.py run experiments/2026-11-04-release-trace-replay/lab-boot-b.json --production-config experiments/2026-11-04-release-trace-replay/candidate-37.json
+python3 experiments/2026-11-04-release-trace-replay/run_window.py
+python3 experiments/2026-11-04-release-trace-replay/run_window.py --apply
 ```
 
 Check each step's exit and the post-run engine state. Preserve every failed
-point and its rank logs. The second command restores candidate-37 and closes
-the window; independently verify all ranks and live doctor before releasing
-the reservation. A first-run failure must be reviewed before the repeat.
+point and its rank logs. The executor restores candidate-37 and closes the
+window only after live doctor; its receipt retains restoration failures and
+leaves the reservation for the watchdog when restoration fails.
 
 ## Assessment to complete
 
