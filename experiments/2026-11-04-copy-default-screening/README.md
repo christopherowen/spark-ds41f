@@ -21,6 +21,9 @@ work; no duplicate PR was opened.
    and capture-envelope sizing. This is an explicit interaction test of enabling
    the path and overlapping its bit-identical copy work; compare both recorded
    candidate-38 standard and copy recipes to distinguish those questions.
+   These have separate success criteria: default enablement is required behavior;
+   the overlap proposal is a performance hypothesis and did not establish a
+   serving-speed gain. It must not be relabeled as cleanup after measurement.
 2. Review the independent scratch-read fix in #878 and qualify it as its own
    corrected candidate before further tuning. Its lazy liveness guard applies
    to the exact candidate-39 tree; the current image and matrix stay frozen.

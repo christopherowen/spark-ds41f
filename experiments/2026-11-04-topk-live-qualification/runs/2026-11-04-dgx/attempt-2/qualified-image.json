@@ -1,0 +1,259 @@
+{
+  "started": "2026-11-04T15:34:55Z",
+  "commit": "1f134c7aad82bc63c95afed36f488becf2959a41",
+  "steps": [
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-40/image-dgx4.json",
+        "build",
+        "prepare"
+      ],
+      "started": "2026-11-04T15:34:56Z",
+      "log": "build-prepare.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:37:19Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-40/image-dgx4.json",
+        "build",
+        "check"
+      ],
+      "started": "2026-11-04T15:37:19Z",
+      "log": "build-check.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:37:22Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-40/image-dgx4.json",
+        "build",
+        "image"
+      ],
+      "started": "2026-11-04T15:37:22Z",
+      "log": "build-image.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:37:26Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-40/image-dgx4.json",
+        "build",
+        "image",
+        "--apply"
+      ],
+      "started": "2026-11-04T15:37:26Z",
+      "log": "build-image-apply.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:45:30Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "gate",
+        "/home/swank/projects/spark-ds41f-copy-default/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-a35ced21/src/vllm",
+        "5f926df6d3126266a9c88c82c06544060008c33c",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/gate-manifest.json"
+      ],
+      "started": "2026-11-04T15:45:30Z",
+      "log": "gate-manifest.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:45:31Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "bundle",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/gate-manifest.json",
+        "spark-ds41f:candidate-40",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/bundle",
+        "candidate-40"
+      ],
+      "started": "2026-11-04T15:45:31Z",
+      "log": "gate-bundle.log",
+      "exit": 0,
+      "ended": "2026-11-04T15:45:32Z"
+    },
+    {
+      "argv": [
+        "docker",
+        "run",
+        "--name",
+        "topk-live-c40-gate",
+        "--rm",
+        "--gpus",
+        "all",
+        "--ipc=host",
+        "--ulimit=core=0",
+        "-e",
+        "DIRECT_IO_TEST_DIR=/c/direct-io-test",
+        "-e",
+        "ENGRAM_ROWS_TEST_DIR=/c/engram-rows-test",
+        "-e",
+        "HF_HUB_OFFLINE=1",
+        "-e",
+        "PYTHONPATH=/b",
+        "-e",
+        "TILELANG_CACHE_DIR=/c/tilelang-release-tests",
+        "--security-opt=seccomp=unconfined",
+        "--ulimit=memlock=-1:-1",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/bundle/manifest.json:/b/manifest.json:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/bundle/release_test_runner.py:/b/release_test_runner.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/bundle/tblib_stub.py:/b/tblib_stub.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-40-image/bundle/offline_skip.py:/b/offline_skip.py:ro",
+        "-v",
+        "/home/swank/.cache/spark-lab/compile:/c",
+        "-w",
+        "/opt/spark-ds41f/candidate/vllm",
+        "--entrypoint",
+        "python3",
+        "spark-ds41f:candidate-40",
+        "/b/release_test_runner.py",
+        "/b/manifest.json",
+        "/c/release-tests/candidate-40"
+      ],
+      "started": "2026-11-04T15:45:32Z",
+      "log": "release-tests.log",
+      "exit": 0,
+      "ended": "2026-11-04T16:21:42Z"
+    },
+    {
+      "argv": [
+        "docker",
+        "run",
+        "--name",
+        "topk-live-c40-initcheck",
+        "--rm",
+        "--gpus",
+        "all",
+        "--ipc=host",
+        "--ulimit=core=0",
+        "--security-opt=seccomp=unconfined",
+        "--ulimit=memlock=-1:-1",
+        "-e",
+        "HF_HUB_OFFLINE=1",
+        "-e",
+        "VLLM_NO_USAGE_STATS=1",
+        "-e",
+        "DO_NOT_TRACK=1",
+        "-e",
+        "PYTORCH_NO_CUDA_MEMORY_CACHING=1",
+        "-e",
+        "TILELANG_CACHE_DIR=/c/tilelang-topk-live-c40",
+        "-e",
+        "EXPECTED_TOPK_SOURCE_SHA256=906039870d8dd00d933d1ee1c083510373292e951f971568b4d3cf9c59cbdbfc",
+        "-v",
+        "/usr/local/cuda-13.0/compute-sanitizer:/opt/compute-sanitizer:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/experiments/2026-11-04-topk-live-reads/bundle/topk_reads.py:/qualification/reproducer.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/experiments/2026-11-04-topk-live-qualification/topk_initcheck.py:/qualification/check.py:ro",
+        "-v",
+        "/home/swank/.cache/spark-lab/compile:/c",
+        "-w",
+        "/opt/spark-ds41f/candidate/vllm",
+        "--entrypoint",
+        "/opt/compute-sanitizer/compute-sanitizer",
+        "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82",
+        "--tool",
+        "initcheck",
+        "--error-exitcode",
+        "1",
+        "--print-limit",
+        "4",
+        "python3",
+        "/qualification/check.py"
+      ],
+      "started": "2026-11-04T16:21:42Z",
+      "log": "topk-initcheck.log",
+      "exit": 0,
+      "ended": "2026-11-04T16:21:53Z"
+    }
+  ],
+  "conditions": {
+    "halted": [],
+    "cooling": [
+      {
+        "node": "dgx4",
+        "start_c": 39.8,
+        "cooled": false,
+        "seconds": 0.0,
+        "final_c": 39.8
+      }
+    ],
+    "fan_curve": [
+      {
+        "node": "dgx4",
+        "service": "inactive",
+        "started": true,
+        "stopped": true
+      }
+    ],
+    "thermal": {
+      "dgx4": {
+        "max_gpu_c": 64.0,
+        "min_headroom_c": 22.0,
+        "max_system_c": 73.5,
+        "max_power_w": 78.99,
+        "thermal_slowdown_ms": 0.0,
+        "power_cap_ms": 434777.5
+      }
+    },
+    "memory": {
+      "dgx4": {
+        "min_available_gib": 78.96,
+        "swap_growth_gib": 0.0
+      }
+    },
+    "fan_stop_failures": []
+  },
+  "source": {
+    "vllm_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+    "expected_labels": {
+      "local.spark-ds41f.vllm.tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+      "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+      "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+      "local.spark-ds41f.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
+      "local.spark-ds41f.tile_kernels.tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+      "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+    }
+  },
+  "image": "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82",
+  "gate": {
+    "passed": true,
+    "summary": "8074 passed, 360 skipped",
+    "failed": [],
+    "batch_variant": [],
+    "bits_unequal": [],
+    "errors": [],
+    "groups": [],
+    "bits": [],
+    "timings": []
+  },
+  "gate_native_results": "/home/swank/.cache/spark-lab/compile/release-tests/candidate-40",
+  "topk_initcheck": {
+    "passed": true,
+    "source_sha256": "906039870d8dd00d933d1ee1c083510373292e951f971568b4d3cf9c59cbdbfc",
+    "log_sha256": "99a225263ffa1cc499687610468b24e8101ecf35d4b055e3526de73244ccb76f"
+  },
+  "passed": true,
+  "ended": "2026-11-04T16:21:53Z"
+}

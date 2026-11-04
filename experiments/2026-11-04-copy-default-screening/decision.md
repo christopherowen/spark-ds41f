@@ -30,6 +30,13 @@ measured cost. No corrected source patch or speedup is asserted. Retain required
 default behavior and the independent correctness fix; C39 is not accepted as a
 performance improvement. Preserve all measured failures and adverse rows.
 
+Purpose clarification: C39 is not merely cleanup. It combines the requested
+default behavior with a copy-work overlap performance hypothesis. Neutrality is
+acceptable for retaining the required default behavior, but the speed hypothesis
+fell short. C40 subsequently qualified the separate scratch-read correctness fix
+with neutral aggregate serving throughput; that is an acceptable correctness
+result, not evidence of a C39 serving-speed win.
+
 Before release, address mixed-prefill first-chunk waits and tail latency, reduce
 copy-path engine overhead where useful, and capture missing timed KV occupancy,
 cache hit/miss counts and ITL tails in future candidates. The current zero cache

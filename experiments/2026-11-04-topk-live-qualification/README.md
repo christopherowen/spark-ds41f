@@ -5,6 +5,13 @@ One intended runtime variable: the lazy inactive-list scratch-read guard from
 merged #878, applied after the exact candidate-39 source. Candidate-39 remains
 unchanged, with both boots and all unfavorable evidence retained.
 
+This is a correctness round, not a proposed serving-speed enhancement. Its goal
+is to eliminate the invalid scratch read, preserve output behavior and check for
+material incremental performance regressions. Neutral aggregate throughput is
+acceptable for this fix. Performance optimizations have a separate requirement:
+a repeatable gain beyond the recorded noise floors. Do not relabel a missed
+optimization as cleanup after measurement.
+
 Candidate-40 full canonical replay from pinned upstream base `19f2c20ed4d6`
 reproduced candidate-39 head/tree before applying the guard. The resulting head
 is `5f926df6d3126266a9c88c82c06544060008c33c`, tree
@@ -38,7 +45,8 @@ Candidate-40 attempt 1 started at 15:34:15 UTC, with window
 16:21:53 UTC. The image is
 `sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82`.
 The controller then yielded for the queued shared request, before seeding,
-functional work or timing. Serving measurements remain pending. The next
+functional work or timing. Serving measurements subsequently completed in
+attempt 2, as reported below. The next
 compiler round waits for this candidate's measurement review.
 No promotion or bypass of TP4 correctness/release gates.
 
@@ -116,7 +124,7 @@ passed; after the foreign request is fulfilled and its window releases, use a
 distinct attempt with the unchanged gate. Do not rebuild, repeat gates or remove
 the foreign request.
 
-## Completed image gate; serving qualification pending
+## Completed image gate
 
 The independent local artifact audit verified 136 unique per-file receipts
 exactly cover the manifest: 8,074 passed, 360 skipped, zero failures/errors.
@@ -154,8 +162,68 @@ fresh heartbeat and no final exit or request. No image build or gate repeated.
 The native receipt is `results/private/lab/candidate-40-round-attempt-2/receipt.json`;
 the log is `/home/swank/tl-logs/topk-live-qualification/candidate-40-window-attempt-2.log`.
 Fresh operator setup, staging, PID and initial hash receipts are preserved in
-`runs/2026-11-04-dgx/attempt-2`. Functional and serving-performance results remain
-pending. The owner paused recurring checks and requested direct waiting here.
+`runs/2026-11-04-dgx/attempt-2`. This was the initial observation, not the final
+state. The owner paused recurring checks and requested direct waiting here.
+
+## Completed serving round and verdict
+
+Attempt 2 completed at 20:28:35 UTC with actual supervisor wait exit 0 and
+`restored=true`. Both functional boots passed all 40 ordered script outcomes,
+including both native explicit-image runtime collectors. All six performance
+suites completed all 26 ordered steps with exit 0. No build, gate or measured
+point was repeated. Independent named live doctor and all three Docker
+image/profile checks verified C36 restoration at 20:28:46 UTC, with no restarts.
+Both controller processes were gone at the subsequent compact check.
+
+The local audit verified all 176 exported file hashes, complete source/image
+identity, unchanged workloads, distinct fresh boots, stable containers and
+untruncated fault-free rank logs. All four C40/C39 model-corpus pairings have
+256/256 identical token sequences, exact selected/top probabilities and KL 0.
+Model corpus digests also match both saved boots of both C38 recipes. This is
+corpus evidence, not a useful-task-completion score or full-token copy recorder.
+
+| Recorded build | C1 output tok/s | C4 output tok/s | C8 output tok/s | C8 versus 1030 | Performance verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1030 | 62.63 | 121.21 | 158.60 | reference | Immutable release reference |
+| C36 | 65.46 | 125.67 | 163.03 | +2.79% | Saved reference; one compatible boot |
+| C39, previous | 65.34–65.35 | 125.91–126.04 | 163.34–163.80 | +2.99–3.28% | No proven serving gain over either C38 parent |
+| C40, current | 65.37–65.38 | 126.10–126.17 | 163.41–163.59 | +3.03–3.15% | No proven serving gain over C39; acceptable correctness result |
+
+Both C40 boots and all four pairings against each two-boot parent are retained.
+C8 output versus C39 ranges from -0.24% to +0.16%, within variation. Paired
+decode and output throughput show no robust incremental gain over C39 or either
+C38 recipe after candidate and saved-reference repeat floors. The fixed-row
+engine grid is 0.30–0.48% cheaper than C39 across all four pairings; that small
+component gain is not an end-to-end serving-speed claim. Gains over 1030 include
+earlier changes and must not be attributed to the C40 guard.
+
+Adverse observations remain visible: C8 TTFT p99 is 0.4327/0.4332 seconds versus
+C39's approximately 0.414–0.417 seconds, without a percentile confidence interval.
+Mixed 131K prefill beside three decoders is 1.64% below the single saved C36
+reference in the headline comparison; cold 524K prefill is 0.46% below it. The
+first C40 boot's first-chunk decode wait is 25.42% above 1030. These observations
+prevent describing every metric as neutral or improved; full rows and repeat
+variation are preserved in the comparison receipts.
+
+Timed conditions: minimum available host memory 6.34 GiB, maximum GPU 77 C,
+minimum thermal headroom 10 C, maximum system 90 C, zero swap growth, thermal
+slowdown or power-cap time. API readiness was 112.7/104.3 seconds in functional
+boots and 104.2/101.2 seconds in performance boots. Timed KV occupancy, raw cache
+hit/miss counts and ITL tails were not recorded; TPOT is not ITL. Saved-reference
+prompt-length and outer-duration warnings remain in the original comparisons.
+
+Retain C40 as the validated corrected default-enabled base, with no serving
+speedup claim and no release promotion. Outstanding TP4 correctness/release gates
+remain. The optional minimum-match-8 proposal is dropped; the compiler refresh
+is a separate performance hypothesis requiring its own gain and quality gates.
+
+Evidence: [functional audit](runs/2026-11-04-dgx/attempt-2/functional-audit.json),
+[performance audit](runs/2026-11-04-dgx/attempt-2/performance-analysis.json),
+[all saved-recipe pairings](runs/2026-11-04-dgx/attempt-2/recipe-comparison.json),
+[core metrics](runs/2026-11-04-dgx/attempt-2/core-metrics.json), and
+[native file manifest](runs/2026-11-04-dgx/attempt-2/source-receipt.json).
+Native timing, conditions, identity and control JSON is copied byte-for-byte;
+raw generated text and logs remain private with every original hash retained.
 
 ## Round reporting and performance review
 
@@ -165,6 +233,14 @@ Keep pending results pending, distinguish inherited gains from the current patch
 and include adverse latency, prefill, memory and engine rows. New candidates need
 both boots. C36's compatible archived full-suite reference has only one saved
 boot; no reference repeat or new old-image measurement is invented.
+
+State each round's intended purpose and success criteria before measurement.
+Cleanup/maintenance and correctness work can succeed with neutral performance
+when their own acceptance checks pass. A proposed performance enhancement must
+show a repeatable relevant gain, and cannot be reclassified after it misses.
+C39 combines required default enablement with an unsuccessful overlap-speed
+hypothesis; C40 is a distinct correctness fix. Performance and purpose verdicts
+must be reported separately, retaining material adverse metrics in either case.
 
 The [recorded C39/C36 backfill](runs/reports/candidate-39-c36-backfill.json)
 supplements the existing C39 comparisons. It retains C39's faster fixed-row grid,
@@ -176,5 +252,5 @@ corrected attempt. A further miss must be highlighted and the optional
 optimization dropped, retaining all evidence. The [copy-policy review](../2026-11-04-copy-policy-review/README.md)
 has already dropped minimum-match-8 at review: no defensible correction or serving
 speedup was established. Required default behavior, safe envelope and PR878
-remain. C40's active image/source/workload is unchanged. The separate compiler
+remain. C40's measured image/source/workload is unchanged. The separate compiler
 round remains subject to its prerequisites and full qualification.
