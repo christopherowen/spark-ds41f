@@ -23,7 +23,7 @@ def main():
         actual, evidence = candidate.run(*args)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         extent = int(data['lengths'][0])
-        score_cpu, bound_cpu = scores.cpu().float(), evidence['bounds'].cpu().float()
+        score_cpu, bound_cpu = scores[:, :extent].cpu().float(), evidence['bounds'].cpu().float()
         for cluster in range((extent + 63) // 64):
             observed = score_cpu[0, cluster*64:min((cluster+1)*64, extent)].max()
             bound = bound_cpu[0, cluster]

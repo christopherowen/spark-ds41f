@@ -42,3 +42,16 @@ print('capture patch recovers the exact candidate-36 indexer; syntax OK')
 # The independent top-k dependency owns its patch, executable copy and regression.
 import sys
 subprocess.run([sys.executable, str(HERE.parent / '2026-11-04-topk-live-reads/check_sources.py')], check=True)
+
+# Real-input replay uses C36's own API plus the same independent scratch guard.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    target = root / RELATIVE.parent / 'indexer.py'
+    target.parent.mkdir(parents=True)
+    target.write_bytes((HERE / 'replay/overlay/indexer.py').read_bytes())
+    subprocess.run(['git', 'apply', '--reverse', str(HERE.parent /
+                    '2026-11-04-topk-live-reads/vllm/0001-topk-merge-live-reads.patch')],
+                   cwd=root, check=True)
+    expected_hash = json.loads((HERE / 'capture/base.json').read_text())['indexer_sha256']
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == expected_hash
+print('replay dependency recovers the exact candidate-36 indexer; syntax OK')
