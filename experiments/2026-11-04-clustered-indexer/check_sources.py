@@ -19,6 +19,11 @@ with tempfile.TemporaryDirectory() as directory:
                    cwd=root)
     subprocess.run(['git', 'apply', str(HERE / 'vllm/0004-tensor-interval-bounds.patch')],
                    cwd=root, check=True)
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0005-share-owned-snapshot.patch')],
+                   cwd=root, check=True)
+    grouped = RELATIVE.parent / 'grouped_indexer.py'
+    assert (root / grouped).read_bytes() == (HERE / 'bundle/overlay' / grouped).read_bytes()
+    ast.parse((root / grouped).read_text())
     actual = (root / RELATIVE).read_bytes()
     expected = (HERE / 'bundle/overlay' / RELATIVE).read_bytes()
     assert actual == expected, 'patch and executable overlay differ'

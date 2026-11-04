@@ -41,6 +41,18 @@ class BoundTests(unittest.TestCase):
             self.assertGreaterEqual(upper_bound([q], [bf16(2**20)], keys, split=True),
                                     score([q], [bf16(2**20)], keys[0]))
 
+    def test_shared_prefix_superset_preserves_selection(self):
+        rng = random.Random(4179)
+        keys = [[decode(rng.randrange(16), 127) for _ in range(128)] for _ in range(65)]
+        for extent in (0, 1, 7, 37, 64, 65):
+            queries = [[decode(rng.randrange(16), 127) for _ in range(128)] for _ in range(2)]
+            weights = [bf16(.03), bf16(-.01)]
+            scores = [score(queries, weights, key) for key in keys[:extent]]
+            bounds = [upper_bound(queries, weights, keys[c:c+8], split=True)
+                      for c in range(0, len(keys), 8)]
+            selected, _ = select_clusters(scores, bounds, [0, 2, 4], 4, 8)
+            self.assertEqual(selected, topk(scores, 4))
+
     def test_single_point_intervals_and_mixed_sign_queries(self):
         rng = random.Random(4117)
         for _ in range(24):

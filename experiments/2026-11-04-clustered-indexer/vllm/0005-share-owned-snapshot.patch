@@ -1,0 +1,235 @@
+From 4e2968ae68dca18a3ec572357454a2908be402de Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 13:02:12 +0100
+Subject: [PATCH] Share rebuilt interval metadata within one explicit cache
+ owner
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the promoted
+series (tree ea1281f880e7535e3d87725be0156a8e38fc2fb2), the independent
+inactive-read guard and experimental cluster-search patches 0001/0003/0004.
+
+Rationale: repeated queries of one cache need not decode the same keys
+for each query. Rebuild one snapshot through the maximum visible extent,
+then use that conservative superset for every row. Include extent reduction
+and safe page-table expansion in candidate cost.
+
+Quality: the API requires one explicitly owned page table, not mixed request
+rows. Every call and graph replay rebuilds all metadata; no persistent cache
+reuse or inferred ownership is introduced. Final scorer and tie order are
+unchanged. Metadata reads only the union of the visible written key prefixes.
+
+Tests: superset-bound and selected-position gates, changing visibility,
+cache mutation and sanitizer tests are required. GPU qualification for this
+optional grouped path remains pending.
+
+Upstream status: local experimental candidate, not submitted upstream.
+---
+ .../tilelang/clustered_indexer.py             | 30 +++---
+ .../deepseek_v4_1/tilelang/grouped_indexer.py | 94 +++++++++++++++++++
+ 2 files changed, 112 insertions(+), 12 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/grouped_indexer.py
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
+index c6daa24941..52367edf37 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
+@@ -164,7 +164,7 @@ def cluster_bounds(width: int):
+ 
+ 
+ @tilelang.jit
+-def cluster_bounds_tensor(width: int, block_C: int = 64):
++def cluster_bounds_tensor(width: int, block_C: int = 64, shared_metadata: bool = False):
+     """The same conservative interval bound, using exact BF16 endpoint inputs.
+ 
+     Decoded certified FP4 values fit BF16 exactly. Split q into positive and
+@@ -174,20 +174,22 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
+     """
+     rows = T.dynamic('rows')
+     clusters = width // CLUSTER
++    metadata_rows = 1 if shared_metadata else rows
+ 
+     @T.prim_func
+     def bounds_tensor(
+         Q: T.Tensor([rows, INDEX_HEADS, 64], T.uint8),
+         Scales: T.Tensor([rows, INDEX_HEADS, 4], T.uint8),
+         Weights: T.Tensor([rows, INDEX_HEADS], T.bfloat16),
+-        Lower: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
+-        Upper: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
++        Lower: T.Tensor([metadata_rows, clusters, INDEX_DIM], T.float32),
++        Upper: T.Tensor([metadata_rows, clusters, INDEX_DIM], T.float32),
+         Lengths: T.Tensor([rows], T.int32),
+         Active: T.Tensor([1], T.int32),
+         Bounds: T.Tensor([rows, clusters], T.bfloat16),
+         Counts: T.Tensor([rows], T.int32),
+     ):
+         with T.Kernel(T.ceildiv(clusters, block_C), rows, threads=128) as (tile, row):
++            metadata_row = 0 if shared_metadata else row
+             A = T.alloc_shared([block_C, INDEX_DIM], T.bfloat16)
+             B = T.alloc_shared([INDEX_HEADS, INDEX_DIM], T.bfloat16)
+             key_bad = T.alloc_shared([block_C], T.int32)
+@@ -219,8 +221,8 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
+                 cluster = tile * block_C + c
+                 A[c, d] = T.cast(0, T.bfloat16)
+                 if cluster < clusters:
+-                    lo = Lower[row, cluster, d]
+-                    hi = Upper[row, cluster, d]
++                    lo = Lower[metadata_row, cluster, d]
++                    hi = Upper[metadata_row, cluster, d]
+                     valid = (T.abs(lo) < T.infinity(T.float32)) & (T.abs(hi) < T.infinity(T.float32))
+                     A[c, d] = T.cast(T.if_then_else(valid, hi, 0.0), T.bfloat16)
+                     if not valid:
+@@ -236,7 +238,7 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
+                 A[c, d] = T.cast(0, T.bfloat16)
+                 if cluster < clusters:
+                     A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
+-                                                    Lower[row, cluster, d], 0.0), T.bfloat16)
++                                                    Lower[metadata_row, cluster, d], 0.0), T.bfloat16)
+             for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
+                 q = _decode(Q[row, h, d // 2], Scales[row, h, d // 32], d)
+                 B[h, d] = T.cast(T.min(q, 0.0), T.bfloat16)
+@@ -247,8 +249,8 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
+                 cluster = tile * block_C + c
+                 A[c, d] = T.cast(0, T.bfloat16)
+                 if cluster < clusters:
+-                    lo = Lower[row, cluster, d]
+-                    hi = Upper[row, cluster, d]
++                    lo = Lower[metadata_row, cluster, d]
++                    hi = Upper[metadata_row, cluster, d]
+                     A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
+                         T.max(T.abs(lo), T.abs(hi)), 0.0), T.bfloat16)
+             for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
+@@ -407,15 +409,18 @@ class ClusteredIndexerPlan:
+         self.seed_plan = IndexerV41Plan(self.seeds * CLUSTER, page_size, topk=topk, candidates=True)
+         self.final_plan = IndexerV41Plan(width, page_size, topk=topk, candidates=True)
+ 
+-    def run(self, q, scales, weights, pool, table, lengths, active):
++    def run(self, q, scales, weights, pool, table, lengths, active, *, _metadata=None):
+         rows, clusters = q.shape[0], self.width // CLUSTER
+         device = q.device
+ 
+         def empty(shape, dtype):
+             return torch.empty(shape, device=device, dtype=dtype)
+ 
+-        lower = empty((rows, clusters, INDEX_DIM), torch.float32)
+-        upper = torch.empty_like(lower)
++        if _metadata is None:
++            lower = empty((rows, clusters, INDEX_DIM), torch.float32)
++            upper = torch.empty_like(lower)
++        else:
++            lower, upper = _metadata
+         bounds = empty((rows, clusters), torch.bfloat16)
+         counts = empty((rows,), torch.int32)
+         coarse_ids = empty((rows, self.seeds), torch.int32)
+@@ -427,7 +432,8 @@ class ClusteredIndexerPlan:
+         cap = torch.full((1,), clusters, device=device, dtype=torch.int32)
+         seed_scratch = [empty(shape, dtype) for shape, dtype in self.seed_plan.scratch_specs(rows)]
+         # Always rebuild: no stale metadata after append, overwrite, rollback or reuse.
+-        self.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
++        if _metadata is None:
++            self.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
+         self.bounds(q.view(torch.uint8), scales.view(torch.uint8).reshape(rows, INDEX_HEADS, 4),
+                     weights, lower, upper, lengths, active, bounds, counts)
+         self.coarse.run(bounds, counts, cap, coarse_ids, coarse_values)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/grouped_indexer.py b/vllm/models/deepseek_v4_1/tilelang/grouped_indexer.py
+new file mode 100644
+index 0000000000..8e295e8cc6
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/grouped_indexer.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact snapshot metadata shared by queries of one explicitly owned cache.
++
++Every call rebuilds metadata through the maximum visible query extent. A bound
++on that superset also bounds each query's visible keys. There is no persistent
++metadata, inferred cache identity, or reuse across calls. Serving must group rows
++by known cache ownership before this API is eligible.
++"""
++import tilelang
++import tilelang.language as T
++import torch
++
++from .clustered_indexer import CLUSTER, ClusteredIndexerPlan, cluster_bounds_tensor
++from .indexer import INDEX_DIM, INDEX_TOPK, page_bytes
++
++
++@tilelang.jit
++def shared_extent(width: int, row_cap: int = 256):
++    rows = T.dynamic('rows')
++
++    @T.prim_func
++    def extent(
++        Lengths: T.Tensor([rows], T.int32),
++        Active: T.Tensor([1], T.int32),
++        Maximum: T.Tensor([1], T.int32),
++    ):
++        with T.Kernel(1, threads=128):
++            values = T.alloc_fragment([row_cap], T.int32)
++            maximum = T.alloc_fragment([1], T.int32)
++            for r in T.Parallel(row_cap):
++                values[r] = T.if_then_else(r < rows, T.max(Lengths[r], 0), 0)
++            T.reduce_max(values, maximum, dim=0)
++            if T.get_thread_binding() == 0:
++                Maximum[0] = T.min(maximum[0], T.max(T.min(Active[0], width), 0))
++
++    return extent
++
++
++@tilelang.jit
++def shared_tables(width: int, page_size: int):
++    rows, table_width = T.dynamic('rows, table_width')
++
++    @T.prim_func
++    def tables(
++        Table: T.Tensor([1, table_width], T.int32),
++        Lengths: T.Tensor([rows], T.int32),
++        Active: T.Tensor([1], T.int32),
++        Expanded: T.Tensor([rows, table_width], T.int32),
++    ):
++        with T.Kernel(T.ceildiv(rows * table_width, 128), threads=128) as block:
++            for i in T.Parallel(128):
++                slot = block * 128 + i
++                if slot < rows * table_width:
++                    row = slot // table_width
++                    page = slot % table_width
++                    extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
++                    Expanded[row, page] = T.if_then_else(page * page_size < extent,
++                                                        Table[0, page], 0)
++
++    return tables
++
++
++class GroupedClusteredIndexerPlan(ClusteredIndexerPlan):
++    """One cache owner, 1..256 query rows; all visible keys must be written.
++
++    ``table`` is the owner's single page-table row, covering the maximum visible
++    extent. This explicit contract does not accept arbitrary mixed-request rows.
++    Each graph replay recomputes the maximum, table and envelopes from live input.
++    """
++
++    def __init__(self, width, page_size, *, topk=INDEX_TOPK, seeds=32):
++        super().__init__(width, page_size, topk=topk, seeds=seeds, matrix_bounds=True)
++        self.bounds = cluster_bounds_tensor(width, shared_metadata=True)
++        self.maximum = shared_extent(width)
++        self.tables = shared_tables(width, page_size)
++
++    def run(self, q, scales, weights, pool, table, lengths, active):
++        rows = q.shape[0]
++        if not 0 < rows <= 256 or table.shape[0] != 1:
++            raise ValueError('grouped search requires 1..256 queries and one owned page table')
++        if table.shape[1] * self.page_size < self.width:
++            raise ValueError('owned table must cover the planned width')
++        maximum = torch.empty((1,), dtype=torch.int32, device=q.device)
++        expanded = torch.empty((rows, table.shape[1]), dtype=torch.int32, device=q.device)
++        lower = torch.empty((1, self.width // CLUSTER, INDEX_DIM), dtype=torch.float32, device=q.device)
++        upper = torch.empty_like(lower)
++        self.maximum(lengths, active, maximum)
++        self.tables(table, lengths, active, expanded)
++        self.envelope(pool[:, :page_bytes(self.page_size)], table, maximum, active, lower, upper)
++        result, evidence = super().run(q, scales, weights, pool, expanded, lengths, active,
++                                      _metadata=(lower, upper))
++        evidence['metadata_elements'] = lower.numel() + upper.numel()
++        return result, evidence
+-- 
+2.54.0 (Apple Git-157)
+

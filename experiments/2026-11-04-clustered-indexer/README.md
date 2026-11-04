@@ -269,3 +269,23 @@ intervals across the two process medians, with the small-sample assumption state
 No production or end-to-end gain is established. Dedicated profiling and
 sanitizer repeats for the streamed candidate remain pending, as do all GPU gates
 for the optional tensor-core bounds.
+
+## Optional metadata sharing within one cache owner
+
+`vllm/0005-share-owned-snapshot.patch` introduces a separate grouped API for
+1–256 queries and one explicitly supplied owner page table. Each invocation
+rebuilds metadata once through the maximum visible query extent. That superset
+bounds every shorter query, while the final scorer still reads only that query's
+visible keys. Extent reduction and safe expansion of the native page table are
+included in candidate cost. There is no persistent metadata or inferred identity.
+Graph replay must rebuild after length rollback, empty domains and key mutation.
+
+The comparison is `sp8-grouped` versus `sp8-group-control`, both using tensor-core
+bounds. It includes 8, 32 and 128 queries on the same owner, native full-score
+bound checks and graph/mutation gates. Its hardware execution remains pending.
+The grouped API does not accept arbitrary mixed-request rows and is not wired
+into serving. Correct integration must use the runtime's cache ownership.
+
+A separate integration gate must preserve the native source layer's candidate
+block list and count as well as its immediate top-512 keys. Those blocks feed
+later reindex layers; a top-512-only snapshot check cannot qualify that handoff.

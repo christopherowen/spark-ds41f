@@ -164,7 +164,7 @@ def cluster_bounds(width: int):
 
 
 @tilelang.jit
-def cluster_bounds_tensor(width: int, block_C: int = 64):
+def cluster_bounds_tensor(width: int, block_C: int = 64, shared_metadata: bool = False):
     """The same conservative interval bound, using exact BF16 endpoint inputs.
 
     Decoded certified FP4 values fit BF16 exactly. Split q into positive and
@@ -174,20 +174,22 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
     """
     rows = T.dynamic('rows')
     clusters = width // CLUSTER
+    metadata_rows = 1 if shared_metadata else rows
 
     @T.prim_func
     def bounds_tensor(
         Q: T.Tensor([rows, INDEX_HEADS, 64], T.uint8),
         Scales: T.Tensor([rows, INDEX_HEADS, 4], T.uint8),
         Weights: T.Tensor([rows, INDEX_HEADS], T.bfloat16),
-        Lower: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
-        Upper: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
+        Lower: T.Tensor([metadata_rows, clusters, INDEX_DIM], T.float32),
+        Upper: T.Tensor([metadata_rows, clusters, INDEX_DIM], T.float32),
         Lengths: T.Tensor([rows], T.int32),
         Active: T.Tensor([1], T.int32),
         Bounds: T.Tensor([rows, clusters], T.bfloat16),
         Counts: T.Tensor([rows], T.int32),
     ):
         with T.Kernel(T.ceildiv(clusters, block_C), rows, threads=128) as (tile, row):
+            metadata_row = 0 if shared_metadata else row
             A = T.alloc_shared([block_C, INDEX_DIM], T.bfloat16)
             B = T.alloc_shared([INDEX_HEADS, INDEX_DIM], T.bfloat16)
             key_bad = T.alloc_shared([block_C], T.int32)
@@ -219,8 +221,8 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
                 cluster = tile * block_C + c
                 A[c, d] = T.cast(0, T.bfloat16)
                 if cluster < clusters:
-                    lo = Lower[row, cluster, d]
-                    hi = Upper[row, cluster, d]
+                    lo = Lower[metadata_row, cluster, d]
+                    hi = Upper[metadata_row, cluster, d]
                     valid = (T.abs(lo) < T.infinity(T.float32)) & (T.abs(hi) < T.infinity(T.float32))
                     A[c, d] = T.cast(T.if_then_else(valid, hi, 0.0), T.bfloat16)
                     if not valid:
@@ -236,7 +238,7 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
                 A[c, d] = T.cast(0, T.bfloat16)
                 if cluster < clusters:
                     A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
-                                                    Lower[row, cluster, d], 0.0), T.bfloat16)
+                                                    Lower[metadata_row, cluster, d], 0.0), T.bfloat16)
             for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
                 q = _decode(Q[row, h, d // 2], Scales[row, h, d // 32], d)
                 B[h, d] = T.cast(T.min(q, 0.0), T.bfloat16)
@@ -247,8 +249,8 @@ def cluster_bounds_tensor(width: int, block_C: int = 64):
                 cluster = tile * block_C + c
                 A[c, d] = T.cast(0, T.bfloat16)
                 if cluster < clusters:
-                    lo = Lower[row, cluster, d]
-                    hi = Upper[row, cluster, d]
+                    lo = Lower[metadata_row, cluster, d]
+                    hi = Upper[metadata_row, cluster, d]
                     A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
                         T.max(T.abs(lo), T.abs(hi)), 0.0), T.bfloat16)
             for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
@@ -407,15 +409,18 @@ class ClusteredIndexerPlan:
         self.seed_plan = IndexerV41Plan(self.seeds * CLUSTER, page_size, topk=topk, candidates=True)
         self.final_plan = IndexerV41Plan(width, page_size, topk=topk, candidates=True)
 
-    def run(self, q, scales, weights, pool, table, lengths, active):
+    def run(self, q, scales, weights, pool, table, lengths, active, *, _metadata=None):
         rows, clusters = q.shape[0], self.width // CLUSTER
         device = q.device
 
         def empty(shape, dtype):
             return torch.empty(shape, device=device, dtype=dtype)
 
-        lower = empty((rows, clusters, INDEX_DIM), torch.float32)
-        upper = torch.empty_like(lower)
+        if _metadata is None:
+            lower = empty((rows, clusters, INDEX_DIM), torch.float32)
+            upper = torch.empty_like(lower)
+        else:
+            lower, upper = _metadata
         bounds = empty((rows, clusters), torch.bfloat16)
         counts = empty((rows,), torch.int32)
         coarse_ids = empty((rows, self.seeds), torch.int32)
@@ -427,7 +432,8 @@ class ClusteredIndexerPlan:
         cap = torch.full((1,), clusters, device=device, dtype=torch.int32)
         seed_scratch = [empty(shape, dtype) for shape, dtype in self.seed_plan.scratch_specs(rows)]
         # Always rebuild: no stale metadata after append, overwrite, rollback or reuse.
-        self.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
+        if _metadata is None:
+            self.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
         self.bounds(q.view(torch.uint8), scales.view(torch.uint8).reshape(rows, INDEX_HEADS, 4),
                     weights, lower, upper, lengths, active, bounds, counts)
         self.coarse.run(bounds, counts, cap, coarse_ids, coarse_values)
