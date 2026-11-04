@@ -53,6 +53,3 @@ def reference_envelopes(width: int, page_size: int):
                 Upper[row, cluster, d] = hmax[d]
 
     return envelope
-
-
-
