@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+import os
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / "experiments/2026-11-04-lossless-memory/engram/verify_cache.py"
@@ -83,6 +84,30 @@ class CacheVerificationTests(unittest.TestCase):
                     patch.object(live.lab, "requests_in_flight", side_effect=AssertionError("unexpected node call")):
                 with self.assertRaisesRegex(SystemExit, "no node operation"):
                     live.main()
+
+    def test_reader_file_identity_survives_different_mount_path_spellings(self):
+        alias = self.root / "another-mount-name"
+        os.link(self.packed, alias)
+        proc = self.root / "proc"
+        fd = proc / "999999/fd/7"
+        fd.parent.mkdir(parents=True)
+        fd.symlink_to(alias)
+        with patch.object(verify, "Path", return_value=proc):
+            owners = verify.open_by_serving_process([self.packed])
+        self.assertEqual(owners[str(self.packed)][0]["observed_path"], str(alias))
+
+    def test_reader_holding_a_replaced_file_does_not_qualify_the_new_cache(self):
+        alias = self.root / "old-open-file"
+        os.link(self.packed, alias)
+        proc = self.root / "proc"
+        fd = proc / "999999/fd/7"
+        fd.parent.mkdir(parents=True)
+        fd.symlink_to(alias)
+        self.packed.unlink()
+        self.packed.write_bytes(self.expected)
+        with patch.object(verify, "Path", return_value=proc):
+            with self.assertRaisesRegex(ValueError, "does not hold"):
+                verify.open_by_serving_process([self.packed])
 
 
 if __name__ == "__main__":
