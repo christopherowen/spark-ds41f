@@ -9,3 +9,7 @@ used for serving changes until access is resolved under the hardware rules.
 The first dispatch yielded to the clustered-indexer request before GPU work.
 Candidate-36 remained healthy. Preserve that attempt and wait for the reservation
 and request queue before resuming with a distinct attempt label.
+
+Attempt 2 now owns the regular DGX window and is building/gating candidate-39.
+The VPN recovery did not restore access; the owner-authorized DGX4 fallback is
+active. Await actual correctness and repeat metric outcomes before a verdict.

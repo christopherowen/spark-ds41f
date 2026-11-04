@@ -60,7 +60,8 @@ measurement work; hardware recovery remains separate.
 
 ## Current state
 
-Source preparation and PR review only. No new GPU measurement has started.
+Candidate-39 image preparation and build are running on DGX4 in attempt 2.
+No new serving-performance measurement has completed.
 The fresh full vLLM preparation reproduced candidate-38 tree `c061e5f6` exactly;
 #842 applies without conflicts. The Mac partial-clone canonical lock replay
 failed on a missing intermediate local GLP blob. Its failure is retained in
@@ -107,3 +108,30 @@ Resume the unchanged matrix with `run_round.py --attempt 2 --apply` only after
 the shared reservation and request queue allow it, from a newly published clean
 commit on all nodes. The executor refuses to overwrite prior outputs or resume
 if any previous phase started. No new GPU measurement exists yet.
+
+## Second dispatch: local qualification running
+
+The owner confirmed local DGX4 as the fallback if the VPN could not be repaired,
+with normal shared scheduling. The isolated operator VPN gateway had no recent
+handshake; its configured endpoint still resolved to the active endpoint. A
+restart with its existing configuration preserved all isolation rules but did
+not establish a handshake or reach sp1 in five bounded checks. No Spark service,
+hardware, key, site routing policy or reservation was changed by the repair.
+The fallback and exact diagnostic results are in `runs/preflight/vpn-recovery`.
+
+DGX source staging synchronized all three serving nodes and the owned DGX4 build
+worktree to published commit `b464e9ad70090af532e44468aae739670eb9227d`.
+A new indexer request deferred the first launch command before it created a
+controller. Our request was requeued rather than replacing that window. Once
+the repeat/sanitizer job released the reservation, attempt 2 launched at
+09:12:04 UTC on 2026-11-04 (controller PID 2926115). Window
+`dgx1-1793783564` opened at 09:12:44 UTC. Its heartbeat is live.
+Complete image preparation and `build check` passed; the image build began at
+09:14:38 UTC. These are preparation results, not serving-performance results.
+
+Current native log: `~/tl-logs/copy-default-screening/candidate-39-window-attempt-2.log`
+on DGX1; setup uses `launch-attempt-2.json` and `exit-attempt-2.json`. The
+controller receipt is `results/private/lab/candidate-39-round-attempt-2/receipt.json`.
+The initial source/launch/reservation/image snapshots are retained in
+`runs/2026-11-04-dgx/attempt-2`. Keep execution pinned at `b464e9ad`; later
+publication of evidence is not a reason to synchronize an active window.
