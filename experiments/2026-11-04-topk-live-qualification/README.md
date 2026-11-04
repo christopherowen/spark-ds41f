@@ -102,3 +102,10 @@ DGX4 worktree. Operator setup, initial liveness/phase receipts and hashes are
 preserved under `runs/2026-11-04-dgx/attempt-1`. The supervisor's actual exit
 receipt exists only after the run ends. Later evidence commits do not change
 the active execution identity and must not trigger synchronization or restart.
+
+At 15:37:11 UTC a separate lossless-memory request entered the shared queue,
+asking for a short screen after the current image-and-gate job. The request is
+retained in `shared-request-1.json`; it does not interrupt the build or gates.
+If the controller yields safely before functional/timed work, preserve its
+actual exit/restoration and the completed immutable gate for explicit resume
+review. Do not rebuild, repeat gates or remove the foreign request.
