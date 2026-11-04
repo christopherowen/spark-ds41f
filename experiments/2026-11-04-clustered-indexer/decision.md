@@ -1,33 +1,27 @@
 # Retain for evidence; do not integrate or promote
 
-The exact-output requirement stands. The corrected TileLang implementation passes
-all 12 expanded snapshot cases on GB10, including 262K-key contexts. Seven CPU
-arithmetic/selection tests pass. The earlier six-case hardware run also passed;
-its setup failure is retained. These are standalone kernel checks, not two
-candidate serving boots or a model-quality qualification.
+The exact-output requirement stands. All 12 expanded GB10 snapshot cases pass
+in two fresh containers, with identical selected-position digests between
+processes. Seven CPU arithmetic/selection tests pass. Memcheck reports 0 errors
+across 12 cases; racecheck reports 0 hazards, 0 errors and 0 warnings across
+10 cases through 16K keys. The initial compile failure is retained. These are
+standalone checks, not candidate serving boots or full model qualification.
 
 The speed target is **not achieved or established**. Separable synthetic inputs
 retain 576 of 262,143 keys; random inputs retain all 262,143. Full snapshot cost,
-including envelope rebuilding, allocations and compaction, is still several
-milliseconds at that size. There is no released-build timing comparison and no
-end-to-end performance claim. Do not generalize the synthetic pruning to actual
-DeepSeek keys.
+including metadata rebuilding, allocation and compaction, remains several
+milliseconds. There is no released-build timing comparison or end-to-end claim.
+Do not generalize synthetic pruning to actual DeepSeek keys.
 
-Next gates are the expanded repeat and sanitizers, followed by explicitly armed
-real-model input capture and replay. Capture instrumentation is prepared against
-the exact serving source found at the start of the window, but has not run. If
-real operands do not prune enough to cover metadata/update/selection costs,
-reject this grouping and test a different exact search. Approximate selection
-must not replace it merely because it is faster.
+Next gates are initcheck and explicitly armed real-model input capture/replay.
+The capture arm freshly reproduces the exact source found serving at the start
+of the first window; its hardware execution remains untested. If real operands
+do not prune enough to cover all costs, reject this grouping and test a different
+exact search. Approximate selection must not replace it merely because it is
+faster. A changed output requires independent evidence of superior quality.
 
-The original window closed on 2026-11-04 at 08:23 UTC. The prior candidate-36 TP3
-profile was already serving; no serving start, stop, restart or sync was performed.
-The hold was removed. A subsequent short idle-dgx4 window is requested; sp8's
-configured SSH route is currently unreachable. Foreign holds are preserved.
-
-The second standalone window completed the expanded repeat: all 12 output
-digests match. Memcheck reports 0 errors across 12 cases; racecheck reports
-0 hazards, 0 errors and 0 warnings across the 10 cases through 16K keys. It
-closed at 09:07:10 UTC after the next cluster request. Initcheck was not started.
-The new capture arm and real-model replay have not run, and no speed claim or
-serving integration is accepted on these synthetic results.
+Both windows closed, at 08:23:17 and 09:07:10 UTC on 2026-11-04, when another
+authorized task requested the cluster. The original candidate-36 TP3 profile
+was already serving; no serving start, stop, restart or sync was performed.
+Holds were removed and foreign requests preserved. Sp8's configured SSH route
+was unreachable; dgx4 supplied every GPU result. No promotion is proposed.

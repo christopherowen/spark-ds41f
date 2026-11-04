@@ -100,35 +100,43 @@ shape, exact attention and greedy digests, teacher-forced distributions, mixed
 traffic, and memory/admission gates at the frozen workload limits, compared with
 the **recorded** release suites. Only the owner may accept promotion.
 
-## Initial hardware results
+## Hardware results and decision
 
-`runs/attempt-01` retains the failed TileLang build (an integer was used as a
-boolean condition). `runs/attempt-02` is the corrected build's first complete
-GB10 pass: six snapshot cases, every selected position identical and no bound
-violation. At 16,383 keys the separable case keeps 576; the random case keeps all
-16,383. This is a useful correctness result and an unfavorable pruning result,
-not evidence of a serving speedup. Expanded tests and repeats are recorded
-separately; see `results.json` for the final status.
+GB10 SM121, the exact recorded `spark-ds41f:1030` image. The released scorer is
+used for correctness only, never timed. `provenance.json` records each published
+harness commit, exact command, and the sanitizer version and binary hash.
 
-The expanded `runs/attempt-03` passes all 12 cases, adding normal-scale extremes,
-NaN keys/queries/weights, a cache mutation that changes the expected winners,
-and 262K-key domains. At 262,143 keys, the separable input retains 576 keys and
-the random input retains all of them. Candidate-only median wall times, including
-rebuilding and allocations, are 3.72 and 5.87 ms respectively. These are different
-inputs, so their ratio is **not a speedup measurement**. The released scorer was
-used for correctness only, never timed.
+- `attempt-01`: failed TileLang build; an integer condition needed an explicit
+  boolean comparison. The complete error is retained.
+- `attempt-02`: six corrected snapshot cases pass.
+- `attempt-03` and `attempt-04`: all 12 expanded cases pass in two fresh
+  containers; every selected-position digest matches between them. They cover
+  normal-scale extremes, NaN keys/queries/weights, a cache mutation that changes
+  the winners, and domains through 262K keys.
+- `memcheck-01`: all 12 cases, **0 errors**.
+- `racecheck-01`: 10 cases through 16K keys, **0 hazards, 0 errors, 0 warnings**.
+  Sanitizer timings are excluded from performance interpretation.
+- Seven CPU arithmetic/selection cases pass. Python 3.12 syntax, patch/overlay
+  identity and both local doctors pass. Freshly applying the 558-patch capture
+  base reproduces candidate-36's exact source tree.
 
-Seven CPU cases pass. The source checks also reverse the capture patch and
-recover the exact recorded candidate-36 indexer. Full build inputs are absent;
-`build check` reports that the build tree is not prepared. The image was neither
-rebuilt nor modified. See `decision.md` for outstanding gates and the window's
-closure, and `capture/README.md` for the unexecuted real-input workflow.
+At 262,143 keys, the separable synthetic input retains 576 keys; random input
+retains all 262,143. The two processes' complete candidate-only median wall times
+are 3.72/3.71 ms and 5.87/5.81 ms respectively, including metadata rebuilding and
+allocations. These are different inputs, so their ratio is **not a speedup**.
+There is no release-relative or end-to-end speed claim. The largest observed
+PyTorch allocation peak was 47,190,016 bytes; this excludes the CUDA context and
+is not a measurement of total host memory. Sampled host MemAvailable before
+the second window was 122,575,488 KiB, and its hottest sampled sensor was 39.8 C.
 
-`runs/attempt-04` repeats all 12 expanded cases in a fresh container: every
-selected-position digest matches `attempt-03`. `memcheck-01` passes all 12 cases
-with **0 errors**; `racecheck-01` passes the 10 cases through 16K keys with
-**0 hazards, 0 errors and 0 warnings**. Sanitizer timings are excluded from
-performance interpretation. `provenance.json` records the exact published
-harness commit and command for every run and the sanitizer's version/hash.
-The second window closed at 09:07:10 UTC, again with the original profile
-already serving. Initcheck and real-input replay remain pending.
+The speed target is not established. Keep this a research candidate. Real
+DeepSeek operands must prune enough to pay for metadata maintenance, bounds,
+selection and compaction before serving integration is justified. See
+`decision.md`, `results.json` and `capture/README.md`.
+
+Both windows closed with the original candidate-36 TP3 profile already serving
+(08:23:17 and 09:07:10 UTC). No serving start, stop, restart or cluster sync was
+performed, and foreign requests were preserved. Initcheck and real-input
+capture/replay remain pending. The capture hook is prepared and locally checked,
+but has not run. Full image build inputs are absent locally; `build check`
+reports that the build tree is not prepared. No image was rebuilt or modified.
