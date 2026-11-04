@@ -1,28 +1,33 @@
 # Decision
 
-Not ready: the equal-or-better performance gate is not passed. PR #895 is a
-draft, stacked on PR #893. The owner requires fixing slower cases while
+Not ready: the equal-or-better performance gate is not yet passed. PR #895
+is a draft, stacked on PR #893. The owner requires fixing slower cases while
 retaining the conversion removals.
 
-The current source (`d9f9a007`, tree `796f702a`) consumes noncompact ids before
-the large score reduction and stores native sampled ids before top-k selection.
-It preserves the original generated kernel for compact int64 inputs. All paths
-read their producer's existing storage without dtype/layout materialization.
-FP32 score arithmetic, ordering, ranks and serialized Python ids are unchanged.
+The current source (`d20a95fd`, tree `ca7edc30`) consumes the producer's native
+integer width and existing strides. Score addressing uses the compact, padded,
+sliced or transposed layout's simple expression; other views use general
+strides. It reads each selected logit once at the final store, without the
+rejected v4 output-buffer round trip. Top-k writes native sampled ids before
+selection. Compact int64 cases preserve the prerequisite's generated CUDA.
+All variants are prepared before startup freeze; no new conversion or GPU
+launch is added.
 
-The v4 source passed 625 tests and 40 decoded IKET launches on each boot. Its
-first controlled timing run left 74 of 120 cases unproved across the two boots;
-the unchanged reference control also showed large timing variation. This run
-is retained as diagnostic evidence, not an acceptance. A follow-up changes
-only the timer: GPU-resident event nodes exclude host submission gaps and
-measure eight cold-cache samples per replay. The same strict per-case gate
-applies on both boots.
+Both current test boots pass 649 checks. Both full 120-case timing boots and
+IKET captures remain required. Timings use GPU-resident event nodes, eight
+cold-cache samples per replay and 120 mirrored rounds per case. Every case
+on both boots must have verified identical GPU code and bindings or a five-SE
+upper time ratio at most 1. Inconclusive is not a pass.
 
-Earlier source variants and unfavorable runs remain unchanged. In particular,
-v3's means increased in 13 of 120 cases, up to 5.95%; those cases are not passes.
-The current source applies cleanly after candidate-38 and composes with the
-three prior ATen replacement candidates.
+Earlier variants and all unfavorable runs are preserved. V3's means increased
+in 13 of 120 cases, up to 5.95%. V4's more controlled timing left 35 cases
+unproved and established four score regressions on both boots. That source
+is rejected. The first v5 test run passed 648 checks and rejected a new fixture
+that derived a transposed mask instead of the production producer's packed
+mask; the fixture alone is corrected in patch 0006.
 
-Full-image/full-model qualification, including host enqueue effects, remains
-before promotion. No promoted configuration, default mode, source lock or
-immutable baseline is changed. No serving operation was performed.
+The complete series applies cleanly after candidate-38 and composes with the
+three prior ATen replacement candidates. Full-image/full-model qualification,
+including host enqueue effects, remains before promotion. No promoted
+configuration, default mode, source lock or immutable baseline is changed.
+No serving operation was performed.

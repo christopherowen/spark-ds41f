@@ -206,3 +206,16 @@ layout in the mask, although the production mask producer allocates a packed
 mask. No performance jobs ran after that failure. Patch 0006 corrects the test
 fixture only; the v5 runtime kernels and 120-round protocol are unchanged.
 The corrected fixture is requalified as native-v6.
+
+### Fixed precision extension rule
+
+Before the second native-v6 timing boot completes, the follow-up is declared:
+collect exactly 480 additional mirrored rounds on two fresh processes for
+every case unresolved on either primary boot. An observed primary mean increase
+is ineligible and requires a code fix. Every extension boot must independently
+meet the same five-SE upper ratio at most 1, and pooling it with its primary
+observations must also meet that criterion. Primary observations are never
+discarded or reclassified. This is one fixed extension, not repeated sampling
+until a case passes. The kernel source, input hashes, output sharing, cold-cache
+protocol and zero regression margin remain identical. The filter is published
+from the full primary result before any extension runs.

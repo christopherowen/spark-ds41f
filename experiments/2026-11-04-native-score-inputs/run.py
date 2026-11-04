@@ -60,7 +60,16 @@ def main():
         choices=["tests", "bench", "pair", "iket"],
         default=["tests", "pair", "iket"],
     )
+    parser.add_argument("--paired-rounds", type=int, choices=(120, 480), default=120)
+    parser.add_argument("--case-filter", type=Path)
     args = parser.parse_args()
+    if args.case_filter:
+        assert args.operations == ["pair"], "filtered runs contain only paired jobs"
+        case_filter = (ROOT / args.case_filter).resolve()
+        assert case_filter.is_file() and case_filter.is_relative_to(
+            ROOT / "experiments"
+        )
+
     assert socket.gethostname() == "spark-0016", "authorized only on idle sp8"
     assert not capture(["git", "-C", str(ROOT), "status", "--porcelain"]), (
         "dirty checkout"
@@ -235,6 +244,10 @@ def main():
                 "--out",
                 "/out/" + label,
             ]
+            if job["operation"] == "pair":
+                cmd += ["--rounds", str(args.paired_rounds)]
+                if args.case_filter:
+                    cmd += ["--case-filter", "/r/" + str(case_filter.relative_to(ROOT))]
             write(dest / "command.json", cmd)
             print(utc(), "START", label, flush=True)
             active.set()

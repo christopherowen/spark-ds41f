@@ -15,6 +15,8 @@ HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("operation", choices=["tests", "bench", "pair", "iket"])
 parser.add_argument("--out", required=True, type=Path)
+parser.add_argument("--rounds", type=int, choices=(120, 480), default=120)
+parser.add_argument("--case-filter", type=Path)
 args = parser.parse_args()
 base = json.loads((HERE / "base.json").read_text())
 candidate = json.loads((HERE / "candidate.json").read_text())
@@ -363,8 +365,17 @@ if args.operation == "pair":
         (source_dir / (digest + ".cu")).write_bytes(data)
         return digest
 
+    selected = None
+    if args.case_filter:
+        selected = {
+            json.dumps(case, sort_keys=True)
+            for case in json.loads(args.case_filter.read_text())
+        }
+        assert selected
     rows = []
     for label, old, new, validate in cases():
+        if selected is not None and json.dumps(label, sort_keys=True) not in selected:
+            continue
         validate()
         operation, logits, ids, valid = new.inputs
         run = tls._triton_run(logits)
@@ -470,6 +481,7 @@ if args.operation == "pair":
             flush,
             seed,
             expected,
+            rounds=args.rounds,
         )
         assert torch.equal(
             outputs["candidate"].view(torch.int32),
@@ -504,13 +516,16 @@ if args.operation == "pair":
             )
         )
         (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
+    if selected is not None:
+        assert {json.dumps(r["case"], sort_keys=True) for r in rows} == selected
     failed = [r["case"] for r in rows if r["gate"]["status"] == "not_proved"]
     result = dict(
         identity,
         cases=rows,
         not_proved=failed,
         gate_passed=not failed,
-        protocol="120 balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        rounds=args.rounds,
+        protocol=f"{args.rounds} balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
