@@ -76,6 +76,12 @@ zero problems). The first doctor run found an inherited patch count of 574;
 it was corrected to 575, with the failed check retained. No build or runtime
 source was changed to resolve that metadata error.
 
+The source-lock, release, release-test classification and recipe unit suites
+also pass: 50 tests from clean published deployment commit
+`75647384749768eab0654a9c774fee95aead6ef4` on Spaceport. The site's checkout
+remained at `15cba190221de06e4d582585384d3391c8aa7666` and had no running
+containers. See [runs/repository-checks.txt](runs/repository-checks.txt).
+
 [AUDIT.md](AUDIT.md) records the other ownership paths inspected and conditional
 retention outside the serving recipe. The new candidate image, full release
 gate, serving performance and complete attribution of #884 remain pending.
