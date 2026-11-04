@@ -11,6 +11,7 @@ parser.add_argument("operation", choices=["vision"])
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--stream", action="store_true")
 parser.add_argument("--rows", type=int, default=128)
+parser.add_argument("--inner", type=int, default=640)
 parser.add_argument("--uniform", action="store_true")
 parser.add_argument("--managed", action="store_true")
 args = parser.parse_args()
@@ -29,15 +30,16 @@ if args.stream:
     )
 from vllm.models.deepseek_v4_1.tilelang.vision import linear_kernel
 
-kernel = linear_kernel(1024, 640, True)
-x = torch.full((args.rows, 640), 0.5, dtype=torch.bfloat16, device="cuda")
-w = torch.ones((1024, 640), dtype=torch.bfloat16, device="cuda")
+kernel = linear_kernel(1024, args.inner, True)
+x = torch.full((args.rows, args.inner), 0.5, dtype=torch.bfloat16, device="cuda")
+w = torch.ones((1024, args.inner), dtype=torch.bfloat16, device="cuda")
 bias = torch.ones(1024, dtype=torch.bfloat16, device="cuda")
 out = torch.empty((args.rows, 1024), dtype=torch.bfloat16, device="cuda")
 print("compiled vision linear; launching", flush=True)
 kernel(x, w, bias, out)
 torch.cuda.synchronize()
-assert bool((out == 320).all())  # 320 + 1 rounds to even 320 in BF16.
+expected = torch.tensor(args.inner / 2 + 1, dtype=torch.bfloat16).item()
+assert bool((out == expected).all())
 result = {
     "operation": "vision",
     "uniform": args.uniform,

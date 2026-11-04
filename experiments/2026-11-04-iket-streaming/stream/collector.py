@@ -280,7 +280,7 @@ class Collector:
                 ],
             }
             self.write_json("sources/" + stem + ".json", manifest)
-            # One elected active lane per warp emits each event. %gridid identifies
+            # Lane zero per warp emits each event. %gridid identifies
             # real launches, including graph replays, without host launch hooks.
             entry = (
                 f"\n  const unsigned long long __spark_trace_kernel = {number}ULL;\n"
