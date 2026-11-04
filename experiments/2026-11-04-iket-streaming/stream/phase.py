@@ -5,8 +5,6 @@ import importlib
 import importlib.util
 import json
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 
 
@@ -21,11 +19,10 @@ def load(out):
     target = root / identity['path']
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(original)
-    for patch in (here / 'series').read_text().splitlines():
-        if patch and not patch.startswith('#'):
-            subprocess.run(['git', 'apply', '--include=' + identity['path'], str(here / patch)], cwd=root, check=True)
-    if hashlib.sha256(target.read_bytes()).hexdigest() != identity['patched_sha256']:
-        raise RuntimeError('patched phase source does not match its recorded identity')
+    source = (here / 'overlay/iket.py').read_bytes()
+    if hashlib.sha256(source).hexdigest() != identity['patched_sha256']:
+        raise RuntimeError('phase overlay does not match its recorded patch-series identity')
+    target.write_bytes(source)
     name = iket.__name__
     spec = importlib.util.spec_from_file_location(name, target)
     patched = importlib.util.module_from_spec(spec)

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 HERE = Path(__file__).resolve().parent
 _ACTIVE = None
@@ -62,13 +63,23 @@ class Collector:
             raise OSError(code, 'trace writer could not start')
         self.closed = False
         self.modules = {}
-        self.write_json('identity.json', {'format': 'SPKIKET1', 'record_bytes': 64,
+        self.write_json('identity.json', {'format': 'SPKIKET1', 'format_version': 2, 'record_bytes': 64,
+                        'writer_source_sha256': hashlib.sha256((HERE / 'writer.cpp').read_bytes()).hexdigest(),
+                        'writer_binary_sha256': hashlib.sha256(library.read_bytes()).hexdigest(),
+                        'device_source_sha256': hashlib.sha256((HERE / 'device.cuh').read_bytes()).hexdigest(),
                         'ring_bytes': self.size, 'capacity_records': self.capacity,
                         'chunk_bytes': chunk_bytes, 'writer_delay_us': writer_delay_us,
                         'fail_after_records': fail_after_records,
                         'device': torch.cuda.get_device_name(), 'pid': os.getpid(),
                         'scope': 'TileLang phase events; not arbitrary SASS tracing'})
-        atexit.register(self.close)
+        atexit.register(self._at_exit)
+
+    def _at_exit(self):
+        try:
+            self.close()
+        except Exception as error:
+            print(f'Streaming trace failed: {error}', file=sys.stderr, flush=True)
+            os._exit(1)
 
     @staticmethod
     def check(code):
@@ -100,7 +111,7 @@ class Collector:
         if not sync_error:
             self.check(self.cuda.cudaFreeHost(self.host))
         if status or sync_error:
-            raise RuntimeError(f'incomplete streaming capture: writer status {status}; {sync_error}')
+            raise RuntimeError(f'incomplete streaming capture: {os.strerror(status) if status else sync_error}; writer status {status}; receipts: {self.out}')
 
     def postproc(self, code, target):
         from vllm.models.deepseek_v4_1.tilelang import iket
