@@ -138,6 +138,8 @@ def gather_columns_into(
             )
     if any(t.shape != first.shape for t in outputs):
         raise ValueError("gather outputs must have equal shapes")
+    if rows > 1 and any(t.stride(0) < width for t in outputs):
+        raise ValueError("gather output rows must not overlap")
     if not rows:
         return
     ranges = [_range(t) for t in (gathered, *outputs)]

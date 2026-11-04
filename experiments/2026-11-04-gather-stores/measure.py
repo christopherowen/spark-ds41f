@@ -183,6 +183,36 @@ def cases():
                     validate,
                 )
 
+    # The previously unsupported last-dimension rows: byte-exact TileLang copy
+    # instead of the communicator's movedim/reshape ATen CUDA kernel.
+    for dtype in (torch.bfloat16, torch.float32):
+        for count in (7, 129):
+            src = torch.randn((3 * count, 5), device="cuda", dtype=dtype)
+
+            def old():
+                return src.view(3, count, 5).movedim(0, 1).reshape(count, 15)
+
+            def new():
+                return concat_rank_shards(src, 3, (count, 5))
+
+            def validate():
+                assert torch.equal(old(), new())
+
+            yield (
+                dict(
+                    operation="tail-layout",
+                    world=3,
+                    parts=1,
+                    dtype=str(dtype),
+                    rows=count,
+                    local_width=5,
+                    width=15,
+                ),
+                old,
+                new,
+                validate,
+            )
+
 
 rows = []
 profiles = None
@@ -196,7 +226,7 @@ for label, old, new, validate in cases():
     validate()
     rows.append(dict(case=label, timings=timings))
     (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
-    if profiles is None:
+    if profiles is None and label["rows"] >= 7:
         profiles = dict(
             reference=inventory("reference", old), candidate=inventory("candidate", new)
         )
@@ -204,10 +234,26 @@ for label, old, new, validate in cases():
         assert not profiles["candidate"]["aten_kernels"], (
             "remaining candidate ATen kernel"
         )
+# Also prove that the tail-layout path no longer launches an ATen copy kernel.
+tail_src = torch.randn((21, 5), device="cuda")
+tail_inventory = dict(
+    reference=inventory(
+        "tail-reference", lambda: tail_src.view(3, 7, 5).movedim(0, 1).reshape(7, 15)
+    ),
+    candidate=inventory(
+        "tail-candidate", lambda: concat_rank_shards(tail_src, 3, (7, 5))
+    ),
+)
+assert any(
+    "collectives_rank_rows_bytes" in n for n in tail_inventory["candidate"]["events"]
+)
+assert not tail_inventory["candidate"]["aten_kernels"]
+
 result = dict(
     identity,
     cases=rows,
     launch_inventory=profiles,
+    tail_inventory=tail_inventory,
     seconds=time.monotonic() - started,
     scope="isolated kernels and local TP emulation; no serving throughput or fabric qualification",
 )

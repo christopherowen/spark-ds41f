@@ -1,4 +1,4 @@
-From 7d2f3f4da2df702800672e38c214efe7f064a8b9 Mon Sep 17 00:00:00 2001
+From 6ee0d76e987ab5a13a64032582bc3da945ce3eae Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 12:35:06 +0100
 Subject: [PATCH] perf(tilelang): gather column shards directly into serving
@@ -10,22 +10,22 @@ The compressor materializes concatenated gathered columns before copying them in
 
 Quality: no projection or accumulation arithmetic changes. Collective payload bytes are unchanged; requested gather layout changes to dim zero and still requires distributed serving qualification. Tests cover independent concatenation, one/two outputs, topology widths, tails, striding, NaN/signed-zero bits, poisoned padding, large row grids and CUDA replay. Native receipts are retained with the deployment experiment. Upstream status: local candidate, not submitted.
 ---
- .../kernels/test_deepseek_v41_gather_into.py  | 106 ++++++++++++
+ .../kernels/test_deepseek_v41_gather_into.py  | 113 +++++++++++++
  tests/models/test_deepseek_v4_1_compressor.py |  10 +-
  vllm/models/deepseek_v4_1/compressor.py       |  33 +++-
- .../deepseek_v4_1/nvidia/tilelang_vision.py   |  55 +++++--
+ .../deepseek_v4_1/nvidia/tilelang_vision.py   |  55 ++++--
  .../deepseek_v4_1/tilelang/collectives.py     |  68 ++++++--
- vllm/models/deepseek_v4_1/tilelang/gather.py  | 154 ++++++++++++++++++
- 6 files changed, 390 insertions(+), 36 deletions(-)
+ vllm/models/deepseek_v4_1/tilelang/gather.py  | 156 ++++++++++++++++++
+ 6 files changed, 399 insertions(+), 36 deletions(-)
  create mode 100644 tests/kernels/test_deepseek_v41_gather_into.py
  create mode 100644 vllm/models/deepseek_v4_1/tilelang/gather.py
 
 diff --git a/tests/kernels/test_deepseek_v41_gather_into.py b/tests/kernels/test_deepseek_v41_gather_into.py
 new file mode 100644
-index 0000000000..6eee739ff0
+index 0000000000..49a70709fc
 --- /dev/null
 +++ b/tests/kernels/test_deepseek_v41_gather_into.py
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,113 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Rank-major gather to final buffers, against an independent concatenation."""
@@ -132,6 +132,13 @@ index 0000000000..6eee739ff0
 +    got = concat_rank_shards(src, 3, (7, width))
 +    assert got is not None
 +    assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
++
++
++def test_overlapping_output_rows_are_rejected_before_launch():
++    src = torch.empty((8, 16), device="cuda")
++    output = torch.empty((1, 32), device="cuda").expand(4, 32)
++    with pytest.raises(ValueError, match="rows must not overlap"):
++        gather_columns_into(src, (output,), 2)
 diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
 index 01b45c20b1..c29906e61e 100644
 --- a/tests/models/test_deepseek_v4_1_compressor.py
@@ -450,10 +457,10 @@ index af5ef85713..b2e2df42ac 100644
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/gather.py b/vllm/models/deepseek_v4_1/tilelang/gather.py
 new file mode 100644
-index 0000000000..5bb833190d
+index 0000000000..b463a5ba5b
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/gather.py
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,156 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Write rank-major gathered column shards directly into persistent outputs."""
@@ -594,6 +601,8 @@ index 0000000000..5bb833190d
 +            )
 +    if any(t.shape != first.shape for t in outputs):
 +        raise ValueError("gather outputs must have equal shapes")
++    if rows > 1 and any(t.stride(0) < width for t in outputs):
++        raise ValueError("gather output rows must not overlap")
 +    if not rows:
 +        return
 +    ranges = [_range(t) for t in (gathered, *outputs)]

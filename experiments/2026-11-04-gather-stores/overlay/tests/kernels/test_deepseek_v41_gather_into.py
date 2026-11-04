@@ -104,3 +104,10 @@ def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):
     got = concat_rank_shards(src, 3, (7, width))
     assert got is not None
     assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_overlapping_output_rows_are_rejected_before_launch():
+    src = torch.empty((8, 16), device="cuda")
+    output = torch.empty((1, 32), device="cuda").expand(4, 32)
+    with pytest.raises(ValueError, match="rows must not overlap"):
+        gather_columns_into(src, (output,), 2)
