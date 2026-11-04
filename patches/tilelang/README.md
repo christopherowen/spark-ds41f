@@ -29,7 +29,17 @@ unchanged; the source manifest records their commits.
 The patches are the first three commits of branch `deepseek-v41-sm120` in the
 contribution fork `christopherowen/tilelang` (tree `1697ad52` at its third
 commit, `193a2c17`). The branch's later commits add the same kernels as
-TileLang examples and are not build inputs. None is upstream yet.
+TileLang examples and are not build inputs. Patch 0001 merged upstream on
+2026-10-10 in [#3430](https://github.com/tile-ai/tilelang/pull/3430); it remains
+necessary against the promoted `b95ee4ff` pin. Patches 0002 and 0003 are covered
+by the open [#3495](https://github.com/tile-ai/tilelang/pull/3495).
+
+The promoted lock selects
+`experiments/2026-10-17-r6u/tilelang/series`: these three instruction patches
+plus the JIT prepare/freeze patch. The
+[2026-11-04 main refresh](../../experiments/2026-11-04-tilelang-refresh/README.md)
+is an unpromoted candidate that rebases the remaining production changes and
+the staged IKET extensions onto `2123e412`, without carrying merged patch 0001.
 
 ## Staged for upstream contribution
 
