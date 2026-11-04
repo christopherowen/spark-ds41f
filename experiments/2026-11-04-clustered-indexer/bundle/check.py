@@ -10,12 +10,14 @@ from vllm.models.deepseek_v4_1.tilelang.clustered_indexer import ClusteredIndexe
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan, page_bytes
 
 
-def inputs(width, extents, mode, page_size=256):
+def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
     rows = len(extents)
     g = torch.Generator(device='cuda').manual_seed(width + rows)
     logical = width // page_size
     pool_pages = rows * logical + 1
-    pool = torch.full((pool_pages, page_bytes(page_size) + 64), 255, dtype=torch.uint8, device='cuda')
+    pool = torch.empty((pool_pages, page_bytes(page_size) + 64), dtype=torch.uint8, device='cuda')
+    if not unwritten_cache:
+        pool.fill_(255)
     table = (torch.randperm(pool_pages - 1, device='cuda', generator=g) + 1).reshape(rows, logical).int()
     for r, extent in enumerate(extents):
         p = torch.arange(extent, device='cuda')
@@ -57,20 +59,23 @@ def inputs(width, extents, mode, page_size=256):
     return q, scales, weights, pool, table, lengths, active
 
 
-def check(width, extents, mode, repeats):
+def check(width, extents, mode, repeats, *, unwritten_cache=False):
     torch.cuda.reset_peak_memory_stats()
-    args = inputs(width, extents, mode)
+    args = inputs(width, extents, mode, unwritten_cache=unwritten_cache)
     candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
     reference = IndexerV41Plan(width, 256)
     expected, scores = reference.run(*args)  # correctness only; never timed
     actual, evidence = candidate.run(*args)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    score_cpu, bound_cpu = scores.cpu(), evidence['bounds'].cpu()
+    # The scorer intentionally leaves scores past each extent unwritten. Copy
+    # only the visible slice, including when initcheck tracks CUDA copies.
+    score_cpu = [scores[r, :extent].cpu() for r, extent in enumerate(extents)]
+    bound_cpu = evidence['bounds'].cpu()
     for r, extent in enumerate(extents):
         if extent:
             for c in range((extent + 63) // 64):
-                observed = score_cpu[r, c*64:min((c+1)*64, extent)].float().max()
+                observed = score_cpu[r][c*64:min((c+1)*64, extent)].float().max()
                 bound = bound_cpu[r, c].float()
                 if bool(torch.isfinite(observed)):
                     assert bool(bound >= observed), (r, c, bound.item(), observed.item())
@@ -94,6 +99,7 @@ def check(width, extents, mode, repeats):
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - start) * 1000)
     return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
+            'unwritten_cache': unwritten_cache,
             'candidate_counts': evidence['candidate_counts'].cpu().tolist(),
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
             'candidate_wall_ms': latencies,
@@ -105,6 +111,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--max-width', type=int, default=262144)
+    parser.add_argument('--unwritten-cache', action='store_true')
     options = parser.parse_args()
     result = {'schema_version': 1, 'torch': torch.__version__,
               'gpu': torch.cuda.get_device_name(), 'capability': torch.cuda.get_device_capability(),
@@ -126,7 +133,8 @@ def main():
         ]:
             if width > options.max_width:
                 continue
-            result['cases'].append(check(width, extents, mode, options.repeats))
+            result['cases'].append(check(width, extents, mode, options.repeats,
+                                         unwritten_cache=options.unwritten_cache))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:
