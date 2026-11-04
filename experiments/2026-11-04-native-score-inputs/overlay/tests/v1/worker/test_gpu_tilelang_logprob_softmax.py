@@ -813,7 +813,8 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
                 storage.t().contiguous().t(),
                 storage[:, 1:17:2],
             ):
-                valid = ids % 3 != 0
+                # The mask producer allocates a packed buffer independently of ids.
+                valid = torch.rand(ids.shape, device=DEVICE) > 0.3
                 for mask in (None, valid):
                     actual = logprob.compute_token_logprobs(logits, ids, mask)
                     assert actual.shape == ids.shape

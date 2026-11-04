@@ -1,0 +1,35 @@
+From d20a95fd3ef5a717353475ad983ada6afd933eff Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 20:41:11 +0100
+Subject: [PATCH] Use the producer mask layout in native-id startup checks
+
+Upstream-base: fe3caf6fefaeef8aa0bb093a1b75fa11fac2eb7d.
+
+Rationale: the expanded transpose-id fixture derived its mask with a stride-preserving elementwise operation, violating the existing contiguous-mask contract. Allocate the mask independently, as fill_token_ids' packed producer does. No runtime change.
+
+Quality: all id layouts remain exercised after startup freeze, with valid and invalid positions; no score or token behavior changes.
+
+Tests: the preceding cold run passed 648 of 649 checks and rejected the invalid mask stride in this fixture. Repeat the complete suite with the corrected producer contract and retain that failure.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ tests/v1/worker/test_gpu_tilelang_logprob_softmax.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 0d7fa3eedb..a60cb0f675 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -813,7 +813,8 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
+                 storage.t().contiguous().t(),
+                 storage[:, 1:17:2],
+             ):
+-                valid = ids % 3 != 0
++                # The mask producer allocates a packed buffer independently of ids.
++                valid = torch.rand(ids.shape, device=DEVICE) > 0.3
+                 for mask in (None, valid):
+                     actual = logprob.compute_token_logprobs(logits, ids, mask)
+                     assert actual.shape == ids.shape
+-- 
+2.54.0 (Apple Git-157)
+

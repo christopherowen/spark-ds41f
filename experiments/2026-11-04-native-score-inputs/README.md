@@ -193,3 +193,16 @@ earlier sample count), with eight cold-cache samples in each replay. Both boots
 run the full 120-case matrix. Increases and unresolved intervals still fail.
 This additional precision is needed to assess the small conversion savings in
 large batches; it does not change the zero regression margin.
+
+The GPU-resident v4 timing run is retained as `runs/native-v4-events.json` and
+`paired-results-v4-events.json`. Both boots passed numerical and IKET checks,
+but 35 cases failed to establish equal-or-better performance across the boots.
+Four score cases were slower on both boots even at the five-SE lower bound.
+That source is rejected; the additional sampling does not excuse it.
+
+The first v5 run (`runs/native-v5.json`) passed 648 checks and failed one new
+startup-freeze fixture: an elementwise operation preserved a transposed id
+layout in the mask, although the production mask producer allocates a packed
+mask. No performance jobs ran after that failure. Patch 0006 corrects the test
+fixture only; the v5 runtime kernels and 120-round protocol are unchanged.
+The corrected fixture is requalified as native-v6.
