@@ -211,7 +211,7 @@ class SourceClusteredIndexerPlan:
         self.restore = restore_source_scores(width)
         self.compact = source_surviving_candidates(width, CANDIDATE_BLOCKS)
 
-    def run(self, q, scales, weights, pool, table, lengths, active):
+    def run(self, q, scales, weights, pool, table, lengths, active, *, _metadata=None):
         rows, device = q.shape[0], q.device
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
@@ -224,8 +224,11 @@ class SourceClusteredIndexerPlan:
                          'native_fallback': True}
         plan = self.search
         clusters = self.width // CLUSTER
-        lower = empty((rows, clusters, 128), torch.float32)
-        upper = torch.empty_like(lower)
+        if _metadata is None:
+            lower = empty((rows, clusters, 128), torch.float32)
+            upper = torch.empty_like(lower)
+        else:
+            lower, upper = _metadata
         bounds = empty((rows, clusters), torch.bfloat16)
         counts = empty((rows,), torch.int32)
         coarse_ids = empty((rows, plan.seeds), torch.int32)
@@ -241,7 +244,8 @@ class SourceClusteredIndexerPlan:
         cutoff_positions = empty((rows,), torch.int32)
         candidates = empty((rows, self.width // 8), torch.int32)
         candidate_counts = empty((rows,), torch.int32)
-        plan.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
+        if _metadata is None:
+            plan.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
         plan.bounds(q.view(torch.uint8), scales.view(torch.uint8).reshape(rows, 32, 4),
                     weights, lower, upper, lengths, active, bounds, counts)
         plan.coarse.run(bounds, counts, active, coarse_ids, coarse_values)

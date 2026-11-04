@@ -1,27 +1,30 @@
 # Continue exact-output qualification; no promotion
 
-Repeated sp8 screens establish substantial improvements over earlier unreleased
-prototypes. The streamed envelope and tensor-core bound each preserve all
-selected keys across 20 numeric and cache fixtures, graph visibility changes and
-three dedicated sanitizer modes. Explicit one-owner sharing also lowers repeated
-snapshot cost and allocation in four multi-query fixtures. Native receipts and
-candidate-only process intervals are in `sp8-results.json`; profiles are in
-`sp8-profiling.json`. No released build was timed again.
+Repeated sp8 screens preserve selected keys, BF16 score bits, source block IDs
+and counts, and a subsequent native reindex query. Streamed/tensor-core bounds,
+one-owner dense snapshots and the exact source cutoff pass dedicated initialization,
+memory and race checks. The source tie cutoff's first execution was three times
+slower; its packed-pair replacement recovers that loss while keeping16511/65535
+separable keys. Both favorable and unfavorable receipts and intervals remain in
+`sp8-results.json`. Candidate-only profiles isolate the cutoff bottleneck.
+No released build was timed again.
 
-The source-layer interface includes a block handoff consumed by later reindex
-queries. The new joint candidate is prepared but hardware untested. Its exact
-keys, ordered block IDs, counts, BF16 score bits and following reindex outputs
-must pass before real snapshots or serving integration can qualify it.
+The next source variable shares fresh metadata across1–256 queries with one
+explicit cache owner. Existing GPU kernel ASTs are unchanged; grouped source
+handoff/reindex, boundary, allocation and sanitizer hardware gates are pending.
+The earlier dense grouped snapshot passes its own complete synthetic gates.
 
-Real DeepSeek operands must establish useful pruning and full candidate cost.
-Synthetic separability is not evidence of real-model speed. If real intervals
-are too loose to cover their cost, reject this grouping and test another exact
-search. Changed selections fail unless independent evidence proves superior
-model quality. Persistent metadata requires explicit ownership and invalidation;
-this experiment rebuilds every snapshot to avoid stale state.
+Real DeepSeek operands must establish useful pruning and complete candidate cost.
+Contextual capture/layout replay passes twice plus initcheck, including native
+planned width, sparse physical layout, source interface and caller metadata.
+Actual collection awaits the natural boundary of the other serving qualification;
+no foreign window is interrupted. A separable fixture is not real-model evidence.
+If real intervals cannot cover their full cost, reject this grouping and test
+another exact search. Changed selections fail unless independent evidence proves
+superior model quality. Persistent metadata needs explicit ownership/invalidation;
+these candidates rebuild each snapshot.
 
-All completed windows returned their host reservations with production unchanged.
-The user selected sp8 for continued isolated tests. Shared-node requests remain
-binding. Full serving boots, distribution/attention digests, mixed traffic,
-admission and memory gates remain required against immutable recorded baselines.
-No runtime configuration, baseline or image tag is promoted by this PR.
+This work has changed no serving state, production configuration or baseline.
+Every isolated sp8 batch returns its native hold. Full serving boots, attention
+and distribution digests, mixed traffic, admission and memory gates remain
+required against immutable recorded references. No promotion is proposed.

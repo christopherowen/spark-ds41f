@@ -249,11 +249,27 @@ C36 sp8 image; real DeepSeek operands have still not been collected.
 
 The packed cutoff passes two eight-case graph processes and all three sanitizers
 with identical source/reindex digests. Complete separable medians recover to
-0.156 / 0.155 ms. Candidate-only traces put69% of the preceding implementation's
+0.156 / 0.155 ms. Candidate-only traces put 69% of the preceding implementation's
 kernel time in its cutoff; the packed reduction removes that bottleneck.
 `source-profiling.json` retains both traces. No real-model or serving claim follows.
 
 The capture arm now reserves separate dense/source pool budgets and records caller
-layer identity. Its default minimum32769 keys avoids letting an early short-domain
+layer identity. Its default minimum 32769 keys avoids letting an early short-domain
 sample stand in for long-domain selection. Its contextual gate is hardware pending;
 see `capture/README.md` for the coordinated deployment and restoration procedure.
+
+## Prepared shared source snapshot
+
+Patch 0009 adds `GroupedSourceClusteredIndexerPlan`: one explicitly owned full
+page table and1–256 source queries share freshly rebuilt interval metadata through
+the maximum visible extent. Native source scoring, tie cutoff, stable compaction,
+block handoff and reindex order stay unchanged. Every pre-existing source GPU
+kernel has the same AST. The separate API expands per-query tables safely and
+includes that overhead in candidate timings; no cache metadata persists.
+
+`grouped-source.json` records the single variable. The harness reuses all native
+source/key/block/score-bit/reindex and graph mutation gates, including1/256 rows.
+Two fresh control/candidate screens and dedicated sanitizers are prepared.
+The contextual long-domain capture gate now also passes twice on the pinned C36
+image, plus strict initcheck; actual model collection still awaits the shared
+serving window.

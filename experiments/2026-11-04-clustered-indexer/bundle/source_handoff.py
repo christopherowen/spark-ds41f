@@ -11,15 +11,15 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS, Indexer
 from vllm.models.deepseek_v4_1.tilelang.source_indexer import SourceClusteredIndexerPlan
 
 
-def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=False):
+def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=False, *, fixture=None, candidate_factory=None):
     torch.cuda.reset_peak_memory_stats()
-    args = inputs(width, extents, mode, unwritten_cache=True)
+    args = inputs(width, extents, mode, unwritten_cache=True) if fixture is None else fixture
     rows = len(extents)
     reference = IndexerV41Plan(width, 256, candidate_blocks=True)
     Plan = SourceClusteredIndexerPlan
     if source_reference:
         from vllm.models.deepseek_v4_1.tilelang.source_reference import SourceClusteredIndexerPlan as Plan
-    candidate = Plan(width, 256)
+    candidate = (candidate_factory or Plan)(width, 256)
     blocks = torch.empty((rows, CANDIDATE_BLOCKS), device='cuda', dtype=torch.int32)
     counts = torch.empty((rows,), device='cuda', dtype=torch.int32)
 
