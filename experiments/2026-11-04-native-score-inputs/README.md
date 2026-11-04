@@ -53,7 +53,7 @@ That variant also generalized mask strides even though the old path never
 normalized masks and the producer already writes them contiguously. Patch 0002
 keeps that existing contract, trimming unused stride parameters. This narrows
 the candidate; it does not change the native token-id support or score arithmetic.
-The final variant requires its own repeated qualification. Initial receipts are
+The final variant has its own repeated qualification below. Initial receipts are
 not relabelled as evidence for the new tree.
 
 The second variant (candidate-v2.json, published source 4cddbfc4) also passed its
@@ -64,3 +64,65 @@ addressing as a specialization and uses dynamic id strides only when needed.
 Both are prepared at startup and read the original input buffer: the layout
 selection never materializes, converts or repacks ids. The second variant's
 source identities and measurements remain separate from the final variant.
+
+## Final qualification
+
+The final source is `da925efbc83245de4cbd6824fda9a877b7968fd2`, tree
+`032385a555e2c9f3ca7cc69ad0c355a7c7025279`. It was tested from published
+deployment commit `1ed48ff2bb1568b33f8302fe2d4607ae53d48e15`, with native
+evidence on sp8 at `/home/chris/spark-lab/native-score-inputs-20261104/native-v3`.
+
+Both final test boots passed **625 tests**, without failures or skips. Both
+benchmark boots passed **120 cases**, retaining 21 cold-L2 graph samples per
+method and case. Each boot's 24 launch inventories show exactly one TileLang
+candidate kernel, without an ATen conversion/copy kernel. References that already
+have compact int64 inputs also launch one kernel: no removed copy is claimed
+for those cases. The exact prerequisite source's modules are retained and hashed
+with the native benchmark outputs.
+
+The compact specialization is selected from existing layout metadata. A compact
+tensor is already strided; specialization makes its strides compile-time
+constants, while other layouts retain dynamic addressing. Neither branch
+reformats its input. Both layouts and both integer widths are prepared before
+cache freeze.
+
+The final paired timing ratios range from **-12.71% to +5.95%** on boot means.
+All cases, boot medians, raw samples and 95% Student t intervals (df=1) are retained.
+No blanket speedup or statistical equivalence is claimed from two boots.
+
+| Case (129,280-token vocabulary) | Reference boot medians, us | Final boot medians, us |
+| --- | --- | --- |
+| FP32 logits, 1 row, compact int64 ids, 129 masked scores (the earlier regression) | 20.160 / 18.592 | 20.160 / 18.528 |
+| BF16 logits, 1 row, transposed int64 ids, 21 unmasked scores (largest final mean increase) | 16.096 / 16.192 | 16.096 / 18.112 |
+| BF16 logits, 96 rows, dense int32 ids, 21 unmasked scores | 149.216 / 132.832 | 147.264 / 147.168 |
+
+The first case returns to the reference timings. The largest mean increase
+comes from a 2.016 us shift in one candidate boot; the 96-row case also has
+substantial reference variation. Full-model qualification must judge practical
+serving effects, including host enqueue costs, which these graph timings do not
+measure.
+
+Both IKET captures passed, each with **40 decoded launches** (20 eager, 20 graph
+replays), covering score, top-k selection and rank kernels with numerical checks.
+The minimum sampled host MemAvailable was **110.85 GiB**, with no memory guard
+stop. Both test reservations closed, their containers were removed, and sp8 was
+idle afterwards. No serving operation was performed.
+
+`runs/local.json`, `runs/fresh-source.json` and `runs/composition.json` record
+matching exports, Python parsing, no new lint diagnostics (one inherited test
+line-length diagnostic), passing doctor/diff checks, fresh application of all
+572 candidate-38 patches followed by PR #893 and this series, and composition
+with the three prior ATen replacement candidates. The composition check is a
+source check; those three other replacements are not part of these GPU runs.
+The full build check reports that its build directory is not prepared locally.
+
+Reproduce the final analysis without GPU access:
+
+```sh
+python3 experiments/2026-11-04-native-score-inputs/analyze.py \
+  experiments/2026-11-04-native-score-inputs/runs/native-v3.json
+```
+
+Use `--candidate candidate-v1.json` or `--candidate candidate-v2.json` (with their
+experiment-relative paths) to analyze an earlier receipt. Their analyses are
+retained separately as `results-v1.json` and `results-v2.json`.
