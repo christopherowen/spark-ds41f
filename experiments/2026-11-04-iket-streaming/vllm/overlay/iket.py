@@ -488,11 +488,12 @@ def _sample_runtime_loops(code: str, iters: int) -> str:
 
 
 def _synchronize_vision_producers(code: str) -> str:
-    """Keep all 128 TMA producers within one generation of their reused barriers.
+    """Make every producer observe an empty buffer before its copy can reuse it.
 
     Only the elected warp issues copies, but all four generated producer warps
-    wait on the two-stage pipeline. Tracing can delay a non-copy warp past two
-    barrier generations. A producer-only rendezvous prevents that parity ABA.
+    wait on the two-stage pipeline. A copy can finish and consumers can advance
+    the empty barrier before a delayed producer has observed its old phase.
+    Rendezvous after each empty wait, before the elected warp issues its copy.
     Barrier 15 is reserved here only for these three known generated kernels.
     """
     changes = []
@@ -523,11 +524,15 @@ def _synchronize_vision_producers(code: str) -> str:
             if len(loops) != 1:
                 raise ValueError("unrecognized vision TMA producer loop")
             loop = loops[0]
-            brace = code.index("{", loop.start, loop.end) + 1
-            changes.append(brace)
+            waits = [child for child in loop.body or []
+                     if re.match(r"mbarrier\[.*\]\.wait\(", child.text)]
+            expected = 2 if name == "vision_attention_kernel" else 1
+            if len(waits) != expected or not all(wait.alone for wait in waits):
+                raise ValueError("unrecognized vision TMA producer waits")
+            changes.extend(wait.end for wait in waits)
     for position in sorted(changes, reverse=True):
         code = (code[:position]
-                + '\n      asm volatile("bar.sync 15, 128;" ::: "memory");'
+                + '      asm volatile("bar.sync 15, 128;" ::: "memory");\n'
                 + code[position:])
     return code
 

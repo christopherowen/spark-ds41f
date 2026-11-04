@@ -1,0 +1,96 @@
+From 97973ea1d54be290cf2287eda158a691e609e635 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 04:15:12 +0100
+Subject: [PATCH] [DS4.1] rendezvous producers after empty waits and before
+ buffer reuse
+
+Base: candidate-38 on upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the four local profiling fixes.
+
+Rationale: a loop-entry rendezvous was insufficient. One full boot passed, but the repeat deadlocked in SwiGLU with producer warp 1 at an empty-barrier wait, the other producers at the next rendezvous, and consumers waiting for new copies. The elected copy can let consumers advance the empty barrier before a delayed non-copy producer observes its previous phase, even within an iteration. Rendezvous immediately after every producer empty wait, before any elected copy can reuse that buffer. Attention has separate K and V waits and needs both rendezvous.
+
+Quality: profiling off is unchanged. Profiling adds producer synchronization; ordinary performance must be measured separately. Preserve all copies and arithmetic, and refuse unexpected wait counts or non-standalone waits.
+
+Tests: 19 CPU phase-pass cases pass, including after-wait/before-copy ordering and both dynamic attention waits. Hardware repeat boots are recorded in the deployment experiment. Upstream status: local experiment, not submitted.
+---
+ .../kernels/test_deepseek_v41_tilelang_iket.py  | 15 ++++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/iket.py      | 17 +++++++++++------
+ 2 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 4ed7255e0a..1963b82735 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -316,10 +316,10 @@ VISION_PRODUCERS = """extern "C" __global__ void vision_swiglu_linear_kernel() {
+ """
+ 
+ 
+-def test_vision_producers_rendezvous_before_each_reused_barrier_wait():
++def test_vision_producers_rendezvous_after_empty_wait_before_copy():
+     out = iket._synchronize_vision_producers(VISION_PRODUCERS)
+     assert out.count('bar.sync 15, 128;') == 1
+-    assert out.index('for (int ko') < out.index('bar.sync 15') < out.index('.wait(')
++    assert out.index('.wait(') < out.index('bar.sync 15') < out.index('tl::tma_load')
+     assert out.index('warpgroup_reg_dealloc') < out.index('bar.sync 15')
+     assert iket._synchronize_vision_producers(VISION_PRODUCERS.replace(
+         'vision_swiglu_linear_kernel', 'other_kernel')) == VISION_PRODUCERS.replace(
+@@ -342,8 +342,17 @@ def test_vision_attention_dynamic_producer_loop_rendezvous():
+     code = VISION_PRODUCERS.replace(
+         "vision_swiglu_linear_kernel", "vision_attention_kernel"
+     ).replace("ko < 16", "ko < ((M + 63) >> 6)")
++    code = code.replace(
++        '        tl::tma_load(A_desc, mbarrier[(ko & 1)], A_shared, 0, 0);\n      }',
++        '        tl::tma_load(A_desc, mbarrier[(ko & 1)], A_shared, 0, 0);\n      }\n'
++        '      mbarrier[((ko & 1) + 6)].wait((((ko & 3) >> 1) ^ 1));\n'
++        '      if (tl::tl_shuffle_elect<128>()) {\n'
++        '        tl::tma_load(V_desc, mbarrier[(ko & 1)], V_shared, 0, 0);\n      }',
++    )
+     out = iket._synchronize_vision_producers(code)
+-    assert 'bar.sync 15, 128;' in out
++    assert out.count('bar.sync 15, 128;') == 2
++    assert out.index('bar.sync 15') < out.index('tl::tma_load(A_desc')
++    assert out.rindex('bar.sync 15') < out.index('tl::tma_load(V_desc')
+     assert 'ko < ((M + 63) >> 6)' in out
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 0dffff0796..3c05438801 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -488,11 +488,12 @@ def _sample_runtime_loops(code: str, iters: int) -> str:
+ 
+ 
+ def _synchronize_vision_producers(code: str) -> str:
+-    """Keep all 128 TMA producers within one generation of their reused barriers.
++    """Make every producer observe an empty buffer before its copy can reuse it.
+ 
+     Only the elected warp issues copies, but all four generated producer warps
+-    wait on the two-stage pipeline. Tracing can delay a non-copy warp past two
+-    barrier generations. A producer-only rendezvous prevents that parity ABA.
++    wait on the two-stage pipeline. A copy can finish and consumers can advance
++    the empty barrier before a delayed producer has observed its old phase.
++    Rendezvous after each empty wait, before the elected warp issues its copy.
+     Barrier 15 is reserved here only for these three known generated kernels.
+     """
+     changes = []
+@@ -523,11 +524,15 @@ def _synchronize_vision_producers(code: str) -> str:
+             if len(loops) != 1:
+                 raise ValueError("unrecognized vision TMA producer loop")
+             loop = loops[0]
+-            brace = code.index("{", loop.start, loop.end) + 1
+-            changes.append(brace)
++            waits = [child for child in loop.body or []
++                     if re.match(r"mbarrier\[.*\]\.wait\(", child.text)]
++            expected = 2 if name == "vision_attention_kernel" else 1
++            if len(waits) != expected or not all(wait.alone for wait in waits):
++                raise ValueError("unrecognized vision TMA producer waits")
++            changes.extend(wait.end for wait in waits)
+     for position in sorted(changes, reverse=True):
+         code = (code[:position]
+-                + '\n      asm volatile("bar.sync 15, 128;" ::: "memory");'
++                + '      asm volatile("bar.sync 15, 128;" ::: "memory");\n'
+                 + code[position:])
+     return code
+ 
+-- 
+2.54.0 (Apple Git-157)
+
