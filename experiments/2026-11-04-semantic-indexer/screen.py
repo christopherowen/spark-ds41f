@@ -5,6 +5,7 @@ Optimization only tightens that majorant; convergence is not a correctness
 assumption. Native rounding is bounded separately. F64 calculations and observed
 dominance do not qualify a future F32/TileLang implementation.
 """
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -13,7 +14,8 @@ import traceback
 import torch
 from diagnose_bounds import decode
 from snapshot_layout import restore_layout
-from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan
+from witness import witnessed_keep
+from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS, IndexerV41Plan
 
 
 def partition(keys, size, semantic):
@@ -58,11 +60,12 @@ def geometry(points, q, kind):
 
         def support(a):
             return (a.clamp(min=0)*upper + a.clamp(max=0)*lower).sum(-1)
-    elif kind == 'shape':
+    elif kind == 'shape' or kind.startswith('shape-'):
         # Full small-leaf shape; residuals are explicitly recomputed rather than
         # assuming the computed singular vectors are orthogonal or exact.
         _, singular, basis = torch.linalg.svd(delta, full_matrices=False)
-        rank = min(8, points.shape[1]-1)
+        requested_rank = int(kind.split('-')[1]) if '-' in kind else 8
+        rank = min(requested_rank, points.shape[1]-1)
         basis, singular = basis[:, :rank], singular[:, :rank]
         coefficients = delta @ basis.transpose(-1, -2)
         residual = delta-coefficients @ basis
@@ -70,13 +73,28 @@ def geometry(points, q, kind):
         scale = singular.clamp(min=2**-50)
         extent = (coefficients/scale[:, None]).norm(dim=-1).amax(1)
         shape = basis*scale[:, :, None]
-        spread = extent[:, None]*(shape @ q.T).square().sum(1).sqrt()
-        spread += radius[:, None]*q.norm(dim=-1)[None]
+        # Retain head correlations in the residual complement too. Explicit
+        # recomposition covers nonzero computed basis/coefficients residuals.
+        q_basis = basis @ q.T
+        q_residual = q[None]-q_basis.transpose(1, 2) @ basis
+        parallel_radius = (residual @ basis.transpose(1, 2)).norm(dim=-1).amax(1)
+        parallel_radius += 2**-40*points.abs().amax((1, 2))
+        spread = extent[:, None]*torch.linalg.vector_norm(shape @ q.T, dim=1)
+        spread += radius[:, None]*q_residual.norm(dim=-1)
+        spread += parallel_radius[:, None]*q_basis.norm(dim=1)
+        if kind == 'shape':
+            spread = extent[:, None]*torch.linalg.vector_norm(shape @ q.T, dim=1)
+            spread += radius[:, None]*q.norm(dim=-1)[None]
         low, high = center @ q.T-spread, center @ q.T+spread
 
         def support(a):
-            return ((a*center).sum(-1) + extent*(shape @ a[:, :, None]).square().sum((1, 2)).sqrt()
-                    + radius*a.norm(dim=-1))
+            if kind == 'shape':
+                return ((a*center).sum(-1) + extent*torch.linalg.vector_norm(shape @ a[:, :, None], dim=(1, 2))
+                        + radius*a.norm(dim=-1))
+            a_basis = (basis @ a[:, :, None]).squeeze(-1)
+            a_residual = a-(a_basis[:, None] @ basis).squeeze(1)
+            return ((a*center).sum(-1) + extent*torch.linalg.vector_norm(shape @ a[:, :, None], dim=(1, 2))
+                    + radius*a_residual.norm(dim=-1) + parallel_radius*a_basis.norm(dim=-1))
     elif kind == 'member-oracle':
         dots = points @ q.T
         low, high = dots.amin(1), dots.amax(1)
@@ -139,7 +157,8 @@ def bound(points, q, weights, kind, steps=48):
     return result.detach(), error.detach()
 
 
-def diagnose(path):
+def diagnose(path, kinds, sizes, selection_gates=False):
+    torch.cuda.reset_peak_memory_stats()
     data = torch.load(path, map_location='cpu', weights_only=True)
     n, page = int(data['lengths'][0]), int(data['page_size'])
     q = decode(data['q'], data['scales'].view(torch.uint8).reshape(1, 32, 4))[0].cuda()
@@ -153,10 +172,14 @@ def diagnose(path):
     assert bool(torch.isfinite(weights).all() and (weights.abs() <= 2**20).all())
     keys = decode(packed, scales).cuda()
     args, span = restore_layout(data)
-    # Native scorer is correctness-only: no timer and no baseline remeasurement.
-    _, scores = IndexerV41Plan(data['width'], page).run(*args)
-    scores = scores[0, :n].double()
     source = bool(data['candidate_blocks'])
+    reference = IndexerV41Plan(data['width'], page, candidate_blocks=source)
+    blocks = torch.empty((1, CANDIDATE_BLOCKS), dtype=torch.int32, device='cuda')
+    counts = torch.empty((1,), dtype=torch.int32, device='cuda')
+    # Native scorer is correctness-only: no timer and no baseline remeasurement.
+    expected, native_scores = reference.run(*args, **(
+        {'candidate_out': blocks, 'candidate_out_lengths': counts} if source else {}))
+    scores = native_scores[0, :n].double()
     if source:
         padded = torch.cat((scores, scores[-1:].expand((-n) % 8)))
         ordinary = padded.reshape(-1, 8).amax(1)[:-1]
@@ -166,12 +189,11 @@ def diagnose(path):
     result = {'snapshot': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
               'extent': n, 'source': source, 'ideal_native_cutoff': float(cutoff),
               'native_pool_span_bytes': span, 'variants': []}
-    del args
     for semantic in (False, True):
-        for size in (8, 64):
+        for size in sizes:
             ids = partition(keys, size, semantic)
             points = keys[ids]
-            for kind in ('box', 'shape', 'member-oracle'):
+            for kind in kinds:
                 bounds, error = bound(points, q, weights, kind)
                 observed = scores[ids].amax(1)
                 if not bool((bounds >= observed).all()):
@@ -191,6 +213,37 @@ def diagnose(path):
                         'bound_min': float(bounds.min()), 'minimum_native_dominance_slack': float((bounds-observed).min()),
                         'maximum_native_rounding_allowance': float(error.max()),
                         'native_bound_dominance': True, 'all_threshold_ties_retained': True}
+                center_dots = points.mean(1) @ q.T
+                center_estimate = (center_dots.clamp(min=0)*weights[None]).sum(1)
+                proposal = torch.full((n,), -float('inf'), device=keys.device, dtype=torch.float64)
+                per_key_bound = torch.full_like(proposal, -float('inf'))
+                proposal.scatter_reduce_(0, ids.flatten(), center_estimate[:, None].expand_as(ids).flatten(), reduce='amax')
+                per_key_bound.scatter_reduce_(0, ids.flatten(), bounds[:, None].expand_as(ids).flatten(), reduce='amax')
+                witnessed, witness = witnessed_keep(proposal, per_key_bound, scores, source)
+                assert bool(witnessed[scores >= cutoff].all())
+                item.update(witness)
+                if selection_gates:
+                    masked = torch.full_like(native_scores, -float('inf'))
+                    masked[0, :n] = torch.where(witnessed, native_scores[0, :n], -float('inf'))
+                    actual = torch.empty_like(expected)
+                    values = torch.empty_like(expected, dtype=torch.bfloat16)
+                    reference.select.run(masked, args[5], args[6], actual, values)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    item['native_selection_identical'] = True
+                    if source:
+                        actual_blocks, actual_counts = torch.empty_like(blocks), torch.empty_like(counts)
+                        block_values = torch.empty_like(blocks, dtype=torch.bfloat16)
+                        reference.select_blocks.run(masked, args[5], args[6], actual_blocks,
+                                                    block_values, counts=actual_counts)
+                        torch.testing.assert_close(actual_blocks, blocks, atol=0, rtol=0)
+                        torch.testing.assert_close(actual_counts, counts, atol=0, rtol=0)
+                        reindex = IndexerV41Plan(CANDIDATE_BLOCKS*8, page, candidates=True)
+                        next_args = [args[0].roll(1, dims=1), *args[1:]]
+                        next_expected, _ = reindex.run(*next_args, blocks, counts)
+                        next_actual, _ = reindex.run(*next_args, actual_blocks, actual_counts)
+                        torch.testing.assert_close(next_actual, next_expected, atol=0, rtol=0)
+                        item.update(native_source_blocks_identical=True, native_source_count_identical=True,
+                                    native_reindex_identical=True)
                 result['variants'].append(item)
                 print(json.dumps({'snapshot': path.name, **item}), flush=True)
     result['peak_allocated_bytes'] = torch.cuda.max_memory_allocated()
@@ -199,15 +252,22 @@ def diagnose(path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bounds', default='box,shape,member-oracle')
+    parser.add_argument('--sizes', default='8,64')
+    parser.add_argument('--all-ranks', action='store_true')
+    parser.add_argument('--selection-gates', action='store_true')
+    options = parser.parse_args()
     torch.set_num_threads(8)
     result = {'schema_version': 1, 'passed': False, 'cases': [],
               'scope': 'untimed geometry screen with ideal cutoff; no executable search or speed claim'}
     try:
-        files = sorted(Path('/snapshots').glob('rank-0-*.pt'))
-        if len(files) != 4:
-            raise RuntimeError('expected four rank0 layer/interface snapshots')
+        files = sorted(Path('/snapshots').glob('rank-*.pt' if options.all_ranks else 'rank-0-*.pt'))
+        if len(files) != (12 if options.all_ranks else 4):
+            raise RuntimeError('unexpected snapshot corpus size')
         for path in files:
-            result['cases'].append(diagnose(path))
+            result['cases'].append(diagnose(path, options.bounds.split(','),
+                                           [int(x) for x in options.sizes.split(',')], options.selection_gates))
         result['passed'] = True
     except Exception:
         result['error'] = traceback.format_exc()
