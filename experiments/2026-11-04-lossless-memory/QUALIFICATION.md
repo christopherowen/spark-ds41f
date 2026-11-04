@@ -65,6 +65,12 @@ the immutable source and confirms the serving reader holds those files open.
 It runs in a separate 1 GiB CPU-only container with read-only source/cache mounts,
 so its buffers do not consume serving's memory allowance. Reads are bounded and
 drop their clean page-cache pages; the verifier stops at a 4 GiB host floor.
+Before and after each Engram suite, the controller records serving-container
+process I/O counters (with PID start identities) and whole-node NVMe counters.
+These read-only snapshots follow cache verification. Node disk activity includes
+other processes; neither snapshot type is a per-row latency measurement or an
+unrecorded baseline comparison. Original outputs and the probe source hash are
+retained, including failed observations.
 
 ## Operations
 

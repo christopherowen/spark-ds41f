@@ -173,6 +173,25 @@ class ComponentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.native_kernel_gate(native, self.images)
 
+    def test_io_observation_requires_process_identity_and_complete_nonnegative_counters(self):
+        keys = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes")
+        value = {"container": "candidate", "monotonic_start_ns": 1, "monotonic_end_ns": 2,
+                 "processes": {"42": {"start_ticks": 100, "io": dict.fromkeys(keys, 0)}},
+                 "nvme_diskstats": {"nvme0n1": [0] * 11}}
+        runner.io_gate(value, "candidate")
+        for bad in ("identity", "counter", "disk", "clock"):
+            row = json.loads(json.dumps(value))
+            if bad == "identity":
+                row["processes"]["42"]["start_ticks"] = 0
+            elif bad == "counter":
+                row["processes"]["42"]["io"]["read_bytes"] = -1
+            elif bad == "disk":
+                row["nvme_diskstats"] = {}
+            else:
+                row["monotonic_end_ns"] = 0
+            with self.assertRaises(ValueError, msg=bad):
+                runner.io_gate(row, "candidate")
+
     def test_determinism_cannot_silently_drop_logprobs(self):
         native = {"summary": "temperature-0 determinism", "identical": True, "logprobs": True,
                   "reference_text_sha256": "short", "long_text_sha256": "long"}
