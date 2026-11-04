@@ -487,6 +487,42 @@ def _sample_runtime_loops(code: str, iters: int) -> str:
     return code
 
 
+def _synchronize_vision_producers(code: str) -> str:
+    """Keep all 128 TMA producers within one generation of their reused barriers.
+
+    Only the elected warp issues copies, but all four generated producer warps
+    wait on the two-stage pipeline. Tracing can delay a non-copy warp past two
+    barrier generations. A producer-only rendezvous prevents that parity ABA.
+    Barrier 15 is reserved here only for these two known generated kernels.
+    """
+    changes = []
+    for name, _, start, end in _kernels(code):
+        if name not in ("vision_linear_kernel", "vision_swiglu_linear_kernel"):
+            continue
+        if _CONDITIONAL.search(code, start, end):
+            continue
+        nodes, _ = _Parser(code).block(start)
+        for node in nodes:
+            if not re.fullmatch(r"if\s*\(\(\(int\)threadIdx\.x\)\s*<\s*128\)", node.text):
+                continue
+            if re.search(r"bar\.sync\s+15\b", code[start:end]):
+                raise ValueError("vision producer rendezvous needs unused barrier 15")
+            loops = [child for child in node.body or []
+                     if child.text.startswith("for")
+                     and "tl::tl_shuffle_elect<128>()" in code[child.start:child.end]
+                     and re.search(r"mbarrier\[.*\]\.wait\(", code[child.start:child.end])]
+            if len(loops) != 1:
+                raise ValueError("unrecognized vision TMA producer loop")
+            loop = loops[0]
+            brace = code.index("{", loop.start, loop.end) + 1
+            changes.append(brace)
+    for position in sorted(changes, reverse=True):
+        code = (code[:position]
+                + '\n      asm volatile("bar.sync 15, 128;" ::: "memory");'
+                + code[position:])
+    return code
+
+
 def _iterations(header: str, iters: int) -> str | None:
     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
@@ -569,6 +605,7 @@ def annotate(
     if granularity not in _GRANULARITIES:
         raise ValueError(f"unknown IKET granularity: {granularity!r}")
     code = _sample_runtime_loops(code, iters)
+    code = _synchronize_vision_producers(code)
     found: list[_Range] = []
     sites: list[dict] = []
     bodies: dict[str, int] = {}
