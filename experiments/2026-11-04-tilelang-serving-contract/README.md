@@ -71,5 +71,27 @@ under `runs/`. New image, full release gate, two-boot serving qualification and
 performance comparison remain necessary before promotion; no old measurements
 are assigned to the new source.
 
+## Checks completed so far
+
+The complete 576-patch series replayed from the pinned upstream base in a fresh
+named worktree and reproduced head `ecbfff36289d4a131169054702cf3eac384b7a4e`,
+tree `bb3748ca2f927069c5314e82da0c3d52eb55b78c`, with a clean checkout.
+Doctor passes. Release-test classification covers 198 selected files (136 gate,
+62 excluded) with zero problems. All 74 backend/source-lock/release/recipe
+checks and another 14 build tests pass locally. All 37 files in the model's
+TileLang implementation directory are byte-identical to candidate-39; generic
+vLLM online NVFP4 support is unchanged too.
+
+The first fresh-worktree doctor attempt lacked its ignored site map; supplying
+the existing local site map resolved setup. The first new backend-check test
+also inherited unrelated retired settings from its historical fixture; clearing
+those settings isolates the option under test. Both failed checks are retained.
+
+The first Spaceport attempt refused an active sp8 reservation before creating
+a container or collecting tests. Its output is preserved separately from test
+results. The other inspected Spaceport nodes were serving and were left alone.
+A short CPU-only request was queued after the current sp8 job. Full build inputs
+are not present for `build check`.
+
 Upstream status: local, not submitted. No promoted configuration, immutable
 baseline or serving cluster is changed.
