@@ -21,11 +21,14 @@ work; no duplicate PR was opened.
    and capture-envelope sizing. This is an explicit interaction test of enabling
    the path and overlapping its bit-identical copy work; compare both recorded
    candidate-38 standard and copy recipes to distinguish those questions.
-2. After candidate-39's quality and performance review, a separate round may test
+2. Review the independent scratch-read fix in #878 and qualify it as its own
+   corrected candidate before further tuning. Its lazy liveness guard applies
+   to the exact candidate-39 tree; the current image and matrix stay frozen.
+3. After candidate-39's quality and performance review, a separate round may test
    minimum match 8 against 16, changing only that variable. It needs new source
    identity and receipts, including a mixed copy-dense/tool-like workload that
    binds the token budget. A failed or slower round is retained and rejected.
-3. The compiler refresh in #875 stays a separate candidate and quality gate:
+4. The compiler refresh in #875 stays a separate candidate and quality gate:
    its standalone tests do not establish model-output or serving performance.
 
 Every measured arm needs a boot and repeat boot. Record servebench release,
@@ -222,3 +225,20 @@ staging and resume receipts are in `runs/2026-11-04-dgx/attempt-3`.
 
 A fresh PR inventory still contains only the four distinct open changes #851,
 #865, #875 and #877; no additional superseded PR was found.
+
+## Independent correctness follow-up
+
+PR #878 isolates a top-k merge scratch-read fix from the separate clustered
+search experiment. On the clean prepared candidate-39 tree `8e33015b`, local
+inspection confirms the same eager bitwise condition around `WorkEntries`:
+the mask does not prevent reading a list whose scratch entries were unwritten.
+The proposed outer lazy guard applies with `git apply --check`, without changing
+the prepared tree. The PR supplies original/fixed sanitizer receipts; those GPU
+checks have not been independently rerun by this experiment. This source review
+is preserved in `runs/preflight/topk-review.json`.
+
+Keep #878 as unique correctness work. Preserve the frozen candidate-39 matrix
+and assess its results with this known source issue recorded. Qualify a separate
+corrected candidate before copy-match tuning or promotion. Passing ordinary
+output comparisons alone would not close the scratch-read issue; performance
+measurements do not replace the sanitizer and correctness gates.

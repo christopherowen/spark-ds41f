@@ -21,3 +21,10 @@ local fallback through regular scheduling. Its cooling and prior no-content
 response remain unresolved. Do not promote an unqualified build or bypass the
 outstanding TP4 correctness and release gates. AgentX does not score useful task
 completion or replace those gates.
+
+A new independent source review confirms candidate-39 carries the inactive-list
+scratch-read pattern addressed by #878; that isolated guard applies to its exact
+prepared tree. Retain the unique PR and qualify a separate corrected candidate
+before copy-match tuning or promotion. Keep the current running image and every
+measurement unchanged. The PR's sanitizer results remain supplied evidence until
+the corrected candidate's own gates pass.
