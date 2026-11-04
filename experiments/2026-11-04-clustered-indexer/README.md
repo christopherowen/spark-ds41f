@@ -249,3 +249,23 @@ observations are in `runs/sp8-control-01/`; `sp8-results.json` summarizes them.
 The batch returned sp8 at that job boundary when another authorized task requested
 it. Its request was preserved. This is one control process only; no speedup or
 qualification of the streamed or tensor-core candidates is inferred from it.
+
+The streamed candidate then passed all **20 cases in two fresh graph containers**
+(`sp8-stream-01` and `sp8-stream-02`), including the new cancellation, smallest
+and largest certified scales, subnormal/unsupported encodings and weight gates.
+Both interval endpoints match the archived reduction, and all common selected
+positions retain their archived digests. The repeated control also passes all
+20 cases. At 262,143 keys, complete candidate graph medians are:
+
+| Input | Archived prototype, two processes | Streamed prototype, two processes |
+| --- | --- | --- |
+| Separable | 3.591 / 3.583 ms | 0.769 / 0.791 ms |
+| Random | 5.678 / 5.694 ms | 1.070 / 1.092 ms |
+
+The ratios of process medians span 4.53–4.67 and 5.20–5.32 respectively, comparing
+two **unreleased prototypes on the same sp8 runtime**. No released timing is
+repeated. `sp8-results.json` includes raw ranges and deliberately wide Student-t
+intervals across the two process medians, with the small-sample assumption stated.
+No production or end-to-end gain is established. Dedicated profiling and
+sanitizer repeats for the streamed candidate remain pending, as do all GPU gates
+for the optional tensor-core bounds.
