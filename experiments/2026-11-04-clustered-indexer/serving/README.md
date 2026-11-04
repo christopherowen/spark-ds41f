@@ -32,7 +32,7 @@ exercises a final one-row chunk. A declared-cache freeze gate is separate.
 
 The paired request plan is LSA-A, control-A, control-B, LSA-B, with one coherent
 three-node boot per arm. Each run uses `bin/spark bench`, quality, prose/code at
-concurrency1/4/8, three to four decode samples, and three cold source-prefill
+concurrency1/4/8, four fixed decode samples, and three cold source-prefill
 samples at32768/131072 tokens. Exact commands, telemetry, request results and
 both boots are retained. Generated outputs must match before interpreting speed.
 These points establish request latency/throughput for this recipe, not a full
@@ -59,3 +59,14 @@ python3 experiments/2026-11-04-clustered-indexer/serving/run_window.py --out /ho
 
 No promotion is proposed. Candidate correctness and the complete request-level
 performance comparison remain pending until native receipts establish them.
+
+The first integrated pilot is retained as `serving-window-01`. It was requested
+to close after its current completed arm when adaptive decode sampling was found
+to advance the shared RNG by a variable amount, changing later source-prefill
+prompts. Its observations are not discarded or presented as a matched comparison.
+The corrected matrix fixes both sample limits at4 and uses `bench_requests.py` to
+hash each exact model input, retain the full payload hash separately, and save
+native raw per-request elapsed time and output digest. Hashing precedes the native
+request timer. Payloads are never changed. Random cache salts remain unique to
+prevent reuse and are excluded only from the matching hash. The final report
+requires matching request identities across arms before comparing their latency.

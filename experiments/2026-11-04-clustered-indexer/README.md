@@ -10,8 +10,9 @@ without independent evidence of superior model quality.
 
 The target is the checkpoint's existing attention rule and weights. This plan
 only changes the search for its selected keys. It introduces no trained maps,
-reduced precision or approximate attention. It remains an unregistered snapshot
-prototype, outside serving configuration. No baseline or runtime image was
+reduced precision or approximate attention. The original snapshot prototype has a separate bounded-workspace adapter
+for owner-authorized Spaceport request measurements; see `serving/README.md`.
+No promoted runtime selects it. No baseline or runtime image was
 promoted.
 
 ## Algorithm and rounding argument
@@ -204,7 +205,8 @@ path with matching SHA256 values. [Capture instructions](capture/README.md)
 describe the guarded collection procedure; reusing the existing saved operands
 requires no serving window. Rerun reports from committed receipts without a GPU.
 
-No serving integration is proposed for this grouping. A different exact search
+No production adoption is proposed for this grouping. A paired experimental
+Spaceport request measurement is now in progress. A different exact search
 must demonstrate useful real-input pruning and complete candidate cost first.
 Only then would full candidate two-boot, attention/greedy/distribution, mixed
 traffic and admission gates against immutable recorded release suites be useful.

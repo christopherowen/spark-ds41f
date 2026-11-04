@@ -201,10 +201,11 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
             if any(x['spark-request.json'] or x['spark3-request.json'] for x in requests.values()):
                 raise RuntimeError('pending requester: return group after current completed job')
             start(profile,out,'boot-'+label)
-            run(spark(profile,'bench','--suites','quality,decode,prefill','--url','http://127.0.0.1:8001',
+            run([sys.executable,str(ROOT/REL/'bench_requests.py'),str(out/label/'requests.jsonl'),
+                 *spark(profile,'bench','--suites')[1:],'quality,decode,prefill','--url','http://127.0.0.1:8001',
                 '--compare','none','--output',str(out/label),'--concurrency','1,4,8','--decode-cases','prose,code',
-                '--min-samples','3','--max-samples','4','--prefill-sizes','32768,131072','--prefill-repeats','3',
-                '--prefill-text','source'),out,'bench-'+label)
+                '--min-samples','4','--max-samples','4','--prefill-sizes','32768,131072','--prefill-repeats','3',
+                '--prefill-text','source'],out,'bench-'+label)
             completed.append(label)
             (out/'completed.json').write_text(json.dumps({'completed':completed,'at':stamp()},indent=2)+'\n')
     except Exception:
