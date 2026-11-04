@@ -1,4 +1,5 @@
 """Untimed correctness process. Never imported by the candidate query module."""
+import argparse
 import json
 import traceback
 import torch
@@ -44,16 +45,19 @@ def check(data,args,plan,native_scores,native_indices):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--rows',type=int,default=1)
+    options = parser.parse_args()
     result = {'passed':False,'cases':[],
               'scope':'out-of-band structural, evaluated-score and graph tests; generated-token equivalence not yet tested'}
     try:
         for path in files():
-            data,args,plan,construction,span = setup(path)
+            data,args,plan,construction,span = setup(path,rows=options.rows)
             reference = IndexerV41Plan(data['width'],data['page_size'])
             expected,scores = reference.run(*args)
             actual = check(data,args,plan,scores,expected)
             complete = int(data['lengths'][0])//512*8
-            query = decode(args[0].view(torch.uint8),args[1].view(torch.uint8).reshape(1,32,4))[0].double()
+            query = decode(args[0].view(torch.uint8),args[1].view(torch.uint8).reshape(options.rows,32,4))[0].double()
             dots = (plan.centers[:complete].double() @ query.T).to(torch.bfloat16).float().clamp(min=0)
             terms = (dots*args[2][0].float()[None]).to(torch.bfloat16).float()
             total = torch.zeros(complete,dtype=torch.float32,device='cuda')
@@ -85,6 +89,7 @@ def main():
                 next_out,_ = reindex.run(*args,plan.blocks,plan.block_lengths)
                 assert bool(((next_out < args[5][:,None]) | (next_out == -1)).all())
             case = {'snapshot':path.name,'keys_scored':count,'native_top512_overlap':overlap,
+                    'rows':options.rows,
                     'overlap_is_diagnostic_not_acceptance':True,'native_evaluated_score_bits_match':True,
                     'centroid_reference_max_abs_error':maximum_centroid_error,
                     'source_handoff_legal':bool(plan.source),'graph_visibility_passed':True,

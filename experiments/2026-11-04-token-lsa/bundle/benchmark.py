@@ -1,5 +1,6 @@
 """Performance process: no correctness reference or comparison in timed path."""
 import argparse
+import hashlib
 import json
 import statistics
 import traceback
@@ -46,6 +47,7 @@ def main():
                 end.record();end.synchronize()
                 times.append(start.elapsed_time(end)/50)
             case = {'snapshot':path.name,'extent':int(data['lengths'][0]),'rows':options.rows,
+                    'snapshot_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
                     'source':bool(data['candidate_blocks']),'budget':512 if data['candidate_blocks'] else options.budget,
                     'planned_width':data['width'],'page_size':data['page_size'],'native_pool_span_bytes':span,
                     'synthetic_repeated_pages':bool(options.extend),

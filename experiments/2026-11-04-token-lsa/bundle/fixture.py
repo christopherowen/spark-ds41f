@@ -30,7 +30,7 @@ def setup(path,budget=64,rows=1,candidate=True,extend=0):
             for index,value in enumerate(args)]
     source = bool(data['candidate_blocks'])
     if candidate:
-        centers,membership,construction = build(data)
+        centers,membership,construction = build(data,args[3],args[4])
         plan = ShortlistPlan(data['width'],data['page_size'],512 if source else budget,
                              centers,membership,rows=rows,source=source)
     else:

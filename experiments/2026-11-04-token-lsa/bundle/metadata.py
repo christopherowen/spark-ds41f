@@ -14,13 +14,14 @@ def decode(packed, scales):
     return values[codes]*torch.exp2(scales.float().repeat_interleave(32,dim=-1)-127)
 
 
-def build(data):
+def build(data,resident_pool=None,resident_table=None):
     torch.cuda.synchronize()
     start = time.perf_counter()
     extent,page,width = int(data['lengths'][0]),int(data['page_size']),int(data['width'])
     complete = extent//512*512
     positions = torch.arange(complete,device='cuda')
-    table,pool = data['table'].cuda(),data['pool'].cuda()
+    table = resident_table if resident_table is not None else data['table'].cuda()
+    pool = resident_pool if resident_pool is not None else data['pool'].cuda()
     physical,offset = table[0,positions//page].long(),positions%page
     packed = pool[physical[:,None],offset[:,None]*64+torch.arange(64,device='cuda')]
     scales = pool[physical[:,None],page*64+offset[:,None]*4+torch.arange(4,device='cuda')]
@@ -58,4 +59,5 @@ def build(data):
         'initialized_keys':complete,'owner_scope':'one explicit immutable snapshot',
         'persistent_bytes':centers.numel()*centers.element_size()+membership.numel()*membership.element_size(),
         'chunks':chunks,'buckets':chunks*8,'native_blocks_per_bucket':8,
+        'reads_resident_native_cache':resident_pool is not None,
         'construction_in_query_timer':False,'construction_is_required_runtime_work':True}
