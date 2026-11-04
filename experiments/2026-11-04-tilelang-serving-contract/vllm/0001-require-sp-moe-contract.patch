@@ -1,0 +1,234 @@
+From 5c2f98f1902c8bc7e7f5f76cd9b4939b273c9adb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 17:24:24 +0100
+Subject: [PATCH] Require the producer cast and local router for
+ sequence-parallel MoE
+
+Base: candidate-39 vLLM 31412339aafdd2c1392c7294975355dbc523c5e1. The native mHC entry and TileLang router already supply this contract.
+
+Rationale: remove BF16 gather/recast and missing-router alternatives retained for CPU stand-ins. Invalid inputs fail before any collective. CPU model simulations now supply the same cast and grouped-routing interface.
+
+Quality: preserve the production grouped gather and routes, tensor shapes and arithmetic. Tests: targeted sequence-parallel CPU suite pending Spaceport validation; serving and GPU qualification pending.
+
+Upstream status: local, not submitted.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 76 +++++++++++--------
+ vllm/models/deepseek_v4_1/kernels.py          | 45 +++++------
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  2 +-
+ 3 files changed, 61 insertions(+), 62 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 364ad18c70..23d531cd79 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -441,15 +441,10 @@ def test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast():
+         seen.append(("route_local", local_x is x, sp_rows is fake_sp_rows, input_ids))
+         return local_w, local_ids
+ 
+-    mhc = SimpleNamespace(
+-        cast_rows=lambda _: (_ for _ in ()).throw(
+-            AssertionError("mhc.cast_rows should not run when x_q is present")
+-        )
+-    )
+     ffn = SimpleNamespace(
+         experts=SimpleNamespace(router=SimpleNamespace(route_local=route_local))
+     )
+-    with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn, input_ids, mhc) as rows:
++    with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn, input_ids) as rows:
+         assert rows is full_q.rows
+         assert provided_mxfp8(rows) is full_q
+         assert provided_routes(rows) == (full_w, full_ids)
+@@ -461,31 +456,14 @@ def test_sp_moe_inputs_routes_local_rows_and_skips_duplicate_cast():
+         ("gather_mxfp8", True, 2),
+     ]
+ 
+-    # Without route_local, gathers MXFP8 only.
+-    seen.clear()
++    # Neither missing input is a request for an alternate execution path.
++    with pytest.raises(ValueError, match="producer-provided MXFP8"):
++        with kernels.sp_moe_inputs(fake_sp_rows, x, None, ffn, input_ids):
++            pytest.fail("missing cast entered the MoE body")
+     ffn_no_router = SimpleNamespace(experts=SimpleNamespace(router=object()))
+-    with kernels.sp_moe_inputs(
+-        _FakeSPRows(), x, x_q, ffn_no_router, input_ids, mhc
+-    ) as rows:
+-        assert rows is full_q.rows
+-        assert provided_mxfp8(rows) is full_q
+-        assert provided_routes(rows) is None
+-    with pytest.raises(RuntimeError):
+-        provided_mxfp8(full_q.rows)
+-    assert seen == [("gather_mxfp8", True, 0)]
+-
+-    # When x_q is None (CPU stand-in tests), falls back to BF16 gather + cast_rows.
+-    fallback_rows = torch.randn(10, 64, dtype=torch.bfloat16)
+-    cast_called = []
+-    sp_fallback = SimpleNamespace(gather=lambda local_x: fallback_rows)
+-    mhc_fallback = SimpleNamespace(
+-        cast_rows=lambda r: (cast_called.append(r is fallback_rows), None)[1]
+-    )
+-    with kernels.sp_moe_inputs(
+-        sp_fallback, x, None, ffn, input_ids, mhc_fallback
+-    ) as rows:
+-        assert rows is fallback_rows
+-    assert cast_called == [True]
++    with pytest.raises(ValueError, match="router with route_local"):
++        with kernels.sp_moe_inputs(fake_sp_rows, x, x_q, ffn_no_router, input_ids):
++            pytest.fail("missing router entered the MoE body")
+ 
+ 
+ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatch):
+@@ -818,20 +796,43 @@ class _Mix:
+         mix = residual.new_zeros((rows, 4))
+         mix[:, 0] = 0.75
+         mix[:, 1] = 0.25
++        normalized = residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5
+         return (
+             residual,
+             residual.new_full((rows, 4), 0.25),
+             torch.eye(4).expand(rows, 4, 4),
+-            residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5,
++            normalized,
+             mix,
+-            None,  # no MXFP8 cast: the stand-in projections take any rows
++            self.cast_rows(normalized),
+         )
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+         return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
+ 
+     def cast_rows(self, rows):
+-        return None
++        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++        # The CPU projections read real-valued rows. Carry the same cast
++        # interface as mHC; actual packed-byte math has separate kernel tests.
++        return MXFP8Rows(
++            rows,
++            torch.zeros_like(rows, dtype=torch.uint8),
++            torch.zeros((rows.shape[0], 1), dtype=torch.uint8),
++        )
++
++
++def _simulated_mxfp8_gather(layout, x_q, *extra):
++    # Match the grouped cast-and-route gather contract, while CPU stand-in
++    # projections consume the gathered real-valued rows instead of GPU bytes.
++    rows, *gathered = layout.gather_many(x_q.rows, *extra)
++    return (_Mix().cast_rows(rows), *gathered)
++
++
++def _cpu_route_local(x, layout, *, input_ids=None):
++    return (
++        torch.ones((x.shape[0], 1), dtype=torch.float32),
++        torch.zeros((x.shape[0], 1), dtype=torch.int64),
++    )
+ 
+ 
+ def _partial(world, rows, result):
+@@ -869,6 +870,9 @@ class _Experts(nn.Module):
+     def __init__(self, world):
+         super().__init__()
+         self.world = world
++        self.experts = SimpleNamespace(
++            router=SimpleNamespace(route_local=_cpu_route_local)
++        )
+ 
+     def forward(self, hidden, ids, *, reduce_scatter_rows=None):
+         result = hidden * 0.25 + hidden.sum(dim=0) * 0.01 + ids[:, None].float() * 0.02
+@@ -922,6 +926,9 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+     pytest.importorskip("b12x")
+     from vllm.models.deepseek_v4_1.nvidia import model as native
+ 
++    monkeypatch.setattr(
++        sp_prefill.SPRows, "gather_mxfp8", _simulated_mxfp8_gather
++    )
+     world = _World(3)
+     monkeypatch.setattr(
+         native,
+@@ -1002,6 +1009,9 @@ def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+     from vllm.models.deepseek_v4_1.nvidia import model as native
+     from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ 
++    monkeypatch.setattr(
++        sp_prefill.SPRows, "gather_mxfp8", _simulated_mxfp8_gather
++    )
+     world = _World(3)
+     monkeypatch.setattr(
+         native,
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 278257128c..0b920e0a67 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -113,40 +113,29 @@ def sp_moe_inputs(
+     x_q,
+     ffn: nn.Module,
+     input_ids: torch.Tensor | None,
+-    mhc: nn.Module | None = None,
+ ):
+-    """Gather the MoE sublayer's inputs across sequence-parallel ranks.
+-
+-    When ``mhc.post_pre`` already cast the rank's local rows into ``x_q``
+-    (``MXFP8Rows``), each rank routes its ``sp_rows.local_rows`` BF16 rows and
+-    all-gathers ``(x_q.values, x_q.scales, topk_weights, topk_ids)`` in one
+-    grouped collective, handing both the gathered MXFP8 cast and the gathered
+-    routes to ``ffn`` without all-gathering BF16 ``x`` or re-running
+-    ``mhc.cast_rows``. When ``x_q`` is None (mHC stand-ins in model tests),
+-    gathers BF16 ``x`` and falls back to ``mhc.cast_rows(rows)``.
++    """Route local rows and gather their producer's MXFP8 cast with the routes.
++
++    The mHC entry supplies the cast and the TileLang MoE router supplies
++    ``route_local``. Missing either is an invalid serving contract, rather than
++    a request to gather BF16 rows or route the whole gathered batch again.
+     """
+     if x_q is None:
+-        rows = sp_rows.gather(x)
+-        cast = None if mhc is None else mhc.cast_rows(rows)
+-        with mxfp8_inputs(cast):
+-            yield rows
+-        return
++        raise ValueError("DS4.1 SP MoE requires producer-provided MXFP8 rows")
++    router = getattr(getattr(ffn, "experts", None), "router", None)
++    route_local = getattr(router, "route_local", None)
++    if not callable(route_local):
++        raise ValueError("DS4.1 SP MoE requires a router with route_local")
++
+     from .tilelang.linear import provide_mxfp8
+     from .tilelang.router import provide_routes
+ 
+-    router = getattr(getattr(ffn, "experts", None), "router", None)
+-    route_local = getattr(router, "route_local", None)
+-    if callable(route_local):
+-        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+-        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
+-        with (
+-            provide_mxfp8(gathered_q),
+-            provide_routes(gathered_q.rows, weights, ids),
+-        ):
+-            yield gathered_q.rows
+-        return
+-    (gathered_q,) = sp_rows.gather_mxfp8(x_q)
+-    with provide_mxfp8(gathered_q):
++    weights, ids = route_local(x, sp_rows, input_ids=input_ids)
++    gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
++    with (
++        provide_mxfp8(gathered_q),
++        provide_routes(gathered_q.rows, weights, ids),
++    ):
+         yield gathered_q.rows
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 88663a15ba..4065eceae8 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -452,7 +452,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+             with (
+                 sp_prefill.activate(sp_rows),
+                 kernels.sp_moe_inputs(
+-                    sp_rows, x, x_q, self.ffn, input_ids, self.mhc
++                    sp_rows, x, x_q, self.ffn, input_ids
+                 ) as rows,
+             ):
+                 del x, x_q
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,177 @@
+Subject: [EXPERIMENT ONLY] Restore optional NVFP4 DSpark head choices
+
+Base: ecbfff36289d4a131169054702cf3eac384b7a4e.
+Rationale: preserve the removed Markov/drafter-head experiment separately from serving.
+Quality: changes draft-head arithmetic and ownership only when explicitly selected;
+acceptance, memory and performance require fresh qualification. Not in the serving series.
+Tests: unqualified experimental restoration; rebuild source identifiers before testing.
+Upstream status: local experiment, not submitted.
+
+diff --git a/tests/models/test_deepseek_v41_serving_contract.py b/tests/models/test_deepseek_v41_serving_contract.py
+index 2b0de56aed..4244efcac3 100644
+--- a/tests/models/test_deepseek_v41_serving_contract.py
++++ b/tests/models/test_deepseek_v41_serving_contract.py
+@@ -9,11 +9,7 @@ import pytest
+ from vllm import envs
+ from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
+ 
+-RETIRED = (
+-    "VLLM_DS41_ENGRAM_OVERLAP",
+-    "VLLM_DS41_MARKOV_NVFP4",
+-    "VLLM_DS41_DRAFT_NVFP4_HEAD",
+-)
++RETIRED = ("VLLM_DS41_ENGRAM_OVERLAP",)
+ 
+ 
+ @pytest.mark.parametrize("name", RETIRED)
+@@ -29,24 +25,3 @@ def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value
+ @pytest.mark.parametrize("name", RETIRED)
+ def test_retired_setting_is_not_an_environment_option(name):
+     assert name not in envs.environment_variables
+-
+-
+-def test_dspark_uses_the_targets_vocabulary_head(monkeypatch):
+-    from torch import nn
+-
+-    from vllm.models.deepseek_v4_1.nvidia import dspark
+-
+-    monkeypatch.setattr(dspark, "DSparkDeepseekV4Model", lambda **kwargs: nn.Identity())
+-    monkeypatch.setattr(dspark, "_linear_scale_param_name", lambda *args: "scale")
+-    monkeypatch.setattr(dspark, "LogitsProcessor", lambda size: SimpleNamespace(size=size))
+-    hf_config = SimpleNamespace(vocab_size=128, expert_dtype="fp4")
+-    config = SimpleNamespace(
+-        quant_config=None,
+-        speculative_config=SimpleNamespace(
+-            draft_model_config=SimpleNamespace(hf_config=hf_config)
+-        ),
+-    )
+-    draft = dspark.DSparkDeepseekV4ForCausalLM(vllm_config=config)
+-    assert draft.lm_head is None  # load_dspark_model aliases the target after loading
+-    assert not draft.has_own_lm_head
+-    assert draft.checkpoint_weight_name_prefixes == ("mtp.",)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index e23bac7fa0..8088e4f40a 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -219,6 +219,8 @@ if TYPE_CHECKING:
+     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
+     VLLM_MTP_NVFP4_LM_HEAD: bool = True
++    VLLM_DS41_MARKOV_NVFP4: bool = False
++    VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
+     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+@@ -1885,9 +1887,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+     ),
++    # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
++    # the GB10 L2; draft graph 3.57 -> 3.0 ms). Off until its effect on
++    # acceptance is measured.
++    "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
++        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "0"))
++    ),
++    # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
++    "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
++    ),
+     # Store the DeepSeek V4/V4.1 target vocabulary head (which the DSpark
+-    # drafter shares) in the exact 12-bit packed BF16 form: every weight bit
+-    # is kept, in 75% of the bytes.
++    # drafter shares when it has no head of its own) in B12X's exact 12-bit
++    # packed BF16 form: every weight bit is kept, in 75% of the bytes.
+     "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
+         int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
+     ),
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index f4418a69ca..305930597c 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -582,11 +582,7 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+ 
+     @staticmethod
+     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+-        retired_options = (
+-            "VLLM_DS41_ENGRAM_OVERLAP",
+-            "VLLM_DS41_MARKOV_NVFP4",
+-            "VLLM_DS41_DRAFT_NVFP4_HEAD",
+-        )
++        retired_options = ("VLLM_DS41_ENGRAM_OVERLAP",)
+         supplied = [name for name in retired_options if name in os.environ]
+         if supplied:
+             raise ValueError(
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index f30e29704e..112cf63d3f 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -17,6 +17,7 @@ import regex as re
+ import torch
+ import torch.nn as nn
+ 
++from vllm import envs
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed import (
+@@ -34,6 +35,7 @@ from vllm.model_executor.layers.logits_processor import (
+     _is_packed_head,
+     _is_plain_bf16_head,
+ )
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.qwen3_dspark import (
+     DSparkConfidenceHead,
+@@ -336,20 +338,26 @@ class DSparkDeepseekV4Model(nn.Module):
+         )
+ 
+         markov_quantization = (
+-            "packed_bf16"
+-            if current_vllm_config.kernel_config.linear_backend == "tilelang"
+-            and packed_bf16_supported(
+-                config.dspark_markov_rank, torch.get_default_dtype()
++            "nvfp4"
++            if envs.VLLM_DS41_MARKOV_NVFP4
++            else (
++                "packed_bf16"
++                if current_vllm_config.kernel_config.linear_backend == "tilelang"
++                and packed_bf16_supported(
++                    config.dspark_markov_rank, torch.get_default_dtype()
++                )
++                else None
+             )
+-            else None
+         )
+         self.markov_head = DSparkMarkovHead(
+             config.vocab_size,
+             draft_vocab_size,
+             config.dspark_markov_rank,
+             prefix=maybe_prefix(prefix, "markov_head"),
+-            # Pack the native BF16 transition head losslessly into 12 bits
+-            # per weight (75% of BF16 bytes) on the supported TileLang path.
++            # An NVFP4 transition head fits the GB10 L2, so the sequential
++            # draft positions after the first reread it from L2. On the
++            # TileLang path without NVFP4, pack the BF16 transition head
++            # losslessly into 12 bits per weight (75% of BF16 bytes).
+             lm_head_quantization=markov_quantization,
+             vocab_parallel=_vocab_parallel_greedy(),
+         )
+@@ -569,6 +577,19 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         # head otherwise remains on meta and cannot be natively precompiled.
+         self.lm_head: nn.Module | None = None
+         self.logits_processor = LogitsProcessor(self.config.vocab_size)
++        if envs.VLLM_DS41_DRAFT_NVFP4_HEAD:
++            # A drafter-owned NVFP4 vocabulary head reads half the bytes of
++            # the shared MXFP8 target head; only draft acceptance depends on it.
++            head = ParallelLMHead(
++                self.config.vocab_size,
++                self.config.hidden_size,
++                prefix=maybe_prefix(prefix, "lm_head"),
++                lm_head_quantization="nvfp4",
++            )
++            if head.runtime_lm_head_quantization == "nvfp4":
++                self.lm_head = head
++                self.has_own_lm_head = True
++                self.checkpoint_weight_name_prefixes = ("mtp.", "head.")
+ 
+     # --- Hooks used by the speculator -------------------------------------
+ 

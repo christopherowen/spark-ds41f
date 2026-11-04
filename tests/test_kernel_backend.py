@@ -310,6 +310,25 @@ class KernelBackendTest(unittest.TestCase):
             spark.topology.set_argument(changed, flag, kernel_backend.BACKENDS["b12x"][flag])
             self.assertTrue(any(flag in e for e in kernel_backend.problems(changed)))
 
+    def test_serving_contract_refuses_retired_settings_only_for_new_sources(self):
+        cluster, lock, manifest, _ = self.ready()
+        for name in kernel_backend.RETIRED_SERVING_ENVIRONMENT:
+            cluster["environment"].pop(name, None)
+        for name in kernel_backend.RETIRED_SERVING_ENVIRONMENT:
+            for value in ("0", "1"):
+                with self.subTest(name=name, value=value):
+                    changed = copy.deepcopy(cluster)
+                    changed["environment"][name] = value
+                    old_errors = kernel_backend.source_problems(changed, lock, manifest)
+                    self.assertFalse(any(name in error for error in old_errors))
+                    current = copy.deepcopy(manifest)
+                    current["vllm"]["capabilities"].append(kernel_backend.SERVING_CONTRACT)
+                    errors = kernel_backend.source_problems(changed, lock, current)
+                    self.assertTrue(any(name in error and "retired" in error for error in errors))
+                    changed["environment"].pop(name)
+                    errors = kernel_backend.source_problems(changed, lock, current)
+                    self.assertFalse(any("retired" in error for error in errors))
+
     def test_missing_capability_fails(self):
         cluster, lock, manifest, patch = self.ready()
         manifest["vllm"]["capabilities"] = []

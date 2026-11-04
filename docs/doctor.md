@@ -14,6 +14,13 @@ bin/spark --shape tp3-triangle doctor  # the recipe at another shape
 
 ## Modes
 
+A candidate whose vLLM manifest records `ds41-serving-contract` rejects
+`VLLM_DS41_ENGRAM_OVERLAP`, `VLLM_DS41_MARKOV_NVFP4` and
+`VLLM_DS41_DRAFT_NVFP4_HEAD`, including explicit `0` values. The first setting
+has no consumer; the NVFP4 head choices are kept as an unselected experiment.
+The candidate's vLLM startup rejects them too. Older frozen source recipes keep
+their own option support.
+
 | Command | Runs where | Needs | Checks |
 | --- | --- | --- | --- |
 | `bin/spark doctor` | any checkout (CI runs it) | nothing outside the repository | [configuration](#configuration-checks) |

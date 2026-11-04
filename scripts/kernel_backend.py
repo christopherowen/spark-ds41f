@@ -45,6 +45,14 @@ CAPABILITY = "tilelang-kernels"
 # A vLLM series whose DS4.1 model has no kernel-family switch: TileLang is its only
 # family and VLLM_DS41_KERNEL_BACKEND is gone.
 TILELANG_ONLY = "tilelang-only"
+# New DS4.1 series keep one serving contract; older frozen sources may still
+# implement these settings and retain their original configuration behavior.
+SERVING_CONTRACT = "ds41-serving-contract"
+RETIRED_SERVING_ENVIRONMENT = (
+    "VLLM_DS41_ENGRAM_OVERLAP",
+    "VLLM_DS41_MARKOV_NVFP4",
+    "VLLM_DS41_DRAFT_NVFP4_HEAD",
+)
 
 
 def backend(cluster: dict) -> str:
@@ -103,6 +111,13 @@ def source_problems(cluster: dict, upstreams: dict, manifest: dict) -> list[str]
             errors.append(f"kernel_backend tilelang requires source {name} in its upstreams lock")
     vllm = manifest.get("vllm", {})
     capabilities = vllm.get("capabilities", [])
+    if SERVING_CONTRACT in capabilities:
+        for name in RETIRED_SERVING_ENVIRONMENT:
+            if name in cluster.get("environment", {}):
+                errors.append(
+                    f"{name} is retired in this vLLM series "
+                    f"(capability {SERVING_CONTRACT}); drop it from the environment"
+                )
     if CAPABILITY not in capabilities:
         errors.append(f"kernel_backend tilelang requires a vLLM source manifest with capability {CAPABILITY}")
     value = cluster.get("environment", {}).get(ENVIRONMENT)
