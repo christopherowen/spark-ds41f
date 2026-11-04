@@ -1,5 +1,16 @@
 # Semantic indexer search
 
+Result: **retain as research; no faster runtime qualified**. The completed
+[two-process screen](results.md) preserves native selections on all twelve
+captured operands, including source block IDs/counts and subsequent reindex.
+With a practical native seed cutoff and seed reuse, semantic shape bounds avoid
+41.74–84.61% of key evaluations on the nine dense snapshots, but only0.15% on the
+three source snapshots. Those source queries repeat across ranks. This is work
+accounting from an untimed oracle, not a TileLang runtime or request-speed result.
+Full shapes have substantially more metadata/query work than native packed keys.
+The cheap compact maps tested here do not provide useful pruning. See
+[the decision](decision.md) before extending this experiment.
+
 Base: `310f1408c1ace65c462d367ce6cb1fc5640d0c5e`.
 
 This experiment tests the interaction between individual-key semantic grouping
@@ -73,3 +84,21 @@ all four files per run. No GPU run was lost or repeated for this client error.
 
 Status: useful pruning observed in a diagnostic, but no kernel speedup or serving
 qualification established. No runtime or upstream source changes in this step.
+
+The sp5–sp7 window completed all seven jobs and restored C37 on every node at
+18:38:25UTC (19:38:25CET). Independent live checks confirm the original C37 image,
+no search mounts/environment, unchanged clean original806c5797 checkouts, clean
+configured experiment checkouts at3b8397f0, and no reservations. Deployment
+metadata advanced coherently to that commit; image/model/settings did not change.
+Minimum available host memory114732613632 bytes, maximum thermal59.7C; no GPU
+job, memory guard or lease failed. Exact commands and all observations are in
+`runs/semantic-window-01`. Thirty local CPU math cases and two poor-proposal
+witness cases also pass. Native hardware gates remain separate from CPU checks.
+
+`query-map-cpu-01` retains the initial rank-only holdout, including its misleading
+source result. The source query is byte-identical to its fitting inputs and is
+excluded from acceptance. `query-map-cpu-02` explicitly refuses that overlap;
+its distinct dense queries still retain every key through64 dimensions. Both
+CPU analyses ran read-only, with two CPU threads, inside our isolated correctness
+container; neither launched CUDA work nor wrote source files. These are idea
+screens, not independently sampled model-quality or GPU gates.

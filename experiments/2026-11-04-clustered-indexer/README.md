@@ -1,5 +1,11 @@
 # Exact clustered indexer search
 
+The follow-up [semantic search screen](../2026-11-04-semantic-indexer/results.md)
+now prunes real dense inputs while preserving native selection/source/reindex
+gates. Its practical dense work reduction is41.74–84.61%, but full-shape metadata
+is expensive and the source layer barely prunes. This does not overturn the
+request-performance rejection below; no faster serving implementation is qualified.
+
 Status: **experimental; current grouping rejected for serving integration**.
 [Native-input evidence](native-input-results.json) contains 12 actual C36 operands
 from three ranks and layers2/8/14/source20. Two fresh sp8 processes preserve

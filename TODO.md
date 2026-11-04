@@ -745,6 +745,10 @@ alternative. The decode-kernel comparison is in
   cold-source-prefill latency14.5/34.4%. Twelve saved real operands prune0%.
   Do not repeat this grouping without a different exact bound and a measured
   real-input reason; synthetic prototype gains did not become request gains.
+  The [semantic follow-up](experiments/2026-11-04-semantic-indexer/results.md)
+  qualifies practical dense pruning with unchanged native selections, but its
+  full-shape metadata is expensive, compact maps lose pruning, and the source
+  handoff retains99.85% of keys. No new request-speed claim or promotion follows.
 
 Don't repeat these without a new reason:
 
