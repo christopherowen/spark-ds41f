@@ -90,6 +90,12 @@ scripts/lab.py run experiments/2026-11-04-lossless-memory/engram/release-tp3.jso
 scripts/lab.py window close
 ```
 
+Each serving arm also has an `image.json` plan that builds once on dgx1 and
+copies that image over the verified direct-peer SSH links. Expected host public
+keys were read through the existing trusted management connections before
+installing their direct-address aliases; no private key or credential enters Git.
+The planned routes are dgx1 to `10.12.2.2`, then dgx2 to `10.23.2.3`.
+
 These commands are **not** a request to execute before those guards are met.
 Screen one variable at a time and stop its progression on a failed exactness
 gate, an unqualified memory condition or an unfavorable timing result.

@@ -11,8 +11,10 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import resource
 import statistics
 import sys
+import time
 import traceback
 
 from collect_weights import collect, family
@@ -46,9 +48,15 @@ def main():
         result["device"] = torch.cuda.get_device_name()
         result["torch"] = torch.__version__
         result["cuda"] = torch.version.cuda
+        result["device_total_memory_bytes"] = torch.cuda.get_device_properties(0).total_memory
         source = Path(__file__).with_suffix(".cu")
         result["cuda_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
         result["frame_source_sha256"] = hashlib.sha256(Path(__file__).with_name("fp8_probe_frame.py").read_bytes()).hexdigest()
+        result["sources_sha256"] = {
+            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in ("fp8_probe.py", "fp8_probe.cu", "fp8_probe_frame.py",
+                         "collect_weights.py", "memory_codec.py")
+        }
         dataset = collect(args.snapshot, args.revision, 24, 2)
         samples = [s for s in dataset["samples"] if family(s["name"]) != "engram_table"]
         raw_samples = [base64.b64decode(s["data_base64"], validate=True) for s in samples]
@@ -65,8 +73,8 @@ def main():
         count = args.mib * 1024 * 1024 // TILE_BYTES
         raw_frames = [Tile(0, args.lanes, raw) for raw in raw_samples]
 
-        def upload(items):
-            selected = [items[i % len(items)] for i in range(count)]
+        def upload(items, num_tiles=count):
+            selected = [items[i % len(items)] for i in range(num_tiles)]
             offsets, stream_offsets, payload = [], [], bytearray()
             for frame in selected:
                 offsets.append(len(payload))
@@ -80,14 +88,28 @@ def main():
                 torch.frombuffer(bytearray(b"".join(f.quick if f.mode else bytes(512) for f in selected)), dtype=torch.uint16).cuda(),
                 torch.tensor(stream_offsets, dtype=torch.int32, device="cuda"),
                 torch.tensor([f.mode for f in selected], dtype=torch.uint8, device="cuda"),
-                torch.empty(count * TILE_BYTES, dtype=torch.uint8, device="cuda"),
-                torch.empty(count, dtype=torch.int32, device="cuda"),
+                torch.empty(num_tiles * TILE_BYTES, dtype=torch.uint8, device="cuda"),
+                torch.empty(num_tiles, dtype=torch.int32, device="cuda"),
             ]
             return tensors
 
         module = load(name="lossless_fp8_" + result["cuda_source_sha256"][:12],
                       sources=[str(source)], extra_cflags=["-O3"],
                       extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+        counts = [8191] + [4096 >> i for i in range(13)] + [1, 1]
+        fixtures = [b"\x30" * (TILE_BYTES - 256) + bytes(range(256)),
+                    b"".join(bytes([i << 3]) * n for i, n in enumerate(counts))]
+        fixture_frames = [pack(raw, args.lanes) for raw in fixtures]
+        if any(frame.mode != 1 or unpack(frame) != raw
+               for frame, raw in zip(fixture_frames, fixtures)):
+            raise ValueError("GPU validation fixtures must use exact compressed streams")
+        oracle = upload(fixture_frames, len(fixtures))
+        module.run(*oracle, args.lanes, False)
+        if oracle[-2].cpu().numpy().tobytes() != b"".join(fixtures):
+            raise ValueError("GPU decoder changed a special encoding or long Huffman code")
+        result["gpu_all_encodings_and_long_codes_exact"] = True
+        result["gpu_validation_fixtures"] = [hashlib.sha256(raw).hexdigest() for raw in fixtures]
+        del oracle
         cases = {"raw": upload(raw_frames), "encoded": upload(frames)}
         for values in cases.values():
             module.run(*values, args.lanes, False)
@@ -121,6 +143,12 @@ def main():
         torch.cuda.synchronize()
         if not torch.equal(cases["raw"][-1], cases["encoded"][-1]):
             raise ValueError("shared-memory byte consumers disagree")
+        warmup = time.monotonic()
+        while time.monotonic() - warmup < 2:
+            for graph in graphs.values():
+                graph.replay()
+            torch.cuda.synchronize()
+        result["alternating_warmup_seconds"] = time.monotonic() - warmup
         observations = {name: [] for name in cases}
         order = [name for _ in range(args.rounds) for name in cases]
         random.Random(41).shuffle(order)
@@ -142,6 +170,8 @@ def main():
         result["status"] = "failed"
         result["error"] = f"{type(error).__name__}: {error}"
         result["traceback"] = traceback.format_exc()
+    result["host_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    result["compiler_children_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     with args.out.open("x") as out:
         json.dump(result, out, indent=2)
         out.write("\n")
