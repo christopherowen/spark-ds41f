@@ -169,3 +169,18 @@ No serving start, stop, restart or cluster sync was performed. Foreign requests
 were preserved. Real-input capture/replay remains pending; its prepared hook
 has not run. Full image build inputs are absent locally; `build check` reports
 that the build tree is not prepared. No image was rebuilt or modified.
+
+## Prepared envelope resource change
+
+`vllm/0003-stream-envelope.patch` changes one causal variable: the envelope
+reduction's register state. It streams the same visible keys with two endpoints
+per coordinate instead of materializing two 64-by-128 fragments. The decoder,
+unsupported-scale handling, bounds, scorer, threshold and tie order are unchanged.
+This remains a complete snapshot rebuild, with no persistent metadata.
+
+`resource-layout.json` records its base and gates. Hardware results above belong
+to the preceding reduction at their published commits and do not qualify this
+candidate. The harness now compares both interval endpoints against a frozen
+copy of that reduction before timing, then runs all existing exact-selection
+checks. `graph-profile` uses a new trace label to preserve earlier evidence.
+The first two fresh runs, graph replays and sanitizer checks remain pending.

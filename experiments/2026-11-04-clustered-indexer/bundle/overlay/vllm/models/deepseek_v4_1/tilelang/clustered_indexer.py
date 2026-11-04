@@ -54,25 +54,27 @@ def cluster_envelopes(width: int, page_size: int):
         Upper: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
     ):
         with T.Kernel(clusters, rows, threads=128) as (cluster, row):
-            lo = T.alloc_fragment([CLUSTER, INDEX_DIM], T.float32)
-            hi = T.alloc_fragment([CLUSTER, INDEX_DIM], T.float32)
+            # One coordinate per lane. Streaming over positions keeps just two
+            # endpoints live instead of two 64x128 reduction fragments.
             lmin = T.alloc_fragment([INDEX_DIM], T.float32)
             hmax = T.alloc_fragment([INDEX_DIM], T.float32)
             extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
-            for p, d in T.Parallel(CLUSTER, INDEX_DIM):
+            for d in T.Parallel(INDEX_DIM):
+                lmin[d] = T.infinity(T.float32)
+                hmax[d] = -T.infinity(T.float32)
+            for p in T.serial(CLUSTER):
                 pos = cluster * CLUSTER + p
-                lo[p, d] = T.infinity(T.float32)
-                hi[p, d] = -T.infinity(T.float32)
                 if pos < extent:
-                    physical = Table[row, pos // page_size]
-                    offset = pos % page_size
-                    scale = Pool[physical, page_size * 64 + offset * 4 + d // 32]
-                    value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)
-                    valid = (scale >= MIN_SCALE) & (scale <= MAX_SCALE)
-                    lo[p, d] = T.if_then_else(valid, value, -T.infinity(T.float32))
-                    hi[p, d] = T.if_then_else(valid, value, T.infinity(T.float32))
-            T.reduce_min(lo, lmin, dim=0)
-            T.reduce_max(hi, hmax, dim=0)
+                    for d in T.Parallel(INDEX_DIM):
+                        physical = Table[row, pos // page_size]
+                        offset = pos % page_size
+                        scale = Pool[physical, page_size * 64 + offset * 4 + d // 32]
+                        value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)
+                        valid = (scale >= MIN_SCALE) & (scale <= MAX_SCALE)
+                        lmin[d] = T.min(lmin[d], T.if_then_else(
+                            valid, value, -T.infinity(T.float32)))
+                        hmax[d] = T.max(hmax[d], T.if_then_else(
+                            valid, value, T.infinity(T.float32)))
             for d in T.Parallel(INDEX_DIM):
                 Lower[row, cluster, d] = lmin[d]
                 Upper[row, cluster, d] = hmax[d]

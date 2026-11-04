@@ -9,6 +9,7 @@ import traceback
 import torch
 from vllm.models.deepseek_v4_1.tilelang.clustered_indexer import ClusteredIndexerPlan
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan, page_bytes
+from envelope_reference import reference_envelopes
 
 
 def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
@@ -70,6 +71,18 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
     actual, evidence = candidate.run(*args)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # Resource-layout change only: audit both interval endpoints against the
+    # frozen previous reduction. Neither implementation is timed here.
+    shape = (len(extents), width // 64, 128)
+    lower = torch.empty(shape, dtype=torch.float32, device='cuda')
+    upper = torch.empty_like(lower)
+    old_lower, old_upper = torch.empty_like(lower), torch.empty_like(lower)
+    envelope_args = (args[3][:, :page_bytes(256)], args[4], args[5], args[6])
+    candidate.envelope(*envelope_args, lower, upper)
+    reference_envelopes(width, 256)(*envelope_args, old_lower, old_upper)
+    torch.testing.assert_close(lower, old_lower, atol=0, rtol=0)
+    torch.testing.assert_close(upper, old_upper, atol=0, rtol=0)
+    del lower, upper, old_lower, old_upper
     # The scorer intentionally leaves scores past each extent unwritten. Copy
     # only the visible slice, including when initcheck tracks CUDA copies.
     score_cpu = [scores[r, :extent].cpu() for r, extent in enumerate(extents)]
@@ -153,6 +166,7 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
         print(profiler.key_averages().table(
             sort_by='self_device_time_total', row_limit=40), flush=True)
     return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
+            'envelopes_identical': True,
             'unwritten_cache': unwritten_cache,
             'execution': 'cuda-graph' if cuda_graph else 'eager',
             'graph_dynamic_counts_identical': True if cuda_graph else None,
