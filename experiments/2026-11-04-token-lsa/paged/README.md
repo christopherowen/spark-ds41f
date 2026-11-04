@@ -43,3 +43,18 @@ Each point charges its first cold request to the measured boot, followed by thre
 explicit same-prompt cache repeats. Both arms must report actual cache-hit usage,
 output counts and response digests; no cold request is relabeled as cached. This
 small synthetic screen does not qualify production-agent quality or throughput.
+
+The first serving trial is **rejected** by the raw-token gate. All six short
+requests match, while the32768/131072/262144-token notebooks first differ at
+zero-based generated-token indices15/9/73. Length128 and termination match but
+are insufficient. No quality superiority has been established. The controller
+stops before candidate performance measurement or further boots, preserves the
+native control measurements, and restores C37 at20:48:50UTC. Independent
+three-node restoration/clean-checkout/no-reservation evidence is retained.
+See `../runs/paged-serving-01/token-divergence.json`. No request-speedup claim.
+
+The direct candidate-construction follow-up preserves the existing selector's
+ordered keys/counts/padding. It visits only selected pages and replaces three
+full-context scan/prefix/scatter launches with one page-local compaction launch.
+It does not repair the failed selector's token fidelity. Separate candidate-list,
+graph, owner-remap and native-lifecycle gates precede any timing or serving use.

@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Construct the same ordered candidate list without scanning the full context.
+
+Only selected pages are read. At most four buckets share a page; a warp orders
+their native blocks with one short page-local scan. Output candidates, forced
+last block and padding retain the page-shortlist contract exactly.
+"""
+import math
+
+import tilelang
+import tilelang.language as T
+import torch
+
+from . import prepare
+from .indexer import IndexerV41Plan, IndexerTopK, CANDIDATE_BLOCKS, CANDIDATE_BLOCK
+from .paged_shortlist import PageShortlistPlan, page_scores, STATE_BYTES, ROW_CAP
+from .shortlist_indexer import BUCKET, BLOCK, remap_blocks
+
+
+@tilelang.jit
+def direct_candidates(width: int, page: int, budget: int):
+    rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
+    blocks, buckets = page//BLOCK, page//BUCKET
+    capacity = (budget+8)*BUCKET//BLOCK
+    ctas = min(budget,128)
+
+    @T.prim_func
+    def compact(Selected: T.Tensor([rows,budget],T.int32),
+                Pool: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.uint8),
+                Table: T.Tensor([rows,width//page],T.int32), Length: T.Tensor([rows],T.int32),
+                Active: T.Tensor([1],T.int32), Candidates: T.Tensor([rows,capacity],T.int32),
+                CandidateLength: T.Tensor([rows],T.int32)):
+        with T.Kernel(ctas,rows,threads=32) as (cta,row):
+            search = T.alloc_local([2],T.int32)
+            mask = T.alloc_local([1],T.int32)
+            first = T.alloc_local([1],T.int32)
+            last_present = T.alloc_local([1],T.int32)
+            membership = T.alloc_fragment([blocks],T.int32)
+            keep = T.alloc_fragment([blocks],T.int32)
+            ordered = T.alloc_fragment([blocks],T.int32)
+            extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
+            visible = T.ceildiv(extent,BLOCK)
+            complete = extent//page*blocks
+            partial = visible-complete
+            # Native selection is ascending valid IDs followed by -1 padding.
+            search[0] = 0
+            search[1] = budget
+            for step in T.serial(budget.bit_length()):
+                if search[0] < search[1]:
+                    middle = (search[0]+search[1])//2
+                    if Selected[row,middle] < 0:
+                        search[1] = middle
+                    else:
+                        search[0] = middle+1
+            used = search[0]
+            if cta == 0:
+                last_present[0] = 0
+                if (extent > 0) & (partial == 0):
+                    last_bucket = ((extent-1)//page)*buckets+T.cast(
+                        Pool[Table[row,(extent-1)//page],page*72+blocks-1],T.int32)
+                    for j in T.serial(buckets):
+                        if used > j:
+                            last_present[0] = T.max(last_present[0],
+                                T.cast(Selected[row,used-1-j] == last_bucket,T.int32))
+                extra = T.cast((extent > 0) & (partial == 0) & (last_present[0] == 0),T.int32)
+                total = used*8+partial+extra
+                # Only this disjoint tail/padding range is written by CTA0.
+                for iteration in T.serial(T.ceildiv(capacity-used*8,32)):
+                    for i in T.Parallel(32):
+                        position = used*8+iteration*32+i
+                        if position < capacity:
+                            Candidates[row,position] = -1
+                            if position < total:
+                                Candidates[row,position] = T.if_then_else(partial > 0,
+                                    complete+position-used*8,visible-1)
+                if T.get_thread_binding() == 0:
+                    CandidateLength[row] = total*BLOCK-T.if_then_else(
+                        extent > 0,(BLOCK-extent%BLOCK)%BLOCK,0)
+            for iteration in T.serial(T.ceildiv(T.max(used-cta,0),ctas)):
+                slot = cta+iteration*ctas
+                selected = Selected[row,slot]
+                logical_page = selected//buckets
+                local_bucket = selected%buckets
+                physical = Table[row,logical_page]
+                mask[0] = 0
+                first[0] = slot
+                # All selected siblings lie within buckets-1 adjacent slots.
+                for delta in T.serial(-(buckets-1),buckets):
+                    neighbor = slot+delta
+                    if (neighbor >= 0) & (neighbor < used):
+                        sibling = Selected[row,neighbor]
+                        if sibling//buckets == logical_page:
+                            mask[0] = mask[0] | (1 << (sibling%buckets))
+                            first[0] = T.min(first[0],neighbor)
+                for block in T.Parallel(blocks):
+                    membership[block] = T.cast(Pool[physical,page*72+block],T.int32)
+                    keep[block] = T.cast((mask[0] & (1 << membership[block])) != 0,T.int32)
+                T.cumsum(keep,ordered,dim=0)
+                for block in T.Parallel(blocks):
+                    if membership[block] == local_bucket:
+                        Candidates[row,first[0]*8+ordered[block]-1] = logical_page*blocks+block
+    return compact
+
+
+class DirectPageShortlistPlan(PageShortlistPlan):
+    def __init__(self,width,page,*,candidate_blocks=False,budget=None):
+        self.width,self.page,self.source = width,page,candidate_blocks
+        self.budget = budget or (512 if candidate_blocks else 64)
+        self.capacity = (self.budget+8)*BUCKET
+        self.score = page_scores(width,page)
+        self.coarse = IndexerTopK(width//BUCKET,self.budget)
+        self.compact = direct_candidates(width,page,self.budget)
+        self.final = IndexerV41Plan(self.capacity,page,candidates=True)
+        if self.source:
+            self.select_blocks = IndexerTopK(self.capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK)
+            self.remap = remap_blocks(self.capacity)
+
+    @staticmethod
+    def calls(width,page,*,candidate_blocks=False,budget=None):
+        from .paged_shortlist import page_flags
+        from .shortlist_indexer import shortlist_prefix,shortlist_scatter
+        calls = PageShortlistPlan.calls(width,page,candidate_blocks=candidate_blocks,budget=budget)
+        calls = [call for call in calls if call[0] not in (page_flags,shortlist_prefix,shortlist_scatter)]
+        return [*calls,prepare.call(direct_candidates,width,page,budget or (512 if candidate_blocks else 64))]
+
+    def _specs(self,rows):
+        return {name:spec for name,spec in super()._specs(rows).items()
+                if name not in ('local','tile_counts','bases')}
+
+    def run(self,q,scales,weights,pool,table,lengths,active,candidates=None,candidate_lengths=None,
+            *,out=None,candidate_out=None,candidate_out_lengths=None,scratch=None):
+        if candidates is not None or candidate_lengths is not None:
+            raise ValueError('page shortlist cannot consume reindex candidates')
+        if out is None or scratch is None:
+            raise ValueError('serving must reserve outputs and workspace before profiling')
+        if self.source and (candidate_out is None or candidate_out_lengths is None):
+            raise ValueError('source shortlist requires handoff outputs')
+        rows = q.shape[0]
+        specs = self._specs(rows)
+        if len(scratch) != len(specs):
+            raise ValueError('shortlist workspace differs from admission reservation')
+        full = dict(zip(specs,scratch))
+        def buffers(name,plan,b):
+            return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
+        for start in range(0,rows,ROW_CAP):
+            end = min(start+ROW_CAP,rows)
+            r = end-start
+            current = self._specs(r)
+            b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0])
+                 for name,t in full.items()}
+            qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
+            self.score(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,
+                       pool.view(torch.bfloat16),tr,lr,active,b['scores'],b['counts'])
+            self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],
+                            scratch=buffers('coarse',self.coarse,b))
+            self.compact(b['selected'],pool,tr,lr,active,b['candidates'],b['candidate_lengths'])
+            _,scores = self.final.run(qr,sr,wr,pool,tr,lr,active,b['candidates'],b['candidate_lengths'],
+                                     out=out[start:end],scratch=buffers('final',self.final,b))
+            if self.source:
+                self.select_blocks.run(scores,b['candidate_lengths'],active,b['compact'],b['block_values'],
+                    counts=candidate_out_lengths[start:end],scratch=buffers('blocks',self.select_blocks,b))
+                self.remap(b['compact'],b['candidates'],candidate_out[start:end])
+        return out,None
