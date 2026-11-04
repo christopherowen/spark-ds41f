@@ -13,6 +13,7 @@ parser.add_argument("--large", action="store_true")
 parser.add_argument("--out", required=True)
 parser.add_argument("--wait-file")
 parser.add_argument("--no-finalize", action="store_true")
+parser.add_argument("--repeat", type=int, default=1)
 args = parser.parse_args()
 out = Path(args.out)
 out.mkdir(parents=True, exist_ok=True)
@@ -56,7 +57,9 @@ elif args.operation == "tile":
     k = 5120 if args.large else 512
     weights = torch.full((E, N, k // 2), 0x33, device="cuda", dtype=torch.int8)
     stage("tile-inputs")
-    result, tail = tile_expert_weights(weights, 32)
+    for iteration in range(args.repeat):
+        result, tail = tile_expert_weights(weights, 32)
+        stage("tile-iteration-" + str(iteration + 1))
     stage("tile-complete")
     assert tail is None
     assert result.numel() == weights.numel()
