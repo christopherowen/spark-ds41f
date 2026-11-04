@@ -22,14 +22,23 @@ BUILD_ROOT = "/home/swank/projects/spark-ds41f-copy-default"
 
 
 def main():
+    global OUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--attempt", type=int, default=1)
     args = parser.parse_args()
+    if args.attempt < 1:
+        parser.error("attempt must be positive")
+    if args.attempt > 1:
+        OUT = OUT.with_name(OUT.name + f"-attempt-{args.attempt}")
     if not args.apply:
-        print(json.dumps({"restore": RESTORE, "candidate": CANDIDATE, "build_host": "dgx4", "serving_nodes": ["dgx1", "dgx2", "dgx3"], "specs": ["functional.json", "performance.json"], "output": str(OUT), "shape_change": False}, indent=2))
+        print(json.dumps({"restore": RESTORE, "candidate": CANDIDATE, "build_host": "dgx4", "serving_nodes": ["dgx1", "dgx2", "dgx3"], "specs": ["functional.json", "performance.json"], "output": str(OUT), "attempt": args.attempt, "shape_change": False}, indent=2))
         return 0
-    if os.uname().nodename != "dgx1" or OUT.exists() or lab.read_hold():
-        raise SystemExit("wrong host, prior receipts or an existing reservation; do not duplicate")
+    if os.uname().nodename != "dgx1" or OUT.exists() or lab.read_hold() or lab.REQUEST.exists() or lab.LEGACY_REQUEST.exists():
+        raise SystemExit("wrong host, prior receipts, existing reservation or pending request; defer without duplicating")
+    for previous in (ROOT / "results/private/lab").glob("candidate-39-round*/receipt.json"):
+        if json.loads(previous.read_text()).get("steps"):
+            raise SystemExit("a prior phase started; retain it and review before another round")
     lab.PRODUCTION_CONFIG = RESTORE
     lab.window_open(0, "owner-authorized candidate-39 defaults; GPU4 build/gate and TP3 repeat metrics")
     window = lab.read_hold()["window"]
