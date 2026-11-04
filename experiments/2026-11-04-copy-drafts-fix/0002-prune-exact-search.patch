@@ -1,0 +1,71 @@
+From 60f436c7c3665ccaad6f3442710f01641dd9aadd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 07:44:23 +0100
+Subject: [PATCH] perf(copy-drafts): stop exact suffix search after an
+ unbeatable warp hit
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus candidate-38 and the useful-continuation selection patch.
+
+Scan each warp in descending continuation priority. Once any lane finds the longest supported matching level, all remaining ends in that warp have lower priority at every level. Stop that warp with a full-mask vote; keep bounds and the loop condition uniform across all lanes, including a partial final pass. This avoids repeating dependent suffix comparisons through an entire repetitive history without bounding the search window or adding an index.
+
+Quality: exact equivalence to useful-continuation selection at every level; no draft policy, verification, arithmetic, state or allocation change. No new buffers or host synchronization. Tests: the preceding independent references and scan-boundary, graph, slot-reuse and output-invariance cases apply; hardware timing and correctness receipts are retained in the deployment experiment.
+
+Upstream status: local candidate, not submitted.
+---
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 26 ++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 190a839eba..6f9371bd81 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -14,6 +14,12 @@ reduction implements the rule without atomics, int64 packing or extra buffers.
+ Valid priorities never exceed the request length. Select and allocation decode
+ this priority using the same lookahead and the same step's length.
+ 
++The scan visits ends in descending priority: full continuations latest first,
++then short ones longest first. Each warp stops after any lane matches the
++longest level: that hit also matches every shorter level, and every unvisited
++end of the warp has lower priority. Other warps keep their own exact search.
++No history window or candidate is omitted unless it cannot improve the result.
++
+ ``copy_select`` updates the request's acceptance estimate and adaptive cap from
+ its verified live drafts, then proposes the chosen continuation up to the cap.
+ A fully accepted copy doubles the cap, up to the lookahead; a rejection resets
+@@ -103,9 +109,19 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+             T.sync_threads()
+             k0 = T.alloc_var(T.int32, init=key[0])
+             ends = T.max(length - min_match, 0)  # window ends min_match .. length - 1
+-            for k in T.serial(T.ceildiv(ends, span)):
+-                e = min_match + k * span + c * _MATCH_THREADS + tx
+-                if e < length:  # noqa: SIM102 - guard the history read
++            full = T.max(length - lookahead - min_match + 1, 0)
++            # Uniform per warp, including a partial final warp. Every lane must
++            # reach __any_sync with its full mask; only the history read is masked.
++            ordinal = T.alloc_var(T.int32, init=c * _MATCH_THREADS + (tx // 32) * 32)
++            searching = T.alloc_var(T.int32, init=1)
++            while ordinal < ends and searching != 0:
++                at = ordinal + tx % 32
++                e = T.if_then_else(
++                    at < full,
++                    length - lookahead - at,
++                    T.max(min_match, length - lookahead + 1) + at - full,
++                )
++                if at < ends:  # noqa: SIM102 - guard the history read
+                     if history[slot, e - 1] == k0:
+                         run = T.alloc_var(T.int32, init=1)
+                         # The shortest level first: most ends fail on its first token.
+@@ -127,6 +143,10 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                                     e <= length - lookahead, e + lookahead, length - e
+                                 )
+                                 best[i] = T.max(best[i], priority)
++                searching = 1 - T.call_extern(
++                    "int32", "__any_sync", T.uint32(0xFFFFFFFF), best[count - 1] >= 0
++                )
++                ordinal += span
+             for i in tuple(range(count)):
+                 for distance in (16, 8, 4, 2, 1):
+                     best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
+-- 
+2.54.0 (Apple Git-157)
+
