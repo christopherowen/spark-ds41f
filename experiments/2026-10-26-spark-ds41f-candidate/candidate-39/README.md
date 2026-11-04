@@ -14,7 +14,9 @@ under `experiments/2026-11-01-dspark-default-copy-drafts`; they do not qualify t
 rebased build. The core-metric protocol, hardware constraints and round order
 are in `experiments/2026-11-04-copy-default-screening/README.md`.
 
-Status: source preparation. No image, serving or performance qualification yet.
-Source identifiers are provisional until the fresh canonical Linux replay
-updates the lock and source manifest. No promoted configuration or immutable
+Status: canonical Linux source preparation passed, reproducing vLLM tree
+`8e33015b1fa1d34250e686db7d1f8061021d6d5a`, head
+`31412339aafdd2c1392c7294975355dbc523c5e1`. The full repository suite passes
+626 tests with hashed benchmark-client dependencies. No image, serving or
+performance qualification yet. No promoted configuration or immutable
 baseline is changed by this candidate.

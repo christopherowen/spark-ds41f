@@ -64,5 +64,28 @@ Source preparation and PR review only. No new GPU measurement has started.
 The fresh full vLLM preparation reproduced candidate-38 tree `c061e5f6` exactly;
 #842 applies without conflicts. The Mac partial-clone canonical lock replay
 failed on a missing intermediate local GLP blob. Its failure is retained in
-`runs/preflight/review.json`; canonical preparation will run in a fresh Linux
-checkout using the verified pinned object cache. No GPU result is inferred.
+`runs/preflight/review.json`; a first Linux cache-backed fetch also failed because its partial clone
+could not serve every promised object. A fresh direct fetch of the pinned
+upstream then completed the full canonical replay and preparation. All logs
+are retained. Both candidate profile doctors and 626 repository tests pass.
+No GPU result is inferred.
+
+## Guarded execution
+
+`run_round.py --apply`, launched once on DGX1 from the exact published clean
+commit on all serving ranks, opens the lab reservation against candidate-36.
+It maintains the heartbeat while `build_gate.py` builds and tests on idle DGX4.
+The builder uses cold-start, memory and thermal guards and keeps its original
+logs and per-file test outcomes. Only a passing image/gate receipt allows the
+same image digest to be seeded and distributed to DGX1–3. Then the functional
+spec and unchanged release/single-stream/sampled suites run with fresh repeat
+boots. The controller stops on a failed phase and restores candidate-36 once.
+Management loss is latched, preserves a hardware-review reservation and blocks
+a restoration launch even if a later probe recovers. No automatic retry replaces
+a failed run.
+
+Native controller receipt: `results/private/lab/candidate-39-round/receipt.json`
+on DGX1. Image/gate receipt: `results/private/candidate-rounds/candidate-39-image/receipt.json`
+in the clean DGX4 build worktree. Both scripts default to a read-only plan; no
+serving change is made by reading this experiment. Collect and analyze native
+exits, digests, conditions and both boots before a verdict or the next round.
