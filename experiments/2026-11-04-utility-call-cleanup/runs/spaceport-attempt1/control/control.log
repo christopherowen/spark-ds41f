@@ -1,0 +1,549 @@
+FFFFFFFFF....FFF.F.F                                                     [100%]
+=================================== FAILURES ===================================
+__________ test_async_utility_failure_releases_pending_future[encode] __________
+
+stage = 'encode'
+
+    @pytest.mark.parametrize("stage", ["encode", "send", "output_task"])
+    def test_async_utility_failure_releases_pending_future(stage):
+        async def run():
+            client = make_client(True, stage)
+            with pytest.raises((ValueError, RuntimeError), match="failed"):
+                await client.call_utility_async("echo", "payload")
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:80: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, stage)
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            await client.call_utility_async("echo", "payload")
+>       assert not client.utility_results
+E       assert not {2374632544792023537: <Future pending>}
+E        +  where {2374632544792023537: <Future pending>} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e61dcec0>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:78: AssertionError
+___________ test_async_utility_failure_releases_pending_future[send] ___________
+
+stage = 'send'
+
+    @pytest.mark.parametrize("stage", ["encode", "send", "output_task"])
+    def test_async_utility_failure_releases_pending_future(stage):
+        async def run():
+            client = make_client(True, stage)
+            with pytest.raises((ValueError, RuntimeError), match="failed"):
+                await client.call_utility_async("echo", "payload")
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:80: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, stage)
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            await client.call_utility_async("echo", "payload")
+>       assert not client.utility_results
+E       assert not {2375454013121958385: <Future pending>}
+E        +  where {2375454013121958385: <Future pending>} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e5158e90>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:78: AssertionError
+_______ test_async_utility_failure_releases_pending_future[output_task] ________
+
+stage = 'output_task'
+
+    @pytest.mark.parametrize("stage", ["encode", "send", "output_task"])
+    def test_async_utility_failure_releases_pending_future(stage):
+        async def run():
+            client = make_client(True, stage)
+            with pytest.raises((ValueError, RuntimeError), match="failed"):
+                await client.call_utility_async("echo", "payload")
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:80: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, stage)
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            await client.call_utility_async("echo", "payload")
+>       assert not client.utility_results
+E       assert not {2376076585811382769: <Future pending>}
+E        +  where {2376076585811382769: <Future pending>} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e51252b0>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:78: AssertionError
+__________ test_sync_utility_failure_releases_pending_future[encode] ___________
+
+stage = 'encode'
+
+    @pytest.mark.parametrize("stage", ["encode", "send"])
+    def test_sync_utility_failure_releases_pending_future(stage):
+        client = make_client(False, stage)
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            client.call_utility("echo", "payload")
+>       assert not client.utility_results
+E       assert not {2376701164250534385: <Future at 0xf632e51254c0 state=pending>}
+E        +  where {2376701164250534385: <Future at 0xf632e51254c0 state=pending>} = <vllm.v1.engine.core_client.SyncMPClient object at 0xf632e5126450>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:88: AssertionError
+___________ test_sync_utility_failure_releases_pending_future[send] ____________
+
+stage = 'send'
+
+    @pytest.mark.parametrize("stage", ["encode", "send"])
+    def test_sync_utility_failure_releases_pending_future(stage):
+        client = make_client(False, stage)
+        with pytest.raises((ValueError, RuntimeError), match="failed"):
+            client.call_utility("echo", "payload")
+>       assert not client.utility_results
+E       assert not {2376801121024414193: <Future at 0xf632e5126660 state=pending>}
+E        +  where {2376801121024414193: <Future at 0xf632e5126660 state=pending>} = <vllm.v1.engine.core_client.SyncMPClient object at 0xf632e5127080>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:88: AssertionError
+____ test_cancellation_releases_slot_and_late_reply_is_harmless[block_send] ____
+
+stage = 'block_send'
+
+    @pytest.mark.parametrize("stage", ["block_send", "wait_reply"])
+    def test_cancellation_releases_slot_and_late_reply_is_harmless(stage):
+        async def run():
+            client = make_client(True, stage)
+            task = asyncio.create_task(client.call_utility_async("echo"))
+            await asyncio.wait_for(client.entered.wait(), 2)
+            call_id = client.call_id
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not client.utility_results
+            _process_utility_output(reply(call_id), client.utility_results)
+            assert not client.utility_results
+            # A delayed response must not kill the output receiver or another call.
+            healthy = make_client(True)
+            healthy.utility_results = client.utility_results
+            assert await healthy.call_utility_async("echo") == "ok"
+            assert not healthy.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:110: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, stage)
+        task = asyncio.create_task(client.call_utility_async("echo"))
+        await asyncio.wait_for(client.entered.wait(), 2)
+        call_id = client.call_id
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+>       assert not client.utility_results
+E       assert not {2376902087115608561: <Future pending>}
+E        +  where {2376902087115608561: <Future pending>} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e5155d00>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:101: AssertionError
+____ test_cancellation_releases_slot_and_late_reply_is_harmless[wait_reply] ____
+
+stage = 'wait_reply'
+
+    @pytest.mark.parametrize("stage", ["block_send", "wait_reply"])
+    def test_cancellation_releases_slot_and_late_reply_is_harmless(stage):
+        async def run():
+            client = make_client(True, stage)
+            task = asyncio.create_task(client.call_utility_async("echo"))
+            await asyncio.wait_for(client.entered.wait(), 2)
+            call_id = client.call_id
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not client.utility_results
+            _process_utility_output(reply(call_id), client.utility_results)
+            assert not client.utility_results
+            # A delayed response must not kill the output receiver or another call.
+            healthy = make_client(True)
+            healthy.utility_results = client.utility_results
+            assert await healthy.call_utility_async("echo") == "ok"
+            assert not healthy.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:110: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, stage)
+        task = asyncio.create_task(client.call_utility_async("echo"))
+        await asyncio.wait_for(client.entered.wait(), 2)
+        call_id = client.call_id
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+>       assert not client.utility_results
+E       assert not {2377527004857176561: <Future cancelled>}
+E        +  where {2377527004857176561: <Future cancelled>} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e5127650>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:101: AssertionError
+_________ test_repeated_failed_utility_calls_do_not_accumulate[False] __________
+
+asynchronous = False
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    def test_repeated_failed_utility_calls_do_not_accumulate(asynchronous):
+        async def run():
+            client = make_client(asynchronous, "send")
+            for _ in range(64):
+                with pytest.raises(RuntimeError, match="send failed"):
+                    if asynchronous:
+                        await client.call_utility_async("echo")
+                    else:
+                        client.call_utility("echo")
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:125: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(asynchronous, "send")
+        for _ in range(64):
+            with pytest.raises(RuntimeError, match="send failed"):
+                if asynchronous:
+                    await client.call_utility_async("echo")
+                else:
+                    client.call_utility("echo")
+>       assert not client.utility_results
+E       assert not {2378132380497547761: <Future at 0xf632e51263f0 state=pending>, 2378133162181595633: <Future at 0xf632e5125ee0 state=p...73946609: <Future at 0xf632e5126900 state=pending>, 2378133784951853553: <Future at 0xf632e5125fd0 state=pending>, ...}
+E        +  where {2378132380497547761: <Future at 0xf632e51263f0 state=pending>, 2378133162181595633: <Future at 0xf632e5125ee0 state=p...73946609: <Future at 0xf632e5126900 state=pending>, 2378133784951853553: <Future at 0xf632e5125fd0 state=pending>, ...} = <vllm.v1.engine.core_client.SyncMPClient object at 0xf632e5126840>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:123: AssertionError
+__________ test_repeated_failed_utility_calls_do_not_accumulate[True] __________
+
+asynchronous = True
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    def test_repeated_failed_utility_calls_do_not_accumulate(asynchronous):
+        async def run():
+            client = make_client(asynchronous, "send")
+            for _ in range(64):
+                with pytest.raises(RuntimeError, match="send failed"):
+                    if asynchronous:
+                        await client.call_utility_async("echo")
+                    else:
+                        client.call_utility("echo")
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:125: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(asynchronous, "send")
+        for _ in range(64):
+            with pytest.raises(RuntimeError, match="send failed"):
+                if asynchronous:
+                    await client.call_utility_async("echo")
+                else:
+                    client.call_utility("echo")
+>       assert not client.utility_results
+E       assert not {2378749356844585457: <Future pending>, 2378750022564516337: <Future pending>, 2378750348982030833: <Future pending>, 2378750598090134001: <Future pending>, ...}
+E        +  where {2378749356844585457: <Future pending>, 2378750022564516337: <Future pending>, 2378750348982030833: <Future pending>, 2378750598090134001: <Future pending>, ...} = <vllm.v1.engine.core_client.AsyncMPClient object at 0xf632e50cef30>.utility_results
+
+tests/v1/engine/test_utility_call_cleanup.py:123: AssertionError
+____ test_unknown_or_duplicate_utility_reply_does_not_stop_receiver[False] _____
+
+failure = False
+
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_unknown_or_duplicate_utility_reply_does_not_stop_receiver(failure):
+>       _process_utility_output(reply(123, failure), {})
+
+tests/v1/engine/test_utility_call_cleanup.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+output = UtilityOutput(call_id=123, failure_message=None, result=<vllm.v1.serial_utils.UtilityResult object at 0xf632e50c3620>)
+utility_results = {}
+
+    def _process_utility_output(
+        output: UtilityOutput, utility_results: dict[int, AnyFuture]
+    ):
+        """Set the result from a utility method in the waiting future."""
+>       future = utility_results.pop(output.call_id)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 123
+
+vllm/v1/engine/core_client.py:881: KeyError
+_____ test_unknown_or_duplicate_utility_reply_does_not_stop_receiver[True] _____
+
+failure = True
+
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_unknown_or_duplicate_utility_reply_does_not_stop_receiver(failure):
+>       _process_utility_output(reply(123, failure), {})
+
+tests/v1/engine/test_utility_call_cleanup.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+output = UtilityOutput(call_id=123, failure_message='utility failed', result=None)
+utility_results = {}
+
+    def _process_utility_output(
+        output: UtilityOutput, utility_results: dict[int, AnyFuture]
+    ):
+        """Set the result from a utility method in the waiting future."""
+>       future = utility_results.pop(output.call_id)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 123
+
+vllm/v1/engine/core_client.py:881: KeyError
+_ test_reply_racing_with_cancelled_future_does_not_stop_receiver[False-False] __
+
+asynchronous = False, failure = False
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_reply_racing_with_cancelled_future_does_not_stop_receiver(asynchronous, failure):
+        async def run():
+            future = asyncio.get_running_loop().create_future() if asynchronous else Future()
+            results = {123: future}
+            future.cancel()
+            _process_utility_output(reply(123, failure), results)
+            assert not results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:164: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_utility_call_cleanup.py:161: in run
+    _process_utility_output(reply(123, failure), results)
+vllm/v1/engine/core_client.py:888: in _process_utility_output
+    future.set_result(output.result.result)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Future at 0xf632e50ce9c0 state=cancelled>, result = 'ok'
+
+    def set_result(self, result):
+        """Sets the return value of work associated with the future.
+    
+        Should only be used by Executor implementations and unit tests.
+        """
+        with self._condition:
+            if self._state in {CANCELLED, CANCELLED_AND_NOTIFIED, FINISHED}:
+>               raise InvalidStateError('{}: {!r}'.format(self._state, self))
+E               concurrent.futures._base.InvalidStateError: CANCELLED: <Future at 0xf632e50ce9c0 state=cancelled>
+
+/usr/lib/python3.12/concurrent/futures/_base.py:544: InvalidStateError
+__ test_reply_racing_with_cancelled_future_does_not_stop_receiver[True-False] __
+
+asynchronous = False, failure = True
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_reply_racing_with_cancelled_future_does_not_stop_receiver(asynchronous, failure):
+        async def run():
+            future = asyncio.get_running_loop().create_future() if asynchronous else Future()
+            results = {123: future}
+            future.cancel()
+            _process_utility_output(reply(123, failure), results)
+            assert not results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:164: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_utility_call_cleanup.py:161: in run
+    _process_utility_output(reply(123, failure), results)
+vllm/v1/engine/core_client.py:885: in _process_utility_output
+    future.set_exception(Exception(failure_message))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Future at 0xf632e5154d70 state=cancelled>
+exception = Exception('utility failed')
+
+    def set_exception(self, exception):
+        """Sets the result of the future as being the given exception.
+    
+        Should only be used by Executor implementations and unit tests.
+        """
+        with self._condition:
+            if self._state in {CANCELLED, CANCELLED_AND_NOTIFIED, FINISHED}:
+>               raise InvalidStateError('{}: {!r}'.format(self._state, self))
+E               concurrent.futures._base.InvalidStateError: CANCELLED: <Future at 0xf632e5154d70 state=cancelled>
+
+/usr/lib/python3.12/concurrent/futures/_base.py:559: InvalidStateError
+_______ test_cancelling_one_utility_does_not_remove_another_pending_call _______
+
+    def test_cancelling_one_utility_does_not_remove_another_pending_call():
+        async def run():
+            client = make_client(True, "wait_reply")
+            first = asyncio.create_task(client.call_utility_async("first"))
+            await asyncio.wait_for(client.entered.wait(), 2)
+            first_id = client.call_id
+            client.entered.clear()
+            second = asyncio.create_task(client.call_utility_async("second"))
+            await asyncio.wait_for(client.entered.wait(), 2)
+            second_id = client.call_id
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert set(client.utility_results) == {second_id}
+            _process_utility_output(reply(first_id), client.utility_results)
+            _process_utility_output(reply(second_id), client.utility_results)
+            assert await second == "ok"
+            assert not client.utility_results
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_utility_call_cleanup.py:186: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        client = make_client(True, "wait_reply")
+        first = asyncio.create_task(client.call_utility_async("first"))
+        await asyncio.wait_for(client.entered.wait(), 2)
+        first_id = client.call_id
+        client.entered.clear()
+        second = asyncio.create_task(client.call_utility_async("second"))
+        await asyncio.wait_for(client.entered.wait(), 2)
+        second_id = client.call_id
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+>       assert set(client.utility_results) == {second_id}
+E       assert {238319476396...6112579793393} == {2383196112579793393}
+E         
+E         Extra items in the left set:
+E         2383194763960062449
+E         Use -v to get more diff
+
+tests/v1/engine/test_utility_call_cleanup.py:180: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/engine/test_utility_call_cleanup.py:18
+  /opt/spark-ds41f/candidate/vllm/tests/v1/engine/test_utility_call_cleanup.py:18: PytestUnknownMarkWarning: Unknown pytest.mark.cpu_test - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = pytest.mark.cpu_test
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../dev::test_async_utility_failure_releases_pending_future[encode]
+FAILED ../../../../dev::test_async_utility_failure_releases_pending_future[send]
+FAILED ../../../../dev::test_async_utility_failure_releases_pending_future[output_task]
+FAILED ../../../../dev::test_sync_utility_failure_releases_pending_future[encode]
+FAILED ../../../../dev::test_sync_utility_failure_releases_pending_future[send]
+FAILED ../../../../dev::test_cancellation_releases_slot_and_late_reply_is_harmless[block_send]
+FAILED ../../../../dev::test_cancellation_releases_slot_and_late_reply_is_harmless[wait_reply]
+FAILED ../../../../dev::test_repeated_failed_utility_calls_do_not_accumulate[False]
+FAILED ../../../../dev::test_repeated_failed_utility_calls_do_not_accumulate[True]
+FAILED ../../../../dev::test_unknown_or_duplicate_utility_reply_does_not_stop_receiver[False]
+FAILED ../../../../dev::test_unknown_or_duplicate_utility_reply_does_not_stop_receiver[True]
+FAILED ../../../../dev::test_reply_racing_with_cancelled_future_does_not_stop_receiver[False-False]
+FAILED ../../../../dev::test_reply_racing_with_cancelled_future_does_not_stop_receiver[True-False]
+FAILED ../../../../dev::test_cancelling_one_utility_does_not_remove_another_pending_call
+14 failed, 6 passed, 15 warnings in 3.98s

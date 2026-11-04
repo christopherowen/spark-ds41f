@@ -19,8 +19,9 @@ race without terminating the output receiver. Normal results and utility
 errors are preserved; token selection, model execution and GPU work are
 unchanged. This is not a serving-performance claim.
 
-The affected module has identical bytes in candidate-38 and candidate-39 plus
-the prior request cleanup. The source patch, original/corrected module hashes,
+The affected methods are identical in candidates 36, 38 and candidate-39 plus
+the prior request cleanup; the module also has identical bytes in the latter
+two sources. The source patch, original/corrected module hashes,
 test hash and immutable candidate-38 image are recorded in [base.json](base.json).
 This source defect is not evidence that utility calls caused #884's overnight
 memory loss or its reported candidate-38/candidate-36 difference.
@@ -52,5 +53,33 @@ changing the site's checkout, checks reservations and idle containers, records
 exact container commands, and removes its temporary containers. Each uses an
 8-GiB memory limit, two CPUs, no network and no GPU devices. Source and runtime
 qualification results will be recorded separately; no image is promoted here.
+
+## Results
+
+Spaceport sp8 reproduced the expected control: 14 failed assertions and six
+passes, with zero errors or skips. The corrected source passed all twenty.
+Each repeated-failure control leaves 64 pending entries; corrected clients
+leave none. The ordinary success/error controls preserve their results.
+The published input commit is `79e96d550c9dbac37f47892d0f1b55b371648a61`.
+Exact commands, hashes, native pytest exits, JUnit and container states are in
+[runs/spaceport-attempt1](runs/spaceport-attempt1). Neither container was
+OOM-killed. Host MemAvailable minima of 115.205/115.200 GiB are test conditions,
+not a claimed memory saving. No containers were left running.
+
+The complete 575-patch source series replayed in a fresh clean worktree from
+the pinned upstream revision. It reproduces head
+`07733cc7611ad3822b313778bc3504f4233709d0`, tree
+`ff08b5ed9f909de67fa74590e321ed634d2e54a3`, carrying both this correction and
+the earlier request cleanup. The new profile passes doctor, and the local
+release-test classification has 199 selected files (137 gate, 62 excluded,
+zero problems). The first doctor run found an inherited patch count of 574;
+it was corrected to 575, with the failed check retained. No build or runtime
+source was changed to resolve that metadata error.
+
+[AUDIT.md](AUDIT.md) records the other ownership paths inspected and conditional
+retention outside the serving recipe. The new candidate image, full release
+gate, serving performance and complete attribution of #884 remain pending.
+Full build inputs are unavailable for `build check`. No prior candidate's
+serving measurements qualify this new source.
 
 Upstream status: local, not submitted.
