@@ -28,14 +28,12 @@ for relative, expected in base["files"].items():
     if actual != expected:
         raise RuntimeError(f"candidate-38 source mismatch: {relative}")
 
-import subprocess
-
 candidate = json.loads((HERE / "candidate.json").read_text())[args.variant]
-for patch in candidate["patches"]:
-    subprocess.run(
-        ["git", "apply", "--check", str(HERE / patch)], cwd=source, check=True
-    )
-    subprocess.run(["git", "apply", str(HERE / patch)], cwd=source, check=True)
+# Exports from the clean, freshly applied patch series; never a node source tree.
+for variant in ("selection", "search") if args.variant == "search" else ("selection",):
+    for exported in (HERE / "inputs" / variant).rglob("*.py"):
+        relative = exported.relative_to(HERE / "inputs" / variant)
+        (source / relative).write_bytes(exported.read_bytes())
 for relative, expected in candidate["files"].items():
     assert hashlib.sha256((source / relative).read_bytes()).hexdigest() == expected, (
         relative

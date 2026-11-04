@@ -26,8 +26,8 @@ with those recorded candidate-38 runs, without rerunning the released baseline.
 Record every run, error and memory observation. Only idle authorized sp8 is used;
 serving clusters are not started, stopped, synced or restarted. A clean published
 checkout supplies patches; each throwaway test container first verifies original
-source hashes, applies patches, then verifies all changed file hashes before
-importing vLLM. These overlays are kernel tests, not a serving image build.
+source hashes, loads Git-tracked exports from the freshly applied patch series,
+then verifies every changed file hash before importing vLLM. These overlays are kernel tests, not a serving image build.
 
 Acceptance: independent reference outputs, full and short continuation boundary
 cases, multiple lookaheads/minimum-match levels, per-request/slot isolation,
@@ -36,3 +36,8 @@ invariance and no errors. Preserve every unfavorable timing. No real-model
 acceptance, distributed performance or release qualification is inferred.
 
 Results pending.
+
+Initial attempt `copy-drafts-fix-v1` (deployment 028f0226) failed all eight jobs
+before GPU work: the frozen runtime image has no Git executable. Preserve its
+logs and memory receipt. The harness now uses exact Git-tracked source exports,
+verified against the fresh patch trees, without installing tools in the image.
