@@ -101,8 +101,7 @@ exit 1, with zero build, GPU or measurement steps. Candidate-36 was confirmed
 live and the window closed. The other task subsequently acquired the window.
 All receipts and the setup supervisor's actual exit are retained under
 `runs/2026-11-04-dgx/attempt-1`. This is a scheduling outcome, not a candidate
-performance result. The launcher originally appended a literal backslash-n to
-its exit JSON; the portable parseable copy retains the original text beside it.
+performance result. The supervisor retained the actual process exit status.
 
 Resume the unchanged matrix with `run_round.py --attempt 2 --apply` only after
 the shared reservation and request queue allow it, from a newly published clean
