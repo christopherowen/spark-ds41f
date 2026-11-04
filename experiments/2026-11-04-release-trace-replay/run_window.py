@@ -20,6 +20,7 @@ RESTORE = f"{EXPERIMENT}/candidate-37.json"
 CANDIDATE = f"{EXPERIMENT}/candidate-38.json"
 OUTPUT = ROOT / "results/private/lab/c38-spaceport-tp4-window"
 IMAGE = "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b"
+MANAGEMENT_LOST = False
 
 
 def save(path, value):
@@ -28,6 +29,7 @@ def save(path, value):
 
 
 def cli(config, operation, name, *extra, mutate=False):
+    global MANAGEMENT_LOST
     argv = [sys.executable, "bin/spark", "--cluster-config", config, operation, name, *extra]
     plan = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True)
     print(plan.stdout, flush=True)
@@ -43,6 +45,9 @@ def cli(config, operation, name, *extra, mutate=False):
         save(OUTPUT / f"{stem}-apply.json", {"argv": [*argv, "--apply"],
              "exit": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
         if result.returncode:
+            detail = (result.stdout + result.stderr).lower()
+            MANAGEMENT_LOST = any(text in detail for text in
+                                  ("ssh: connect", "cannot reach", "connection reset", "broken pipe"))
             raise RuntimeError(f"{operation} {name} failed ({result.returncode})")
 
 
@@ -193,6 +198,17 @@ def main():
         current["note"] = "restoring candidate-37"
         lab.beat(current["note"])
         try:
+            unreachable = [node["name"] for node in nodes["nodes"]
+                           if lab.spark.run_ssh(nodes, node, "true").returncode]
+            if MANAGEMENT_LOST or unreachable:
+                # A lost management path requires bounded isolation and renewed
+                # hardware authorization, even if a later SSH happens to work.
+                hold = lab.read_hold()
+                hold["holder"] = "tp4-trace-replay-hardware-review"
+                hold["rule"] = "management path lost; no launch until isolated and explicitly authorized"
+                lab.write_json_atomic(lab.HOLD, hold)
+                receipt["management_unreachable"] = unreachable
+                raise RuntimeError("management path lost; reservation retained, watchdog launch disabled")
             cli(RESTORE, "cluster", "start", "--replace", mutate=True)
             if not lab.production_live():
                 raise RuntimeError("candidate-37 live verification failed")
