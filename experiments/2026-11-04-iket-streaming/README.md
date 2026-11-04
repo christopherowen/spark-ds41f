@@ -214,7 +214,10 @@ exact container command, image identity, output checks, memory observations,
 failure tails and retained artifact locations. Native event files and full logs
 remain on sp8 under `/home/chris/spark-lab/iket-streaming-20261104/`. The capture
 files are too large for this repository. `collect_receipts.py` regenerates the
-portable receipt from that directory. No published baseline was rerun or edited.
+portable receipt from that directory. Per-chunk CRC receipts remain beside the
+native files; the portable receipt seals their ordered filenames (NUL-terminated)
+and raw bytes with SHA256, and records the first/last receipt and any missing ones.
+No published baseline was rerun or edited.
 
 Final validation passes: two full boots; eight successful transport stress boots
 and two expected disk-full failures; four float32 networking boots; four BF16
