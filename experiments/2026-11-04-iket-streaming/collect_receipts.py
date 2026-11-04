@@ -53,6 +53,7 @@ def collect(root):
                 "summary": read(trace / "summary.json"),
                 "stall_events": read(dest / "stall-events.json"),
                 "integrity": read(dest / "integrity.json"),
+                "source_coverage": read(dest / "source-coverage.json"),
             }
             log = folder / (label + ".log")
             if log.exists():
@@ -82,6 +83,7 @@ def collect(root):
             "identity": identity,
             "completed": read(folder / "completed.json"),
             "interruption": read(folder / "interruption.json"),
+            "output_comparison": read(folder / "output-comparison.json"),
             "memory_log": digest(folder / "memory.jsonl")
             if (folder / "memory.jsonl").exists()
             else None,
