@@ -102,6 +102,13 @@ object database reproduced and checked the same locked tree without another
 large fetch. Doctor and the experiment-local release-test classification pass;
 the latter has no unclassified, ambiguous or missing test files.
 
+The source-lock, release, release-test classification and recipe unit suites
+also pass on Spaceport: 50 tests, no failures. They ran from a clean, isolated
+checkout of published deployment commit
+`9cd45de34c6f5976785e3cf3874698234f417bc7`; the site's checkout and running
+container state were unchanged. The exact command and result are retained in
+[repository-checks.txt](runs/repository-checks.txt).
+
 This corrects a demonstrated frontend leak. The candidate image, full release
 gate, serving performance and attribution of #884's entire overnight loss
 remain unqualified. No previous measurements are transferred to the new image.
