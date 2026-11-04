@@ -192,3 +192,26 @@ The scratch-read fix and its reproducer are owned by
 This search series references that patch and tested executable directly.
 Historical receipts retain the old paths and exact commits at which they ran.
 The attention experiment is stacked on that independent fix for review.
+
+## Isolated sp8 continuation
+
+The owner selected sp8 (spark-0016) for continued work. `sp8.json` freezes its
+existing image identity separately from dgx4's. Source hashes and compiler
+versions were checked before use. Each `sp8-*` bundle pins that exact image ID.
+No serving state, production configuration or image tag is changed.
+
+`sp8-control` times the archived **unreleased candidate** reduction with the same
+harness and fixtures; it does not time the released scorer. Two fresh control
+and candidate graph runs test the one envelope resource change on the same host.
+Endpoint identity, exact selection, visibility replay and sanitizer gates remain
+required. New receipts are recorded separately from the earlier dgx4 results.
+
+The isolated batch runner uses the existing lab's bundle construction and verdicts,
+with a host reservation and GPU lock, 16 GiB container cap, 24 GiB host memory floor,
+thermal observation and heartbeat. It stops only its uniquely named test container.
+Each job refuses an existing result path and records the complete command and
+mounted input hashes. Use the published clean checkout on sp8:
+
+```sh
+python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-control:sp8-control-01 sp8-control:sp8-control-02 sp8-graph:sp8-stream-01 sp8-graph:sp8-stream-02 sp8-profile:sp8-profile-01 sp8-initcheck:sp8-initcheck-01 sp8-memcheck:sp8-memcheck-01 sp8-racecheck:sp8-racecheck-01
+```
