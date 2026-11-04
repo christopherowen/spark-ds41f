@@ -1,13 +1,18 @@
 # Exact clustered indexer search
 
-Status: unpromoted experiment. The target is identical selected keys and attention
-outputs with a materially lower indexer cost. No quality-changing approximation
-is accepted. No production configuration or published baseline is changed.
+Status: **experimental; current grouping rejected for serving integration**.
+[Native-input evidence](native-input-results.json) contains 12 actual C36 operands
+from three ranks and layers2/8/14/source20. Two fresh sp8 processes preserve
+selected keys, evaluated BF16 score bits, source block IDs/counts and the following
+reindex result. Every sample retains every visible key: **0% pruning**. A dramatic
+production speedup has not been established. Do not accept changed selections
+without independent evidence of superior model quality.
 
-One variable: replace a dense indexer search with a bounded search over clusters
-of 64 consecutive keys in the checkpoint's existing 128-dimensional index space.
-There are no trained maps, new weights, reduced precision or changed attention
-arithmetic. This is an exact search experiment, not a replacement attention rule.
+The target is the checkpoint's existing attention rule and weights. This plan
+only changes the search for its selected keys. It introduces no trained maps,
+reduced precision or approximate attention. It remains an unregistered snapshot
+prototype, outside serving configuration. No baseline or runtime image was
+promoted.
 
 ## Algorithm and rounding argument
 
@@ -52,269 +57,156 @@ all selected positions and checks each bound against every visible full score.
 The gate includes signed weights, empty/short rows, page tails, noncontiguous
 physical pages, allocator padding, unsupported scales, ties, and a mutated cache.
 
-## Scope and risks
+## Source handoff and shared owners
 
-The implementation is a standalone snapshot plan. It is not selected by a
-serving flag and does not yet own CSA source/reindex/reuse state, incremental
-metadata, prefix-cache reuse, speculative rollback, or a shared serving workspace.
-A rebuild on every call prevents stale metadata. Its cost and allocations are
-included in candidate timings. Coordinate intervals may be too loose for real
-keys, in which case little or nothing is pruned and the candidate will lose.
-A separable synthetic case demonstrates pruning mechanics only; random inputs
-and real model snapshots must be reported separately.
+At the source layer, matching immediate top512 keys is insufficient. Native code
+also publishes top2048 blocks of eight positions, in original order, with the
+last visible block forced into the list and an exact position count. Later layers
+reindex through that list. The source plan seeds32768 positions, derives a cutoff
+from ordinary seed blocks excluding the forced-last block, and preserves every
+possible winner plus the global last cluster. Unsupported or short seed domains
+disable pruning.
 
-The next useful decision comes from real indexer snapshots: exact selection,
-pruned-key fraction and complete candidate cost, including updates and compaction.
-Only then is serving integration justified. A large kernel gain alone does not
-establish an end-to-end gain.
+The final cutoff packs native BF16 score order and complemented original block
+position in a uint64 reduction. This preserves threshold ties, signed-zero order
+and native position precedence. Stable whole64-cluster compaction preserves
+8-position boundaries. The unchanged native block selector operates on compact
+scores; a mapping kernel restores original block IDs. Native scoring and final
+selection arithmetic are unchanged. Planned widths at most32768 use native
+fallback for correctness only and are never timed.
 
-## Reproduction
+Grouped plans share one freshly built metadata snapshot across1–256 queries with
+one **explicit** cache owner. They do not infer cache ownership from allocation
+order. A one-query source call skips unnecessary owner-table expansion. All plans
+rebuild metadata per invocation, including graph replay; no persistent metadata
+or invalidation protocol is claimed. Prefix reuse, speculative rollback across
+calls and serving workspace ownership would need separate integration gates.
 
-The patch applies after the promoted vLLM series at tree
+## Actual model operands and decision
+
+The authorized TP3 window captured one query per layer/interface and rank from a
+seeded public-source request of124426 actual prompt tokens. The native C36
+attention/scorer ran during capture; this prototype did not run in serving.
+The window restored C36 on all three ranks and closed at14:25:30UTC. Exact
+commands, the failed initial checkout sync, restoration checks, input hashes and
+transfer correction are retained in [the capture receipts](runs/capture-01/receipt.json).
+Raw tensors, prompt text and response stay outside Git.
+
+Replay reconstructs original physical page IDs, stride and alignment rather than
+substituting a compact cache. Its address span is approximately5.27GB. Samples use
+native planned widths524288/1048576, key pages128/256 and visible extents32896–36576.
+The original query-row count is saved, but execution mode was not recorded and
+is not inferred. This sample does not establish full-attention equality, decode
+coverage, prompt-corpus quality or serving memory/admission behavior.
+
+Two fresh pinned C36 sp8 containers pass all12 samples, including graph visibility
+rollback/empty/restore and source reindex. Candidate-only process medians are
+approximately0.182–0.185ms for dense samples and0.250–0.251ms for source samples.
+Every sample keeps all visible keys. Native scoring is a correctness oracle only;
+no released build was timed again. The empty-input run `sp8-real-01` is a retained
+operator setup failure before any candidate case, followed by verified transfer
+and two successful runs.
+
+Untimed diagnostics on rank0's four layer/interface samples also find no pruning
+with an ideal native cutoff: signed-head lower bounds, groups of8/64 keys,
+semantic clustering of indivisible native eight-key blocks, and affine bounds
+that combine signed heads before taking a support bound. The geometry diagnostic
+is an idea screen with observed native-bound checks, not a qualified GPU kernel
+or a substitute for a machine-arithmetic proof. These results reject the tested
+bounds and groupings; they do not prove that every exact sparse search is impossible.
+Adding persistent metadata or tuning the seed is not justified by these operands.
+
+## Synthetic evidence and unfavorable runs
+
+Every native receipt, exact command, mounted-input hash, error and memory
+observation is retained in `runs/`. [Initial dgx4 results](results.json),
+[sp8 results](sp8-results.json), [visible-domain results](visible-domain-results.json)
+and [candidate-only profiles](source-profiling.json) index the stages. Timings
+compare unreleased prototypes, never a remeasured released baseline.
+
+| Candidate;262143 synthetic keys | Separable process medians | Random process medians |
+| --- | --- | --- |
+| Initial archived sp8 prototype | 3.591 /3.583ms | 5.678 /5.694ms |
+| Streamed scalar envelope | 0.769 /0.791ms | 1.070 /1.092ms |
+| Tensor-core bounds | 0.298 /0.306ms | 0.551 /0.553ms |
+| Visible-domain metadata | 0.368 /0.377ms | 0.625 /0.622ms |
+
+The latest visible-domain producer avoids writing invisible envelopes; its tensor
+consumer avoids reading them. It improves1M-planned/short-visible source medians
+from1.488/1.287ms to0.395/0.396ms, with a wide two-process interval. It also
+regresses full-domain and grouped cases, as shown above and in the complete report.
+It is not a universal replacement. A large synthetic prototype gain is not a
+production speedup, especially when real operands do not prune.
+
+Other isolated variables and their receipts remain available:
+
+- Streamed endpoint construction and tensor-core interval products replace an
+  expensive per-cluster register reduction. Visible endpoints remain bitwise equal.
+- Explicit owner sharing reduces repeated metadata work. At64K planning and128
+  queries, the earlier dense shared snapshot changes random medians13.383/13.466ms
+  to3.498/3.530ms and separable7.046/7.047ms to0.767/0.767ms. Harness allocation
+  peaks are not serving memory evidence.
+- The first source tie cutoff is approximately three times slower. Its packed
+  uint64 replacement recovers that loss while preserving16511/65535 separable
+  keys. Both versions remain recorded.
+- Mapping compact native block winners avoids restoring a dense score grid while
+  retaining exact source handoff and following reindex results.
+- The initial compiler failure and initialization failures (4608 reads in the
+  full search;1536 in the isolated top-k regression) are retained. The independent
+  lazy scratch-read guard fixes those reads without changing live arithmetic.
+
+The latest42-job batch passes two fresh graph processes for scalar/matrix dense,
+source, grouped dense and grouped source plans; new page128 cases; both-page
+native-layout capture/replay fixtures; and24 dedicated initcheck/memcheck/racecheck
+jobs. Bounded race/initialization screens are identified per receipt and do not
+claim every large shape. Student-t intervals use two process medians (df1), with
+an unverified normality assumption; they are descriptive prototype uncertainty.
+Fourteen CPU reference checks pass. See each report for exact shapes, retained
+counts, intervals and cumulative host memory/thermal observations.
+
+## Reproduction and adoption boundary
+
+The experimental vLLM series applies after promoted tree
 `ea1281f880e7535e3d87725be0156a8e38fc2fb2`, upstream base
-`19f2c20ed4d64ae22bd009ceacadd85e2a81e354`. Its status is experimental, not
-submitted upstream. `bundle/overlay` is a byte-identical executable copy of the
-new module; `check_sources.py` verifies it against the patch.
+`19f2c20ed4d64ae22bd009ceacadd85e2a81e354`. It is not submitted upstream.
+`bundle/overlay` is a byte-identical executable copy verified by `check_sources.py`.
+The capture series independently applies after C36 tree
+`cc0fdf582d0bddff71c6a853e237bc9e87587832`; its558-patch base is reproduced and
+original source hashes recovered by reversing capture patches.
 
 ```sh
 bin/spark doctor
-bin/spark upstream prepare vllm
 python3 experiments/2026-11-04-clustered-indexer/check_sources.py
 python3 -m unittest discover -s experiments/2026-11-04-clustered-indexer -p test_reference.py -v
+python3 experiments/2026-11-04-clustered-indexer/summarize_native.py
 git diff --check
 ```
 
-Inside an authorized cluster window, on an idle node with the recorded release
-image present, use the existing kernel lab. It refuses a serving container and
-holds the node's GPU lock. Run twice in fresh containers and retain every result.
-The release scorer is run for **correctness only**. The harness times only the
-candidate; it does not remeasure released performance.
+Use fresh prepared trees to apply the complete affected source series. Complete
+build inputs are absent locally; `bin/spark build check` reports an unprepared
+build tree. No new runtime image was built. The independent scratch-read fix and
+its regression belong to [PR878](https://github.com/christopherowen/spark-ds41f/pull/878).
+That fix has merged; this experiment retains the same tested dependency.
+
+Only run GPU jobs from one clean, published commit on an authorized idle node.
+`sp8.json` pins both exact existing image IDs; C36 real replay uses its own pinned
+runtime. `sp8_run.py` acquires the native hold and GPU lock, refreshes a heartbeat,
+uses a16GiB container cap, observes a24GiB host memory floor and temperatures,
+yields between jobs on request, and releases the hold. Receipts record exact
+commands, commit and mounted hashes. Never substitute a dirty source copy.
 
 ```sh
-scripts/lab.py kernel-local experiments/2026-11-04-clustered-indexer/bundle --out results/private/clustered-indexer-a
-scripts/lab.py kernel-local experiments/2026-11-04-clustered-indexer/bundle --out results/private/clustered-indexer-b
+python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-replay:real-a sp8-replay:real-b
 ```
 
-Full qualification still requires two candidate serving boots on each target
-shape, exact attention and greedy digests, teacher-forced distributions, mixed
-traffic, and memory/admission gates at the frozen workload limits, compared with
-the **recorded** release suites. Only the owner may accept promotion.
+The raw operand files must already exist at the recorded private node-local
+path with matching SHA256 values. [Capture instructions](capture/README.md)
+describe the guarded collection procedure; reusing the existing saved operands
+requires no serving window. Rerun reports from committed receipts without a GPU.
 
-## Hardware evidence
-
-Every native receipt, error, exact command and input hash is retained under
-`runs/`; `provenance.json`, `results.json` and `sp8-results.json` index the runs.
-The native scorer is correctness-only. Timings below measure unreleased
-prototypes, including metadata rebuilding, compaction and candidate selection.
-They are not released-build or serving speedups.
-
-The initial dgx4 prototype passed 12 fixtures in two eager and two graph
-processes. Its medians at 262,143 keys were about 3.7 ms (separable) and 5.8 ms
-(random). Profiling identified envelope rebuilding as 85% of kernel time.
-The first compile failure and the top-k initialization failures (4,608 in the
-full search and 1,536 in the independent reproducer) remain recorded. The lazy
-scratch-read guard fixed those reads without changing live arithmetic; full
-initcheck, memcheck and racecheck then passed. Three dgx4 windows closed with
-candidate-36 production unchanged, at 08:23:17, 09:07:10 and 10:15:21 UTC.
-
-On sp8, the screened changes have these two fresh-process medians:
-
-| Prototype; 262,143 keys | Separable | Random |
-| --- | --- | --- |
-| Archived unreleased envelope | 3.591 / 3.583 ms | 5.678 / 5.694 ms |
-| Streamed envelope, scalar bounds | 0.769 / 0.791 ms | 1.070 / 1.092 ms |
-| Streamed envelope, tensor-core bounds | 0.298 / 0.306 ms | 0.551 / 0.553 ms |
-
-All 20 fixtures preserve selected keys and pass full-score bounds checks and
-graph visibility rollback/empty/restore. Streamed and tensor-core variants each
-pass initcheck (18 fixtures), memcheck (20), and racecheck (18), with zero errors
-or hazards. Exceptional scales, large signed weights, cancellation, subnormals,
-NaNs, page tails and unwritten allocations are included. Two of the fixtures
-are too large for the bounded init/race screen. Eleven CPU tests pass.
-`sp8-profiling.json` records instrumented diagnostics: tensor bounds reduce their
-stage cost, leaving snapshot rebuilding dominant. Traces are not timing gates.
-
-The explicit one-owner grouped snapshot also passes two graph processes with
-four multi-query fixtures. At 65,536 planned keys and 128 separable query rows,
-sharing metadata changes candidate medians from 7.046 / 7.047 ms to
-0.767 / 0.767 ms. For random rows they change from 13.383 / 13.466 ms to
-3.498 / 3.530 ms. Metadata tensors shrink from 128 MiB to 1 MiB and the
-harness allocation peak from 181.3 MiB to 64.8 MiB. These are test allocations,
-not serving memory or admission measurements. Six fixtures including the 1/256-row boundaries now pass twice; dedicated
-initcheck and memcheck pass all six, and racecheck passes two bounded fixtures. No persistent cache metadata is used.
-
-All native sp8 jobs have returned their host reservation. No serving state,
-image tag, production configuration or immutable baseline changed. Complete
-image build inputs are absent locally; `build check` reports an unprepared
-build tree. Real-input capture/replay and serving qualification remain pending.
-
-## Source-layer handoff gate
-
-`vllm/0006-preserve-source-handoff.patch` prepares a joint source-layer plan.
-Source rows publish both top-512 keys and top-2048 blocks of eight positions;
-a later reindex query depends on the block IDs, their order and position count.
-A threshold from immediate winners alone cannot qualify this interface.
-
-The source candidate scores a larger seed, takes the ordinary block cutoff
-excluding the native forced-last block, and keeps all bound ties plus the global
-last visible cluster. Retained scores are restored to the native logical grid
-before unchanged block selection. A shared lookup and one writer per dense
-position avoid scatter races and initialization fills. Small planned domains
-use the native source plan directly and are correctness-only, never timed.
-
-`source-handoff.json` records the variable. Its CPU oracle and fresh patch/source
-checks pass. Two eight-case source runs, seven-case initcheck and memcheck,
-and two-case racecheck all pass. Source bounds currently retain every visible
-key even on the separable fixture: preserving the larger block handoff is a
-stricter requirement. This unfavorable pruning result is retained. The harness compares all immediate
-keys, every handoff block and count, BF16 score bits, following reindex output,
-graph visibility changes and late cache mutations. There is no serving dispatch.
-
-## Independent top-k fix
-
-The scratch-read fix and its reproducer are owned by
-`experiments/2026-11-04-topk-live-reads/` in [PR #878](https://github.com/christopherowen/spark-ds41f/pull/878).
-This search series references that patch and tested executable directly.
-Historical receipts retain the old paths and exact commits at which they ran.
-The attention experiment is stacked on that independent fix for review.
-
-## Reproduce the isolated sp8 screens
-
-`sp8.json` pins spark-0016's existing image separately from dgx4. Every
-`sp8-*` bundle pins that exact ID and mounts the recorded source files. The
-published clean detached checkout is
-`/home/chris/spark-lab/checkouts/clustered-indexer`.
-
-The runner uses the existing lab bundle construction and verdicts, a native
-host reservation and GPU lock, a 16 GiB container cap, a 24 GiB host memory floor,
-thermal observations and a heartbeat. It stops only its own named container,
-yields between jobs when another task requests the host, and refuses existing
-result paths. All completed jobs return the reservation. Exact reproduction
-commands are retained in each native `command.json` and `verdict.json`.
-
-```sh
-python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-source:source-a sp8-source:source-b sp8-source-initcheck:source-init sp8-source-memcheck:source-mem sp8-source-racecheck:source-race
-python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-grouped:group-a sp8-grouped:group-b sp8-grouped-initcheck:group-init sp8-grouped-memcheck:group-mem sp8-grouped-racecheck:group-race
-```
-
-## Separate screened variables
-
-- `resource-layout.json` and patch 0003: stream the same visible keys with only
-  two endpoints per coordinate instead of two 64-by-128 register fragments.
-  Endpoints are bitwise equal to the frozen unreleased prototype.
-- `matrix-bounds.json` and patch 0004: BF16 tensor products with FP32 accumulation
-  compute `q+ @ upper + q- @ lower` and the absolute norm. Decoded certified FP4
-  values are exactly representable in BF16. Exceptional metadata is tagged and
-  never enters a product. The split sum has at most 256 terms; `2*gamma(255)`
-  still leaves more than 100 times slack inside the existing `A/256` allowance.
-  Scalar bounds remain the original API default.
-- `grouped-metadata.json` and patch 0005: an explicit API for one cache owner and
-  1–256 queries. Fresh metadata through the maximum extent bounds all shorter
-  rows. Reduction and safe per-row table expansion are included in timing.
-  Arbitrary mixed-owner requests are not accepted. The grouped API is separate
-  from source handoff and neither is registered in serving.
-- `source-handoff.json` and patch 0006: jointly preserve native immediate keys
-  and source-block output; never qualify a source layer using keys alone.
-
-Real model capture and replay are described in `capture/README.md`. Timing a
-compact copy can change cache behavior, so the diagnostic now records and
-reconstructs native physical page IDs, byte stride, pointer alignment, planned
-width and active limit. A synthetic capture/layout initialization gate must pass
-before collecting real operands. Raw activations and prompts stay outside Git.
-
-## Prepared source tie cutoff
-
-The source cutoff now also retains the worst seeded ordinary winner's original
-block position. On equal native BF16 ordering keys, a cluster entirely after
-that position cannot contain a selected ordinary block. Stable compaction can
-remove it while always retaining the global mandatory last cluster. Native
-ordering keys distinguish signed zeros; short and nonfinite seeds disable this
-refinement. Original bound values remain intact for the full-score oracle.
-
-`source-ties.json` and patch 0007 record this single variable. Thirteen CPU tests
-and fresh patch/source checks pass. Two eight-case graph runs and all three
-sanitizers pass the tie cutoff with unchanged source/reindex digests. However,
-complete separable medians rise from 0.177 / 0.176 ms to 0.533 / 0.535 ms, despite
-retaining only 16,511 keys. This execution is rejected for speed. `sp8-source-control` preserves the preceding
-unreleased source plan with exactly the same expanded harness. It does not
-benchmark a released build.
-
-Patch 0008 prepares one execution change: reduce a packed native BF16 key and
-complemented original block position once, preserving the same cutoff order.
-`source-cutoff-packing.json` records pending GPU gates. Both the earlier numeric
-prototype and the slower two-reduction tie prototype are frozen for diagnostics.
-Candidate-only traces must identify the stage cost rather than infer it from
-pruned-key counts. Native-layout capture/replay QA also passes twice on the exact
-C36 sp8 image; real DeepSeek operands have still not been collected.
-
-The packed cutoff passes two eight-case graph processes and all three sanitizers
-with identical source/reindex digests. Complete separable medians recover to
-0.156 / 0.155 ms. Candidate-only traces put 69% of the preceding implementation's
-kernel time in its cutoff; the packed reduction removes that bottleneck.
-`source-profiling.json` retains both traces. No real-model or serving claim follows.
-
-The capture arm now reserves separate dense/source pool budgets and records caller
-layer identity. Its default minimum 32769 keys avoids letting an early short-domain
-sample stand in for long-domain selection. Its contextual gate is hardware pending;
-see `capture/README.md` for the coordinated deployment and restoration procedure.
-
-## Prepared shared source snapshot
-
-Patch 0009 adds `GroupedSourceClusteredIndexerPlan`: one explicitly owned full
-page table and1–256 source queries share freshly rebuilt interval metadata through
-the maximum visible extent. Native source scoring, tie cutoff, stable compaction,
-block handoff and reindex order stay unchanged. Every pre-existing source GPU
-kernel has the same AST. The separate API expands per-query tables safely and
-includes that overhead in candidate timings; no cache metadata persists.
-
-`grouped-source.json` records the single variable. The harness reuses all native
-source/key/block/score-bit/reindex and graph mutation gates, including1/256 rows.
-Two fresh control/candidate screens and dedicated sanitizers are prepared.
-The contextual long-domain capture gate now also passes twice on the pinned C36
-image, plus strict initcheck; actual model collection still awaits the shared
-serving window.
-
-The grouped-source screen now passes all six fixtures in two control and two
-candidate processes, six-case initcheck/memcheck and two-case racecheck. At128
-random queries, medians move from14.737 /14.769 ms to4.841 /4.844 ms; separable
-queries move from8.827 /8.838 ms to2.737 /2.742 ms. The256-row test also passes.
-One-row overhead is retained as an unfavorable result. These are complete
-unreleased prototype comparisons, not native serving improvements.
-
-Patch0010 prepares another independent variable: run unchanged native block
-selection directly on compact scores, then map block IDs through stable candidate
-IDs. Whole64-key compaction preserves eight-key boundaries, relative tie order,
-and the global last block's partial length. This removes the full dense score
-restoration buffer and pass. Fourteen CPU tests and fresh source checks pass;
-full source/grouped/score-bit/reindex, graph, allocation and sanitizer hardware
-gates remain pending. A separate wide fixture retains1M planned width with
-short visibility, matching an important native planning geometry.
-
-Mapped handoff now passes two nine-case source and two six-case grouped graph
-processes, source initcheck/memcheck through1M planned width, both full grouped
-sanitizers, bounded race checks and C36 capture/replay for both interfaces.
-At128 separable queries its medians are2.498 /2.531 ms versus2.737 /2.742 ms
-with dense restoration. The reported harness allocation peak is unchanged in
-that case because another stage sets it; removing a buffer is not an observed
-peak-memory gain. The new1M-width/short-visibility fixture is exact but has wide
-two-process timing variance (1.488 /1.287 ms); no previous matching control exists.
-
-Patch0011 prepares a static one-query bypass for the grouped API's maximum and
-table expansion. Existing GPU kernels and the other row-count path are unchanged.
-Two targeted graph processes plus initialization/memory checks are pending.
-A separate candidate-only wide-domain trace will locate its remaining cost.
-
-The one-query bypass passes both targeted graph processes plus initialization
-and memory checking, with unchanged source/reindex hashes. The full-width
-profile attributes37.4% of kernel time to bounds and36.8% to envelopes, including
-invisible planned keys. Patch0012 explicitly tests the producer/consumer
-interaction: a bounded512-CTA envelope grid writes only visible metadata, while
-tensor bounds skip invisible tiles and reads. Scalar bounds already skip them.
-All allocated planning shapes stay fixed; no metadata persists. Visible endpoint
-identity, graph rollback/empty/restore and strict initialization checks are gates.
-
-Native pages are256 keys at compression1 and128 at compression2. Source layer20
-uses256; dense owners2/8/14 use128. `native-pages.json` prepares independent
-128-page workloads with explicit page identity, rather than comparing hashes or
-timings across geometries. This expands fixtures and capture QA, not arithmetic.
-The domain and128-page hardware screens remain pending.
+No serving integration is proposed for this grouping. A different exact search
+must demonstrate useful real-input pruning and complete candidate cost first.
+Only then would full candidate two-boot, attention/greedy/distribution, mixed
+traffic and admission gates against immutable recorded release suites be useful.
+Only the owner may accept promotion. Current production configuration and
+immutable baseline evidence remain unchanged.

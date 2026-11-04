@@ -1,30 +1,30 @@
-# Continue exact-output qualification; no promotion
+# Reject the tested grouping; preserve exact-output requirements
 
-Repeated sp8 screens preserve selected keys, BF16 score bits, source block IDs
-and counts, and a subsequent native reindex query. Streamed/tensor-core bounds,
-one-owner dense snapshots and the exact source cutoff pass dedicated initialization,
-memory and race checks. The source tie cutoff's first execution was three times
-slower; its packed-pair replacement recovers that loss while keeping16511/65535
-separable keys. Both favorable and unfavorable receipts and intervals remain in
-`sp8-results.json`. Candidate-only profiles isolate the cutoff bottleneck.
-No released build was timed again.
+All12 actual C36 layer/interface/rank operands replay exactly in two fresh sp8
+containers. Selected keys, evaluated BF16 score bits, source block IDs/counts,
+following reindex and graph visibility changes match. Every sample retains every
+visible key:0% pruning. The prototype has not established a production speedup.
+See `native-input-results.json` and the complete native receipts.
 
-The next source variable shares fresh metadata across1–256 queries with one
-explicit cache owner. Existing GPU kernel ASTs are unchanged; grouped source
-handoff/reindex, boundary, allocation and sanitizer hardware gates are pending.
-The earlier dense grouped snapshot passes its own complete synthetic gates.
+Signed-head bounds, smaller groups, semantic clustering of native eight-key
+blocks, and cancellation-aware affine bounds also fail to prune in four untimed
+layer/interface screens, even against ideal native cutoffs. These screens reject
+the tested directions; they do not establish impossibility for all exact search.
+Do not integrate this grouping, add persistent metadata for it, or accept changed
+selections without independent evidence of superior model quality.
 
-Real DeepSeek operands must establish useful pruning and complete candidate cost.
-Contextual capture/layout replay passes twice plus initcheck, including native
-planned width, sparse physical layout, source interface and caller metadata.
-Actual collection awaits the natural boundary of the other serving qualification;
-no foreign window is interrupted. A separable fixture is not real-model evidence.
-If real intervals cannot cover their full cost, reject this grouping and test
-another exact search. Changed selections fail unless independent evidence proves
-superior model quality. Persistent metadata needs explicit ownership/invalidation;
-these candidates rebuild each snapshot.
+The latest42 synthetic jobs pass, including both native key-page sizes and
+initialization/memory/race checks. Visible-domain execution helps a short-visible,
+wide-planned source fixture but regresses several full-domain/grouped fixtures.
+All favorable and unfavorable runs remain recorded. Only unreleased prototypes
+were timed; released builds were correctness oracles and were not timed again.
 
-This work has changed no serving state, production configuration or baseline.
-Every isolated sp8 batch returns its native hold. Full serving boots, attention
-and distribution digests, mixed traffic, admission and memory gates remain
-required against immutable recorded references. No promotion is proposed.
+The input-capture window restored the original C36 service on every rank, passed
+independent live checks and closed14:25:30UTC. Raw operands remain outside Git.
+No production configuration, image tag or immutable baseline was promoted.
+The separate top-k scratch-read bug is isolated in PR878.
+
+Future work needs a different exact search with useful real-input behavior before
+serving integration. Full attention equality and end-to-end two-boot performance,
+quality, mixed-traffic and memory/admission gates remain unperformed. The current
+research PR stays draft; exact indexer replay is not full-model qualification.

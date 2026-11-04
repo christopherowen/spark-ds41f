@@ -1,0 +1,86 @@
+{
+  "scope": "local final source and evidence verification; no GPU or serving mutation",
+  "source_commit": "4eee6658",
+  "checks": [
+    {
+      "argv": [
+        "bin/spark",
+        "doctor"
+      ],
+      "exit": 0,
+      "output": "configuration OK"
+    },
+    {
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/check_sources.py"
+      ],
+      "exit": 0,
+      "result": "all source/patch roundtrips, frozen controls and executable overlays pass"
+    },
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "experiments/2026-11-04-clustered-indexer",
+        "-p",
+        "test_reference.py",
+        "-v"
+      ],
+      "exit": 0,
+      "tests": 14
+    },
+    {
+      "argv": [
+        "bin/spark",
+        "build",
+        "check"
+      ],
+      "exit": 1,
+      "output": "WARN: .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-31ac0765 is not prepared; run bin/spark build prepare"
+    },
+    {
+      "action": "fresh experimental series on promoted source tree",
+      "head": "5a1610df88edc19669bf7a124ba05160d5ac4140",
+      "patches": 12,
+      "passed": true,
+      "all_overlays_identical": true
+    },
+    {
+      "action": "fresh capture series on reproduced558-patch C36 base",
+      "base_upstream": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+      "capture_patches": 4,
+      "passed": true,
+      "all_overlays_identical": true
+    },
+    {
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/summarize_native.py"
+      ],
+      "exit": 0,
+      "result": "42 hardware jobs, 12 actual operands twice and diagnostics validated"
+    },
+    {
+      "action": "Python3.12 AST syntax for both diagnostics and report generator",
+      "passed": true
+    },
+    {
+      "argv": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit": 0
+    }
+  ],
+  "sp8_released": {
+    "native_hold": "absent",
+    "native_request": "absent",
+    "running_containers": []
+  },
+  "serving_restoration": "runs/capture-01/receipt.json"
+}

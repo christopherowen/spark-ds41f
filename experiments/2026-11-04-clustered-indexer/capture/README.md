@@ -1,8 +1,10 @@
 # Real indexer input capture
 
-Status: prepared instrumentation; no real model operands collected yet. Earlier
-synthetic capture/layout checks pass twice on both pinned sp8 images and pass
-strict initialization checking. The contextual, long-domain gate is prepared next.
+Status: collection completed in window `dgx1-1793801035`, closed14:25:30UTC
+after verified C36 restoration. Twelve operands (three ranks, dense2/8/14 and
+source20) replay exactly twice on sp8, but retain every visible key. See
+`../native-input-results.json` and `../runs/capture-01/`. Synthetic capture/layout
+checks pass for both native key-page sizes and strict initialization checking.
 This arm retains exact C36 scoring/attention arithmetic and checkpoint weights.
 No benchmark result comes from capture: copies and synchronization perturb timing.
 
@@ -27,8 +29,9 @@ score bit, full bound, source handoff/count and following reindex output is gate
 Graph rollback, empty domain and restoration are checked. Only the candidate is
 timed; native fallback is correctness-only.
 
-Use only the already owner-authorized, coordinated window after the current
-holder releases it. This profile uses an isolated published checkout on every
+The completed collection used the owner-authorized coordinated window after
+the previous holder released it. Any future collection must establish the
+current holder and authorization again; saved-input replay needs no serving change. This profile uses an isolated published checkout on every
 rank, the same topology, an isolated API on port8001, and existing node-local
 compile caches. Startup memory guards remain unchanged. Native serving checkouts
 remain at their current published commit for restoration.
@@ -62,8 +65,10 @@ remain at their current published commit for restoration.
    C36 containers. Preserve every refusal/error and every unfavorable pruning/cost
    result. A positive kernel result still requires full serving qualification.
 
-This initial sample is long eager prefill, one query per distinct pool/interface.
-It establishes neither decode coverage nor model quality across a prompt corpus.
+The initial request has124426 actual prompt tokens and saves one query per
+distinct pool/interface and rank. Execution mode was not saved; original
+query-row count is recorded and is not used to infer decode or prefill coverage.
+It establishes neither mode coverage nor model quality across a prompt corpus.
 If real bounds do not prune enough to cover cost, reject this grouping and revise
 before serving integration. Changed keys fail unless independent evidence proves
 superior model quality.
