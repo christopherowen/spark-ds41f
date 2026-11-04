@@ -526,7 +526,11 @@ def _synchronize_vision_producers(code: str) -> str:
             loop = loops[0]
             waits = [child for child in loop.body or []
                      if re.match(r"mbarrier\[.*\]\.wait\(", child.text)]
-            expected = 2 if name == "vision_attention_kernel" else 1
+            expected = {
+                "vision_linear_kernel": 1,
+                "vision_swiglu_linear_kernel": 3,
+                "vision_attention_kernel": 2,
+            }[name]
             if len(waits) != expected or not all(wait.alone for wait in waits):
                 raise ValueError("unrecognized vision TMA producer waits")
             changes.extend(wait.end for wait in waits)

@@ -1,4 +1,4 @@
-From 97973ea1d54be290cf2287eda158a691e609e635 Mon Sep 17 00:00:00 2001
+From 10b26085de48e06ff64096354dcf722be6de98d2 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <root@your.mom>
 Date: Wed, 4 Nov 2026 04:15:12 +0100
 Subject: [PATCH] [DS4.1] rendezvous producers after empty waits and before
@@ -6,21 +6,30 @@ Subject: [PATCH] [DS4.1] rendezvous producers after empty waits and before
 
 Base: candidate-38 on upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the four local profiling fixes.
 
-Rationale: a loop-entry rendezvous was insufficient. One full boot passed, but the repeat deadlocked in SwiGLU with producer warp 1 at an empty-barrier wait, the other producers at the next rendezvous, and consumers waiting for new copies. The elected copy can let consumers advance the empty barrier before a delayed non-copy producer observes its previous phase, even within an iteration. Rendezvous immediately after every producer empty wait, before any elected copy can reuse that buffer. Attention has separate K and V waits and needs both rendezvous.
+Rationale: a loop-entry rendezvous was insufficient. One full boot passed, but the repeat deadlocked in SwiGLU with producer warp 1 at an empty-barrier wait, the other producers at the next rendezvous, and consumers waiting for new copies. The elected copy can let consumers advance the empty barrier before a delayed non-copy producer observes its previous phase, even within an iteration. Rendezvous immediately after every producer empty wait, before any elected copy can reuse that buffer. SwiGLU has independent activation, gate and up waits; attention has separate K and V waits. Rendezvous after all three or both respectively, and after the single linear wait.
 
 Quality: profiling off is unchanged. Profiling adds producer synchronization; ordinary performance must be measured separately. Preserve all copies and arithmetic, and refuse unexpected wait counts or non-standalone waits.
 
-Tests: 19 CPU phase-pass cases pass, including after-wait/before-copy ordering and both dynamic attention waits. Hardware repeat boots are recorded in the deployment experiment. Upstream status: local experiment, not submitted.
+Tests: 20 CPU phase-pass cases pass, including after-wait/before-copy ordering and both dynamic attention waits and all three SwiGLU inputs. Hardware repeat boots are recorded in the deployment experiment. Upstream status: local experiment, not submitted.
 ---
- .../kernels/test_deepseek_v41_tilelang_iket.py  | 15 ++++++++++++---
- vllm/models/deepseek_v4_1/tilelang/iket.py      | 17 +++++++++++------
- 2 files changed, 23 insertions(+), 9 deletions(-)
+ .../test_deepseek_v41_tilelang_iket.py        | 39 +++++++++++++++----
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 21 +++++++---
+ 2 files changed, 47 insertions(+), 13 deletions(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
-index 4ed7255e0a..1963b82735 100644
+index 4ed7255e0a..0b7315d15c 100644
 --- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
 +++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
-@@ -316,10 +316,10 @@ VISION_PRODUCERS = """extern "C" __global__ void vision_swiglu_linear_kernel() {
+@@ -300,7 +300,7 @@ def test_sampled_global_flag_loop_remains_a_wait_phase():
+     assert [(s["phase"], s["kinds"]) for s in sites] == [("wait", ["spin"])]
+ 
+ 
+-VISION_PRODUCERS = """extern "C" __global__ void vision_swiglu_linear_kernel() {
++VISION_PRODUCERS = """extern "C" __global__ void vision_linear_kernel() {
+   if (((int)threadIdx.x) < 128) {
+     tl::warpgroup_reg_dealloc<24>();
+     for (int ko = 0; ko < 16; ++ko) {
+@@ -316,14 +316,14 @@ VISION_PRODUCERS = """extern "C" __global__ void vision_swiglu_linear_kernel() {
  """
  
  
@@ -32,10 +41,19 @@ index 4ed7255e0a..1963b82735 100644
 +    assert out.index('.wait(') < out.index('bar.sync 15') < out.index('tl::tma_load')
      assert out.index('warpgroup_reg_dealloc') < out.index('bar.sync 15')
      assert iket._synchronize_vision_producers(VISION_PRODUCERS.replace(
-         'vision_swiglu_linear_kernel', 'other_kernel')) == VISION_PRODUCERS.replace(
-@@ -342,8 +342,17 @@ def test_vision_attention_dynamic_producer_loop_rendezvous():
+-        'vision_swiglu_linear_kernel', 'other_kernel')) == VISION_PRODUCERS.replace(
+-            'vision_swiglu_linear_kernel', 'other_kernel')
++        'vision_linear_kernel', 'other_kernel')) == VISION_PRODUCERS.replace(
++            'vision_linear_kernel', 'other_kernel')
+     annotated, sites = iket.annotate(VISION_PRODUCERS, _token, iters=1)
+     assert 'bar.sync 15, 128;' in annotated and sites
+ 
+@@ -340,13 +340,38 @@ def test_vision_producer_barrier_refuses_conflicts_and_unknown_layout():
+ 
+ def test_vision_attention_dynamic_producer_loop_rendezvous():
      code = VISION_PRODUCERS.replace(
-         "vision_swiglu_linear_kernel", "vision_attention_kernel"
+-        "vision_swiglu_linear_kernel", "vision_attention_kernel"
++        "vision_linear_kernel", "vision_attention_kernel"
      ).replace("ko < 16", "ko < ((M + 63) >> 6)")
 +    code = code.replace(
 +        '        tl::tma_load(A_desc, mbarrier[(ko & 1)], A_shared, 0, 0);\n      }',
@@ -52,8 +70,27 @@ index 4ed7255e0a..1963b82735 100644
      assert 'ko < ((M + 63) >> 6)' in out
  
  
++def test_swiglu_producers_rendezvous_after_all_three_input_waits():
++    code = VISION_PRODUCERS.replace(
++        "vision_linear_kernel", "vision_swiglu_linear_kernel"
++    )
++    for offset, desc in [(8, "G_desc"), (10, "U_desc")]:
++        extra = (
++            f'      mbarrier[((ko & 1) + {offset})].wait((((ko & 3) >> 1) ^ 1));\n'
++            '      if (tl::tl_shuffle_elect<128>()) {\n'
++            f'        tl::tma_load({desc}, mbarrier[0], W_shared, 0, 0);\n      }}\n'
++        )
++        code = code.replace('    }\n  } else', extra + '    }\n  } else')
++    out = iket._synchronize_vision_producers(code)
++    assert out.count('bar.sync 15, 128;') == 3
++    assert out.rindex('bar.sync 15') < out.index('tl::tma_load(U_desc')
++
++
+ def test_module_without_kernels_is_unchanged():
+     code = (
+         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
 diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
-index 0dffff0796..3c05438801 100644
+index 0dffff0796..27f77de5c4 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/iket.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
 @@ -488,11 +488,12 @@ def _sample_runtime_loops(code: str, iters: int) -> str:
@@ -72,7 +109,7 @@ index 0dffff0796..3c05438801 100644
      Barrier 15 is reserved here only for these three known generated kernels.
      """
      changes = []
-@@ -523,11 +524,15 @@ def _synchronize_vision_producers(code: str) -> str:
+@@ -523,11 +524,19 @@ def _synchronize_vision_producers(code: str) -> str:
              if len(loops) != 1:
                  raise ValueError("unrecognized vision TMA producer loop")
              loop = loops[0]
@@ -80,7 +117,11 @@ index 0dffff0796..3c05438801 100644
 -            changes.append(brace)
 +            waits = [child for child in loop.body or []
 +                     if re.match(r"mbarrier\[.*\]\.wait\(", child.text)]
-+            expected = 2 if name == "vision_attention_kernel" else 1
++            expected = {
++                "vision_linear_kernel": 1,
++                "vision_swiglu_linear_kernel": 3,
++                "vision_attention_kernel": 2,
++            }[name]
 +            if len(waits) != expected or not all(wait.alone for wait in waits):
 +                raise ValueError("unrecognized vision TMA producer waits")
 +            changes.extend(wait.end for wait in waits)
