@@ -110,52 +110,62 @@ harness commit, exact command, and the sanitizer version and binary hash.
   boolean comparison. The complete error is retained.
 - `attempt-02`: six corrected snapshot cases pass.
 - `attempt-03` and `attempt-04`: all 12 expanded cases pass in two fresh
-  containers; every selected-position digest matches between them. They cover
-  normal-scale extremes, NaN keys/queries/weights, a cache mutation that changes
-  the winners, and domains through 262K keys.
-- `memcheck-01`: all 12 cases, **0 errors**.
-- `racecheck-01`: 10 cases through 16K keys, **0 hazards, 0 errors, 0 warnings**.
-  Sanitizer timings are excluded from performance interpretation.
+  containers. Cases include normal-scale extremes, NaN keys/queries/weights,
+  ties, a cache mutation that changes the winners, and domains through 262K keys.
+- `initcheck-01`: functional selection passes, but strict initialization checking
+  **fails with 4,608 unwritten reads** in the existing top-k merge. Its bitwise
+  condition reads scratch entries from inactive lists before masking them.
+  The independent `topk-original-01` reproducer reports 1,536 errors without
+  invoking the clustered search. Both failures are retained.
+- `vllm/0002-topk-merge-live-reads.patch` guards the read with a lazy outer
+  condition, preserving live arithmetic and ordering. The independent
+  `topk-fixed-01` reproducer and complete `initcheck-02` report **0 errors**.
+  Initcheck covers 10 cases through 16K with fresh allocations and cache tails
+  left unwritten. Allocator statistics are unavailable in this mode; reported
+  raw zero counters do not mean zero GPU memory usage.
+- `eager-fixed-01` and `eager-fixed-02`: all 12 cases pass, retaining the archived
+  selected-position digests. `graph-01` and `graph-02` do the same in two fresh
+  containers, including replay after reduced visibility, an empty active
+  domain, and restoration of the original counts.
+- `memcheck-02`: all 12 cases, **0 errors**. `racecheck-02`: 10 cases through 16K,
+  **0 hazards, 0 errors, 0 warnings**. The earlier `memcheck-01`/`racecheck-01`
+  receipts are retained at their original source revisions. Sanitizer timings
+  are excluded from performance interpretation.
 - Seven CPU arithmetic/selection cases pass. Python 3.12 syntax, patch/overlay
   identity and both local doctors pass. Freshly applying the 558-patch capture
   base reproduces candidate-36's exact source tree.
 
-At 262,143 keys, the separable synthetic input retains 576 keys; random input
-retains all 262,143. The two processes' complete candidate-only median wall times
-are 3.72/3.71 ms and 5.87/5.81 ms respectively, including metadata rebuilding and
-allocations. These are different inputs, so their ratio is **not a speedup**.
-There is no release-relative or end-to-end speed claim. The largest observed
-PyTorch allocation peak was 47,190,016 bytes; this excludes the CUDA context and
-is not a measurement of total host memory. Sampled host MemAvailable before
-the second window was 122,575,488 KiB, and its hottest sampled sensor was 39.8 C.
+At 262,143 keys, separable synthetic input retains 576 keys; random input retains
+all 262,143. The guarded candidate's median wall times are:
 
-The speed target is not established. Keep this a research candidate. Real
-DeepSeek operands must prune enough to pay for metadata maintenance, bounds,
-selection and compaction before serving integration is justified. See
-`decision.md`, `results.json` and `capture/README.md`.
+| Execution | Separable, two fresh containers | Random, two fresh containers |
+| --- | --- | --- |
+| Eager | 3.690 / 3.683 ms | 5.801 / 5.854 ms |
+| CUDA graph | 3.657 / 3.667 ms | 5.840 / 5.834 ms |
 
-Both windows closed with the original candidate-36 TP3 profile already serving
-(08:23:17 and 09:07:10 UTC). No serving start, stop, restart or cluster sync was
-performed, and foreign requests were preserved. Initcheck and real-input
-capture/replay remain pending. The capture hook is prepared and locally checked,
-but has not run. Full image build inputs are absent locally; `build check`
-reports that the build tree is not prepared. No image was rebuilt or modified.
+Complete candidate timing includes metadata rebuilding and compaction. The two
+input distributions are different, so their ratio is **not a speedup**. There is
+no released-build or end-to-end speed claim. Graph capture barely changes the
+long-domain cost. The candidate-only instrumented `graph-profile-01` trace puts
+about **85% of GPU kernel time in envelope rebuilding** and 9–13% in query
+bounds. Raw traces, hashes and stage totals are in `profiling.json`. These
+instrumented durations diagnose the bottleneck; they are not performance gates.
 
-## Prepared shared-dgx4 batch (not yet executed)
+The largest observed PyTorch allocation peak was 47,190,016 bytes; this excludes
+the CUDA context and is not total host memory. The latest slot began with about
+116 GiB of host MemAvailable and a hottest sampled sensor of 40.2 C. Its fixed
+source commit is `6cc82a8956a1a67bb21dd60ef969f30063c45fbe`.
 
-The next serialized slot after the current release gate runs:
+The speed target is not established. First reduce snapshot metadata cost and
+collect real DeepSeek operands to decide whether the bounds prune useful work.
+Persistent metadata would need explicit cache ownership, append, overwrite,
+rollback and reuse rules. Approximate selection is not an accepted shortcut.
+See `decision.md`, `results.json` and `capture/README.md`.
 
-1. `sanitizer-initcheck`: fresh CUDA allocations with cache slots past visibility
-   left unwritten. The audit copies only each row's written score slice.
-2. `graph`, twice in fresh containers: the complete candidate captured once,
-   then replayed after reducing visible lengths, emptying the active domain,
-   and restoring the original counts. Each replay must preserve exact selection.
-3. `graph-profile`: the same captured candidate, with a candidate-only profiler
-   interval after the correctness audit and ordinary timing samples. Reference
-   calls are outside the interval. Raw traces stay in the node-local compile
-   mount until collected; trace names refuse overwrites.
-
-These modes are prepared in published source but have no passing hardware
-receipt yet. Earlier results retain their original harness commits and do not
-qualify these new modes. All work remains on dgx4; no serving change is needed
-for this batch. Return the shared GPU slot before analyzing traces locally.
+The three windows closed with the original candidate-36 TP3 profile already
+serving (08:23:17, 09:07:10 and 10:15:21 UTC). The latest dgx4 slot ran from
+10:05:43 to 10:15:21 UTC and was returned for the other task's qualification.
+No serving start, stop, restart or cluster sync was performed. Foreign requests
+were preserved. Real-input capture/replay remains pending; its prepared hook
+has not run. Full image build inputs are absent locally; `build check` reports
+that the build tree is not prepared. No image was rebuilt or modified.
