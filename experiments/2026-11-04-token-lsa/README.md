@@ -32,6 +32,6 @@ receipts do not satisfy raw token-ID equivalence for this changed-selector path.
 `token_gate.py capture` uses the pinned server's `return_token_ids` response
 metadata in a separate, untimed request run. `compare` requires identical raw
 IDs and termination under the same checkpoint/tokenizer/workload. Keep captures
-node-local. It never retokenizes decoded text. Six gate regression cases cover
+node-local. It never retokenizes decoded text. Eight gate regression cases cover
 changed IDs with identical text/count, missing IDs and mismatched termination or
 workload. This client is never imported by the query module or benchmark.
