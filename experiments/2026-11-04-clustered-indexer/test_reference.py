@@ -25,6 +25,16 @@ class BoundTests(unittest.TestCase):
                 for order in orders:
                     self.assertGreaterEqual(bound, score(queries, weights, key, order), case)
 
+    def test_single_point_intervals_and_mixed_sign_queries(self):
+        rng = random.Random(4117)
+        for _ in range(24):
+            q = [decode(rng.randrange(16), rng.choice((96, 127, 144))) for _ in range(128)]
+            key = [decode(rng.randrange(16), rng.choice((96, 127, 144))) for _ in range(128)]
+            queries = [q, list(reversed(q))]
+            weights = [bf16(.03), bf16(-.02)]
+            bound = upper_bound(queries, weights, [key] * 64)
+            self.assertGreaterEqual(bound, score(queries, weights, key))
+
     def test_zero_and_cancellation(self):
         keys = [[(-1.)**d for d in range(128)], [0.] * 128]
         for weights in ([0.], [1.], [-1.]):
