@@ -344,9 +344,13 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
         return []
     calls = [prepare.call(rank_order_sum_kernel, world)]
     for dtype in ("bfloat16", "float16", "float32"):
-        calls.append(prepare.call(rank_order_strided_kernel, (dtype,) * world, dtype))
+        calls.append(
+            prepare.call(rank_order_strided_kernel, (dtype,) * world, dtype, _RANK_DIMS)
+        )
         # A temporary protects overlapping output/input storage, then copies out.
-        calls.append(prepare.call(rank_order_strided_kernel, (dtype,), dtype))
+        calls.append(
+            prepare.call(rank_order_strided_kernel, (dtype,), dtype, _RANK_DIMS)
+        )
     return calls
 
 

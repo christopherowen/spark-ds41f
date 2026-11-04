@@ -100,3 +100,36 @@ def test_explicit_cuda_contract_errors():
         rank_order_sum([x, x.cpu()])
     with pytest.raises(ValueError, match="must not overlap"):
         rank_order_sum([x], x[:1].expand_as(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_declared_keys_cover_the_actual_strided_and_alias_launches(monkeypatch, dtype):
+    from types import SimpleNamespace
+
+    import vllm.distributed as distributed
+    from vllm.models.deepseek_v4_1.tilelang import collectives as ops
+
+    recorded = []
+
+    def factory(*args, **kwargs):
+        recorded.append((args, kwargs))
+        return lambda *buffers: None
+
+    monkeypatch.setattr(ops, "rank_order_strided_kernel", factory)
+    monkeypatch.setattr(
+        distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=3,
+            device_communicator=SimpleNamespace(rank_order_reduce_scatter=True),
+        ),
+    )
+    declared = [
+        (args, kwargs)
+        for fn, args, kwargs in ops.rank_order_sum_calls()
+        if fn is factory
+    ]
+    parts = [torch.empty((3, 7), dtype=dtype, device="cuda") for _ in range(3)]
+    ops.rank_order_sum(parts, parts[0])
+    assert len(recorded) == 2  # reduction into independent scratch, then copy-out
+    assert all(key in declared for key in recorded)

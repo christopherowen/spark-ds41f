@@ -1,4 +1,4 @@
-From 03ef2e330ba84fc5e40fe61899c18f4aa713dad9 Mon Sep 17 00:00:00 2001
+From 08ddcef79cf197bd3da97cd7154a07ddf46ff65a Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 12:35:06 +0100
 Subject: [PATCH] feat(tilelang): cover rank-order reduction tails and strided
@@ -10,17 +10,17 @@ Keep the packed BF16 reduction for aligned independent buffers. Replace the CUDA
 
 Quality: sources are cast to FP32, accumulated in the original rank order and rounded to the output dtype once. The first source is loaded directly to preserve signed zero. No cross-rank transport change. Tests cover independent references, odd sizes, strides, misalignment, mixed types, aliases, dimensions, empty/scalar tensors, CUDA replay and errors. Native results are retained in the deployment experiment. Upstream status: local candidate, not submitted.
 ---
- .../test_deepseek_v41_rank_order_strided.py   | 102 +++++++
- .../deepseek_v4_1/tilelang/collectives.py     | 258 ++++++++++++++++--
- 2 files changed, 342 insertions(+), 18 deletions(-)
+ .../test_deepseek_v41_rank_order_strided.py   | 135 +++++++++
+ .../deepseek_v4_1/tilelang/collectives.py     | 262 ++++++++++++++++--
+ 2 files changed, 379 insertions(+), 18 deletions(-)
  create mode 100644 tests/kernels/test_deepseek_v41_rank_order_strided.py
 
 diff --git a/tests/kernels/test_deepseek_v41_rank_order_strided.py b/tests/kernels/test_deepseek_v41_rank_order_strided.py
 new file mode 100644
-index 0000000000..b62544f49f
+index 0000000000..b464fd1121
 --- /dev/null
 +++ b/tests/kernels/test_deepseek_v41_rank_order_strided.py
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,135 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Exact rank-order arithmetic with tails, striding, mixed types and aliasing."""
@@ -123,8 +123,41 @@ index 0000000000..b62544f49f
 +        rank_order_sum([x, x.cpu()])
 +    with pytest.raises(ValueError, match="must not overlap"):
 +        rank_order_sum([x], x[:1].expand_as(x))
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++def test_declared_keys_cover_the_actual_strided_and_alias_launches(monkeypatch, dtype):
++    from types import SimpleNamespace
++
++    import vllm.distributed as distributed
++    from vllm.models.deepseek_v4_1.tilelang import collectives as ops
++
++    recorded = []
++
++    def factory(*args, **kwargs):
++        recorded.append((args, kwargs))
++        return lambda *buffers: None
++
++    monkeypatch.setattr(ops, "rank_order_strided_kernel", factory)
++    monkeypatch.setattr(
++        distributed,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            world_size=3,
++            device_communicator=SimpleNamespace(rank_order_reduce_scatter=True),
++        ),
++    )
++    declared = [
++        (args, kwargs)
++        for fn, args, kwargs in ops.rank_order_sum_calls()
++        if fn is factory
++    ]
++    parts = [torch.empty((3, 7), dtype=dtype, device="cuda") for _ in range(3)]
++    ops.rank_order_sum(parts, parts[0])
++    assert len(recorded) == 2  # reduction into independent scratch, then copy-out
++    assert all(key in declared for key in recorded)
 diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
-index af5ef85713..0af04edb57 100644
+index af5ef85713..2404263057 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
 @@ -166,6 +166,168 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
@@ -296,21 +329,25 @@ index af5ef85713..0af04edb57 100644
  def rank_order_sum_calls() -> list[prepare.TileLangCall]:
      """The rank-order sum the TP group's collectives launch, as ``rank_order_sum``
      calls it: one part per rank, when the group's communicator all-reduces and
-@@ -180,7 +342,12 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
+@@ -180,7 +342,16 @@ def rank_order_sum_calls() -> list[prepare.TileLangCall]:
          comm, "rank_order_reduce_scatter", False
      ):
          return []
 -    return [prepare.call(rank_order_sum_kernel, world)]
 +    calls = [prepare.call(rank_order_sum_kernel, world)]
 +    for dtype in ("bfloat16", "float16", "float32"):
-+        calls.append(prepare.call(rank_order_strided_kernel, (dtype,) * world, dtype))
++        calls.append(
++            prepare.call(rank_order_strided_kernel, (dtype,) * world, dtype, _RANK_DIMS)
++        )
 +        # A temporary protects overlapping output/input storage, then copies out.
-+        calls.append(prepare.call(rank_order_strided_kernel, (dtype,), dtype))
++        calls.append(
++            prepare.call(rank_order_strided_kernel, (dtype,), dtype, _RANK_DIMS)
++        )
 +    return calls
  
  
  _RANK_ROWS_THREADS = 128
-@@ -266,32 +433,87 @@ def concat_rank_shards(
+@@ -266,32 +437,87 @@ def concat_rank_shards(
      return out
  
  
