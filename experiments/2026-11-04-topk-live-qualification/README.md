@@ -34,10 +34,13 @@ published same-commit checkouts, named plans, guards and foreign/hardware-review
 holds remain mandatory. No Spaceport hardware operation is authorized here.
 
 Candidate-40 attempt 1 started at 15:34:15 UTC, with window
-`dgx1-1793806495` opened at 15:34:55 UTC. Image preparation and gates are active;
-the actual image digest and serving measurements remain pending. The next
-copy-match and compiler rounds wait for this candidate's quality and measurement
-review. No promotion or bypass of TP4 correctness/release gates.
+`dgx1-1793806495` opened at 15:34:55 UTC. All eight image/gate steps passed at
+16:21:53 UTC. The image is
+`sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82`.
+The controller then yielded for the queued shared request, before seeding,
+functional work or timing. Serving measurements remain pending. The next
+copy-match and compiler rounds wait for this candidate's measurement review.
+No promotion or bypass of TP4 correctness/release gates.
 
 ## Execution controls
 
@@ -93,19 +96,43 @@ published execution commit `1f134c7aad82bc63c95afed36f488becf2959a41`. All four
 checkouts were clean; live C36 verification passed. Staging closed at 15:33:45
 UTC without a serving restart.
 
-The sole detached controller is PID `3431611`, supervised by PID `3431610`,
+The attempt-1 detached controller was PID `3431611`, supervised by PID `3431610`,
 under `/home/swank/tl-logs/topk-live-qualification/candidate-40-window.log` on
 DGX1. Native controller output is
 `results/private/lab/candidate-40-round/receipt.json`; builder output is
 `results/private/candidate-rounds/candidate-40-image/receipt.json` in the owned
 DGX4 worktree. Operator setup, initial liveness/phase receipts and hashes are
-preserved under `runs/2026-11-04-dgx/attempt-1`. The supervisor's actual exit
-receipt exists only after the run ends. Later evidence commits do not change
+preserved under `runs/2026-11-04-dgx/attempt-1`. The supervisor recorded actual
+exit 1 at 16:22:13 UTC, solely `RuntimeError: window changed or closure requested`;
+the image/gate child exited 0 and no serving phase started. Later evidence commits do not change
 the active execution identity and must not trigger synchronization or restart.
 
 At 15:37:11 UTC a separate lossless-memory request entered the shared queue,
 asking for a short screen after the current image-and-gate job. The request is
 retained in `shared-request-1.json`; it does not interrupt the build or gates.
-If the controller yields safely before functional/timed work, preserve its
-actual exit/restoration and the completed immutable gate for explicit resume
-review. Do not rebuild, repeat gates or remove the foreign request.
+The controller yielded safely before functional/timed work. Preserve its actual
+exit/restoration and the completed immutable gate. Local explicit resume review
+passed; after the foreign request is fulfilled and its window releases, use a
+distinct attempt with the unchanged gate. Do not rebuild, repeat gates or remove
+the foreign request.
+
+## Completed image gate; serving qualification pending
+
+The independent local artifact audit verified 136 unique per-file receipts
+exactly cover the manifest: 8,074 passed, 360 skipped, zero failures/errors.
+All 14 original XML reports agree. The actual-image top-k initialization check
+verified the native module path and byte hash, exact tie-ordered output and
+`ERROR SUMMARY: 0 errors`, without a source overlay. Its original log and hash
+are retained. The actual DGX4 image still matches the frozen digest, and both
+gate containers are stopped.
+
+Build/gate conditions: max GPU 64 C, minimum thermal headroom 22 C, maximum
+system 73.5 C, minimum available host memory 78.96 GiB, zero swap growth and
+thermal slowdown; recorded power-cap time 434,777.5 ms. These are build/gate
+conditions, not serving-performance measurements.
+
+Independent named C36 live doctor exited 0 after closure. All three running
+containers independently matched the C36 image and exact restoration-profile
+label. Native controller/error, actual exit, original logs, image receipt,
+XML/JSONL, all export hashes and separate restoration receipts are preserved in
+the attempt directory. Full raw exports remain private under `gate-export`.
