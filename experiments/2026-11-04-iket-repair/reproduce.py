@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=["smoke", "index", "overlay", "pack"])
+parser.add_argument("operation", choices=["smoke", "index", "overlay", "pack", "tile"])
 parser.add_argument("--large", action="store_true")
 parser.add_argument("--out", required=True)
 parser.add_argument("--wait-file")
@@ -51,6 +51,16 @@ elif args.operation == "index":
     result[mask] = selected
     stage("scatter")
     assert torch.equal(values, result)
+elif args.operation == "tile":
+    from vllm.models.deepseek_v4_1.tilelang.moe import tile_expert_weights
+    k = 5120 if args.large else 512
+    weights = torch.full((E, N, k // 2), 0x33, device="cuda", dtype=torch.int8)
+    stage("tile-inputs")
+    result, tail = tile_expert_weights(weights, 32)
+    stage("tile-complete")
+    assert tail is None
+    assert result.numel() == weights.numel()
+    assert bool((result == 0x33).all())
 else:
     from vllm.models.deepseek_v4_1.tilelang.scale_codes import (
         narrow_code_offsets, overlay_byte_codes, pack_expert_scale_codes,

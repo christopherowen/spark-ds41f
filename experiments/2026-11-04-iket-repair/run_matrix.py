@@ -162,9 +162,11 @@ def main():
                                         "-ex", "set pagination off", "-ex", "set confirm off",
                                         "-ex", "set print thread-events off",
                                         "-ex", f"set sysroot /proc/{pid}/root", "-p", pid,
-                                        "-ex", "handle SIGABRT stop print nopass",
-                                        "-ex", "shell touch " + str(dest / "go"),
-                                        "-ex", "continue", "-ex", "thread apply all bt", "-ex", "kill"]
+                                        "-ex", "handle SIGABRT stop print nopass"]
+                            if job.get("catch_throw"):
+                                debugger += ["-ex", "source " + str(HERE / "catch_throw.py")]
+                            debugger += ["-ex", "shell touch " + str(dest / "go"),
+                                         "-ex", "continue", "-ex", "thread apply all bt 32", "-ex", "kill"]
                             write(out / (label + ".debugger-command.json"), debugger)
                             with (out / (label + ".gdb.log")).open("w") as debug_log:
                                 subprocess.run(debugger, stdout=debug_log, stderr=subprocess.STDOUT,
