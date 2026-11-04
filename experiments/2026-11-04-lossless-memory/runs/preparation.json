@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "command": "bin/spark doctor",
+      "initial_exit_code": 1,
+      "error": "isolated checkout had no ignored site node maps",
+      "resolution": "python3 scripts/example_site.py; bin/spark doctor",
+      "final_exit_code": 0
+    },
+    {
+      "command": "fresh shared clone; checkout 19f2c20e; git am --committer-date-is-author-date <promoted series>",
+      "exit_code": 0,
+      "tree": "ea1281f880e7535e3d87725be0156a8e38fc2fb2",
+      "note": "tree matches promoted manifest; this preliminary clone used the local committer, so its commit identity is not canonical build identity"
+    },
+    {
+      "command": "git apply --check <rc20 expert scale compaction patch>",
+      "exit_code": 1,
+      "error": "two hunks depend on a later weight-preparation refactor",
+      "resolution": "port only compaction and the offset ABI onto promoted preparation; retain original prepare_weights behavior"
+    },
+    {
+      "command": "python3 -m unittest tests.test_lossless_memory -v",
+      "exit_code": 0,
+      "passed": 22,
+      "scope": "CPU correctness only"
+    },
+    {
+      "command": ".venv/bin/python -m unittest discover -s tests",
+      "attempt": 1,
+      "tests": 648,
+      "exit_code": 1,
+      "failures": [
+        "source-lock fingerprint was not populated yet"
+      ],
+      "resolution": "finish canonical lock preparation before the final suite"
+    },
+    {
+      "command": ".venv/bin/python -m unittest discover -s tests",
+      "attempt": 2,
+      "tests": 648,
+      "exit_code": 1,
+      "errors": [
+        "existing memguard subprocess exceeded its 5-second timeout"
+      ],
+      "failures": [
+        "existing servebench probe timing expectation failed"
+      ],
+      "conditions": "source preparation was running concurrently; rerun these checks after preparation finishes"
+    },
+    {
+      "command": "build prepare --lock --only vllm",
+      "exit_code": 1,
+      "canonical_lock_computed": true,
+      "tree": "c3a9bf4be9b672f11c99f0c3098778a901dbae99",
+      "patch_head": "30e56e093b33a9f45d6f58d032d65ed5055a2105",
+      "error": "subsequent source preparation could not fetch a promised object from the upstream server"
+    },
+    {
+      "command": "build prepare --only vllm with local file-protocol source cache",
+      "exit_code": 1,
+      "error": "file-protocol upload requested unavailable historical objects from a partial source cache"
+    },
+    {
+      "command": "lab.py run expert-scales/screen-tp3.json --dry-run",
+      "exit_code": 0,
+      "problem": "current screening suite differs from the recorded release suite",
+      "resolution": "remove invalid screen recipes and freeze the recorded release suite definition; compare candidate boot and repeat without measuring the release again"
+    },
+    {
+      "command": "build prepare --only vllm with verified local Git object cache",
+      "exit_code": 0,
+      "patch_head": "30e56e093b33a9f45d6f58d032d65ed5055a2105",
+      "tree": "c3a9bf4be9b672f11c99f0c3098778a901dbae99",
+      "scope": "partial source preparation only; no image or complete build-input check"
+    },
+    {
+      "command": ".venv/bin/python -m unittest discover -s tests",
+      "attempt": 3,
+      "python": "3.15",
+      "tests": 648,
+      "exit_code": 1,
+      "errors": [
+        "existing test_low_headroom_warns_once_per_crossing exceeded its 5-second subprocess timeout"
+      ]
+    },
+    {
+      "command": ".venv/bin/python -m unittest <two previously failing timing tests> -v",
+      "exit_code": 0,
+      "passed": 2
+    },
+    {
+      "command": ".venv312/bin/python -m unittest discover -s tests",
+      "python": "3.12",
+      "exit_code": 0,
+      "passed": 648,
+      "seconds": 74.918,
+      "dependencies": "requirements/bench-client.txt installed with --require-hashes"
+    },
+    {
+      "command": "lab.py run expert-scales/release-tp3.json --dry-run",
+      "exit_code": 0,
+      "problems": [],
+      "scope": "plan validation only; no node operation"
+    }
+  ],
+  "gpu_work_started": false,
+  "serving_performance_verified": false
+}
