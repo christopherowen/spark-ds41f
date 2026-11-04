@@ -1,0 +1,26 @@
+name: tilelang-async-waits
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tilelang-async-waits-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/example_site.py
+      - run: bin/spark doctor
+      - run: bin/spark --cluster-config experiments/2026-11-04-tilelang-async-waits/candidate-tp4.json doctor
+      - run: bin/spark --cluster-config experiments/2026-11-04-tilelang-async-waits/candidate-tp3.json doctor
+      - name: Apply all six patches in a fresh prepared tree
+        run: bin/spark --cluster-config experiments/2026-11-04-tilelang-async-waits/candidate-tp4.json build prepare --only tilelang
+      - run: python3 experiments/2026-11-04-tilelang-async-waits/check_sources.py
