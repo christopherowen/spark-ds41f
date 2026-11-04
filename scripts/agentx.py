@@ -643,9 +643,15 @@ class _Stub(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
 
 
+class _StubServer(http.server.ThreadingHTTPServer):
+    # Warmup opens root and child requests in bursts. Python 3.12's default
+    # backlog of five is too small for the 16-session cache verification.
+    request_queue_size = 128
+
+
 def stub_server(port: int, model: str) -> http.server.ThreadingHTTPServer:
     handler = type("Stub", (_Stub,), {"model": model})
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server = _StubServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     return server
 
