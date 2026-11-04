@@ -65,6 +65,12 @@ the immutable source and confirms the serving reader holds those files open.
 It runs in a separate 1 GiB CPU-only container with read-only source/cache mounts,
 so its buffers do not consume serving's memory allowance. Reads are bounded and
 drop their clean page-cache pages; the verifier stops at a 4 GiB host floor.
+Before and after each Engram suite, the controller records serving-container
+process I/O counters (with PID start identities) and whole-node NVMe counters.
+These read-only snapshots follow cache verification. Node disk activity includes
+other processes; neither snapshot type is a per-row latency measurement or an
+unrecorded baseline comparison. Original outputs and the probe source hash are
+retained, including failed observations.
 
 ## Operations
 
@@ -125,6 +131,31 @@ and greedy/gathered paths. No logprob fallback or quality tolerance is accepted.
 The controller stops on a failed gate. A management failure latches a review hold
 instead of starting another serving container. A foreign window is never closed.
 Production is restored once at the end of the owned window.
+
+After both boots, also compare each complete model report with the recorded
+1030 model evidence pinned by `model-reference.json`. This is an offline check;
+the released build is never run again. The original report covers all 256
+sequences and 65,536 scored positions. Its model step and all other index fields
+match the published reference; the original and published suite definitions
+differ in later prefill extents/description, as the provenance records. This
+model evidence supplies no substitute throughput observation.
+
+```sh
+python3 experiments/2026-11-04-lossless-memory/model_identity.py \
+  --reference INPUTS/recorded-1030-model.json.gz \
+  --provenance experiments/2026-11-04-lossless-memory/model-reference.json \
+  --candidate INPUTS/first-model.json.gz INPUTS/repeat-model.json.gz \
+  --out INPUTS/model-identity.json
+```
+
+The comparison requires complete generated-token, rank, given-token score and
+returned top-token vector identity. Missing sequences, failed requests, truncated
+vectors, non-finite scores, a different corpus/workload and any numeric change
+fail the gate. Returned top/given-token scores are not a complete vocabulary
+distribution; the exact kernel/scale/row tests remain required too. The recorded
+reference self-check validates this analysis path and is not candidate evidence.
+Both candidate comparisons must pass before a release proposal claims unchanged
+recorded model behavior.
 
 `--through gate` ends after the image tests. A later window may use
 `--reuse-gates-from RECEIPT` only when the prior window restored production,

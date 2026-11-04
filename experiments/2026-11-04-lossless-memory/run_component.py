@@ -24,6 +24,44 @@ MANAGEMENT_ERRORS = ("ssh: connect", "cannot reach", "kex_exchange_identificatio
                      "connection timed out during banner exchange", "memory telemetry stopped reporting",
                      "memory telemetry did not start")
 
+IO_PROGRAM = r'''
+import datetime, json, pathlib, re, subprocess, sys, time
+started = time.monotonic_ns()
+lines = subprocess.check_output(["docker", "top", sys.argv[1], "-eo", "pid"], text=True).splitlines()
+processes = {}
+for line in lines[1:]:
+    pid = int(line.strip())
+    root = pathlib.Path("/proc") / str(pid)
+    stat = (root / "stat").read_text()
+    counters = {key: int(value) for key, value in
+                (line.split(":", 1) for line in (root / "io").read_text().splitlines())}
+    processes[str(pid)] = {"start_ticks": int(stat[stat.rfind(")") + 2:].split()[19]), "io": counters}
+disks = {}
+for line in pathlib.Path("/proc/diskstats").read_text().splitlines():
+    fields = line.split()
+    if re.fullmatch(r"nvme[0-9]+n[0-9]+", fields[2]):
+        disks[fields[2]] = [int(value) for value in fields[3:]]
+print(json.dumps({"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "monotonic_start_ns": started, "monotonic_end_ns": time.monotonic_ns(),
+                  "container": sys.argv[1], "processes": processes, "nvme_diskstats": disks}))
+'''
+
+
+def io_gate(value, container):
+    required = {"rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes"}
+    if value.get("container") != container or not value.get("processes") or not value.get("nvme_diskstats"):
+        raise ValueError("I/O observation omits serving processes or NVMe counters")
+    if not 0 < value["monotonic_start_ns"] <= value["monotonic_end_ns"]:
+        raise ValueError("I/O observation has an invalid clock extent")
+    for pid, row in value["processes"].items():
+        if not pid.isdecimal() or row["start_ticks"] <= 0 or not required <= row["io"].keys():
+            raise ValueError("I/O observation has incomplete process identity or counters")
+        if any(type(number) is not int or number < 0 for number in row["io"].values()):
+            raise ValueError("invalid process I/O counter")
+    for row in value["nvme_diskstats"].values():
+        if len(row) < 11 or any(type(number) is not int or number < 0 for number in row):
+            raise ValueError("invalid NVMe disk counter")
+
 
 def preflight(arm, through):
     kinds = ["image", "kernel", "full-gate"]
@@ -220,6 +258,34 @@ def main():
         save()
         if strict and failed:
             raise RuntimeError("engine evidence unavailable or exceeds its 32 MiB/rank bound")
+    def save_io(stage, *, strict=True):
+        nonlocal management_lost
+        records, failed = [], False
+        for node in nodes["nodes"]:
+            if not owns():
+                raise RuntimeError("window changed before I/O observation")
+            process = spark.run_ssh(nodes, node, "python3", "-c", IO_PROGRAM, cluster["container"]["name"])
+            raw = process.stdout + process.stderr
+            record = {"node": node["name"], "exit": process.returncode, "stdout": process.stdout,
+                      "stderr": process.stderr, "program_sha256": hashlib.sha256(IO_PROGRAM.encode()).hexdigest()}
+            management_lost |= process.returncode == 255 or any(marker in raw.lower() for marker in MANAGEMENT_ERRORS)
+            try:
+                if process.returncode or len(raw.encode()) > 65536:
+                    raise ValueError("I/O observation failed or exceeded its output bound")
+                record["observation"] = json.loads(process.stdout)
+                io_gate(record["observation"], cluster["container"]["name"])
+            except (ValueError, KeyError, TypeError) as error:
+                record["error"] = f"{type(error).__name__}: {error}"
+                failed = True
+            records.append(record)
+        path = out / f"io-{active_label}-{stage}.json"
+        with path.open("x") as file:
+            json.dump(records, file, indent=2)
+            file.write("\n")
+        receipt.setdefault("io_observations", []).append(str(path.relative_to(ROOT)))
+        save()
+        if strict and failed:
+            raise RuntimeError("incomplete serving-process or NVMe I/O observation")
     code = 1
     try:
         guard()
@@ -305,6 +371,7 @@ def main():
                 if args.component == "engram":
                     run([sys.executable, str((arm / "check_live_cache.py").relative_to(ROOT)), lab.head_url(),
                          "--config", profile, "--run", release["run"], "--label", label], "cache-" + label)
+                    save_io("before-suites")
                 starts = None
                 for i, name in enumerate(job["suite"]):
                     suffix = "" if i == 0 else "-" + name
@@ -315,6 +382,8 @@ def main():
                         first = ROOT / "results/private/suites" / release["run"] / job["arms"][0]["label"] / "model.json.gz"
                         argv += ["--corpus", str(first.relative_to(ROOT))]
                     run(argv, f"suite-{label}-{i}")
+                    if args.component == "engram":
+                        save_io("after-suite-" + str(i))
                     observed = native_suite_gate(directory, suite.load(name), profile, commit, receipt["images"])
                     if starts is not None and starts != observed:
                         raise ValueError("companion suites changed boot")
@@ -363,6 +432,8 @@ def main():
             if owns():
                 if active_profile is not None:
                     save_logs("cleanup", strict=False)
+                    if args.component == "engram":
+                        save_io("cleanup", strict=False)
                 unreachable = [n["name"] for n in nodes["nodes"] if spark.run_ssh(nodes, n, "true").returncode]
                 if management_lost or unreachable:
                     hold = lab.read_hold()
