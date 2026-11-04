@@ -72,3 +72,20 @@ The unchanged full workload families are used here, rather than comparing a
 lean protocol with C39's full protocol. The shared window is expected to take
 about 4–5 hours, without a time cap; ordinary requests close it after its current
 job. A released build and already measured earlier images are never remeasured.
+
+## Coordinated queue
+
+The tested source/control packet is published at
+`2922052677cb01c959af3461efa617cc7aa88b7b`. A new foreign lossless-memory
+window opened before our source-staging dispatch. The dispatch honored it and
+exited before creating a setup directory, reservation, controller or node
+checkout change. This is scheduling history, not a measured candidate failure.
+
+An atomic `who=copy-default-screening` request was queued at 15:16:03 UTC behind
+window `dgx1-1793805208`, asking for about 4–5 hours after its current job. The
+original request/hold snapshot and deferral are preserved in `runs/preflight`.
+No candidate-40 GPU work has started. Re-read actual state, preserve foreign
+requests/holds, and remove only our fulfilled request before guarded staging.
+Refresh published changes and select one exact clean source/control commit on
+all serving checkouts and the owned DGX4 build worktree; record actual execution
+identity separately from later evidence commits.
