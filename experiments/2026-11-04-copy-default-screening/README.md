@@ -11,8 +11,8 @@ Released builds and already measured earlier candidates are not remeasured.
 Closed #850: its recipe-form cleanup changes no serving command and introduces
 a known frozen-release equality-test failure. Its patch remains on the PR.
 Retain #851's unique startup/image safeguards, #865's unique external-site
-receipts, #875's active compiler candidate, and #842 for this default-enablement
-work. Reuse #842 rather than opening a duplicate default-enablement PR.
+receipts, #875's active compiler candidate, and the separate active research in #877. PR #842 merged this default-enablement
+work; no duplicate PR was opened.
 
 ## Round order and measurements
 
@@ -60,8 +60,10 @@ measurement work; hardware recovery remains separate.
 
 ## Current state
 
-Candidate-39 image preparation and build are running on DGX4 in attempt 2.
-No new serving-performance measurement has completed.
+Candidate-39 image preparation, build and the release-test gate passed in attempt 2.
+The window yielded for the requested DGX4 slot after preserving the completed
+gate and verifying candidate-36 on every serving rank. Functional qualification
+and both serving metric boots remain unmeasured.
 The fresh full vLLM preparation reproduced candidate-38 tree `c061e5f6` exactly;
 #842 applies without conflicts. The Mac partial-clone canonical lock replay
 failed on a missing intermediate local GLP blob. Its failure is retained in
@@ -161,3 +163,33 @@ outputs. Nine offline safety cases pass. The current gate is still pending;
 this control change neither qualifies it nor changes its running checkout.
 Only after the foreign slot ends and the usual publish/sync/live/idle guards
 pass may the new controller resume. No image build or test gate is repeated.
+
+## Completed gate and safe shared-slot closure
+
+Attempt 2 completed its image gate at 09:58:18 UTC. Image
+`sha256:17550af8ae03a42919d72fac7d2771a18f0f30300b45f0b06edc1ac83625f885`
+passed all seven preparation/build/gate steps. The 136 per-file receipts cover
+exactly the gate manifest: 8,074 tests passed, 360 skipped, zero failed and zero
+errors. The original JSONL, XML, manifest and logs are retained alongside hashes
+in `runs/2026-11-04-dgx/attempt-2`. Skipped tests remain a qualification limit;
+this gate does not establish model-output correctness or serving performance.
+
+During build and tests, maximum GPU temperature was 64 C, minimum thermal
+headroom 23 C, maximum system temperature 74.6 C, minimum available host memory
+79.3 GiB, and swap growth zero. Thermal slowdown was zero; the recorded power-cap
+counter was 407,500.5 ms. These are build/gate conditions, not serving metrics.
+
+The controller honored the queued clustered-indexer request before seed,
+functional or timed work. It ended at 09:58:37 UTC, actual exit 1, with the exact
+scheduling closure error and `restored=true`. Its child image/gate exit was zero.
+The release-test container stopped, the hold was removed normally, and an
+independent candidate-36 live doctor confirmed every rank matches the named
+restoration profile, retaining the two known recommendations. The shared
+handoff receipt was marked ready only after these checks. No owner relay is
+needed to schedule the foreign slot through the hold/request files.
+
+The resume validator accepts these preserved receipts. After the other slot
+ends, synchronize a single published control commit through the usual guarded
+process, then use attempt 3 to reuse this identical image and completed gate.
+Do not rebuild it or repeat any already completed measurement. The subsequent
+functional and two-boot serving results decide whether a tuning round is sound.
