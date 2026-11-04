@@ -1,20 +1,35 @@
-From ba1e8da449bb7111e9ca7d691f27ef5c4bb257c3 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <root@your.mom>
+From cd875db322b9b9d77039a0624ce8f54e8e7576b6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 09:07:15 +0100
 Subject: [PATCH] Experiment with certified cluster pruning in the MXFP4
  indexer
 
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after the
+promoted deployment series (tree ea1281f880e7535e3d87725be0156a8e38fc2fb2).
+
+Rationale: avoid scoring clusters that cannot reach the exact top-k threshold.
+Use coordinate intervals, conservative FP32 error slack and inclusive bounds;
+reuse the existing MXFP4 scorer and deterministic tie rule for surviving keys.
+
+Quality: identical selected positions are mandatory. Unsupported encodings
+are fully scored. No serving registration, new weights or precision changes.
+The snapshot plan rebuilds metadata on every call; incremental state is absent.
+
+Tests: six CPU arithmetic/selection cases; patch/overlay identity and Python
+syntax. GPU compilation and exact comparisons are required before qualification.
+
+Upstream status: local experiment, not submitted upstream.
 ---
- .../tilelang/clustered_indexer.py             | 320 ++++++++++++++++++
- 1 file changed, 320 insertions(+)
+ .../tilelang/clustered_indexer.py             | 323 ++++++++++++++++++
+ 1 file changed, 323 insertions(+)
  create mode 100644 vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
 
 diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
 new file mode 100644
-index 0000000000..a824a80a99
+index 0000000000..47fa7bdcdb
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,323 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Experimental, lossless cluster pruning for the V4.1 MXFP4 indexer.
@@ -50,7 +65,7 @@ index 0000000000..a824a80a99
 +    )
 +    safe_scale = T.min(T.max(T.cast(scale, T.int32), MIN_SCALE), MAX_SCALE)
 +    value = value * T.reinterpret(safe_scale << 23, T.float32)
-+    return T.if_then_else(code & 8, -value, value)
++    return T.if_then_else((code & 8) != 0, -value, value)
 +
 +
 +@tilelang.jit
@@ -237,7 +252,10 @@ index 0000000000..a824a80a99
 +            v = T.alloc_var(T.int32)
 +            extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
 +            for k in T.Parallel(topk):
-+                values[k] = T.cast(Values[row, k], T.float32)
++                value = T.cast(Values[row, k], T.float32)
++                values[k] = T.if_then_else(
++                    T.abs(value) < T.infinity(T.float32), value, -T.infinity(T.float32)
++                )
 +            T.reduce_min(values, minimum, dim=0)
 +            for b in T.Parallel(width // 8):
 +                Candidates[row, b] = -1

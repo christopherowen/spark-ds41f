@@ -33,7 +33,7 @@ def _decode(byte, scale, d):
     )
     safe_scale = T.min(T.max(T.cast(scale, T.int32), MIN_SCALE), MAX_SCALE)
     value = value * T.reinterpret(safe_scale << 23, T.float32)
-    return T.if_then_else(code & 8, -value, value)
+    return T.if_then_else((code & 8) != 0, -value, value)
 
 
 @tilelang.jit
@@ -220,7 +220,10 @@ def surviving_candidates(width: int, topk: int):
             v = T.alloc_var(T.int32)
             extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
             for k in T.Parallel(topk):
-                values[k] = T.cast(Values[row, k], T.float32)
+                value = T.cast(Values[row, k], T.float32)
+                values[k] = T.if_then_else(
+                    T.abs(value) < T.infinity(T.float32), value, -T.infinity(T.float32)
+                )
             T.reduce_min(values, minimum, dim=0)
             for b in T.Parallel(width // 8):
                 Candidates[row, b] = -1

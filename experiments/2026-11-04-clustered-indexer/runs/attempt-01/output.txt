@@ -1,0 +1,139 @@
+2026-11-04 08:11:14  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1797): Failed to build prim_func from envelope
+args={'Pool': Pool, 'Table': Table, 'Lengths': Lengths, 'Active': Active, 'Lower': Lower, 'Upper': Upper}
+source=def make_closure(clusters, page_size, rows, width):
+
+    def envelope(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py'
+        __tb_fn = 'envelope'
+        __tb.set_fileline(__tb_fl, 48, __tb_fn)
+
+        def envelope(Pool, Table, Lengths, Active, Lower, Upper, **__kwargs):
+            __tb.set_fileline(__tb_fl, 49, __tb_fn)
+            Pool = __tb.arg('Pool', Pool)
+            __tb.set_fileline(__tb_fl, 50, __tb_fn)
+            Table = __tb.arg('Table', Table)
+            __tb.set_fileline(__tb_fl, 51, __tb_fn)
+            Lengths = __tb.arg('Lengths', Lengths)
+            __tb.set_fileline(__tb_fl, 52, __tb_fn)
+            Active = __tb.arg('Active', Active)
+            __tb.set_fileline(__tb_fl, 53, __tb_fn)
+            Lower = __tb.arg('Lower', Lower)
+            __tb.set_fileline(__tb_fl, 54, __tb_fn)
+            Upper = __tb.arg('Upper', Upper)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 56, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('clusters', clusters), __tb.rval('rows', rows), threads=128)) as (cluster, row):
+                __tb.set_fileline(__tb_fl, 57, __tb_fn)
+                lo = __tb.bind('lo', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('CLUSTER', CLUSTER), __tb.rval('INDEX_DIM', INDEX_DIM)], __tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 58, __tb_fn)
+                hi = __tb.bind('hi', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('CLUSTER', CLUSTER), __tb.rval('INDEX_DIM', INDEX_DIM)], __tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 59, __tb_fn)
+                lmin = __tb.bind('lmin', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('INDEX_DIM', INDEX_DIM)], __tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 60, __tb_fn)
+                hmax = __tb.bind('hmax', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('INDEX_DIM', INDEX_DIM)], __tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 61, __tb_fn)
+                extent = __tb.bind('extent', __tb.resolve_call(__tb.rval('T', T).min)(__tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('Lengths', Lengths)[__tb.rval('row', row)], 0), __tb.resolve_call(__tb.rval('T', T).max)(__tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('Active', Active)[0], __tb.rval('width', width)), 0)))
+                __tb.set_fileline(__tb_fl, 62, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('CLUSTER', CLUSTER), __tb.rval('INDEX_DIM', INDEX_DIM))):
+                    __2, __3 = __tb.unwrap_value(__1)
+                    __tb.set_fileline(__tb_fl, 62, __tb_fn)
+                    __2, __3 = (__tb.bind('_', __2), __tb.bind('_', __3))
+                    __tb.set_fileline(__tb_fl, 62, __tb_fn)
+                    p, d = (__tb.bind('p', __2, loop_target=True), __tb.bind('d', __3, loop_target=True))
+                    __tb.set_fileline(__tb_fl, 63, __tb_fn)
+                    pos = __tb.bind('pos', __tb.rval('cluster', cluster) * __tb.rval('CLUSTER', CLUSTER) + __tb.rval('p', p))
+                    __tb.set_fileline(__tb_fl, 64, __tb_fn)
+                    __tb.assign_slice(__tb.rval('lo', lo), (__tb.rval('p', p), __tb.rval('d', d)), __tb.resolve_call(__tb.rval('T', T).infinity)(__tb.rval('T', T).float32))
+                    __tb.set_fileline(__tb_fl, 65, __tb_fn)
+                    __tb.assign_slice(__tb.rval('hi', hi), (__tb.rval('p', p), __tb.rval('d', d)), -__tb.resolve_call(__tb.rval('T', T).infinity)(__tb.rval('T', T).float32))
+                    __tb.set_fileline(__tb_fl, 66, __tb_fn)
+                    for __0 in __tb.ctx_if(__tb.rval('pos', pos) < __tb.rval('extent', extent)):
+                        __tb.set_fileline(__tb_fl, 66, __tb_fn)
+                        for _ in __tb.ctx_then(__0):
+                            __tb.set_fileline(__tb_fl, 67, __tb_fn)
+                            physical = __tb.bind('physical', __tb.rval('Table', Table)[__tb.rval('row', row), __tb.rval('pos', pos) // __tb.rval('page_size', page_size)])
+                            __tb.set_fileline(__tb_fl, 68, __tb_fn)
+                            offset = __tb.bind('offset', __tb.rval('pos', pos) % __tb.rval('page_size', page_size))
+                            __tb.set_fileline(__tb_fl, 69, __tb_fn)
+                            scale = __tb.bind('scale', __tb.rval('Pool', Pool)[__tb.rval('physical', physical), __tb.rval('page_size', page_size) * 64 + __tb.rval('offset', offset) * 4 + __tb.rval('d', d) // 32])
+                            __tb.set_fileline(__tb_fl, 70, __tb_fn)
+                            value = __tb.bind('value', __tb.resolve_call(__tb.rval('_decode', _decode))(__tb.rval('Pool', Pool)[__tb.rval('physical', physical), __tb.rval('offset', offset) * 64 + __tb.rval('d', d) // 2], __tb.rval('scale', scale), __tb.rval('d', d)))
+                            __tb.set_fileline(__tb_fl, 71, __tb_fn)
+                            valid = __tb.bind('valid', (__tb.rval('scale', scale) >= __tb.rval('MIN_SCALE', MIN_SCALE)) & (__tb.rval('scale', scale) <= __tb.rval('MAX_SCALE', MAX_SCALE)))
+                            __tb.set_fileline(__tb_fl, 72, __tb_fn)
+                            __tb.assign_slice(__tb.rval('lo', lo), (__tb.rval('p', p), __tb.rval('d', d)), __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('valid', valid), __tb.rval('value', value), -__tb.resolve_call(__tb.rval('T', T).infinity)(__tb.rval('T', T).float32)))
+                            __tb.set_fileline(__tb_fl, 73, __tb_fn)
+                            __tb.assign_slice(__tb.rval('hi', hi), (__tb.rval('p', p), __tb.rval('d', d)), __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('valid', valid), __tb.rval('value', value), __tb.resolve_call(__tb.rval('T', T).infinity)(__tb.rval('T', T).float32)))
+                __tb.set_fileline(__tb_fl, 74, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_min)(__tb.rval('lo', lo), __tb.rval('lmin', lmin), dim=0))
+                __tb.set_fileline(__tb_fl, 75, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_max)(__tb.rval('hi', hi), __tb.rval('hmax', hmax), dim=0))
+                __tb.set_fileline(__tb_fl, 76, __tb_fn)
+                for __4 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('INDEX_DIM', INDEX_DIM))):
+                    __tb.set_fileline(__tb_fl, 76, __tb_fn)
+                    d = __tb.bind('d', __4, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 77, __tb_fn)
+                    __tb.assign_slice(__tb.rval('Lower', Lower), (__tb.rval('row', row), __tb.rval('cluster', cluster), __tb.rval('d', d)), __tb.rval('lmin', lmin)[__tb.rval('d', d)])
+                    __tb.set_fileline(__tb_fl, 78, __tb_fn)
+                    __tb.assign_slice(__tb.rval('Upper', Upper), (__tb.rval('row', row), __tb.rval('cluster', cluster), __tb.rval('d', d)), __tb.rval('hmax', hmax)[__tb.rval('d', d)])
+        return envelope
+    return envelope
+RESULT {"schema_version": 1, "torch": "2.13.0+cu130", "gpu": "NVIDIA GB10", "capability": [12, 1], "cases": [], "passed": false, "error": "Traceback (most recent call last):\n  File \"/tmp/clustered-indexer-check.py\", line 102, in main\n    result['cases'].append(check(width, extents, mode, options.repeats))\n                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/clustered-indexer-check.py\", line 52, in check\n    candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py\", line 281, in __init__\n    self.envelope = cluster_envelopes(width, page_size)\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 567, in __call__\n    kernel = self.compile(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 480, in compile\n    prim_func = self.get_tir(*args, **kwargs)\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 388, in get_tir\n    tir = self.func(*args, **kwargs)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1719, in __call__\n    return self.get_tir(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1711, in get_tir\n    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1679, in _build_tir_template\n    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))\n                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py\", line 47, in cluster_envelopes\n    @T.prim_func\n     ^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1800, in prim_func\n    return impl(func) if func is not None else impl\n           ^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1798, in impl\n    raise e\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1791, in impl\n    ir_gen.gen(builder)(**annot)\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py\", line 70, in envelope\n    value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py\", line 36, in _decode\n    return T.if_then_else(code & 8, -value, value)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/tir/ir.py\", line 167, in wrapped\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/tirx/op.py\", line 3166, in if_then_else\n    return _ffi_api._OpIfThenElse(cond, t, f, span)  # type: ignore\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/tvm_ffi/cython/function.pxi\", line 968, in tvm_ffi.core.Function.__call__\n  File \"/workspace/tilelang/3rdparty/tvm/src/tirx/op/op.cc\", line 634, in tvm::PrimExpr tvm::if_then_else(PrimExpr, PrimExpr, PrimExpr, Span)\ntvm.error.InternalError: Check failed: (cond.dtype() == DataType::Bool()) is false: if_then_else only accept the condition to be boolean type.\n"}
+Traceback (most recent call last):
+  File "/tmp/clustered-indexer-check.py", line 115, in <module>
+    main()
+  File "/tmp/clustered-indexer-check.py", line 102, in main
+    result['cases'].append(check(width, extents, mode, options.repeats))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/clustered-indexer-check.py", line 52, in check
+    candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py", line 281, in __init__
+    self.envelope = cluster_envelopes(width, page_size)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 567, in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 480, in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 388, in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1719, in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1711, in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1679, in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py", line 47, in cluster_envelopes
+    @T.prim_func
+     ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1800, in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1798, in impl
+    raise e
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1791, in impl
+    ir_gen.gen(builder)(**annot)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py", line 70, in envelope
+    value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py", line 36, in _decode
+    return T.if_then_else(code & 8, -value, value)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/tir/ir.py", line 167, in wrapped
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/tirx/op.py", line 3166, in if_then_else
+    return _ffi_api._OpIfThenElse(cond, t, f, span)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+  File "/workspace/tilelang/3rdparty/tvm/src/tirx/op/op.cc", line 634, in tvm::PrimExpr tvm::if_then_else(PrimExpr, PrimExpr, PrimExpr, Span)
+tvm.error.InternalError: Check failed: (cond.dtype() == DataType::Bool()) is false: if_then_else only accept the condition to be boolean type.
