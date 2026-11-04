@@ -52,7 +52,8 @@ def main():
         parked = (host["Runtime"] == "runc" and not host.get("DeviceRequests")
                   and not host.get("Devices") and entrypoint == ["sleep"]
                   and command == ["infinity"])
-        processes = capture(["docker", "top", container_id, "-eo", "args"]).splitlines()[1:]
+        processes = [line.strip().split(None, 1)[1] for line in
+                     capture(["docker", "top", container_id, "-eo", "pid,args"]).splitlines()[1:]]
         if not parked or processes != ["sleep infinity"]:
             raise SystemExit("sp8 has an active container: " + other["Name"])
     if capture(["git", "-C", str(ROOT), "status", "--porcelain"]):
