@@ -46,6 +46,8 @@ def temperature():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('jobs', nargs='+', help='bundle:unique-run-name, in order')
+    parser.add_argument('--shared-slot-seconds', type=int, default=0,
+                        help='explicitly agreed short slot while a pending requester prepares')
     options = parser.parse_args()
     if socket.gethostname() != 'spark-0016':
         raise SystemExit('this continuation is scoped to sp8 only')
@@ -58,7 +60,9 @@ def main():
         raise SystemExit('sp8 must start cool with at least 32 GiB available')
     token = uuid.uuid4().hex
     hold = {'holder': 'clustered-indexer-sp8', 'token': token, 'since': stamp(),
-            'heartbeat': stamp(), 'expected_end': None, 'scope': ['sp8'],
+            'heartbeat': stamp(), 'expected_end': (dt.datetime.now(dt.timezone.utc)
+                + dt.timedelta(seconds=options.shared_slot_seconds)).isoformat()
+                if options.shared_slot_seconds else None, 'scope': ['sp8'],
             'rule': 'exclusive isolated GPU tests on sp8; no serving changes',
             'commit': commit}
     # O_EXCL refuses an existing foreign reservation instead of overwriting it.
@@ -96,11 +100,15 @@ def main():
     watcher.start()
     success = True
     container = None
+    slot_started = time.monotonic()
     try:
         with open('/tmp/spark-lab-gpu.lock', 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             for job in options.jobs:
-                if (Path.home() / 'spark-request.json').exists():
+                if (Path.home() / 'spark-request.json').exists() and (
+                    not options.shared_slot_seconds
+                    or time.monotonic() - slot_started >= options.shared_slot_seconds
+                ):
                     print('pending request: returning sp8 after the current completed job', flush=True)
                     break
                 bundle_name, run = job.split(':', 1)

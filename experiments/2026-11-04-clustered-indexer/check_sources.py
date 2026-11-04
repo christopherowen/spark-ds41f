@@ -34,8 +34,9 @@ with tempfile.TemporaryDirectory() as directory:
     for source in (HERE / 'capture/overlay').glob('*.py'):
         ast.parse(source.read_text())
         shutil.copy2(source, target / source.name)
-    subprocess.run(['git', 'apply', '--reverse',
-                    str(HERE / 'capture/0001-capture.patch')], cwd=root, check=True)
+    for patch in reversed((HERE / 'capture/series').read_text().splitlines()):
+        subprocess.run(['git', 'apply', '--reverse',
+                        str(HERE / 'capture' / patch)], cwd=root, check=True)
     expected_hash = json.loads((HERE / 'capture/base.json').read_text())['indexer_sha256']
     assert hashlib.sha256((target / 'indexer.py').read_bytes()).hexdigest() == expected_hash
     assert not (target / 'clustered_capture.py').exists()

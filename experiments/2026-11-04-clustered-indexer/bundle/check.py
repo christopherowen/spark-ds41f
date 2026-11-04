@@ -39,6 +39,13 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
             sf[0, 0] = 255
         if mode == 'extreme':
             sf.random_(96, 145, generator=g)
+        if mode in ('tiny', 'largest'):
+            sf.fill_(96 if mode == 'tiny' else 144)
+        if mode == 'cancellation':
+            keys.fill_(0x77)
+            sf.fill_(127)
+        if mode == 'subnormal-key' and extent:
+            sf[0, 0] = 0
         for b in range(64):
             pool[physical, offset * 64 + b] = keys[:, b]
         for b in range(4):
@@ -52,6 +59,22 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
         weights.fill_(1 / 64)
     if mode == 'extreme':
         scales.random_(96, 145, generator=g)
+    if mode in ('tiny', 'largest'):
+        scales.fill_(96 if mode == 'tiny' else 144)
+        weights.fill_(2**20)
+    if mode == 'cancellation':
+        q.fill_(0x7f)
+        scales.fill_(127)
+        weights[:, ::2].fill_(2**20)
+        weights[:, 1::2].fill_(-2**20)
+    if mode == 'unsupported-query':
+        scales[0, 0, 0] = 150
+    if mode == 'subnormal-query':
+        scales[0, 0, 0] = 0
+    if mode == 'weight-range':
+        weights[0, 0] = 2**21
+    if mode == 'inf-weight':
+        weights[0, 0] = float('inf')
     if mode == 'nan-query':
         scales[0, 0, 0] = 255
     if mode == 'nan-weight':
@@ -211,6 +234,14 @@ def main():
             (16384, [16383], 'random'),
             (262144, [262143], 'separable'),
             (262144, [262143], 'random'),
+            (4096, [4093], 'tiny'),
+            (4096, [4093], 'largest'),
+            (4096, [4093], 'cancellation'),
+            (4096, [4093], 'subnormal-key'),
+            (4096, [4093], 'subnormal-query'),
+            (4096, [4093], 'unsupported-query'),
+            (4096, [4093], 'weight-range'),
+            (4096, [4093], 'inf-weight'),
         ]:
             if width > options.max_width:
                 continue
