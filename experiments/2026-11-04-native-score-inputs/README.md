@@ -1,5 +1,10 @@
 # Native token-id inputs for scoring
 
+**Performance gate not passed:** the owner requires equal or better GPU
+performance in every case. PR #895 is a draft while the slower cases are fixed;
+the v3 results below do not qualify that requirement. Conversion removals are
+to be retained. `performance-gate.json` records the current gate state.
+
 One variable: selected-token score kernels consume the token-id dtype and
 strides supplied by their producers, replacing repeated int64 casts and
 contiguous materializations. This builds on the selected-logit output patch
@@ -126,3 +131,32 @@ python3 experiments/2026-11-04-native-score-inputs/analyze.py \
 Use `--candidate candidate-v1.json` or `--candidate candidate-v2.json` (with their
 experiment-relative paths) to analyze an earlier receipt. Their analyses are
 retained separately as `results-v1.json` and `results-v2.json`.
+
+## Regression fix and controlled measurement
+
+Patch 0004 retires native-id inputs before register-heavy computation. Noncompact
+score ids are gathered into the existing output before normalization; top-k's
+native sampled column is written before selection. Compact int64 cases retain
+the original kernel form, chosen using metadata without a conversion or copy.
+
+The previous timer ran each method's samples in one block, which did not control
+short-term GPU drift well enough for the new per-case gate. The `pair` operation
+instead uses 40 deterministic, randomized mirrored rounds per case, with two
+samples per role in each round. The roles are the exact prerequisite reference,
+the candidate, the recorded v3 implementation, and an unchanged reference
+control. All share the same output address, and graph allocation is outside the
+GPU event interval. Every captured role's output is checked against an independent
+reference result. Input seeds and hashes are recorded.
+
+The zero-margin GPU gate is evaluated separately for every case on both boots:
+either the candidate has identical generated CUDA with the same input/output
+bindings and no reference-preparation copy, or the paired log-time ratio's
+five-standard-error upper bound is at most 1. Inconclusive cases do not pass.
+This is a predeclared conservative measurement rule, not an allowance for a
+percentage slowdown. Full-model and host enqueue qualification remain separate.
+
+The old v3 results are retained as `results-v3.json`, `candidate-v3.json` and
+`runs/native-v3.json`; their code is also retained under `control/v3/` with verified
+hashes for simultaneous comparisons. No old result is relabelled as evidence for
+the new source. The prototype's numerical, paired-performance and IKET checks
+are still required.

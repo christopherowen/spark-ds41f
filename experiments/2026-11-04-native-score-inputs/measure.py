@@ -13,7 +13,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=["tests", "bench", "iket"])
+parser.add_argument("operation", choices=["tests", "bench", "pair", "iket"])
 parser.add_argument("--out", required=True, type=Path)
 args = parser.parse_args()
 base = json.loads((HERE / "base.json").read_text())
@@ -38,7 +38,7 @@ prior = HERE.parents[1] / base["prerequisite"]
 overlay(prior)
 verify(json.loads((prior / "candidate.json").read_text())["files"])
 verify(base["files"])
-if args.operation == "bench":
+if args.operation in ("bench", "pair"):
     reference_dir = args.out / "reference"
     reference_dir.mkdir()
     for name in ("tilelang_logprob.py", "tilelang_topk_ids.py"):
@@ -106,7 +106,7 @@ if args.operation == "iket":
         "--timeout",
         "240",
         "--single-pass-max-ts",
-        "64",
+        "128",
         "--pool-gb",
         "0.25",
         "--skip-raw-data-dump",
@@ -223,11 +223,11 @@ def timed(launch):
 from vllm.v1.worker.gpu.sample import logprob, tilelang_topk_ids  # noqa: E402
 
 
-def load_reference(name):
+def load_reference(name, folder=None, prefix="reference_"):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "reference_" + name, reference_dir / (name + ".py")
+        prefix + name, (reference_dir if folder is None else folder) / (name + ".py")
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -244,6 +244,13 @@ def cases():
             for id_dtype in (torch.int32, torch.int64):
                 for layout in ("dense", "padded", "sliced", "transposed"):
                     width = 129280
+                    seed = int.from_bytes(
+                        hashlib.sha256(
+                            f"{dtype}/{rows}/{id_dtype}/{layout}".encode()
+                        ).digest()[:4],
+                        "little",
+                    )
+                    torch.manual_seed(seed)
                     logits = torch.randn(rows, width, device="cuda", dtype=dtype)
                     for masked in (False, True):
                         cols = 129 if masked else 21
@@ -268,9 +275,7 @@ def cases():
 
                         def old():
                             native = ids.to(torch.int64).contiguous()
-                            out = torch.empty(
-                                ids.shape, device="cuda", dtype=torch.float32
-                            )
+                            out = logits.new_empty(ids.shape, dtype=torch.float32)
                             old_scores.topk_log_softmax(logits, native, out, valid)
                             return out
 
@@ -282,6 +287,7 @@ def cases():
                                 new().view(torch.int32), old().view(torch.int32)
                             )
 
+                        new.inputs = ("scores", logits, ids, valid)
                         yield (
                             dict(
                                 operation="scores",
@@ -318,6 +324,7 @@ def cases():
                         def validate():
                             assert torch.equal(new(), old())
 
+                        new.inputs = ("topk", logits, sampled, None)
                         yield (
                             dict(
                                 operation="topk",
@@ -333,6 +340,181 @@ def cases():
                             new,
                             validate,
                         )
+
+
+if args.operation == "pair":
+    from paired import classify, measure
+    from vllm.v1.worker.gpu.sample import tilelang_logprob as current_scores
+    from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
+
+    control = HERE / "control/v3"
+    control_id = json.loads((control / "identity.json").read_text())
+    for name, sha in control_id["files"].items():
+        assert hashlib.sha256((control / name).read_bytes()).hexdigest() == sha
+    previous_scores = load_reference("tilelang_logprob", control, "previous_")
+    previous_topk = load_reference("tilelang_topk_ids", control, "previous_")
+    source_dir = args.out / "kernel-sources"
+    source_dir.mkdir()
+
+    def compiled(factory, key):
+        kernel = factory(*key)
+        data = kernel.get_kernel_source().encode()
+        digest = hashlib.sha256(data).hexdigest()
+        (source_dir / (digest + ".cu")).write_bytes(data)
+        return digest
+
+    rows = []
+    for label, old, new, validate in cases():
+        validate()
+        operation, logits, ids, valid = new.inputs
+        run = tls._triton_run(logits)
+        alias = ids.dtype == torch.int64 and ids.is_contiguous()
+        native = ids.to(torch.int64).contiguous()
+        alias = alias and native.data_ptr() == ids.data_ptr()
+        if operation == "scores":
+            reference_code = compiled(
+                old_scores.topk_log_softmax_kernel,
+                old_scores.topk_log_softmax_key(logits.dtype, run, valid is not None),
+            )
+            previous_code = compiled(
+                previous_scores.topk_log_softmax_kernel,
+                previous_scores.topk_log_softmax_key(
+                    logits.dtype, run, valid is not None, ids.dtype, ids.is_contiguous()
+                ),
+            )
+            candidate_code = compiled(
+                current_scores.topk_log_softmax_kernel,
+                current_scores.topk_log_softmax_key(
+                    logits.dtype, run, valid is not None, ids.dtype, ids.is_contiguous()
+                ),
+            )
+        else:
+            reference_code = compiled(
+                old_topk.topk_ids_kernel,
+                old_topk.topk_ids_key(logits.dtype, torch.int64, run),
+            )
+            previous_code = compiled(
+                previous_topk.topk_ids_kernel,
+                previous_topk.topk_ids_key(logits.dtype, torch.int64, run, ids.dtype),
+            )
+            candidate_code = compiled(
+                tilelang_topk_ids.topk_ids_kernel,
+                tilelang_topk_ids.topk_ids_key(
+                    logits.dtype, torch.int64, run, ids.dtype, ids.is_contiguous()
+                ),
+            )
+        same_program = alias and candidate_code == reference_code
+        # CUDA events exclude host allocation. Use the same destination for all
+        # captured programs so output address/color is not another variable.
+        expected = old().clone()
+        destination = torch.empty_like(expected)
+        if operation == "scores":
+
+            def reference_launch():
+                native_ids = ids.to(torch.int64).contiguous()
+                old_scores.topk_log_softmax(logits, native_ids, destination, valid)
+                return destination
+
+            def candidate_launch():
+                current_scores.topk_log_softmax(logits, ids, destination, valid)
+                return destination
+
+            def previous_launch():
+                previous_scores.topk_log_softmax(logits, ids, destination, valid)
+                return destination
+        else:
+
+            def reference_launch():
+                old_topk._launch(logits, destination, ids.to(torch.int64).contiguous())
+                return destination
+
+            def candidate_launch():
+                tilelang_topk_ids._launch(logits, destination, ids)
+                return destination
+
+            def previous_launch():
+                previous_topk._launch(logits, destination, ids)
+                return destination
+
+        seed = int.from_bytes(
+            hashlib.sha256(json.dumps(label, sort_keys=True).encode()).digest()[:4],
+            "little",
+        )
+        data_id = dict(
+            sample_order_seed=seed,
+            data_seed=int.from_bytes(
+                hashlib.sha256(
+                    f"{logits.dtype}/{logits.shape[0]}/{ids.dtype}/{label['layout']}".encode()
+                ).digest()[:4],
+                "little",
+            ),
+            logits_sha256=hashlib.sha256(
+                logits.cpu().view(torch.uint8).numpy().tobytes()
+            ).hexdigest(),
+            ids_sha256=hashlib.sha256(ids.cpu().numpy().tobytes()).hexdigest(),
+            id_strides=list(ids.stride()),
+            reference_preparation_aliases_input=alias,
+            shared_output_address=True,
+        )
+        measured, outputs = measure(
+            dict(
+                reference=reference_launch,
+                candidate=candidate_launch,
+                previous=previous_launch,
+                null=reference_launch,
+            ),
+            flush,
+            seed,
+            expected,
+        )
+        assert torch.equal(
+            outputs["candidate"].view(torch.int32),
+            outputs["reference"].view(torch.int32),
+        )
+        assert torch.equal(
+            outputs["previous"].view(torch.int32),
+            outputs["reference"].view(torch.int32),
+        )
+        summary = classify(
+            measured["log_ratios"]["candidate"], identical_program=same_program
+        )
+        rows.append(
+            dict(
+                case=label,
+                data=data_id,
+                same_program=same_program,
+                cuda_source_sha256=dict(
+                    reference=reference_code,
+                    previous=previous_code,
+                    candidate=candidate_code,
+                ),
+                measured=measured,
+                gate=summary,
+                previous_gate=classify(
+                    measured["log_ratios"]["previous"],
+                    identical_program=alias and previous_code == reference_code,
+                ),
+                null_control=classify(
+                    measured["log_ratios"]["null"], identical_program=True
+                ),
+            )
+        )
+        (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
+    failed = [r["case"] for r in rows if r["gate"]["status"] == "not_proved"]
+    result = dict(
+        identity,
+        cases=rows,
+        not_proved=failed,
+        gate_passed=not failed,
+        protocol="40 balanced randomized mirrored rounds per case; two samples per role/round; shared output address; cold L2; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        seconds=time.monotonic() - started,
+    )
+    (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(
+        json.dumps(dict(operation="pair", cases=len(rows), not_proved=len(failed))),
+        flush=True,
+    )
+    raise SystemExit(0)
 
 
 rows = []

@@ -210,6 +210,7 @@ def topk_log_softmax_kernel(
     logits_stride = T.dynamic("logits_stride", "int64")
     id_row, id_col = T.dynamic("id_row, id_col", "int64")
     id_strides = (topk, 1) if compact_ids else (id_row, id_col)
+    gather_first = not compact_ids
     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
     threads = _SOFTMAX_THREADS
     loads = _SOFTMAX_LOADS
@@ -285,6 +286,16 @@ def topk_log_softmax_kernel(
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
+            if gather_first:
+                # Retire native-id pointers and strides before the row reduction.
+                # The output is also the selected-value scratch; no extra buffer.
+                row64 = T.cast(row, T.int64)
+                for c in T.serial(T.ceildiv(topk, threads)):
+                    col = c * threads + tx
+                    if col < topk:
+                        output[row64, col] = T.cast(
+                            logits[row, token_ids[row64, col]], T.float32
+                        )
             raw = T.alloc_local((per,), logits_dtype)
             peak = T.alloc_local((loads,), T.float32)
             total = T.alloc_local((loads,), T.float32)
@@ -353,7 +364,10 @@ def topk_log_softmax_kernel(
             for c in T.serial(T.ceildiv(topk, threads)):
                 col = c * threads + tx
                 if col < topk:
-                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                    if gather_first:
+                        picked = output[row64, col]
+                    else:
+                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
                     value = T.call_extern(
                         "float32",
                         "vllm_sub",

@@ -215,7 +215,11 @@ __device__ __forceinline__ int vllm_tki_order(unsigned long long entry, int k) {
 
 @tilelang.jit(pass_configs=_PASS)
 def topk_ids_kernel(
-    logits_dtype: str, ids_dtype: str, run: int, sampled_dtype: str = "int64"
+    logits_dtype: str,
+    ids_dtype: str,
+    run: int,
+    sampled_dtype: str = "int64",
+    compact_sampled: bool = True,
 ):
     """A block a row: its ``k = width - first`` top columns in ``torch.topk``'s order,
     at ``out[row, first:]``. int64 ids take the sampled token at column 0 (``first``
@@ -224,7 +228,7 @@ def topk_ids_kernel(
     alignment, or one element)."""
     rows, vocab, width = T.dynamic("rows, vocab, width")
     logits_stride = T.dynamic("logits_stride", "int64")
-    sampled_stride = T.dynamic("sampled_stride", "int64")
+    sampled_stride = 1 if compact_sampled else T.dynamic("sampled_stride", "int64")
     with_sampled = ids_dtype == "int64"
     first = 1 if with_sampled else 0
     vectors = _PER // run
@@ -373,9 +377,13 @@ def topk_ids_kernel(
                 tx = T.get_thread_binding()
                 lists = T.alloc_shared((_WARPS, 32), T.uint64)
                 chosen = T.alloc_shared((32,), T.uint64)
+                if sampled_dtype != "int64" or not compact_sampled:
+                    if tx == 0:
+                        out[row, 0] = sampled[row]
                 select(logits, out, row, tx, lists, chosen)
-                if tx == 0:
-                    out[row, 0] = sampled[row]
+                if sampled_dtype == "int64" and compact_sampled:
+                    if tx == 0:
+                        out[row, 0] = sampled[row]
 
         return topk_ids
 
@@ -399,8 +407,15 @@ def topk_ids_key(
     ids_dtype: torch.dtype,
     run: int,
     sampled_dtype: torch.dtype = torch.int64,
+    compact_sampled: bool = True,
 ) -> tuple:
-    return (_DTYPES[logits_dtype], _DTYPES[ids_dtype], run, _DTYPES[sampled_dtype])
+    return (
+        _DTYPES[logits_dtype],
+        _DTYPES[ids_dtype],
+        run,
+        _DTYPES[sampled_dtype],
+        compact_sampled,
+    )
 
 
 # The ids each path writes: the fast path's int64 rows with the sampled token, the
@@ -412,13 +427,17 @@ def topk_ids_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
     """The calls for logits of each of ``logits_dtypes``: both ids layouts, in both
     load layouts a launch may take (``_runs``)."""
     return [
-        _call(topk_ids_kernel, *topk_ids_key(dtype, ids_dtype, run, sampled_dtype))
+        _call(
+            topk_ids_kernel,
+            *topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
+        )
         for dtype in dict.fromkeys(logits_dtypes)
         for ids_dtype in _IDS_DTYPES
         for run in _runs(dtype)
         for sampled_dtype in (
             (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
         )
+        for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
     ]
 
 
@@ -452,6 +471,7 @@ def _launch(
             out.dtype,
             _triton_run(logits),
             torch.int64 if sampled is None else sampled.dtype,
+            sampled is None or sampled.is_contiguous(),
         ),
     )
     if sampled is None:

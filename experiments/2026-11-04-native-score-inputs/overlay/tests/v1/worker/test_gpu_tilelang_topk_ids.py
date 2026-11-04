@@ -570,7 +570,7 @@ def test_runner_declares_the_launched_calls():
     assert declared == {
         (
             id(tki.topk_ids_kernel),
-            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype),
+            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
         )
         for dtype in (torch.bfloat16, torch.float32)
         for ids_dtype in (torch.int64, torch.int32)
@@ -578,6 +578,7 @@ def test_runner_declares_the_launched_calls():
         for sampled_dtype in (
             (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
         )
+        for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
     }
     prepare.prepare_declared(registry)
     for dtype in (torch.bfloat16, torch.float32):

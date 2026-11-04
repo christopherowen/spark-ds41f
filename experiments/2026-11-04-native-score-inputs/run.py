@@ -54,6 +54,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiments", nargs="+", required=True)
     parser.add_argument("--run", required=True)
+    parser.add_argument(
+        "--operations",
+        nargs="+",
+        choices=["tests", "bench", "pair", "iket"],
+        default=["tests", "pair", "iket"],
+    )
     args = parser.parse_args()
     assert socket.gethostname() == "spark-0016", "authorized only on idle sp8"
     assert not capture(["git", "-C", str(ROOT), "status", "--porcelain"]), (
@@ -97,7 +103,7 @@ def main():
     jobs = [
         dict(experiment=str(p.relative_to(ROOT)), operation=op, boot=boot)
         for p in folders
-        for op in ("tests", "bench", "iket")
+        for op in args.operations
         for boot in (1, 2)
     ]
     write(
