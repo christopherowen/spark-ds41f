@@ -121,6 +121,9 @@ A failed or missing byte gate cannot become a timing win. It compares first and
 repeat containers with exploratory bootstrap uncertainty, then closes its owned
 window and restores the recorded service even on a failed gate. It never opens
 or changes another holder's reservation.
+Restoration first checks all management connections and an explicit unchanged-shape
+plan. Observed management loss or a refused restoration plan preserves a review
+hold and the native receipt, with no further launch.
 
 After acquiring the standard published/idle window with the note
 `owner-authorized lossless FP8 decoder measurements`, run on dgx1:

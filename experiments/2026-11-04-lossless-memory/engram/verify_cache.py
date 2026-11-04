@@ -115,16 +115,23 @@ def cache_path(directory, layer, tp, rank, weight, scale, table_rows, starts, le
 
 def open_by_serving_process(paths):
     owners = {str(p): [] for p in paths}
+    identities = {str(p): (p.stat().st_dev, p.stat().st_ino) for p in paths}
     for process in Path("/proc").glob("[0-9]*"):
         if process.name == str(os.getpid()):
             continue
         for fd in (process / "fd").glob("*"):
             try:
                 target = os.readlink(fd)
+                info = fd.stat()
             except OSError:
                 continue
-            if target in owners:
-                owners[target].append({"pid": int(process.name), "fd": fd.name})
+            # The verifier and serving process have separate mount namespaces.
+            # Match the underlying file, including stale/deleted FD detection,
+            # rather than assuming procfs spells both mount paths identically.
+            for path, identity in identities.items():
+                if (info.st_dev, info.st_ino) == identity:
+                    owners[path].append({"pid": int(process.name), "fd": fd.name,
+                                         "observed_path": target})
     if not owners or not all(owners.values()):
         raise ValueError("the running reader does not hold every verified packed file")
     return owners

@@ -32,6 +32,8 @@ class RunnerTests(unittest.TestCase):
         self.pending, self.change_to_foreign, self.omit_verdict = False, False, False
         self.closure_reason = "cluster requested (fixture)"
         self.request_path = self.root / "spark-request.json"
+        self.management_unreachable = []
+        self.restore_refused = False
         self.write(self.here / "base.json", {"image_id": "sha256:" + "a" * 64, "model_revision": "b" * 40})
         self.write(self.here / "fp8/kernel-32.json",
                    {"run": "first", "jobs": [{"bundles": [{"bundle": "experiments/memory/fp8/bundle", "node": "dgx1"}]}]})
@@ -51,7 +53,8 @@ class RunnerTests(unittest.TestCase):
     def run_command(self, argv, **kwargs):
         if "bin/spark" in argv:
             self.assertNotIn("--apply", argv)
-            return SimpleNamespace(returncode=0, stdout="live: running: 3 nodes, TP3\nplan only\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="live: running: 3 nodes, TP3\nplan only\n" +
+                                   ("--apply would refuse" if self.restore_refused and "start" in argv else ""), stderr="")
         raise AssertionError("unexpected process: " + repr(argv))
 
     def kernel(self, step):
@@ -70,6 +73,7 @@ class RunnerTests(unittest.TestCase):
             read_hold=lambda: self.hold,
             window_should_close=lambda hold: self.closure_reason if self.pending else None,
             REQUEST=self.request_path,
+            HOLD=self.root / "hold.json",
             now=lambda: "2026-11-04T00:00:00Z", beat=lambda note: None,
             write_json_atomic=self.write, compile_cache=lambda candidate: self.cache,
             window_close=self.close, production_live=lambda: True,
@@ -81,6 +85,7 @@ class RunnerTests(unittest.TestCase):
         argv = ["run_fp8.py", "--window", "owned", "--lanes", "32", "--out", "results/private/round", "--apply"]
         with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=fake_lab,
                             subprocess=process, os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"))), \
+                patch.object(runner, "probe_management", return_value=self.management_unreachable), \
                 patch.object(sys, "argv", argv):
             return runner.main()
 
@@ -152,6 +157,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(set(specs)), 6)
         self.assertTrue(all("/fp8/fixed/" in path for path in specs))
         self.assertTrue(any("512-repeat" in path for path in specs))
+
+    def test_management_loss_never_launches_restoration(self):
+        self.management_unreachable = ["dgx2"]
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.closed, [])
+        hold = json.loads((self.root / "hold.json").read_text())
+        self.assertEqual(hold["holder"], "lossless-memory-hardware-review")
+        self.assertFalse(self.receipt()["restored"])
+
+    def test_refused_restoration_plan_is_retained_without_another_launch(self):
+        self.restore_refused = True
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.closed, [])
+        hold = json.loads((self.root / "hold.json").read_text())
+        self.assertEqual(hold["holder"], "lossless-memory-restoration-review")
 
 
 if __name__ == "__main__":
