@@ -39,7 +39,7 @@ def score(queries, weights, key, order=None):
     return bf16(total)
 
 
-def upper_bound(queries, weights, keys):
+def upper_bound(queries, weights, keys, *, split=False):
     lower = [min(column) for column in zip(*keys)]
     upper = [max(column) for column in zip(*keys)]
     total = 0.
@@ -49,8 +49,16 @@ def upper_bound(queries, weights, keys):
         products = [f32(x * (hi if x >= 0 else lo)) for x, lo, hi in zip(q, lower, upper)]
         absolute = [f32(abs(x) * max(abs(lo), abs(hi))) for x, lo, hi in zip(q, lower, upper)]
         estimate, norm = 0., 0.
-        for p, a in zip(products, absolute):
-            estimate, norm = f32(estimate + p), f32(norm + a)
+        if split:
+            for endpoint, positive in ((upper, True), (lower, False)):
+                for x, end in zip(q, endpoint):
+                    part = max(x, 0.) if positive else min(x, 0.)
+                    estimate = f32(estimate + f32(part * end))
+            for a in absolute:
+                norm = f32(norm + a)
+        else:
+            for p, a in zip(products, absolute):
+                estimate, norm = f32(estimate + p), f32(norm + a)
         bound = max(f32(f32(estimate + f32(norm / 256.)) + 2**-50), 0.)
         term = bf16(f32(bf16(bound) * max(w, 0.)))
         total = f32(total + term)

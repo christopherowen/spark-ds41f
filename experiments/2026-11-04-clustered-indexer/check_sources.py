@@ -17,6 +17,8 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run(['git', 'apply',
                     str(HERE / 'vllm/0003-stream-envelope.patch')], check=True,
                    cwd=root)
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0004-tensor-interval-bounds.patch')],
+                   cwd=root, check=True)
     actual = (root / RELATIVE).read_bytes()
     expected = (HERE / 'bundle/overlay' / RELATIVE).read_bytes()
     assert actual == expected, 'patch and executable overlay differ'

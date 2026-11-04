@@ -215,3 +215,37 @@ mounted input hashes. Use the published clean checkout on sp8:
 ```sh
 python3 experiments/2026-11-04-clustered-indexer/sp8_run.py sp8-control:sp8-control-01 sp8-control:sp8-control-02 sp8-graph:sp8-stream-01 sp8-graph:sp8-stream-02 sp8-profile:sp8-profile-01 sp8-initcheck:sp8-initcheck-01 sp8-memcheck:sp8-memcheck-01 sp8-racecheck:sp8-racecheck-01
 ```
+
+## Optional tensor-core interval bounds
+
+`vllm/0004-tensor-interval-bounds.patch` changes the bound execution only, after
+separately screening the streamed envelope. The scalar bound stays the default.
+The explicit `--matrix-bounds` candidate computes `q+ @ upper + q- @ lower` and
+`abs(q) @ max(abs(lower), abs(upper))` with BF16 tensor cores and FP32 accumulation.
+Every certified decoded FP4 coordinate is exactly representable in BF16, so this
+introduces no input rounding. Metadata stays in its original format. Exceptional
+clusters are explicitly tagged and get an infinite bound; NaN/Inf metadata never
+enters a matrix product. The final indexer scorer and attention arithmetic stay
+unchanged.
+
+The split dot has at most 256 terms. Using `2*gamma(255)` for its comparison with
+the scorer, and `(1-gamma(127))*A` for the computed absolute norm, still leaves
+more than a factor of 100 inside the existing `A/256` allowance, including its
+addition rounding. All certified products and sums remain normal and finite.
+The same BF16 monotonicity and ordered head-sum argument applies. The CPU gate
+checks all 784 decoded code/scale values for exact BF16 representation and checks
+split-bound dominance under signed weights and cancellation. Hardware arithmetic
+and exact-selection gates remain required before this path can qualify.
+
+`matrix-bounds.json` records the one variable and pending gates. Its results must
+be compared with the streamed scalar candidate on the same sp8 runtime, in two
+fresh processes, keeping all failed runs. Earlier scalar results do not qualify
+this optional path.
+
+The first sp8 archived-candidate control completed at source commit `cf24a61c`:
+12 cases pass, retaining every archived selected-position digest, including graph
+visibility changes. Its native command, input hashes, timings and memory
+observations are in `runs/sp8-control-01/`; `sp8-results.json` summarizes them.
+The batch returned sp8 at that job boundary when another authorized task requested
+it. Its request was preserved. This is one control process only; no speedup or
+qualification of the streamed or tensor-core candidates is inferred from it.

@@ -164,6 +164,122 @@ def cluster_bounds(width: int):
 
 
 @tilelang.jit
+def cluster_bounds_tensor(width: int, block_C: int = 64):
+    """The same conservative interval bound, using exact BF16 endpoint inputs.
+
+    Decoded certified FP4 values fit BF16 exactly. Split q into positive and
+    negative parts: q+ @ upper + q- @ lower is the real interval bound. The
+    existing 1/256 allowance covers both 128-term MMA reductions and the norm.
+    The final index scorer and selected-key arithmetic are never changed.
+    """
+    rows = T.dynamic('rows')
+    clusters = width // CLUSTER
+
+    @T.prim_func
+    def bounds_tensor(
+        Q: T.Tensor([rows, INDEX_HEADS, 64], T.uint8),
+        Scales: T.Tensor([rows, INDEX_HEADS, 4], T.uint8),
+        Weights: T.Tensor([rows, INDEX_HEADS], T.bfloat16),
+        Lower: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
+        Upper: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
+        Lengths: T.Tensor([rows], T.int32),
+        Active: T.Tensor([1], T.int32),
+        Bounds: T.Tensor([rows, clusters], T.bfloat16),
+        Counts: T.Tensor([rows], T.int32),
+    ):
+        with T.Kernel(T.ceildiv(clusters, block_C), rows, threads=128) as (tile, row):
+            A = T.alloc_shared([block_C, INDEX_DIM], T.bfloat16)
+            B = T.alloc_shared([INDEX_HEADS, INDEX_DIM], T.bfloat16)
+            key_bad = T.alloc_shared([block_C], T.int32)
+            query_bad = T.alloc_shared([INDEX_HEADS], T.int32)
+            contrib = T.alloc_shared([block_C, INDEX_HEADS], T.float32)
+            estimate = T.alloc_fragment([block_C, INDEX_HEADS], T.float32)
+            norm = T.alloc_fragment([block_C, INDEX_HEADS], T.float32)
+            total = T.alloc_fragment([block_C], T.float32)
+            extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
+            if tile == 0:
+                if T.get_thread_binding() == 0:
+                    Counts[row] = T.ceildiv(extent, CLUSTER)
+            for c in T.Parallel(block_C):
+                key_bad[c] = 0
+            for h in T.Parallel(INDEX_HEADS):
+                s0 = T.cast(Scales[row, h, 0], T.int32)
+                s1 = T.cast(Scales[row, h, 1], T.int32)
+                s2 = T.cast(Scales[row, h, 2], T.int32)
+                s3 = T.cast(Scales[row, h, 3], T.int32)
+                query_bad[h] = T.cast(
+                    (s0 < MIN_SCALE) | (s0 > MAX_SCALE)
+                    | (s1 < MIN_SCALE) | (s1 > MAX_SCALE)
+                    | (s2 < MIN_SCALE) | (s2 > MAX_SCALE)
+                    | (s3 < MIN_SCALE) | (s3 > MAX_SCALE), T.int32)
+            T.sync_threads()
+            # Unsupported metadata is tagged explicitly, never sent as NaN/Inf
+            # into MMA. Only the exceptional clusters issue shared atomics.
+            for c, d in T.Parallel(block_C, INDEX_DIM):
+                cluster = tile * block_C + c
+                A[c, d] = T.cast(0, T.bfloat16)
+                if cluster < clusters:
+                    lo = Lower[row, cluster, d]
+                    hi = Upper[row, cluster, d]
+                    valid = (T.abs(lo) < T.infinity(T.float32)) & (T.abs(hi) < T.infinity(T.float32))
+                    A[c, d] = T.cast(T.if_then_else(valid, hi, 0.0), T.bfloat16)
+                    if not valid:
+                        T.atomic_max(key_bad[c], 1)
+            for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
+                q = _decode(Q[row, h, d // 2], Scales[row, h, d // 32], d)
+                B[h, d] = T.cast(T.max(q, 0.0), T.bfloat16)
+            T.sync_threads()
+            T.gemm(A, B, estimate, transpose_B=True, clear_accum=True)
+            T.sync_threads()
+            for c, d in T.Parallel(block_C, INDEX_DIM):
+                cluster = tile * block_C + c
+                A[c, d] = T.cast(0, T.bfloat16)
+                if cluster < clusters:
+                    A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
+                                                    Lower[row, cluster, d], 0.0), T.bfloat16)
+            for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
+                q = _decode(Q[row, h, d // 2], Scales[row, h, d // 32], d)
+                B[h, d] = T.cast(T.min(q, 0.0), T.bfloat16)
+            T.sync_threads()
+            T.gemm(A, B, estimate, transpose_B=True, clear_accum=False)
+            T.sync_threads()
+            for c, d in T.Parallel(block_C, INDEX_DIM):
+                cluster = tile * block_C + c
+                A[c, d] = T.cast(0, T.bfloat16)
+                if cluster < clusters:
+                    lo = Lower[row, cluster, d]
+                    hi = Upper[row, cluster, d]
+                    A[c, d] = T.cast(T.if_then_else(key_bad[c] == 0,
+                        T.max(T.abs(lo), T.abs(hi)), 0.0), T.bfloat16)
+            for h, d in T.Parallel(INDEX_HEADS, INDEX_DIM):
+                q = _decode(Q[row, h, d // 2], Scales[row, h, d // 32], d)
+                B[h, d] = T.cast(T.abs(q), T.bfloat16)
+            T.sync_threads()
+            T.gemm(A, B, norm, transpose_B=True, clear_accum=True)
+            for c, h in T.Parallel(block_C, INDEX_HEADS):
+                w = T.cast(Weights[row, h], T.float32)
+                valid = (key_bad[c] == 0) & (query_bad[h] == 0) & (T.abs(w) <= 1048576.0)
+                valid = valid & (T.abs(estimate[c, h]) < T.infinity(T.float32))
+                valid = valid & (T.abs(norm[c, h]) < T.infinity(T.float32))
+                upper = T.max(estimate[c, h] + norm[c, h] * (1.0 / 256.0) + 2.0**-50, 0.0)
+                dot_bf16 = T.cast(T.cast(upper, T.bfloat16), T.float32)
+                weighted = T.cast(T.cast(T.fmul(dot_bf16, T.max(w, 0.0)), T.bfloat16), T.float32)
+                contrib[c, h] = T.if_then_else(valid, weighted, T.infinity(T.float32))
+            T.sync_threads()
+            T.fill(total, 0)
+            for h in T.serial(INDEX_HEADS):
+                for c in T.Parallel(block_C):
+                    total[c] += contrib[c, h]
+            for c in T.Parallel(block_C):
+                cluster = tile * block_C + c
+                if cluster < clusters:
+                    Bounds[row, cluster] = T.if_then_else(cluster * CLUSTER < extent,
+                        T.cast(total[c], T.bfloat16), -T.infinity(T.bfloat16))
+
+    return bounds_tensor
+
+
+@tilelang.jit
 def seed_candidates(width: int, seeds: int):
     rows = T.dynamic("rows")
 
@@ -274,7 +390,7 @@ class ClusteredIndexerPlan:
     handles dense indexer domains only, not CSA's source/reindex/reuse state.
     """
 
-    def __init__(self, width, page_size, *, topk=INDEX_TOPK, seeds=32):
+    def __init__(self, width, page_size, *, topk=INDEX_TOPK, seeds=32, matrix_bounds=False):
         from .indexer import IndexerTopK
 
         if width <= 0 or width % CLUSTER or page_size % CLUSTER:
@@ -284,7 +400,7 @@ class ClusteredIndexerPlan:
         if self.seeds <= 0 or self.seeds * CLUSTER < topk:
             raise ValueError("seed capacity must cover topk")
         self.envelope = cluster_envelopes(width, page_size)
-        self.bounds = cluster_bounds(width)
+        self.bounds = cluster_bounds_tensor(width) if matrix_bounds else cluster_bounds(width)
         self.coarse = IndexerTopK(width // CLUSTER, self.seeds)
         self.seed = seed_candidates(width, self.seeds)
         self.compact = surviving_candidates(width, topk)

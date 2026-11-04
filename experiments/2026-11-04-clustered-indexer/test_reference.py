@@ -17,13 +17,29 @@ class BoundTests(unittest.TestCase):
             keys = [vector() for _ in range(8)]
             weights = [bf16(rng.uniform(-.1, .1)) for _ in queries]
             bound = upper_bound(queries, weights, keys)
+            matrix_bound = upper_bound(queries, weights, keys, split=True)
             orders = [list(range(128)), list(reversed(range(128)))]
             permuted = list(range(128))
             rng.shuffle(permuted)
             orders.append(permuted)
             for key in keys:
                 for order in orders:
-                    self.assertGreaterEqual(bound, score(queries, weights, key, order), case)
+                    observed = score(queries, weights, key, order)
+                    self.assertGreaterEqual(bound, observed, case)
+                    self.assertGreaterEqual(matrix_bound, observed, case)
+
+    def test_certified_endpoints_are_exact_bf16(self):
+        for scale in range(96, 145):
+            for code in range(16):
+                value = decode(code, scale)
+                self.assertEqual(bf16(value), value)
+
+    def test_split_bound_cancellation(self):
+        for scale in (96, 127, 144):
+            q = [decode(7 if d % 2 else 15, scale) for d in range(128)]
+            keys = [[decode(7, scale)] * 128]
+            self.assertGreaterEqual(upper_bound([q], [bf16(2**20)], keys, split=True),
+                                    score([q], [bf16(2**20)], keys[0]))
 
     def test_single_point_intervals_and_mixed_sign_queries(self):
         rng = random.Random(4117)

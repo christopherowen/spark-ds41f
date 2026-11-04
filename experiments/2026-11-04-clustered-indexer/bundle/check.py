@@ -62,10 +62,11 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
 
 
 def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=False,
-          profile_label=None, envelope_reference=False):
+          profile_label=None, envelope_reference=False, matrix_bounds=False):
     torch.cuda.reset_peak_memory_stats()
     args = inputs(width, extents, mode, unwritten_cache=unwritten_cache)
-    candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
+    candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64),
+                                     matrix_bounds=matrix_bounds)
     if envelope_reference:
         candidate.envelope = reference_envelopes(width, 256)
     reference = IndexerV41Plan(width, 256)
@@ -168,6 +169,7 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
         print(profiler.key_averages().table(
             sort_by='self_device_time_total', row_limit=40), flush=True)
     return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
+            'bound_execution': 'tensor-core' if matrix_bounds else 'scalar',
             'envelope_execution': 'archived-reduction' if envelope_reference else 'streamed',
             'envelopes_identical': True,
             'unwritten_cache': unwritten_cache,
@@ -188,6 +190,7 @@ def main():
     parser.add_argument('--unwritten-cache', action='store_true')
     parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--profile-label')
+    parser.add_argument('--matrix-bounds', action='store_true')
     parser.add_argument('--envelope-reference', action='store_true',
                         help='time the archived, unreleased candidate reduction as a control')
     options = parser.parse_args()
@@ -215,6 +218,7 @@ def main():
                                          unwritten_cache=options.unwritten_cache,
                                          cuda_graph=options.cuda_graph,
                                          envelope_reference=options.envelope_reference,
+                                         matrix_bounds=options.matrix_bounds,
                                          profile_label=(options.profile_label
                                                         if width == options.max_width else None)))
             print(json.dumps(result['cases'][-1]), flush=True)
