@@ -135,8 +135,11 @@ def main():
     parser.add_argument("--window", required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--through", choices=("gate", "release"), default="release")
-    parser.add_argument("--reuse-gates-from", type=Path,
-                        help="reuse completed native image gates before any serving measurement")
+    reuse = parser.add_mutually_exclusive_group()
+    reuse.add_argument("--reuse-gates-from", type=Path,
+                       help="reuse completed native image gates before any serving measurement")
+    reuse.add_argument("--reuse-kernel-from", type=Path,
+                       help="reuse an image and passed component gate, then run a new full gate")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     arm = HERE / args.component
@@ -162,15 +165,21 @@ def main():
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT).strip():
         raise SystemExit("checkout is dirty")
     previous = None
-    if args.reuse_gates_from:
-        path = (ROOT / args.reuse_gates_from).resolve()
+    reuse_path = args.reuse_gates_from or args.reuse_kernel_from
+    if reuse_path:
+        path = (ROOT / reuse_path).resolve()
         if not path.is_relative_to(ROOT / "results/private"):
             parser.error("gate receipts must be retained native results")
         previous = json.loads(path.read_text())
-        if (previous.get("component") != args.component or previous.get("gates_passed") is not True
-                or previous.get("restored") is not True
+        if (previous.get("component") != args.component or previous.get("restored") is not True
+                or args.reuse_gates_from and previous.get("gates_passed") is not True
+                or args.reuse_kernel_from and not previous.get("kernel")
                 or any(s.get("log", "").startswith("boot-") for s in previous.get("steps", []))):
             raise SystemExit("prior execution lacks safely completed gates or already started serving measurement")
+        if args.reuse_kernel_from:
+            full = json.loads((arm / "full-gate.json").read_text())
+            if (ROOT / "results/private/lab" / full["run"] / "verdicts.json").exists():
+                raise SystemExit("full-gate observations already exist; use a distinct retained run")
     elif any((ROOT / "results/private/lab" / json.loads((arm / (n + ".json")).read_text())["run"]
               / "verdicts.json").exists() for n in ("kernel", "full-gate")):
         raise SystemExit("prior native gates exist; retain and review them before reusing")
@@ -184,7 +193,7 @@ def main():
                "component": args.component, "steps": [], "plans": [], "images": {}, "restored": False,
                "release_promoted": False, "completed": False}
     if previous is not None:
-        receipt["reused_gates_from"] = str(args.reuse_gates_from)
+        receipt["reused_gates_from" if args.reuse_gates_from else "reused_kernel_from"] = str(reuse_path)
         receipt["prior_receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     done, management_lost = threading.Event(), False
     active_profile, active_label = None, None
@@ -331,14 +340,15 @@ def main():
             spec = json.loads((arm / (name + ".json")).read_text())
             bundle = ROOT / spec["jobs"][0]["bundles"][0]["bundle"] / "candidate.json"
             bundle_sha = hashlib.sha256(bundle.read_bytes()).hexdigest()
-            if previous is None:
+            reusing = previous is not None and (name == "kernel" or bool(args.reuse_gates_from))
+            if not reusing:
                 run([sys.executable, "scripts/lab.py", "run", str((arm / (name + ".json")).relative_to(ROOT)),
                      "--production-config", RESTORE, "--keep-open"], name)
             path = ROOT / "results/private/lab" / spec["run"] / "verdicts.json"
             native = json.loads(path.read_text())
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if previous is not None and (previous[name]["sha256"] != digest
-                                         or previous[name]["bundle_sha256"] != bundle_sha):
+            if reusing and (previous[name]["sha256"] != digest
+                            or previous[name]["bundle_sha256"] != bundle_sha):
                 raise ValueError("retained native gate or its test bundle changed")
             management_lost |= any(marker in json.dumps(native).lower() for marker in MANAGEMENT_ERRORS)
             management_lost |= any(v.get("exit") == 255 for v in native.get("verdicts", []))

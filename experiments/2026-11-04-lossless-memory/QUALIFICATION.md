@@ -2,8 +2,10 @@
 
 These are measurement candidates. The standalone FP8 GPU screen ran and rejected
 all three tested Huffman layouts and all three fixed-field layouts. Each of the
-twelve fresh containers passed its exact-byte gate. Neither isolated serving image has been built;
-no serving improvement or release acceptance is claimed.
+twelve fresh containers passed its exact-byte gate. The isolated scale image built
+and passed its component gate on every rank; its first full gate failed inherited
+fixtures and did not start serving measurement. Engram remains unbuilt. No
+serving improvement or release acceptance is claimed.
 
 ## Source identities
 
@@ -21,7 +23,9 @@ no revision, source bytes or check was substituted. Complete local inputs for bo
 auxiliary sources and hash-locked aarch64 wheels. Both `build check` commands
 pass. `runs/full-input-preparation/` retains the initial fetch failure and retry;
 `runs/engram-observation-preparation/` records the final instrumented Engram tree.
-Target image builds and checks are still required. The first image attempt was
+The scale image is built and its initial gates/restoration are recorded in
+`expert-scales/initial-gate-results.json`. Engram image construction and both
+candidates' complete corrected qualification remain required. The first image attempt was
 rejected before stopping service because its plan used a non-resolving profile
 path; `runs/component-plan-failure/` retains the original receipt and logs.
 Both plans now use complete repository-relative paths, and the controller
@@ -99,7 +103,7 @@ names its cluster configuration explicitly.
 For each variable, complete `build prepare`, `build check`, then
 `build image --apply` with that explicit `--cluster-config`. The latter runs
 GPU smoke tests and belongs inside the authorized cluster window. None of these
-complete builds has run for this experiment.
+complete builds has qualified serving; the scale build itself is complete.
 
 Within the window, run jobs back to back with `--keep-open`, restoring production
 once at the end. The FP8 first/repeat specs have different run IDs, bundles and
@@ -156,6 +160,14 @@ distribution; the exact kernel/scale/row tests remain required too. The recorded
 reference self-check validates this analysis path and is not candidate evidence.
 Both candidate comparisons must pass before a release proposal claims unchanged
 recorded model behavior.
+
+`gate-fixtures/` records test-only corrections for the inherited full-gate
+fixture failures. The original failure is retained; no serving qualification
+uses it as a pass. After restoration, `--reuse-kernel-from RECEIPT` can retain
+only the exact image and passed component gate while requiring a distinct new
+full gate. It rejects failed component verdicts, earlier serving observations
+and any already-existing replacement full-gate output. Test-source overrides
+are limited to the three pinned test files; the complete catalog still runs.
 
 `--through gate` ends after the image tests. A later window may use
 `--reuse-gates-from RECEIPT` only when the prior window restored production,

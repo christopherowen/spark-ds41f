@@ -29,6 +29,8 @@ class ComponentTests(unittest.TestCase):
         self.image_failure = True
         self.plan_failure = False
         self.kernel_passes = False
+        self.full_gate_passes = None
+        self.lab_calls = []
         self.image = {"Id": "sha256:" + "a" * 64, "Layers": ["sha256:" + "b" * 64],
                       "Labels": {"local.spark-ds41f.vllm.tree": "c" * 40, "org.opencontainers.image.revision": "d" * 40}}
         self.images = {f"dgx{i}": self.image for i in (1, 2, 3)}
@@ -64,15 +66,18 @@ class ComponentTests(unittest.TestCase):
                                    ("--apply would refuse" if refused else "plan only"), stderr="")
         if "scripts/lab.py" in argv:
             kind = Path(argv[3]).stem
+            self.lab_calls.append(kind)
             if kind == "image" and self.image_failure:
                 kwargs["stdout"].write("ssh: connect timed out" if self.management_failure else "build failed")
                 if self.foreign_after_failure:
                     self.hold = {"holder": "spark-lab: foreign", "window": "foreign"}
                 return SimpleNamespace(returncode=1)
             if kind in ("kernel", "full-gate"):
+                passed = self.kernel_passes if kind == "kernel" or self.full_gate_passes is None else self.full_gate_passes
                 native = {"agree": True, "verdicts": [{"node": node, "image": self.image["Id"],
-                          "passed": self.kernel_passes, "exit": 0, "errors": [], "failed": []} for node in self.images]}
-                self.write(self.root / "results/private/lab" / kind / "verdicts.json", native)
+                          "passed": passed, "exit": 0, "errors": [], "failed": []} for node in self.images]}
+                run_name = json.loads((self.root / argv[3]).read_text())["run"]
+                self.write(self.root / "results/private/lab" / run_name / "verdicts.json", native)
         return SimpleNamespace(returncode=0)
 
     def ssh(self, nodes, node, *argv):
@@ -81,7 +86,7 @@ class ComponentTests(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         return SimpleNamespace(returncode=0, stdout=json.dumps(self.image))
 
-    def invoke(self):
+    def invoke(self, *, out="results/private/component", extra=()):
         lab = SimpleNamespace(read_hold=lambda: self.hold, HOLD=self.root / "hold.json", now=lambda: "fixture",
                               window_should_close=lambda hold: None, published_problems=lambda: [],
                               plan=lambda spec: [spec["run"]],
@@ -93,7 +98,7 @@ class ComponentTests(unittest.TestCase):
         process = SimpleNamespace(run=self.process, STDOUT=runner.subprocess.STDOUT,
                                   check_output=lambda argv, **kwargs: b"" if "status" in argv else "d" * 40)
         argv = ["run_component.py", "--component", "expert-scales", "--window", "owned", "--through", "gate",
-                "--out", "results/private/component", "--apply"]
+                "--out", out, "--apply", *extra]
         with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=lab, spark=spark, subprocess=process,
                             os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"))), patch.object(sys, "argv", argv):
             return runner.main()
@@ -161,6 +166,45 @@ class ComponentTests(unittest.TestCase):
         self.assertTrue(receipt["gates_passed"])
         self.assertTrue(receipt["completed"])
         self.assertTrue(receipt["restored"])
+
+    def prepare_failed_full_gate(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.full_gate_passes = False
+        self.assertEqual(self.invoke(), 1)
+        self.hold = {"holder": runner.HOLDER, "window": "owned", "production_config": runner.RESTORE}
+        self.lab_calls.clear()
+        return "results/private/component/receipt.json"
+
+    def test_retained_passed_component_can_precede_a_distinct_new_full_gate(self):
+        prior = self.prepare_failed_full_gate()
+        path = self.here / "expert-scales/full-gate.json"
+        spec = json.loads(path.read_text())
+        spec["run"] = "full-gate-fixtures"
+        self.write(path, spec)
+        self.full_gate_passes = True
+        self.image_failure = True  # neither image nor component may run again
+        self.kernel_passes = False
+        self.assertEqual(self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", prior)), 0)
+        self.assertEqual(self.lab_calls, ["full-gate"])
+        receipt = json.loads((self.root / "results/private/resumed/receipt.json").read_text())
+        self.assertTrue(receipt["gates_passed"])
+        self.assertEqual(receipt["reused_kernel_from"], prior)
+
+    def test_reusing_component_does_not_overwrite_prior_full_gate_observations(self):
+        prior = self.prepare_failed_full_gate()
+        with self.assertRaisesRegex(SystemExit, "distinct retained run"):
+            self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", prior))
+        self.assertEqual(self.lab_calls, [])
+
+    def test_a_failed_component_cannot_be_reused_as_a_pass(self):
+        self.image_failure = False
+        self.assertEqual(self.invoke(), 1)
+        self.hold = {"holder": runner.HOLDER, "window": "owned", "production_config": runner.RESTORE}
+        self.lab_calls.clear()
+        self.full_gate_passes = True
+        self.assertEqual(self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", "results/private/component/receipt.json")), 1)
+        self.assertEqual(self.lab_calls, [])
 
     def test_zero_exit_is_insufficient_when_native_verdict_fails_or_rank_is_missing(self):
         native = {"agree": True, "verdicts": [{"node": name, "image": self.image["Id"],
