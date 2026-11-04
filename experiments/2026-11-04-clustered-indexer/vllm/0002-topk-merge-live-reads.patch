@@ -1,0 +1,53 @@
+From ce8801512a3c7bdbe1cb09448dc16af9f9fdae6e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 11:08:51 +0100
+Subject: [PATCH] Guard top-k merge reads by input-list liveness
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the promoted
+series, tree ea1281f880e7535e3d87725be0156a8e38fc2fb2, and the preceding
+experimental cluster-search patch.
+
+Rationale: a bitwise conjunction reads WorkEntries from lists beyond the
+visible extent even though their keys are then masked. Sparse candidates
+with a wide planned domain expose these unwritten scratch reads under
+compute-sanitizer initcheck. Guard the read with a lazy outer conditional.
+
+Quality: selection keys, tie ordering and arithmetic on live entries are
+unchanged. Inactive lists contribute the same zero key without being read.
+
+Tests: strict initcheck exposed 4608 reads with unchanged selected outputs.
+Fresh application and patch/overlay identity pass. The fixed CUDA gate and
+independent original/fixed reproducer are required before qualification.
+
+Upstream status: local experimental dependency fix, not submitted upstream.
+---
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index f5858e79cc..de1a27bcf9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -954,11 +954,15 @@ def indexer_topk_merge_v41(
+                 for i in T.serial(per):
+                     j = i * threads + tx
+                     c = T.min(base + j, lists * topk - 1)
++                    # List liveness must guard the global read itself. A bitwise
++                    # conjunction evaluates WorkEntries even for unwritten lists.
+                     keys[j] = T.if_then_else(
+-                        (j < n)
+-                        & (g * fan_in + j // topk < live)
+-                        & (WorkEntries[row, c] >= 0),
+-                        _key16(WorkValues[row, c]),
++                        (j < n) & (g * fan_in + j // topk < live),
++                        T.if_then_else(
++                            WorkEntries[row, c] >= 0,
++                            _key16(WorkValues[row, c]),
++                            0,
++                        ),
+                         0,
+                     )
+                 T.sync_threads()
+-- 
+2.54.0 (Apple Git-157)
+
