@@ -1,5 +1,11 @@
 # Semantic indexer search
 
+The owner has revised future acceptance to generated-token equivalence and moved
+correctness/proof work outside the timed path; see
+[`../2026-11-04-clustered-indexer/acceptance.md`](../2026-11-04-clustered-indexer/acceptance.md).
+The exact-selection bounds below remain historical research, not requirements
+for the next performance candidate.
+
 Result: **retain as research; no faster runtime qualified**. The completed
 [two-process screen](results.md) preserves native selections on all twelve
 captured operands, including source block IDs/counts and subsequent reindex.

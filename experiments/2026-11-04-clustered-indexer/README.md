@@ -1,5 +1,9 @@
 # Exact clustered indexer search
 
+Future candidates use [generated-token equivalence](acceptance.md): selected keys
+and attention values may differ. Correctness oracles and proof work stay outside
+the timed path. The exact-selection criteria below describe the historical arm.
+
 The follow-up [semantic search screen](../2026-11-04-semantic-indexer/results.md)
 now prunes real dense inputs while preserving native selection/source/reindex
 gates. Its practical dense work reduction is41.74–84.61%, but full-shape metadata
@@ -11,8 +15,8 @@ Status: **experimental; current grouping rejected for serving integration**.
 from three ranks and layers2/8/14/source20. Two fresh sp8 processes preserve
 selected keys, evaluated BF16 score bits, source block IDs/counts and the following
 reindex result. Every sample retains every visible key: **0% pruning**. A dramatic
-production speedup has not been established. Do not accept changed selections
-without independent evidence of superior model quality.
+production speedup has not been established. Future candidates must satisfy the
+generated-token and performance gates in `acceptance.md`.
 
 The target is the checkpoint's existing attention rule and weights. This plan
 only changes the search for its selected keys. It introduces no trained maps,

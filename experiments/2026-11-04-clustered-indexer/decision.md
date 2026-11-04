@@ -34,6 +34,9 @@ image tag or immutable baseline was promoted. The independent top-k guard merged
 in PR878. The experimental search remains draft research.
 
 Do not spend full release qualification on this losing candidate. A different
-exact search needs a measured real-workload benefit first. Full teacher-forced
+search needs a measured real-workload benefit first. Full teacher-forced
 distributions, mixed traffic and admission qualification are not claimed.
-Changed selections still require independent evidence of superior model quality.
+The current gate is generated-token equivalence, as defined in `acceptance.md`.
+Selected keys and intermediate values may differ. Validation and proof work stay
+outside the timed implementation; changed generated tokens still need independent
+evidence of superior quality before acceptance.

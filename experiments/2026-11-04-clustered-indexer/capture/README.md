@@ -70,5 +70,6 @@ distinct pool/interface and rank. Execution mode was not saved; original
 query-row count is recorded and is not used to infer decode or prefill coverage.
 It establishes neither mode coverage nor model quality across a prompt corpus.
 If real bounds do not prune enough to cover cost, reject this grouping and revise
-before serving integration. Changed keys fail unless independent evidence proves
-superior model quality.
+before serving integration. The historical replay checks exact keys; future
+candidates use the generated-token gate in `../acceptance.md`. Changed keys and
+intermediate values are allowed when the generated token sequence matches.
