@@ -1,0 +1,430 @@
+FFFFFFFF..                                                               [100%]
+=================================== FAILURES ===================================
+__________ test_failed_submission_rolls_back_registered_prompt[False] __________
+
+abort_error = False
+
+    @pytest.mark.parametrize("abort_error", [False, True])
+    def test_failed_submission_rolls_back_registered_prompt(abort_error):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.fail_at = 1
+            llm.engine_core.abort_error = abort_error
+            request = make_request()
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:109: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:106: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78bf4dd30>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4e180>}
+E        +  where {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4e180>} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78bf4de80>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+----------------------------- Captured stdout call -----------------------------
+WARNING 11-04 15:40:02 [async_llm.py:425] Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() is deprecated and will be removed in the future. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().
+------------------------------ Captured log call -------------------------------
+WARNING  vllm.v1.engine.async_llm:async_llm.py:425 Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() is deprecated and will be removed in the future. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().
+__________ test_failed_submission_rolls_back_registered_prompt[True] ___________
+
+abort_error = True
+
+    @pytest.mark.parametrize("abort_error", [False, True])
+    def test_failed_submission_rolls_back_registered_prompt(abort_error):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.fail_at = 1
+            llm.engine_core.abort_error = abort_error
+            request = make_request()
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:109: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:106: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78bf4c950>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4f110>}
+E        +  where {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4f110>} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78bf4e930>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+______ test_repeated_failed_submissions_do_not_accumulate_prompt_history _______
+
+    def test_repeated_failed_submissions_do_not_accumulate_prompt_history():
+        async def run():
+            llm = make_llm()
+            for index in range(16):
+                llm.engine_core.fail_at = len(llm.engine_core.submitted) + 1
+                request = make_request(request_id=f"failed-{index}")
+                with pytest.raises(RuntimeError, match="submission failed"):
+                    await llm.add_request(
+                        request.request_id, request, request.sampling_params
+                    )
+            # The uncorrected code retains sixteen prompts (1,048,576 token IDs)
+            # even though none reached the engine and no request can finish them.
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:126: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:124: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78bf4f9b0>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'failed-0-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf54260>, 'failed-1-internal-2'...t 0xfae78bf544a0>, 'failed-3-internal-4': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf545c0>, ...}
+E        +  where {'failed-0-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf54260>, 'failed-1-internal-2'...t 0xfae78bf544a0>, 'failed-3-internal-4': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf545c0>, ...} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78bf54cb0>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+________ test_disconnect_during_submission_rolls_back_all_children[1-1] ________
+
+n = 1, block_at = 1
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:148: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78befc0e0>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78befcad0>}
+E        +  where {'shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78befcad0>} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78befc2f0>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+________ test_disconnect_during_submission_rolls_back_all_children[3-2] ________
+
+n = 3, block_at = 2
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:148: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78bf54bc0>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'0_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf547a0>, '1_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf54710>}
+E        +  where {'0_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf547a0>, '1_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf54710>} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78bf54b60>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+________ test_disconnect_during_submission_rolls_back_all_children[3-3] ________
+
+n = 3, block_at = 3
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:148: in run
+    assert_empty(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+llm = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfae78bf4fe00>
+
+    def assert_empty(llm):
+        processor = llm.output_processor
+>       assert not processor.request_states
+E       AssertionError: assert not {'0_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4e990>, '1_shared...78bf4e930>, '2_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4eff0>}
+E        +  where {'0_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4e990>, '1_shared...78bf4e930>, '2_shared-external-id-internal-1': <vllm.v1.engine.output_processor.RequestState object at 0xfae78bf4eff0>} = <vllm.v1.engine.output_processor.OutputProcessor object at 0xfae78bf4f290>.request_states
+
+tests/v1/engine/test_request_submission_cleanup.py:91: AssertionError
+______ test_failure_does_not_abort_another_request_reusing_external_id[1] ______
+
+n = 1
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failure_does_not_abort_another_request_reusing_external_id(n):
+        async def run():
+            llm = make_llm()
+            first = make_request()
+            queue = await llm.add_request(
+                first.request_id, first, first.sampling_params
+            )
+            original_id = first.request_id
+            llm.engine_core.fail_at = 1 + n
+            request = make_request(n)
+            with pytest.raises(RuntimeError, match="submission failed"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert set(llm.output_processor.request_states) == {original_id}
+            assert not llm.output_processor.parent_requests
+            assert llm.output_processor.external_req_ids == {
+                "shared-external-id": [original_id]
+            }
+            assert original_id not in llm.engine_core.aborted
+            await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:176: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        llm = make_llm()
+        first = make_request()
+        queue = await llm.add_request(
+            first.request_id, first, first.sampling_params
+        )
+        original_id = first.request_id
+        llm.engine_core.fail_at = 1 + n
+        request = make_request(n)
+        with pytest.raises(RuntimeError, match="submission failed"):
+            await llm.add_request(request.request_id, request, request.sampling_params)
+>       assert set(llm.output_processor.request_states) == {original_id}
+E       AssertionError: assert {'shared-exte...d-internal-2'} == {'shared-exte...d-internal-1'}
+E         
+E         Extra items in the left set:
+E         'shared-external-id-internal-2'
+E         Use -v to get more diff
+
+tests/v1/engine/test_request_submission_cleanup.py:167: AssertionError
+______ test_failure_does_not_abort_another_request_reusing_external_id[3] ______
+
+n = 3
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failure_does_not_abort_another_request_reusing_external_id(n):
+        async def run():
+            llm = make_llm()
+            first = make_request()
+            queue = await llm.add_request(
+                first.request_id, first, first.sampling_params
+            )
+            original_id = first.request_id
+            llm.engine_core.fail_at = 1 + n
+            request = make_request(n)
+            with pytest.raises(RuntimeError, match="submission failed"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert set(llm.output_processor.request_states) == {original_id}
+            assert not llm.output_processor.parent_requests
+            assert llm.output_processor.external_req_ids == {
+                "shared-external-id": [original_id]
+            }
+            assert original_id not in llm.engine_core.aborted
+            await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:176: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run():
+        llm = make_llm()
+        first = make_request()
+        queue = await llm.add_request(
+            first.request_id, first, first.sampling_params
+        )
+        original_id = first.request_id
+        llm.engine_core.fail_at = 1 + n
+        request = make_request(n)
+        with pytest.raises(RuntimeError, match="submission failed"):
+            await llm.add_request(request.request_id, request, request.sampling_params)
+>       assert set(llm.output_processor.request_states) == {original_id}
+E       AssertionError: assert {'0_shared-ex...d-internal-1'} == {'shared-exte...d-internal-1'}
+E         
+E         Extra items in the left set:
+E         '1_shared-external-id-internal-2'
+E         '2_shared-external-id-internal-2'
+E         '0_shared-external-id-internal-2'
+E         Use -v to get more diff
+
+tests/v1/engine/test_request_submission_cleanup.py:167: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/engine/test_request_submission_cleanup.py:16
+  /opt/spark-ds41f/candidate/vllm/tests/v1/engine/test_request_submission_cleanup.py:16: PytestUnknownMarkWarning: Unknown pytest.mark.cpu_test - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = pytest.mark.cpu_test
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../dev::test_failed_submission_rolls_back_registered_prompt[False]
+FAILED ../../../../dev::test_failed_submission_rolls_back_registered_prompt[True]
+FAILED ../../../../dev::test_repeated_failed_submissions_do_not_accumulate_prompt_history
+FAILED ../../../../dev::test_disconnect_during_submission_rolls_back_all_children[1-1]
+FAILED ../../../../dev::test_disconnect_during_submission_rolls_back_all_children[3-2]
+FAILED ../../../../dev::test_disconnect_during_submission_rolls_back_all_children[3-3]
+FAILED ../../../../dev::test_failure_does_not_abort_another_request_reusing_external_id[1]
+FAILED ../../../../dev::test_failure_does_not_abort_another_request_reusing_external_id[3]
+8 failed, 2 passed, 15 warnings in 4.04s

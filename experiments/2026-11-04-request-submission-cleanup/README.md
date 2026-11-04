@@ -77,6 +77,35 @@ image has no Git executable. Its two failed containers and raw logs are retained
 they are not regression-test results. Patch application now happens on the host,
 with the original, corrected and test hashes checked again inside each container.
 
+## Results
+
+On Spaceport sp8 (`spark-0016`), the original source failed eight of the ten
+regressions and passed the two normal-completion controls. The corrected source
+passed all ten, with zero errors or skips. The CPU-only containers used the same
+immutable image, a 2-CPU/8-GiB limit, and no network or GPU devices. Minimum host
+MemAvailable was 115.148/115.135 GiB; neither container was OOM-killed. These
+host minima are conditions, not a claimed memory saving.
+
+Both raw pytest exits, JUnit reports, generated-source hashes, exact commands,
+container states and setup failures are retained under [runs](runs).
+The controller receipt names published input commit
+`0cc598f8d19f1238c1b355eff4ebeb0ed54d9735`. Its wrapper reports success for the
+control only when pytest actually records the expected eight failures; the
+native pytest exit remains 1 in the raw verdict.
+
+The candidate-39 plus cleanup recipe reproduces vLLM head
+`0cff1109940f15d08f2e893ae06e0a527fde438a`, tree
+`3a9e45d804da57cd8bcfb61f7d18108d72d9b154`. The initial lock operation replayed
+the complete ordered series. Its subsequent independent source fetch hit the
+workstation's disk limit; the failure is preserved. Reusing the existing Git
+object database reproduced and checked the same locked tree without another
+large fetch. Doctor and the experiment-local release-test classification pass;
+the latter has no unclassified, ambiguous or missing test files.
+
+This corrects a demonstrated frontend leak. The candidate image, full release
+gate, serving performance and attribution of #884's entire overnight loss
+remain unqualified. No previous measurements are transferred to the new image.
+
 Upstream status: local, not submitted. No promoted configuration or immutable
 baseline changes. Candidate-39 integration is an isolated source recipe, pending
 its own image and serving qualification.
