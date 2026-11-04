@@ -65,9 +65,9 @@ measurement work; hardware recovery remains separate.
 
 Candidate-39 image preparation, build and the release-test gate passed in attempt 2.
 The window yielded for the requested DGX4 slot after preserving the completed
-gate and verifying candidate-36 on every serving rank. That slot is complete;
-attempt 3 now owns the regular window for the remaining qualification. Functional
-and serving metric results are pending.
+gate and verifying candidate-36 on every serving rank. That slot and the full attempt-3 matrix are complete. Candidate-36 restoration
+is independently verified. The measurements below show no proven serving
+throughput gain versus either C38 recipe; a separate correctness fix is required.
 The fresh full vLLM preparation reproduced candidate-38 tree `c061e5f6` exactly;
 #842 applies without conflicts. The Mac partial-clone canonical lock replay
 failed on a missing intermediate local GLP blob. Its failure is retained in
@@ -266,3 +266,78 @@ rank agreement locally against the intended immutable image, retaining the old
 failures and any newly found issue. Future candidates need a collector with an
 explicit expected-image input. Do not remeasure candidate-39 to repair a metadata
 check or silently replace a native failed receipt.
+
+## Completed candidate-39 measurements
+
+Attempt 3 completed at 13:59:26 UTC on 2026-11-04, actual controller wait exit 0.
+Both functional boots and all six performance suites completed. The 26 ordered
+performance steps exited zero; the request tables, full output lengths, workload
+identities, same-boot companion suites and fresh repeat boot passed local audit.
+The 256-prompt corpus digest matches both saved boots of both candidate-38
+recipes. No released build or earlier candidate image was remeasured.
+
+| Output tokens/s, boot / repeat | C38 standard | C38 copy | C39 default |
+|---|---:|---:|---:|
+| 8 streams | 163.95 / 163.80 | 163.64 / 163.28 | 163.34 / 163.80 |
+| 4 streams | 126.45 / 126.29 | 126.13 / 125.83 | 125.91 / 126.04 |
+| 1 stream | 65.52 / 65.42 | 65.43 / 65.29 | 65.35 / 65.34 |
+| Sampled 16 streams | 160.11 / 160.20 | 159.41 / 159.66 | 160.73 / 160.05 |
+
+These are the original window-throughput means, not pooled recipes. Every boot
+retains its ten-window confidence interval. `recipe-comparison.json` keeps all
+four boot pairings against each earlier recipe, all adverse rows, and headlines
+using both candidate and saved-reference A/A floors. C39 has no proven serving
+throughput gain over either saved C38 recipe. The small C4/C1 losses against the
+standard recipe are not robust across both saved-reference repeat floors. The
+15-shape engine-grid cost is consistently worse against the standard recipe
+(about 0.9% for its first saved boot); the smaller copy-recipe cost is less
+conclusive after saved-reference variation. Do not attribute inherited gains
+over 1030 to this default-enablement round.
+
+C39's eight-stream median user decode is 20.67 / 20.83 tokens/s. TTFT p99 is
+0.417 / 0.414 s; TPOT p99 is 65.58 / 65.03 ms. TPOT is not an inter-token-gap
+percentile. The four-stream TTFT p99 is 0.322 s on both boots, versus the saved
+1030 observation 0.311 s, without a percentile confidence interval. The short
+decode wait before the first 131K prefill chunk is 0.527 / 0.514 s, versus
+0.438 s in 1030; this remains an interactivity lever. Raw stall tails have wide
+intervals and are retained. Actual 524K/1M reference token counts differ, so
+small prefill comparisons retain that warning.
+
+Accepted tokens per draft at eight streams are 1.305 / 1.308; prefix-cache hit
+rate is zero on these timed inputs, and all timed preemption batches are zero.
+This workload does not establish cache-rich agent behavior. The exports do not
+retain timed KV occupancy, raw hit/miss totals or ITL-tail distributions; no
+values are inferred for those fields. The copy probe reports about 16 output
+tokens/step for dense copy, 14 for edits and 6.8 for tool-like prompts, with no
+request errors on either boot. Those synthetic results do not score useful task
+completion.
+
+During timed suites, minimum host memory available was 6.11 GiB, swap growth was
+zero, maximum GPU temperature 78 C, and minimum thermal headroom 9 C. Thermal
+slowdown and power-cap counters were zero. Performance boot readiness was
+106.6 / 103.3 s (see the native boot-time records for exact values). The two
+native runtime collectors still have failed verdicts: explicit local revalidation
+checks all 178 exported file hashes, exact source/profile/image identities,
+container stability and untruncated fault-free logs, and accepts only the stale
+C38 expected-ID exception. Three rejection checks prove a wrong actual image,
+an additional native issue, or a different stale-ID origin is still rejected.
+
+Candidate-36 was restored under the tracked profile, its actual image verified
+independently on every rank, and its live doctor passed. The hold was removed
+normally. The other task then acquired its separately authorized capture window;
+this task performs no GPU or serving operations during that window.
+
+`source-receipt.json` and `publication-receipt.json` preserve native hashes and
+byte-for-byte published timing/conditions/identity JSON. The full private export,
+model text and raw logs remain locally under `final-export`, following the saved
+C38 publication convention. Original failed collector summaries are published.
+No native verdict or unfavorable point was overwritten. The three analysis
+scripts reproduce the audits from that private export.
+
+CopyDrafter defaults are retained as source behavior, without a speedup claim.
+The known inactive scratch-read issue in #878 keeps C39 unqualified for release.
+The next distinct candidate must isolate that correctness fix and use an explicit
+collector image identity plus checks for every functional extra. Only afterward
+should minimum match 8 versus 16 and the compiler refresh be assessed separately.
+AgentX does not score useful task completion or replace the outstanding TP4
+correctness and release gates. No promotion is made.

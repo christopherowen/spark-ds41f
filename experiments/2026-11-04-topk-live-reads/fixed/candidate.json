@@ -1,0 +1,30 @@
+{
+  "image": "spark-ds41f:1030",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "VLLM_NO_USAGE_STATS": "1",
+    "DO_NOT_TRACK": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang",
+    "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"
+  },
+  "workdir": "vllm",
+  "mounts": [
+    [
+      "../bundle/topk_reads.py",
+      "/tmp/topk-reads.py"
+    ],
+    [
+      "/usr/local/cuda-13.0/compute-sanitizer",
+      "/opt/compute-sanitizer"
+    ],
+    [
+      "../bundle/overlay/vllm/models/deepseek_v4_1/tilelang/indexer.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py"
+    ]
+  ],
+  "argv": [
+    "-c",
+    "import os; os.execv('/opt/compute-sanitizer/compute-sanitizer', ['/opt/compute-sanitizer/compute-sanitizer', '--tool', 'initcheck', '--error-exitcode', '1', '--print-limit', '4', 'python3', '/tmp/topk-reads.py'])"
+  ],
+  "verdict": "status"
+}
