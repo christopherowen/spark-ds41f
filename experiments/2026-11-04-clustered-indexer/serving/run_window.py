@@ -140,6 +140,21 @@ def main():
     assert subprocess.check_output(['git','branch','-r','--contains',commit],cwd=ROOT,text=True).strip()
     holds=each(HOLD_CODE,{'action':'read'})
     assert not any(any(v.values()) for v in holds.values()),holds
+    identity=each('''from pathlib import Path
+import subprocess,json
+p=Path('/home/chris/spark-lab/checkouts/clustered-serving')
+original=Path.home()/'projects/spark-ds41f'
+x=json.loads(subprocess.check_output(['docker','inspect','spark-ds41f'],text=True))[0]
+print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
+ 'containers':subprocess.check_output(['docker','ps','--format','{{.Names}}'],text=True).splitlines(),
+ 'commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=p,text=True).strip(),
+ 'dirty':subprocess.check_output(['git','status','--porcelain'],cwd=p,text=True).strip(),
+ 'original_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=original,text=True).strip(),
+ 'original_dirty':subprocess.check_output(['git','status','--porcelain'],cwd=original,text=True).strip()}))
+''')
+    assert all(x['image']==IMAGE and x['running'] and x['containers']==['spark-ds41f']
+               and x['commit']==commit and not x['dirty'] and not x['original_dirty'] for x in identity.values()),identity
+    (out/'preflight-identity.json').write_text(json.dumps(identity,indent=2)+'\n')
     run(spark('restore','doctor','--live'),out,'preflight-doctor')
     # Require thirty seconds with no active/waiting work and no completion.
     baseline=None
