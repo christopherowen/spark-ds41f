@@ -6,6 +6,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import struct
+import zlib
 
 HEADER = struct.Struct('<8sIIQQ4Q')
 RECORD = struct.Struct('<QQQQQIIIIII')
@@ -16,23 +17,29 @@ def records(root):
     for path in sorted(Path(root).glob('events-*.bin')):
         with path.open('rb') as handle:
             magic, version, size, chunk, first, *_ = HEADER.unpack(handle.read(HEADER.size))
-            if (magic, version, size, first) != (b'SPKIKET1', 1, 64, expected):
+            if magic != b'SPKIKET1' or version not in (1, 2) or size != 64 or first != expected:
                 raise ValueError(f'invalid or discontinuous chunk {path}')
-            count, checksum = 0, 14695981039346656037
-            while raw := handle.read(RECORD.size):
-                if len(raw) != RECORD.size:
+            count, checksum = 0, 0 if version == 2 else 14695981039346656037
+            while block := handle.read(1 << 20):
+                if len(block) % RECORD.size:
                     raise ValueError(f'partial record in {path}')
-                row = RECORD.unpack(raw)
-                if row[0] != expected:
-                    raise ValueError(f'sequence gap at {path}: {row[0]} != {expected}')
-                for byte in raw:
-                    checksum = ((checksum ^ byte) * 1099511628211) & ((1 << 64) - 1)
-                expected += 1
-                count += 1
-                yield row
+                if version == 2:
+                    checksum = zlib.crc32(block, checksum)
+                else:
+                    for byte in block:
+                        checksum = ((checksum ^ byte) * 1099511628211) & ((1 << 64) - 1)
+                for row in RECORD.iter_unpack(block):
+                    if row[0] != expected:
+                        raise ValueError(f'sequence gap at {path}: {row[0]} != {expected}')
+                    expected += 1
+                    count += 1
+                    yield row
         receipt = json.loads(path.with_suffix('.bin.json').read_text())
-        if receipt != {'chunk': chunk, 'records': count, 'fnv1a64': f'{checksum:016x}'}:
+        key = 'crc32' if version == 2 else 'fnv1a64'
+        value = f'{checksum:08x}' if version == 2 else f'{checksum:016x}'
+        if receipt != {'chunk': chunk, 'records': count, key: value}:
             raise ValueError(f'checksum/count mismatch in {path}')
+
 
 
 def export(root, output, grid=None):

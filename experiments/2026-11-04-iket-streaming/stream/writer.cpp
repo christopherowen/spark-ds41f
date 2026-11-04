@@ -11,6 +11,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <zlib.h>
 
 struct alignas(64) Header {
   uint64_t capacity, tail, head, status, waits, stop, reserved[2];
@@ -30,7 +31,7 @@ struct Writer {
   Slot *slots;
   std::string path;
   uint64_t chunk_records, delay_us, fail_after, head = 0, chunk = 0, count = 0;
-  uint64_t hash = 14695981039346656037ULL;
+  uint64_t hash = 0;
   std::atomic<uint64_t> written{0}, chunks{0};
   int fd = -1;
   std::thread worker;
@@ -58,9 +59,9 @@ struct Writer {
     if (fd < 0) { store(&header->status, errno); throw std::runtime_error("cannot create trace chunk"); }
     struct FileHeader { char magic[8]; uint32_t version, record_size; uint64_t chunk, first; uint64_t reserved[4]; } meta{};
     static_assert(sizeof(meta) == 64);
-    std::memcpy(meta.magic, "SPKIKET1", 8); meta.version = 1; meta.record_size = 64;
+    std::memcpy(meta.magic, "SPKIKET1", 8); meta.version = 2; meta.record_size = 64;
     meta.chunk = chunk; meta.first = written.load();
-    write_all(&meta, sizeof(meta)); count = 0; hash = 14695981039346656037ULL;
+    write_all(&meta, sizeof(meta)); count = 0; hash = 0;
   }
   void close_chunk() {
     if (fd < 0) return;
@@ -72,7 +73,7 @@ struct Writer {
     std::string receipt = final + ".json";
     FILE *f = std::fopen(receipt.c_str(), "wx");
     if (!f) { store(&header->status, errno); throw std::runtime_error("cannot create chunk receipt"); }
-    std::fprintf(f, "{\"chunk\":%llu,\"records\":%llu,\"fnv1a64\":\"%016llx\"}\n",
+    std::fprintf(f, "{\"chunk\":%llu,\"records\":%llu,\"crc32\":\"%08llx\"}\n",
                  static_cast<unsigned long long>(chunk), static_cast<unsigned long long>(count), static_cast<unsigned long long>(hash));
     if (std::fclose(f)) { store(&header->status, errno ? errno : EIO); throw std::runtime_error("chunk receipt failed"); }
     chunks.fetch_add(1); ++chunk;
@@ -81,8 +82,8 @@ struct Writer {
     if (fail_after && written.load() + n > fail_after) { store(&header->status, ENOSPC); throw std::runtime_error("injected disk-full error"); }
     if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
     write_all(data, n * sizeof(DiskRecord));
-    auto p = reinterpret_cast<const unsigned char *>(data);
-    for (size_t i = 0; i < n * sizeof(DiskRecord); ++i) hash = (hash ^ p[i]) * 1099511628211ULL;
+    hash = crc32(static_cast<uLong>(hash), reinterpret_cast<const Bytef *>(data),
+                 static_cast<uInt>(n * sizeof(DiskRecord)));
     count += n; written.fetch_add(n);
   }
   void run() noexcept {
@@ -111,6 +112,12 @@ struct Writer {
   }
 };
 extern "C" {
+void stream_store_u32_release(uint32_t *word, uint32_t value) {
+  __atomic_store_n(word, value, __ATOMIC_RELEASE);
+}
+void stream_abort(void *memory, int error) {
+  store(&static_cast<Header *>(memory)->status, static_cast<uint64_t>(error));
+}
 int stream_publish(void *memory, const Record *record) {
   auto h = static_cast<Header *>(memory);
   auto slots = reinterpret_cast<Slot *>(h + 1);

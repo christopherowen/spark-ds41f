@@ -1,0 +1,48 @@
+From 49828e12df0c176e9e68fb1ac8f02914ebccad42 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 02:34:51 +0100
+Subject: [PATCH] [DS4.1] preserve flag-wait classification after loop sampling
+
+Base: local runtime-loop sampling on candidate-38, upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354. Rationale: an observation counter must not turn a global flag wait into a load phase. Quality: profiling-off kernels unchanged. Tests: 16 CPU phase-pass cases pass. Upstream status: local experiment, not submitted.
+---
+ tests/kernels/test_deepseek_v41_tilelang_iket.py | 10 ++++++++++
+ vllm/models/deepseek_v4_1/tilelang/iket.py       |  2 +-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 8ef93e8c5b..4b15422185 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -288,6 +288,16 @@ def test_network_exchange_stage_doorbell_and_gather_have_distinct_phases():
+     }
+ 
+ 
++def test_sampled_global_flag_loop_remains_a_wait_phase():
++    code = """extern "C" __global__ void flag_kernel(float* A) {
++  while (A[0] == 0) {
++  }
++}
++"""
++    sites = iket.annotate(code, _token, iters=1)[1]
++    assert [(s["phase"], s["kinds"]) for s in sites] == [("wait", ["spin"])]
++
++
+ def test_module_without_kernels_is_unchanged():
+     code = (
+         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 0d106515b3..5adaf672ab 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -321,7 +321,7 @@ def _classify(
+             if child.phase == "wait":
+                 wait_kinds |= child.kinds
+     if set(_IDENTIFIER.findall(node.text)) & params:
+-        if node.text.startswith("while"):
++        if node.text.startswith("while") or _RUNTIME_FOR.fullmatch(node.text):
+             phases.add("wait")  # a spin on a global flag
+             node.kinds.add("spin")
+             wait_kinds.add("spin")
+-- 
+2.54.0 (Apple Git-157)
+

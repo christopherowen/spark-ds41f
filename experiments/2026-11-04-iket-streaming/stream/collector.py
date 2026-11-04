@@ -46,11 +46,12 @@ class Collector:
             ctypes.c_uint64.from_address(self.host.value + 64 + index * 64).value = index
         library = self.out / 'writer.so'
         subprocess.run(['g++', '-std=c++17', '-O2', '-shared', '-fPIC', '-pthread',
-                        str(HERE / 'writer.cpp'), '-o', str(library)], check=True)
+                        str(HERE / 'writer.cpp'), '-lz', '-o', str(library)], check=True)
         self.lib = ctypes.CDLL(str(library))
         self.lib.stream_start.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64,
                                           ctypes.c_uint64, ctypes.c_uint64]
         self.lib.stream_start.restype = ctypes.c_void_p
+        self.lib.stream_abort.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.lib.stream_finish.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
                                            ctypes.POINTER(ctypes.c_uint64)]
         self.handle = self.lib.stream_start(self.host, os.fsencode(self.out), chunk_bytes,
@@ -88,7 +89,7 @@ class Collector:
         except Exception as error:
             sync_error = str(error)
             # Stop the reader if a failed producer left an unpublished ticket.
-            self.header[3] = self.header[3] or 125
+            self.lib.stream_abort(self.host, self.header[3] or 125)
         written, chunks = ctypes.c_uint64(), ctypes.c_uint64()
         status = self.lib.stream_finish(self.handle, ctypes.byref(written), ctypes.byref(chunks))
         self.write_json('summary.json', {'reserved_records': self.header[1],

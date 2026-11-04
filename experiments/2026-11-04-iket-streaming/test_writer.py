@@ -17,7 +17,7 @@ spec.loader.exec_module(export)
 def library(tmp_path_factory):
     so = tmp_path_factory.mktemp('native') / 'writer.so'
     subprocess.run(['c++', '-std=c++17', '-O2', '-shared', '-fPIC', '-pthread',
-                    str(HERE / 'stream/writer.cpp'), '-o', str(so)], check=True)
+                    str(HERE / 'stream/writer.cpp'), '-lz', '-o', str(so)], check=True)
     lib = ctypes.CDLL(str(so))
     lib.stream_start.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64,
                                  ctypes.c_uint64, ctypes.c_uint64]
