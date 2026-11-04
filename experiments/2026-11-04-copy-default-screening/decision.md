@@ -1,37 +1,37 @@
 # Decision
 
-PR #850 closed as unnecessary to the runtime work; unique PRs remain open.
-Candidate-39 default CopyDrafter source merged in #842. Its image and release-test
-gate passed: 8,074 passed, 360 skipped, no failed/error files. This supports
-continuing qualification; it establishes no serving improvement or promotion.
+Retain CopyDrafter default enablement as source behavior, with no proven serving
+throughput gain over either saved candidate-38 recipe. C39 measured 163.34/163.80
+output tokens/s at eight streams, 125.91/126.04 at four and 65.35/65.34 at one.
+All reference boot pairings, intervals, A/A floors and unfavorable rows remain
+in the evidence. Small C4/C1 losses are not robust across both reference floors;
+the engine grid has a small consistent cost against the standard recipe.
 
-Attempt 1 yielded before any work. Attempt 2 built and gated the image, then
-yielded normally for the shared DGX4 slot before seed, functional or timed work.
-Preserve both attempts. The actual controller exit 1 is a scheduling closure,
-with a zero-exit gate and independently verified candidate-36 restoration on all
-ranks. The resume guard accepts this completed safe handoff.
+Both fresh performance boots completed all three suites with no request, foreign
+traffic, memory, swap or thermal failures. Model corpus digests match all saved
+C38 boots. The 40 functional script exits include two preserved stale-ID collector
+failures; explicit offline revalidation of the original data passed without a
+benchmark repeat or native-verdict overwrite. Original runtime failures remain
+visible. The current source's independent inactive scratch-read issue (#878)
+still prevents release qualification. No promotion is made.
 
-The foreign slot has ended. Attempt 3 now resumes only unmeasured functional
-and two-boot metrics using the frozen passing image. Compare both saved candidate-38 recipes and the
-immutable release references, retaining repeat variation and adverse rows.
-Only then choose a separate copy-tuning round and assess compiler prerequisites.
+Next isolate the #878 liveness fix as a corrected default-enabled candidate, with
+its own clean source, image/gates and repeat core metrics. Then test minimum copy
+match 8 versus 16 if correctness permits, and evaluate #875's compiler work as a
+separate round. Fix the collector's expected-image input and ensure every quality
+extra is audited before treating its parent phase exit as a pass. Do not change
+C39 or silently replace its measurements.
 
-Spaceport VPN recovery did not restore management access; use the owner-approved
-local fallback through regular scheduling. Its cooling and prior no-content
-response remain unresolved. Do not promote an unqualified build or bypass the
-outstanding TP4 correctness and release gates. AgentX does not score useful task
-completion or replace those gates.
+Before release, address mixed-prefill first-chunk waits and tail latency, reduce
+copy-path engine overhead where useful, and capture missing timed KV occupancy,
+cache hit/miss counts and ITL tails in future candidates. The current zero cache
+hit rate is a property of these inputs, not a cache-rich workload qualification.
 
-A new independent source review confirms candidate-39 carries the inactive-list
-scratch-read pattern addressed by #878; that isolated guard applies to its exact
-prepared tree. Retain the unique PR and qualify a separate corrected candidate
-before copy-match tuning or promotion. Keep the current running image and every
-measurement unchanged. The PR's sanitizer results remain supplied evidence until
-the corrected candidate's own gates pass.
+Candidate-36 restoration is independently verified on all ranks; the shared hold
+closed normally. Respect the other task's subsequent capture window. Spaceport's
+reported access recovery does not close its earlier thermal/no-content findings
+or authorize our own new hardware operations. AgentX does not score useful task
+completion or replace the outstanding TP4 correctness/release gates.
 
-The functional phase's zero exit does not close its two failed runtime-collector
-extras. Their expected ID was incorrectly pinned to candidate-38; all six saved
-rank image IDs match the intended gated candidate-39 image and have no other
-reported collector issue. Preserve the native failures, finish the frozen matrix,
-and perform explicit local evidence revalidation after timing. No benchmark is
-replaced to repair this collector error, and no full correctness pass is inferred.
+PR #850 closed as unnecessary; #842 merged. Keep the distinct safeguards, site
+evidence, compiler, LSA and scratch-read work in #851, #865, #875, #877 and #878.
