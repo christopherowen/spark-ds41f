@@ -148,45 +148,26 @@ def retain_last_cluster(width: int):
 
 
 @tilelang.jit
-def restore_source_scores(width: int, max_ctas: int = 32):
+def map_source_blocks(width: int):
     rows = T.dynamic('rows')
-    clusters = width // CLUSTER
-    ctas = min(tilelang.cdiv(width, 128), max_ctas)
-    span = tilelang.cdiv(width, ctas)
 
     @T.prim_func
-    def restore(
-        Scores: T.Tensor([rows, width], T.bfloat16),
-        Blocks: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
-        Counts: T.Tensor([rows], T.int32),
-        Lengths: T.Tensor([rows], T.int32),
-        Active: T.Tensor([1], T.int32),
-        Dense: T.Tensor([rows, width], T.bfloat16),
+    def remap(
+        Selected: T.Tensor([rows, CANDIDATE_BLOCKS], T.int32),
+        Candidates: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
+        Original: T.Tensor([rows, CANDIDATE_BLOCKS], T.int32),
     ):
-        with T.Kernel(ctas, rows, threads=128) as (tile, row):
-            offsets = T.alloc_shared([clusters], T.int32)
-            tx = T.get_thread_binding()
-            extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
-            for c in T.Parallel(clusters):
-                offsets[c] = -1
-            T.sync_threads()
-            # Stable compaction keeps full 64-key clusters and at most one
-            # final partial cluster. Only its first eight-key block writes.
-            for i in T.serial(T.ceildiv(T.max(T.ceildiv(Counts[row], CLUSTER) - tx, 0), 128)):
-                compact_cluster = i * 128 + tx
-                slot = compact_cluster * (CLUSTER // CANDIDATE_BLOCK)
-                cluster = Blocks[row, slot] // (CLUSTER // CANDIDATE_BLOCK)
-                offsets[cluster] = compact_cluster * CLUSTER
-            T.sync_threads()
-            for j in T.Parallel(span):
-                position = tile * span + j
-                if position < width:
-                    start = offsets[position // CLUSTER]
-                    Dense[row, position] = T.if_then_else((start >= 0) & (position < extent),
-                        Scores[row, T.max(start, 0) + position % CLUSTER],
-                        -T.infinity(T.bfloat16))
+        with T.Kernel(T.ceildiv(rows * CANDIDATE_BLOCKS, 128), threads=128) as tile:
+            for i in T.Parallel(128):
+                slot = tile * 128 + i
+                if slot < rows * CANDIDATE_BLOCKS:
+                    row = slot // CANDIDATE_BLOCKS
+                    k = slot % CANDIDATE_BLOCKS
+                    selected = Selected[row, k]
+                    Original[row, k] = T.if_then_else(selected >= 0,
+                        Candidates[row, T.max(selected, 0)], -1)
 
-    return restore
+    return remap
 
 
 class SourceClusteredIndexerPlan:
@@ -208,7 +189,7 @@ class SourceClusteredIndexerPlan:
         self.select_blocks = IndexerTopK(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
         self.threshold = source_threshold(self.search.seeds * 8)
         self.last = retain_last_cluster(width)
-        self.restore = restore_source_scores(width)
+        self.remap = map_source_blocks(width)
         self.compact = source_surviving_candidates(width, CANDIDATE_BLOCKS)
 
     def run(self, q, scales, weights, pool, table, lengths, active, *, _metadata=None):
@@ -264,11 +245,14 @@ class SourceClusteredIndexerPlan:
                      candidates, candidate_counts)
         out, compact_scores = plan.final_plan.run(q, scales, weights, pool, table, lengths, active,
                                                   candidates, candidate_counts)
-        dense = empty((rows, self.width), torch.bfloat16)
-        self.restore(compact_scores, candidates, candidate_counts, lengths, active, dense)
+        compact_blocks = empty((rows, CANDIDATE_BLOCKS), torch.int32)
         block_values = empty((rows, CANDIDATE_BLOCKS), torch.bfloat16)
-        self.select_blocks.run(dense, lengths, active, source_blocks, block_values,
-                               counts=source_lengths)
+        # Compaction retains whole 64-key clusters and the global last cluster.
+        # Thus eight-key block boundaries, their total order, and the only
+        # partial block remain unchanged under the logical-ID remap.
+        self.select_blocks.run(compact_scores, candidate_counts, active,
+                               compact_blocks, block_values, counts=source_lengths)
+        self.remap(compact_blocks, candidates, source_blocks)
         return out, {'source_blocks': source_blocks, 'source_lengths': source_lengths,
                      'native_fallback': False, 'bounds': bounds, 'candidates': candidates,
                      'candidate_counts': candidate_counts, 'compact_scores': compact_scores}

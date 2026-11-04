@@ -14,6 +14,7 @@ from vllm.models.deepseek_v4_1.tilelang.source_ties_reference import SourceClust
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--archived', action='store_true')
+    parser.add_argument('--label')
     options = parser.parse_args()
     result = {'schema_version': 1, 'passed': False, 'instrumented': True}
     try:
@@ -35,7 +36,9 @@ def main():
             for _ in range(3):
                 graph.replay()
             torch.cuda.synchronize()
-        label = 'two-reductions' if options.archived else 'packed'
+        label = options.label or ('two-reductions' if options.archived else 'packed')
+        if Path(label).name != label:
+            raise ValueError('profile label must be one path component')
         path = Path('/c/clustered-indexer-profiles') / f'source-cutoff-{label}-65536-separable.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():

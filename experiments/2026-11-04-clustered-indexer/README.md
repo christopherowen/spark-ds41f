@@ -273,3 +273,19 @@ Two fresh control/candidate screens and dedicated sanitizers are prepared.
 The contextual long-domain capture gate now also passes twice on the pinned C36
 image, plus strict initcheck; actual model collection still awaits the shared
 serving window.
+
+The grouped-source screen now passes all six fixtures in two control and two
+candidate processes, six-case initcheck/memcheck and two-case racecheck. At128
+random queries, medians move from14.737 /14.769 ms to4.841 /4.844 ms; separable
+queries move from8.827 /8.838 ms to2.737 /2.742 ms. The256-row test also passes.
+One-row overhead is retained as an unfavorable result. These are complete
+unreleased prototype comparisons, not native serving improvements.
+
+Patch0010 prepares another independent variable: run unchanged native block
+selection directly on compact scores, then map block IDs through stable candidate
+IDs. Whole64-key compaction preserves eight-key boundaries, relative tie order,
+and the global last block's partial length. This removes the full dense score
+restoration buffer and pass. Fourteen CPU tests and fresh source checks pass;
+full source/grouped/score-bit/reindex, graph, allocation and sanitizer hardware
+gates remain pending. A separate wide fixture retains1M planned width with
+short visibility, matching an important native planning geometry.

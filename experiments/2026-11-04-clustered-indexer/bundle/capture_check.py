@@ -60,6 +60,9 @@ def check(extent, duplicate):
         assert len(list(Path(directory).glob('*.pt'))) == 2, 'source and dense budgets were conflated'
         replay_result = replay_file(paths[0], cuda_graph=os.environ.get('PYTORCH_NO_CUDA_MEMORY_CACHING') != '1')
         assert replay_result['identical'] and replay_result['source_interface']
+        dense_path = next(Path(directory).glob('rank-*-dense-*.pt'))
+        dense_result = replay_file(dense_path, cuda_graph=os.environ.get('PYTORCH_NO_CUDA_MEMORY_CACHING') != '1')
+        assert dense_result['identical'] and not dense_result['source_interface']
         return {'synthetic': True, 'full_candidate_replay_identical': True, 'extent': extent, 'duplicate_page': duplicate,
                 'planned_width': width, 'active': active, 'address_span_bytes': span,
                 'row_stride_bytes': restored[3].stride(0),

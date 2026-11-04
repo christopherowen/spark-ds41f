@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory() as directory:
     grouped_source = RELATIVE.parent / 'grouped_source_indexer.py'
     assert (root / grouped_source).read_bytes() == (HERE / 'bundle/overlay' / grouped_source).read_bytes()
     ast.parse((root / grouped_source).read_text())
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0010-map-source-handoff.patch')],
+                   cwd=root, check=True)
     source = RELATIVE.parent / 'source_indexer.py'
     assert (root / source).read_bytes() == (HERE / 'bundle/overlay' / source).read_bytes()
     ast.parse((root / source).read_text())

@@ -145,7 +145,8 @@ def main():
                 (65536, [0, 37, 32769, 65535], 'random'),
                 (65536, [65535], 'separable'), (65536, [65535], 'ties'),
                 (65536, [65535], 'extreme'), (65536, [65535], 'nan-key'),
-                (65536, [65535], 'nan-weight'), (262144, [262143], 'random')]
+                (65536, [65535], 'nan-weight'), (262144, [262143], 'random'),
+                (1048576, [0, 37, 32769, 65535], 'random')]
         if options.quick:
             cases = [(65536, [65535], 'random'), (65536, [65535], 'separable')]
         for width, extents, mode in cases:

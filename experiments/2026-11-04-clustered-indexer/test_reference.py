@@ -76,6 +76,29 @@ class BoundTests(unittest.TestCase):
                                  source_block_ids(scores, block_k, group)[0])
                 self.assertEqual(topk(pruned, 4), topk(scores, 4))
 
+    def test_compact_source_handoff_maps_ids_and_counts(self):
+        rng = random.Random(4187)
+        for length in (0, 1, 7, 37, 65, 129, 1025):
+            for _ in range(40):
+                scores = [float(rng.randrange(-3, 4)) for _ in range(length)]
+                group, cluster, block_k = 2, 4, 8
+                clusters = (length+cluster-1)//cluster
+                seeds = sorted(rng.sample(range(clusters), (clusters+1)//2))
+                seed_pos = [p for c in seeds for p in range(c*cluster,min((c+1)*cluster,length))]
+                selected, values = source_block_ids([scores[p] for p in seed_pos],block_k,group)
+                ordinary = [b for b in selected if b != len(values)-1]
+                cutoff = min((values[b],-(seed_pos[b*group]//group)) for b in ordinary) if len(ordinary)==block_k-1 else (-math.inf,-length)
+                kept = [p for c in range(clusters)
+                        if (max(scores[c*cluster:min((c+1)*cluster,length)]),-(c*cluster//group)) >= cutoff or c==(length-1)//cluster
+                        for p in range(c*cluster,min((c+1)*cluster,length))]
+                compact_ids, _ = source_block_ids([scores[p] for p in kept],block_k,group)
+                mapped = [kept[b*group]//group for b in compact_ids]
+                full_ids, _ = source_block_ids(scores,block_k,group)
+                self.assertEqual(mapped,full_ids)
+                compact_count = sum(min(group,len(kept)-b*group) for b in compact_ids)
+                full_count = sum(min(group,length-b*group) for b in full_ids)
+                self.assertEqual(compact_count,full_count)
+
     def test_packed_source_cutoff_matches_native_pair_order(self):
         rng = random.Random(4185)
         for _ in range(200):
