@@ -307,7 +307,10 @@ def main():
                                 )
                     code = process.wait(
                         timeout=max(
-                            1, job.get("timeout", 180) + 60 - (time.monotonic() - start)
+                            1,
+                            job.get("timeout", 180)
+                            + (60 if job["mode"] != "plain" else 0)
+                            - (time.monotonic() - start),
                         )
                     )
                 except subprocess.TimeoutExpired:

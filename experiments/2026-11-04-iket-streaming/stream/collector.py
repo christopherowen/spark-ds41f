@@ -25,6 +25,7 @@ class Collector:
         fail_after_records=0,
         uniform_registers=False,
         managed=True,
+        synchronize_warps=True,
     ):
         import torch
 
@@ -137,6 +138,7 @@ class Collector:
             raise OSError(code, "trace writer could not start")
         self.closed = False
         self.uniform_registers = uniform_registers
+        self.synchronize_warps = synchronize_warps
         self.write_json(
             "identity.json",
             {
@@ -161,6 +163,7 @@ class Collector:
                 "pid": os.getpid(),
                 "uniform_registers": uniform_registers,
                 "allocation": "managed" if managed else "mapped-host",
+                "synchronize_warps": synchronize_warps,
                 "scope": "TileLang lane-zero events; not arbitrary SASS tracing",
             },
         )
@@ -306,6 +309,7 @@ class Collector:
             annotated = annotated[:position] + text + annotated[until:]
         header = (
             f"#define SPARK_TRACE_ADDRESS {self.device.value}ULL\n"
+            + f"#define SPARK_TRACE_SYNC_WARPS {int(self.synchronize_warps)}\n"
             + (HERE / "device.cuh").read_text()
         )
         source = header + "\n" + annotated
@@ -329,6 +333,7 @@ def enable(
     patched=False,
     uniform_registers=False,
     managed=True,
+    synchronize_warps=True,
 ):
     global _ACTIVE
     if _ACTIVE is not None:
@@ -349,6 +354,7 @@ def enable(
         fail_after_records,
         uniform_registers,
         managed,
+        synchronize_warps,
     )
     if patched:
         from .phase import load

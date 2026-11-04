@@ -68,7 +68,9 @@ __device__ __forceinline__ void spark_trace_emit(unsigned long long kernel,
           .store(ticket + 1, cuda::memory_order_release);
     }
   }
+#if SPARK_TRACE_SYNC_WARPS
   __syncwarp(active);
+#endif
 }
 __device__ __forceinline__ void spark_trace_settle() {
   __shared__ unsigned word;
