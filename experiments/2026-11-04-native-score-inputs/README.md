@@ -1,9 +1,11 @@
 # Native token-id inputs for scoring
 
-**Performance gate not passed:** the owner requires equal or better GPU
-performance in every case. PR #895 is a draft while the slower cases are fixed;
-the v3 results below do not qualify that requirement. Conversion removals are
-to be retained. `performance-gate.json` records the current gate state.
+**GPU performance gate passed for all 120 cases.** The final source retains
+native integer widths and layouts and selects only GPU programs qualified on
+both timing boots. Two fresh final boots verify exact code/input identity for
+every case, pass 673 correctness checks each, and decode 56 IKET launches each,
+including the shared-staging path. Full-model and host enqueue qualification
+remain before promotion. See `performance-gate.json` and `paired-results-final.json`.
 
 One variable: selected-token score kernels consume the token-id dtype and
 strides supplied by their producers, replacing repeated int64 casts and
@@ -45,6 +47,55 @@ and monitors host memory. Tests, paired graph timings, and actual decoded IKET
 captures each boot twice. Every run and failure is retained. No serving operation
 is authorized by this experiment; full-image/full-model qualification remains
 before promotion.
+
+## Current qualification
+
+Final source: `bce3375da1b478deabd64fe92a1ac4ac449131b7`, tree `499aea14913f209c2981da0db973c2cad924c660`.
+Published test checkout: `2837a3251d0caea2861431cd56c5b93b8fedc4e6`. Native evidence:
+`/home/chris/spark-lab/native-score-inputs-20261104/native-v9`; portable receipt: `runs/native-final.json`.
+
+The final dispatch uses the existing native-stride kernel for larger selections
+and a block-sized shared tile for a transposed selection that fits one warp.
+The tile retains selected FP32 logits on chip, with no global conversion buffer
+or extra launch. Already-compact int64 ids preserve the prerequisite's program.
+The reduction, final arithmetic, ranks and serialized token values are unchanged.
+
+All 120 cases pass on each final boot by exact program/input identity with
+per-case programs qualified on both earlier timing boots: 112 from v6 and eight
+small transposed selections from v7. Those eight shared-staging cases were timed
+for 480 mirrored rounds on each boot. Every accepted measured case uses a
+five-standard-error upper time ratio at most 1, with no regression tolerance;
+reference-identical cases are proven by code and aliased preparation. The
+unqualified v6 case is changed, and the rejected larger v7 kernels are never
+selected by the final dispatch. No new timing measurements are claimed for
+identical programs. Their source, inputs, strides and reference program are
+verified again and their outputs checked independently.
+
+Both final boots pass **673 tests**, without skips or failures. Each final IKET
+capture decodes **56 launches** with valid phase ranges and warp lifetimes.
+The probe explicitly runs sliced and transposed ids, both native widths,
+masked/unmasked scores, eager/graph execution and aligned vector loads. Four
+cases per boot dispatch shared staging; their numerical outputs are checked.
+Minimum sampled host memory available: **111.08 GiB**. No memory guard stopped a
+job, both reservations closed, and the containers were removed. Serving was
+not changed.
+
+The full candidate-38 series, prerequisite and all nine native-input patches
+apply to a fresh tree matching the final export. Composition with the earlier
+sampler, rank-order and gather candidates also applies cleanly (source check
+only). Doctor, parsing, export hashes and diff checks pass; there are no new
+lint diagnostics. Full build inputs are not prepared locally.
+
+Reproduce the final audit without GPU access:
+
+```sh
+python3 experiments/2026-11-04-native-score-inputs/analyze_final.py \
+  experiments/2026-11-04-native-score-inputs/runs/native-final.json
+```
+
+All unsuccessful variants and raw samples below remain unchanged. The results
+qualify these GPU operations; they do not qualify full-model serving or host
+enqueue performance. No promoted configuration, source lock or baseline changes.
 
 ## Initial variant retained
 

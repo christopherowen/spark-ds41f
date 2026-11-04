@@ -1,33 +1,33 @@
 # Decision
 
-Not ready: the equal-or-better performance gate is not yet passed. PR #895
-is a draft, stacked on PR #893. The owner requires fixing slower cases while
-retaining the conversion removals.
+GPU case gate passed; retain as an unpromoted source candidate for full-model
+and host enqueue qualification. PR #895 remains stacked on PR #893.
 
-The current source (`d20a95fd`, tree `ca7edc30`) consumes the producer's native
-integer width and existing strides. Score addressing uses the compact, padded,
-sliced or transposed layout's simple expression; other views use general
-strides. It reads each selected logit once at the final store, without the
-rejected v4 output-buffer round trip. Top-k writes native sampled ids before
-selection. Compact int64 cases preserve the prerequisite's generated CUDA.
-All variants are prepared before startup freeze; no new conversion or GPU
-launch is added.
+The final source `bce3375da1b478deabd64fe92a1ac4ac449131b7` reads the producer's native int32/int64 ids and
+strides. Small transposed selections use the qualified block-sized shared stage;
+larger selections retain the qualified native-stride program. No conversion or
+layout materialization is restored, and no extra GPU launch or global buffer is
+added. FP32 arithmetic and order, token values, ranks and wire ids are preserved.
 
-Both current test boots pass 649 checks. Both full 120-case timing boots and
-IKET captures remain required. Timings use GPU-resident event nodes, eight
-cold-cache samples per replay and 120 mirrored rounds per case. Every case
-on both boots must have verified identical GPU code and bindings or a five-SE
-upper time ratio at most 1. Inconclusive is not a pass.
+All 120 GPU cases on both fresh final boots exactly match per-case reference and
+candidate CUDA, inputs and strides that qualified on both prior timing boots:
+112 cases from v6 and eight from v7. No unmatched or previously unqualified
+program is accepted. Measured programs use the five-SE upper ratio at most 1,
+with zero regression allowance; identical prerequisite programs are proven by
+code and aliased preparation. The single unqualified v6 case changes, and the
+larger v7 programs that regressed are excluded by the one-warp dispatch bound.
 
-Earlier variants and all unfavorable runs are preserved. V3's means increased
-in 13 of 120 cases, up to 5.95%. V4's more controlled timing left 35 cases
-unproved and established four score regressions on both boots. That source
-is rejected. The first v5 test run passed 648 checks and rejected a new fixture
-that derived a transposed mask instead of the production producer's packed
-mask; the fixture alone is corrected in patch 0006.
+Both final boots pass 673 numerical, boundary, graph, prompt, speculative,
+serialization and cold startup-freeze checks. Both expanded IKET captures pass
+with 56 decoded launches, explicitly including shared staging and aligned vector
+loads. Minimum sampled available host memory is 111.08 GiB, with no guard stop.
+`runs/native-final.json`, `paired-results-final.json` and `performance-gate.json`
+record the final source and proof chain. Every rejected source and unfavorable
+observation remains separate and unchanged.
 
-The complete series applies cleanly after candidate-38 and composes with the
-three prior ATen replacement candidates. Full-image/full-model qualification,
-including host enqueue effects, remains before promotion. No promoted
-configuration, default mode, source lock or immutable baseline is changed.
-No serving operation was performed.
+The full ordered patch series applies in a fresh source tree. Source composition
+with the prior three ATen replacement candidates passes too. Doctor, export hashes,
+parsing and diff checks pass; local full build inputs are absent. Full-image,
+full-model and host enqueue qualification remain before promotion. No promoted
+configuration, mode, source lock or immutable baseline changed; no serving
+operation was performed.
