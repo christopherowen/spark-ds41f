@@ -14,8 +14,10 @@ RECORD = struct.Struct("<QQQQQIIIIII")
 
 
 def records(root):
+    root = Path(root)
     expected = 0
-    for path in sorted(Path(root).glob("events-*.bin")):
+    index = 0
+    while (path := root / f"events-{index:08d}.bin").exists():
         with path.open("rb") as handle:
             magic, version, size, chunk, first, *_ = HEADER.unpack(
                 handle.read(HEADER.size)
@@ -24,6 +26,7 @@ def records(root):
                 magic != b"SPKIKET1"
                 or version not in (1, 2)
                 or size != 64
+                or chunk != index
                 or first != expected
             ):
                 raise ValueError(f"invalid or discontinuous chunk {path}")
@@ -49,6 +52,13 @@ def records(root):
         value = f"{checksum:08x}" if version == 2 else f"{checksum:016x}"
         if receipt != {"chunk": chunk, "records": count, key: value}:
             raise ValueError(f"checksum/count mismatch in {path}")
+        index += 1
+    if (root / "summary.json").exists():
+        summary = json.loads((root / "summary.json").read_text())
+        if summary["complete"] and (
+            expected != summary["written_records"] or index != summary["chunks"]
+        ):
+            raise ValueError("missing chunk or summary record count mismatch")
 
 
 def export(root, output, grid=None):

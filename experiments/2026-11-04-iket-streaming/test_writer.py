@@ -2,6 +2,7 @@
 
 import ctypes
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -100,3 +101,23 @@ def test_disk_full_wakes_blocked_producers_and_retains_complete_chunks(
     assert written <= 100
     assert list(tmp_path.glob("*.partial"))
     assert len(list(export.records(tmp_path))) <= written
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt"])
+def test_reader_rejects_missing_or_corrupt_completed_data(library, tmp_path, fault):
+    _, status, written, _ = run(library, tmp_path)
+    assert status == 0
+    paths = sorted(tmp_path.glob("events-*.bin"))
+    (tmp_path / "summary.json").write_text(
+        json.dumps({"complete": True, "written_records": written, "chunks": len(paths)})
+    )
+    if fault == "missing":
+        paths[1].unlink()
+    else:
+        with paths[1].open("r+b") as handle:
+            handle.seek(64 + 8)
+            byte = handle.read(1)
+            handle.seek(-1, 1)
+            handle.write(bytes([byte[0] ^ 1]))
+    with pytest.raises(ValueError, match="missing chunk|checksum"):
+        list(export.records(tmp_path))
