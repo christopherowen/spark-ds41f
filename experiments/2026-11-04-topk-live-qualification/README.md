@@ -33,9 +33,11 @@ once at window end and independently verify all ranks/live doctor. Clean
 published same-commit checkouts, named plans, guards and foreign/hardware-review
 holds remain mandatory. No Spaceport hardware operation is authorized here.
 
-Preparation only: no candidate-40 image, GPU run or serving change exists yet.
-The next copy-match and compiler rounds wait for this candidate's quality and
-measurement review. No promotion or bypass of TP4 correctness/release gates.
+Candidate-40 attempt 1 started at 15:34:15 UTC, with window
+`dgx1-1793806495` opened at 15:34:55 UTC. Image preparation and gates are active;
+the actual image digest and serving measurements remain pending. The next
+copy-match and compiler rounds wait for this candidate's quality and measurement
+review. No promotion or bypass of TP4 correctness/release gates.
 
 ## Execution controls
 
@@ -84,8 +86,19 @@ checkout change. This is scheduling history, not a measured candidate failure.
 An atomic `who=copy-default-screening` request was queued at 15:16:03 UTC behind
 window `dgx1-1793805208`, asking for about 4–5 hours after its current job. The
 original request/hold snapshot and deferral are preserved in `runs/preflight`.
-No candidate-40 GPU work has started. Re-read actual state, preserve foreign
-requests/holds, and remove only our fulfilled request before guarded staging.
-Refresh published changes and select one exact clean source/control commit on
-all serving checkouts and the owned DGX4 build worktree; record actual execution
-identity separately from later evidence commits.
+The foreign window subsequently released. Only our matching request was
+fulfilled and removed. Guarded staging window `dgx1-1793806106` synchronized all
+three serving checkouts and Git-updated the owned DGX4 build worktree to exact
+published execution commit `1f134c7aad82bc63c95afed36f488becf2959a41`. All four
+checkouts were clean; live C36 verification passed. Staging closed at 15:33:45
+UTC without a serving restart.
+
+The sole detached controller is PID `3431611`, supervised by PID `3431610`,
+under `/home/swank/tl-logs/topk-live-qualification/candidate-40-window.log` on
+DGX1. Native controller output is
+`results/private/lab/candidate-40-round/receipt.json`; builder output is
+`results/private/candidate-rounds/candidate-40-image/receipt.json` in the owned
+DGX4 worktree. Operator setup, initial liveness/phase receipts and hashes are
+preserved under `runs/2026-11-04-dgx/attempt-1`. The supervisor's actual exit
+receipt exists only after the run ends. Later evidence commits do not change
+the active execution identity and must not trigger synchronization or restart.
