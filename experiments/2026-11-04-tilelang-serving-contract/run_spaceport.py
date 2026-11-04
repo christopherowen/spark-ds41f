@@ -55,7 +55,19 @@ def main():
     receipt = {"node": socket.gethostname(), "commit": args.commit, "root": str(root),
                "cpu_only": True, "runs": []}
     created = []
+    hold = Path.home() / "spark-hold.json"
+    holder = "serving-contract-cpu-" + stamp
+    held = False
     try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reservation = {"holder": holder, "since": now.isoformat(),
+                       "heartbeat": now.isoformat(),
+                       "expected_end": (now + datetime.timedelta(minutes=10)).isoformat(),
+                       "scope": ["sp8"],
+                       "rule": "exclusive bounded CPU source checks; no GPU or serving changes"}
+        with hold.open("x") as handle:
+            json.dump(reservation, handle)
+        held = True
         command(["git", "-C", str(repo), "fetch", "--quiet", "origin", args.commit])
         archive = subprocess.Popen(["git", "-C", str(repo), "archive", args.commit,
                                     EXPERIMENT], stdout=subprocess.PIPE)
@@ -136,6 +148,12 @@ def main():
     finally:
         for name in created:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20)
+        if held and hold.is_file() and json.loads(hold.read_text()).get("holder") == holder:
+            hold.unlink()
+        request = Path.home() / "spark-request.json"
+        if held and request.is_file():
+            if json.loads(request.read_text()).get("who") == "tilelang-serving-contract":
+                request.unlink()
         receipt["final_running_containers"] = command(
             ["docker", "ps", "--format", "{{.Names}}"]
         ).stdout.splitlines()
