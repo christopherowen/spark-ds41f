@@ -99,7 +99,8 @@ lookup/tree agreement. Metadata and per-stream padding count toward storage.
 
 `fp8_probe.cu` and `fp8_probe.py` prepare a GB10 decoder microbenchmark. Before
 timing, it materializes and compares every decoded GPU byte with the pinned
-checkpoint. Timed consumers reconstruct into shared memory and consume those
+checkpoint. Separate compressed fixtures cover all 256 byte encodings and
+Huffman codes longer than the fast lookup. Timed consumers reconstruct into shared memory and consume those
 bytes, comparing with a raw-byte control. The working set is at least 64 MiB,
 larger than GB10's 24 MiB L2. All rounds, memory allocations and input/source
 identities are recorded. Unused metadata in the raw probe scaffold is reported
@@ -111,6 +112,27 @@ Those are repeated decoder microbenchmarks, **not** serving boots. The CUDA
 source has not yet been compiled or executed on target. A winning byte consumer
 still requires a fused GEMM consumer and the two full serving boots before any
 release claim. No inference kernel calls this prototype.
+
+The bundles name the frozen base image by its immutable SHA-256 identity.
+`run_fp8.py` checks native process exits and verdicts, all exactness flags, source
+hashes, workload identity, working-set size and actual allocation observations.
+A failed or missing byte gate cannot become a timing win. It compares first and
+repeat containers with exploratory bootstrap uncertainty, then closes its owned
+window and restores the recorded service even on a failed gate. It never opens
+or changes another holder's reservation.
+
+After acquiring the standard published/idle window with the note
+`owner-authorized lossless FP8 decoder measurements`, run on dgx1:
+
+```sh
+python3 experiments/2026-11-04-lossless-memory/run_fp8.py \
+  --window WINDOW_ID --lanes 32 64 128 \
+  --out results/private/lossless-fp8-round-1 --apply
+```
+
+The owner has authorized these candidate operations. A shared-window request
+still ends the current window after its job. Preserve partial observations and
+resume only unmeasured lane counts in a separately named receipt.
 
 ## Hardware sequence
 

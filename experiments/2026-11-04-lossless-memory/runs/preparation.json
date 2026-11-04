@@ -212,6 +212,42 @@
       "command": "audit kernel job nodes against the current production map",
       "problem": "initial dgx4 target is outside the production TP3 node map and cannot be resolved by the standard runner",
       "resolution": "FP8 screen on dgx1; component and full-gate tests on all three configured ranks; no hardware execution before correction"
+    },
+    {
+      "command": ".venv312/bin/python -m unittest tests.test_lossless_memory -v",
+      "exit_code": 0,
+      "passed": 33,
+      "seconds": 3.261,
+      "scope": "CPU codecs plus strict GPU-receipt refusal cases; no CUDA execution"
+    },
+    {
+      "command": ".venv312/bin/python -m unittest discover -s tests",
+      "exit_code": 0,
+      "passed": 659,
+      "seconds": 103.839,
+      "scope": "full repository CPU suite on current published base"
+    },
+    {
+      "command": "docker image inspect sha256:7918fd6145b59c980d40c985eb30f0f06bcc1aecadf0fd9e3fc73baa4db0a93e on dgx1",
+      "exit_code": 0,
+      "scope": "read-only identity check; FP8 bundles now pin this immutable image"
+    },
+    {
+      "command": "check_compatibility.py --repo .work/upstreams/vllm --out experiments/2026-11-04-lossless-memory/cold-prefix/compatibility.json",
+      "exit_code": 0,
+      "serving_compatible": false,
+      "scope": "static audit of exact promoted vLLM tree"
+    },
+    {
+      "command": "run_fp8.py --window PLAN --lanes 32 64 128 --out results/private/lossless-fp8-round-1",
+      "exit_code": 0,
+      "scope": "plan only; no reservation or node operation"
+    },
+    {
+      "command": "lab.py run <each of 16 current experiment plans> --dry-run; AST parse updated measurement helpers; git diff --check",
+      "exit_code": 0,
+      "plans": 16,
+      "scope": "local validation only; no GPU execution"
     }
   ],
   "gpu_work_started": false,

@@ -19,7 +19,11 @@ no variable is approved for release.
   measure a coherent isolated layout, including packing time and disk space.
 - Cold prefix: bounded disk storage prototype prepared. A complete-state export,
   all-rank restore barrier, vLLM adapter and reuse-after-eviction measurement are
-  outstanding. Storage round trips do not qualify continuation correctness.
+  outstanding. The promoted-source compatibility gate excludes immediate use of
+  the generic recurrent adapter for this model, and the host-local filesystem
+  tier does not certify multi-host rank persistence. A model-specific checkpoint
+  or ordinary-prefix replay adapter is required. Storage round trips do not
+  qualify continuation correctness.
 
 Another experiment held the cluster during preparation. At 14:31 UTC on
 2026-11-04 its hold was absent. The standard lab kernel job stops the serving

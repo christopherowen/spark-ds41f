@@ -26,6 +26,7 @@ codec = load("memory_codec")
 store = load("cold_store")
 collector = load("collect_weights")
 probe_frame = load("fp8_probe_frame")
+probe_results = load("fp8_results")
 
 
 class CodecTests(unittest.TestCase):
@@ -271,6 +272,82 @@ class ParallelProbeFrameTests(unittest.TestCase):
         quick[0] ^= 1
         with self.assertRaises(ValueError):
             probe_frame.unpack(replace(frame, quick=bytes(quick)))
+
+
+class ProbeReceiptTests(unittest.TestCase):
+    image = "sha256:" + "a" * 64
+    revision = "b" * 40
+
+    def receipt(self):
+        raw_bytes = 128 * 1024**2
+        return {"status": "measured microbenchmark; serving remains unqualified",
+                "gpu_byte_exact": True, "gpu_all_encodings_and_long_codes_exact": True,
+                "lanes": 32, "model_revision": self.revision,
+                "sources_sha256": probe_results.source_hashes(),
+                "inputs": [{"name": "test", "sha256": "c" * 64}],
+                "decoded_bytes_per_replay": raw_bytes,
+                "allocated_input_bytes": {"raw": raw_bytes * 2, "encoded": raw_bytes // 2},
+                "kernel_ms": {"raw": [1.0] * 9, "encoded": [0.5] * 9},
+                "sample_encoded_bytes_with_metadata": 8192,
+                "host_peak_rss_kib": 1000, "peak_cuda_allocated_bytes": raw_bytes,
+                "peak_cuda_reserved_bytes": raw_bytes}
+
+    def verdict(self):
+        return {"passed": True, "exit": 0, "image": self.image, "errors": [], "failed": []}
+
+    def check(self, native, verdict=None):
+        probe_results.validate(native, verdict or self.verdict(), lanes=32,
+                               image=self.image, revision=self.revision)
+
+    def test_complete_exact_first_repeat_can_qualify_only_the_microbenchmark(self):
+        pair = [self.receipt(), self.receipt()]
+        for native in pair:
+            self.check(native)
+        summary = probe_results.summarize(pair)
+        self.assertEqual(summary["decision"], "retain for fused-consumer investigation")
+        self.assertEqual(summary["exploratory_bootstrap_ratio_ci95"], [0.5, 0.5])
+        self.assertFalse(summary["serving_performance_verified"])
+
+    def test_any_byte_gate_failure_or_missing_memory_rejects(self):
+        for key in ("gpu_byte_exact", "gpu_all_encodings_and_long_codes_exact",
+                    "host_peak_rss_kib", "peak_cuda_allocated_bytes"):
+            native = self.receipt()
+            native.pop(key)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.check(native)
+
+    def test_wrong_image_source_or_process_exit_rejects(self):
+        native = self.receipt()
+        native["sources_sha256"]["fp8_probe.cu"] = "0" * 64
+        with self.assertRaises(ValueError):
+            self.check(native)
+        for changes in ({"image": "sha256:" + "d" * 64}, {"exit": 1}, {"passed": False}):
+            verdict = self.verdict()
+            verdict.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.check(self.receipt(), verdict)
+
+    def test_nan_infinity_zero_and_missing_timings_reject(self):
+        for values in ([float("nan")] * 9, [float("inf")] * 9, [0] * 9, []):
+            native = self.receipt()
+            native["kernel_ms"]["encoded"] = values
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.check(native)
+
+    def test_repeat_input_change_rejects(self):
+        pair = [self.receipt(), self.receipt()]
+        pair[1]["inputs"][0]["sha256"] = "d" * 64
+        with self.assertRaises(ValueError):
+            probe_results.summarize(pair)
+
+    def test_slow_repeat_or_inflated_encoded_allocation_cannot_qualify(self):
+        pair = [self.receipt(), self.receipt()]
+        pair[1]["kernel_ms"]["encoded"] = [1.1] * 9
+        self.assertEqual(probe_results.summarize(pair)["decision"], "reject this microdecoder layout")
+        pair = [self.receipt(), self.receipt()]
+        for native in pair:
+            native["allocated_input_bytes"]["encoded"] = native["decoded_bytes_per_replay"] + 1
+        self.assertEqual(probe_results.summarize(pair)["decision"], "reject this microdecoder layout")
 
 
 if __name__ == "__main__":

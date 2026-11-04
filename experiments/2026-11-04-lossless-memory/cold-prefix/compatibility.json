@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "scope": "static compatibility audit; no performance measurement",
+  "vllm_tree": "ea1281f880e7535e3d87725be0156a8e38fc2fb2",
+  "model_type": "deepseek_v41",
+  "generic_boundary_supported_model_types": [
+    "glm5_next",
+    "glm5_next_text",
+    "qwen3_8_flash_next",
+    "qwen3_8_flash_next_text",
+    "qwen4_exp",
+    "qwen4_exp_text"
+  ],
+  "generic_boundary_supports_this_model": false,
+  "private_attention_windows": true,
+  "compressor_circular_state": true,
+  "filesystem_tier_uses_host_local_scheduler_buffer": true,
+  "source_sha256": {
+    "vllm/config/vllm.py": "a7e678c5d65d14c64db350808e3d979d3643412b7f9d1733e3434703da6afda2",
+    "vllm/transformers_utils/configs/deepseek_v41.py": "32034171437c29ad718358bdba8fd70e6afae9180914ed78809180ab3bd6086a",
+    "vllm/models/deepseek_v4_1/attention.py": "88651e8918abac6c527aace61c135e715fce09e19925f76e8115ffcd6032da9f",
+    "vllm/models/deepseek_v4_1/compressor.py": "fb64664df6fac8c68cf835298bd08a968166128e6de74f4e029b5ef234332389",
+    "vllm/v1/kv_offload/cpu/shared_offload_region.py": "4ba8b46f485fdda25c17cc7485bc3da80e46b35faacdbf31423ecf5e5fe83498",
+    "vllm/v1/kv_offload/tiering/spec.py": "435ae3effedb68e479377d00b49800087b70e2e27ccca041a8396c6aaa985c32"
+  },
+  "serving_candidate_qualified": false,
+  "decision": "defer serving integration until model-specific and per-rank transfer gates pass",
+  "required_gates": [
+    "Define complete target/draft capture, or prove ordinary prefix replay rebuilds every private state.",
+    "Export only committed written spans of complete cacheable blocks; exclude allocation padding.",
+    "Prove every node's shard is persisted and restored; a head-local mmap is not that proof.",
+    "Reserve destinations and wait for every rank before publishing an external prefix hit.",
+    "Verify byte identity, continuation equivalence and TTFT after forced GPU/CPU cache eviction."
+  ],
+  "command": [
+    "experiments/2026-11-04-lossless-memory/cold-prefix/check_compatibility.py",
+    "--repo",
+    ".work/upstreams/vllm",
+    "--out",
+    "experiments/2026-11-04-lossless-memory/cold-prefix/compatibility.json"
+  ]
+}

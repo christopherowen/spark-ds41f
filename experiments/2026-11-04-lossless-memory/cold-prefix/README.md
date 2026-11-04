@@ -5,6 +5,26 @@ publication tests. It is not connected to vLLM and has no measured TTFT benefit.
 Weight-tile compression ratios do not predict this cache state's ratio. Screen
 only real complete-state exports before choosing its codec and block size.
 
+The promoted-source compatibility gate is recorded in `compatibility.json`.
+The generic recurrent checkpoint adapter excludes `deepseek_v41`; this model
+has private decoder/draft windows and compressor circular state. The native
+filesystem tier's scheduler reads a host-local `/dev/shm` region, which alone
+does not prove that all three hosts' rank shards reach disk. Do not enable that
+path merely because its byte codec round trips.
+
+A second possible design stores only complete, prefix-cacheable blocks and
+uses the ordinary warm-prefix replay to rebuild private state. That design
+needs an explicit selected-group mapping, committed written-span export and
+per-rank storage/restore proof. The current prototype implements neither serving
+design and remains behind this compatibility gate.
+
+Reproduce the static audit without loading weights or initializing CUDA:
+
+```sh
+python3 experiments/2026-11-04-lossless-memory/cold-prefix/check_compatibility.py \
+  --repo .work/upstreams/vllm --out INPUTS/cold-prefix-compatibility.json
+```
+
 The next measurement is a complete request-boundary export at 32K, 131K and
 262K, at the selected shape's unchanged batch and context limits. Record every
 cache group's logical positions, dtype, shape and written byte spans, plus the
