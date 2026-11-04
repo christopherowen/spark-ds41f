@@ -89,3 +89,22 @@ on DGX1. Image/gate receipt: `results/private/candidate-rounds/candidate-39-imag
 in the clean DGX4 build worktree. Both scripts default to a read-only plan; no
 serving change is made by reading this experiment. Collect and analyze native
 exits, digests, conditions and both boots before a verdict or the next round.
+
+## First dispatch: yielded before GPU work
+
+Published #842 merged at `f3795349`; execution controls were finalized at
+`f9ba89ea` and synchronized cleanly to DGX1–3. The DGX4 build worktree used that
+same commit. Staging left candidate-36 running and its live doctor passed.
+The first controller opened at 08:07:37 UTC on 2026-11-04, then honored a
+clustered-indexer request before starting any phase. It ended at 08:07:55 UTC,
+exit 1, with zero build, GPU or measurement steps. Candidate-36 was confirmed
+live and the window closed. The other task subsequently acquired the window.
+All receipts and the setup supervisor's actual exit are retained under
+`runs/2026-11-04-dgx/attempt-1`. This is a scheduling outcome, not a candidate
+performance result. The launcher originally appended a literal backslash-n to
+its exit JSON; the portable parseable copy retains the original text beside it.
+
+Resume the unchanged matrix with `run_round.py --attempt 2 --apply` only after
+the shared reservation and request queue allow it, from a newly published clean
+commit on all nodes. The executor refuses to overwrite prior outputs or resume
+if any previous phase started. No new GPU measurement exists yet.
