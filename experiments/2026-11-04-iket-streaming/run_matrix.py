@@ -46,16 +46,15 @@ def main():
     for container_id in capture(["docker", "ps", "-q"]).splitlines():
         other = json.loads(capture(["docker", "inspect", container_id]))[0]
         host = other["HostConfig"]
-        command = other["Config"].get("Cmd", [])
-        entrypoint = other["Config"].get("Entrypoint", [])
-        # A parked CPU-only review container is not a GPU workload. Never stop it.
-        parked = (host["Runtime"] == "runc" and not host.get("DeviceRequests")
-                  and not host.get("Devices") and entrypoint == ["sleep"]
-                  and command == ["infinity"])
-        processes = [line.strip().split(None, 1)[1] for line in
-                     capture(["docker", "top", container_id, "-eo", "pid,args"]).splitlines()[1:]]
-        if not parked or processes != ["sleep infinity"]:
-            raise SystemExit("sp8 has an active container: " + other["Name"])
+        cpu_only = (host["Runtime"] == "runc" and not host.get("DeviceRequests")
+                    and not host.get("Devices") and not host.get("Privileged")
+                    and not any(m.get("Source", "").startswith("/dev")
+                                for m in other.get("Mounts", [])))
+        if not cpu_only:
+            raise SystemExit("sp8 has a GPU-capable container: " + other["Name"])
+        print("CPU-only concurrent container:", other["Name"], flush=True)
+    if capture(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"]):
+        raise SystemExit("sp8 has an active GPU process")
     if capture(["git", "-C", str(ROOT), "status", "--porcelain"]):
         raise SystemExit("diagnostic checkout must be clean")
     if memory() < 40 * (1 << 30):
@@ -72,7 +71,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     state = {"holder": "iket-streaming-" + args.run, "since": utc(), "expected_end": None,
              "heartbeat": utc(), "nodes": ["sp8"],
-             "rule": "sp8-only diagnostics; no other GPU jobs or builds on sp8"}
+             "rule": "sp8 GPU diagnostics; no other GPU jobs or image builds; CPU-only review may continue"}
     mutex = threading.RLock()
 
     def write(path, value):
