@@ -126,15 +126,22 @@ def measured_point(step, nodes):
 
 
 def main():
+    global OUTPUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--attempt", type=int, default=1, help="distinct window receipts; never overwrite a failed attempt")
     args = parser.parse_args()
+    if args.attempt < 1:
+        parser.error("--attempt must be positive")
+    if args.attempt > 1:
+        OUTPUT = OUTPUT.with_name(f"{OUTPUT.name}-attempt-{args.attempt}")
     lab.PRODUCTION_CONFIG = RESTORE
     specs = [json.loads((ROOT / EXPERIMENT / f"lab-boot-{boot}.json").read_text()) for boot in "ab"]
     points = [step for spec in specs for job in spec["jobs"]
               for step in lab.agentx_steps(spec, job) if step["kind"] == "agentx"]
     if not args.apply:
         print(json.dumps({"restore": RESTORE, "image": IMAGE, "points": points,
+                          "output": str(OUTPUT), "attempt": args.attempt,
                           "memory_floor_gib": 4, "client_admission_gib": 20,
                           "cool_below_c": 55, "apply": False}, indent=2))
         return 0
@@ -155,6 +162,7 @@ def main():
             raise SystemExit(f"{node['name']}: candidate image mismatch")
     OUTPUT.mkdir(parents=True)
     receipt = {"started": lab.now(), "points": [], "restored": False,
+               "attempt": args.attempt,
                "deployment_commit": lab.checkout_commit(), "authorization": "owner approved full TP4 test window"}
     lab.window_open(0, "candidate-38 TP4 trace replay")
     done = threading.Event()

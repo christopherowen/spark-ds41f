@@ -115,6 +115,25 @@ long-context, mixed-load and release/single-stream/sampled gates on repeat
 boots. The remaining loop canary and a long compacted tool session need their
 own scored correctness checks; forced reasoning completion is containment.
 
+## First execution: setup failure, preserved
+
+Window `spark-0009-1793751815` (00:23:35–00:29:20 UTC) stopped all four
+candidate-37 ranks and rebuilt the corpus in 172.5 s, peaking at 26.9 GiB.
+The 16-session local-stub restore check hit the 5.95 GiB mmap cache, then
+failed with a connection reset during warmup. AgentX exited 1; no candidate-38
+engine or measurement was started. Candidate-37 was restored on all four
+ranks, independently passed live doctor (four existing recommendations),
+and the hold was removed. Native receipts are in
+`runs/2026-11-04-spaceport/attempt-1`; larger/private raw records remain
+under the recorded native paths and ignored evidence directory.
+
+A CPU-only verification using the existing cache, the measurement's 12 GiB
+cap and non-serving cores reproduced the 16-session stub failure while
+candidate-37 remained live. Its first two-session replay passed. The client
+setup is being repaired before resuming the originally approved matrix.
+Subsequent windows use `run_window.py --attempt N --apply` so the failed
+window remains intact. The candidate image and measured workloads do not change.
+
 ## Conclusion
 
 No candidate-38 TP4 measurements yet. No release verdict or measured tuning
