@@ -140,7 +140,7 @@ def main():
                     "-v", f"{out}:/out", "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1",
                     "-e", "VLLM_PLUGINS=", "-e", "DO_NOT_TRACK=1", "-e", "VLLM_NO_USAGE_STATS=1",
                     "-e", "PYTHONUNBUFFERED=1", "-e", "PYTHONFAULTHANDLER=1"]
-            if job.get("script") == "full_step.py":
+            if job.get("script") in ("full_step.py", "full_stream.py"):
                 argv += ["-v", f"{Path.home() / '.cache/huggingface'}:/hf:ro",
                          "-v", f"{Path.home() / 'spark-lab/spaceport-iket-c38-20261104/cache'}:/c"]
             for key, value in sorted(job.get("env", {}).items()):
