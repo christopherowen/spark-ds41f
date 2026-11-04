@@ -1,0 +1,104 @@
+From ba2fa878e84e9d2b653f215378f10fbb16f598ee Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 14:10:05 +0100
+Subject: [PATCH] Reserve long-domain capture coverage for the source interface
+
+Base: C36 cc0fdf582d0bddff71c6a853e237bc9e87587832 and the three diagnostic patches. Rationale: capturing only the first three pools would miss the later global candidate source, and an 8192-key capture cannot establish long-domain pruning. Reserve separate three-dense/two-source budgets, record caller layer identity, and default to at least32769 keys. The planned workload exceeds65538 input tokens for the native 1/2 compression ratios. No scorer or attention arithmetic changes. Tests: fresh C36 series, exact source recovery and syntax; synthetic contextual capture/replay and initcheck pending. Upstream status: diagnostic only, not submitted.
+---
+ .../deepseek_v4_1/tilelang/attention.py       |  3 +++
+ .../tilelang/clustered_capture.py             | 19 +++++++++++++------
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  4 +++-
+ 3 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index ea18104ce7..0b935ff21f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -320,6 +320,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+             out=output_indices,
+             candidate_out=candidate_output,
+             candidate_out_lengths=candidate_output_lengths,
++            _capture_context={'prefix': self.prefix, 'layer_id': self.layer_id,
++                              'index_source_layer_id': self.index_source_layer_id,
++                              'candidate_source_layer': self.candidate_source_layer},
+             scratch=scratch,
+         )
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+index 16f51aaf1d..150fa32559 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
++++ b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+@@ -9,19 +9,23 @@ import torch
+ _captured = set()
+ 
+ 
+-def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size, candidate_blocks=False):
++def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size, candidate_blocks=False, context=None):
+     directory = os.environ.get('VLLM_DS41_CLUSTER_CAPTURE')
+     if not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
+         return
+     if torch.cuda.is_current_stream_capturing():
+         return
+-    key = pool.data_ptr()
+-    if key in _captured or len(_captured) >= 3:
++    kind = bool(candidate_blocks)
++    key = (pool.data_ptr(), kind)
++    budget = 2 if kind else 3
++    ordinal = sum(item[1] == kind for item in _captured)
++    if key in _captured or ordinal >= budget:
+         return
+     limit = max(min(int(active[0].item()), width), 0)
+     row = int(lengths.argmax().item())
+     extent = min(int(lengths[row].item()), limit)
+-    if extent < 8192:
++    minimum = int(os.environ.get('VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS', '32769'))
++    if extent < minimum:
+         return
+     # Copy only written byte prefixes. Reading a whole final page and clearing
+     # its tail afterwards would still read unwritten device memory.
+@@ -41,8 +45,9 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
+         selected[compact, start:start + count * 4].copy_(
+             byte_pool[physical, start:start + count * 4].detach().cpu())
+     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+-    pool_ordinal = len(_captured)
+-    target = Path(directory, f'rank-{rank}-pool-{pool_ordinal}.pt')
++    pool_ordinal = ordinal
++    interface = 'source' if kind else 'dense'
++    target = Path(directory, f'rank-{rank}-{interface}-{pool_ordinal}.pt')
+     if target.exists():
+         raise RuntimeError(f'refusing to overwrite a real-input capture: {target}')
+     snapshot = {
+@@ -57,6 +62,8 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
+         'width': width,
+         'candidate_blocks': bool(candidate_blocks),
+         'schema_version': 2,
++        'capture_context': context or {},
++        'capture_minimum_keys': minimum,
+         'layout': {
+             'pool_pages': byte_pool.shape[0],
+             'row_stride_bytes': byte_pool.stride(0),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index a6b3d526bb..cd22abd593 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -1715,6 +1715,7 @@ class IndexerV41Plan:
+         out=None,
+         candidate_out=None,
+         candidate_out_lengths=None,
++        _capture_context=None,
+         scratch=None,
+     ):
+         """Select each row's top positions into ``out``; returns ``(out, scores)``.
+@@ -1728,7 +1729,8 @@ class IndexerV41Plan:
+         if not self.candidates:
+             from .clustered_capture import maybe_capture
+             maybe_capture(q_packed, q_scales, weights, pool, page_table, lengths,
+-                          active, self.width, self.page_size, self.candidate_blocks)
++                          active, self.width, self.page_size, self.candidate_blocks,
++                          _capture_context)
+         rows = q_packed.shape[0]
+         buffers = _take(scratch, self.scratch_specs(rows))
+         scores, values = buffers[:2]
+-- 
+2.54.0 (Apple Git-157)
+

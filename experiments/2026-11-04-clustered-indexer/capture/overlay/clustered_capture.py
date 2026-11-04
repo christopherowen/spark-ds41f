@@ -9,19 +9,23 @@ import torch
 _captured = set()
 
 
-def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size, candidate_blocks=False):
+def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size, candidate_blocks=False, context=None):
     directory = os.environ.get('VLLM_DS41_CLUSTER_CAPTURE')
     if not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
         return
     if torch.cuda.is_current_stream_capturing():
         return
-    key = pool.data_ptr()
-    if key in _captured or len(_captured) >= 3:
+    kind = bool(candidate_blocks)
+    key = (pool.data_ptr(), kind)
+    budget = 2 if kind else 3
+    ordinal = sum(item[1] == kind for item in _captured)
+    if key in _captured or ordinal >= budget:
         return
     limit = max(min(int(active[0].item()), width), 0)
     row = int(lengths.argmax().item())
     extent = min(int(lengths[row].item()), limit)
-    if extent < 8192:
+    minimum = int(os.environ.get('VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS', '32769'))
+    if extent < minimum:
         return
     # Copy only written byte prefixes. Reading a whole final page and clearing
     # its tail afterwards would still read unwritten device memory.
@@ -41,8 +45,9 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
         selected[compact, start:start + count * 4].copy_(
             byte_pool[physical, start:start + count * 4].detach().cpu())
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    pool_ordinal = len(_captured)
-    target = Path(directory, f'rank-{rank}-pool-{pool_ordinal}.pt')
+    pool_ordinal = ordinal
+    interface = 'source' if kind else 'dense'
+    target = Path(directory, f'rank-{rank}-{interface}-{pool_ordinal}.pt')
     if target.exists():
         raise RuntimeError(f'refusing to overwrite a real-input capture: {target}')
     snapshot = {
@@ -57,6 +62,8 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
         'width': width,
         'candidate_blocks': bool(candidate_blocks),
         'schema_version': 2,
+        'capture_context': context or {},
+        'capture_minimum_keys': minimum,
         'layout': {
             'pool_pages': byte_pool.shape[0],
             'row_stride_bytes': byte_pool.stride(0),

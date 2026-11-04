@@ -1715,6 +1715,7 @@ class IndexerV41Plan:
         out=None,
         candidate_out=None,
         candidate_out_lengths=None,
+        _capture_context=None,
         scratch=None,
     ):
         """Select each row's top positions into ``out``; returns ``(out, scores)``.
@@ -1728,7 +1729,8 @@ class IndexerV41Plan:
         if not self.candidates:
             from .clustered_capture import maybe_capture
             maybe_capture(q_packed, q_scales, weights, pool, page_table, lengths,
-                          active, self.width, self.page_size, self.candidate_blocks)
+                          active, self.width, self.page_size, self.candidate_blocks,
+                          _capture_context)
         rows = q_packed.shape[0]
         buffers = _take(scratch, self.scratch_specs(rows))
         scores, values = buffers[:2]

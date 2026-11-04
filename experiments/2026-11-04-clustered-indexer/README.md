@@ -246,3 +246,14 @@ prototype and the slower two-reduction tie prototype are frozen for diagnostics.
 Candidate-only traces must identify the stage cost rather than infer it from
 pruned-key counts. Native-layout capture/replay QA also passes twice on the exact
 C36 sp8 image; real DeepSeek operands have still not been collected.
+
+The packed cutoff passes two eight-case graph processes and all three sanitizers
+with identical source/reindex digests. Complete separable medians recover to
+0.156 / 0.155 ms. Candidate-only traces put69% of the preceding implementation's
+kernel time in its cutoff; the packed reduction removes that bottleneck.
+`source-profiling.json` retains both traces. No real-model or serving claim follows.
+
+The capture arm now reserves separate dense/source pool budgets and records caller
+layer identity. Its default minimum32769 keys avoids letting an early short-domain
+sample stand in for long-domain selection. Its contextual gate is hardware pending;
+see `capture/README.md` for the coordinated deployment and restoration procedure.

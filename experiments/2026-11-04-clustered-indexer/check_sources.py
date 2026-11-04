@@ -54,6 +54,8 @@ with tempfile.TemporaryDirectory() as directory:
     expected_hash = json.loads((HERE / 'capture/base.json').read_text())['indexer_sha256']
     assert hashlib.sha256((target / 'indexer.py').read_bytes()).hexdigest() == expected_hash
     assert not (target / 'clustered_capture.py').exists()
+    attention_hash = json.loads((HERE / 'capture/base.json').read_text())['attention_sha256']
+    assert hashlib.sha256((target / 'attention.py').read_bytes()).hexdigest() == attention_hash
 print('capture patch recovers the exact candidate-36 indexer; syntax OK')
 
 # The independent top-k dependency owns its patch, executable copy and regression.

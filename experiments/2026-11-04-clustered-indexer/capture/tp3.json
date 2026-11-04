@@ -1,16 +1,17 @@
 {
-  "notes": "Input capture only: candidate-36 arithmetic, one explicitly armed query from each of three distinct owned index-cache pools per rank; isolated API port.",
+  "notes": "Input capture only: C36 arithmetic, long-domain dense and source interfaces, caller layer identity; isolated checkout and API port.",
   "extends": {
     "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
   },
   "set": {
     "environment": {
-      "VLLM_DS41_CLUSTER_CAPTURE": "/cache/clustered-indexer-capture-20261104"
+      "VLLM_DS41_CLUSTER_CAPTURE": "/cache/clustered-indexer-capture-20261104",
+      "VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS": "32769"
     },
     "container": {
       "mounts": [
         [
-          "{checkout}/cache",
+          "{home}/projects/spark-ds41f/cache",
           "/cache",
           "rw"
         ],
@@ -22,6 +23,11 @@
         [
           "{checkout}/experiments/2026-11-04-clustered-indexer/capture/overlay/clustered_capture.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/capture/overlay/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/attention.py",
           "ro"
         ]
       ]

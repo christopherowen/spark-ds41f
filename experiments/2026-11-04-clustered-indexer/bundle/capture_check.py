@@ -25,15 +25,20 @@ def check(extent, duplicate):
     clustered_capture._captured.clear()
     with tempfile.TemporaryDirectory() as directory:
         os.environ['VLLM_DS41_CLUSTER_CAPTURE'] = directory
-        clustered_capture.maybe_capture(*args, width, page_size, True)
+        if extent < 32769:
+            os.environ['VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS'] = '8192'
+        else:
+            os.environ.pop('VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS', None)
+        clustered_capture.maybe_capture(*args, width, page_size, True, {'prefix': 'synthetic.layer', 'layer_id': 20})
         assert not list(Path(directory).glob('*.pt')), 'unarmed capture ran'
         Path(directory, 'arm').touch()
-        clustered_capture.maybe_capture(*args, width, page_size, True)
+        clustered_capture.maybe_capture(*args, width, page_size, True, {'prefix': 'synthetic.layer', 'layer_id': 20})
         paths = list(Path(directory).glob('*.pt'))
         assert len(paths) == 1
         data = torch.load(paths[0], weights_only=True, map_location='cpu')
         assert data['width'] == width and int(data['active'][0]) == active
         assert data['candidate_blocks'] and data['layout']['query_rows'] == 1
+        assert data['capture_context'] == {'prefix': 'synthetic.layer', 'layer_id': 20}
         for physical, count in zip(range(len(data['pool'])), data['layout']['written_prefixes']):
             assert not data['pool'][physical, count*64:page_size*64].count_nonzero()
             assert not data['pool'][physical, page_size*64+count*4:].count_nonzero()
@@ -49,8 +54,10 @@ def check(extent, duplicate):
         for a, b in [(left, right), (blocks[0], blocks[1]), (counts[0], counts[1]),
                      (scores[:, :extent].view(torch.int16), recovered[:, :extent].view(torch.int16))]:
             torch.testing.assert_close(a, b, atol=0, rtol=0)
-        clustered_capture.maybe_capture(*args, width, page_size, True)
+        clustered_capture.maybe_capture(*args, width, page_size, True, {'prefix': 'synthetic.layer', 'layer_id': 20})
         assert len(list(Path(directory).glob('*.pt'))) == 1, 'same pool captured twice'
+        clustered_capture.maybe_capture(*args, width, page_size, False, {'prefix': 'synthetic.layer', 'layer_id': 20})
+        assert len(list(Path(directory).glob('*.pt'))) == 2, 'source and dense budgets were conflated'
         replay_result = replay_file(paths[0], cuda_graph=os.environ.get('PYTORCH_NO_CUDA_MEMORY_CACHING') != '1')
         assert replay_result['identical'] and replay_result['source_interface']
         return {'synthetic': True, 'full_candidate_replay_identical': True, 'extent': extent, 'duplicate_page': duplicate,

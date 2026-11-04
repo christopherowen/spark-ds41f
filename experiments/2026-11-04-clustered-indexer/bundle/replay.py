@@ -92,7 +92,7 @@ def replay_file(path, cuda_graph=True):
             torch.cuda.synchronize()
             samples.append((time.perf_counter() - start) * 1000)
     result = {'snapshot': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-              'source': data['source'], 'rank': data['rank'], 'pool_ordinal': data['pool_ordinal'],
+              'source': data['source'], 'capture_context': data.get('capture_context'), 'rank': data['rank'], 'pool_ordinal': data['pool_ordinal'],
               'extent': extent, 'planned_width': width, 'active': int(active[0]),
               'layout': {k: v for k, v in data['layout'].items() if k != 'physical_ids'},
               'address_span_bytes': address_span, 'source_interface': source,

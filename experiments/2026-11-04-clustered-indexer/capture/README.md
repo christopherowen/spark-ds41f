@@ -1,56 +1,69 @@
-# Real indexer input capture (not yet run)
+# Real indexer input capture
 
-This arm is instrumentation, not a performance candidate. It extends the exact
-candidate-36 profile the lab window originally found serving. Its patch adds an
-explicitly armed one-shot hook before the dense indexer search. It copies one
-query from each of three distinct cache pools and only written key/scale prefixes. Duplicate physical pages are
-deduplicated using their maximum readable prefix; the saved remainder is initialized
-without reading its device tail. It remaps the compact saved page table and atomically saves the tensors **outside Git**. Each rank gets
-one file per captured pool. Native planned width, active limit, source-block
-interface, physical page IDs, byte stride and alignment are retained. Replay
-reconstructs that sparse address geometry within an explicit 8 GiB span budget;
-a larger span is a reported refusal, never silently compacted. It changes no scorer arithmetic or model weights. Capturing and
-synchronizing perturb timing; no performance conclusion comes from this arm.
+Status: prepared instrumentation; no real model operands collected yet. Earlier
+synthetic capture/layout checks pass twice on both pinned sp8 images and pass
+strict initialization checking. The contextual, long-domain gate is prepared next.
+This arm retains exact C36 scoring/attention arithmetic and checkpoint weights.
+No benchmark result comes from capture: copies and synchronization perturb timing.
 
-The candidate-36 series was freshly applied: 558 patches reproduce tree
-`cc0fdf582d0bddff71c6a853e237bc9e87587832`. The ordered `series` applies after
-that tree. The executable `overlay` copies match that patch. The capture
-profile uses an isolated checkout and passes local doctor; synthetic capture/layout
-checks are prepared, while real hardware capture remains untested.
+The ordered series applies after C36 tree
+`cc0fdf582d0bddff71c6a853e237bc9e87587832`, reproduced by all 558 source patches.
+`base.json` pins both original source hashes; `check_sources.py` reverses every
+capture patch and recovers them exactly. No source-layer or caller identity is
+inferred from allocation order.
 
-Use this only in an owner-authorized window. Restore the production profile
-recorded by that window, which may have changed since this arm was prepared.
-The API is isolated on port 8001. Its startup memory guards remain unchanged.
-Do not arm the capture during startup's dummy/profile inputs.
+The hook requires an explicit `arm` file, skips graph capture/startup, and defaults
+to at least 32,769 visible keys. It reserves independent budgets for three dense
+pools and two source pools per rank, so early dense layers cannot exhaust source
+coverage. Each sample retains caller prefix/layer identity, source interface,
+native planned width and active limit. It copies only written key/scale byte
+prefixes, deduplicates physical IDs by maximum written prefix, and initializes
+saved tails without reading device tails. Raw activations stay outside Git.
 
-1. Publish the complete commit. Inspect the capture profile's coordinated
-   `cluster sync` and `cluster start --replace` plans and their `live:` and
-   `shape:` lines. Use only the explicit profile with `--apply`, covering all
-   configured ranks at the same clean detached commit. Do not change shape.
-2. Wait for API readiness and all startup guards. Then create the empty `arm`
-   file on each node in its ignored `cache/clustered-indexer-capture-20261104/`
-   directory. Before arming, ensure the directory contains no prior capture;
-   use a new directory/arm for a later run rather than overwriting evidence.
-3. Send one public-source prompt long enough to produce at least 8,192
-   compressed index keys (for example a 64K-token source-text prompt). Keep
-   the prompt identity and hash. This request collects operands, not timings.
-4. Collect each `rank-*-pool-*.pt` into the idle replay node's
-   `~/spark-lab/inputs/clustered-indexer/`. Record SHA-256 values; retain the
-   raw tensors node-locally. Do not put activations or prompts in this repo.
-5. Close the window through the lab, verifying the prior serving profile and
-   clearing the hold. In a subsequent authorized idle-node job, run the
-   `replay` bundle twice in fresh containers. It compares all selected keys,
-   checks each cluster bound and evaluated BF16 score bit, verifies source blocks
-when published, and tests graph visibility rollback/empty/restore. It times only the
-   candidate, including envelope rebuilding, selection and compaction.
+Replay reconstructs original physical page IDs, byte stride and alignment with
+unwritten unreferenced pages. It refuses an address span above 8 GiB rather than
+silently switching to compact timing geometry. Every selected key, evaluated BF16
+score bit, full bound, source handoff/count and following reindex output is gated.
+Graph rollback, empty domain and restoration are checked. Only the candidate is
+timed; native fallback is correctness-only.
 
-A positive result justifies designing persistent metadata and CSA state ownership.
-If real keys do not prune, retain that unfavorable result and revise the search
-before any serving integration. A changed selected key fails the experiment.
+Use only the already owner-authorized, coordinated window after the current
+holder releases it. This profile uses an isolated published checkout on every
+rank, the same topology, an isolated API on port8001, and existing node-local
+compile caches. Startup memory guards remain unchanged. Native serving checkouts
+remain at their current published commit for restoration.
 
-The diagnostic now captures up to three distinct eligible owned pools per rank,
-identified only by stable device allocation identity within that process. This
-samples multiple source caches, rather than treating three replicated ranks as
-three independent layers. Filenames and `pool_ordinal` retain that distinction;
-no layer identity or decode coverage is inferred. CUDA graph capture is skipped,
-so the long eager prefill is the intended source. No graph mode is changed.
+1. Read the native hold/request and verify the actual serving profile. Open the
+   window from the clean production checkout through `scripts/lab.py window open`
+   with note `owner-authorized clustered-indexer-input-capture` and that exact
+   `--production-config`. Never treat another `spark-lab` holder as this window.
+   Keep its heartbeat current throughout startup, capture and restoration.
+2. Publish this whole commit. Read the explicit capture profile's coordinated
+   `cluster sync` plan, then apply the exact published revision on all three
+   isolated checkouts. Read the `cluster start --replace` plan's `live:` and
+   `shape:` lines before applying; topology must remain unchanged. Use explicit
+   `--cluster-config` on every apply, and never use a one-rank serving launch.
+3. Wait for API readiness and startup guards. Refuse existing snapshots/partial
+   files, then create `arm` in each node's ignored
+   `~/projects/spark-ds41f/cache/clustered-indexer-capture-20261104/` directory.
+4. On dgx1, run the pinned `capture/request.py` with the exact window ID and a new
+   node-local `--out` directory. It generates a seeded public Python source prompt,
+   retains source/prompt hashes, checks the actual served token count, and sends
+   one greedy completion request. The native checkpoint's compression ratios1/2
+   make the default approximately131K-token prompt cover long dense/source keys.
+   Prompt contents and response remain node-local; this is not a timed baseline.
+5. Collect all `rank-*.pt` into sp8's
+   `~/spark-lab/inputs/clustered-indexer/`, retaining original files and SHA-256
+   values. Source/dense filenames and saved caller metadata distinguish samples.
+   Disarm every node. Stop the capture profile coherently and restore the window's
+   recorded profile with named-profile commands. Check `doctor --live`, then close
+   the lab window and verify the hold is removed.
+6. In the next isolated sp8 reservation, run `sp8-replay` twice in fresh pinned
+   C36 containers. Preserve every refusal/error and every unfavorable pruning/cost
+   result. A positive kernel result still requires full serving qualification.
+
+This initial sample is long eager prefill, one query per distinct pool/interface.
+It establishes neither decode coverage nor model quality across a prompt corpus.
+If real bounds do not prune enough to cover cost, reject this grouping and revise
+before serving integration. Changed keys fail unless independent evidence proves
+superior model quality.
