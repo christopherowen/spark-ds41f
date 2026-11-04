@@ -55,3 +55,12 @@ keeps that existing contract, trimming unused stride parameters. This narrows
 the candidate; it does not change the native token-id support or score arithmetic.
 The final variant requires its own repeated qualification. Initial receipts are
 not relabelled as evidence for the new tree.
+
+The second variant (candidate-v2.json, published source 4cddbfc4) also passed its
+625 tests, 120 timing cases and IKET captures on both boots. Its FP32 one-row,
+masked, already-compact int64 cases still measured slower (up to 10.05% on boot
+means; results-v2.json). Patch 0003 therefore preserves the original compact
+addressing as a specialization and uses dynamic id strides only when needed.
+Both are prepared at startup and read the original input buffer: the layout
+selection never materializes, converts or repacks ids. The second variant's
+source identities and measurements remain separate from the final variant.

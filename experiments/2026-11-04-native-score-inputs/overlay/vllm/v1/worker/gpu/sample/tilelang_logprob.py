@@ -192,7 +192,11 @@ def _row_reduce(value, partial, tx, combine):
 
 @tilelang.jit(pass_configs=tilelang_sampling._PASS)
 def topk_log_softmax_kernel(
-    logits_dtype: str, run: int, masked: bool = False, id_dtype: str = "int64"
+    logits_dtype: str,
+    run: int,
+    masked: bool = False,
+    id_dtype: str = "int64",
+    compact_ids: bool = True,
 ):
     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
@@ -205,6 +209,7 @@ def topk_log_softmax_kernel(
     rows, vocab, topk = T.dynamic("rows, vocab, topk")
     logits_stride = T.dynamic("logits_stride", "int64")
     id_row, id_col = T.dynamic("id_row, id_col", "int64")
+    id_strides = (topk, 1) if compact_ids else (id_row, id_col)
     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
     threads = _SOFTMAX_THREADS
     loads = _SOFTMAX_LOADS
@@ -274,7 +279,7 @@ def topk_log_softmax_kernel(
     def topk_log_softmax(
         output: T.Tensor((rows, topk), T.float32),
         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
-        token_ids: T.StridedTensor((rows, topk), (id_row, id_col), id_dtype),
+        token_ids: T.StridedTensor((rows, topk), id_strides, id_dtype),
         valid: T.Tensor((valid_rows, valid_cols), T.bool),
     ):
         with T.Kernel(rows, threads=threads) as row:
@@ -369,8 +374,9 @@ def topk_log_softmax_key(
     run: int = 1,
     masked: bool = False,
     id_dtype: torch.dtype = torch.int64,
+    compact_ids: bool = True,
 ) -> tuple:
-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype])
+    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], compact_ids)
 
 
 def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
@@ -379,12 +385,13 @@ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
     return [
         _call(
             topk_log_softmax_kernel,
-            *topk_log_softmax_key(dtype, run, masked, id_dtype),
+            *topk_log_softmax_key(dtype, run, masked, id_dtype, compact_ids),
         )
         for dtype in dict.fromkeys(logits_dtypes)
         for run in _runs(dtype)
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
+        for compact_ids in (True, False)
     ]
 
 
@@ -411,7 +418,11 @@ def topk_log_softmax(
     kernel = _kernel(
         topk_log_softmax_kernel,
         *topk_log_softmax_key(
-            logits.dtype, _triton_run(logits), valid is not None, token_ids.dtype
+            logits.dtype,
+            _triton_run(logits),
+            valid is not None,
+            token_ids.dtype,
+            token_ids.is_contiguous(),
         ),
     )
     # The unmasked specialization never reads the dummy validity tensor.

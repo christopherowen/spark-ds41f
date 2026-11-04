@@ -530,12 +530,15 @@ def test_runner_declares_the_launched_calls(logits_mode):
     expected = {
         (
             id(tilelang_logprob.topk_log_softmax_kernel),
-            tilelang_logprob.topk_log_softmax_key(dtype, run, masked, id_dtype),
+            tilelang_logprob.topk_log_softmax_key(
+                dtype, run, masked, id_dtype, compact_ids
+            ),
         )
         for dtype in (torch.bfloat16, torch.float32)
         for run in tls._runs(dtype)
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
+        for compact_ids in (True, False)
     }
     declared = _declared(registry)
     softmax = {

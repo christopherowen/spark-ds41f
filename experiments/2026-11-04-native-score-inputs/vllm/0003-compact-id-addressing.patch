@@ -1,0 +1,117 @@
+From da925efbc83245de4cbd6824fda9a877b7968fd2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 18:10:40 +0100
+Subject: [PATCH] Specialize score addressing for the existing compact id
+ layout
+
+Upstream-base: native token-id candidate cde7c981cc, after candidate-38 and selected-logit source c88a692e98.
+
+Rationale: native-id measurements exposed a regression on already-compact int64 ids. Compile compact addressing as the original kernel did; use dynamic id strides only for noncompact input. Dispatch examines metadata and never converts or copies ids.
+
+Quality: identical score arithmetic, output values and native-id support. Both input layouts compile during startup, before the cache freezes.
+
+Tests: extend warmup declarations to both layouts; repeat native input, numerical, graph, prompt, speculative and paired performance qualification on the new source tree.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      |  5 ++++-
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 21 ++++++++++++++-----
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 19b4bbcd47..7922573712 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -530,12 +530,15 @@ def test_runner_declares_the_launched_calls(logits_mode):
+     expected = {
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+-            tilelang_logprob.topk_log_softmax_key(dtype, run, masked, id_dtype),
++            tilelang_logprob.topk_log_softmax_key(
++                dtype, run, masked, id_dtype, compact_ids
++            ),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for run in tls._runs(dtype)
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
++        for compact_ids in (True, False)
+     }
+     declared = _declared(registry)
+     softmax = {
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 0d1771bc5e..875e6ba746 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -192,7 +192,11 @@ def _row_reduce(value, partial, tx, combine):
+ 
+ @tilelang.jit(pass_configs=tilelang_sampling._PASS)
+ def topk_log_softmax_kernel(
+-    logits_dtype: str, run: int, masked: bool = False, id_dtype: str = "int64"
++    logits_dtype: str,
++    run: int,
++    masked: bool = False,
++    id_dtype: str = "int64",
++    compact_ids: bool = True,
+ ):
+     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
+     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
+@@ -205,6 +209,7 @@ def topk_log_softmax_kernel(
+     rows, vocab, topk = T.dynamic("rows, vocab, topk")
+     logits_stride = T.dynamic("logits_stride", "int64")
+     id_row, id_col = T.dynamic("id_row, id_col", "int64")
++    id_strides = (topk, 1) if compact_ids else (id_row, id_col)
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+     threads = _SOFTMAX_THREADS
+     loads = _SOFTMAX_LOADS
+@@ -274,7 +279,7 @@ def topk_log_softmax_kernel(
+     def topk_log_softmax(
+         output: T.Tensor((rows, topk), T.float32),
+         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+-        token_ids: T.StridedTensor((rows, topk), (id_row, id_col), id_dtype),
++        token_ids: T.StridedTensor((rows, topk), id_strides, id_dtype),
+         valid: T.Tensor((valid_rows, valid_cols), T.bool),
+     ):
+         with T.Kernel(rows, threads=threads) as row:
+@@ -369,8 +374,9 @@ def topk_log_softmax_key(
+     run: int = 1,
+     masked: bool = False,
+     id_dtype: torch.dtype = torch.int64,
++    compact_ids: bool = True,
+ ) -> tuple:
+-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype])
++    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], compact_ids)
+ 
+ 
+ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+@@ -379,12 +385,13 @@ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     return [
+         _call(
+             topk_log_softmax_kernel,
+-            *topk_log_softmax_key(dtype, run, masked, id_dtype),
++            *topk_log_softmax_key(dtype, run, masked, id_dtype, compact_ids),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype)
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
++        for compact_ids in (True, False)
+     ]
+ 
+ 
+@@ -411,7 +418,11 @@ def topk_log_softmax(
+     kernel = _kernel(
+         topk_log_softmax_kernel,
+         *topk_log_softmax_key(
+-            logits.dtype, _triton_run(logits), valid is not None, token_ids.dtype
++            logits.dtype,
++            _triton_run(logits),
++            valid is not None,
++            token_ids.dtype,
++            token_ids.is_contiguous(),
+         ),
+     )
+     # The unmasked specialization never reads the dummy validity tensor.
+-- 
+2.54.0 (Apple Git-157)
+
