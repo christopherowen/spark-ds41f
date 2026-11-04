@@ -564,7 +564,7 @@ if args.operation == "pair":
         not_proved=failed,
         gate_passed=not failed,
         rounds=args.rounds,
-        protocol=f"{args.rounds} balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        protocol=f"{args.rounds} balanced randomized mirrored rounds per changed case; exact qualified-code transfer for unchanged cases; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")

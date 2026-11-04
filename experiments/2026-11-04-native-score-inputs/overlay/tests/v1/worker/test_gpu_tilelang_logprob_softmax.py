@@ -717,8 +717,8 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
         ("padded", 33),
         ("sliced", 33),
         ("transposed", 33),
-        ("transposed", 1024),
-        ("transposed", 1025),
+        ("transposed", 31),
+        ("transposed", 32),
         ("general", 33),
     ],
 )

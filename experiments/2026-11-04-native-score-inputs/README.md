@@ -242,3 +242,18 @@ The 16 changed transposed programs each receive 480 mirrored timing rounds on
 both boots, with the same zero-margin five-SE gate. The frozen v6 source is
 retained under `control/v6/` and runs beside the new kernels as the causal
 control. This avoids remeasuring programs that are provably unchanged.
+
+### v8 one-warp staging
+
+V7 fixes the small transposed selection, but its first complete timing boot
+establishes a regression in the larger BF16/int64 masked selection. It is
+rejected, and its repeated timing boot is retained. Further correctness and
+IKET work on that rejected source is unnecessary.
+
+Patch 0008 bounds staging to one warp (32 selections, 128 bytes), a hardware
+granularity rather than a dtype/request-shape exception. Larger selections
+retain the v6 native-stride GPU program and its qualification. Boundary checks
+cover 31, 32 and 33 columns. There are eight changed cases to time for 480 rounds
+on each boot; every other case must prove exact code and input identity with
+a qualified v6 case. The rejected source's single unqualified v6 case is
+changed and must earn its own performance qualification.
