@@ -24,7 +24,7 @@ class Collector:
         writer_delay_us=0,
         fail_after_records=0,
         uniform_registers=False,
-        managed=False,
+        managed=True,
     ):
         import torch
 
@@ -161,7 +161,7 @@ class Collector:
                 "pid": os.getpid(),
                 "uniform_registers": uniform_registers,
                 "allocation": "managed" if managed else "mapped-host",
-                "scope": "TileLang phase events; not arbitrary SASS tracing",
+                "scope": "TileLang lane-zero events; not arbitrary SASS tracing",
             },
         )
         atexit.register(self._at_exit)
@@ -213,8 +213,8 @@ class Collector:
                 and written.value == self.header[1],
             },
         )
-        if not sync_error:
-            self.check(self.free_memory(self.host))
+        # Compiled kernels embed this pointer. Keep the bounded allocation alive
+        # until process exit; stop=1 makes subsequent calls skip recording.
         if status or sync_error:
             raise RuntimeError(
                 f"incomplete streaming capture: {os.strerror(status) if status else sync_error}; writer status {status}; receipts: {self.out}"
@@ -328,7 +328,7 @@ def enable(
     payloads=True,
     patched=False,
     uniform_registers=False,
-    managed=False,
+    managed=True,
 ):
     global _ACTIVE
     if _ACTIVE is not None:

@@ -11,6 +11,7 @@ parser.add_argument("operation", choices=["bounds"])
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--stream", action="store_true")
 parser.add_argument("--native", action="store_true")
+parser.add_argument("--all-events", action="store_true")
 args = parser.parse_args()
 import torch
 
@@ -19,7 +20,13 @@ if args.stream:
     from stream.collector import enable
 
     collector = enable(
-        args.out / "stream", ring_bytes=4096, chunk_bytes=16384, patched=True
+        args.out / "stream",
+        ring_bytes=4096,
+        chunk_bytes=16384,
+        patched=True,
+        iters=0 if args.all_events else 1,
+        ctas=0 if args.all_events else 1,
+        warps=0 if args.all_events else 1,
     )
 elif args.native:
     from stream.phase import load
@@ -123,8 +130,10 @@ if source.exists():
     for file in source.glob("*.json"):
         manifest = json.loads(file.read_text())
         values = [s["events_per_warp_bound"] for s in manifest["sites"] if "range" in s]
-        assert values and all(isinstance(value, int) for value in values)
-        bounds[manifest["kernel"]] = max(values)
+        assert values and (
+            args.all_events or all(isinstance(value, int) for value in values)
+        )
+        bounds[manifest["kernel"]] = None if None in values else max(values)
     result["bounds"] = bounds
 (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result), flush=True)

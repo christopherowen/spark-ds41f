@@ -59,6 +59,10 @@ torch.cuda.synchronize()
 for output in outputs:
     assert bool((output == 256).all())
 collector.close()
+# Retiring the writer must leave compiled kernels safe to call.
+gemm(x, w, outputs[0])
+torch.cuda.synchronize()
+assert bool((outputs[0] == 256).all())
 counts = export(args.out / "stream", args.out / "trace.json")
 launches = args.repeats * (1 if args.graph else args.streams) + int(args.graph)
 assert counts["kind_0"] == counts["kind_3"] == 16 * launches

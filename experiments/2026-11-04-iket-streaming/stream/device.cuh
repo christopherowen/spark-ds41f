@@ -29,41 +29,44 @@ __device__ __forceinline__ void spark_trace_emit(unsigned long long kernel,
     auto h = reinterpret_cast<SparkTraceHeader *>(SPARK_TRACE_ADDRESS);
     if (SparkSysAtomic(h->status).load(cuda::memory_order_acquire))
       asm volatile("trap;");
-    unsigned long long ts, grid;
-    unsigned sm;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
-    asm volatile("mov.u64 %0, %%gridid;" : "=l"(grid));
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
-    unsigned long long ticket =
-        SparkSysAtomic(h->tail).fetch_add(1, cuda::memory_order_relaxed);
-    auto slot =
-        reinterpret_cast<SparkTraceSlot *>(h + 1) + ticket % h->capacity;
-    bool waited = false;
-    while (SparkSysAtomic(slot->sequence).load(cuda::memory_order_acquire) !=
-           ticket) {
-      if (!waited) {
-        SparkSysAtomic(h->waits).fetch_add(1, cuda::memory_order_relaxed);
-        waited = true;
+    if (!SparkSysAtomic(h->stop).load(cuda::memory_order_acquire)) {
+      unsigned long long ts, grid;
+      unsigned sm;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+      asm volatile("mov.u64 %0, %%gridid;" : "=l"(grid));
+      asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+      unsigned long long ticket =
+          SparkSysAtomic(h->tail).fetch_add(1, cuda::memory_order_relaxed);
+      auto slot =
+          reinterpret_cast<SparkTraceSlot *>(h + 1) + ticket % h->capacity;
+      bool waited = false;
+      while (SparkSysAtomic(slot->sequence).load(cuda::memory_order_acquire) !=
+             ticket) {
+        if (!waited) {
+          SparkSysAtomic(h->waits).fetch_add(1, cuda::memory_order_relaxed);
+          waited = true;
+        }
+        if (SparkSysAtomic(h->status).load(cuda::memory_order_acquire))
+          asm volatile("trap;");
+        __nanosleep(256);
       }
-      if (SparkSysAtomic(h->status).load(cuda::memory_order_acquire))
-        asm volatile("trap;");
-      __nanosleep(256);
+      slot->record = SparkTraceRecord{
+          ts,
+          grid,
+          kernel,
+          (static_cast<unsigned long long>(blockIdx.z) * gridDim.y +
+           blockIdx.y) *
+                  gridDim.x +
+              blockIdx.x,
+          linear >> 5,
+          sm,
+          event,
+          payload,
+          kind,
+          0};
+      SparkSysAtomic(slot->sequence)
+          .store(ticket + 1, cuda::memory_order_release);
     }
-    slot->record = SparkTraceRecord{
-        ts,
-        grid,
-        kernel,
-        (static_cast<unsigned long long>(blockIdx.z) * gridDim.y + blockIdx.y) *
-                gridDim.x +
-            blockIdx.x,
-        linear >> 5,
-        sm,
-        event,
-        payload,
-        kind,
-        0};
-    SparkSysAtomic(slot->sequence)
-        .store(ticket + 1, cuda::memory_order_release);
   }
   __syncwarp(active);
 }
