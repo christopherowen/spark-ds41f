@@ -1,6 +1,6 @@
 """Degenerate/signed normal-range CPU checks; hardware gates remain separate."""
 import torch
-from screen import bound
+from bounds import bound
 from witness import witnessed_keep
 
 

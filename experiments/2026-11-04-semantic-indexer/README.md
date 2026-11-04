@@ -46,6 +46,18 @@ passed to the native selector includes those seeds. This accounting excludes
 duplicate scoring but is still an untimed diagnostic, with neither metadata
 cost nor a production kernel implementation hidden in its claimed results.
 
+sp8 yielded before the follow-up batch to a pending native-input qualification.
+`runs/sp8-deferred-01` retains that refusal. DGX4 overlap was also unavailable
+under the other window's frozen measurement protocol. The owner-authorized idle
+sp5–sp7 group can run these same pinned bundles through `run_window.py`: clean
+published sources, thirty-second idle gate, leases on all three nodes, reviewed
+named-profile synchronization/stop, bounded16GiB kernels on sp5, and one C37
+restoration with independent watchdog/live verification. No candidate serving
+engine starts. Raw snapshot transfer must be hash-verified and remains node-local.
+The deployed experiment checkout advances coherently; original project checkouts
+stay untouched. This changes deployment metadata when C37 is restored, so report
+the final checkout commit explicitly.
+
 The first two fresh containers (`semantic-screen-01/02`, commit663f5e7f) agree
 exactly. Shape bounds with semantic groups8 retain15402/11385/8836 of33656 keys
 on the three dense samples and33571 of36576 on the source sample. Expanding to
