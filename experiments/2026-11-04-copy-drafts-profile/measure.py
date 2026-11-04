@@ -4,6 +4,7 @@
 import argparse
 from collections import Counter
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import statistics
@@ -14,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 STREAM = HERE.parent / "2026-11-04-iket-streaming"
 sys.path.insert(0, str(STREAM))
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=["tests", "bench", "profile"])
+parser.add_argument("operation", choices=["tests", "bench", "profile", "verify"])
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--native", action="store_true")
 parser.add_argument("--samples", type=int, default=21)
@@ -90,6 +91,24 @@ if args.operation == "tests":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
     raise SystemExit(status)
+
+if args.operation == "verify":
+    spec = importlib.util.spec_from_file_location(
+        "copy_verification_benchmark",
+        source / "benchmarks/kernels/benchmark_copy_drafts.py",
+    )
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    cases = [
+        benchmark.verify_case(method, requests, wide, 7123)
+        for method in ("greedy", "block")
+        for requests in (1, 8, 16)
+        for wide in (False, True)
+    ]
+    result = dict(identity, cases=cases, seconds=time.monotonic() - started)
+    (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result), flush=True)
+    raise SystemExit(0)
 
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.spec_decode import tilelang_copy as copy
