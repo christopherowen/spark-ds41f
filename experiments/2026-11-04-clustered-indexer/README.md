@@ -140,3 +140,22 @@ performed, and foreign requests were preserved. Initcheck and real-input
 capture/replay remain pending. The capture hook is prepared and locally checked,
 but has not run. Full image build inputs are absent locally; `build check`
 reports that the build tree is not prepared. No image was rebuilt or modified.
+
+## Prepared shared-dgx4 batch (not yet executed)
+
+The next serialized slot after the current release gate runs:
+
+1. `sanitizer-initcheck`: fresh CUDA allocations with cache slots past visibility
+   left unwritten. The audit copies only each row's written score slice.
+2. `graph`, twice in fresh containers: the complete candidate captured once,
+   then replayed after reducing visible lengths, emptying the active domain,
+   and restoring the original counts. Each replay must preserve exact selection.
+3. `graph-profile`: the same captured candidate, with a candidate-only profiler
+   interval after the correctness audit and ordinary timing samples. Reference
+   calls are outside the interval. Raw traces stay in the node-local compile
+   mount until collected; trace names refuse overwrites.
+
+These modes are prepared in published source but have no passing hardware
+receipt yet. Earlier results retain their original harness commits and do not
+qualify these new modes. All work remains on dgx4; no serving change is needed
+for this batch. Return the shared GPU slot before analyzing traces locally.
