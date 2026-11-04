@@ -36,7 +36,10 @@ def compare(reference,candidate):
         raise ValueError('workload identities/order differ')
     differences,matched = [],0
     for expected,observed in zip(base,actual):
-        if expected['choices'] != observed['choices'] or expected['completion_tokens'] != observed['completion_tokens']:
+        if expected.get('prompt_token_ids') != observed.get('prompt_token_ids'):
+            raise ValueError('tokenized prompt differs for '+expected['id'])
+        expected_choices,observed_choices = choices({'choices':expected['choices']}),choices({'choices':observed['choices']})
+        if expected_choices != observed_choices or expected['completion_tokens'] != observed['completion_tokens']:
             differences.append({'id':expected['id'],
                 'reference_tokens_sha256':digest(expected['choices']),
                 'candidate_tokens_sha256':digest(observed['choices'])})
@@ -61,9 +64,14 @@ def capture(options):
         request = urllib.request.Request(options.url.rstrip('/')+endpoint,
             data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
         response = json.load(urllib.request.urlopen(request,timeout=options.timeout))
+        prompt_ids = response.get('prompt_token_ids')
+        if prompt_ids is None:
+            prompt_ids = [x.get('prompt_token_ids') for x in response['choices']]
+        if not isinstance(prompt_ids,list) or not prompt_ids or any(x is None for x in prompt_ids):
+            raise ValueError('tokenized prompt IDs missing')
         records.append({'id':case['id'],'input_sha256':digest({'endpoint':endpoint,'payload':
             {k:v for k,v in payload.items() if k != 'cache_salt'}}),
-            'prompt_token_ids':response.get('prompt_token_ids') or [x.get('prompt_token_ids') for x in response['choices']],
+            'prompt_token_ids':prompt_ids,
             'choices':choices(response),'completion_tokens':response['usage']['completion_tokens']})
     assert records and len({x['id'] for x in records}) == len(records)
     result = {'schema_version':1,'identity':identity,'records':records,

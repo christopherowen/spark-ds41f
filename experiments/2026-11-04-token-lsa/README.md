@@ -1,4 +1,4 @@
-# Token-equivalent shortlist performance experiment
+# Token-gated shortlist performance experiment
 
 Base: `0d389a0552db4cfab4d833af6ea6290488c7c1ab`. The owner revised fidelity to
 generated token IDs and required correctness/proof work outside the timed path;
@@ -28,3 +28,10 @@ Do not promote a shortlist based on kernel speed or key recall. It must also pas
 the generated-token gate on predeclared full-model workloads, plus complete
 request performance and memory/admission checks. Historical response-digest
 receipts do not satisfy raw token-ID equivalence for this changed-selector path.
+
+`token_gate.py capture` uses the pinned server's `return_token_ids` response
+metadata in a separate, untimed request run. `compare` requires identical raw
+IDs and termination under the same checkpoint/tokenizer/workload. Keep captures
+node-local. It never retokenizes decoded text. Six gate regression cases cover
+changed IDs with identical text/count, missing IDs and mismatched termination or
+workload. This client is never imported by the query module or benchmark.

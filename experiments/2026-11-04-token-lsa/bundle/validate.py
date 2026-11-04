@@ -3,6 +3,7 @@ import json
 import traceback
 import torch
 from fixture import files,setup
+from metadata import decode
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan,CANDIDATE_BLOCKS
 
 
@@ -51,6 +52,17 @@ def main():
             reference = IndexerV41Plan(data['width'],data['page_size'])
             expected,scores = reference.run(*args)
             actual = check(data,args,plan,scores,expected)
+            complete = int(data['lengths'][0])//512*8
+            query = decode(args[0].view(torch.uint8),args[1].view(torch.uint8).reshape(1,32,4))[0].double()
+            dots = (plan.centers[:complete].double() @ query.T).to(torch.bfloat16).float().clamp(min=0)
+            terms = (dots*args[2][0].float()[None]).to(torch.bfloat16).float()
+            total = torch.zeros(complete,dtype=torch.float32,device='cuda')
+            for h in range(32):
+                total += terms[:,h]
+            reference_centroids = total.to(torch.bfloat16).float()
+            actual_centroids = plan.scores[0,:complete].float()
+            torch.testing.assert_close(actual_centroids,reference_centroids,rtol=.02,atol=.02)
+            maximum_centroid_error = float((actual_centroids-reference_centroids).abs().max())
             count = int(plan.candidate_lengths[0])
             overlap = len(set(actual[0].cpu().tolist()) & set(expected[0].cpu().tolist()))
             graph = torch.cuda.CUDAGraph()
@@ -74,6 +86,7 @@ def main():
                 assert bool(((next_out < args[5][:,None]) | (next_out == -1)).all())
             case = {'snapshot':path.name,'keys_scored':count,'native_top512_overlap':overlap,
                     'overlap_is_diagnostic_not_acceptance':True,'native_evaluated_score_bits_match':True,
+                    'centroid_reference_max_abs_error':maximum_centroid_error,
                     'source_handoff_legal':bool(plan.source),'graph_visibility_passed':True,
                     'token_id_gate':'not run; snapshot operands cannot establish generated token equivalence',
                     'construction':construction}

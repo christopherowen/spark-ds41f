@@ -13,6 +13,18 @@ class TokenGateTests(unittest.TestCase):
     def test_identical_tokens(self):
         self.assertTrue(compare(self.record,copy.deepcopy(self.record))['passed'])
 
+    def test_only_tokens_and_termination_define_generated_equivalence(self):
+        candidate = copy.deepcopy(self.record)
+        candidate['records'][0]['choices'][0]['text'] = 'extra decoded metadata'
+        self.assertTrue(compare(self.record,candidate)['passed'])
+
+    def test_tokenized_prompt_must_match(self):
+        self.record['records'][0]['prompt_token_ids'] = [1,2]
+        candidate = copy.deepcopy(self.record)
+        candidate['records'][0]['prompt_token_ids'] = [1,3]
+        with self.assertRaises(ValueError):
+            compare(self.record,candidate)
+
     def test_same_text_and_count_do_not_hide_changed_ids(self):
         candidate = copy.deepcopy(self.record)
         candidate['records'][0]['choices'][0].update(token_ids=[101,200],text='same')
