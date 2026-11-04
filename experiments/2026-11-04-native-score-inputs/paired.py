@@ -28,16 +28,29 @@ def classify(samples, identical_program=False):
     return dict(summary, status=status)
 
 
-def measure(launches, flush, seed, expected, rounds=40):
+def measure(launches, flush, seed, expected, rounds=40, samples_per_replay=8):
     import torch
 
-    graphs, outputs = {}, {}
+    graphs, outputs, events = {}, {}, {}
     for name, launch in launches.items():
         launch()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        # Explicit event nodes remove Python submission gaps from the interval.
+        # Each sample starts cold, including samples within the same replay.
+        events[name] = [
+            (
+                torch.cuda.Event(enable_timing=True, external=True),
+                torch.cuda.Event(enable_timing=True, external=True),
+            )
+            for _ in range(samples_per_replay)
+        ]
         with torch.cuda.graph(graph):
-            outputs[name] = launch()
+            for start, end in events[name]:
+                flush.zero_()
+                start.record()
+                outputs[name] = launch()
+                end.record()
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(
@@ -47,13 +60,8 @@ def measure(launches, flush, seed, expected, rounds=40):
     # Equal warmup for every role, before collecting any sample.
     for _ in range(8):
         for graph in graphs.values():
-            flush.zero_()
             graph.replay()
     torch.cuda.synchronize()
-    start, end = (
-        torch.cuda.Event(enable_timing=True),
-        torch.cuda.Event(enable_timing=True),
-    )
     rng = random.Random(seed)
     pairs = []
     for _ in range(rounds):
@@ -63,22 +71,28 @@ def measure(launches, flush, seed, expected, rounds=40):
         order += order[::-1]
         row = {name: [] for name in graphs}
         for name in order:
-            flush.zero_()
-            start.record()
             graphs[name].replay()
-            end.record()
-            end.synchronize()
-            row[name].append(start.elapsed_time(end) * 1000)
+            events[name][-1][1].synchronize()
+            row[name].append(
+                [start.elapsed_time(end) * 1000 for start, end in events[name]]
+            )
         pairs.append(dict(order=order, times_us=row))
     logs = {
         name: [
             math.log(
-                statistics.fmean(row["times_us"][name])
-                / statistics.fmean(row["times_us"]["reference"])
+                statistics.fmean(t for batch in row["times_us"][name] for t in batch)
+                / statistics.fmean(
+                    t for batch in row["times_us"]["reference"] for t in batch
+                )
             )
             for row in pairs
         ]
         for name in graphs
         if name != "reference"
     }
-    return dict(pairs=pairs, log_ratios=logs), outputs
+    return dict(
+        pairs=pairs,
+        log_ratios=logs,
+        timer="external event nodes inside the graph; no host submission gap",
+        samples_per_replay=samples_per_replay,
+    ), outputs

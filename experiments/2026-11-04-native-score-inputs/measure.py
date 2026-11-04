@@ -506,7 +506,7 @@ if args.operation == "pair":
         cases=rows,
         not_proved=failed,
         gate_passed=not failed,
-        protocol="40 balanced randomized mirrored rounds per case; two samples per role/round; shared output address; cold L2; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        protocol="40 balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")

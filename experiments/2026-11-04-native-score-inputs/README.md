@@ -160,3 +160,20 @@ The old v3 results are retained as `results-v3.json`, `candidate-v3.json` and
 hashes for simultaneous comparisons. No old result is relabelled as evidence for
 the new source. The prototype's numerical, paired-performance and IKET checks
 are still required.
+
+### v4 timing diagnostic and correction
+
+Source `d9f9a007` passed 625 checks and 40 IKET launches on each boot. Its first
+paired timing run did not pass the gate: 62 and 67 cases were inconclusive,
+respectively. The unchanged null control itself varied from -6.1% to +8.2% in
+mean time across cases. Those samples are retained in `runs/native-v4.json` and
+`paired-results-v4.json`; they do not establish performance acceptance.
+
+The event markers had been submitted from Python around each graph replay.
+They could therefore include host submission gaps. The revised timer captures
+explicit external CUDA event nodes with the operation, with a cold-cache flush
+before each of eight samples per replay, excluded from every event interval.
+Each round still has two mirrored replays per role, and the gate is unchanged.
+Reference and candidate run the same inputs and share the output address.
+Only the measurement mechanism changes in this follow-up; the v4 source is
+unchanged.
