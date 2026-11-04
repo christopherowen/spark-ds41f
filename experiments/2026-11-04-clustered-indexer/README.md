@@ -117,7 +117,7 @@ harness commit, exact command, and the sanitizer version and binary hash.
   condition reads scratch entries from inactive lists before masking them.
   The independent `topk-original-01` reproducer reports 1,536 errors without
   invoking the clustered search. Both failures are retained.
-- `vllm/0002-topk-merge-live-reads.patch` guards the read with a lazy outer
+- The independent [top-k fix](../2026-11-04-topk-live-reads/README.md) guards the read with a lazy outer
   condition, preserving live arithmetic and ordering. The independent
   `topk-fixed-01` reproducer and complete `initcheck-02` report **0 errors**.
   Initcheck covers 10 cases through 16K with fresh allocations and cache tails
@@ -184,3 +184,11 @@ candidate. The harness now compares both interval endpoints against a frozen
 copy of that reduction before timing, then runs all existing exact-selection
 checks. `graph-profile` uses a new trace label to preserve earlier evidence.
 The first two fresh runs, graph replays and sanitizer checks remain pending.
+
+## Independent top-k fix
+
+The scratch-read fix and its reproducer are owned by
+`experiments/2026-11-04-topk-live-reads/` in [PR #878](https://github.com/christopherowen/spark-ds41f/pull/878).
+This search series references that patch and tested executable directly.
+Historical receipts retain the old paths and exact commits at which they ran.
+The attention experiment is stacked on that independent fix for review.

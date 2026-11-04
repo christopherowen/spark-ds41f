@@ -3,13 +3,15 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
-The next candidate is [candidate-38](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md).
-It carries the shared CopyDrafter budget fix, removes the unused draft-limit machinery,
-and includes the selected loop, draft-kernel and test repairs. Its final image passes
-the release-test gate. Its [TP3 triangle qualification](experiments/2026-11-03-candidate-38-tp3-qualification/README.md)
-preserves recorded greedy outputs and improves headline throughput against 1030;
-latency findings and small copy-recipe costs remain under review. The candidate
-stays unpromoted, and the promoted release remains spark-ds41f-1030.
+The next candidate is [candidate-39](experiments/2026-10-26-spark-ds41f-candidate/candidate-39/README.md).
+It makes CopyDrafter the default for greedy adaptive DSpark, fits the decode and
+capture envelopes automatically, and overlaps the copy work. Its canonical source
+is prepared; image and serving qualification are pending in the
+[measured rounds](experiments/2026-11-04-copy-default-screening/README.md).
+It builds on [candidate-38](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md),
+whose [TP3 qualification](experiments/2026-11-03-candidate-38-tp3-qualification/README.md)
+retains throughput gains, latency findings and small copy-recipe costs for review.
+The promoted release remains spark-ds41f-1030.
 Loop work follows the candidate's
 [containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
 preserve requested effort, end looping reasoning once, and stop continued

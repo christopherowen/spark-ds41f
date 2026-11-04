@@ -1,0 +1,45 @@
+# Unit tests on #860, dgx4, 2026-11-03, image spark-ds41f:candidate-37 (c4c59de1)
+# run.sh = run_image.sh; files: tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_copy_drafts.py
+#   tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py
+
+## 1. 6bfbd7927 (first resolution), summary as printed (its file was overwritten by run 2)
+FAILED tests/v1/spec_decode/test_copy_drafts.py::test_copy_alloc_and_apply_follow_the_reference_over_a_copy
+FAILED tests/v1/spec_decode/test_copy_drafts.py::test_copy_alloc_judges_only_its_pending_copy
+FAILED tests/v1/spec_decode/test_copy_drafts.py::test_kernels_replay_in_a_cuda_graph
+E       TypeError: copy_alloc() takes 15 positional arguments but 16 were given
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+3 failed, 81 passed, 1 skipped, 14 warnings in 46.89s
+
+## 2. 9b8f05a35 (tree 949f829d), this patch: TREE=/tmp/842-final/vllm
+..............................................................s......... [ 84%]
+.............                                                            [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+84 passed, 1 skipped, 14 warnings in 38.57s
+
+## 3. #860 alone (88982f34e, tree f473423c): TREE=/tmp/842-final/only860
+.........................................................s.............. [ 90%]
+........                                                                 [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+79 passed, 1 skipped, 14 warnings in 35.08s
+
+## 4. Mutation: 9b8f05a35 without propose's self._join(), test_copy_drafts.py only: TREE=/tmp/842-final/mut860
+E               AssertionError: assert False
+E                +  where False = <built-in method equal of type object at 0xe50345d9d638>(tensor([[ 47544,  24109,  11198, 108840,  99032,  54459,  63541,   3672,     -1,\n             -1,     -1,     -1,     ... -1,     -1,     -1,     -1,\n             -1,     -1,     -1,     -1,     -1,     -1,     -1]],\n       device='cuda:0'), tensor([[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],\n        [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]],\n       device='cuda:0'))
+E                +    where <built-in method equal of type object at 0xe50345d9d638> = torch.equal
+tests/v1/spec_decode/test_copy_drafts.py:994: AssertionError
+FAILED tests/v1/spec_decode/test_copy_drafts.py::test_side_stream_prepare_alloc_matches_the_drafters_stream
+1 failed, 24 passed, 14 warnings in 12.44s

@@ -39,15 +39,6 @@ with tempfile.TemporaryDirectory() as directory:
     assert not (target / 'clustered_capture.py').exists()
 print('capture patch recovers the exact candidate-36 indexer; syntax OK')
 
-with tempfile.TemporaryDirectory() as directory:
-    root = Path(directory)
-    target = root / RELATIVE.parent
-    target.mkdir(parents=True)
-    source = HERE / 'bundle/overlay' / RELATIVE.parent / 'indexer.py'
-    ast.parse(source.read_text())
-    shutil.copy2(source, target / 'indexer.py')
-    subprocess.run(['git', 'apply', '--reverse',
-                    str(HERE / 'vllm/0002-topk-merge-live-reads.patch')], cwd=root, check=True)
-    expected_hash = json.loads((HERE / 'base.json').read_text())['indexer_sha256']
-    assert hashlib.sha256((target / 'indexer.py').read_bytes()).hexdigest() == expected_hash
-print('top-k read patch recovers the exact promoted indexer; syntax OK')
+# The independent top-k dependency owns its patch, executable copy and regression.
+import sys
+subprocess.run([sys.executable, str(HERE.parent / '2026-11-04-topk-live-reads/check_sources.py')], check=True)

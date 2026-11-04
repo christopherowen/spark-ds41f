@@ -4,8 +4,8 @@ Date: Wed, 4 Nov 2026 11:08:51 +0100
 Subject: [PATCH] Guard top-k merge reads by input-list liveness
 
 Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the promoted
-series, tree ea1281f880e7535e3d87725be0156a8e38fc2fb2, and the preceding
-experimental cluster-search patch.
+series, tree ea1281f880e7535e3d87725be0156a8e38fc2fb2. This patch has no
+clustered-search dependency.
 
 Rationale: a bitwise conjunction reads WorkEntries from lists beyond the
 visible extent even though their keys are then masked. Sparse candidates
@@ -16,8 +16,10 @@ Quality: selection keys, tie ordering and arithmetic on live entries are
 unchanged. Inactive lists contribute the same zero key without being read.
 
 Tests: strict initcheck exposed 4608 reads with unchanged selected outputs.
-Fresh application and patch/overlay identity pass. The fixed CUDA gate and
-independent original/fixed reproducer are required before qualification.
+An independent original reproducer reports 1536 initcheck errors; the
+fixed reproducer reports zero, with exact tie-ordered selected positions.
+The guarded full snapshot gate passes initcheck, memcheck and racecheck.
+Fresh patch application and patch/overlay identity pass.
 
 Upstream status: local experimental dependency fix, not submitted upstream.
 ---
