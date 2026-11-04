@@ -136,3 +136,23 @@ containers independently matched the C36 image and exact restoration-profile
 label. Native controller/error, actual exit, original logs, image receipt,
 XML/JSONL, all export hashes and separate restoration receipts are preserved in
 the attempt directory. Full raw exports remain private under `gate-export`.
+
+## Resume attempt 2
+
+The foreign FP8 screen released window `dgx1-1793809624`; only our exact matching
+return request was fulfilled. Named guarded staging window `dgx1-1793810908`
+read the unchanged TP3 live/shape and synchronization plans, synchronized all
+three serving checkouts back to the frozen execution commit `1f134c7a`, and
+verified the owned DGX4 build worktree already matched it. All four checkouts
+were clean. Staging closed at 16:49:25 UTC with C36 still live and no restart.
+
+The sole resume controller started at 16:49:55 UTC (PID `3534669`, supervisor
+`3534668`), opening window `dgx1-1793811034` at 16:50:34 UTC. It explicitly
+reuses attempt 1's unchanged completed image/gate receipt and actual image.
+At the initial compact check it was seeding the image, with both processes alive,
+fresh heartbeat and no final exit or request. No image build or gate repeated.
+The native receipt is `results/private/lab/candidate-40-round-attempt-2/receipt.json`;
+the log is `/home/swank/tl-logs/topk-live-qualification/candidate-40-window-attempt-2.log`.
+Fresh operator setup, staging, PID and initial hash receipts are preserved in
+`runs/2026-11-04-dgx/attempt-2`. Functional and serving-performance results remain
+pending. The owner paused recurring checks and requested direct waiting here.

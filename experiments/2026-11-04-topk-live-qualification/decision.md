@@ -27,3 +27,11 @@ local explicit resume review passes. Resume under a new attempt after the
 foreign request/window completes, without rebuilding or repeating any gate.
 The owner paused recurring checks and requested direct waiting in this chat;
 do not restart the recurring schedule.
+
+Resume attempt 2 is active at the exact same execution commit and immutable
+image. Its original gate-resume validation passed before launch; the first
+native phase is image seeding, with no repeated build or gate. Source staging
+after the foreign window independently verified clean same-commit checkouts
+and matching live C36 without a restart. Wait for all functional outcomes,
+both performance boots and independent restoration before drawing a serving
+qualification or performance conclusion.
