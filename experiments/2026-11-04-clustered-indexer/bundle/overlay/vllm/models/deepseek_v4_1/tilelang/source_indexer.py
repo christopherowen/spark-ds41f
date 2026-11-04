@@ -5,12 +5,12 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from .clustered_indexer import CLUSTER, ClusteredIndexerPlan, surviving_candidates
-from .indexer import CANDIDATE_BLOCK, CANDIDATE_BLOCKS, IndexerTopK, IndexerV41Plan, page_bytes
+from .clustered_indexer import CLUSTER, ClusteredIndexerPlan
+from .indexer import CANDIDATE_BLOCK, CANDIDATE_BLOCKS, IndexerTopK, IndexerV41Plan, _key16, page_bytes
 
 
 @tilelang.jit
-def source_threshold():
+def source_threshold(seed_blocks: int):
     rows = T.dynamic('rows')
 
     @T.prim_func
@@ -18,10 +18,17 @@ def source_threshold():
         Blocks: T.Tensor([rows, CANDIDATE_BLOCKS], T.int32),
         Values: T.Tensor([rows, CANDIDATE_BLOCKS], T.bfloat16),
         Counts: T.Tensor([rows], T.int32),
+        SeedIDs: T.Tensor([rows, seed_blocks], T.int32),
+        CutoffKey: T.Tensor([rows], T.int32),
+        CutoffPosition: T.Tensor([rows], T.int32),
         ThresholdValues: T.Tensor([rows, CANDIDATE_BLOCKS], T.bfloat16),
     ):
         with T.Kernel(rows, threads=128) as row:
             last = T.ceildiv(Counts[row], CANDIDATE_BLOCK) - 1
+            keys = T.alloc_fragment([CANDIDATE_BLOCKS], T.int32)
+            positions = T.alloc_fragment([CANDIDATE_BLOCKS], T.int32)
+            minimum = T.alloc_fragment([1], T.int32)
+            maximum_position = T.alloc_fragment([1], T.int32)
             for k in T.Parallel(CANDIDATE_BLOCKS):
                 # The native block selector forces its last block. Excluding it
                 # gives a lower bound for the 2047 ordinary winners; padding
@@ -30,7 +37,94 @@ def source_threshold():
                 ThresholdValues[row, k] = T.if_then_else(forced,
                     T.cast(3.3895313892515355e38, T.bfloat16), Values[row, k])
 
+                finite = T.abs(T.cast(Values[row, k], T.float32)) < T.infinity(T.float32)
+                keys[k] = T.if_then_else(forced, 65535,
+                    T.if_then_else(finite, _key16(Values[row, k]), 0))
+            T.reduce_min(keys, minimum, dim=0)
+            for k in T.Parallel(CANDIDATE_BLOCKS):
+                block = Blocks[row, k]
+                eligible = (block >= 0) & (block != last) & (keys[k] == minimum[0])
+                positions[k] = T.if_then_else(eligible, SeedIDs[row, T.max(block, 0)], -1)
+            T.reduce_max(positions, maximum_position, dim=0)
+            if T.get_thread_binding() == 0:
+                CutoffKey[row] = minimum[0]
+                CutoffPosition[row] = T.if_then_else(minimum[0] == 0,
+                    2147483647, maximum_position[0])
+
     return threshold
+
+
+@tilelang.jit
+def source_surviving_candidates(width: int, topk: int):
+    """Stable compaction with the native block value/position cutoff."""
+    rows = T.dynamic("rows")
+    clusters, threads = width // CLUSTER, 128
+
+    @T.prim_func
+    def compact(
+        Bounds: T.Tensor([rows, clusters], T.bfloat16),
+        Values: T.Tensor([rows, topk], T.bfloat16),
+        CutoffKey: T.Tensor([rows], T.int32),
+        CutoffPosition: T.Tensor([rows], T.int32),
+        Lengths: T.Tensor([rows], T.int32),
+        Active: T.Tensor([1], T.int32),
+        Candidates: T.Tensor([rows, width // 8], T.int32),
+        Counts: T.Tensor([rows], T.int32),
+    ):
+        with T.Kernel(rows, threads=threads) as row:
+            tx = T.get_thread_binding()
+            values = T.alloc_fragment([topk], T.float32)
+            minimum = T.alloc_fragment([1], T.float32)
+            scan = T.alloc_shared([threads], T.int32)
+            base = T.alloc_shared([1], T.int32)
+            v = T.alloc_var(T.int32)
+            extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
+            for k in T.Parallel(topk):
+                value = T.cast(Values[row, k], T.float32)
+                values[k] = T.if_then_else(
+                    T.abs(value) < T.infinity(T.float32), value, -T.infinity(T.float32)
+                )
+            T.reduce_min(values, minimum, dim=0)
+            for b in T.Parallel(width // 8):
+                Candidates[row, b] = -1
+            if tx == 0:
+                base[0] = 0
+            T.sync_threads()
+            for chunk in T.serial(T.ceildiv(clusters, threads)):
+                cluster = chunk * threads + tx
+                live = T.min(CLUSTER, T.max(extent - cluster * CLUSTER, 0))
+                keep = T.if_then_else(
+                    cluster < clusters,
+                    (Bounds[row, T.min(cluster, clusters - 1)] >= minimum[0]) & (
+                        (_key16(Bounds[row, T.min(cluster, clusters - 1)]) != CutoffKey[row])
+                        | (cluster * (CLUSTER // CANDIDATE_BLOCK) <= CutoffPosition[row])),
+                    False,
+                )
+                size = T.if_then_else(keep, live, 0)
+                scan[tx] = size
+                T.sync_threads()
+                for step in T.serial(7):
+                    offset = 1 << step
+                    v = scan[tx]
+                    if tx >= offset:
+                        v = v + scan[tx - offset]
+                    T.sync_threads()
+                    scan[tx] = v
+                    T.sync_threads()
+                if (cluster < clusters) & (size > 0):
+                    for b in T.serial(8):
+                        if b * 8 < size:
+                            Candidates[row, (base[0] + scan[tx] - size) // 8 + b] = (
+                                cluster * 8 + b
+                            )
+                T.sync_threads()
+                if tx == 0:
+                    base[0] = base[0] + scan[threads - 1]
+                T.sync_threads()
+            if tx == 0:
+                Counts[row] = base[0]
+
+    return compact
 
 
 @tilelang.jit
@@ -111,10 +205,10 @@ class SourceClusteredIndexerPlan:
         self.search = ClusteredIndexerPlan(width, page_size, seeds=512, matrix_bounds=matrix_bounds)
         self.seed_blocks = IndexerTopK(self.search.seeds * CLUSTER, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
         self.select_blocks = IndexerTopK(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
-        self.threshold = source_threshold()
+        self.threshold = source_threshold(self.search.seeds * 8)
         self.last = retain_last_cluster(width)
         self.restore = restore_source_scores(width)
-        self.compact = surviving_candidates(width, CANDIDATE_BLOCKS)
+        self.compact = source_surviving_candidates(width, CANDIDATE_BLOCKS)
 
     def run(self, q, scales, weights, pool, table, lengths, active):
         rows, device = q.shape[0], q.device
@@ -142,6 +236,8 @@ class SourceClusteredIndexerPlan:
         seed_block_values = empty((rows, CANDIDATE_BLOCKS), torch.bfloat16)
         seed_block_counts = empty((rows,), torch.int32)
         thresholds = torch.empty_like(seed_block_values)
+        cutoff_keys = empty((rows,), torch.int32)
+        cutoff_positions = empty((rows,), torch.int32)
         candidates = empty((rows, self.width // 8), torch.int32)
         candidate_counts = empty((rows,), torch.int32)
         plan.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
@@ -156,9 +252,11 @@ class SourceClusteredIndexerPlan:
             table, lengths, active, seed_ids, seed_counts, seed_scores)
         self.seed_blocks.run(seed_scores, seed_counts, active, seed_block_ids,
                              seed_block_values, counts=seed_block_counts)
-        self.threshold(seed_block_ids, seed_block_values, seed_counts, thresholds)
+        self.threshold(seed_block_ids, seed_block_values, seed_counts, seed_ids,
+                       cutoff_keys, cutoff_positions, thresholds)
         self.last(bounds, lengths, active)
-        self.compact(bounds, thresholds, lengths, active, candidates, candidate_counts)
+        self.compact(bounds, thresholds, cutoff_keys, cutoff_positions, lengths, active,
+                     candidates, candidate_counts)
         out, compact_scores = plan.final_plan.run(q, scales, weights, pool, table, lengths, active,
                                                   candidates, candidate_counts)
         dense = empty((rows, self.width), torch.bfloat16)

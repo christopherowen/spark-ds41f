@@ -11,12 +11,15 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS, Indexer
 from vllm.models.deepseek_v4_1.tilelang.source_indexer import SourceClusteredIndexerPlan
 
 
-def check(width, extents, mode, cuda_graph=True, repeats=15):
+def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=False):
     torch.cuda.reset_peak_memory_stats()
     args = inputs(width, extents, mode, unwritten_cache=True)
     rows = len(extents)
     reference = IndexerV41Plan(width, 256, candidate_blocks=True)
-    candidate = SourceClusteredIndexerPlan(width, 256)
+    Plan = SourceClusteredIndexerPlan
+    if source_reference:
+        from vllm.models.deepseek_v4_1.tilelang.source_reference import SourceClusteredIndexerPlan as Plan
+    candidate = Plan(width, 256)
     blocks = torch.empty((rows, CANDIDATE_BLOCKS), device='cuda', dtype=torch.int32)
     counts = torch.empty((rows,), device='cuda', dtype=torch.int32)
 
@@ -33,6 +36,17 @@ def check(width, extents, mode, cuda_graph=True, repeats=15):
 
     compare(expected)
     if not evidence['native_fallback']:
+        bound_cpu = evidence['bounds'].cpu().float()
+        # Only written native scores enter the oracle; no row tail is copied.
+        for row, extent in enumerate(extents):
+            full = scores[row, :extent].cpu().float()
+            for cluster in range((extent + 63) // 64):
+                observed = full[cluster*64:min((cluster+1)*64, extent)].max()
+                bound = bound_cpu[row, cluster]
+                if torch.isfinite(observed):
+                    assert bound >= observed, (row, cluster, observed, bound)
+                else:
+                    assert torch.isposinf(bound), (row, cluster, observed, bound)
         # Every evaluated compact score must keep its native BF16 bits, including
         # signed zeros and NaN encodings. Never copy an unwritten score tail.
         for row, count in enumerate(evidence['candidate_counts'].cpu().tolist()):
@@ -106,7 +120,7 @@ def check(width, extents, mode, cuda_graph=True, repeats=15):
             'source_winners_identical': True, 'source_blocks_identical': True,
             'source_lengths_identical': True, 'reindex_identical': True,
             'graph_visibility_identical': True if cuda_graph else None, 'cache_mutation_identical': True, 'native_fallback': evidence['native_fallback'],
-            'execution': 'cuda-graph' if cuda_graph else 'eager',
+            'execution': 'cuda-graph' if cuda_graph else 'eager', 'archived_source_reference': source_reference,
             'retained_keys': evidence['candidate_counts'].cpu().tolist()
                              if not evidence['native_fallback'] else None,
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
@@ -123,6 +137,7 @@ def main():
     parser.add_argument('--no-graph', action='store_true')
     parser.add_argument('--repeats', type=int, default=15)
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--source-reference', action='store_true')
     options = parser.parse_args()
     result = {'schema_version': 1, 'passed': False, 'cases': []}
     try:
@@ -136,7 +151,7 @@ def main():
         for width, extents, mode in cases:
             if width > options.max_width:
                 continue
-            result['cases'].append(check(width, extents, mode, not options.no_graph, options.repeats))
+            result['cases'].append(check(width, extents, mode, not options.no_graph, options.repeats, options.source_reference))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:

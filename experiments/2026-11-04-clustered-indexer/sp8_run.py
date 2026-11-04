@@ -18,7 +18,9 @@ sys.path.insert(0, str(ROOT))
 from spark_ds41f import lab
 
 HERE = Path(__file__).resolve().parent
-IMAGE = json.loads((HERE / 'sp8.json').read_text())['image_id']
+RUNTIMES = json.loads((HERE / 'sp8.json').read_text())
+IMAGE = RUNTIMES['image_id']
+ALLOWED_IMAGES = {IMAGE, RUNTIMES['real_input_runtime']['image_id']}
 HOLD = Path.home() / 'spark-hold.json'
 
 
@@ -116,7 +118,7 @@ def main():
                     raise ValueError('expected a local sp8 bundle and a single-component run name')
                 bundle = HERE / bundle_name
                 candidate = json.loads((bundle / 'candidate.json').read_text())
-                assert candidate['image'] == IMAGE, 'sp8 image identity differs'
+                assert candidate['image'] in ALLOWED_IMAGES, 'sp8 image identity differs'
                 out = Path.home() / 'spark-lab/results/clustered-indexer' / run
                 out.mkdir(parents=True, exist_ok=False)
                 container = 'clustered-indexer-' + token[:12]
@@ -143,7 +145,7 @@ def main():
                         time.sleep(0.2)
                 output = (out / 'output.txt').read_text()
                 verdict = lab.verdict_from_lines(output.splitlines(), candidate)
-                verdict.update(node=socket.gethostname(), image=IMAGE, commit=commit,
+                verdict.update(node=socket.gethostname(), image=candidate['image'], commit=commit,
                                command=command, exit=process.returncode,
                                started_at=began, ended_at=stamp(),
                                seconds=round(time.monotonic() - started, 3),

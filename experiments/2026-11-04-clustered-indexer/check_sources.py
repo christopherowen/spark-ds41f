@@ -26,6 +26,8 @@ with tempfile.TemporaryDirectory() as directory:
     ast.parse((root / grouped).read_text())
     subprocess.run(['git', 'apply', str(HERE / 'vllm/0006-preserve-source-handoff.patch')],
                    cwd=root, check=True)
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0007-source-tie-cutoff.patch')],
+                   cwd=root, check=True)
     source = RELATIVE.parent / 'source_indexer.py'
     assert (root / source).read_bytes() == (HERE / 'bundle/overlay' / source).read_bytes()
     ast.parse((root / source).read_text())
@@ -68,3 +70,8 @@ with tempfile.TemporaryDirectory() as directory:
     expected_hash = json.loads((HERE / 'capture/base.json').read_text())['indexer_sha256']
     assert hashlib.sha256(target.read_bytes()).hexdigest() == expected_hash
 print('replay dependency recovers the exact candidate-36 indexer; syntax OK')
+
+# Freeze the preceding unreleased source prototype independently of current edits.
+control_hash = json.loads((HERE / 'source-ties.json').read_text())['control_sha256']
+assert hashlib.sha256((HERE / 'bundle/source_reference.py').read_bytes()).hexdigest() == control_hash
+print('archived source control hash matches')

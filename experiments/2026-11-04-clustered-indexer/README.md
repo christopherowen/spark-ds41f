@@ -221,3 +221,18 @@ compact copy can change cache behavior, so the diagnostic now records and
 reconstructs native physical page IDs, byte stride, pointer alignment, planned
 width and active limit. A synthetic capture/layout initialization gate must pass
 before collecting real operands. Raw activations and prompts stay outside Git.
+
+## Prepared source tie cutoff
+
+The source cutoff now also retains the worst seeded ordinary winner's original
+block position. On equal native BF16 ordering keys, a cluster entirely after
+that position cannot contain a selected ordinary block. Stable compaction can
+remove it while always retaining the global mandatory last cluster. Native
+ordering keys distinguish signed zeros; short and nonfinite seeds disable this
+refinement. Original bound values remain intact for the full-score oracle.
+
+`source-ties.json` and patch 0007 record this single variable. Twelve CPU tests
+and fresh patch/source checks pass; repeated source, handoff/reindex and
+sanitizer GPU gates remain pending. `sp8-source-control` preserves the preceding
+unreleased source plan with exactly the same expanded harness. It does not
+benchmark a released build.
