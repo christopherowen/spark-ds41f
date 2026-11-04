@@ -7,6 +7,7 @@ metadata is inferred. At most eight rows use scratch simultaneously; native
 attention owns all published outputs. Every kernel is declared before serving.
 """
 import os
+import math
 import torch
 
 from . import prepare
@@ -135,7 +136,9 @@ class ServingClusteredIndexerPlan:
             return [b[f'{prefix}_{i}'] for i in range(len(plan.scratch_specs(1)))]
         for start in range(0,rows,ROW_CAP):
             end=min(start+ROW_CAP,rows);r=end-start
-            b={name:value[:r] for name,value in full.items()}
+            current_specs=self._specs(r)
+            b={name:value.view(-1)[:math.prod(current_specs[name][0])].view(current_specs[name][0])
+               for name,value in full.items()}
             qr,sr,wr,tr,lr=q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
             self.envelope(pool[:, :nbytes],tr,lr,active,b['lower'],b['upper'])
             self.bounds(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,

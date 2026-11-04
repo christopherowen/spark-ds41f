@@ -39,10 +39,10 @@ index ea18104ce7..f2afa0050a 100644
  class DeepseekV41TileLangAttention(DeepseekV4Attention):
 diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_serving.py b/vllm/models/deepseek_v4_1/tilelang/clustered_serving.py
 new file mode 100644
-index 0000000000..2810a2ead3
+index 0000000000..5e6f8f8d6f
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/clustered_serving.py
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,174 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Bounded-workspace serving adapter for the experimental exact snapshot search.
@@ -52,6 +52,7 @@ index 0000000000..2810a2ead3
 +attention owns all published outputs. Every kernel is declared before serving.
 +"""
 +import os
++import math
 +import torch
 +
 +from . import prepare
@@ -180,7 +181,9 @@ index 0000000000..2810a2ead3
 +            return [b[f'{prefix}_{i}'] for i in range(len(plan.scratch_specs(1)))]
 +        for start in range(0,rows,ROW_CAP):
 +            end=min(start+ROW_CAP,rows);r=end-start
-+            b={name:value[:r] for name,value in full.items()}
++            current_specs=self._specs(r)
++            b={name:value.view(-1)[:math.prod(current_specs[name][0])].view(current_specs[name][0])
++               for name,value in full.items()}
 +            qr,sr,wr,tr,lr=q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
 +            self.envelope(pool[:, :nbytes],tr,lr,active,b['lower'],b['upper'])
 +            self.bounds(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,
