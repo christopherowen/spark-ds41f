@@ -70,25 +70,30 @@ else:
     )
     library = ctypes.CDLL(str(so))
 library.stream_store_u32_release.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-input_tensor = torch.arange(1024, device="cuda", dtype=torch.float32) / 16
+all_input = torch.arange(2048, device="cuda", dtype=torch.float32) / 16
 region = torch.zeros(65536, dtype=torch.uint8, pin_memory=True)
 region_array = region.numpy()
 recv, flags, send, ctrl, slot_bytes = 0, 16384, 20480, 32768, 4096
 ctrl_words = region_array[ctrl:].view(np.uint32)
 ctrl_words[28 // 4] = 1_000_000
 results = {}
-for operation in ["allreduce", "allgather"]:
+for operation in ["allreduce", "allgather", "reducescatter", "exchange"]:
     region_array.fill(0)
     ctrl_words[28 // 4] = 1_000_000
     counters = torch.zeros(5, device="cuda", dtype=torch.int32)
+    input_tensor = (
+        all_input if operation in ("reducescatter", "exchange") else all_input[:1024]
+    )
     out = torch.empty(
-        1024 if operation == "allreduce" else 2048, device="cuda", dtype=torch.float32
+        1024 if operation in ("allreduce", "reducescatter") else 2048,
+        device="cuda",
+        dtype=torch.float32,
     )
-    launcher = (
-        ar._build("float32", 2, 0, 128, 2, 64, 2, False)()
-        if operation == "allreduce"
-        else ag._build(2, 0, 128, 2, 64, 2, False)()
-    )
+    module = {"allreduce": ar, "allgather": ag, "reducescatter": rs, "exchange": ex}[
+        operation
+    ]
+    prefix = ("float32",) if operation in ("allreduce", "reducescatter") else ()
+    launcher = module._build(*prefix, 2, 0, 128, 2, 64, 2, False)()
     for seq in range(1, 4):
         errors = []
 
@@ -135,7 +140,7 @@ for operation in ["allreduce", "allgather"]:
                 0,
             )
             expected = input_tensor + 7
-        else:
+        elif operation == "allgather":
             launcher(
                 *common,
                 256,
@@ -154,6 +159,48 @@ for operation in ["allreduce", "allgather"]:
                 1,
             )
             expected = torch.cat([input_tensor, torch.full_like(input_tensor, 7)])
+        elif operation == "reducescatter":
+            launcher(
+                *common,
+                256,
+                4096,
+                256,
+                recv,
+                flags,
+                send,
+                ctrl,
+                slot_bytes,
+                1,
+                2,
+                3,
+                4,
+                1,
+            )
+            expected = input_tensor[:1024] + 7
+        else:
+            launcher(
+                *common,
+                256,
+                4096,
+                256,
+                256,
+                512,
+                256,
+                1,
+                recv,
+                flags,
+                send,
+                ctrl,
+                slot_bytes,
+                1,
+                2,
+                3,
+                4,
+                1,
+            )
+            expected = torch.cat(
+                [input_tensor[:1024], torch.full_like(input_tensor[:1024], 7)]
+            )
         torch.cuda.synchronize()
         thread.join(3)
         assert not thread.is_alive() and not errors, errors
