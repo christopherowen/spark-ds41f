@@ -349,12 +349,19 @@ if args.operation == "pair":
     from vllm.v1.worker.gpu.sample import tilelang_logprob as current_scores
     from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
 
-    control = HERE / "control/v3"
+    control = HERE / "control/v6"
     control_id = json.loads((control / "identity.json").read_text())
     for name, sha in control_id["files"].items():
         assert hashlib.sha256((control / name).read_bytes()).hexdigest() == sha
     previous_scores = load_reference("tilelang_logprob", control, "previous_")
     previous_topk = load_reference("tilelang_topk_ids", control, "previous_")
+    evidence_path = HERE / "paired-results-v6.json"
+    evidence_sha = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["source_head"] == control_id["head"]
+    qualified = {
+        json.dumps(row["case"], sort_keys=True): row for row in evidence["cases"]
+    }
     source_dir = args.out / "kernel-sources"
     source_dir.mkdir()
 
@@ -390,18 +397,16 @@ if args.operation == "pair":
             previous_code = compiled(
                 previous_scores.topk_log_softmax_kernel,
                 previous_scores.topk_log_softmax_key(
-                    logits.dtype, run, valid is not None, ids.dtype, ids.is_contiguous()
-                ),
-            )
-            candidate_code = compiled(
-                current_scores.topk_log_softmax_kernel,
-                current_scores.topk_log_softmax_key(
                     logits.dtype,
                     run,
                     valid is not None,
                     ids.dtype,
-                    current_scores._id_layout(ids),
+                    previous_scores._id_layout(ids),
                 ),
+            )
+            candidate_code = compiled(
+                current_scores.topk_log_softmax_kernel,
+                current_scores._score_key(logits, ids, valid is not None),
             )
         else:
             reference_code = compiled(
@@ -410,7 +415,9 @@ if args.operation == "pair":
             )
             previous_code = compiled(
                 previous_topk.topk_ids_kernel,
-                previous_topk.topk_ids_key(logits.dtype, torch.int64, run, ids.dtype),
+                previous_topk.topk_ids_key(
+                    logits.dtype, torch.int64, run, ids.dtype, ids.is_contiguous()
+                ),
             )
             candidate_code = compiled(
                 tilelang_topk_ids.topk_ids_kernel,
@@ -471,6 +478,38 @@ if args.operation == "pair":
             reference_preparation_aliases_input=alias,
             shared_output_address=True,
         )
+        prior_case = qualified[json.dumps(label, sort_keys=True)]
+        prior_programs = prior_case["boots"][0]["programs"]
+        assert data_id == prior_case["boots"][0]["data"]
+        assert data_id == prior_case["boots"][1]["data"]
+        assert reference_code == prior_programs["reference"]
+        assert previous_code == prior_programs["candidate"]
+        if prior_case["passed"] and candidate_code == prior_programs["candidate"]:
+            for launch in (reference_launch, candidate_launch, previous_launch):
+                out = launch()
+                torch.cuda.synchronize()
+                assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
+            rows.append(
+                dict(
+                    case=label,
+                    data=data_id,
+                    same_program=same_program,
+                    cuda_source_sha256=dict(
+                        reference=reference_code,
+                        previous=previous_code,
+                        candidate=candidate_code,
+                    ),
+                    transfer=dict(evidence=evidence_path.name, sha256=evidence_sha),
+                    gate=dict(status="equal_to_qualified_v6"),
+                )
+            )
+            (args.out / "cases.json").write_text(json.dumps(rows, indent=2) + "\n")
+            continue
+        assert (
+            operation == "scores"
+            and label["layout"] == "transposed"
+            and label["rows"] > 1
+        ), "Unexpected changed or unqualified GPU program"
         measured, outputs = measure(
             dict(
                 reference=reference_launch,

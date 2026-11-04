@@ -219,3 +219,26 @@ discarded or reclassified. This is one fixed extension, not repeated sampling
 until a case passes. The kernel source, input hashes, output sharing, cold-cache
 protocol and zero regression margin remain identical. The filter is published
 from the full primary result before any extension runs.
+
+### v7 shared staging
+
+The v6 extension retained 119 qualified cases and one unresolved transposed
+BF16 96-row/21-column case (`paired-results-v6.json`). Its first extension
+boot's upper bound remained 1.00153, so it is not accepted. No further
+precision reruns of that source are allowed by this experiment's fixed rule.
+
+Patch 0007 stages transposed selected logits in a 4 KiB shared array while the
+row reduction runs. This avoids a late dependent gather and the rejected global
+output-buffer round trip. Selections above 1024 columns use the existing native
+strided kernel; correctness checks cover columns 1024 and 1025. All variants
+are declared before startup freeze. There is still one GPU launch, and no
+global normalization or conversion buffer.
+
+V7 recompiles and numerically checks every one of the 120 cases on each boot.
+For unchanged GPU programs, qualification transfers only when both generated
+CUDA hashes (reference and candidate), input hashes and layouts match a
+previously qualified v6 case. The single unqualified case cannot transfer.
+The 16 changed transposed programs each receive 480 mirrored timing rounds on
+both boots, with the same zero-margin five-SE gate. The frozen v6 source is
+retained under `control/v6/` and runs beside the new kernels as the causal
+control. This avoids remeasuring programs that are provably unchanged.

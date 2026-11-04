@@ -197,6 +197,7 @@ def topk_log_softmax_kernel(
     masked: bool = False,
     id_dtype: str = "int64",
     id_layout: str = "compact",
+    prefetch_ids: bool = False,
 ):
     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
@@ -291,6 +292,12 @@ def topk_log_softmax_kernel(
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
+            if prefetch_ids:
+                T.assume(topk <= threads)
+                # Reuse the reduction barriers; each thread later reads its own slot.
+                selected = T.alloc_shared((threads,), T.float32)
+                if tx < topk:
+                    selected[tx] = T.cast(logits[row, token_ids[row, tx]], T.float32)
             raw = T.alloc_local((per,), logits_dtype)
             peak = T.alloc_local((loads,), T.float32)
             total = T.alloc_local((loads,), T.float32)
@@ -359,7 +366,10 @@ def topk_log_softmax_kernel(
             for c in T.serial(T.ceildiv(topk, threads)):
                 col = c * threads + tx
                 if col < topk:
-                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                    if prefetch_ids:
+                        picked = selected[col]
+                    else:
+                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
                     value = T.call_extern(
                         "float32",
                         "vllm_sub",
@@ -381,8 +391,16 @@ def topk_log_softmax_key(
     masked: bool = False,
     id_dtype: torch.dtype = torch.int64,
     id_layout: str = "compact",
+    prefetch_ids: bool = False,
 ) -> tuple:
-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], id_layout)
+    return (
+        _DTYPES[logits_dtype],
+        run,
+        masked,
+        _DTYPES[id_dtype],
+        id_layout,
+        prefetch_ids,
+    )
 
 
 def _id_layout(ids: torch.Tensor) -> str:
@@ -398,19 +416,34 @@ def _id_layout(ids: torch.Tensor) -> str:
     return "general"
 
 
+def _score_key(logits: torch.Tensor, ids: torch.Tensor, masked: bool) -> tuple:
+    layout = _id_layout(ids)
+    return topk_log_softmax_key(
+        logits.dtype,
+        _triton_run(logits),
+        masked,
+        ids.dtype,
+        layout,
+        layout == "transpose" and ids.shape[1] <= _SOFTMAX_THREADS,
+    )
+
+
 def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
     """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
     layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
     return [
         _call(
             topk_log_softmax_kernel,
-            *topk_log_softmax_key(dtype, run, masked, id_dtype, id_layout),
+            *topk_log_softmax_key(
+                dtype, run, masked, id_dtype, id_layout, prefetch_ids
+            ),
         )
         for dtype in dict.fromkeys(logits_dtypes)
         for run in _runs(dtype)
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
         for id_layout in ("compact", "row", "column", "transpose", "general")
+        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
     ]
 
 
@@ -436,13 +469,7 @@ def topk_log_softmax(
         raise TypeError("token_ids must be int32 or int64")
     kernel = _kernel(
         topk_log_softmax_kernel,
-        *topk_log_softmax_key(
-            logits.dtype,
-            _triton_run(logits),
-            valid is not None,
-            token_ids.dtype,
-            _id_layout(token_ids),
-        ),
+        *_score_key(logits, token_ids, valid is not None),
     )
     # The unmasked specialization never reads the dummy validity tensor.
     kernel(

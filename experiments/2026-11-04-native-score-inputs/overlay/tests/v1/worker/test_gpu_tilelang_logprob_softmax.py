@@ -531,7 +531,7 @@ def test_runner_declares_the_launched_calls(logits_mode):
         (
             id(tilelang_logprob.topk_log_softmax_kernel),
             tilelang_logprob.topk_log_softmax_key(
-                dtype, run, masked, id_dtype, id_layout
+                dtype, run, masked, id_dtype, id_layout, prefetch_ids
             ),
         )
         for dtype in (torch.bfloat16, torch.float32)
@@ -539,6 +539,7 @@ def test_runner_declares_the_launched_calls(logits_mode):
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
         for id_layout in ("compact", "row", "column", "transpose", "general")
+        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
     }
     declared = _declared(registry)
     softmax = {
@@ -710,12 +711,21 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
-    "layout", ["dense", "padded", "sliced", "transposed", "general"]
+    "layout,cols",
+    [
+        ("dense", 33),
+        ("padded", 33),
+        ("sliced", 33),
+        ("transposed", 33),
+        ("transposed", 1024),
+        ("transposed", 1025),
+        ("general", 33),
+    ],
 )
 @pytest.mark.parametrize("masked", [False, True])
-def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
+def test_logprobs_read_native_ids(dtype, id_dtype, layout, cols, masked):
     """ID strides change addressing, never log-softmax arithmetic."""
-    rows, cols, vocab = 5, 33, 8193
+    rows, vocab = 5, 8193
     logits = torch.randn(rows, vocab + 7, device=DEVICE, dtype=dtype)[:, :vocab]
     ids = torch.randint(vocab, (rows, cols), device=DEVICE, dtype=id_dtype)
     valid = torch.rand(rows, cols, device=DEVICE) > 0.3
