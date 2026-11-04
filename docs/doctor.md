@@ -14,13 +14,6 @@ bin/spark --shape tp3-triangle doctor  # the recipe at another shape
 
 ## Modes
 
-A candidate whose vLLM manifest records `ds41-serving-contract` rejects
-`VLLM_DS41_ENGRAM_OVERLAP`, `VLLM_DS41_MARKOV_NVFP4` and
-`VLLM_DS41_DRAFT_NVFP4_HEAD`, including explicit `0` values. The first setting
-has no consumer; the NVFP4 head choices are kept as an unselected experiment.
-The candidate's vLLM startup rejects them too. Older frozen source recipes keep
-their own option support.
-
 | Command | Runs where | Needs | Checks |
 | --- | --- | --- | --- |
 | `bin/spark doctor` | any checkout (CI runs it) | nothing outside the repository | [configuration](#configuration-checks) |
@@ -64,6 +57,13 @@ repository. Every one is an error unless marked **warn**.
 | GLP steering | a `glp` field is malformed: `repo` is not `<owner>/<name>`, `revision` not a full commit SHA, `file` not a `.gguf` name, `sha256` not 64 hex digits; `glp.served_model_name` is not served exactly once after the first `--served-model-name` (the first is the stock model every tool and probe uses); `WEIGHTLESS_STEER_*` is set without a `glp` block |
 | Secrets | a tracked file is named `.env`, `id_rsa`, `id_ed25519` or `credentials.json`, or ends in `.pem`, `.key`, `.local.env` or `.local.json` |
 | Watchlist | **warn**: `docs/inspiration.md` is missing, or a watched reference is absent from it |
+
+A candidate whose vLLM manifest records `ds41-serving-contract` rejects
+`VLLM_DS41_ENGRAM_OVERLAP`, `VLLM_DS41_MARKOV_NVFP4` and
+`VLLM_DS41_DRAFT_NVFP4_HEAD`, including explicit `0` values. The first setting
+has no consumer; the NVFP4 head choices are kept as an unselected experiment.
+The candidate's vLLM startup rejects them too. Older frozen source recipes keep
+their own option support.
 
 Fix these in the repository; nothing on the nodes changes them.
 

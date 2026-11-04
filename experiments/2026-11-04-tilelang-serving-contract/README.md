@@ -71,7 +71,7 @@ under `runs/`. New image, full release gate, two-boot serving qualification and
 performance comparison remain necessary before promotion; no old measurements
 are assigned to the new source.
 
-## Checks completed so far
+## Results
 
 The complete 576-patch series replayed from the pinned upstream base in a fresh
 named worktree and reproduced head `ecbfff36289d4a131169054702cf3eac384b7a4e`,
@@ -92,6 +92,31 @@ a container or collecting tests. Its output is preserved separately from test
 results. The other inspected Spaceport nodes were serving and were left alone.
 A short CPU-only request was queued after the current sp8 job. Full build inputs
 are not present for `build check`.
+
+The second attempt collected all 81 cases, but ten cases failed in both modes:
+without a GPU driver, vLLM substitutes unavailable compiler declarations, and
+the CPU model simulations still import modules containing kernel definitions.
+The original source had twenty failures and the corrected source ten. This is
+a failed run, not the expected control, and all outputs are retained.
+
+The third attempt uses [cpu_declarations.py](cpu_declarations.py) identically in
+both modes to import the real installed TileLang/Triton declaration APIs. It
+replaces no computational kernel or test assertion. Both collection and test
+completion verify that CUDA remained uninitialized; the containers expose no
+GPU devices. Every case stays selected.
+
+| Same 81 CPU cases | Original source | Corrected source |
+| --- | --- | --- |
+| Passed | 71 | 81 |
+| Failed | 10, the expected contract checks | 0 |
+| Errors / skips | 0 / 0 | 0 / 0 |
+
+The successful published input commit and exact commands/source/test/harness
+hashes are in [runs/spaceport-attempt3](runs/spaceport-attempt3). Both native
+pytest exits are preserved: 1 for the expected original failures, 0 for the
+corrected source. Wrapper success requires the expected counts and successful
+collection. No serving process was changed. Memory minima and container state
+are test conditions, not a measured saving or serving qualification.
 
 Upstream status: local, not submitted. No promoted configuration, immutable
 baseline or serving cluster is changed.
