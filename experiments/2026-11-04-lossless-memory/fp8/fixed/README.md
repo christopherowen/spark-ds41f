@@ -24,10 +24,20 @@ word consumer. First/repeat containers run at 128, 256 and 512 threads with a
 timings and errors must be retained. A proxy win would still require a fused
 GEMM with unchanged arithmetic, followed by full serving qualification.
 
-Local tests pass. Exact deterministic encoding of the matched 42 dense tiles
-saves 8.6876%, including every device descriptor. This is a size screen only;
-the decoder has not been compiled or run on GB10. Its CPU packing cost and
-storage ratio do not predict GPU throughput.
+All six GB10 first/repeat runs reconstruct the matched 42 dense tiles and
+compressed special-encoding fixtures exactly. Storage saves 8.6876%, including
+every device descriptor, but all layouts lose to their paired raw consumer.
+The 128-thread layout takes 1.910/1.912 times the raw duration; 256 threads
+take 1.412/1.413; 512 threads take 1.404/1.362. Every exploratory 95% ratio
+interval is above 1. These layouts are rejected; no serving candidate follows.
+`gpu-results.json` retains the ratios, uncertainty and all six native receipts.
+
+The read-only CUDA driver query in `device-capabilities.json` reports a zero
+algorithm mask and zero maximum decompression length on this GB10 stack.
+A software LZ4 path would need its own measured decode cost. No hardware
+decompression performance is assumed. `../palette-size-budget.json` also
+retains an unimplemented palette proposal rejected at its size budget: only
+0.2334% estimated saving after tile fallback and metadata.
 
 Within the standard authorized, published, idle cluster window bearing the
 FP8 measurement holder, after inspecting the coordinated stop plan:

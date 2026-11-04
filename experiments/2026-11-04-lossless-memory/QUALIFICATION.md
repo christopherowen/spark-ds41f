@@ -1,7 +1,8 @@
 # Qualification sequence
 
 These are measurement candidates. The standalone FP8 GPU screen ran and rejected
-all three tested Huffman layouts. Neither isolated serving image has been built;
+all three tested Huffman layouts and all three fixed-field layouts. Each of the
+twelve fresh containers passed its exact-byte gate. Neither isolated serving image has been built;
 no serving improvement or release acceptance is claimed.
 
 ## Source identities
