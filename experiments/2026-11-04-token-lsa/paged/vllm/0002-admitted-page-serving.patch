@@ -38,7 +38,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  from .indexer import (
      CANDIDATE_BLOCK,
      CANDIDATE_BLOCKS,
-@@ -67,18 +70,36 @@
+@@ -67,18 +70,41 @@
      return SparseMlaV41Plan.calls(*args, **kwargs)
  
  
@@ -49,9 +49,12 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +        return None
 +    name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
 +    budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
-+    if budget <= 0 or budget & (budget-1):
-+        raise ValueError("shortlist budget must be a positive power of two")
-+    return dict(candidate_blocks=candidate_blocks, budget=budget)
++    if budget <= 0 or budget % 8:
++        raise ValueError("shortlist budget must be a positive multiple of eight")
++    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "8"))
++    if row_cap <= 0 or row_cap > 256:
++        raise ValueError("shortlist row capacity must be between1 and256")
++    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
 +
 +
 +def _shortlist_class():
@@ -77,12 +80,14 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 -    )
 +    options = _shortlist_options(width, candidates, candidate_blocks)
 +    if options is not None:
-+        return _shortlist_class().calls(width, page_size, **options)
++        return [*_shortlist_class().calls(width, page_size, **options),
++                *IndexerV41Plan.calls(width, page_size, candidates=candidates,
++                                      candidate_blocks=candidate_blocks)]
 +    return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
  
  
  class DeepseekV41TileLangAttention(DeepseekV4Attention):
-@@ -147,6 +168,11 @@
+@@ -147,6 +173,11 @@
                      rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
                  )
              )  # _quantize_index_query
@@ -94,7 +99,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
          if self.compressor is not None:
              from .gemm import bf16_shards
  
-@@ -175,6 +201,13 @@
+@@ -175,6 +206,13 @@
          with torch.inference_mode(False):
              self._prepare(self.rotary_emb.cos_sin_cache.device)
          self._tilelang_plans = self._build_tilelang_plans()
@@ -108,7 +113,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  
      def _tilelang(self) -> SimpleNamespace:
          """This layer's plans (built when its kernels are bound; the cache pages
-@@ -208,7 +241,9 @@
+@@ -208,7 +246,9 @@
              caches.append(("indexed", self._owner().kv_cache, self._main_page * 288))
          if self.indexer is not None:
              caches.append(
@@ -119,7 +124,33 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
              )
          for name, cache, page in caches:
              if cache.dim() != 2 or cache.dtype != torch.uint8 or cache.shape[1] != page:
-@@ -277,10 +312,13 @@
+@@ -221,6 +261,10 @@
+         mla_args, index_args, chunks = self._plan_args()
+         mla = _mla_plan(*mla_args)
+         index = {mode: _index_plan(*args) for mode, args in index_args.items()}
++        native_index = {
++            mode: IndexerV41Plan(args[0], args[1], candidates=args[2], candidate_blocks=args[3])
++            for mode, args in index_args.items() if isinstance(index[mode], PageShortlistPlan)
++        }
+         # The largest scratch each phase borrows: indexing, then the attention
+         # metadata arena with the decode route's segment workspace. They are
+         # reserved in the workspace lane this layer runs in, before profiling
+@@ -229,12 +273,13 @@
+         split_rows = min(mla.decode_max_rows, self.capacity)
+         self._scratch_reservations = (
+             *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
++            *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
+             *(
+                 (*metadata_specs, *mla.scratch_specs(split_rows))
+                 for metadata_specs in self._attention_workspace_specs.values()
+             ),
+         )
+-        return SimpleNamespace(mla=mla, index=index)
++        return SimpleNamespace(mla=mla, index=index, native_index=native_index)
+ 
+     def reserve_profile_scratch(self) -> None:
+         """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
+@@ -277,10 +322,13 @@
                  self._index_page,
                  self.compress_ratio,
              )
@@ -137,3 +168,21 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  
      def _index_chunk(
          self,
+@@ -299,10 +347,13 @@
+         candidate_output=None,
+         candidate_output_lengths=None,
+     ):
+-        # The kernels bound their work by each row's live length on device,
+-        # so the host-side ``score_width`` hint has nothing left to trim.
+-        del score_width
+-        plan = self._tilelang().index[mode]
++        plans = self._tilelang()
++        plan = plans.index[mode]
++        # Outside graph capture, the existing conservative prefill extent can
++        # prove that every key would be kept. Avoid the entire coarse pipeline.
++        if (score_width is not None and isinstance(plan, PageShortlistPlan)
++                and score_width <= plan.budget * 64 + plan.page - 1):
++            plan = plans.native_index[mode]
+         scratch = current_workspace_manager().get_simultaneous(
+             *plan.scratch_specs(rows)
+         )

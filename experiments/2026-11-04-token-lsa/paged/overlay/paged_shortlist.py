@@ -121,7 +121,7 @@ def summarize_pages(page: int, slot_dtype: str = 'int64'):
 
 
 @tilelang.jit
-def page_scores(width: int, page: int, block_c: int = 64):
+def page_scores(width: int, page: int, block_c: int = 64, skip_budget: int = 0):
     rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
     buckets = width//BUCKET
     ctas = min(tilelang.cdiv(buckets,block_c),128)
@@ -140,7 +140,8 @@ def page_scores(width: int, page: int, block_c: int = 64):
             terms = T.alloc_shared([block_c,32],T.float32)
             total = T.alloc_fragment([block_c],T.float32)
             extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
-            count = extent//page*(page//BUCKET)
+            count = T.if_then_else((skip_budget > 0) & (extent//page*(page//BUCKET) <= skip_budget),
+                                   0,extent//page*(page//BUCKET))
             if (cta == 0) & (T.get_thread_binding() == 0):
                 Count[row] = count
             if cta*block_c < count:
@@ -229,8 +230,9 @@ def page_flags(width: int, page: int, budget: int):
 
 class PageShortlistPlan:
     """Buffer-free serving plan. Cache owns metadata; caller owns all scratch."""
-    def __init__(self,width,page,*,candidate_blocks=False,budget=None):
+    def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=ROW_CAP):
         self.width,self.page,self.source = width,page,candidate_blocks
+        self.row_cap = row_cap
         self.budget = budget or (512 if candidate_blocks else 64)
         self.capacity = (self.budget+8)*BUCKET
         self.score = page_scores(width,page)
@@ -244,7 +246,7 @@ class PageShortlistPlan:
             self.remap = remap_blocks(self.capacity)
 
     @staticmethod
-    def calls(width,page,*,candidate_blocks=False,budget=None):
+    def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=ROW_CAP):
         budget = budget or (512 if candidate_blocks else 64)
         capacity = (budget+8)*BUCKET
         calls = [prepare.call(page_scores,width,page),*IndexerTopK.calls(width//BUCKET,budget),
@@ -257,7 +259,7 @@ class PageShortlistPlan:
         return calls
 
     def _specs(self,rows):
-        r,b = min(rows,ROW_CAP),self.budget
+        r,b = min(rows,self.row_cap),self.budget
         tiles = tilelang.cdiv(self.width//BLOCK,TILE)
         specs = {'scores':((r,self.width//BUCKET),torch.bfloat16),'counts':((r,),torch.int32),
                  'selected':((r,b),torch.int32),'values':((r,b),torch.bfloat16),
@@ -292,8 +294,8 @@ class PageShortlistPlan:
         full = dict(zip(specs,scratch))
         def buffers(name,plan,b):
             return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
-        for start in range(0,rows,ROW_CAP):
-            end = min(start+ROW_CAP,rows)
+        for start in range(0,rows,self.row_cap):
+            end = min(start+self.row_cap,rows)
             r = end-start
             current = self._specs(r)
             b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0])

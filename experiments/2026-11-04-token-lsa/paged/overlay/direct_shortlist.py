@@ -19,7 +19,7 @@ from .shortlist_indexer import BUCKET, BLOCK, remap_blocks
 
 
 @tilelang.jit
-def direct_candidates(width: int, page: int, budget: int):
+def direct_candidates(width: int, page: int, budget: int, whole_domain: bool = False):
     rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
     blocks, buckets = page//BLOCK, page//BUCKET
     capacity = (budget+8)*BUCKET//BLOCK
@@ -43,86 +43,100 @@ def direct_candidates(width: int, page: int, budget: int):
             visible = T.ceildiv(extent,BLOCK)
             complete = extent//page*blocks
             partial = visible-complete
-            # Native selection is ascending valid IDs followed by -1 padding.
-            search[0] = 0
-            search[1] = budget
-            for step in T.serial(budget.bit_length()):
-                if search[0] < search[1]:
-                    middle = (search[0]+search[1])//2
-                    if Selected[row,middle] < 0:
-                        search[1] = middle
-                    else:
-                        search[0] = middle+1
-            used = search[0]
-            if cta == 0:
-                last_present[0] = 0
-                if (extent > 0) & (partial == 0):
-                    last_bucket = ((extent-1)//page)*buckets+T.cast(
-                        Pool[Table[row,(extent-1)//page],page*72+blocks-1],T.int32)
-                    for j in T.serial(buckets):
-                        if used > j:
-                            last_present[0] = T.max(last_present[0],
-                                T.cast(Selected[row,used-1-j] == last_bucket,T.int32))
-                extra = T.cast((extent > 0) & (partial == 0) & (last_present[0] == 0),T.int32)
-                total = used*8+partial+extra
-                # Only this disjoint tail/padding range is written by CTA0.
-                for iteration in T.serial(T.ceildiv(capacity-used*8,32)):
+            if whole_domain & (extent//page*buckets <= budget):
+                # The complete visible domain fits: no centroid scores or
+                # selection are needed. Construct its identity gather directly.
+                for iteration in T.serial(T.ceildiv(T.max(capacity-cta*32,0),ctas*32)):
                     for i in T.Parallel(32):
-                        position = used*8+iteration*32+i
+                        position = cta*32+iteration*ctas*32+i
                         if position < capacity:
-                            Candidates[row,position] = -1
-                            if position < total:
-                                Candidates[row,position] = T.if_then_else(partial > 0,
-                                    complete+position-used*8,visible-1)
-                if T.get_thread_binding() == 0:
-                    CandidateLength[row] = total*BLOCK-T.if_then_else(
-                        extent > 0,(BLOCK-extent%BLOCK)%BLOCK,0)
-            for iteration in T.serial(T.ceildiv(T.max(used-cta,0),ctas)):
-                slot = cta+iteration*ctas
-                selected = Selected[row,slot]
-                logical_page = selected//buckets
-                local_bucket = selected%buckets
-                physical = Table[row,logical_page]
-                mask[0] = 0
-                first[0] = slot
-                # All selected siblings lie within buckets-1 adjacent slots.
-                for delta in T.serial(-(buckets-1),buckets):
-                    neighbor = slot+delta
-                    if (neighbor >= 0) & (neighbor < used):
-                        sibling = Selected[row,neighbor]
-                        if sibling//buckets == logical_page:
-                            mask[0] = mask[0] | (1 << (sibling%buckets))
-                            first[0] = T.min(first[0],neighbor)
-                for block in T.Parallel(blocks):
-                    membership[block] = T.cast(Pool[physical,page*72+block],T.int32)
-                    keep[block] = T.cast((mask[0] & (1 << membership[block])) != 0,T.int32)
-                T.cumsum(keep,ordered,dim=0)
-                for block in T.Parallel(blocks):
-                    if membership[block] == local_bucket:
-                        Candidates[row,first[0]*8+ordered[block]-1] = logical_page*blocks+block
+                            Candidates[row,position] = T.if_then_else(position < visible,position,-1)
+                if (cta == 0) & (T.get_thread_binding() == 0):
+                    CandidateLength[row] = extent
+            else:
+                # Native selection is ascending valid IDs followed by -1 padding.
+                search[0] = 0
+                search[1] = budget
+                for step in T.serial(budget.bit_length()):
+                    if search[0] < search[1]:
+                        middle = (search[0]+search[1])//2
+                        if Selected[row,middle] < 0:
+                            search[1] = middle
+                        else:
+                            search[0] = middle+1
+                used = search[0]
+                if cta == 0:
+                    last_present[0] = 0
+                    if (extent > 0) & (partial == 0):
+                        last_bucket = ((extent-1)//page)*buckets+T.cast(
+                            Pool[Table[row,(extent-1)//page],page*72+blocks-1],T.int32)
+                        for j in T.serial(buckets):
+                            if used > j:
+                                last_present[0] = T.max(last_present[0],
+                                    T.cast(Selected[row,used-1-j] == last_bucket,T.int32))
+                    extra = T.cast((extent > 0) & (partial == 0) & (last_present[0] == 0),T.int32)
+                    total = used*8+partial+extra
+                    # Only this disjoint tail/padding range is written by CTA0.
+                    for iteration in T.serial(T.ceildiv(capacity-used*8,32)):
+                        for i in T.Parallel(32):
+                            position = used*8+iteration*32+i
+                            if position < capacity:
+                                Candidates[row,position] = -1
+                                if position < total:
+                                    Candidates[row,position] = T.if_then_else(partial > 0,
+                                        complete+position-used*8,visible-1)
+                    if T.get_thread_binding() == 0:
+                        CandidateLength[row] = total*BLOCK-T.if_then_else(
+                            extent > 0,(BLOCK-extent%BLOCK)%BLOCK,0)
+                for iteration in T.serial(T.ceildiv(T.max(used-cta,0),ctas)):
+                    slot = cta+iteration*ctas
+                    selected = Selected[row,slot]
+                    logical_page = selected//buckets
+                    local_bucket = selected%buckets
+                    physical = Table[row,logical_page]
+                    mask[0] = 0
+                    first[0] = slot
+                    # All selected siblings lie within buckets-1 adjacent slots.
+                    for delta in T.serial(-(buckets-1),buckets):
+                        neighbor = slot+delta
+                        if (neighbor >= 0) & (neighbor < used):
+                            sibling = Selected[row,neighbor]
+                            if sibling//buckets == logical_page:
+                                mask[0] = mask[0] | (1 << (sibling%buckets))
+                                first[0] = T.min(first[0],neighbor)
+                    for block in T.Parallel(blocks):
+                        membership[block] = T.cast(Pool[physical,page*72+block],T.int32)
+                        keep[block] = T.cast((mask[0] & (1 << membership[block])) != 0,T.int32)
+                    T.cumsum(keep,ordered,dim=0)
+                    for block in T.Parallel(blocks):
+                        if membership[block] == local_bucket:
+                            Candidates[row,first[0]*8+ordered[block]-1] = logical_page*blocks+block
     return compact
 
 
 class DirectPageShortlistPlan(PageShortlistPlan):
-    def __init__(self,width,page,*,candidate_blocks=False,budget=None):
+    def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=ROW_CAP):
         self.width,self.page,self.source = width,page,candidate_blocks
+        self.row_cap = row_cap
         self.budget = budget or (512 if candidate_blocks else 64)
         self.capacity = (self.budget+8)*BUCKET
-        self.score = page_scores(width,page)
+        self.score = page_scores(width,page,skip_budget=self.budget)
         self.coarse = IndexerTopK(width//BUCKET,self.budget)
-        self.compact = direct_candidates(width,page,self.budget)
+        self.compact = direct_candidates(width,page,self.budget,whole_domain=True)
         self.final = IndexerV41Plan(self.capacity,page,candidates=True)
         if self.source:
             self.select_blocks = IndexerTopK(self.capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK)
             self.remap = remap_blocks(self.capacity)
 
     @staticmethod
-    def calls(width,page,*,candidate_blocks=False,budget=None):
+    def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=ROW_CAP):
         from .paged_shortlist import page_flags
         from .shortlist_indexer import shortlist_prefix,shortlist_scatter
-        calls = PageShortlistPlan.calls(width,page,candidate_blocks=candidate_blocks,budget=budget)
-        calls = [call for call in calls if call[0] not in (page_flags,shortlist_prefix,shortlist_scatter)]
-        return [*calls,prepare.call(direct_candidates,width,page,budget or (512 if candidate_blocks else 64))]
+        calls = PageShortlistPlan.calls(width,page,candidate_blocks=candidate_blocks,budget=budget,row_cap=row_cap)
+        calls = [call for call in calls if call[0] not in (page_flags,shortlist_prefix,shortlist_scatter,page_scores)]
+        selected_budget = budget or (512 if candidate_blocks else 64)
+        return [*calls,prepare.call(page_scores,width,page,skip_budget=selected_budget),
+                prepare.call(direct_candidates,width,page,selected_budget,whole_domain=True)]
 
     def _specs(self,rows):
         return {name:spec for name,spec in super()._specs(rows).items()
@@ -143,8 +157,8 @@ class DirectPageShortlistPlan(PageShortlistPlan):
         full = dict(zip(specs,scratch))
         def buffers(name,plan,b):
             return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
-        for start in range(0,rows,ROW_CAP):
-            end = min(start+ROW_CAP,rows)
+        for start in range(0,rows,self.row_cap):
+            end = min(start+self.row_cap,rows)
             r = end-start
             current = self._specs(r)
             b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0])

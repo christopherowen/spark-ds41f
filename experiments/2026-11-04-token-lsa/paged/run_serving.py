@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--out',required=True)
     parser.add_argument('--watchdog')
     parser.add_argument('--preflight-only',action='store_true')
+    parser.add_argument('--candidate-profile',default='candidate',help='paired default candidate recipe')
     parser.add_argument('--kernel-jobs',nargs='+',help='isolated bundles before serving boots')
     parser.add_argument('--quality-profiles',nargs='+',help='predeclared label:profile token-only calibration')
     parser.add_argument('--reference-private',help='existing native capture/corpus directory; never copied to Git')
@@ -68,6 +69,12 @@ def main():
     if options.watchdog:
         return w.watchdog(options.watchdog,out)
     out.mkdir(parents=True,exist_ok=False)
+    if not options.quality_profiles:
+        assert all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in options.candidate_profile)
+        assert (HERE/(options.candidate_profile+'.json')).is_file()
+    if options.reference_private:
+        assert (Path(options.reference_private)/'control-a.json').is_file()
+
     commit = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     assert not subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()
     assert subprocess.check_output(['git','branch','-r','--contains',commit],cwd=ROOT,text=True).strip()
@@ -188,7 +195,7 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
 
         completed = []
         jobs = ([tuple(job.split(':',1)) for job in options.quality_profiles] if options.quality_profiles else
-                [('control-a','control'),('shortlist-a','candidate'),('shortlist-b','candidate'),('control-b','control')])
+                [('control-a','control'),('shortlist-a',options.candidate_profile),('shortlist-b',options.candidate_profile),('control-b','control')])
         for label,profile in jobs:
             assert len((label,profile)) == 2 and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in label+profile)
             assert (HERE/(profile+'.json')).is_file()
@@ -204,16 +211,33 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
             w.run([sys.executable,str(HERE.parent/'token_gate.py'),'capture',
                    '--url','http://127.0.0.1:8001','--requests',str(private/'requests.jsonl'),
                    '--identity',str(private/'identity.json'),'--out',str(capture)],out,'tokens-'+label)
+            if label == 'control-a' and options.reference_private:
+                w.run([sys.executable,str(HERE.parent/'token_gate.py'),'compare',
+                       str(Path(options.reference_private)/'control-a.json'),str(capture)],out,'native-baseline-repeat')
             if label != 'control-a':
                 # Failed presets stay failed. A declared token-only calibration
                 # may continue to its next preset; ordinary qualification stops.
                 w.run([sys.executable,str(HERE.parent/'token_gate.py'),'compare',
                        str(private/'control-a.json'),str(capture)],out,'token-comparison-'+label,
-                       allow_failure=bool(options.quality_profiles))
+                       allow_failure=bool(options.quality_profiles and profile != 'control'))
                 if options.quality_profiles:
                     verdict = json.loads((out/('token-comparison-'+label+'.txt')).read_text())
                     assert 'passed' in verdict and verdict['total_requests'] == 9
             if not options.quality_profiles:
+                parallel = private/(label+'-c4.json')
+                w.run([sys.executable,str(HERE.parent/'token_gate.py'),'capture',
+                       '--url','http://127.0.0.1:8001','--requests',str(private/'requests.jsonl'),
+                       '--identity',str(private/'identity.json'),'--concurrency','4','--out',str(parallel)],out,'tokens-'+label+'-c4')
+                if label != 'control-a':
+                    w.run([sys.executable,str(HERE.parent/'token_gate.py'),'compare',
+                           str(private/'control-a-c4.json'),str(parallel)],out,'token-comparison-'+label+'-c4')
+                else:
+                    repeat = private/'control-a-c4-repeat.json'
+                    w.run([sys.executable,str(HERE.parent/'token_gate.py'),'capture',
+                           '--url','http://127.0.0.1:8001','--requests',str(private/'requests.jsonl'),
+                           '--identity',str(private/'identity.json'),'--concurrency','4','--out',str(repeat)],out,'tokens-control-a-c4-repeat')
+                    w.run([sys.executable,str(HERE.parent/'token_gate.py'),'compare',
+                           str(parallel),str(repeat)],out,'native-parallel-repeat')
                 w.run([sys.executable,str(HERE/'request_screen.py'),'bench','--private',str(private),
                        '--out',str(out/('requests-'+label+'.json'))],out,'bench-'+label)
             completed.append(label)

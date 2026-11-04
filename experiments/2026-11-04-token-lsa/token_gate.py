@@ -1,5 +1,6 @@
 """Out-of-band raw generated-token capture/comparison. Never a benchmark client."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ def choices(response):
 
 
 def compare(reference,candidate):
+    if reference.get('concurrency',1) != candidate.get('concurrency',1):
+        raise ValueError('request concurrency differs')
     for key in ('checkpoint','tokenizer'):
         if reference['identity'][key] != candidate['identity'][key]:
             raise ValueError(key+' differs')
@@ -53,9 +56,10 @@ def compare(reference,candidate):
 def capture(options):
     identity = json.loads(Path(options.identity).read_text())
     assert identity.get('checkpoint') and identity.get('tokenizer')
-    records = []
-    for line in Path(options.requests).read_text().splitlines():
-        case = json.loads(line)
+    cases = list(map(json.loads,Path(options.requests).read_text().splitlines()))
+    concurrency = getattr(options,'concurrency',1)
+    assert concurrency > 0
+    def one(case):
         payload = dict(case['payload'])
         assert payload.get('temperature') == 0, 'token-equivalence corpus must declare deterministic greedy generation'
         payload.update(stream=False,return_token_ids=True)
@@ -69,12 +73,14 @@ def capture(options):
             prompt_ids = [x.get('prompt_token_ids') for x in response['choices']]
         if not isinstance(prompt_ids,list) or not prompt_ids or any(x is None for x in prompt_ids):
             raise ValueError('tokenized prompt IDs missing')
-        records.append({'id':case['id'],'input_sha256':digest({'endpoint':endpoint,'payload':
+        return {'id':case['id'],'input_sha256':digest({'endpoint':endpoint,'payload':
             {k:v for k,v in payload.items() if k != 'cache_salt'}}),
             'prompt_token_ids':prompt_ids,
-            'choices':choices(response),'completion_tokens':response['usage']['completion_tokens']})
+            'choices':choices(response),'completion_tokens':response['usage']['completion_tokens']}
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        records = list(pool.map(one,cases))
     assert records and len({x['id'] for x in records}) == len(records)
-    result = {'schema_version':1,'identity':identity,'records':records,
+    result = {'schema_version':1,'identity':identity,'records':records,'concurrency':concurrency,
               'scope':'out-of-band deterministic raw-token capture; no timing'}
     with Path(options.out).open('x') as handle:
         json.dump(result,handle,indent=2);handle.write('\n')
@@ -87,6 +93,7 @@ def main():
     for name in ('url','requests','identity','out'):
         take.add_argument('--'+name,required=True)
     take.add_argument('--timeout',type=int,default=900)
+    take.add_argument('--concurrency',type=int,default=1)
     check = sub.add_parser('compare')
     check.add_argument('reference');check.add_argument('candidate')
     options = parser.parse_args()

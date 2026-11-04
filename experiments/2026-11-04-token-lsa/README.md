@@ -55,3 +55,9 @@ checkout roots clean, and experimental mounts/environment removed.
 The next [page-owned follow-up](paged/README.md) moves essential summary work to
 cache completion and charges storage to cache admission. It is a separate
 unqualified grouping geometry until its own lifecycle and generated-token gates.
+
+The page-owned full-model follow-up has now run: the initial64/512-bucket selector
+fails all three long token gates; native-source dense256 matches7/9 and dense1024
+matches8/9 on both boots. No request-speedup claim or promotion follows. Further
+batching/covered-domain optimizations and a wider calibrated preset are tracked
+in `paged/`; all failed gates and complete restoration receipts are retained.

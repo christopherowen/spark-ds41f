@@ -77,9 +77,12 @@ def _shortlist_options(width, candidates, candidate_blocks):
         return None
     name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
     budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
-    if budget <= 0 or budget & (budget-1):
-        raise ValueError("shortlist budget must be a positive power of two")
-    return dict(candidate_blocks=candidate_blocks, budget=budget)
+    if budget <= 0 or budget % 8:
+        raise ValueError("shortlist budget must be a positive multiple of eight")
+    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "8"))
+    if row_cap <= 0 or row_cap > 256:
+        raise ValueError("shortlist row capacity must be between1 and256")
+    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
 
 
 def _shortlist_class():
@@ -98,7 +101,9 @@ def _index_plan(width, page_size, candidates, candidate_blocks):
 def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
     options = _shortlist_options(width, candidates, candidate_blocks)
     if options is not None:
-        return _shortlist_class().calls(width, page_size, **options)
+        return [*_shortlist_class().calls(width, page_size, **options),
+                *IndexerV41Plan.calls(width, page_size, candidates=candidates,
+                                      candidate_blocks=candidate_blocks)]
     return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
 
 
@@ -256,6 +261,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         mla_args, index_args, chunks = self._plan_args()
         mla = _mla_plan(*mla_args)
         index = {mode: _index_plan(*args) for mode, args in index_args.items()}
+        native_index = {
+            mode: IndexerV41Plan(args[0], args[1], candidates=args[2], candidate_blocks=args[3])
+            for mode, args in index_args.items() if isinstance(index[mode], PageShortlistPlan)
+        }
         # The largest scratch each phase borrows: indexing, then the attention
         # metadata arena with the decode route's segment workspace. They are
         # reserved in the workspace lane this layer runs in, before profiling
@@ -264,12 +273,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         split_rows = min(mla.decode_max_rows, self.capacity)
         self._scratch_reservations = (
             *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
+            *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
             *(
                 (*metadata_specs, *mla.scratch_specs(split_rows))
                 for metadata_specs in self._attention_workspace_specs.values()
             ),
         )
-        return SimpleNamespace(mla=mla, index=index)
+        return SimpleNamespace(mla=mla, index=index, native_index=native_index)
 
     def reserve_profile_scratch(self) -> None:
         """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
@@ -337,10 +347,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         candidate_output=None,
         candidate_output_lengths=None,
     ):
-        # The kernels bound their work by each row's live length on device,
-        # so the host-side ``score_width`` hint has nothing left to trim.
-        del score_width
-        plan = self._tilelang().index[mode]
+        plans = self._tilelang()
+        plan = plans.index[mode]
+        # Outside graph capture, the existing conservative prefill extent can
+        # prove that every key would be kept. Avoid the entire coarse pipeline.
+        if (score_width is not None and isinstance(plan, PageShortlistPlan)
+                and score_width <= plan.budget * 64 + plan.page - 1):
+            plan = plans.native_index[mode]
         scratch = current_workspace_manager().get_simultaneous(
             *plan.scratch_specs(rows)
         )

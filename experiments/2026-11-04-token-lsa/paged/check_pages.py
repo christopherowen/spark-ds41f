@@ -36,7 +36,7 @@ def case(page,source,rows,extent):
     # Different physical caches per owner; no owner deduplication assumption.
     pool[:, :page*64].random_(0,256,generator=g)
     pool[:,page*64:page*68].random_(122,130,generator=g)
-    lengths = torch.tensor([max(extent-i*page//2,0) for i in range(rows)],device='cuda',dtype=torch.int32)
+    lengths = torch.tensor([max(extent-(i%16)*page//2,0) for i in range(rows)],device='cuda',dtype=torch.int32)
     active = torch.tensor([width],device='cuda',dtype=torch.int32)
     q = torch.randint(0,256,(rows,32,64),device='cuda',dtype=torch.uint8,generator=g)
     scales = torch.randint(122,130,(rows,32,4),device='cuda',dtype=torch.uint8,generator=g)
@@ -73,7 +73,7 @@ def case(page,source,rows,extent):
             live = out[r][out[r] >= 0]
             assert len(live) == min(512,visible) and len(live) == len(live.unique())
             assert bool((live < visible).all())
-            if visible < 4096:
+            if visible <= plan.budget*64:
                 torch.testing.assert_close(out[r],expected[r],atol=0,rtol=0)
             if source:
                 ids = blocks[r][blocks[r] >= 0]
@@ -81,7 +81,7 @@ def case(page,source,rows,extent):
                 assert int(counts[r]) == len(ids)*8-((8-visible%8)%8 if visible else 0)
                 if visible:
                     assert int(ids[-1]) == (visible-1)//8
-        start = ((rows-1)//8)*8
+        start = ((rows-1)//plan.row_cap)*plan.row_cap
         for r in range(rows-start):
             n = int(b['candidate_lengths'].view(-1)[r])
             ids = b['candidates'].view(-1,plan.capacity//8)[r,:(n+7)//8]

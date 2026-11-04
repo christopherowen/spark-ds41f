@@ -82,3 +82,34 @@ processes first, then the three token-only boots, and restores C37 once. The
 same immutable C36 control capture/corpus stays node-local; no released runtime
 is retimed. All new sources and the independent guard apply in a fresh named
 C36 tree, with all six mounted source files verified byte for byte.
+
+The calibration at`989e5f63` remains rejected: dense256 matches7/9; dense1024
+matches8/9 on both fresh boots and still differs on the262144-token notebook.
+C37 was restored at21:39:32UTC, independently checked on all three clean nodes.
+All four isolated compaction timing processes pass matched input hashes. Point
+speedups are2.15–4.10x for dense and1.11–2.70x for source shapes; n=2 confidence
+intervals are broad or undefined for several points. These are synthetic
+compaction-only results, retained with complete samples and uncertainty in
+`../runs/calibration-window-01/compact-comparison.json`.
+
+The batching follow-up tests an explicit interaction: a256-row bounded workspace,
+native prefill selection when every visible key is covered, and a device identity
+gather that omits centroid math in covered decode domains. Each query computes
+its answer through the selected path. Reference execution and comparisons stay
+in separate programs. The native source phase already reserves a larger arena;
+all new scratch is nevertheless declared and reserved before profiling.
+
+`dense-1536-fast.json` retains98304 dense keys plus the visible tail and uses
+native source selection. Its262K notebook still prunes dense keys, so a pass
+cannot come solely from all-key coverage. This preset tests fidelity, not a
+promise of acceleration. The256-row boundary gate checks1/255/256/257 rows;
+non-power-of-two compaction is checked independently. Two fresh row8/row256
+performance processes per arm use synthetic repeated captured inputs, include
+separate eager-wall and graph-GPU timings, and report required construction cost.
+
+The next paired request order is native-A, fast1536-A, fast1536-B, native-B. A
+saved native capture is first replayed to check baseline stability. Separate
+raw-token runs cover serial and four-concurrent requests; the native parallel
+reference is itself repeated before candidate measurements. Any mismatch stops
+ordinary qualification before candidate timing. Timed requests still omit token
+metadata. A finite synthetic screen does not qualify production-agent traffic.
