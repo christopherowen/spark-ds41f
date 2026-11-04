@@ -11,8 +11,13 @@ here; #842's default-enablement change remains separate.
 
 This is an unpromoted candidate. The final image's release-test gate passes, and
 focused loop and CopyDrafter reproductions completed on TP3 switched, each with
-a fresh boot and repeat boot. Broader inference and release/performance
-qualification remains pending. The [fault investigation](../../2026-11-03-copy-fault-forensics/README.md)
+a fresh boot and repeat boot. The
+[TP3 triangle qualification](../../2026-11-03-candidate-38-tp3-qualification/README.md)
+now records two functional and two full performance boots per recipe, plus two
+standard tail-latency confirmation boots. Greedy model outputs and recorded
+probabilities match 1030; headline throughput improves. Tail latency and small
+copy-recipe costs remain under review, so this is not a no-regression promotion.
+Broader topology and long-session qualification remains separate. The [fault investigation](../../2026-11-03-copy-fault-forensics/README.md)
 demonstrates the unequal-layout defect and a stale-receive-buffer corruption
 mechanism. Its last host preparation records do not prove which GPU forward
 produced the original NaN.
@@ -61,9 +66,9 @@ Remaining work is focused:
    plus the focused seeded/default/off/clean checks, when changing this path.
    The answer safeguards address observed false positives and are not cleanup
    candidates merely because the policy can be described simply.
-3. Complete the candidate's broader inference and release/performance gates
-   against the recorded release references. The diagnostic runs below are not
-   a no-regression performance verdict.
+3. Review the completed TP3 triangle qualification's latency findings and
+   complete the remaining topology and long-session gates against recorded
+   references. The diagnostic runs below are not a no-regression performance verdict.
 
 The onset/root-cause question stays open under #864. Broader effort, precision,
 activation or DSpark sweeps are investigations to justify from a concrete
