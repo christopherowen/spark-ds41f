@@ -385,7 +385,11 @@ if args.operation == "pair":
             candidate_code = compiled(
                 current_scores.topk_log_softmax_kernel,
                 current_scores.topk_log_softmax_key(
-                    logits.dtype, run, valid is not None, ids.dtype, ids.is_contiguous()
+                    logits.dtype,
+                    run,
+                    valid is not None,
+                    ids.dtype,
+                    current_scores._id_layout(ids),
                 ),
             )
         else:
@@ -506,7 +510,7 @@ if args.operation == "pair":
         cases=rows,
         not_proved=failed,
         gate_passed=not failed,
-        protocol="40 balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
+        protocol="120 balanced randomized mirrored rounds per case; two eight-sample replays per role/round; GPU-resident event nodes; shared output address; cold L2 before every sample; five-SE upper ratio bound with zero regression margin, or identical CUDA program and aliasing reference preparation",
         seconds=time.monotonic() - started,
     )
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")

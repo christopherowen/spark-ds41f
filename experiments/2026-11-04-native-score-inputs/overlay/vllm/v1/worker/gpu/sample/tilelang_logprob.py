@@ -196,7 +196,7 @@ def topk_log_softmax_kernel(
     run: int,
     masked: bool = False,
     id_dtype: str = "int64",
-    compact_ids: bool = True,
+    id_layout: str = "compact",
 ):
     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
@@ -209,8 +209,13 @@ def topk_log_softmax_kernel(
     rows, vocab, topk = T.dynamic("rows, vocab, topk")
     logits_stride = T.dynamic("logits_stride", "int64")
     id_row, id_col = T.dynamic("id_row, id_col", "int64")
-    id_strides = (topk, 1) if compact_ids else (id_row, id_col)
-    gather_first = not compact_ids
+    id_strides = {
+        "compact": (topk, 1),
+        "row": (id_row, 1),
+        "column": (topk * id_col, id_col),
+        "transpose": (1, rows),
+        "general": (id_row, id_col),
+    }[id_layout]
     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
     threads = _SOFTMAX_THREADS
     loads = _SOFTMAX_LOADS
@@ -286,16 +291,6 @@ def topk_log_softmax_kernel(
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
-            if gather_first:
-                # Retire native-id pointers and strides before the row reduction.
-                # The output is also the selected-value scratch; no extra buffer.
-                row64 = T.cast(row, T.int64)
-                for c in T.serial(T.ceildiv(topk, threads)):
-                    col = c * threads + tx
-                    if col < topk:
-                        output[row64, col] = T.cast(
-                            logits[row, token_ids[row64, col]], T.float32
-                        )
             raw = T.alloc_local((per,), logits_dtype)
             peak = T.alloc_local((loads,), T.float32)
             total = T.alloc_local((loads,), T.float32)
@@ -364,10 +359,7 @@ def topk_log_softmax_kernel(
             for c in T.serial(T.ceildiv(topk, threads)):
                 col = c * threads + tx
                 if col < topk:
-                    if gather_first:
-                        picked = output[row64, col]
-                    else:
-                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
                     value = T.call_extern(
                         "float32",
                         "vllm_sub",
@@ -388,9 +380,22 @@ def topk_log_softmax_key(
     run: int = 1,
     masked: bool = False,
     id_dtype: torch.dtype = torch.int64,
-    compact_ids: bool = True,
+    id_layout: str = "compact",
 ) -> tuple:
-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], compact_ids)
+    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], id_layout)
+
+
+def _id_layout(ids: torch.Tensor) -> str:
+    if ids.is_contiguous():
+        return "compact"
+    row, col = ids.stride()
+    if col == 1:
+        return "row"
+    if row == 1 and col == ids.shape[0]:
+        return "transpose"
+    if row == ids.shape[1] * col:
+        return "column"
+    return "general"
 
 
 def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
@@ -399,13 +404,13 @@ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
     return [
         _call(
             topk_log_softmax_kernel,
-            *topk_log_softmax_key(dtype, run, masked, id_dtype, compact_ids),
+            *topk_log_softmax_key(dtype, run, masked, id_dtype, id_layout),
         )
         for dtype in dict.fromkeys(logits_dtypes)
         for run in _runs(dtype)
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
-        for compact_ids in (True, False)
+        for id_layout in ("compact", "row", "column", "transpose", "general")
     ]
 
 
@@ -436,7 +441,7 @@ def topk_log_softmax(
             _triton_run(logits),
             valid is not None,
             token_ids.dtype,
-            token_ids.is_contiguous(),
+            _id_layout(token_ids),
         ),
     )
     # The unmasked specialization never reads the dummy validity tensor.

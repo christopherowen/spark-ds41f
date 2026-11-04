@@ -70,14 +70,14 @@ Both are prepared at startup and read the original input buffer: the layout
 selection never materializes, converts or repacks ids. The second variant's
 source identities and measurements remain separate from the final variant.
 
-## Final qualification
+## v3 historical qualification
 
-The final source is `da925efbc83245de4cbd6824fda9a877b7968fd2`, tree
+The v3 source is `da925efbc83245de4cbd6824fda9a877b7968fd2`, tree
 `032385a555e2c9f3ca7cc69ad0c355a7c7025279`. It was tested from published
 deployment commit `1ed48ff2bb1568b33f8302fe2d4607ae53d48e15`, with native
 evidence on sp8 at `/home/chris/spark-lab/native-score-inputs-20261104/native-v3`.
 
-Both final test boots passed **625 tests**, without failures or skips. Both
+Both v3 test boots passed **625 tests**, without failures or skips. Both
 benchmark boots passed **120 cases**, retaining 21 cold-L2 graph samples per
 method and case. Each boot's 24 launch inventories show exactly one TileLang
 candidate kernel, without an ATen conversion/copy kernel. References that already
@@ -91,7 +91,7 @@ constants, while other layouts retain dynamic addressing. Neither branch
 reformats its input. Both layouts and both integer widths are prepared before
 cache freeze.
 
-The final paired timing ratios range from **-12.71% to +5.95%** on boot means.
+The v3 paired timing ratios range from **-12.71% to +5.95%** on boot means.
 All cases, boot medians, raw samples and 95% Student t intervals (df=1) are retained.
 No blanket speedup or statistical equivalence is claimed from two boots.
 
@@ -121,7 +121,7 @@ with the three prior ATen replacement candidates. The composition check is a
 source check; those three other replacements are not part of these GPU runs.
 The full build check reports that its build directory is not prepared locally.
 
-Reproduce the final analysis without GPU access:
+Reproduce the v3 analysis without GPU access:
 
 ```sh
 python3 experiments/2026-11-04-native-score-inputs/analyze.py \
@@ -177,3 +177,19 @@ Each round still has two mirrored replays per role, and the gate is unchanged.
 Reference and candidate run the same inputs and share the output address.
 Only the measurement mechanism changes in this follow-up; the v4 source is
 unchanged.
+
+### v5 address simplification
+
+The v4 follow-up with GPU-resident timing exposed a real penalty in large BF16
+score cases from the early gather's additional output store/load. Patch 0005
+removes that round trip and reduces address parameters from the existing input
+metadata: contiguous, row-padded, column-sliced and transposed views have simple
+expressions; other views keep general strides. It never repacks the data. Every
+variant is declared before startup freeze and native-input checks now cover
+padded and fully general views as well. The top-k lifetime change is unchanged.
+
+The v5 qualification predeclares 120 mirrored rounds per case (three times the
+earlier sample count), with eight cold-cache samples in each replay. Both boots
+run the full 120-case matrix. Increases and unresolved intervals still fail.
+This additional precision is needed to assess the small conversion savings in
+large batches; it does not change the zero regression margin.

@@ -12,10 +12,12 @@ from paired import classify
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("receipt", type=Path)
+parser.add_argument("--candidate", type=Path, default=HERE / "candidate.json")
 parser.add_argument("--out", type=Path, default=HERE / "paired-results.json")
+parser.add_argument("--rounds", type=int, default=120)
 args = parser.parse_args()
 r = json.loads(args.receipt.read_text())
-c = json.loads((HERE / "candidate.json").read_text())
+c = json.loads(args.candidate.read_text())
 assert all(j["exit"] == 0 and j["result"]["candidate"] == c for j in r["jobs"])
 jobs = {
     op: [j["result"] for j in r["jobs"] if j["job"]["operation"] == op]
@@ -29,7 +31,7 @@ for boot, data in enumerate(jobs["pair"], 1):
     assert len(data["cases"]) == 120
     for row in data["cases"]:
         records = row["measured"]["pairs"]
-        assert len(records) == 40
+        assert len(records) == args.rounds
         assert all(
             Counter(p["order"])
             == {k: 2 for k in ("reference", "candidate", "previous", "null")}

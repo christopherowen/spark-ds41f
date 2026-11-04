@@ -531,14 +531,14 @@ def test_runner_declares_the_launched_calls(logits_mode):
         (
             id(tilelang_logprob.topk_log_softmax_kernel),
             tilelang_logprob.topk_log_softmax_key(
-                dtype, run, masked, id_dtype, compact_ids
+                dtype, run, masked, id_dtype, id_layout
             ),
         )
         for dtype in (torch.bfloat16, torch.float32)
         for run in tls._runs(dtype)
         for masked in (False, True)
         for id_dtype in (torch.int32, torch.int64)
-        for compact_ids in (True, False)
+        for id_layout in ("compact", "row", "column", "transpose", "general")
     }
     declared = _declared(registry)
     softmax = {
@@ -709,7 +709,9 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("layout", ["dense", "sliced", "transposed"])
+@pytest.mark.parametrize(
+    "layout", ["dense", "padded", "sliced", "transposed", "general"]
+)
 @pytest.mark.parametrize("masked", [False, True])
 def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
     """ID strides change addressing, never log-softmax arithmetic."""
@@ -721,6 +723,12 @@ def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
         ids = torch.stack((ids, ids), dim=-1)[..., 0]
     elif layout == "transposed":
         ids = ids.t().contiguous().t()
+    elif layout in ("padded", "general"):
+        step = 1 if layout == "padded" else 2
+        storage = ids.new_empty((rows + 2, cols * step + 7))
+        view = storage[1 : rows + 1, 1 : cols * step + 1 : step]
+        view.copy_(ids)
+        ids = view
     before = ids.clone()
     mask = valid if masked else None
     expected = logprob.compute_token_logprobs(
@@ -797,11 +805,18 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
     for dtype, _ in pairs:
         logits = torch.randn(3, 264, device=DEVICE, dtype=dtype)[:, :257]
         for id_dtype in (torch.int32, torch.int64):
-            ids = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)[:, ::2]
-            valid = ids % 3 != 0
-            for mask in (None, valid):
-                actual = logprob.compute_token_logprobs(logits, ids, mask)
-                assert actual.shape == ids.shape
-            for topk in (0, 5):
-                actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
-                assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
+            storage = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)
+            for ids in (
+                storage,
+                storage[:, :9],
+                storage[:, ::2],
+                storage.t().contiguous().t(),
+                storage[:, 1:17:2],
+            ):
+                valid = ids % 3 != 0
+                for mask in (None, valid):
+                    actual = logprob.compute_token_logprobs(logits, ids, mask)
+                    assert actual.shape == ids.shape
+                for topk in (0, 5):
+                    actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
+                    assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])

@@ -28,7 +28,7 @@ def classify(samples, identical_program=False):
     return dict(summary, status=status)
 
 
-def measure(launches, flush, seed, expected, rounds=40, samples_per_replay=8):
+def measure(launches, flush, seed, expected, rounds=120, samples_per_replay=8):
     import torch
 
     graphs, outputs, events = {}, {}, {}
