@@ -1,5 +1,13 @@
 # Full 43-Layer Forward-Pass IKET Recording and IKET Runtime Optimizations
 
+2026-11-04 follow-up: the numbers below describe this historical workload.
+Do not reuse its 42-slot allocation for candidate-38: that candidate has a
+60-event finite bound and two kernels with unknown bounds. The wrapper now
+supports manifest-checked automatic capacity for bounded replays. The
+[Spaceport repair experiment](../2026-11-04-iket-repair/README.md) also isolates
+whole-model warp-trace buffer exhaustion and verifies a small phase replay.
+Use a separate uninstrumented Nsight run for application timing.
+
 ## Overview
 
 This experiment completes the full 43-layer (`40` target layers + `3` DSpark speculative drafter layers) DeepSeek-V4.1-Flash forward-pass IKET recording on `dgx4` (TP4 rank shard shape: `16` attention heads, `2` `o_groups`, `moe_intermediate_size=576`, `c1` decode with `5` speculative drafts = `6` verified rows/step) and measures four concrete runtime and memory optimizations to the IKET profiling pipeline itself.
