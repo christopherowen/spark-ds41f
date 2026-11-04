@@ -6,6 +6,13 @@ recorded spark-ds41f-1030 TP3 release. This qualifies the combined candidate;
 it does not attribute any difference to an individual patch. The standard and
 CopyDrafter recipes are reported separately, each with a boot and repeat boot.
 
+Measurements are complete. Both recipes preserve the recorded greedy model
+outputs and improve headline throughput against 1030. Retain the candidate for
+review: C4 tail latency, mixed-prefill latency and small copy-recipe costs prevent
+a blanket no-regression claim. [Decision](decision.md) and [normalized results](results.json)
+retain these limits. The original candidate-36 service is restored on all three
+nodes and the shared window is closed; no release is promoted.
+
 The owner authorized building on dgx4 and testing on dgx1–3 using the normal
 regression workflow. The current serving profile to restore is
 `experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json` on the
@@ -160,8 +167,8 @@ exited on truncated input. Both transfers then completed successfully; a separat
 comparison and the complete archive audit passed. Its failed collection-attempt
 receipt is retained with the controls; it was not a failed GPU measurement.
 
-The focused confirmation is complete; CopyDrafter's two performance boots are
-running. No recipe, lock or published baseline has been promoted or rewritten.
+The focused confirmation and CopyDrafter's two performance boots are complete.
+No recipe, lock or published baseline has been promoted or rewritten.
 
 The standard repeat's C4 TTFT p99 is 322.96 ms against the reference's
 310.59 ms (+3.98%, a direction-only flag without an interval); the first boot
@@ -304,3 +311,66 @@ job was changed or restarted. The repeat model/scoring step subsequently
 completed successfully. The [access incident receipts](runs/2026-11-03-dgx1-3/workstation-access/)
 retain this observation without attributing an unconfirmed transport cause to
 the candidate.
+
+## Completed CopyDrafter performance
+
+Across both boots, all 26 ordered suite steps completed successfully. Their 2,452
+closed-loop/Poisson request-table records have zero failed, rejected, foreign or
+approximate-timing requests and all produce 256 tokens. Both boots retain all
+15 successful prefill samples and three successful repeats at each stall point.
+The [native records and audit](runs/2026-11-03-dgx1-3/performance-copy/) verify
+all 60 archived files against the published runtime, profile and image.
+All 18 first-boot preview files match the final archive byte-for-byte.
+
+| Metric | Change vs recorded 1030 | Decision margin | Verdict |
+| --- | ---: | ---: | --- |
+| Fixed-row grid step time | −16.31% | 0.66% | better |
+| Greedy decode C8 / C4 / C1 | +2.98% / +4.01% / +4.67% | 0.71% / 0.88% / 0.31% | better |
+| Sampled decode C16 / C8 / C1 | +2.93% / +4.14% / +4.69% | 1.89% / 0.99% / 0.31% | better |
+| Prefill 32K / 131K / 262K | +4.62% / +4.85% / +4.50% | 1.06% / 0.61% / 0.63% | better |
+| Prefill 524K | +3.77% | 0.37% | better, reference caveat above |
+| Prefill 1M | +0.10% | 0.58% | same, reference caveat above |
+
+Readiness is 105.5/104.7 seconds. Startup minima (dgx1/2/3) are
+6.883/9.703/9.957 GiB and 6.994/10.163/10.247 GiB; runtime minima across
+the three suites are 6.58/10.26/10.20 GiB and 6.91/10.20/10.11 GiB.
+Neither boot halted, grew swap, recorded thermal slowdown or failed to restore
+its fan state. Both model runs also
+[match both archived released boots](runs/2026-11-03-dgx1-3/historical-model-comparison-copy/):
+256/256 greedy outputs and identical selected-token probabilities and recorded
+top-20 distributions over 65,536 positions, all finite, KL zero.
+
+No headline verdict against 1030 is worse, but three adverse raw rows remain.
+C4 p99 is 321.95/324.46 ms (+3.66%/+4.46%). With three streams beside a
+131K prefill, the wait before the first chunk is 0.512/0.522 s against
+0.438 s; the repeat is flagged worse (+19.14%, interval 10.46%). Standard's
+corresponding waits are already 0.501/0.488 s. Copy's worst decode wait during
+that prefill is 1.700/1.495 s against 1.103 s, with wide intervals and an
+inconclusive verdict. Its p90 decode step is faster on both boots and the short
+probes' first-token latency improves; these gains do not erase the adverse rows.
+
+The [direct recipe comparison](runs/2026-11-03-dgx1-3/recipe-comparison/) uses
+each standard boot separately as the reference for both copy boots, retaining
+each profile's repeat independently. Paired C4 decode changes −0.32%/−0.31%,
+greedy C1 −0.37%/−0.13%, and sampled C1 −0.34%/−0.15%, depending on the
+standard reference boot. The former reference flags these small losses; the
+latter is within its decision margins. The grid table reads +0.39%/+0.80%,
+with margins 0.62%/0.61% and same/worse verdicts. Prefill is essentially level;
+the 524K direction also depends on the reference boot. This compares complete
+recipes, including copy's batch/capture sizing, rather than isolating patch 0677.
+Keep both reference choices and all raw rows; do not call the copy recipe free.
+
+## Restoration
+
+Window `dgx1-1793730237` closed at 2026-11-04 02:02:46 UTC after candidate 36
+became ready at +100.4 seconds. The
+[independent restoration records](runs/2026-11-03-dgx1-3/restoration/)
+confirm image `sha256:b0522146640a7d852c017ec8c99423224492b7c2c4951eb3a64005ab4555ab11`
+and the original `candidate-36/tp3-dev.json` profile on all three nodes, with
+matching Config/layers, healthy fresh containers and zero restart counts.
+All three checkouts remain clean and detached at the tested deployment commit.
+Complete rank logs are untruncated, hash-verified and free of the checked fault
+patterns; their content stays private. Fan states match the initial service,
+no lab clock marker remains, and both hold-file names are absent on dgx1.
+Independent live doctor passes with the same wireless/weight-fragmentation
+recommendations recorded before testing.
