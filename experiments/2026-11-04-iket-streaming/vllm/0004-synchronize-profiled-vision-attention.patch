@@ -1,0 +1,106 @@
+From 2d912573d729336187be270266a60a20424cb5ee Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 04:00:41 +0100
+Subject: [PATCH] [DS4.1] synchronize profiled vision attention producers
+
+Base: candidate-38 on upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the three local profiling fixes.
+
+Rationale: the full encoder exposed the same reused-barrier producer lag in vision_attention_kernel. The in-container CUDA debugger found only warp 1 active in mbarrier_wait after the consumers had exited. Apply the same 128-producer rendezvous to the recognized attention loop, whose trip count is CTA-uniform and depends on image rows. Reflow the earlier additions without changing their behavior.
+
+Quality: profiling off remains unchanged; profiling on adds synchronization and must not be used to infer ordinary performance. No arithmetic or transfers are removed.
+
+Tests: 19 CPU phase-pass cases pass. GPU repeat boots are recorded in the deployment experiment. Upstream status: local experiment, not submitted.
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 13 +++++++++-
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 26 +++++++++++++------
+ 2 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index eadf0947d8..4ed7255e0a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -268,7 +268,9 @@ def test_runtime_while_is_sampled_without_changing_its_test():
+     assert all(isinstance(s["events_per_warp_bound"], int) for s in sites)
+     assert any(s.get("loop_trips", 0) is None for s in sites)
+     # Full iteration tracing still explicitly has no static capacity bound.
+-    assert {s["events_per_warp_bound"] for s in iket.annotate(code, _token)[1]} == {None}
++    assert {
++        s["events_per_warp_bound"] for s in iket.annotate(code, _token)[1]
++    } == {None}
+ 
+ 
+ def test_network_exchange_stage_doorbell_and_gather_have_distinct_phases():
+@@ -336,6 +338,15 @@ def test_vision_producer_barrier_refuses_conflicts_and_unknown_layout():
+             'tl::tl_shuffle_elect<128>()', 'other()'))
+ 
+ 
++def test_vision_attention_dynamic_producer_loop_rendezvous():
++    code = VISION_PRODUCERS.replace(
++        "vision_swiglu_linear_kernel", "vision_attention_kernel"
++    ).replace("ko < 16", "ko < ((M + 63) >> 6)")
++    out = iket._synchronize_vision_producers(code)
++    assert 'bar.sync 15, 128;' in out
++    assert 'ko < ((M + 63) >> 6)' in out
++
++
+ def test_module_without_kernels_is_unchanged():
+     code = (
+         "#include <tl_templates/cuda/copy.h>\n__device__ int f(int x) { return x; }\n"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index f8eba3222d..0dffff0796 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -493,24 +493,33 @@ def _synchronize_vision_producers(code: str) -> str:
+     Only the elected warp issues copies, but all four generated producer warps
+     wait on the two-stage pipeline. Tracing can delay a non-copy warp past two
+     barrier generations. A producer-only rendezvous prevents that parity ABA.
+-    Barrier 15 is reserved here only for these two known generated kernels.
++    Barrier 15 is reserved here only for these three known generated kernels.
+     """
+     changes = []
+     for name, _, start, end in _kernels(code):
+-        if name not in ("vision_linear_kernel", "vision_swiglu_linear_kernel"):
++        if name not in (
++            "vision_linear_kernel", "vision_swiglu_linear_kernel",
++            "vision_attention_kernel",
++        ):
+             continue
+         if _CONDITIONAL.search(code, start, end):
+             continue
+         nodes, _ = _Parser(code).block(start)
+         for node in nodes:
+-            if not re.fullmatch(r"if\s*\(\(\(int\)threadIdx\.x\)\s*<\s*128\)", node.text):
++            if not re.fullmatch(
++                r"if\s*\(\(\(int\)threadIdx\.x\)\s*<\s*128\)", node.text
++            ):
+                 continue
+             if re.search(r"bar\.sync\s+15\b", code[start:end]):
+                 raise ValueError("vision producer rendezvous needs unused barrier 15")
+-            loops = [child for child in node.body or []
+-                     if child.text.startswith("for")
+-                     and "tl::tl_shuffle_elect<128>()" in code[child.start:child.end]
+-                     and re.search(r"mbarrier\[.*\]\.wait\(", code[child.start:child.end])]
++            loops = [
++                child for child in node.body or []
++                if child.text.startswith("for")
++                and "tl::tl_shuffle_elect<128>()" in code[child.start:child.end]
++                and re.search(
++                    r"mbarrier\[.*\]\.wait\(", code[child.start:child.end]
++                )
++            ]
+             if len(loops) != 1:
+                 raise ValueError("unrecognized vision TMA producer loop")
+             loop = loops[0]
+@@ -592,7 +601,8 @@ def annotate(
+     CTA, evenly spread across warp groups, record their ranges so trace stores do
+     not contend across every warp of a CTA. With ``iters`` > 0 a range inside a
+     ``for`` loop records in at most that many of its iterations, evenly spread
+-    (a ``while`` loop uses a saturating counter and records its first sampled iterations):
++    (a ``while`` loop uses a saturating counter and records its first sampled
++    iterations):
+     run-iket reserves the run's largest warp record for every warp of every
+     instrumented launch, so one long kernel sizes the whole run's buffer. With
+     ``granularity="phase"``, consecutive waits and same-phase siblings separated
+-- 
+2.54.0 (Apple Git-157)
+

@@ -493,24 +493,33 @@ def _synchronize_vision_producers(code: str) -> str:
     Only the elected warp issues copies, but all four generated producer warps
     wait on the two-stage pipeline. Tracing can delay a non-copy warp past two
     barrier generations. A producer-only rendezvous prevents that parity ABA.
-    Barrier 15 is reserved here only for these two known generated kernels.
+    Barrier 15 is reserved here only for these three known generated kernels.
     """
     changes = []
     for name, _, start, end in _kernels(code):
-        if name not in ("vision_linear_kernel", "vision_swiglu_linear_kernel"):
+        if name not in (
+            "vision_linear_kernel", "vision_swiglu_linear_kernel",
+            "vision_attention_kernel",
+        ):
             continue
         if _CONDITIONAL.search(code, start, end):
             continue
         nodes, _ = _Parser(code).block(start)
         for node in nodes:
-            if not re.fullmatch(r"if\s*\(\(\(int\)threadIdx\.x\)\s*<\s*128\)", node.text):
+            if not re.fullmatch(
+                r"if\s*\(\(\(int\)threadIdx\.x\)\s*<\s*128\)", node.text
+            ):
                 continue
             if re.search(r"bar\.sync\s+15\b", code[start:end]):
                 raise ValueError("vision producer rendezvous needs unused barrier 15")
-            loops = [child for child in node.body or []
-                     if child.text.startswith("for")
-                     and "tl::tl_shuffle_elect<128>()" in code[child.start:child.end]
-                     and re.search(r"mbarrier\[.*\]\.wait\(", code[child.start:child.end])]
+            loops = [
+                child for child in node.body or []
+                if child.text.startswith("for")
+                and "tl::tl_shuffle_elect<128>()" in code[child.start:child.end]
+                and re.search(
+                    r"mbarrier\[.*\]\.wait\(", code[child.start:child.end]
+                )
+            ]
             if len(loops) != 1:
                 raise ValueError("unrecognized vision TMA producer loop")
             loop = loops[0]
@@ -592,7 +601,8 @@ def annotate(
     CTA, evenly spread across warp groups, record their ranges so trace stores do
     not contend across every warp of a CTA. With ``iters`` > 0 a range inside a
     ``for`` loop records in at most that many of its iterations, evenly spread
-    (a ``while`` loop uses a saturating counter and records its first sampled iterations):
+    (a ``while`` loop uses a saturating counter and records its first sampled
+    iterations):
     run-iket reserves the run's largest warp record for every warp of every
     instrumented launch, so one long kernel sizes the whole run's buffer. With
     ``granularity="phase"``, consecutive waits and same-phase siblings separated
