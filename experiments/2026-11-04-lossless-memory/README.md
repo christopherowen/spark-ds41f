@@ -110,7 +110,9 @@ The six `fp8/kernel-*.json` plans give each lane count a first and repeat run
 in separate fresh test containers, preserving distinct native output files.
 Those are repeated decoder microbenchmarks, **not** serving boots. All six
 target runs passed byte reconstruction and failed the performance gate; see
-`fp8/gpu-results.json`. A winning byte consumer
+`fp8/gpu-results.json`. Six further fixed-field runs also passed their exact-byte
+gates and lost to the paired word-sized raw control; see
+`fp8/fixed/gpu-results.json`. A winning byte consumer
 still requires a fused GEMM consumer and the two full serving boots before any
 release claim. No inference kernel calls this prototype.
 

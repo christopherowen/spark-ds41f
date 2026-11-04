@@ -25,6 +25,17 @@ MANAGEMENT_ERRORS = ("ssh: connect", "cannot reach", "kex_exchange_identificatio
                      "memory telemetry did not start")
 
 
+def preflight(arm, through):
+    kinds = ["image", "kernel", "full-gate"]
+    if through == "release":
+        kinds.append("release-tp3")
+    problems = []
+    for kind in kinds:
+        spec = json.loads((arm / (kind + ".json")).read_text())
+        problems.extend(kind + ": " + problem for problem in lab.plan_problems(lab.plan(spec)))
+    return problems
+
+
 def native_kernel_gate(value, images):
     rows = value.get("verdicts", [])
     if (value.get("agree") is not True or len(rows) != len(images)
@@ -97,12 +108,13 @@ def main():
     if not out.is_relative_to(ROOT / "results/private"):
         parser.error("receipts must stay under results/private")
     if not args.apply:
+        problems = preflight(arm, args.through)
         print(json.dumps({"component": args.component, "restore": RESTORE, "window": args.window,
                           "build_and_gate": [str((arm / (n + ".json")).relative_to(ROOT))
                                              for n in ("image", "kernel", "full-gate")],
                           "release_spec": release, "through": args.through,
-                          "out": str(out), "restores_at_end": True}, indent=2))
-        return 0
+                          "out": str(out), "restores_at_end": True, "problems": problems}, indent=2))
+        return int(bool(problems))
     def owns():
         hold = lab.read_hold()
         return bool(hold and hold.get("window") == args.window and hold.get("holder") == HOLDER
@@ -211,6 +223,11 @@ def main():
     code = 1
     try:
         guard()
+        problems = preflight(arm, args.through)
+        receipt["preflight_problems"] = problems
+        save()
+        if problems:
+            raise RuntimeError("invalid measurement plans: " + "; ".join(problems))
         problems = lab.published_problems()
         if problems:
             raise RuntimeError("publish guard: " + "; ".join(problems))

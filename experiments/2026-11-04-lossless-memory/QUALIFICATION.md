@@ -1,7 +1,8 @@
 # Qualification sequence
 
 These are measurement candidates. The standalone FP8 GPU screen ran and rejected
-all three tested Huffman layouts. Neither isolated serving image has been built;
+all three tested Huffman layouts and all three fixed-field layouts. Each of the
+twelve fresh containers passed its exact-byte gate. Neither isolated serving image has been built;
 no serving improvement or release acceptance is claimed.
 
 ## Source identities
@@ -20,7 +21,11 @@ no revision, source bytes or check was substituted. Complete local inputs for bo
 auxiliary sources and hash-locked aarch64 wheels. Both `build check` commands
 pass. `runs/full-input-preparation/` retains the initial fetch failure and retry;
 `runs/engram-observation-preparation/` records the final instrumented Engram tree.
-Target image builds and checks are still required.
+Target image builds and checks are still required. The first image attempt was
+rejected before stopping service because its plan used a non-resolving profile
+path; `runs/component-plan-failure/` retains the original receipt and logs.
+Both plans now use complete repository-relative paths, and the controller
+validates every selected lab plan before image or serving operations.
 
 Reproduce the source preparation and local configuration checks with:
 
