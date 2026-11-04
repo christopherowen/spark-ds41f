@@ -242,3 +242,27 @@ and assess its results with this known source issue recorded. Qualify a separate
 corrected candidate before copy-match tuning or promotion. Passing ordinary
 output comparisons alone would not close the scratch-read issue; performance
 measurements do not replace the sanitizer and correctness gates.
+
+## Functional collector identity error
+
+The functional phase exited zero at 11:14:03 UTC and the controller proceeded to
+performance. That phase exit is not an all-step qualification pass: both runtime
+collector extras exited 1. This experiment reused a candidate-38 collector whose
+expected image ID is a hardcoded candidate-38 digest. Its original failed checks
+remain preserved. No other nonzero functional exit line appeared in the compact
+controller-log review; each raw result still needs the final local audit.
+
+Read-only inspection of the six saved rank identities across both functional
+boots confirms the actual container and image IDs all equal candidate-39's gated
+`sha256:17550af8ae03a42919d72fac7d2771a18f0f30300b45f0b06edc1ac83625f885`.
+All six recorded a running unchanged container before/after collection, with
+only the stale expected-ID issue. The compact review is saved separately in
+`runs/2026-11-04-dgx/attempt-3/collector-identity-review.json`. It does not rewrite
+the native verdicts or establish a full repaired evidence pass.
+
+Keep the active image, specs and workloads pinned at execution commit `2e6bc10e`.
+After timing ends, collect and verify the original logs, hashes, source labels and
+rank agreement locally against the intended immutable image, retaining the old
+failures and any newly found issue. Future candidates need a collector with an
+explicit expected-image input. Do not remeasure candidate-39 to repair a metadata
+check or silently replace a native failed receipt.

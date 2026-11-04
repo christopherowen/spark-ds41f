@@ -28,3 +28,10 @@ prepared tree. Retain the unique PR and qualify a separate corrected candidate
 before copy-match tuning or promotion. Keep the current running image and every
 measurement unchanged. The PR's sanitizer results remain supplied evidence until
 the corrected candidate's own gates pass.
+
+The functional phase's zero exit does not close its two failed runtime-collector
+extras. Their expected ID was incorrectly pinned to candidate-38; all six saved
+rank image IDs match the intended gated candidate-39 image and have no other
+reported collector issue. Preserve the native failures, finish the frozen matrix,
+and perform explicit local evidence revalidation after timing. No benchmark is
+replaced to repair this collector error, and no full correctness pass is inferred.
