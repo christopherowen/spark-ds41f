@@ -12,12 +12,17 @@ import sys
 parser = argparse.ArgumentParser()
 parser.add_argument("operation", choices=["full"])
 parser.add_argument("--out", type=Path, required=True)
+parser.add_argument("--uniform", action="store_true")
 args, rest = parser.parse_known_args()
 from stream.collector import enable
 from stream.export import records
 
 collector = enable(
-    args.out / "stream", ring_bytes=8 << 20, chunk_bytes=64 << 20, patched=True
+    args.out / "stream",
+    ring_bytes=8 << 20,
+    chunk_bytes=64 << 20,
+    patched=True,
+    uniform_registers=args.uniform,
 )
 sys.argv = ["/h/iket_step.py", "off", "--out", str(args.out / "model"), *rest]
 try:
