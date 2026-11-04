@@ -79,3 +79,13 @@ def select_clusters(scores, bounds, seed_ids, k, cluster_size):
             for p in range(c * cluster_size, min((c + 1) * cluster_size, len(scores)))]
     winners = sorted(kept, key=lambda p: (-scores[p], p))[:k]
     return sorted(winners), kept
+
+
+def source_block_ids(scores, k, group):
+    """Finite-score source oracle: ordinary winners plus the mandatory last."""
+    values = [max(scores[p:p+group]) for p in range(0, len(scores), group)]
+    if not values:
+        return [], values
+    ordinary = [b for b in range(len(values)-1) if values[b] > -math.inf]
+    winners = sorted(ordinary, key=lambda b: (-values[b], b))[:k-1]
+    return sorted(winners + [len(values)-1]), values

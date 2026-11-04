@@ -100,90 +100,72 @@ shape, exact attention and greedy digests, teacher-forced distributions, mixed
 traffic, and memory/admission gates at the frozen workload limits, compared with
 the **recorded** release suites. Only the owner may accept promotion.
 
-## Hardware results and decision
+## Hardware evidence
 
-GB10 SM121, the exact recorded `spark-ds41f:1030` image. The released scorer is
-used for correctness only, never timed. `provenance.json` records each published
-harness commit, exact command, and the sanitizer version and binary hash.
+Every native receipt, error, exact command and input hash is retained under
+`runs/`; `provenance.json`, `results.json` and `sp8-results.json` index the runs.
+The native scorer is correctness-only. Timings below measure unreleased
+prototypes, including metadata rebuilding, compaction and candidate selection.
+They are not released-build or serving speedups.
 
-- `attempt-01`: failed TileLang build; an integer condition needed an explicit
-  boolean comparison. The complete error is retained.
-- `attempt-02`: six corrected snapshot cases pass.
-- `attempt-03` and `attempt-04`: all 12 expanded cases pass in two fresh
-  containers. Cases include normal-scale extremes, NaN keys/queries/weights,
-  ties, a cache mutation that changes the winners, and domains through 262K keys.
-- `initcheck-01`: functional selection passes, but strict initialization checking
-  **fails with 4,608 unwritten reads** in the existing top-k merge. Its bitwise
-  condition reads scratch entries from inactive lists before masking them.
-  The independent `topk-original-01` reproducer reports 1,536 errors without
-  invoking the clustered search. Both failures are retained.
-- The independent [top-k fix](../2026-11-04-topk-live-reads/README.md) guards the read with a lazy outer
-  condition, preserving live arithmetic and ordering. The independent
-  `topk-fixed-01` reproducer and complete `initcheck-02` report **0 errors**.
-  Initcheck covers 10 cases through 16K with fresh allocations and cache tails
-  left unwritten. Allocator statistics are unavailable in this mode; reported
-  raw zero counters do not mean zero GPU memory usage.
-- `eager-fixed-01` and `eager-fixed-02`: all 12 cases pass, retaining the archived
-  selected-position digests. `graph-01` and `graph-02` do the same in two fresh
-  containers, including replay after reduced visibility, an empty active
-  domain, and restoration of the original counts.
-- `memcheck-02`: all 12 cases, **0 errors**. `racecheck-02`: 10 cases through 16K,
-  **0 hazards, 0 errors, 0 warnings**. The earlier `memcheck-01`/`racecheck-01`
-  receipts are retained at their original source revisions. Sanitizer timings
-  are excluded from performance interpretation.
-- Seven CPU arithmetic/selection cases pass. Python 3.12 syntax, patch/overlay
-  identity and both local doctors pass. Freshly applying the 558-patch capture
-  base reproduces candidate-36's exact source tree.
+The initial dgx4 prototype passed 12 fixtures in two eager and two graph
+processes. Its medians at 262,143 keys were about 3.7 ms (separable) and 5.8 ms
+(random). Profiling identified envelope rebuilding as 85% of kernel time.
+The first compile failure and the top-k initialization failures (4,608 in the
+full search and 1,536 in the independent reproducer) remain recorded. The lazy
+scratch-read guard fixed those reads without changing live arithmetic; full
+initcheck, memcheck and racecheck then passed. Three dgx4 windows closed with
+candidate-36 production unchanged, at 08:23:17, 09:07:10 and 10:15:21 UTC.
 
-At 262,143 keys, separable synthetic input retains 576 keys; random input retains
-all 262,143. The guarded candidate's median wall times are:
+On sp8, the screened changes have these two fresh-process medians:
 
-| Execution | Separable, two fresh containers | Random, two fresh containers |
+| Prototype; 262,143 keys | Separable | Random |
 | --- | --- | --- |
-| Eager | 3.690 / 3.683 ms | 5.801 / 5.854 ms |
-| CUDA graph | 3.657 / 3.667 ms | 5.840 / 5.834 ms |
+| Archived unreleased envelope | 3.591 / 3.583 ms | 5.678 / 5.694 ms |
+| Streamed envelope, scalar bounds | 0.769 / 0.791 ms | 1.070 / 1.092 ms |
+| Streamed envelope, tensor-core bounds | 0.298 / 0.306 ms | 0.551 / 0.553 ms |
 
-Complete candidate timing includes metadata rebuilding and compaction. The two
-input distributions are different, so their ratio is **not a speedup**. There is
-no released-build or end-to-end speed claim. Graph capture barely changes the
-long-domain cost. The candidate-only instrumented `graph-profile-01` trace puts
-about **85% of GPU kernel time in envelope rebuilding** and 9–13% in query
-bounds. Raw traces, hashes and stage totals are in `profiling.json`. These
-instrumented durations diagnose the bottleneck; they are not performance gates.
+All 20 fixtures preserve selected keys and pass full-score bounds checks and
+graph visibility rollback/empty/restore. Streamed and tensor-core variants each
+pass initcheck (18 fixtures), memcheck (20), and racecheck (18), with zero errors
+or hazards. Exceptional scales, large signed weights, cancellation, subnormals,
+NaNs, page tails and unwritten allocations are included. Two of the fixtures
+are too large for the bounded init/race screen. Eleven CPU tests pass.
+`sp8-profiling.json` records instrumented diagnostics: tensor bounds reduce their
+stage cost, leaving snapshot rebuilding dominant. Traces are not timing gates.
 
-The largest observed PyTorch allocation peak was 47,190,016 bytes; this excludes
-the CUDA context and is not total host memory. The latest slot began with about
-116 GiB of host MemAvailable and a hottest sampled sensor of 40.2 C. Its fixed
-source commit is `6cc82a8956a1a67bb21dd60ef969f30063c45fbe`.
+The explicit one-owner grouped snapshot also passes two graph processes with
+four multi-query fixtures. At 65,536 planned keys and 128 separable query rows,
+sharing metadata changes candidate medians from 7.046 / 7.047 ms to
+0.767 / 0.767 ms. For random rows they change from 13.383 / 13.466 ms to
+3.498 / 3.530 ms. Metadata tensors shrink from 128 MiB to 1 MiB and the
+harness allocation peak from 181.3 MiB to 64.8 MiB. These are test allocations,
+not serving memory or admission measurements. Boundary-row and dedicated
+sanitizer screens are prepared next. No persistent cache metadata is used.
 
-The speed target is not established. First reduce snapshot metadata cost and
-collect real DeepSeek operands to decide whether the bounds prune useful work.
-Persistent metadata would need explicit cache ownership, append, overwrite,
-rollback and reuse rules. Approximate selection is not an accepted shortcut.
-See `decision.md`, `results.json` and `capture/README.md`.
+All native sp8 jobs have returned their host reservation. No serving state,
+image tag, production configuration or immutable baseline changed. Complete
+image build inputs are absent locally; `build check` reports an unprepared
+build tree. Real-input capture/replay and serving qualification remain pending.
 
-The three windows closed with the original candidate-36 TP3 profile already
-serving (08:23:17, 09:07:10 and 10:15:21 UTC). The latest dgx4 slot ran from
-10:05:43 to 10:15:21 UTC and was returned for the other task's qualification.
-No serving start, stop, restart or cluster sync was performed. Foreign requests
-were preserved. Real-input capture/replay remains pending; its prepared hook
-has not run. Full image build inputs are absent locally; `build check` reports
-that the build tree is not prepared. No image was rebuilt or modified.
+## Source-layer handoff gate
 
-## Prepared envelope resource change
+`vllm/0006-preserve-source-handoff.patch` prepares a joint source-layer plan.
+Source rows publish both top-512 keys and top-2048 blocks of eight positions;
+a later reindex query depends on the block IDs, their order and position count.
+A threshold from immediate winners alone cannot qualify this interface.
 
-`vllm/0003-stream-envelope.patch` changes one causal variable: the envelope
-reduction's register state. It streams the same visible keys with two endpoints
-per coordinate instead of materializing two 64-by-128 fragments. The decoder,
-unsupported-scale handling, bounds, scorer, threshold and tie order are unchanged.
-This remains a complete snapshot rebuild, with no persistent metadata.
+The source candidate scores a larger seed, takes the ordinary block cutoff
+excluding the native forced-last block, and keeps all bound ties plus the global
+last visible cluster. Retained scores are restored to the native logical grid
+before unchanged block selection. A shared lookup and one writer per dense
+position avoid scatter races and initialization fills. Small planned domains
+use the native source plan directly and are correctness-only, never timed.
 
-`resource-layout.json` records its base and gates. Hardware results above belong
-to the preceding reduction at their published commits and do not qualify this
-candidate. The harness now compares both interval endpoints against a frozen
-copy of that reduction before timing, then runs all existing exact-selection
-checks. `graph-profile` uses a new trace label to preserve earlier evidence.
-The first two fresh runs, graph replays and sanitizer checks remain pending.
+`source-handoff.json` records the variable. Its CPU oracle and fresh patch/source
+checks pass; GPU validation is still pending. The harness compares all immediate
+keys, every handoff block and count, BF16 score bits, following reindex output,
+graph visibility changes and late cache mutations. There is no serving dispatch.
 
 ## Independent top-k fix
 
@@ -237,7 +219,7 @@ checks all 784 decoded code/scale values for exact BF16 representation and check
 split-bound dominance under signed weights and cancellation. Hardware arithmetic
 and exact-selection gates remain required before this path can qualify.
 
-`matrix-bounds.json` records the one variable and pending gates. Its results must
+`matrix-bounds.json` records the one variable and completed synthetic gates. Its results must
 be compared with the streamed scalar candidate on the same sp8 runtime, in two
 fresh processes, keeping all failed runs. Earlier scalar results do not qualify
 this optional path.

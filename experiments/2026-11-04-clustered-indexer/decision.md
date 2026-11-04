@@ -1,36 +1,27 @@
-# Retain for evidence; do not integrate or promote
+# Continue exact-output qualification; no promotion
 
-The exact-output requirement stands. All 12 expanded GB10 snapshot cases pass
-in two fresh guarded eager runs and two fresh CUDA graph runs, retaining the
-archived selected-position digests. Captured replays also pass after reduced
-visibility, an empty active domain and restoration. Seven CPU arithmetic and
-selection tests pass. These are standalone checks, not candidate serving boots
-or full model qualification.
+Repeated sp8 screens establish substantial improvements over earlier unreleased
+prototypes. The streamed envelope and tensor-core bound each preserve all
+selected keys across 20 numeric and cache fixtures, graph visibility changes and
+three dedicated sanitizer modes. Explicit one-owner sharing also lowers repeated
+snapshot cost and allocation in four multi-query fixtures. Native receipts and
+candidate-only process intervals are in `sp8-results.json`; profiles are in
+`sp8-profiling.json`. No released build was timed again.
 
-Strict initialization checking found a pre-existing top-k merge read of
-unwritten scratch entries. The independent original reproducer fails with
-1,536 errors; the guarded reproducer passes with zero. The complete guarded
-search passes initcheck (10 cases), memcheck (12 cases) and racecheck (10 cases),
-all with zero errors or hazards. Failures and earlier receipts remain intact.
-Only the experimental overlay carries the guard; production was unchanged.
+The source-layer interface includes a block handoff consumed by later reindex
+queries. The new joint candidate is prepared but hardware untested. Its exact
+keys, ordered block IDs, counts, BF16 score bits and following reindex outputs
+must pass before real snapshots or serving integration can qualify it.
 
-The speed target is **not achieved or established**. Separable synthetic inputs
-retain 576 of 262,143 keys; random inputs retain all 262,143. Guarded complete
-snapshot medians remain about 3.7 ms and 5.8 ms respectively. CUDA graph capture
-does not materially change that cost. Candidate-only profiling attributes about
-85% of kernel time to envelope rebuilding and 9–13% to bounds. There is no
-released-build timing comparison or end-to-end claim. Do not generalize
-synthetic pruning to actual DeepSeek keys.
+Real DeepSeek operands must establish useful pruning and full candidate cost.
+Synthetic separability is not evidence of real-model speed. If real intervals
+are too loose to cover their cost, reject this grouping and test another exact
+search. Changed selections fail unless independent evidence proves superior
+model quality. Persistent metadata requires explicit ownership and invalidation;
+this experiment rebuilds every snapshot to avoid stale state.
 
-The next causal variable is the envelope reduction's resource use. Separately,
-real-model input capture/replay must establish useful pruning before persistent
-metadata and CSA ownership are justified. Capture hardware execution remains
-untested. If real operands do not prune enough to cover all costs, reject this
-grouping and test another exact search. A changed selected key fails the
-experiment unless independent evidence establishes superior model quality.
-
-All three windows closed on 2026-11-04 (08:23:17, 09:07:10 and 10:15:21 UTC).
-The original candidate-36 TP3 profile was already serving; no serving start,
-stop, restart or sync was performed. Holds were removed, foreign requests
-preserved, and dgx4 returned for the shared qualification. Sp8's configured SSH
-route was unreachable; dgx4 supplied every GPU result. No promotion is proposed.
+All completed windows returned their host reservations with production unchanged.
+The user selected sp8 for continued isolated tests. Shared-node requests remain
+binding. Full serving boots, distribution/attention digests, mixed traffic,
+admission and memory gates remain required against immutable recorded baselines.
+No runtime configuration, baseline or image tag is promoted by this PR.

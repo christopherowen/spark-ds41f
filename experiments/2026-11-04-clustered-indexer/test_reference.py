@@ -2,7 +2,7 @@ import math
 import random
 import unittest
 
-from reference import bf16, decode, score, select_clusters, topk, upper_bound
+from reference import bf16, decode, score, select_clusters, source_block_ids, topk, upper_bound
 
 
 class BoundTests(unittest.TestCase):
@@ -52,6 +52,29 @@ class BoundTests(unittest.TestCase):
                       for c in range(0, len(keys), 8)]
             selected, _ = select_clusters(scores, bounds, [0, 2, 4], 4, 8)
             self.assertEqual(selected, topk(scores, 4))
+
+    def test_joint_source_threshold_keeps_handoff_and_immediate_keys(self):
+        rng = random.Random(4181)
+        for length in (0, 1, 7, 37, 65, 129, 1025):
+            for _ in range(20):
+                scores = [float(rng.randrange(-3, 4)) for _ in range(length)]
+                if scores:
+                    scores[-1] = -100.
+                block_k, group, cluster = 8, 2, 4
+                seeds = list(range(0, (length+cluster-1)//cluster, 2))
+                positions = [p for c in seeds for p in range(c*cluster, min((c+1)*cluster, length))]
+                selected, values = source_block_ids([scores[p] for p in positions], block_k, group)
+                ordinary = [b for b in selected if b != len(values)-1]
+                threshold = min(values[b] for b in ordinary) if len(ordinary) == block_k-1 else -math.inf
+                kept = []
+                for c in range((length+cluster-1)//cluster):
+                    bound = max(scores[c*cluster:min((c+1)*cluster, length)])
+                    if bound >= threshold or c == (length-1)//cluster:
+                        kept.extend(range(c*cluster, min((c+1)*cluster, length)))
+                pruned = [v if p in kept else -math.inf for p, v in enumerate(scores)]
+                self.assertEqual(source_block_ids(pruned, block_k, group)[0],
+                                 source_block_ids(scores, block_k, group)[0])
+                self.assertEqual(topk(pruned, 4), topk(scores, 4))
 
     def test_single_point_intervals_and_mixed_sign_queries(self):
         rng = random.Random(4117)

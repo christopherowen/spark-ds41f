@@ -12,7 +12,7 @@ from vllm.models.deepseek_v4_1.tilelang.grouped_indexer import GroupedClusteredI
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan
 
 
-def check(width, rows, mode, grouped):
+def check(width, rows, mode, grouped, cuda_graph=True, repeats=15):
     torch.cuda.reset_peak_memory_stats()
     args = list(inputs(width, [width - 1], mode, unwritten_cache=True))
     generator = torch.Generator(device='cuda').manual_seed(width + rows + 51)
@@ -41,20 +41,28 @@ def check(width, rows, mode, grouped):
         visible = scores[row, :extent].cpu().float()
         for cluster in range((extent + 63) // 64):
             assert bounds[row, cluster] >= visible[cluster*64:min((cluster+1)*64, extent)].max()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual, evidence = candidate.run(*candidate_args)
-    graph.replay()
+    graph = None
+    if cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, evidence = candidate.run(*candidate_args)
+    def replay():
+        nonlocal actual, evidence
+        if graph is None:
+            actual, evidence = candidate.run(*candidate_args)
+        else:
+            graph.replay()
+    replay()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     saved = args[5].clone()
     args[5].copy_(saved // 2)
     args[6].fill_(width - 17)
     reduced, _ = native.run(*args)
-    graph.replay()
+    replay()
     torch.testing.assert_close(actual, reduced, atol=0, rtol=0)
     args[6].zero_()
     empty, _ = native.run(*args)
-    graph.replay()
+    replay()
     torch.testing.assert_close(actual, empty, atol=0, rtol=0)
     args[5].copy_(saved)
     args[6].fill_(width)
@@ -65,18 +73,19 @@ def check(width, rows, mode, grouped):
     changed, _ = native.run(*args)
     if mode == 'separable':
         assert not torch.equal(changed, expected), 'cache mutation did not change the winners'
-    graph.replay()
+    replay()
     torch.testing.assert_close(actual, changed, atol=0, rtol=0)
     torch.cuda.synchronize()
     latencies = []
-    for _ in range(15):
+    for _ in range(repeats):
         torch.cuda.synchronize()
         start = time.perf_counter()
-        graph.replay()
+        replay()
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - start) * 1000)
-    return {'width': width, 'rows': rows, 'mode': mode, 'grouped_metadata': grouped,
-            'identical': True, 'graph_visibility_and_mutation_identical': True,
+    return {'width': width, 'rows': rows, 'mode': mode, 'grouped_metadata': grouped, 'execution': 'cuda-graph' if cuda_graph else 'eager',
+            'identical': True, 'graph_visibility_and_mutation_identical': True if cuda_graph else None,
+            'visibility_and_mutation_identical': True,
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
             'metadata_elements': (2 * (1 if grouped else rows) * (width // 64) * 128),
             'candidate_counts': evidence['candidate_counts'].cpu().tolist(),
@@ -88,12 +97,20 @@ def check(width, rows, mode, grouped):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--grouped', action='store_true')
+    parser.add_argument('--no-graph', action='store_true')
+    parser.add_argument('--repeats', type=int, default=15)
+    parser.add_argument('--quick', action='store_true')
     options = parser.parse_args()
     result = {'schema_version': 1, 'passed': False, 'cases': []}
     try:
-        for width, rows, mode in [(4096, 8, 'random'), (16384, 32, 'random'),
-                                  (65536, 128, 'random'), (65536, 128, 'separable')]:
-            result['cases'].append(check(width, rows, mode, options.grouped))
+        cases = [(4096, 1, 'random'), (4096, 8, 'random'), (16384, 32, 'random'),
+                                  (65536, 128, 'random'), (65536, 128, 'separable'),
+                                  (16384, 256, 'random')]
+        if options.quick:
+            cases = [(4096, 8, 'random'), (16384, 32, 'separable')]
+        for width, rows, mode in cases:
+            result['cases'].append(check(width, rows, mode, options.grouped,
+                                         not options.no_graph, options.repeats))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:
