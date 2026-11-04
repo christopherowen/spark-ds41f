@@ -15,8 +15,10 @@ import struct
 
 
 def family(name):
+    if "engram" in name and ".embed." in name:
+        return "engram_table"
     if "engram" in name:
-        return "engram"
+        return "engram_projection"
     for token in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "shared_experts"):
         if token in name:
             return token
@@ -79,7 +81,7 @@ def collect(snapshot: Path, revision: str, max_tensors: int, tiles_per_tensor: i
                             "data_base64": base64.b64encode(raw).decode("ascii")})
     if not samples:
         raise ValueError("no supported FP8 tiles were found")
-    return {"schema_version": 1, "kind": "immutable_checkpoint_tiles",
+    return {"schema_version": 2, "kind": "immutable_checkpoint_tiles",
             "model_revision": revision, "tile_bytes": 16384,
             "sample_bytes": len(samples) * 16384, "samples": samples}
 

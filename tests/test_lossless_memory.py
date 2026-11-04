@@ -25,6 +25,7 @@ def load(name):
 codec = load("memory_codec")
 store = load("cold_store")
 collector = load("collect_weights")
+probe_frame = load("fp8_probe_frame")
 
 
 class CodecTests(unittest.TestCase):
@@ -210,6 +211,10 @@ class ColdStoreTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def test_engram_gpu_projections_are_separate_from_disk_tables(self):
+        self.assertEqual(collector.family("layers.14.engram.embed.weight"), "engram_table")
+        self.assertEqual(collector.family("layers.14.engram.wkv.weight"), "engram_projection")
+
     def test_rectangular_tiles_are_not_contiguous_file_slices(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "revision"
@@ -231,6 +236,41 @@ class CollectorTests(unittest.TestCase):
     def test_wrong_revision_is_refused_before_reading(self):
         with self.assertRaises(ValueError):
             collector.collect(Path("wrong-revision"), "expected-revision", 1, 1)
+
+
+class ParallelProbeFrameTests(unittest.TestCase):
+    def test_all_encodings_survive_each_parallel_layout(self):
+        raw = b"\x30" * (probe_frame.TILE_BYTES - 256) + bytes(range(256))
+        for lanes in (32, 64, 128):
+            frame = probe_frame.pack(raw, lanes)
+            self.assertEqual(frame.mode, 1)
+            self.assertEqual(probe_frame.unpack(frame), raw)
+            self.assertLess(frame.stored_bytes, len(raw))
+
+    def test_codes_longer_than_the_gpu_fast_lookup_are_exact(self):
+        counts = [8191] + [4096 >> i for i in range(13)] + [1, 1]
+        self.assertEqual(sum(counts), probe_frame.TILE_BYTES)
+        raw = b"".join(bytes([i << 3]) * count for i, count in enumerate(counts))
+        self.assertGreater(max(codec.huffman_fp8(raw)[:16]), 8)
+        frame = probe_frame.pack(raw, 32)
+        self.assertEqual(frame.mode, 1)
+        self.assertEqual(probe_frame.unpack(frame), raw)
+
+    def test_unprofitable_layout_keeps_original_bytes(self):
+        raw = bytes(range(256)) * 64
+        frame = probe_frame.pack(raw, 32)
+        self.assertEqual(frame.mode, 0)
+        self.assertEqual(probe_frame.unpack(frame), raw)
+
+    def test_corrupt_lookup_and_lane_extents_are_refused(self):
+        from dataclasses import replace
+        frame = probe_frame.pack(b"\x30" * probe_frame.TILE_BYTES, 32)
+        with self.assertRaises(ValueError):
+            probe_frame.unpack(replace(frame, offsets=(0,) * 32))
+        quick = bytearray(frame.quick)
+        quick[0] ^= 1
+        with self.assertRaises(ValueError):
+            probe_frame.unpack(replace(frame, quick=bytes(quick)))
 
 
 if __name__ == "__main__":

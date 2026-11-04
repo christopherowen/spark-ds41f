@@ -74,9 +74,9 @@ python3 experiments/2026-11-04-lossless-memory/collect_weights.py \
   --max-tensors 24 --tiles-per-tensor 2 --out INPUTS/weight-tiles.json
 
 python3 experiments/2026-11-04-lossless-memory/screen.py \
-  INPUTS/weight-tiles.json --repeats 5 --out runs/fp8-screen-boot-a.json
+  INPUTS/weight-tiles.json --repeats 5 --out runs/fp8-local-a.json
 python3 experiments/2026-11-04-lossless-memory/screen.py \
-  INPUTS/weight-tiles.json --repeats 5 --out runs/fp8-screen-repeat.json
+  INPUTS/weight-tiles.json --repeats 5 --out runs/fp8-local-repeat.json
 
 python3 -m unittest tests.test_lossless_memory -v
 ```
@@ -88,6 +88,29 @@ Dense projection families and Engram are reported separately. Each encoder
 invocation includes its round-trip verification; decoder timings include SHA-256.
 The illustrative saved-read budget uses the older recorded 266.6 GB/s marginal
 rate and is neither a current release estimate nor a performance verdict.
+
+## FP8 GPU decode gate
+
+`fp8_probe_frame.py` prepares independent 32/64/128-lane exponent streams and
+unchanged sign/mantissa fields. An eight-bit prefix lookup handles common codes;
+longer codes follow the exact bounded tree. Every lane has explicit lookahead
+padding. CPU tests cover every encoding, long codes, malformed extents, and the
+lookup/tree agreement. Metadata and per-stream padding count toward storage.
+
+`fp8_probe.cu` and `fp8_probe.py` prepare a GB10 decoder microbenchmark. Before
+timing, it materializes and compares every decoded GPU byte with the pinned
+checkpoint. Timed consumers reconstruct into shared memory and consume those
+bytes, comparing with a raw-byte control. The working set is at least 64 MiB,
+larger than GB10's 24 MiB L2. All rounds, memory allocations and input/source
+identities are recorded. Unused metadata in the raw probe scaffold is reported
+separately and never counted as the real raw-weight footprint.
+
+The six `fp8/kernel-*.json` plans give each lane count a first and repeat run
+in separate fresh test containers, preserving distinct native output files.
+Those are repeated decoder microbenchmarks, **not** serving boots. The CUDA
+source has not yet been compiled or executed on target. A winning byte consumer
+still requires a fused GEMM consumer and the two full serving boots before any
+release claim. No inference kernel calls this prototype.
 
 ## Hardware sequence
 
@@ -112,5 +135,23 @@ rate and is neither a current release estimate nor a performance verdict.
 
 ## Status
 
-CPU codec/storage tests pass. Hardware performance and serving integration are
-not yet qualified. See `decision.md`, `base.json` and `runs/preparation.json`.
+CPU codec/storage tests pass. Two local CPU runs over 44 real checkpoint tiles
+show exact size reductions (dense tiles: 5.956% bitplane-LZ4, 16.426% exponent
+Huffman; plain LZ4 selects RAW). Native receipts contain all observations and
+are archived as JSON gzip files; their uncompressed hashes are in `results.json`.
+These runs do not establish GPU throughput or serving improvement.
+
+Reproduce the summary, including the original collector's table/projection
+grouping correction, with:
+
+```sh
+python3 experiments/2026-11-04-lossless-memory/analyze_screen.py \
+  experiments/2026-11-04-lossless-memory/runs/fp8-local-a.json.gz \
+  experiments/2026-11-04-lossless-memory/runs/fp8-local-repeat.json.gz \
+  --out experiments/2026-11-04-lossless-memory/results.json
+```
+
+Isolated expert-scale and Engram arms, canonical source locks, exactness
+bundles and repeated release-suite plans are prepared in a separate qualification
+change. Hardware performance and serving integration remain unqualified.
+See `decision.md`, `base.json` and `runs/preparation.json`.
