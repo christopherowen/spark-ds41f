@@ -49,6 +49,7 @@ Capabilities:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -155,6 +156,68 @@ def max_static_events_from_sources(sources_dir: Path) -> int:
             if isinstance(bound, int) and bound > best:
                 best = bound
     return best
+
+
+def event_capacity_from_sources(directories, kernels=None, margin=4):
+    """Bound exactly the selected manifest kernels; unknown bounds fail closed.
+
+    The historical max_static_events_from_sources helper only reports a finite
+    maximum. It is not sufficient to certify a single-pass allocation because
+    it ignores unknown bounds. This check also fingerprints the input manifests.
+    """
+    if margin < 0:
+        raise ValueError("event margin must be nonnegative")
+    selected = set(kernels) if kernels else None
+    bounds, unknown, fingerprints = {}, set(), {}
+    for directory in directories:
+        paths = sorted(Path(directory).glob("*.json"))
+        if not paths:
+            raise ValueError(f"no event manifests in {directory}")
+        for path in paths:
+            raw = path.read_bytes()
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeDecodeError) as error:
+                raise ValueError(f"invalid event manifest {path}: {error}") from error
+            if not isinstance(data, dict) or not isinstance(data.get("kernel"), str):
+                raise ValueError(f"missing kernel identity in {path}")
+            kernel = data["kernel"]
+            if selected is not None and kernel not in selected:
+                continue
+            sites = data.get("sites")
+            if not isinstance(sites, list) or not sites:
+                raise ValueError(f"no event sites in {path}")
+            fingerprints[str(path)] = hashlib.sha256(raw).hexdigest()
+            for site in sites:
+                value = site.get("events_per_warp_bound") if isinstance(site, dict) else None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    unknown.add(kernel)
+                else:
+                    bounds[kernel] = max(bounds.get(kernel, 0), value)
+    missing = (selected or set()) - (set(bounds) | unknown)
+    if missing:
+        raise ValueError("missing event manifests for: " + ", ".join(sorted(missing)))
+    if unknown:
+        raise ValueError("unknown event bound for: " + ", ".join(sorted(unknown))
+                         + "; use a bounded replay or tracker mode")
+    maximum = max(bounds.values(), default=0)
+    if not maximum:
+        raise ValueError("no positive event bound found")
+    capacity = ((maximum + margin + 7) // 8) * 8
+    return {"maximum": maximum, "capacity": capacity, "margin": margin,
+            "kernels": bounds, "manifests_sha256": fingerprints}
+
+
+def timestamp_capacity(value):
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a positive integer or auto") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("timestamp capacity must be positive")
+    return number
 
 
 def run_iket(argv, timeout, log):
@@ -277,9 +340,15 @@ def main(argv=None):
                         help="explicit --context-buffer-size in GiB passed to run-iket (0: auto)")
     parser.add_argument("--use-tracker-dir", type=Path,
                         help="reuse an existing tracker directory and skip the dry run")
-    parser.add_argument("--single-pass-max-ts", type=int, default=0,
+    parser.add_argument("--single-pass-max-ts", type=timestamp_capacity, default=0,
                         help="skip the tracker dry run completely and profile in a single pass with "
-                             "this maxTsCntPerWarp (e.g. 32 for granularity=phase, iters=1)")
+                             "this maxTsCntPerWarp, or auto from --event-sources")
+    parser.add_argument("--event-sources", type=Path, nargs="+",
+                        help="candidate-specific source manifests used to certify capacity")
+    parser.add_argument("--event-kernels", nargs="+",
+                        help="exact kernel names the bounded replay executes (default: all manifests)")
+    parser.add_argument("--event-margin", type=int, default=4,
+                        help="extra events before rounding automatic capacity up to 8 (default 4)")
     parser.add_argument("--skip-raw-data-dump", action="store_true",
                         help="patch libsmodel_injection.so to skip building and writing raw "
                              "iket.data.json (~90 GB RAM at 40M warps) while keeping iket.decoded_results.json")
@@ -291,8 +360,32 @@ def main(argv=None):
                         help="extra safety margin in MiB added when --deduct-kv-bytes is set (default: 256)")
     args = parser.parse_args(argv[:split])
     command = argv[split + 1:]
+    if not command:
+        parser.error("a workload command is required after --")
+    if args.event_kernels and not args.event_sources:
+        parser.error("--event-kernels requires --event-sources")
+    if args.event_sources and (args.warp_trace or not args.single_pass_max_ts):
+        parser.error("--event-sources certifies single-pass native events only")
+    certificate = None
+    if args.event_sources:
+        try:
+            certificate = event_capacity_from_sources(
+                args.event_sources, args.event_kernels, args.event_margin)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        if args.single_pass_max_ts == "auto":
+            args.single_pass_max_ts = certificate["capacity"]
+        elif args.single_pass_max_ts < certificate["maximum"]:
+            parser.error(f"{args.single_pass_max_ts} timestamp slots cannot hold the "
+                         f"{certificate['maximum']}-event bound")
+    elif args.single_pass_max_ts == "auto":
+        parser.error("automatic capacity requires --event-sources")
+    if args.max_pool_gb and args.pool_gb > args.max_pool_gb:
+        parser.error("explicit pool exceeds --max-pool-gb")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if certificate is not None:
+        (out / "event-capacity.json").write_text(json.dumps(certificate, indent=2) + "\n")
     common = ["--log-level", args.log_level]
     if args.pool_gb > 0:
         common.extend(["--context-buffer-size", format_pool_size_arg(args.pool_gb)])
@@ -341,6 +434,7 @@ def main(argv=None):
             "stub_config": str(stub_cfg),
             "single_pass": True,
             "skip_raw_data_dump": args.skip_raw_data_dump,
+            "event_capacity_certificate": certificate,
         }
         (out / "pool.json").write_text(json.dumps(pool_record, indent=1) + "\n")
         if args.dry_only:
