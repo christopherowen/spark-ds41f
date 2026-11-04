@@ -72,10 +72,26 @@ def collect(root):
                     "maximum_temperature_c": max(s["hottest_c"] for s in samples),
                 }
             chunks = sorted(trace.glob("events-*.bin"))
+            receipt_hash = hashlib.sha256()
+            first_receipt, last_receipt, missing_receipts = None, None, []
+            for chunk in chunks:
+                receipt = chunk.with_suffix(".bin.json")
+                receipt_hash.update(receipt.name.encode() + b"\0")
+                if receipt.exists():
+                    raw = receipt.read_bytes()
+                    receipt_hash.update(raw)
+                    last_receipt = json.loads(raw)
+                    if first_receipt is None:
+                        first_receipt = last_receipt
+                else:
+                    missing_receipts.append(receipt.name)
             row["native_chunks"] = {
                 "completed": len(chunks),
                 "bytes": sum(p.stat().st_size for p in chunks),
-                "receipts": [read(p.with_suffix(".bin.json")) for p in chunks],
+                "receipt_manifest_sha256": receipt_hash.hexdigest(),
+                "first_receipt": first_receipt,
+                "last_receipt": last_receipt,
+                "missing_receipts": missing_receipts,
                 "partial_bytes": sum(p.stat().st_size for p in trace.glob("*.partial")),
             }
             jobs[label] = row
