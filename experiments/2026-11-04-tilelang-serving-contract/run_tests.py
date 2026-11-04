@@ -29,6 +29,8 @@ def main():
               "python": sys.version, "files": {}, "expected_result_observed": False}
     output.mkdir(exist_ok=True)
     try:
+        if sha(inputs / "cpu_declarations.py") != base["cpu_declarations_sha256"]:
+            raise ValueError("CPU declaration harness identity mismatch")
         for name, expected in base["patches"].items():
             if sha(inputs / "vllm" / name) != expected:
                 raise ValueError("patch identity mismatch: " + name)
@@ -53,11 +55,12 @@ def main():
         env = dict(os.environ)
         for name in base["retired_environment"]:
             env.pop(name, None)
-        env.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONPATH=str(source),
+        env.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONPATH=f"{inputs}:{source}",
                    VLLM_TARGET_DEVICE="cpu", CUDA_VISIBLE_DEVICES="-1",
                    HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                    OMP_NUM_THREADS="2", MKL_NUM_THREADS="2")
-        common = [sys.executable, "-m", "pytest", "--noconftest", "-c", "/dev/null", "-q"]
+        common = [sys.executable, "-m", "pytest", "--noconftest", "-c", "/dev/null",
+                  "-p", "cpu_declarations", "-q"]
         collect_command = common + ["--collect-only"] + tests
         collect = subprocess.run(collect_command, cwd=source, env=env, text=True,
                                  capture_output=True, timeout=120)
