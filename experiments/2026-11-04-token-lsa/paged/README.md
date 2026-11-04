@@ -18,3 +18,28 @@ This is a new grouping geometry, not an equivalence claim for the snapshot
 clusterer. Separate tests must cover page completion, partial visibility, mixed
 owners, physical-page reuse, graph replay and source/reindex handoff. A full-model
 raw-token gate and complete request measurements remain required. No promotion.
+
+The first two fresh lifecycle processes pass all eight cases each:128/256-key
+pages,1/2/9 rows, mixed owners, partial-page boundaries, native key-record bytes,
+balanced summary references, evaluated-score bit equality, graph replay and
+physical-page recycling. Runtime commit`bf8d5eb3`; raw receipts are retained in
+`../runs/paged-window-01`. These are kernel and lifecycle results, not a token gate.
+
+`control.json` and `candidate.json` keep the same admitted73-byte cache geometry,
+native scratch-read guard and C36 image. The control runs native queries and no
+summary maintenance; the candidate pays for both cache-write summaries and
+shortlist queries. Reindex and small planned domains stay native. All scratch
+is reserved before profiling and every kernel declared before the cache freezes.
+
+`run_serving.py` uses a clean published source commit and the existing exclusive
+three-node idle-window protocol. The predeclared order is control-A, shortlist-A,
+shortlist-B, control-B. Every arm performs a separate raw-token capture: six short
+tasks and synthetic notebook contexts of32768/131072/262144 tokens, greedy,
+seed0, up to128 output tokens. Tokenization and private capture occur only on the
+node. Any mismatch stops the screen. No benchmark requests ask for token IDs.
+
+Request timing covers131072 tokens at concurrency1/4 and262144 at concurrency1.
+Each point charges its first cold request to the measured boot, followed by three
+explicit same-prompt cache repeats. Both arms must report actual cache-hit usage,
+output counts and response digests; no cold request is relabeled as cached. This
+small synthetic screen does not qualify production-agent quality or throughput.

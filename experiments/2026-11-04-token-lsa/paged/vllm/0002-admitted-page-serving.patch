@@ -1,0 +1,110 @@
+# Upstream base: C36 vLLM6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+# Requires snapshot shortlist kernel and page-summary kernel patches.
+# Rationale: maintain page summaries on cache writes and account for persistent storage.
+# Quality: changed selection; generated-token gate required; partial pages remain native.
+# Tests: separate lifecycle/graph/native score gates, then full-model raw-token comparisons.
+# Upstream status: experimental, not submitted; no promotion.
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -107,7 +107,9 @@
+             block_size=self.block_size,
+             num_kv_heads=1,
+             head_size=512 if self.kind == "swa" else 68,
+-            state_content_bytes=528 if self.kind == "swa" else 68,
++            # Experiment storage is part of each admitted physical cache page.
++            state_content_bytes=(528 if self.kind == "swa" else
++                                 73 if "VLLM_DS41_PAGE_SHORTLIST" in os.environ else 68),
+             dtype=torch.uint8,
+             tokens_per_state=self.ratio,
+             cache_dtype_str="b12x_dsv41",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -13,6 +13,7 @@
+ """
+ 
+ import functools
++import os
+ from types import SimpleNamespace
+ 
+ import torch
+@@ -25,6 +26,7 @@
+ )
+ 
+ from . import prepare
++from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
+ from .indexer import (
+     CANDIDATE_BLOCK,
+     CANDIDATE_BLOCKS,
+@@ -69,6 +71,9 @@
+ 
+ @functools.cache
+ def _index_plan(width, page_size, candidates, candidate_blocks):
++    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
++            and width > (32768 if candidate_blocks else 16384)):
++        return PageShortlistPlan(width, page_size, candidate_blocks=candidate_blocks)
+     return IndexerV41Plan(
+         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+     )
+@@ -76,6 +81,9 @@
+ 
+ def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
+     """The kernel calls ``_index_plan`` of these arguments makes."""
++    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
++            and width > (32768 if candidate_blocks else 16384)):
++        return PageShortlistPlan.calls(width, page_size, candidate_blocks=candidate_blocks)
+     return IndexerV41Plan.calls(
+         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+     )
+@@ -147,6 +155,9 @@
+                     rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
+                 )
+             )  # _quantize_index_query
++        if (self.compressor is not None and self.indexer is not None
++                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"):
++            calls.append(prepare.call(summarize_pages, self._index_page))
+         if self.compressor is not None:
+             from .gemm import bf16_shards
+ 
+@@ -175,6 +186,11 @@
+         with torch.inference_mode(False):
+             self._prepare(self.rotary_emb.cos_sin_cache.device)
+         self._tilelang_plans = self._build_tilelang_plans()
++        self._page_summary = (
++            summarize_pages(self._index_page)
++            if (self.compressor is not None and self.indexer is not None
++                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1") else None
++        )
+ 
+     def _tilelang(self) -> SimpleNamespace:
+         """This layer's plans (built when its kernels are bound; the cache pages
+@@ -208,7 +224,9 @@
+             caches.append(("indexed", self._owner().kv_cache, self._main_page * 288))
+         if self.indexer is not None:
+             caches.append(
+-                ("index K", self.indexer.k_cache.kv_cache, page_bytes(self._index_page))
++                ("index K", self.indexer.k_cache.kv_cache,
++                 self._index_page * STATE_BYTES if "VLLM_DS41_PAGE_SHORTLIST" in os.environ
++                 else page_bytes(self._index_page))
+             )
+         for name, cache, page in caches:
+             if cache.dim() != 2 or cache.dtype != torch.uint8 or cache.shape[1] != page:
+@@ -277,10 +295,13 @@
+                 self._index_page,
+                 self.compress_ratio,
+             )
+-            return
+-        write_index_keys(
+-            key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
+-        )
++        else:
++            write_index_keys(
++                key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
++            )
++        if self._page_summary is not None:
++            pool = self.indexer.k_cache.kv_cache
++            self._page_summary(pool, pool.view(torch.bfloat16), slot_mapping)
+ 
+     def _index_chunk(
+         self,
