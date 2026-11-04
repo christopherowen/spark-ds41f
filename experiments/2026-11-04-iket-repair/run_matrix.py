@@ -117,7 +117,9 @@ def main():
                 workload += ["--wait-file", "/out/" + label + "/go"]
             if job["mode"] != "plain":
                 workload = ["python3", "/h/iket_profile.py", "/out/" + label + "/profile",
-                            "--timeout", str(job.get("timeout", 180)), "--log-level", "debug", "--warp-trace",
+                            "--timeout", str(job.get("timeout", 180)), "--log-level", "debug",
+                            *(["--single-pass-max-ts", "auto", "--event-sources",
+                               "/out/preflight/sources"] if job["mode"] == "phase" else ["--warp-trace"]),
                             "--pool-gb", str(job.get("pool_gb", 0.25)),
                             *(["--skip-raw-data-dump"] if job["mode"] == "patched" else []),
                             "--", *workload]
