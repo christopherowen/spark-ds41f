@@ -1,4 +1,4 @@
-From 7ddb90c05fbda34e8b77bea4207c441c19eacaeb Mon Sep 17 00:00:00 2001
+From fe3caf6fefaeef8aa0bb093a1b75fa11fac2eb7d Mon Sep 17 00:00:00 2001
 From: Christopher Owen <root@your.mom>
 Date: Wed, 4 Nov 2026 20:31:49 +0100
 Subject: [PATCH] Specialize native score addressing without an output-buffer
@@ -91,7 +91,7 @@ index 7922573712..0d7fa3eedb 100644
 +                    actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
 +                    assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
-index 93eb5a2722..f37bd5b0b0 100644
+index 93eb5a2722..05a0f98d23 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
 @@ -196,7 +196,7 @@ def topk_log_softmax_kernel(
@@ -113,7 +113,7 @@ index 93eb5a2722..f37bd5b0b0 100644
 +        "compact": (topk, 1),
 +        "row": (id_row, 1),
 +        "column": (topk * id_col, id_col),
-+        "transpose": (1, rows),
++        "transpose": (1, T.cast(rows, T.int64)),
 +        "general": (id_row, id_col),
 +    }[id_layout]
      valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")

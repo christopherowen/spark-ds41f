@@ -213,7 +213,7 @@ def topk_log_softmax_kernel(
         "compact": (topk, 1),
         "row": (id_row, 1),
         "column": (topk * id_col, id_col),
-        "transpose": (1, rows),
+        "transpose": (1, T.cast(rows, T.int64)),
         "general": (id_row, id_col),
     }[id_layout]
     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")

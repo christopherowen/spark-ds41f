@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import json
 import math
+import statistics
 from pathlib import Path
 
 from paired import classify
@@ -18,7 +19,11 @@ parser.add_argument("--rounds", type=int, default=120)
 args = parser.parse_args()
 r = json.loads(args.receipt.read_text())
 c = json.loads(args.candidate.read_text())
-assert all(j["exit"] == 0 and j["result"]["candidate"] == c for j in r["jobs"])
+assert all(
+    j["exit"] == 0 and not j["memory_guard"] and j["result"]["candidate"] == c
+    for j in r["jobs"]
+)
+assert r["closure"]["reservation_released"] and not r["completed"]["failed"]
 jobs = {
     op: [j["result"] for j in r["jobs"] if j["job"]["operation"] == op]
     for op in ("tests", "pair", "iket")
@@ -44,6 +49,25 @@ for boot, data in enumerate(jobs["pair"], 1):
                     assert all(len(batch) == 8 for batch in samples)
                     samples = [t for batch in samples for t in batch]
                 assert all(math.isfinite(t) and t > 0 for t in samples)
+        logs = {role: [] for role in ("candidate", "previous", "null")}
+        for record in records:
+
+            def average(role):
+                samples = record["times_us"][role]
+                if isinstance(samples[0], list):
+                    samples = [t for batch in samples for t in batch]
+                return statistics.fmean(samples)
+
+            reference = average("reference")
+            for role in logs:
+                logs[role].append(math.log(average(role) / reference))
+        for role, values in logs.items():
+            assert all(
+                math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-14)
+                for a, b in zip(
+                    values, row["measured"]["log_ratios"][role], strict=True
+                )
+            )
         same = (
             row["data"]["reference_preparation_aliases_input"]
             and row["data"]["shared_output_address"]
@@ -51,9 +75,7 @@ for boot, data in enumerate(jobs["pair"], 1):
             == row["cuda_source_sha256"]["reference"]
         )
         assert same == row["same_program"]
-        stats = classify(
-            row["measured"]["log_ratios"]["candidate"], identical_program=same
-        )
+        stats = classify(logs["candidate"], identical_program=same)
         assert stats.keys() == row["gate"].keys()
         for k, value in stats.items():
             if isinstance(value, float):
