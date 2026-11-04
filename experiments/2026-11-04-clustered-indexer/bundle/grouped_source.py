@@ -49,6 +49,7 @@ def main():
     parser.add_argument('--no-graph', action='store_true')
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--repeats', type=int, default=15)
+    parser.add_argument('--single-row-only', action='store_true')
     options = parser.parse_args()
     result = {'schema_version':1, 'passed':False, 'cases':[]}
     try:
@@ -56,6 +57,10 @@ def main():
                  (65536,128,'random'), (65536,128,'separable'), (65536,256,'random')]
         if options.quick:
             cases = [(65536,8,'random'), (65536,8,'separable')]
+        if options.single_row_only:
+            cases = [(w,r,m) for w,r,m in cases if r == 1]
+        if not cases:
+            raise ValueError('no cases selected')
         for width, rows, mode in cases:
             case = check(width,rows,mode,options.grouped,not options.no_graph,options.repeats)
             result['cases'].append(case)

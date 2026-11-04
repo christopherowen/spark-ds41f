@@ -29,6 +29,10 @@ class GroupedSourceClusteredIndexerPlan(SourceClusteredIndexerPlan):
             raise ValueError('grouped source search requires 1..256 queries and one owned page table')
         if table.shape[1] * self.page_size < self.width:
             raise ValueError('owned table must cover the planned width')
+        if rows == 1:
+            # The owned table already has the native one-query shape; its
+            # extent is the query's own length. No expansion/reduction is needed.
+            return super().run(q, scales, weights, pool, table, lengths, active)
         expanded = torch.empty((rows, table.shape[1]), dtype=torch.int32, device=q.device)
         self.tables(table, lengths, active, expanded)
         if self.native_fallback:

@@ -289,3 +289,17 @@ restoration buffer and pass. Fourteen CPU tests and fresh source checks pass;
 full source/grouped/score-bit/reindex, graph, allocation and sanitizer hardware
 gates remain pending. A separate wide fixture retains1M planned width with
 short visibility, matching an important native planning geometry.
+
+Mapped handoff now passes two nine-case source and two six-case grouped graph
+processes, source initcheck/memcheck through1M planned width, both full grouped
+sanitizers, bounded race checks and C36 capture/replay for both interfaces.
+At128 separable queries its medians are2.498 /2.531 ms versus2.737 /2.742 ms
+with dense restoration. The reported harness allocation peak is unchanged in
+that case because another stage sets it; removing a buffer is not an observed
+peak-memory gain. The new1M-width/short-visibility fixture is exact but has wide
+two-process timing variance (1.488 /1.287 ms); no previous matching control exists.
+
+Patch0011 prepares a static one-query bypass for the grouped API's maximum and
+table expansion. Existing GPU kernels and the other row-count path are unchanged.
+Two targeted graph processes plus initialization/memory checks are pending.
+A separate candidate-only wide-domain trace will locate its remaining cost.
