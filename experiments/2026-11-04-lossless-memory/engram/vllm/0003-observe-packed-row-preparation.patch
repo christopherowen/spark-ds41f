@@ -1,0 +1,66 @@
+From 8018b364c9d0bc1e3e3f11689ced5dc35270992f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 20:22:15 +0100
+Subject: [PATCH] Record packed row preparation and reuse costs
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after the spark-ds41f-1030 series and isolated packed-row bounds guard (tree c40fbd1b553c0f0bf0ae72e0d12082f564e769b0).
+
+Report each rank and layer once during startup: physical bytes, bytes written, cache reuse and elapsed native packing time. This distinguishes cold preparation from repeat-boot reuse in the storage experiment.
+
+Quality implications: startup observation only. Packed bytes, cache identity, row addresses, consumer arithmetic and the hot path are unchanged.
+
+Tests: source syntax and fresh canonical series replay are required locally; existing packed-reader model/kernel gates and two serving boots remain target requirements. No performance qualification is claimed.
+
+Upstream status: local experiment instrumentation; not submitted upstream.
+---
+ vllm/models/deepseek_v4_1/common/engram.py | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 5fd1437b1a..711be22983 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -587,6 +587,7 @@ class ParallelEngramEmbedding(nn.Module):
+         )
+         if ENGRAM_PACKED_DIR and self.columns is not None:
+             import hashlib
++            import time
+ 
+             by_plane = {scale: (path, offset) for path, offset, scale in self._disk_sources}
+             w_path, w_offset = by_plane[False]
+@@ -613,10 +614,13 @@ class ParallelEngramEmbedding(nn.Module):
+                 f"-rank{self.caps.tp_rank}-{digest}.packed",
+             )
+             expected_bytes = int(owned_rows.sum()) * PACKED_ROW_BYTES
+-            if (
+-                not os.path.exists(packed_path)
+-                or os.path.getsize(packed_path) != expected_bytes
+-            ):
++            reused = (
++                os.path.exists(packed_path)
++                and os.path.getsize(packed_path) == expected_bytes
++            )
++            pack_seconds = 0.0
++            if not reused:
++                pack_started = time.monotonic()
+                 pack_engram_columns(
+                     w_path,
+                     w_offset,
+@@ -626,6 +630,14 @@ class ParallelEngramEmbedding(nn.Module):
+                     owned_starts,
+                     owned_rows,
+                 )
++                pack_seconds = time.monotonic() - pack_started
++            logger.info(
++                "Engram packed rows layer=%d tp=%d rank=%d layout=264-v1 "
++                "bytes=%d written_bytes=%d reused=%s pack_s=%.6f path=%s",
++                self.caps.layer_id, self.caps.tp_size, self.caps.tp_rank,
++                expected_bytes, 0 if reused else expected_bytes,
++                reused, pack_seconds, packed_path,
++            )
+             rows.add_packed_source(
+                 packed_path,
+                 0,
+-- 
+2.54.0 (Apple Git-157)
+

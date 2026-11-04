@@ -1,0 +1,75 @@
+From de32dcf3c4cfbcae18ced8e1c0d08ff867748e99 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 17:18:27 +0100
+Subject: [PATCH] Reject negative offsets in packed Engram column maps
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after the
+spark-ds41f-1030 series and the isolated packed-row patch (tree
+833cd629a486fdc78e21cf8d06c916e3f4932ceb).
+
+The compaction map generates nonnegative column deltas. Reject negative
+metadata before subtracting it: INT64_MIN could overflow col_end - delta
+and smaller negative deltas could name rows outside the compact file.
+
+Quality implications: invalid metadata is rejected before I/O. Valid
+row addresses, value/scale bytes, layout and consumer arithmetic are
+unchanged.
+
+Tests: a standalone C metadata probe under UndefinedBehaviorSanitizer
+reproduced signed overflow before this guard and returns EINVAL after it.
+Two native-reader GPU regression cases are included; target execution
+and the candidate serving gates remain required.
+
+Upstream status: local measurement candidate; not submitted upstream.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 19 +++++++++++++++++++
+ .../deepseek_v4_1/engram_rows/_row_plan.h     |  3 ++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index f7b6f5688d..50cbf14731 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -113,6 +113,25 @@ def test_packed_column_map_refuses_invalid_owned_columns(columns):
+         column_compaction_map(np.arange(24, dtype=np.int64), 24, columns)
+ 
+ 
++@pytest.mark.parametrize("delta", [-1, -(1 << 63)])
++def test_packed_column_map_refuses_negative_delta_before_io(delta):
++    rows = EngramDiskRows(
++        device="cuda", table_rows=1, shard_start=0, shard_end=1,
++        max_lookups=24, columns=1,
++    )
++    start = np.zeros(24, dtype=np.int64)
++    end = np.zeros(24, dtype=np.int64)
++    end[0] = 1
++    offsets = np.zeros(24, dtype=np.int64)
++    offsets[0] = delta
++    try:
++        with pytest.raises(ValueError):
++            rows.add_packed_source("must-not-open", col_start=start,
++                                   col_end=end, col_delta=offsets)
++    finally:
++        rows.close()
++
++
+ def _step(rows, ids, live, early=None):
+     stream = torch.cuda.current_stream()
+     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index f70f4719f5..f70448fea5 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -179,7 +179,8 @@ static inline int ple_add_packed_source(ple_plan_t *reader, int64_t shard, const
+         expected_rows = 0;
+         for (unsigned c = 0; c < PLE_COLUMNS; c++) {
+             if (!((reader->columns >> c) & 1u)) continue;
+-            if (col_start[c] < 0 || col_end[c] < col_start[c] || col_end[c] > reader->padded_rows ||
++            if (col_start[c] < 0 || col_delta[c] < 0 ||
++                col_end[c] < col_start[c] || col_end[c] > reader->padded_rows ||
+                 col_start[c] < col_delta[c])
+                 return EINVAL;
+             int64_t phys_end = col_end[c] - col_delta[c];
+-- 
+2.54.0 (Apple Git-157)
+

@@ -21,13 +21,17 @@ work; no duplicate PR was opened.
    and capture-envelope sizing. This is an explicit interaction test of enabling
    the path and overlapping its bit-identical copy work; compare both recorded
    candidate-38 standard and copy recipes to distinguish those questions.
+   These have separate success criteria: default enablement is required behavior;
+   the overlap proposal is a performance hypothesis and did not establish a
+   serving-speed gain. It must not be relabeled as cleanup after measurement.
 2. Review the independent scratch-read fix in #878 and qualify it as its own
    corrected candidate before further tuning. Its lazy liveness guard applies
    to the exact candidate-39 tree; the current image and matrix stay frozen.
-3. After candidate-39's quality and performance review, a separate round may test
-   minimum match 8 against 16, changing only that variable. It needs new source
-   identity and receipts, including a mixed copy-dense/tool-like workload that
-   binds the token budget. A failed or slower round is retained and rejected.
+3. The proposed minimum match 8 versus 16 round was
+   [dropped at review](../2026-11-04-copy-policy-review/README.md). Adverse saved
+   simulations and no compatible targeted timing baseline do not justify a new
+   GPU round. No patch or serving speedup is claimed. Any future hypothesis
+   needs its own defensible causal mechanism and compatible recorded baseline.
 4. The compiler refresh in #875 stays a separate candidate and quality gate:
    its standalone tests do not establish model-output or serving performance.
 
@@ -336,8 +340,9 @@ scripts reproduce the audits from that private export.
 
 CopyDrafter defaults are retained as source behavior, without a speedup claim.
 The known inactive scratch-read issue in #878 keeps C39 unqualified for release.
-The next distinct candidate must isolate that correctness fix and use an explicit
-collector image identity plus checks for every functional extra. Only afterward
-should minimum match 8 versus 16 and the compiler refresh be assessed separately.
+Candidate-40 isolates that correctness fix and uses an explicit collector image
+identity plus checks for every functional extra. Its serving qualification is
+pending. Minimum match 8 is dropped at review; the compiler refresh remains a
+separate candidate when its prerequisites allow.
 AgentX does not score useful task completion or replace the outstanding TP4
 correctness and release gates. No promotion is made.

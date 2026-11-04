@@ -108,8 +108,11 @@ separately and never counted as the real raw-weight footprint.
 
 The six `fp8/kernel-*.json` plans give each lane count a first and repeat run
 in separate fresh test containers, preserving distinct native output files.
-Those are repeated decoder microbenchmarks, **not** serving boots. The CUDA
-source has not yet been compiled or executed on target. A winning byte consumer
+Those are repeated decoder microbenchmarks, **not** serving boots. All six
+target runs passed byte reconstruction and failed the performance gate; see
+`fp8/gpu-results.json`. Six further fixed-field runs also passed their exact-byte
+gates and lost to the paired word-sized raw control; see
+`fp8/fixed/gpu-results.json`. A winning byte consumer
 still requires a fused GEMM consumer and the two full serving boots before any
 release claim. No inference kernel calls this prototype.
 
@@ -120,6 +123,9 @@ A failed or missing byte gate cannot become a timing win. It compares first and
 repeat containers with exploratory bootstrap uncertainty, then closes its owned
 window and restores the recorded service even on a failed gate. It never opens
 or changes another holder's reservation.
+Restoration first checks all management connections and an explicit unchanged-shape
+plan. Observed management loss or a refused restoration plan preserves a review
+hold and the native receipt, with no further launch.
 
 After acquiring the standard published/idle window with the note
 `owner-authorized lossless FP8 decoder measurements`, run on dgx1:
@@ -131,7 +137,10 @@ python3 experiments/2026-11-04-lossless-memory/run_fp8.py \
 ```
 
 The owner has authorized these candidate operations. A shared-window request
-still ends the current window after its job. Preserve partial observations and
+still ends the current window after its job. The fixed first/repeat FP8 matrix
+is one short screen job: a return request explicitly queued after that window
+opened stays visible and is honored at the screen's end. An older or unrelated
+pending request prevents starting. Preserve partial observations and
 resume only unmeasured lane counts in a separately named receipt.
 
 ## Hardware sequence
@@ -157,11 +166,29 @@ resume only unmeasured lane counts in a separately named receipt.
 
 ## Status
 
-CPU codec/storage tests pass. Two local CPU runs over 44 real checkpoint tiles
+CPU codec/storage tests pass. The original two local CPU runs over 44 real checkpoint tiles
 show exact size reductions (dense tiles: 5.956% bitplane-LZ4, 16.426% exponent
 Huffman; plain LZ4 selects RAW). Native receipts contain all observations and
 are archived as JSON gzip files; their uncompressed hashes are in `results.json`.
 These runs do not establish GPU throughput or serving improvement.
+
+The version-2 collector separates disk tables from Engram projections. Its
+46-tile sample contains all original tiles plus two projection tiles. Two new
+local CPU processes over that exact sample are preserved separately under
+`runs/fp8-local-v2-*.json.gz`; their summary is `fp8/cpu-v2-results.json`.
+Dense bitplane-LZ4 saves 5.870% and exponent Huffman 16.274% in the CPU frame.
+No original input or receipt was rewritten.
+
+The GPU screen used the same 42 dense tile identities as the version-2 CPU
+screen. The real GPU frame, including stream padding and metadata, saves
+11.839%, 10.385% and 7.477% at 32, 64 and 128 lanes. Corresponding first/repeat
+time ratios to the paired raw-byte consumer are 1.633/1.633, 1.848/1.860 and
+1.815/1.810. All three layouts are rejected. The working set is 128 MiB;
+the kernel does not perform GEMM. Neither compressed nor raw proxy throughput
+is a serving result. Every original native JSON, worker verdict, log and
+controller receipt is preserved losslessly under `runs/fp8-gpu-artifacts/`.
+`analyze_gpu.py` checks source hashes, workload identity, original/controller
+agreement and recomputed uncertainty before producing `fp8/gpu-results.json`.
 
 Reproduce the summary, including the original collector's table/projection
 grouping correction, with:
@@ -174,6 +201,12 @@ python3 experiments/2026-11-04-lossless-memory/analyze_screen.py \
 ```
 
 Isolated expert-scale and Engram arms, canonical source locks, exactness
-bundles and repeated release-suite plans are prepared in a separate qualification
-change. Hardware performance and serving integration remain unqualified.
+bundles and repeated release-suite plans are prepared. A portable C fixture
+reproduced signed overflow on invalid Engram metadata; the new guard rejects it
+and preserves every byte in 1,025 valid rows across page boundaries. Native GPU
+tests and serving performance for these two arms remain unqualified.
+Complete source/wheel inputs and both local build checks now pass. The final
+Engram arm records cold preparation and cache reuse costs; its qualification
+controller verifies every rank's complete packed file against source bytes
+before timings. See `QUALIFICATION.md` for exact commands and failure guards.
 See `decision.md`, `base.json` and `runs/preparation.json`.
