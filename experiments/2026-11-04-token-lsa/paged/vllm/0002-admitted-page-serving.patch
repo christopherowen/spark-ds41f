@@ -29,57 +29,86 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  from types import SimpleNamespace
  
  import torch
-@@ -25,6 +26,7 @@
+@@ -25,6 +26,8 @@
  )
  
  from . import prepare
 +from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
++from .direct_shortlist import DirectPageShortlistPlan
  from .indexer import (
      CANDIDATE_BLOCK,
      CANDIDATE_BLOCKS,
-@@ -69,6 +71,9 @@
+@@ -67,18 +70,36 @@
+     return SparseMlaV41Plan.calls(*args, **kwargs)
  
+ 
++def _shortlist_options(width, candidates, candidate_blocks):
++    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") != "1" or candidates
++            or width <= (32768 if candidate_blocks else 16384)
++            or (candidate_blocks and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
++        return None
++    name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
++    budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
++    if budget <= 0 or budget & (budget-1):
++        raise ValueError("shortlist budget must be a positive power of two")
++    return dict(candidate_blocks=candidate_blocks, budget=budget)
++
++
++def _shortlist_class():
++    return (DirectPageShortlistPlan if os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
++            else PageShortlistPlan)
++
++
  @functools.cache
  def _index_plan(width, page_size, candidates, candidate_blocks):
-+    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
-+            and width > (32768 if candidate_blocks else 16384)):
-+        return PageShortlistPlan(width, page_size, candidate_blocks=candidate_blocks)
-     return IndexerV41Plan(
-         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-     )
-@@ -76,6 +81,9 @@
+-    return IndexerV41Plan(
+-        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+-    )
++    options = _shortlist_options(width, candidates, candidate_blocks)
++    if options is not None:
++        return _shortlist_class()(width, page_size, **options)
++    return IndexerV41Plan(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
+ 
  
  def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
-     """The kernel calls ``_index_plan`` of these arguments makes."""
-+    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
-+            and width > (32768 if candidate_blocks else 16384)):
-+        return PageShortlistPlan.calls(width, page_size, candidate_blocks=candidate_blocks)
-     return IndexerV41Plan.calls(
-         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-     )
-@@ -147,6 +155,9 @@
+-    """The kernel calls ``_index_plan`` of these arguments makes."""
+-    return IndexerV41Plan.calls(
+-        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+-    )
++    options = _shortlist_options(width, candidates, candidate_blocks)
++    if options is not None:
++        return _shortlist_class().calls(width, page_size, **options)
++    return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
+ 
+ 
+ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+@@ -147,6 +168,11 @@
                      rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
                  )
              )  # _quantize_index_query
 +        if (self.compressor is not None and self.indexer is not None
-+                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"):
++                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
++                and not (self.layer_id == self.candidate_source_layer
++                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
 +            calls.append(prepare.call(summarize_pages, self._index_page))
          if self.compressor is not None:
              from .gemm import bf16_shards
  
-@@ -175,6 +186,11 @@
+@@ -175,6 +201,13 @@
          with torch.inference_mode(False):
              self._prepare(self.rotary_emb.cos_sin_cache.device)
          self._tilelang_plans = self._build_tilelang_plans()
 +        self._page_summary = (
 +            summarize_pages(self._index_page)
 +            if (self.compressor is not None and self.indexer is not None
-+                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1") else None
++                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
++                and not (self.layer_id == self.candidate_source_layer
++                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")) else None
 +        )
  
      def _tilelang(self) -> SimpleNamespace:
          """This layer's plans (built when its kernels are bound; the cache pages
-@@ -208,7 +224,9 @@
+@@ -208,7 +241,9 @@
              caches.append(("indexed", self._owner().kv_cache, self._main_page * 288))
          if self.indexer is not None:
              caches.append(
@@ -90,7 +119,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
              )
          for name, cache, page in caches:
              if cache.dim() != 2 or cache.dtype != torch.uint8 or cache.shape[1] != page:
-@@ -277,10 +295,13 @@
+@@ -277,10 +312,13 @@
                  self._index_page,
                  self.compress_ratio,
              )

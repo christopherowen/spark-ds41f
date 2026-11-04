@@ -27,6 +27,7 @@ from vllm.v1.worker.workspace import (
 
 from . import prepare
 from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
+from .direct_shortlist import DirectPageShortlistPlan
 from .indexer import (
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
@@ -69,24 +70,36 @@ def _mla_calls(*shape) -> list:
     return SparseMlaV41Plan.calls(*args, **kwargs)
 
 
+def _shortlist_options(width, candidates, candidate_blocks):
+    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") != "1" or candidates
+            or width <= (32768 if candidate_blocks else 16384)
+            or (candidate_blocks and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
+        return None
+    name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
+    budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
+    if budget <= 0 or budget & (budget-1):
+        raise ValueError("shortlist budget must be a positive power of two")
+    return dict(candidate_blocks=candidate_blocks, budget=budget)
+
+
+def _shortlist_class():
+    return (DirectPageShortlistPlan if os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
+            else PageShortlistPlan)
+
+
 @functools.cache
 def _index_plan(width, page_size, candidates, candidate_blocks):
-    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
-            and width > (32768 if candidate_blocks else 16384)):
-        return PageShortlistPlan(width, page_size, candidate_blocks=candidate_blocks)
-    return IndexerV41Plan(
-        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-    )
+    options = _shortlist_options(width, candidates, candidate_blocks)
+    if options is not None:
+        return _shortlist_class()(width, page_size, **options)
+    return IndexerV41Plan(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
 
 
 def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
-    """The kernel calls ``_index_plan`` of these arguments makes."""
-    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1" and not candidates
-            and width > (32768 if candidate_blocks else 16384)):
-        return PageShortlistPlan.calls(width, page_size, candidate_blocks=candidate_blocks)
-    return IndexerV41Plan.calls(
-        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-    )
+    options = _shortlist_options(width, candidates, candidate_blocks)
+    if options is not None:
+        return _shortlist_class().calls(width, page_size, **options)
+    return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
 
 
 class DeepseekV41TileLangAttention(DeepseekV4Attention):
@@ -156,7 +169,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 )
             )  # _quantize_index_query
         if (self.compressor is not None and self.indexer is not None
-                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"):
+                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
+                and not (self.layer_id == self.candidate_source_layer
+                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
             calls.append(prepare.call(summarize_pages, self._index_page))
         if self.compressor is not None:
             from .gemm import bf16_shards
@@ -189,7 +204,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         self._page_summary = (
             summarize_pages(self._index_page)
             if (self.compressor is not None and self.indexer is not None
-                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1") else None
+                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
+                and not (self.layer_id == self.candidate_source_layer
+                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")) else None
         )
 
     def _tilelang(self) -> SimpleNamespace:

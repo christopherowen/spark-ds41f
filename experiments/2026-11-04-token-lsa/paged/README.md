@@ -58,3 +58,27 @@ ordered keys/counts/padding. It visits only selected pages and replaces three
 full-context scan/prefix/scatter launches with one page-local compaction launch.
 It does not repair the failed selector's token fidelity. Separate candidate-list,
 graph, owner-remap and native-lifecycle gates precede any timing or serving use.
+
+Both direct-compaction processes at`4a7fa4e9` pass12 geometries x32 selection/
+visibility patterns (384 per process), plus eight native lifecycle cases each.
+The independent set reference and the original assembler agree on every ordered
+candidate, count and padding slot; graph replay includes changed physical maps.
+A separate `benchmark_direct.py` measures only one arm per process, with no
+reference or comparison work. Its synthetic results do not establish request
+speed or fix the rejected low-budget selector's output changes.
+
+The next token-only calibration retains native source selection and changes the
+dense bucket budget to256 and1024 (16384/65536 keys plus the visible tail), using
+the qualified direct assembler. Source summaries are skipped when that cache
+owner has no shortlist consumer. These presets are not accepted configurations.
+The predeclared sequence is dense256, dense1024-A, dense1024-B against the saved
+native raw-token reference. Failed presets remain failed; this calibration may
+continue after a mismatch to record the next preset. It performs no request
+benchmark. A pass must include a case that actually prunes keys; all-key coverage
+on shorter prompts alone would not qualify approximate selection.
+
+The coordinated next window runs two scan and two direct compaction performance
+processes first, then the three token-only boots, and restores C37 once. The
+same immutable C36 control capture/corpus stays node-local; no released runtime
+is retimed. All new sources and the independent guard apply in a fresh named
+C36 tree, with all six mounted source files verified byte for byte.

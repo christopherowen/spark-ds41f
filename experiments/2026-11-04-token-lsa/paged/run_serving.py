@@ -4,6 +4,7 @@ Native token-scoped leases, watchdog and the tracked C37 restoration recipe are
 shared with the earlier request window. No one-rank serving launch is permitted.
 """
 import argparse
+import fcntl
 import importlib.util
 import json
 from pathlib import Path
@@ -38,7 +39,7 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
  'checkouts':{p:{'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=p,text=True).strip(),
                  'status':subprocess.check_output(['git','status','--porcelain'],cwd=p,text=True)} for p in roots},
  'experiment_mounts':[m['Destination'] for m in x['Mounts'] if any(s in m['Source'] for s in ['clustered-indexer','token-lsa'])],
- 'search_env':[e for e in x['Config']['Env'] if e.startswith(('VLLM_DS41_CLUSTERED_SEARCH=','VLLM_DS41_PAGE_SHORTLIST='))]}))
+ 'search_env':[e for e in x['Config']['Env'] if e.startswith(('VLLM_DS41_CLUSTERED_SEARCH=','VLLM_DS41_PAGE_'))]}))
 ''')
     assert all(v['image'] == w.IMAGE and v['running'] and not v['experiment_mounts'] and not v['search_env']
                and all(not c['status'] for c in v['checkouts'].values()) for v in check.values()),check
@@ -57,6 +58,9 @@ def main():
     parser.add_argument('--out',required=True)
     parser.add_argument('--watchdog')
     parser.add_argument('--preflight-only',action='store_true')
+    parser.add_argument('--kernel-jobs',nargs='+',help='isolated bundles before serving boots')
+    parser.add_argument('--quality-profiles',nargs='+',help='predeclared label:profile token-only calibration')
+    parser.add_argument('--reference-private',help='existing native capture/corpus directory; never copied to Git')
     options = parser.parse_args()
     out = Path(options.out).resolve()
     if socket.gethostname() != 'spark-0013':
@@ -93,6 +97,17 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
     assert all(review.values()) and 'unchanged' in review['shape'] and '--apply would refuse:' not in plan,review
     (out/'runtime-review.json').write_text(json.dumps(review,indent=2)+'\n')
     w.run(w.spark('control','cluster','sync','--revision',commit),out,'sync-plan')
+    for job in options.kernel_jobs or []:
+        bundle,label = job.split(':',1)
+        assert bundle.startswith('sp8-') and Path(bundle).name == bundle and Path(label).name == label
+        config = HERE.parent/bundle/'candidate.json'
+        assert config.is_file()
+        candidate = json.loads(config.read_text())
+        assert candidate['image'] == 'sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713'
+        for relative,_ in candidate['mounts']:
+            path = Path(relative)
+            assert path.is_absolute() or (config.parent/path).is_file(),relative
+
     if options.preflight_only:
         return
     baseline = None
@@ -110,6 +125,13 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
         (out/f'idle-{i}.json').write_text(json.dumps({'at':w.stamp(),'metrics':lines},indent=2)+'\n')
         if i < 6:
             time.sleep(5)
+    if options.quality_profiles and not options.reference_private:
+        parser.error('--reference-private is required with --quality-profiles')
+    private = (Path(options.reference_private).resolve() if options.quality_profiles else
+               Path.home()/'spark-lab/private/token-lsa-paged'/out.name)
+    if options.quality_profiles:
+        assert options.reference_private and (private/'control-a.json').is_file()
+        assert (private/'requests.jsonl').is_file() and (private/'identity.json').is_file()
     token = uuid.uuid4().hex
     hold = {'holder':'page-shortlist-request-window','token':token,'since':w.stamp(),
             'heartbeat':w.stamp(),'expected_end':None,'nodes':['sp5','sp6','sp7'],'commit':commit,
@@ -142,13 +164,34 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
     with (out/'watchdog.txt').open('w') as handle:
         subprocess.Popen([sys.executable,__file__,'--out',str(out),'--watchdog',token],cwd=ROOT,
                          stdin=subprocess.DEVNULL,stdout=handle,stderr=subprocess.STDOUT,start_new_session=True)
-    private = Path.home()/'spark-lab/private/token-lsa-paged'/out.name
     try:
         assert w.owns(token) and not errors
         w.run(w.spark('control','cluster','sync','--revision',commit,'--apply'),out,'sync-apply')
+        if options.kernel_jobs:
+            source = HERE.parent.parent/'2026-11-04-semantic-indexer/run_window.py'
+            spec = importlib.util.spec_from_file_location('isolated_kernels',source)
+            kernels = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(kernels)
+            kernels.HERE = HERE.parent
+            w.run(w.spark('restore','cluster','stop'),out,'kernel-stop-plan')
+            w.run(w.spark('restore','cluster','stop','--apply'),out,'kernel-stop-apply')
+            with open('/tmp/spark-lab-gpu.lock','a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                for job in options.kernel_jobs:
+                    requests = w.each(w.HOLD_CODE,{'action':'read'})
+                    assert not any(x['spark-request.json'] or x['spark3-request.json'] for x in requests.values())
+                    began = time.monotonic()
+                    while kernels.thermal() >= 55:
+                        assert w.owns(token) and not errors and time.monotonic()-began < 600
+                        time.sleep(5)
+                    kernels.kernel(job,out,token,errors)
+
         completed = []
-        for label,profile in [('control-a','control'),('shortlist-a','candidate'),
-                              ('shortlist-b','candidate'),('control-b','control')]:
+        jobs = ([tuple(job.split(':',1)) for job in options.quality_profiles] if options.quality_profiles else
+                [('control-a','control'),('shortlist-a','candidate'),('shortlist-b','candidate'),('control-b','control')])
+        for label,profile in jobs:
+            assert len((label,profile)) == 2 and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in label+profile)
+            assert (HERE/(profile+'.json')).is_file()
             assert w.owns(token) and not errors
             requests = w.each(w.HOLD_CODE,{'action':'read'})
             assert not any(x['spark-request.json'] or x['spark3-request.json'] for x in requests.values()),'pending requester'
@@ -157,16 +200,22 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
             if label == 'control-a':
                 (out/'corpus-manifest.json').write_text((private/'manifest.json').read_text())
                 (out/'identity.json').write_text((private/'identity.json').read_text())
-            capture = private/(label+'.json')
+            capture = private/((out.name+'-'+label if options.quality_profiles else label)+'.json')
             w.run([sys.executable,str(HERE.parent/'token_gate.py'),'capture',
                    '--url','http://127.0.0.1:8001','--requests',str(private/'requests.jsonl'),
                    '--identity',str(private/'identity.json'),'--out',str(capture)],out,'tokens-'+label)
             if label != 'control-a':
-                # A mismatch stops qualification; no timing win can waive it.
+                # Failed presets stay failed. A declared token-only calibration
+                # may continue to its next preset; ordinary qualification stops.
                 w.run([sys.executable,str(HERE.parent/'token_gate.py'),'compare',
-                       str(private/'control-a.json'),str(capture)],out,'token-comparison-'+label)
-            w.run([sys.executable,str(HERE/'request_screen.py'),'bench','--private',str(private),
-                   '--out',str(out/('requests-'+label+'.json'))],out,'bench-'+label)
+                       str(private/'control-a.json'),str(capture)],out,'token-comparison-'+label,
+                       allow_failure=bool(options.quality_profiles))
+                if options.quality_profiles:
+                    verdict = json.loads((out/('token-comparison-'+label+'.txt')).read_text())
+                    assert 'passed' in verdict and verdict['total_requests'] == 9
+            if not options.quality_profiles:
+                w.run([sys.executable,str(HERE/'request_screen.py'),'bench','--private',str(private),
+                       '--out',str(out/('requests-'+label+'.json'))],out,'bench-'+label)
             completed.append(label)
             (out/'completed.json').write_text(json.dumps({'at':w.stamp(),'completed':completed},indent=2)+'\n')
     except Exception:
