@@ -35,3 +35,23 @@ IDs and termination under the same checkpoint/tokenizer/workload. Keep captures
 node-local. It never retokenizes decoded text. Eight gate regression cases cover
 changed IDs with identical text/count, missing IDs and mismatched termination or
 workload. This client is never imported by the query module or benchmark.
+
+The first two process cohorts are summarized in [results.md](results.md), with
+raw samples, uncertainty and construction accounting in `results.json` and
+`runs/`. Captured eight-repeated-query dense calls improve1.92–1.93x; captured
+single-query and source calls regress. Replicated512K-key calls improve6.27–6.43x
+at one query and12.42–12.59x at eight repeated dense queries (source4.06/7.51x).
+These are query component results on the stated shapes, not request speedups.
+Two additional validation processes pass the resident-cache centroid oracle
+(maximum error0.0), native evaluated-score bits, visibility replay and legal
+source handoff. Selected-key overlap is diagnostic, not token qualification.
+
+`shortlist-window-01` retains the initial compile failure and its coordinated
+restore. `shortlist-window-02` retains the successful eight-query cohort and both
+validation modes. C37 was restored once at20:12:53UTC, independently checked on
+all three nodes at20:17:53UTC; all native holds and requests were absent, both
+checkout roots clean, and experimental mounts/environment removed.
+
+The next [page-owned follow-up](paged/README.md) moves essential summary work to
+cache completion and charges storage to cache admission. It is a separate
+unqualified grouping geometry until its own lifecycle and generated-token gates.
