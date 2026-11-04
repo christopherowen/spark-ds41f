@@ -206,7 +206,6 @@ def topk_log_softmax_kernel(
     logits_stride = T.dynamic("logits_stride", "int64")
     id_row, id_col = T.dynamic("id_row, id_col", "int64")
     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
-    valid_row, valid_col = T.dynamic("valid_row, valid_col", "int64")
     threads = _SOFTMAX_THREADS
     loads = _SOFTMAX_LOADS
     per = loads * run
@@ -276,9 +275,7 @@ def topk_log_softmax_kernel(
         output: T.Tensor((rows, topk), T.float32),
         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
         token_ids: T.StridedTensor((rows, topk), (id_row, id_col), id_dtype),
-        valid: T.StridedTensor(
-            (valid_rows, valid_cols), (valid_row, valid_col), T.bool
-        ),
+        valid: T.Tensor((valid_rows, valid_cols), T.bool),
     ):
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
@@ -403,7 +400,7 @@ def topk_log_softmax(
     logits: torch.Tensor,  # [rows, vocab_size]
     token_ids: torch.Tensor,  # [rows, topk], int32/int64, strided
     output: torch.Tensor,  # [rows, topk], FP32, contiguous
-    valid: torch.Tensor | None = None,  # [rows, topk], bool, strided
+    valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
 ) -> None:
     """Each row's log-softmax (Eq. 5) at its ``token_ids``, into ``output``: the
     launch ``_topk_log_softmax_kernel`` took."""

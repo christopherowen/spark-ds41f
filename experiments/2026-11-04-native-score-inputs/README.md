@@ -5,7 +5,7 @@ strides supplied by their producers, replacing repeated int64 casts and
 contiguous materializations. This builds on the selected-logit output patch
 in PR #893; both remain unpromoted source candidates after candidate-38.
 
-The log-softmax consumes int32 or int64 matrices and strided validity masks.
+The log-softmax consumes int32 or int64 matrices and the producer's contiguous validity masks.
 Top-k reads either sampled-id type and writes the required int64 result in its
 existing final store. Ranks read the sampled vector's stride directly. Prompt
 scoring no longer widens its ids before those operations. With no top-k columns,
@@ -40,3 +40,18 @@ and monitors host memory. Tests, paired graph timings, and actual decoded IKET
 captures each boot twice. Every run and failure is retained. No serving operation
 is authorized by this experiment; full-image/full-model qualification remains
 before promotion.
+
+## Initial variant retained
+
+The initial variant (candidate-v1.json, published source 7b7a619d) passed 625 tests
+per boot, 120 timing cases per boot, and two IKET captures. Its full evidence and
+analysis are retained as runs/native-v1.json and results-v1.json. One already-int64,
+contiguous-input FP32 masked case read 0.93 us (+4.78%) higher on boot means, with
+substantial reference variation; no serving slowdown is inferred from it.
+
+That variant also generalized mask strides even though the old path never
+normalized masks and the producer already writes them contiguously. Patch 0002
+keeps that existing contract, trimming unused stride parameters. This narrows
+the candidate; it does not change the native token-id support or score arithmetic.
+The final variant requires its own repeated qualification. Initial receipts are
+not relabelled as evidence for the new tree.

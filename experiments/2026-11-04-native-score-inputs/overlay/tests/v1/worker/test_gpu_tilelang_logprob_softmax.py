@@ -708,18 +708,16 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("layout", ["dense", "sliced", "transposed"])
 @pytest.mark.parametrize("masked", [False, True])
-def test_logprobs_read_native_ids_and_masks(dtype, id_dtype, layout, masked):
-    """ID and mask strides change addressing, never log-softmax arithmetic."""
+def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
+    """ID strides change addressing, never log-softmax arithmetic."""
     rows, cols, vocab = 5, 33, 8193
     logits = torch.randn(rows, vocab + 7, device=DEVICE, dtype=dtype)[:, :vocab]
     ids = torch.randint(vocab, (rows, cols), device=DEVICE, dtype=id_dtype)
     valid = torch.rand(rows, cols, device=DEVICE) > 0.3
     if layout == "sliced":
         ids = torch.stack((ids, ids), dim=-1)[..., 0]
-        valid = torch.stack((valid, valid), dim=-1)[..., 0]
     elif layout == "transposed":
         ids = ids.t().contiguous().t()
-        valid = valid.t().contiguous().t()
     before = ids.clone()
     mask = valid if masked else None
     expected = logprob.compute_token_logprobs(

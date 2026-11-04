@@ -10,10 +10,11 @@ import statistics
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("receipt", type=Path)
+parser.add_argument("--candidate", type=Path, default=HERE / "candidate.json")
 parser.add_argument("--out", type=Path, default=HERE / "results.json")
 args = parser.parse_args()
 receipt = json.loads(args.receipt.read_text())
-current = json.loads((HERE / "candidate.json").read_text())
+current = json.loads(args.candidate.read_text())
 base = json.loads((HERE / "base.json").read_text())
 expected = ("topk_log_softmax", "topk_ids")
 jobs = receipt["jobs"]

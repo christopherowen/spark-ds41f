@@ -1,0 +1,79 @@
+From cde7c981ccc7b942806a59deaaddf911a7a7cf06 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 18:01:39 +0100
+Subject: [PATCH] Keep score masks in their producer-defined contiguous layout
+
+Upstream-base: native token-id candidate 2b793793e9, after candidate-38 and selected-logit source c88a692e98.
+
+Rationale: only token ids were normalized by the old score path. Its validity masks are already produced contiguously. Keep that existing mask contract, avoiding unused stride parameters while preserving native token-id addressing.
+
+Quality: FP32 arithmetic and valid/invalid score values are unchanged; native token-id dtypes and strides remain supported.
+
+Tests: retain the dtype/id-stride/masking matrix with producer-layout masks, frozen-cache startup, and the full numerical regression suite. Repeat qualification is recorded separately from the initial variant.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ tests/v1/worker/test_gpu_tilelang_logprob_softmax.py | 6 ++----
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py        | 7 ++-----
+ 2 files changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 3edc3e4f46..19b4bbcd47 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -708,18 +708,16 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+ @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize("layout", ["dense", "sliced", "transposed"])
+ @pytest.mark.parametrize("masked", [False, True])
+-def test_logprobs_read_native_ids_and_masks(dtype, id_dtype, layout, masked):
+-    """ID and mask strides change addressing, never log-softmax arithmetic."""
++def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
++    """ID strides change addressing, never log-softmax arithmetic."""
+     rows, cols, vocab = 5, 33, 8193
+     logits = torch.randn(rows, vocab + 7, device=DEVICE, dtype=dtype)[:, :vocab]
+     ids = torch.randint(vocab, (rows, cols), device=DEVICE, dtype=id_dtype)
+     valid = torch.rand(rows, cols, device=DEVICE) > 0.3
+     if layout == "sliced":
+         ids = torch.stack((ids, ids), dim=-1)[..., 0]
+-        valid = torch.stack((valid, valid), dim=-1)[..., 0]
+     elif layout == "transposed":
+         ids = ids.t().contiguous().t()
+-        valid = valid.t().contiguous().t()
+     before = ids.clone()
+     mask = valid if masked else None
+     expected = logprob.compute_token_logprobs(
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index c6ad4740b1..0d1771bc5e 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -206,7 +206,6 @@ def topk_log_softmax_kernel(
+     logits_stride = T.dynamic("logits_stride", "int64")
+     id_row, id_col = T.dynamic("id_row, id_col", "int64")
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+-    valid_row, valid_col = T.dynamic("valid_row, valid_col", "int64")
+     threads = _SOFTMAX_THREADS
+     loads = _SOFTMAX_LOADS
+     per = loads * run
+@@ -276,9 +275,7 @@ def topk_log_softmax_kernel(
+         output: T.Tensor((rows, topk), T.float32),
+         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+         token_ids: T.StridedTensor((rows, topk), (id_row, id_col), id_dtype),
+-        valid: T.StridedTensor(
+-            (valid_rows, valid_cols), (valid_row, valid_col), T.bool
+-        ),
++        valid: T.Tensor((valid_rows, valid_cols), T.bool),
+     ):
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+@@ -403,7 +400,7 @@ def topk_log_softmax(
+     logits: torch.Tensor,  # [rows, vocab_size]
+     token_ids: torch.Tensor,  # [rows, topk], int32/int64, strided
+     output: torch.Tensor,  # [rows, topk], FP32, contiguous
+-    valid: torch.Tensor | None = None,  # [rows, topk], bool, strided
++    valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
+ ) -> None:
+     """Each row's log-softmax (Eq. 5) at its ``token_ids``, into ``output``: the
+     launch ``_topk_log_softmax_kernel`` took."""
+-- 
+2.54.0 (Apple Git-157)
+
