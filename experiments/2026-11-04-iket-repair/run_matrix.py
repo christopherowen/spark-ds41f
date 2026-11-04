@@ -110,20 +110,27 @@ def main():
                 time.sleep(2)
             state["current"] = label
             write(hold, state)
-            workload = ["python3", "/r/reproduce.py", job["operation"], "--out", "/out/" + label]
+            script = "/r/" + job.get("script", "reproduce.py")
+            workload = ["python3", script, job["operation"], "--out", "/out/" + label]
             workload += job.get("args", [])
+            if job.get("debugger"):
+                workload += ["--wait-file", "/out/" + label + "/go"]
             if job["mode"] != "plain":
                 workload = ["python3", "/h/iket_profile.py", "/out/" + label + "/profile",
-                            "--timeout", "180", "--log-level", "debug", "--warp-trace",
+                            "--timeout", str(job.get("timeout", 180)), "--log-level", "debug", "--warp-trace",
                             "--pool-gb", str(job.get("pool_gb", 0.25)),
                             *(["--skip-raw-data-dump"] if job["mode"] == "patched" else []),
                             "--", *workload]
+            cap = str(job.get("memory_gb", 32)) + "g"
             argv = ["docker", "run", "--rm", "--name", container, "--gpus=all", "--ipc=host",
-                    "--memory=32g", "--memory-swap=32g", "--ulimit=core=0",
+                    "--memory=" + cap, "--memory-swap=" + cap, "--ulimit=core=0",
                     "--cpuset-cpus=5-9,15-19", "-v", f"{HERE}:/r:ro", "-v", f"{OLD}:/h:ro",
                     "-v", f"{out}:/out", "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1",
                     "-e", "VLLM_PLUGINS=", "-e", "DO_NOT_TRACK=1", "-e", "VLLM_NO_USAGE_STATS=1",
                     "-e", "PYTHONUNBUFFERED=1", "-e", "PYTHONFAULTHANDLER=1"]
+            if job.get("script") == "full_step.py":
+                argv += ["-v", f"{Path.home() / '.cache/huggingface'}:/hf:ro",
+                         "-v", f"{Path.home() / 'spark-lab/spaceport-iket-c38-20261104/cache'}:/c"]
             for key, value in sorted(job.get("env", {}).items()):
                 argv += ["-e", f"{key}={value}"]
             argv += ["--entrypoint", workload[0], IMAGE, *workload[1:]]
@@ -133,8 +140,36 @@ def main():
             start = time.monotonic()
             with (out / (label + ".log")).open("w") as handle:
                 try:
-                    code = subprocess.run(argv, stdout=handle, stderr=subprocess.STDOUT,
-                                          timeout=240).returncode
+                    process = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT)
+                    if job.get("debugger"):
+                        until = time.monotonic() + 90
+                        while not (dest / "ready").exists() and process.poll() is None:
+                            if time.monotonic() >= until:
+                                raise subprocess.TimeoutExpired(argv, 90)
+                            time.sleep(.1)
+                        if (dest / "ready").exists():
+                            top = capture(["docker", "top", container, "-eo", "pid,args"])
+                            candidates = []
+                            for line in top.splitlines()[1:]:
+                                pid, command = line.strip().split(None, 1)
+                                parts = command.split()
+                                if len(parts) > 1 and parts[1] == script:
+                                    candidates.append(pid)
+                            if len(candidates) != 1:
+                                raise RuntimeError("could not identify debugger target: " + top)
+                            pid = candidates[0]
+                            debugger = ["sudo", "-n", "gdb", "-q", "--batch",
+                                        "-ex", "set pagination off", "-ex", "set confirm off",
+                                        "-ex", "set print thread-events off",
+                                        "-ex", f"set sysroot /proc/{pid}/root", "-p", pid,
+                                        "-ex", "handle SIGABRT stop print nopass",
+                                        "-ex", "shell touch " + str(dest / "go"),
+                                        "-ex", "continue", "-ex", "thread apply all bt", "-ex", "kill"]
+                            write(out / (label + ".debugger-command.json"), debugger)
+                            with (out / (label + ".gdb.log")).open("w") as debug_log:
+                                subprocess.run(debugger, stdout=debug_log, stderr=subprocess.STDOUT,
+                                               timeout=job.get("timeout", 180) + 30)
+                    code = process.wait(timeout=max(1, job.get("timeout", 180) + 60 - (time.monotonic() - start)))
                 except subprocess.TimeoutExpired:
                     subprocess.run(["docker", "kill", container], capture_output=True)
                     code = 124
