@@ -51,6 +51,8 @@ def collect(root):
                 "command": read(folder / (label + ".command.json")),
                 "collector": read(trace / "identity.json"),
                 "summary": read(trace / "summary.json"),
+                "stall_events": read(dest / "stall-events.json"),
+                "integrity": read(dest / "integrity.json"),
             }
             log = folder / (label + ".log")
             if log.exists():
@@ -84,8 +86,19 @@ def collect(root):
             if (folder / "memory.jsonl").exists()
             else None,
             "jobs": jobs,
+            "diagnostics": [
+                digest(path)
+                for path in sorted(folder.glob("*.log"))
+                if path.name not in {label + ".log" for label in jobs}
+            ],
         }
-    return {"evidence_root": str(root), "runs": runs}
+    return {
+        "evidence_root": str(root),
+        "runs": runs,
+        "controller_logs": [
+            digest(path) for path in sorted(root.parent.glob("iket-streaming-*.log"))
+        ],
+    }
 
 
 if __name__ == "__main__":
