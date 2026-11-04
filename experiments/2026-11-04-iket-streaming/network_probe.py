@@ -18,6 +18,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("operation", choices=["network"])
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--stream", action="store_true")
+parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
 args = parser.parse_args()
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ for topology, world, hcas, ring in [
         ("exchange", ex),
         ("reducescatter", rs),
     ]:
-        prefix = ("float32",) if operation in ("allreduce", "reducescatter") else ()
+        prefix = (args.dtype,) if operation in ("allreduce", "reducescatter") else ()
         module._build(*prefix, world, 0, 128, 2, 64, hcas, ring)()
         compiled.append([topology, operation])
 
@@ -70,7 +71,12 @@ else:
     )
     library = ctypes.CDLL(str(so))
 library.stream_store_u32_release.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-all_input = torch.arange(2048, device="cuda", dtype=torch.float32) / 16
+dtype = getattr(torch, args.dtype)
+chunk_elements = 4096 // torch.empty((), dtype=dtype).element_size()
+all_input = (
+    torch.arange(2 * chunk_elements, device="cuda", dtype=torch.float32) / 16
+).to(dtype)
+remote_payload = torch.full((chunk_elements,), 7, dtype=dtype).view(torch.uint8).numpy()
 region = torch.zeros(65536, dtype=torch.uint8, pin_memory=True)
 region_array = region.numpy()
 recv, flags, send, ctrl, slot_bytes = 0, 16384, 20480, 32768, 4096
@@ -82,17 +88,21 @@ for operation in ["allreduce", "allgather", "reducescatter", "exchange"]:
     ctrl_words[28 // 4] = 1_000_000
     counters = torch.zeros(5, device="cuda", dtype=torch.int32)
     input_tensor = (
-        all_input if operation in ("reducescatter", "exchange") else all_input[:1024]
+        all_input
+        if operation in ("reducescatter", "exchange")
+        else all_input[:chunk_elements]
     )
     out = torch.empty(
-        1024 if operation in ("allreduce", "reducescatter") else 2048,
+        chunk_elements
+        if operation in ("allreduce", "reducescatter")
+        else 2 * chunk_elements,
         device="cuda",
-        dtype=torch.float32,
+        dtype=dtype,
     )
     module = {"allreduce": ar, "allgather": ag, "reducescatter": rs, "exchange": ex}[
         operation
     ]
-    prefix = ("float32",) if operation in ("allreduce", "reducescatter") else ()
+    prefix = (args.dtype,) if operation in ("allreduce", "reducescatter") else ()
     launcher = module._build(*prefix, 2, 0, 128, 2, 64, 2, False)()
     for seq in range(1, 4):
         errors = []
@@ -107,7 +117,7 @@ for operation in ["allreduce", "allgather", "reducescatter", "exchange"]:
                 time.sleep(0.002)
                 slot = seq & 1
                 remote = (2 + slot) * slot_bytes
-                region_array[remote : remote + 4096].view(np.float32).fill(7)
+                region_array[remote : remote + 4096] = remote_payload
                 for lane in range(2):
                     offset = flags + ((2 + slot) * 2 + lane) * 64
                     library.stream_store_u32_release(region.data_ptr() + offset, seq)
@@ -176,7 +186,7 @@ for operation in ["allreduce", "allgather", "reducescatter", "exchange"]:
                 4,
                 1,
             )
-            expected = input_tensor[:1024] + 7
+            expected = input_tensor[:chunk_elements] + 7
         else:
             launcher(
                 *common,
@@ -199,13 +209,18 @@ for operation in ["allreduce", "allgather", "reducescatter", "exchange"]:
                 1,
             )
             expected = torch.cat(
-                [input_tensor[:1024], torch.full_like(input_tensor[:1024], 7)]
+                [
+                    input_tensor[:chunk_elements],
+                    torch.full_like(input_tensor[:chunk_elements], 7),
+                ]
             )
         torch.cuda.synchronize()
         thread.join(3)
         assert not thread.is_alive() and not errors, errors
         assert torch.equal(out, expected)
-    results[operation] = hashlib.sha256(out.cpu().numpy().tobytes()).hexdigest()
+    results[operation] = hashlib.sha256(
+        out.view(torch.uint8).cpu().numpy().tobytes()
+    ).hexdigest()
 coverage = {}
 if collector:
     collector.close()
@@ -229,6 +244,7 @@ if collector:
 results.update(
     operation="network",
     stream=args.stream,
+    dtype=args.dtype,
     compiled=compiled,
     coverage=coverage,
     scope="local fake peer in pinned memory; no NIC traffic or fabric qualification",
