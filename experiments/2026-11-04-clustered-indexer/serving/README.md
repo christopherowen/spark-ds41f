@@ -57,8 +57,9 @@ source tree is copied. Do not change a checkout while a mounted test uses it.
 python3 experiments/2026-11-04-clustered-indexer/serving/run_window.py --out /home/chris/spark-lab/results/clustered-indexer/serving-window-01
 ```
 
-No promotion is proposed. Candidate correctness and the complete request-level
-performance comparison remain pending until native receipts establish them.
+No promotion is proposed. The completed four-boot request comparison is in
+`../runs/serving-window-02/comparison.md`: all564 outputs match, but decode
+latency increases1.8–3.8% and cold-prefill latency14.5/34.4%. No adoption is proposed.
 
 The first integrated pilot is retained as `serving-window-01`. It was requested
 to close after its current completed arm when adaptive decode sampling was found
@@ -70,3 +71,9 @@ native raw per-request elapsed time and output digest. Hashing precedes the nati
 request timer. Payloads are never changed. Random cache salts remain unique to
 prevent reuse and are excluded only from the matching hash. The final report
 requires matching request identities across arms before comparing their latency.
+
+The original C37 service and all three native reservations were independently
+verified after closure. A later controller-only hardening joins the heartbeat
+writer before deleting hold files, preventing a final refresh from recreating a
+released reservation. Its CPU contract is checked in `check_client.py`; the
+measured runtime remains exactly `bc004cce`, and no active checkout was updated.

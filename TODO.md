@@ -739,6 +739,13 @@ alternative. The decode-kernel comparison is in
 
 ## Tried and not adopted
 
+- **Exact clustered indexer search:** the matched four-boot Spaceport C36
+  [request screen](experiments/2026-11-04-clustered-indexer/runs/serving-window-02/comparison.md)
+  preserves all564 responses but raises decode request latency1.8–3.8% and
+  cold-source-prefill latency14.5/34.4%. Twelve saved real operands prune0%.
+  Do not repeat this grouping without a different exact bound and a measured
+  real-input reason; synthetic prototype gains did not become request gains.
+
 Don't repeat these without a new reason:
 
 - **Verification and drafting:** marginal verify rule (0006); gathered Markov

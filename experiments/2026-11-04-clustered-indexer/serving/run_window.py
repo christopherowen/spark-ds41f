@@ -100,7 +100,7 @@ def start(profile,out,stem):
     run(spark(profile,'doctor','--live'),out,stem+'-doctor')
 
 
-def restore(token,out,stem):
+def restore(token,out,stem,finish_heartbeat=None):
     if not owns(token):raise RuntimeError('reservation changed; refusing to overwrite another holder')
     # If no serving mutation occurred, avoid an unnecessary C37 restart.
     code=run(spark('restore','doctor','--live'),out,stem+'-already-live',allow_failure=True)
@@ -114,6 +114,9 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],'original_c
 """)
     assert all(x['image']==IMAGE and x['running'] and not x['experiment_mounts'] and not x['search_env'] for x in check.values())
     (out/(stem+'-verification.json')).write_text(json.dumps(check,indent=2)+'\n')
+    # Stop and join the writer before unlinking; otherwise a final atomic
+    # refresh could recreate an already released hold. The watchdog has no writer.
+    if finish_heartbeat is not None:finish_heartbeat()
     each(HOLD_CODE,{'action':'remove','token':token})
     (out/'restored.json').write_text(json.dumps({'at':stamp(),'restored':True,'holds_removed':True},indent=2)+'\n')
 
@@ -187,6 +190,9 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
             try:each(HOLD_CODE,{'action':'refresh','token':token,'heartbeat':stamp()})
             except Exception as error:heartbeat_errors.append(str(error));return
     thread=threading.Thread(target=beat,daemon=True);thread.start()
+    def finish_heartbeat():
+        stop.set();thread.join(timeout=35)
+        if thread.is_alive():raise RuntimeError('heartbeat writer did not stop; retaining holds')
     with (out/'watchdog.txt').open('w') as handle:
         subprocess.Popen([sys.executable,__file__,'--out',str(out),'--watchdog',token],cwd=ROOT,
                          stdout=handle,stderr=subprocess.STDOUT,start_new_session=True,stdin=subprocess.DEVNULL)
@@ -212,8 +218,8 @@ print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
         (out/'error.txt').write_text(traceback.format_exc());raise
     finally:
         # Keep the heartbeat alive throughout coordinated restoration.
-        try:restore(token,out,'final-restore')
-        finally:stop.set();thread.join(timeout=35)
+        try:restore(token,out,'final-restore',finish_heartbeat)
+        finally:finish_heartbeat()
 
 
 if __name__=='__main__':main()

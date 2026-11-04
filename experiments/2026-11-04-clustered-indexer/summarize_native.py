@@ -138,7 +138,7 @@ report = {'schema_version':1, 'decision':'reject this grouping for serving integ
           'diagnostics': {'signed_head_bound':'runs/sp8-bound-diagnostic-01/result.json',
                           'cancellation_and_eight_key_block_clustering':'runs/sp8-geometry-diagnostic-01/result.json',
                           'result':'No pruning even with ideal native cutoffs. Geometry checks are untimed idea screens, not qualified GPU kernels or machine-arithmetic proofs.'},
-          'serving_candidate_integrated':False, 'released_timing_repeated':False,
+          'serving_candidate_integrated':True, 'request_measurement':'runs/serving-window-02/comparison.json', 'released_timing_repeated':False,
           'conclusion':'Exact selected keys and evaluated score bits pass, but these bounds cannot cover their cost without pruning. No production speedup is established. Do not trade output fidelity for synthetic gains.'}
 (HERE/'native-input-results.json').write_text(json.dumps(report,indent=2)+'\n')
 
@@ -160,7 +160,7 @@ summary=json.loads((HERE/'sp8-results.json').read_text())
 summary['status']='Synthetic gates pass; 12 real operands replay exactly twice but prune zero keys. Current grouping rejected for serving integration.'
 summary['pending']=['A different exact search with demonstrated real-input benefit before serving integration',
                     'Full serving qualification only if a candidate clears that gate']
-summary['latest_reports']=['visible-domain-results.json','native-input-results.json']
-summary['speed_claim']='Only unreleased synthetic-prototype comparisons exist. No released-build or serving speedup is established; real-input pruning is zero.'
+summary['latest_reports']=['visible-domain-results.json','native-input-results.json','runs/serving-window-02/comparison.json']
+summary['speed_claim']='Only unreleased synthetic-prototype comparisons exist. Real-input pruning is zero; the separate matched C36 request measurement shows higher latency, not a speedup.'
 (HERE/'sp8-results.json').write_text(json.dumps(summary,indent=2)+'\n')
 print('42 synthetic runs, 12 real operands twice, two untimed diagnostics and two profiles summarized')

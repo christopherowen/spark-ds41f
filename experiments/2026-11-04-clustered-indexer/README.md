@@ -15,6 +15,53 @@ for owner-authorized Spaceport request measurements; see `serving/README.md`.
 No promoted runtime selects it. No baseline or runtime image was
 promoted.
 
+## Matched request result on Spaceport
+
+The [four-boot request comparison](runs/serving-window-02/comparison.md) now
+measures the integrated candidate against the same C36 image with search off.
+The only runtime variable is `VLLM_DS41_CLUSTERED_SEARCH=0/1`; both arms include
+the same independent scratch-read guard. C36 is unreleased, so this does not
+remeasure a released build. No release-relative speedup is claimed.
+
+All141 request inputs per boot match exactly after excluding the deliberately
+unique prefix-cache salt. All564 request outputs, token counts and finish reasons
+match across the four boots. Five quality checks pass on every boot. Raw native
+HTTP request elapsed time gives these point estimates across two boot medians:
+
+| Workload | Actual prompt tokens | LSA request latency change |
+| --- | --- | --- |
+| 256-token prose/code, concurrency1/4/8 | Fixed native decode cases | +1.8% to +3.8% |
+| Nominal32K cold source prefill | 28095–30739 | +14.5% |
+| Nominal131K cold source prefill | 116664–121877 | +34.4% |
+
+Positive change means slower. Both prefill ratio intervals are below1; several
+small decode differences have intervals spanning1. Intervals use only two boot
+medians (df1), with an unverified normality assumption; complete values and raw
+samples remain in `comparison.json`. These are results on the selected existing
+Spaceport4KiB kernel and stock fan control, not qualification of64KiB release
+hardware or mixed production traffic. No memory or thermal guard aborted a run;
+all four native reports retain memory, swap and temperature observations.
+
+The first integrated pilot is retained separately in `runs/serving-window-01`.
+It completed one LSA arm, then yielded for a method correction: adaptive3–4
+sample counts could advance the shared RNG differently before source-prefill
+sampling. The final matrix fixes every decode point at4 samples and records
+exact model-input hashes and native elapsed times without changing payloads.
+`serving/check_client.py` checks that client contract. No unfavorable result was
+discarded or presented as a matched comparison.
+
+The C37 service was restored on sp5–sp7 at16:27:33UTC (17:27:33CET). Independent
+live doctor and per-node checks confirm the original image/settings, no search
+mounts or environment, clean published checkouts, unchanged original806c5797
+checkouts, and absent native reservations. The tracked restore profile now names
+the isolated checkout, so its deployment/profile identity is explicit. No
+promoted configuration, image tag or immutable baseline changed.
+
+This candidate preserves tested outputs but fails the requested speed goal.
+Keep the current native search; do not promote this grouping. The benchmark
+adapter, exact commands, client identities, failures, repeated runs and closure
+receipts remain reviewable under `serving/` and `runs/`.
+
 ## Algorithm and rounding argument
 
 1. Build per-coordinate minimum and maximum values of every cluster's **visible**
@@ -205,8 +252,8 @@ path with matching SHA256 values. [Capture instructions](capture/README.md)
 describe the guarded collection procedure; reusing the existing saved operands
 requires no serving window. Rerun reports from committed receipts without a GPU.
 
-No production adoption is proposed for this grouping. A paired experimental
-Spaceport request measurement is now in progress. A different exact search
+No production adoption is proposed for this grouping. The paired experimental
+Spaceport request measurement is complete and shows higher latency. A different exact search
 must demonstrate useful real-input pruning and complete candidate cost first.
 Only then would full candidate two-boot, attention/greedy/distribution, mixed
 traffic and admission gates against immutable recorded release suites be useful.
