@@ -99,3 +99,27 @@ Full qualification still requires two candidate serving boots on each target
 shape, exact attention and greedy digests, teacher-forced distributions, mixed
 traffic, and memory/admission gates at the frozen workload limits, compared with
 the **recorded** release suites. Only the owner may accept promotion.
+
+## Initial hardware results
+
+`runs/attempt-01` retains the failed TileLang build (an integer was used as a
+boolean condition). `runs/attempt-02` is the corrected build's first complete
+GB10 pass: six snapshot cases, every selected position identical and no bound
+violation. At 16,383 keys the separable case keeps 576; the random case keeps all
+16,383. This is a useful correctness result and an unfavorable pruning result,
+not evidence of a serving speedup. Expanded tests and repeats are recorded
+separately; see `results.json` for the final status.
+
+The expanded `runs/attempt-03` passes all 12 cases, adding normal-scale extremes,
+NaN keys/queries/weights, a cache mutation that changes the expected winners,
+and 262K-key domains. At 262,143 keys, the separable input retains 576 keys and
+the random input retains all of them. Candidate-only median wall times, including
+rebuilding and allocations, are 3.72 and 5.87 ms respectively. These are different
+inputs, so their ratio is **not a speedup measurement**. The released scorer was
+used for correctness only, never timed.
+
+Seven CPU cases pass. The source checks also reverse the capture patch and
+recover the exact recorded candidate-36 indexer. Full build inputs are absent;
+`build check` reports that the build tree is not prepared. The image was neither
+rebuilt nor modified. See `decision.md` for outstanding gates and the window's
+closure, and `capture/README.md` for the unexecuted real-input workflow.

@@ -104,6 +104,7 @@ def check(width, extents, mode, repeats):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--max-width', type=int, default=262144)
     options = parser.parse_args()
     result = {'schema_version': 1, 'torch': torch.__version__,
               'gpu': torch.cuda.get_device_name(), 'capability': torch.cuda.get_device_capability(),
@@ -123,6 +124,8 @@ def main():
             (262144, [262143], 'separable'),
             (262144, [262143], 'random'),
         ]:
+            if width > options.max_width:
+                continue
             result['cases'].append(check(width, extents, mode, options.repeats))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
