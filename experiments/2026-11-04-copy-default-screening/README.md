@@ -135,3 +135,29 @@ controller receipt is `results/private/lab/candidate-39-round-attempt-2/receipt.
 The initial source/launch/reservation/image snapshots are retained in
 `runs/2026-11-04-dgx/attempt-2`. Keep execution pinned at `b464e9ad`; later
 publication of evidence is not a reason to synchronize an active window.
+
+## Scheduled DGX4 sharing after the gate
+
+The LSA work requested a 10–15 minute DGX4 slot through the regular request file
+while candidate-39's release gate was running. The owned hold records a planned
+serialized handoff after this gate ends and the existing service is verified.
+A hardware-review hold blocks that handoff. No simultaneous DGX4 work is added
+to the TP3 timed window. The request does not interrupt the current gate.
+
+After the slot, a completed, passing image gate can be reused for the remaining
+unmeasured work with a distinct controller attempt:
+
+```sh
+python3 experiments/2026-11-04-copy-default-screening/run_round.py --attempt 3 --resume-image-gate-from results/private/lab/candidate-39-round-attempt-2/receipt.json
+```
+
+This is a plan unless `--apply` is supplied. The resume guard requires a safely
+closed scheduling handoff, all image/build/gate exits zero, a nonempty passing
+test summary, no guard/restoration/hardware error, and the exact frozen image
+`sha256:17550af8ae03a42919d72fac7d2771a18f0f30300b45f0b06edc1ac83625f885`.
+It rechecks the unchanged native gate receipt and DGX4 image before transferring
+it. It rejects any earlier functional or timed phase, and preserves prior
+outputs. Nine offline safety cases pass. The current gate is still pending;
+this control change neither qualifies it nor changes its running checkout.
+Only after the foreign slot ends and the usual publish/sync/live/idle guards
+pass may the new controller resume. No image build or test gate is repeated.
