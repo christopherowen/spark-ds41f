@@ -14,6 +14,7 @@ parser.add_argument("--ctas", type=int, default=1)
 parser.add_argument("--iters", type=int, default=1)
 parser.add_argument("--warps", type=int, default=1)
 parser.add_argument("--export", action="store_true")
+parser.add_argument("--uniform-registers", action="store_true")
 split = sys.argv.index("--") if "--" in sys.argv else len(sys.argv)
 args = parser.parse_args(sys.argv[1:split])
 workload = sys.argv[split + 1 :]
@@ -29,6 +30,7 @@ collector = enable(
     iters=args.iters,
     warps=args.warps,
     patched=True,
+    uniform_registers=args.uniform_registers,
 )
 sys.argv = workload
 sys.path.insert(0, str(Path(workload[0]).resolve().parent))
