@@ -16,7 +16,7 @@ _ACTIVE = None
 
 class Collector:
     def __init__(self, out, ring_bytes=8 << 20, chunk_bytes=64 << 20,
-                 writer_delay_us=0, fail_after_records=0):
+                 writer_delay_us=0, fail_after_records=0, uniform_registers=False):
         import torch
         torch.cuda.init()
         self.out = Path(out).resolve()
@@ -62,7 +62,7 @@ class Collector:
             self.cuda.cudaFreeHost(self.host)
             raise OSError(code, 'trace writer could not start')
         self.closed = False
-        self.modules = {}
+        self.uniform_registers = uniform_registers
         self.write_json('identity.json', {'format': 'SPKIKET1', 'format_version': 2, 'record_bytes': 64,
                         'writer_source_sha256': hashlib.sha256((HERE / 'writer.cpp').read_bytes()).hexdigest(),
                         'writer_binary_sha256': hashlib.sha256(library.read_bytes()).hexdigest(),
@@ -71,6 +71,7 @@ class Collector:
                         'chunk_bytes': chunk_bytes, 'writer_delay_us': writer_delay_us,
                         'fail_after_records': fail_after_records,
                         'device': torch.cuda.get_device_name(), 'pid': os.getpid(),
+                        'uniform_registers': uniform_registers,
                         'scope': 'TileLang phase events; not arbitrary SASS tracing'})
         atexit.register(self._at_exit)
 
@@ -121,6 +122,11 @@ class Collector:
             return code
         if skip and all(re.search(skip, name) for name, *_ in kernels):
             return code
+        original_digest = hashlib.sha256(code.encode()).hexdigest()
+        redistribution = re.findall(r"tl::warpgroup_reg_(?:dealloc|alloc)<[0-9]+>\(\);", code)
+        if self.uniform_registers:
+            code = re.sub(r"tl::warpgroup_reg_(?:dealloc|alloc)<[0-9]+>\(\);",
+                          "/* streaming: uniform register allocation */", code)
         digest = hashlib.sha256(code.encode()).hexdigest()
         annotated, sites = iket.annotate(code, lambda name, number: str(number),
                                         ctas, iters, granularity, warps, payloads)
@@ -131,6 +137,8 @@ class Collector:
             stem = f'{name}.{digest[:12]}'
             manifest = {'kernel': name, 'kernel_id': number, 'ctas': ctas, 'iters': iters,
                         'warps': warps, 'granularity': granularity, 'payloads': payloads,
+                        'original_code_sha256': original_digest,
+                        'register_redistribution': 'disabled' if redistribution and self.uniform_registers else 'unchanged',
                         'sites': [dict(s, range_id=__import__('zlib').crc32(s['range'].encode()) & 0xffffffff or 1)
                                   if 'range' in s else s for s in sites if s['kernel'] == name]}
             self.write_json('sources/' + stem + '.json', manifest)
@@ -151,14 +159,14 @@ class Collector:
 
 
 def enable(out, *, ring_bytes=8 << 20, chunk_bytes=64 << 20, writer_delay_us=0,
-           fail_after_records=0, ctas=1, iters=1, warps=1, payloads=True, patched=False):
+           fail_after_records=0, ctas=1, iters=1, warps=1, payloads=True, patched=False, uniform_registers=False):
     global _ACTIVE
     if _ACTIVE is not None:
         raise RuntimeError('one collector per process')
     if os.environ.get('CUDA_INJECTION64_PATH') or os.environ.get('VLLM_DS41_IKET_CACHE_DIR'):
         raise RuntimeError('streaming requires its own collector and no persistent instrumented cache')
     from vllm.models.deepseek_v4_1.tilelang import iket
-    collector = Collector(out, ring_bytes, chunk_bytes, writer_delay_us, fail_after_records)
+    collector = Collector(out, ring_bytes, chunk_bytes, writer_delay_us, fail_after_records, uniform_registers)
     if patched:
         from .phase import load
         iket = load(collector.out)

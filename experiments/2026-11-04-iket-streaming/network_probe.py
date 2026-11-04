@@ -29,7 +29,7 @@ from sparknet.oneshot import _reducescatter_tilelang as rs
 compiled = []
 for topology, world, hcas, ring in [('triangle', 3, 2, False), ('ring', 4, 2, True), ('switched', 4, 4, False)]:
     for operation, module in [('allreduce', ar), ('allgather', ag), ('exchange', ex), ('reducescatter', rs)]:
-        prefix = () if operation == 'allgather' else ('float32',)
+        prefix = ('float32',) if operation in ('allreduce', 'reducescatter') else ()
         module._build(*prefix, world, 0, 128, 2, 64, hcas, ring)()
         compiled.append([topology, operation])
 
