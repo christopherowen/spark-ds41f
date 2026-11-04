@@ -11,8 +11,8 @@ Preserve both attempts. The actual controller exit 1 is a scheduling closure,
 with a zero-exit gate and independently verified candidate-36 restoration on all
 ranks. The resume guard accepts this completed safe handoff.
 
-After the foreign slot, resume only unmeasured functional and two-boot metrics
-using the frozen passing image. Compare both saved candidate-38 recipes and the
+The foreign slot has ended. Attempt 3 now resumes only unmeasured functional
+and two-boot metrics using the frozen passing image. Compare both saved candidate-38 recipes and the
 immutable release references, retaining repeat variation and adverse rows.
 Only then choose a separate copy-tuning round and assess compiler prerequisites.
 

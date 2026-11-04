@@ -62,8 +62,9 @@ measurement work; hardware recovery remains separate.
 
 Candidate-39 image preparation, build and the release-test gate passed in attempt 2.
 The window yielded for the requested DGX4 slot after preserving the completed
-gate and verifying candidate-36 on every serving rank. Functional qualification
-and both serving metric boots remain unmeasured.
+gate and verifying candidate-36 on every serving rank. That slot is complete;
+attempt 3 now owns the regular window for the remaining qualification. Functional
+and serving metric results are pending.
 The fresh full vLLM preparation reproduced candidate-38 tree `c061e5f6` exactly;
 #842 applies without conflicts. The Mac partial-clone canonical lock replay
 failed on a missing intermediate local GLP blob. Its failure is retained in
@@ -111,7 +112,7 @@ the shared reservation and request queue allow it, from a newly published clean
 commit on all nodes. The executor refuses to overwrite prior outputs or resume
 if any previous phase started. No new GPU measurement exists yet.
 
-## Second dispatch: local qualification running
+## Second dispatch: image gate before the shared slot
 
 The owner confirmed local DGX4 as the fallback if the VPN could not be repaired,
 with normal shared scheduling. The isolated operator VPN gateway had no recent
@@ -127,7 +128,7 @@ A new indexer request deferred the first launch command before it created a
 controller. Our request was requeued rather than replacing that window. Once
 the repeat/sanitizer job released the reservation, attempt 2 launched at
 09:12:04 UTC on 2026-11-04 (controller PID 2926115). Window
-`dgx1-1793783564` opened at 09:12:44 UTC. Its heartbeat is live.
+`dgx1-1793783564` opened at 09:12:44 UTC. Its heartbeat remained live through closure.
 Complete image preparation and `build check` passed; the image build began at
 09:14:38 UTC. These are preparation results, not serving-performance results.
 
@@ -193,3 +194,31 @@ ends, synchronize a single published control commit through the usual guarded
 process, then use attempt 3 to reuse this identical image and completed gate.
 Do not rebuild it or repeat any already completed measurement. The subsequent
 functional and two-boot serving results decide whether a tuning round is sound.
+
+## Third dispatch: remaining qualification resumed
+
+The other task returned DGX4 at 10:15:21 UTC. Our own queued return request was
+fulfilled without changing another request. Guarded staging window
+`dgx1-1793787483` used the named candidate-36 restoration profile; the start plan
+reported the same live and planned TP3 shape. Git-based cluster sync put DGX1–3
+at published commit `2e6bc10ed8ae6a5f36459e9985011aca070179e3`, with the clean
+owned DGX4 build checkout detached at that same commit. The frozen image and
+original gate receipt retained their build lineage at `b464e9ad`. Staging closed
+at 10:19:14 UTC after verifying the already-matching serving profile, with no
+serving restart.
+
+An operator launch command failed in shell/Python quoting before any dispatcher,
+controller, hold or native attempt-3 directory was created. Its error and the
+absence checks are preserved. Corrected argument-safe transport then launched
+exactly one supervisor (PID 3000758) and controller (PID 3000759), at 10:20:40 UTC.
+This is a launch error, not a measured candidate failure or replaced data point.
+
+Attempt 3 opened window `dgx1-1793787679` at 10:21:19 UTC. The explicit resume
+control validated the unchanged gate and actual DGX4 image, then began seeding
+that image. It repeats neither build nor release-test gate. Functional and
+two-boot serving measurements remain pending. The actual wait exit will be
+retained separately when this controller ends. Initial launch, queue fulfillment,
+staging and resume receipts are in `runs/2026-11-04-dgx/attempt-3`.
+
+A fresh PR inventory still contains only the four distinct open changes #851,
+#865, #875 and #877; no additional superseded PR was found.
