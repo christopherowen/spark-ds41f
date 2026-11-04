@@ -45,6 +45,13 @@ catalog; the smaller `bundle` directories are initial component screens.
 
 The current site is TP3 triangle. Do not start a TP4 arm on that cabling. TP4
 plans are prepared for its own authorized, hardware-qualified window only.
+Kernel job targets must belong to the window's production node map: the FP8
+probe uses dgx1; scale and Engram component/full-gate tests use dgx1/2/3.
+
+The owner has authorized coordinated candidate boots/restarts and production
+restoration (`runs/authorization.json`). Candidate 36's TP3 dev profile currently
+matches the live cluster and is the restoration profile for this window. The
+publish, idle and hold guards still apply; promotion is not authorized.
 
 Before any hardware work, read the hold on dgx1 and obtain the required explicit
 authorization for coordinated stops, candidate boots/restarts and restoration.
