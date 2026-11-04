@@ -168,8 +168,6 @@ def main():
             p.read_text(errors="replace") for p in out.glob("*.log"))).lower() for marker in MANAGEMENT_ERRORS)
         print(receipt["error"], flush=True)
     finally:
-        done.set()
-        thread.join(timeout=5)
         try:
             if owns():
                 unreachable = probe_management()
@@ -203,6 +201,8 @@ def main():
                 hold.update(holder="lossless-memory-restoration-review",
                             rule="restoration guard failed; retain reservation without another launch")
                 lab.write_json_atomic(lab.HOLD, hold)
+        done.set()
+        thread.join(timeout=5)
         if not receipt["restored"]:
             code = 1
         receipt["ended"] = lab.now()
