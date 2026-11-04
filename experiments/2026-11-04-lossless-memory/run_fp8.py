@@ -19,6 +19,18 @@ from fp8_results import FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, validate
 
 HOLDER = "spark-lab: owner-authorized lossless FP8 decoder measurements"
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
+MANAGEMENT_ERRORS = ("ssh: connect", "cannot reach", "kex_exchange_identification",
+                     "connection timed out during banner exchange", "memory telemetry stopped reporting",
+                     "memory telemetry did not start")
+
+
+def probe_management():
+    try:
+        _, nodes, _ = lab.production_configuration()
+        return [node["name"] for node in nodes["nodes"]
+                if lab.spark.run_ssh(nodes, node, "true").returncode]
+    except Exception as error:
+        return ["management probe failed: " + type(error).__name__]
 
 
 def main():
@@ -79,7 +91,7 @@ def main():
 
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
-    code = 1
+    code, management_lost = 1, False
     try:
         hold = lab.read_hold()
         closing = lab.window_should_close(hold)
@@ -132,6 +144,8 @@ def main():
                 verdicts_path = ROOT / "results/private/lab" / spec["run"] / "verdicts.json"
                 verdicts = json.loads(verdicts_path.read_text())
                 step["verdicts"] = verdicts
+                management_lost |= any(marker in json.dumps(verdicts).lower() for marker in MANAGEMENT_ERRORS)
+                management_lost |= any(v.get("exit") == 255 for v in verdicts.get("verdicts", []))
                 if verdicts.get("agree") is not True or len(verdicts.get("verdicts", [])) != 1:
                     raise RuntimeError("kernel job failed or lacks an agreed verdict")
                 candidate_path = ROOT / spec["jobs"][0]["bundles"][0]["bundle"] / "candidate.json"
@@ -150,16 +164,45 @@ def main():
         code = 0
     except BaseException as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
+        management_lost |= any(marker in (receipt["error"] + "\n" + "\n".join(
+            p.read_text(errors="replace") for p in out.glob("*.log"))).lower() for marker in MANAGEMENT_ERRORS)
         print(receipt["error"], flush=True)
     finally:
         done.set()
         thread.join(timeout=5)
-        if owns():
-            receipt["restored"] = lab.window_close("FP8 measurements finished or deferred")
-        elif lab.read_hold() is None:
-            receipt["restored"] = lab.production_live()
-        else:
-            receipt["restore_deferred"] = "foreign reservation; no operation"
+        try:
+            if owns():
+                unreachable = probe_management()
+                if not owns():
+                    raise RuntimeError("window changed during cleanup; no restoration launch")
+                if management_lost or unreachable:
+                    hold = lab.read_hold()
+                    hold.update(holder="lossless-memory-hardware-review",
+                                rule="management unavailable; no launch until isolated and explicitly authorized")
+                    lab.write_json_atomic(lab.HOLD, hold)
+                    receipt["management_unreachable"] = unreachable
+                    receipt["management_loss_latched"] = management_lost
+                    raise RuntimeError("management loss; reservation kept without a restoration launch")
+                argv = [sys.executable, "bin/spark", "--cluster-config", RESTORE, "cluster", "start", "--replace"]
+                plan = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True)
+                lab.write_json_atomic(out / "restore-plan.json", {"argv": argv, "exit": plan.returncode,
+                                      "stdout": plan.stdout, "stderr": plan.stderr})
+                print(plan.stdout, flush=True)
+                if plan.returncode or "--apply would refuse" in plan.stdout or "shape:   CHANGED" in plan.stdout:
+                    raise RuntimeError("restoration plan refused; no shape bypass")
+                if owns():
+                    receipt["restored"] = lab.window_close("FP8 measurements finished or deferred")
+            elif lab.read_hold() is None:
+                receipt["restored"] = lab.production_live()
+            else:
+                receipt["restore_deferred"] = "foreign reservation; no operation"
+        except BaseException as error:
+            receipt["restore_error"] = f"{type(error).__name__}: {error}"
+            if owns():
+                hold = lab.read_hold()
+                hold.update(holder="lossless-memory-restoration-review",
+                            rule="restoration guard failed; retain reservation without another launch")
+                lab.write_json_atomic(lab.HOLD, hold)
         if not receipt["restored"]:
             code = 1
         receipt["ended"] = lab.now()
