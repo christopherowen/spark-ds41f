@@ -200,4 +200,8 @@ bundles and repeated release-suite plans are prepared. A portable C fixture
 reproduced signed overflow on invalid Engram metadata; the new guard rejects it
 and preserves every byte in 1,025 valid rows across page boundaries. Native GPU
 tests and serving performance for these two arms remain unqualified.
+Complete source/wheel inputs and both local build checks now pass. The final
+Engram arm records cold preparation and cache reuse costs; its qualification
+controller verifies every rank's complete packed file against source bytes
+before timings. See `QUALIFICATION.md` for exact commands and failure guards.
 See `decision.md`, `base.json` and `runs/preparation.json`.
