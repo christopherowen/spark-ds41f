@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -45,11 +46,20 @@ def main() -> int:
         raise RuntimeError("patch identity mismatch")
     if report["original_async_llm_sha256"] != identity["original_async_llm_sha256"]:
         raise RuntimeError("candidate host source does not match the recorded base")
-    apply = ["git", "apply"]
-    if args.mode == "control":
-        apply += ["--include=tests/v1/engine/test_request_submission_cleanup.py"]
-    subprocess.run([*apply, "--check", str(patch)], cwd=source, check=True)
-    subprocess.run([*apply, str(patch)], cwd=source, check=True)
+    # The runtime image deliberately has no Git client. The host generates
+    # these files by applying the published patch to the verified image source;
+    # check every resulting byte before installing into this disposable container.
+    generated = root / "generated"
+    corrected = generated / "async_llm.py"
+    regression = generated / "test_request_submission_cleanup.py"
+    if digest(corrected) != identity["fixed_async_llm_sha256"]:
+        raise RuntimeError("generated correction identity mismatch")
+    if digest(regression) != identity["test_sha256"]:
+        raise RuntimeError("generated regression test identity mismatch")
+    test.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(regression, test)
+    if args.mode == "corrected":
+        shutil.copyfile(corrected, target)
     expected = identity[
         "fixed_async_llm_sha256"
         if args.mode == "corrected"
