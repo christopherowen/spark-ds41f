@@ -129,8 +129,13 @@ under the recorded native paths and ignored evidence directory.
 
 A CPU-only verification using the existing cache, the measurement's 12 GiB
 cap and non-serving cores reproduced the 16-session stub failure while
-candidate-37 remained live. Its first two-session replay passed. The client
-setup is being repaired before resuming the originally approved matrix.
+candidate-37 remained live. Its first two-session replay passed. Increasing only the model-free stub listen backlog from five to 128 then
+passed two native verification runs, including the 16-session restores
+(4.6 and 4.4 GiB peak under the 12 GiB cap). The repair and unchanged timed
+workload are recorded under `runs/2026-11-04-spaceport/client-repair`.
+The original four-point matrix resumed as attempt 2 at commit `f2a1d74b`;
+its controller log is `~/spark-lab/release-trace-replay-c38/window-attempt-2.log`
+and its receipt directory is `results/private/lab/c38-spaceport-tp4-window-attempt-2`.
 Subsequent windows use `run_window.py --attempt N --apply` so the failed
 window remains intact. The candidate image and measured workloads do not change.
 
