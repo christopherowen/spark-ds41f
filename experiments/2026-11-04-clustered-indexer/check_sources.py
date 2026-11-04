@@ -28,6 +28,8 @@ with tempfile.TemporaryDirectory() as directory:
                    cwd=root, check=True)
     subprocess.run(['git', 'apply', str(HERE / 'vllm/0007-source-tie-cutoff.patch')],
                    cwd=root, check=True)
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0008-pack-source-cutoff.patch')],
+                   cwd=root, check=True)
     source = RELATIVE.parent / 'source_indexer.py'
     assert (root / source).read_bytes() == (HERE / 'bundle/overlay' / source).read_bytes()
     ast.parse((root / source).read_text())
@@ -75,3 +77,7 @@ print('replay dependency recovers the exact candidate-36 indexer; syntax OK')
 control_hash = json.loads((HERE / 'source-ties.json').read_text())['control_sha256']
 assert hashlib.sha256((HERE / 'bundle/source_reference.py').read_bytes()).hexdigest() == control_hash
 print('archived source control hash matches')
+
+tie_hash = json.loads((HERE / 'source-cutoff-packing.json').read_text())['archived_tie_source_sha256']
+assert hashlib.sha256((HERE / 'bundle/source_ties_reference.py').read_bytes()).hexdigest() == tie_hash
+print('archived tie-cutoff source hash matches')

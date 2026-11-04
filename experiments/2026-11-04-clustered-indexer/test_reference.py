@@ -76,6 +76,16 @@ class BoundTests(unittest.TestCase):
                                  source_block_ids(scores, block_k, group)[0])
                 self.assertEqual(topk(pruned, 4), topk(scores, 4))
 
+    def test_packed_source_cutoff_matches_native_pair_order(self):
+        rng = random.Random(4185)
+        for _ in range(200):
+            entries = [(rng.choice([0x7fff, 0x8000, rng.randrange(1, 65535)]), rng.randrange(131072))
+                       for _ in range(rng.randrange(1, 65))]
+            expected = min((key, -position) for key, position in entries)
+            packed = min(key * 2**32 + (2**32 - 1 - position) for key, position in entries)
+            recovered = (packed // 2**32, -(2**32 - 1 - packed % 2**32))
+            self.assertEqual(recovered, expected)
+
     def test_source_lexicographic_cutoff_preserves_tied_blocks(self):
         rng = random.Random(4183)
         for length in (0, 1, 7, 37, 65, 129, 1025):

@@ -231,8 +231,18 @@ remove it while always retaining the global mandatory last cluster. Native
 ordering keys distinguish signed zeros; short and nonfinite seeds disable this
 refinement. Original bound values remain intact for the full-score oracle.
 
-`source-ties.json` and patch 0007 record this single variable. Twelve CPU tests
-and fresh patch/source checks pass; repeated source, handoff/reindex and
-sanitizer GPU gates remain pending. `sp8-source-control` preserves the preceding
+`source-ties.json` and patch 0007 record this single variable. Thirteen CPU tests
+and fresh patch/source checks pass. Two eight-case graph runs and all three
+sanitizers pass the tie cutoff with unchanged source/reindex digests. However,
+complete separable medians rise from 0.177 / 0.176 ms to 0.533 / 0.535 ms, despite
+retaining only 16,511 keys. This execution is rejected for speed. `sp8-source-control` preserves the preceding
 unreleased source plan with exactly the same expanded harness. It does not
 benchmark a released build.
+
+Patch 0008 prepares one execution change: reduce a packed native BF16 key and
+complemented original block position once, preserving the same cutoff order.
+`source-cutoff-packing.json` records pending GPU gates. Both the earlier numeric
+prototype and the slower two-reduction tie prototype are frozen for diagnostics.
+Candidate-only traces must identify the stage cost rather than infer it from
+pruned-key counts. Native-layout capture/replay QA also passes twice on the exact
+C36 sp8 image; real DeepSeek operands have still not been collected.

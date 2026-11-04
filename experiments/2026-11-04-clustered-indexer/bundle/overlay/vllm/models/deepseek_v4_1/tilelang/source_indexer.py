@@ -25,10 +25,8 @@ def source_threshold(seed_blocks: int):
     ):
         with T.Kernel(rows, threads=128) as row:
             last = T.ceildiv(Counts[row], CANDIDATE_BLOCK) - 1
-            keys = T.alloc_fragment([CANDIDATE_BLOCKS], T.int32)
-            positions = T.alloc_fragment([CANDIDATE_BLOCKS], T.int32)
-            minimum = T.alloc_fragment([1], T.int32)
-            maximum_position = T.alloc_fragment([1], T.int32)
+            pairs = T.alloc_fragment([CANDIDATE_BLOCKS], T.uint64)
+            minimum = T.alloc_fragment([1], T.uint64)
             for k in T.Parallel(CANDIDATE_BLOCKS):
                 # The native block selector forces its last block. Excluding it
                 # gives a lower bound for the 2047 ordinary winners; padding
@@ -37,19 +35,22 @@ def source_threshold(seed_blocks: int):
                 ThresholdValues[row, k] = T.if_then_else(forced,
                     T.cast(3.3895313892515355e38, T.bfloat16), Values[row, k])
 
-                finite = T.abs(T.cast(Values[row, k], T.float32)) < T.infinity(T.float32)
-                keys[k] = T.if_then_else(forced, 65535,
-                    T.if_then_else(finite, _key16(Values[row, k]), 0))
-            T.reduce_min(keys, minimum, dim=0)
-            for k in T.Parallel(CANDIDATE_BLOCKS):
                 block = Blocks[row, k]
-                eligible = (block >= 0) & (block != last) & (keys[k] == minimum[0])
-                positions[k] = T.if_then_else(eligible, SeedIDs[row, T.max(block, 0)], -1)
-            T.reduce_max(positions, maximum_position, dim=0)
+                position = SeedIDs[row, T.max(block, 0)]
+                finite = T.abs(T.cast(Values[row, k], T.float32)) < T.infinity(T.float32)
+                pair = T.cast(_key16(Values[row, k]), T.uint64) * 4294967296 + (
+                    T.cast(4294967295, T.uint64) - T.cast(T.max(position, 0), T.uint64))
+                # One native key/original-position pair avoids keeping a second
+                # fragment alive across dependent reductions and gathers.
+                pairs[k] = T.if_then_else(forced,
+                    T.cast(65535, T.uint64) * 4294967296 + 4294967295,
+                    T.if_then_else(finite & (block >= 0) & (position >= 0), pair, T.cast(0, T.uint64)))
+            T.reduce_min(pairs, minimum, dim=0)
             if T.get_thread_binding() == 0:
-                CutoffKey[row] = minimum[0]
-                CutoffPosition[row] = T.if_then_else(minimum[0] == 0,
-                    2147483647, maximum_position[0])
+                key = T.cast(minimum[0] // 4294967296, T.int32)
+                CutoffKey[row] = key
+                CutoffPosition[row] = T.if_then_else(key == 0, 2147483647,
+                    T.cast(4294967295 - minimum[0] % 4294967296, T.int32))
 
     return threshold
 
