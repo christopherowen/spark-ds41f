@@ -43,8 +43,18 @@ def main():
     jobs = json.loads(Path(args.matrix).read_text())
     if socket.gethostname() != "spark-0016":
         raise SystemExit("authorized only on idle sp8")
-    if capture(["docker", "ps", "-q"]):
-        raise SystemExit("sp8 is not idle")
+    for container_id in capture(["docker", "ps", "-q"]).splitlines():
+        other = json.loads(capture(["docker", "inspect", container_id]))[0]
+        host = other["HostConfig"]
+        command = other["Config"].get("Cmd", [])
+        entrypoint = other["Config"].get("Entrypoint", [])
+        # A parked CPU-only review container is not a GPU workload. Never stop it.
+        parked = (host["Runtime"] == "runc" and not host.get("DeviceRequests")
+                  and not host.get("Devices") and entrypoint == ["sleep"]
+                  and command == ["infinity"])
+        processes = capture(["docker", "top", container_id, "-eo", "args"]).splitlines()[1:]
+        if not parked or processes != ["sleep infinity"]:
+            raise SystemExit("sp8 has an active container: " + other["Name"])
     if capture(["git", "-C", str(ROOT), "status", "--porcelain"]):
         raise SystemExit("diagnostic checkout must be clean")
     if memory() < 40 * (1 << 30):
