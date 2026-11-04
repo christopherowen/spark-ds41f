@@ -14,7 +14,7 @@ __device__ __forceinline__ unsigned long long spark_trace_name(const char *s) {
 }
 __device__ __forceinline__ void spark_trace_emit(unsigned long long kernel, unsigned kind, unsigned event, unsigned payload) {
   unsigned linear = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
-  if ((linear & 31) != (__ffs(__activemask()) - 1)) return;
+  if ((linear & 31) != 0) return;
   auto h = reinterpret_cast<SparkTraceHeader *>(SPARK_TRACE_ADDRESS);
   if (SparkSysAtomic(h->status).load(cuda::memory_order_acquire)) asm volatile("trap;");
   unsigned long long ts, grid; unsigned sm;

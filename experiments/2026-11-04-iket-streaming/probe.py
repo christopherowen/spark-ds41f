@@ -46,6 +46,9 @@ for output in outputs:
     assert bool((output == 256).all())
 collector.close()
 counts = export(args.out / 'stream', args.out / 'trace.json')
+launches = args.repeats * (1 if args.graph else args.streams) + int(args.graph)
+assert counts['kind_0'] == counts['kind_3'] == 16 * launches
+assert counts['kind_1'] == counts['kind_2'] == 3 * launches
 summary = json.loads((args.out / 'stream/summary.json').read_text())
 assert summary['written_records'] > collector.capacity * 10
 result = {'operation':args.operation, 'seconds':time.monotonic()-start,
