@@ -24,6 +24,7 @@ class Collector:
         writer_delay_us=0,
         fail_after_records=0,
         uniform_registers=False,
+        managed=False,
     ):
         import torch
 
@@ -43,12 +44,18 @@ class Collector:
             ctypes.c_uint,
         ]
         self.cuda.cudaFreeHost.argtypes = [ctypes.c_void_p]
+        self.cuda.cudaMallocManaged.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        self.cuda.cudaFree.argtypes = [ctypes.c_void_p]
         self.cuda.cudaDeviceGetAttribute.argtypes = [
             ctypes.POINTER(ctypes.c_int),
             ctypes.c_int,
             ctypes.c_int,
         ]
-        for attribute in (19, 86):
+        for attribute in (86, 89) if managed else (19, 86):
             value = ctypes.c_int()
             self.check(
                 self.cuda.cudaDeviceGetAttribute(
@@ -64,11 +71,21 @@ class Collector:
         self.capacity = (ring_bytes - 64) // 64
         self.size = 64 + self.capacity * 64
         self.host = ctypes.c_void_p()
-        self.check(self.cuda.cudaHostAlloc(ctypes.byref(self.host), self.size, 2))
         self.device = ctypes.c_void_p()
-        self.check(
-            self.cuda.cudaHostGetDevicePointer(ctypes.byref(self.device), self.host, 0)
-        )
+        if managed:
+            self.check(
+                self.cuda.cudaMallocManaged(ctypes.byref(self.host), self.size, 1)
+            )
+            self.device.value = self.host.value
+            self.free_memory = self.cuda.cudaFree
+        else:
+            self.check(self.cuda.cudaHostAlloc(ctypes.byref(self.host), self.size, 2))
+            self.check(
+                self.cuda.cudaHostGetDevicePointer(
+                    ctypes.byref(self.device), self.host, 0
+                )
+            )
+            self.free_memory = self.cuda.cudaFreeHost
         ctypes.memset(self.host, 0, self.size)
         self.header = (ctypes.c_uint64 * 8).from_address(self.host.value)
         self.header[0] = self.capacity
@@ -116,7 +133,7 @@ class Collector:
         )
         if not self.handle:
             code = self.header[3]
-            self.cuda.cudaFreeHost(self.host)
+            self.free_memory(self.host)
             raise OSError(code, "trace writer could not start")
         self.closed = False
         self.uniform_registers = uniform_registers
@@ -143,6 +160,7 @@ class Collector:
                 "device": torch.cuda.get_device_name(),
                 "pid": os.getpid(),
                 "uniform_registers": uniform_registers,
+                "allocation": "managed" if managed else "mapped-host",
                 "scope": "TileLang phase events; not arbitrary SASS tracing",
             },
         )
@@ -196,7 +214,7 @@ class Collector:
             },
         )
         if not sync_error:
-            self.check(self.cuda.cudaFreeHost(self.host))
+            self.check(self.free_memory(self.host))
         if status or sync_error:
             raise RuntimeError(
                 f"incomplete streaming capture: {os.strerror(status) if status else sync_error}; writer status {status}; receipts: {self.out}"
@@ -310,6 +328,7 @@ def enable(
     payloads=True,
     patched=False,
     uniform_registers=False,
+    managed=False,
 ):
     global _ACTIVE
     if _ACTIVE is not None:
@@ -329,6 +348,7 @@ def enable(
         writer_delay_us,
         fail_after_records,
         uniform_registers,
+        managed,
     )
     if patched:
         from .phase import load

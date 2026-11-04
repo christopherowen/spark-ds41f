@@ -12,6 +12,7 @@ parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--stream", action="store_true")
 parser.add_argument("--rows", type=int, default=128)
 parser.add_argument("--uniform", action="store_true")
+parser.add_argument("--managed", action="store_true")
 args = parser.parse_args()
 import torch
 
@@ -24,6 +25,7 @@ if args.stream:
         ring_bytes=1 << 20,
         patched=True,
         uniform_registers=args.uniform,
+        managed=args.managed,
     )
 from vllm.models.deepseek_v4_1.tilelang.vision import linear_kernel
 
