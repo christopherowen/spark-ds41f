@@ -131,7 +131,10 @@ python3 experiments/2026-11-04-lossless-memory/run_fp8.py \
 ```
 
 The owner has authorized these candidate operations. A shared-window request
-still ends the current window after its job. Preserve partial observations and
+still ends the current window after its job. The fixed first/repeat FP8 matrix
+is one short screen job: a return request explicitly queued after that window
+opened stays visible and is honored at the screen's end. An older or unrelated
+pending request prevents starting. Preserve partial observations and
 resume only unmeasured lane counts in a separately named receipt.
 
 ## Hardware sequence

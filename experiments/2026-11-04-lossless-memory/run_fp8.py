@@ -2,6 +2,8 @@
 """Run first/repeat FP8 gates inside an already reserved, authorized window."""
 
 import argparse
+import contextlib
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -68,10 +70,26 @@ def main():
     thread.start()
     code = 1
     try:
+        hold = lab.read_hold()
+        closing = lab.window_should_close(hold)
+        # A request explicitly queued behind this already-open screen is for
+        # after its fixed first/repeat matrix. Older or unrelated requests
+        # prevent a new job. Keep the request visible throughout the screen.
+        if closing:
+            request_path = getattr(lab, "REQUEST", None)
+            request = json.loads(request_path.read_text()) if request_path and request_path.exists() else {}
+            if (not str(closing).startswith("cluster requested")
+                    or request.get("after_window") != args.window or not hold.get("since")
+                    or not request.get("since")
+                    or datetime.fromisoformat(request["since"].replace("Z", "+00:00")) <
+                       datetime.fromisoformat(hold["since"].replace("Z", "+00:00"))):
+                raise RuntimeError("window changed or closure requested; preserve completed observations")
+            receipt["queued_return_request"] = request
+            save()
         for lanes in args.lanes:
             pair = []
             for suffix in ("", "-repeat"):
-                if not owns() or lab.window_should_close(lab.read_hold()):
+                if not owns():
                     raise RuntimeError("window changed or closure requested; preserve completed observations")
                 spec_path = HERE / "fp8" / f"kernel-{lanes}{suffix}.json"
                 spec = json.loads(spec_path.read_text())
@@ -88,16 +106,22 @@ def main():
                 if plan.returncode or "--apply would refuse" in plan.stdout or "shape:   CHANGED" in plan.stdout:
                     raise RuntimeError("coordinated stop plan refused; no operation")
                 log_path = out / (spec["run"] + ".log")
-                argv = [sys.executable, "scripts/lab.py", "run", step["spec"], "--keep-open"]
-                step["argv"] = argv
+                kernel_step = next(s for s in lab.plan(spec) if s["kind"] == "kernel")
+                step["kernel_step"] = kernel_step
+                step["helper"] = "spark_ds41f.lab.run_kernel_bundles"
+                # One screen is one reserved job. Use the standard coordinated
+                # stop and kernel backend, with one restoration at its end.
                 with log_path.open("x") as log:
-                    result = subprocess.run(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-                step.update(exit=result.returncode, ended=lab.now())
+                    with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                        if not lab.stop_cluster():
+                            raise RuntimeError("coordinated stop failed")
+                        lab.run_kernel_bundles(kernel_step)
+                step.update(ended=lab.now())
                 save()
                 verdicts_path = ROOT / "results/private/lab" / spec["run"] / "verdicts.json"
                 verdicts = json.loads(verdicts_path.read_text())
                 step["verdicts"] = verdicts
-                if result.returncode or verdicts.get("agree") is not True or len(verdicts.get("verdicts", [])) != 1:
+                if verdicts.get("agree") is not True or len(verdicts.get("verdicts", [])) != 1:
                     raise RuntimeError("kernel job failed or lacks an agreed verdict")
                 candidate_path = ROOT / spec["jobs"][0]["bundles"][0]["bundle"] / "candidate.json"
                 candidate = json.loads(candidate_path.read_text())
