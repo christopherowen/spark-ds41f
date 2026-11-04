@@ -113,11 +113,10 @@ def shortlist_flags(width: int, budget: int):
                     block = tile*TILE+i
                     keep[i] = 0
                     if block < visible:
-                        chosen = (block >= complete) | (block == visible-1)
+                        keep[i] = T.cast((block >= complete) | (block == visible-1),T.int32)
                         if block < complete:
-                            chosen = chosen | ((low[i] < budget) &
-                                (Selected[row,T.min(low[i],budget-1)] == Membership[block]))
-                        keep[i] = T.cast(chosen,T.int32)
+                            keep[i] = T.max(keep[i],T.cast((low[i] < budget) &
+                                (Selected[row,T.min(low[i],budget-1)] == Membership[block]),T.int32))
                 T.cumsum(keep,prefix,dim=0)
                 for i in T.Parallel(TILE):
                     block = tile*TILE+i
