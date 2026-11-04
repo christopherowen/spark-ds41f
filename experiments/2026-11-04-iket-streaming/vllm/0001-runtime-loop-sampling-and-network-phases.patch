@@ -1,0 +1,159 @@
+From 905f0a8e2472c267b7cac42fd0dab7745fba7d0e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 02:26:24 +0100
+Subject: [PATCH] [DS4.1] sample runtime loops and classify networking exchange
+ phases
+
+Base: candidate-38 series on upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (tree c061e5f6931306fa4655ba531428f639c365bf10).
+
+Rationale: bias and slot-mapping loops need finite sampled event counts; sparknet exchange staging and doorbells need explicit phase labels. Runtime while loops keep their test and use a saturating observation counter. Profiling off has no change; profiling on adds only observation state, with first-iteration sampling for runtime loops.
+
+Tests: 15 CPU phase-pass cases pass; candidate-38 series freshly applied and reproduced its tree; GPU validation recorded separately in the deployment experiment. Upstream status: local experiment, not submitted.
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 40 +++++++++++------
+ vllm/models/deepseek_v4_1/tilelang/iket.py    | 43 +++++++++++++++++--
+ 2 files changed, 68 insertions(+), 15 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index cae522ad28..8ef93e8c5b 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -253,23 +253,39 @@ def test_sampled_iterations_guard_loop_ranges():
+     assert f"TL_IKET_WHEN(__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
+ 
+ 
+-def test_while_loop_ranges_have_no_bound():
+-    # TVM's while loop has no variable to sample: a range in it records in every
+-    # iteration, so the kernel's bound on a warp's events is None.
++def test_runtime_while_is_sampled_without_changing_its_test():
+     code = KERNEL.replace(
+         "  C[threadIdx.x] = acc[0];\n",
+         "  int t = 0;\n  while (1) {\n    if (!((t < e))) { break; }\n"
+         "    C[t] = acc[0];\n    t = (t + 1);\n  }\n  C[threadIdx.x] = acc[0];\n",
+     )
+-    _, sites = iket.annotate(code, _token, iters=1)
+-    assert [s["unsampled_loops"] for s in sites if "unsampled_loops" in s] == [
+-        ["while (1)"]
+-    ]
+-    assert {s["events_per_warp_bound"] for s in sites} == {None}
+-    assert [s["loop_trips"] for s in sites if "unsampled_loops" in s] == [None]
+-    # Without it, each range opens and closes once in the sampled iteration.
+-    sites = iket.annotate(KERNEL, _token, iters=1)[1]
+-    assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}
++    out, sites = iket.annotate(code, _token, iters=1)
++    assert "__tl_iket_while_0 = 0; (1);" in out
++    assert "__tl_iket_while_0 += (__tl_iket_while_0 < 1ULL)" in out
++    assert "TL_IKET_WHEN((__tl_iket_while_0 < 1ULL))" in out
++    assert "if (!((t < e))) { break; }" in out
++    assert not any(s.get("unsampled_loops") for s in sites)
++    assert all(isinstance(s["events_per_warp_bound"], int) for s in sites)
++    assert any(s.get("loop_trips", 0) is None for s in sites)
++    # Full iteration tracing still explicitly has no static capacity bound.
++    assert {s["events_per_warp_bound"] for s in iket.annotate(code, _token)[1]} == {None}
++
++
++def test_network_exchange_stage_doorbell_and_gather_have_distinct_phases():
++    code = """extern "C" __global__ void network_kernel(float* A, float* C) {
++  roce_stage_scatter_pack(A, C);
++  roce_doorbell_exchange(C);
++  roce_wait_peers(C);
++  roce_reduce_pack_f32(A, C);
++  roce_exchange_pack(A, C);
++  roce_tail(C);
++}
++"""
++    sites = iket.annotate(code, _token, iters=1)[1]
++    assert {s["range"] for s in sites} == {
++        "store.stage", "signal.proxy", "wait.flags", "compute.reduce",
++        "load.gather", "signal.proxy#2",
++    }
+ 
+ 
+ def test_module_without_kernels_is_unchanged():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 648171f028..0d106515b3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -110,13 +110,14 @@ _PATTERNS = [
+     ("load", "tma", [r"\btl::tma_load\w*", r"\.expect_transaction\s*\(",
+                      r"\barrive_and_expect_tx\b"]),
+     ("load", "cp_async", [r"\btl::cp_async_\w+", r"\bcp\.async\b"]),
++    ("load", "gather", [r"\broce_(?:gather|exchange)_pack\s*\("]),
+     ("compute", "mma", [r"\btl::\w*mma\w*", r"\bmma\.sync\b",
+                         r"\btl::ptx_ldmatrix\w*", r"\btl::gemm_\w+", r"\bwmma::"]),
+     ("compute", "reduce", [r"\btl::AllReduce\b", r"\btl::warp_reduce\w*",
+                            r"\b__shfl_\w+", r"\broce_reduce_\w+"]),
+     ("store", "tma", [r"\btl::tma_store\w*"]),
+-    ("store", "stage", [r"\broce_copy_\w+\s*\("]),
+-    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\(",
++    ("store", "stage", [r"\broce_(?:copy|stage)_\w+\s*\("]),
++    ("signal", "proxy", [r"\broce_doorbell(?:_\w+)?\s*\(", r"\broce_tail\s*\(",
+                          r"\broce_st_\w+\s*\("]),
+     ("store", "atomic", [r"\batomic\w+\s*\(", r"\btl::Atomic\w+\s*\("]),
+ ]  # fmt: skip
+@@ -454,10 +455,45 @@ def _sampled_factor(headers: tuple[str, ...], iters: int) -> float | None:
+     return total / sampled
+ 
+ 
++_RUNTIME_FOR = re.compile(
++    r"for\s*\(unsigned long long (__tl_iket_while_\d+) = 0;.*; "
++    r"\1 \+= \(\1 < (\d+)ULL\)\)", re.S
++)
++
++
++def _sample_runtime_loops(code: str, iters: int) -> str:
++    """Give while loops a saturating observation counter without changing their test."""
++    if not iters:
++        return code
++    changes = []
++
++    def visit(nodes):
++        for node in nodes:
++            if node.text.startswith("while"):
++                position = code.index(node.text, node.start, node.end)
++                test = node.text[node.text.index("(") + 1 : -1]
++                counter = f"__tl_iket_while_{len(changes)}"
++                header = (f"for (unsigned long long {counter} = 0; ({test}); "
++                          f"{counter} += ({counter} < {iters}ULL))")
++                changes.append((position, position + len(node.text), header))
++            visit(node.body or [])
++            visit(node.orelse or [])
++
++    for _, _, start, end in _kernels(code):
++        if not _CONDITIONAL.search(code, start, end):
++            visit(_Parser(code).block(start)[0])
++    for start, end, text in sorted(changes, reverse=True):
++        code = code[:start] + text + code[end:]
++    return code
++
++
+ def _iterations(header: str, iters: int) -> str | None:
+     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
+     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
+     sample is the middle iteration, not the pipeline's fill; None for another header."""
++    runtime = _RUNTIME_FOR.fullmatch(header)
++    if runtime is not None:
++        return f"({runtime.group(1)} < {iters}ULL)"
+     loop = _FOR.match(header)
+     if loop is None:
+         return None
+@@ -520,7 +556,7 @@ def annotate(
+     CTA, evenly spread across warp groups, record their ranges so trace stores do
+     not contend across every warp of a CTA. With ``iters`` > 0 a range inside a
+     ``for`` loop records in at most that many of its iterations, evenly spread
+-    (a ``while`` loop has no variable to sample: its site lists it, unsampled):
++    (a ``while`` loop uses a saturating counter and records its first sampled iterations):
+     run-iket reserves the run's largest warp record for every warp of every
+     instrumented launch, so one long kernel sizes the whole run's buffer. With
+     ``granularity="phase"``, consecutive waits and same-phase siblings separated
+@@ -532,6 +568,7 @@ def annotate(
+     preprocessor conditional in its body is left as it is."""
+     if granularity not in _GRANULARITIES:
+         raise ValueError(f"unknown IKET granularity: {granularity!r}")
++    code = _sample_runtime_loops(code, iters)
+     found: list[_Range] = []
+     sites: list[dict] = []
+     bodies: dict[str, int] = {}
+-- 
+2.54.0 (Apple Git-157)
+

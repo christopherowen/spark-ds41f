@@ -139,7 +139,7 @@ class Collector:
 
 
 def enable(out, *, ring_bytes=8 << 20, chunk_bytes=64 << 20, writer_delay_us=0,
-           fail_after_records=0, ctas=1, iters=1, warps=1, payloads=True):
+           fail_after_records=0, ctas=1, iters=1, warps=1, payloads=True, patched=False):
     global _ACTIVE
     if _ACTIVE is not None:
         raise RuntimeError('one collector per process')
@@ -147,6 +147,9 @@ def enable(out, *, ring_bytes=8 << 20, chunk_bytes=64 << 20, writer_delay_us=0,
         raise RuntimeError('streaming requires its own collector and no persistent instrumented cache')
     from vllm.models.deepseek_v4_1.tilelang import iket
     collector = Collector(out, ring_bytes, chunk_bytes, writer_delay_us, fail_after_records)
+    if patched:
+        from .phase import load
+        iket = load(collector.out)
     iket._postproc = collector.postproc
     iket.enable(out, ctas=ctas, iters=iters, warps=warps, granularity='phase', payloads=payloads)
     _ACTIVE = collector
