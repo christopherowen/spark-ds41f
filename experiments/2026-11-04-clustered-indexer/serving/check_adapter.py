@@ -59,8 +59,23 @@ def check(args,width,page,source,label,cuda_graph=True):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--quick',action='store_true');parser.add_argument('--real-only',action='store_true')
     parser.add_argument('--no-graph',action='store_true')
+    parser.add_argument('--freeze-declared',action='store_true')
     options=parser.parse_args();result={'passed':False,'cases':[]}
     try:
+        if options.freeze_declared:
+            import tilelang
+            from tilelang.cache import freeze
+            calls=[]
+            shapes=[(16384,page,False) for page in [128,256]]+[(65536,page,True) for page in [128,256]]
+            for path in sorted(Path('/snapshots').glob('rank-0-*.pt')):
+                data=torch.load(path,map_location='cpu',weights_only=True)
+                shapes.append((data['width'],data['page_size'],data['candidate_blocks']))
+            for width,page,source in set(shapes):
+                calls.extend(ServingClusteredIndexerPlan.calls(width,page,candidate_blocks=source))
+                calls.extend(IndexerV41Plan.calls(width,page,candidate_blocks=source))
+            tilelang.prepare(calls)
+            freeze('serving adapter declaration gate')
+            result['declared_calls_frozen']=True
         if not options.real_only:
             for page in [128,256]:
                 for rows in ([9] if options.quick else [1,8,9,17]):

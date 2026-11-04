@@ -94,3 +94,20 @@ print('archived source control hash matches')
 tie_hash = json.loads((HERE / 'source-cutoff-packing.json').read_text())['archived_tie_source_sha256']
 assert hashlib.sha256((HERE / 'bundle/source_ties_reference.py').read_bytes()).hexdigest() == tie_hash
 print('archived tie-cutoff source hash matches')
+
+# The serving adapter is reviewed against the independently reproduced C36 base.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    target = root / RELATIVE.parent
+    target.mkdir(parents=True)
+    for source in (HERE / 'capture/overlay').glob('*.py'):
+        shutil.copy2(source, target / source.name)
+    for patch in reversed((HERE / 'capture/series').read_text().splitlines()):
+        subprocess.run(['git', 'apply', '--reverse', str(HERE / 'capture' / patch)],
+                       cwd=root, check=True)
+    subprocess.run(['git', 'apply', str(HERE / 'serving/0013-serving-workspace.patch')],
+                   cwd=root, check=True)
+    for source in (HERE / 'serving/overlay').glob('*.py'):
+        assert source.read_bytes() == (target / source.name).read_bytes()
+        ast.parse(source.read_text(), feature_version=(3, 12))
+print('serving patch applies to exact C36 base; executable overlays and Python3.12 syntax match')
