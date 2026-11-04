@@ -1,0 +1,205 @@
+{
+  "date": "2026-11-04T17:32:06.323149+00:00",
+  "status": "optional_minimum_match_8_hypothesis_dropped_at_review",
+  "performance_verdict": "C39 has no proven serving-throughput gain versus either saved C38 recipe after candidate and reference repeat floors. This review establishes no speedup.",
+  "actions": {
+    "source_runtime_or_control_changes": false,
+    "gpu_or_node_operations": false,
+    "remeasurement_of_old_images": false,
+    "patch_created": false,
+    "current_C40_changed": false,
+    "required_default_copy_behavior_retained": true,
+    "PR878_correctness_fix_retained": true
+  },
+  "source_identity": {
+    "C39": {
+      "head": "31412339aafdd2c1392c7294975355dbc523c5e1",
+      "tree": "8e33015b1fa1d34250e686db7d1f8061021d6d5a",
+      "image": "sha256:17550af8ae03a42919d72fac7d2771a18f0f30300b45f0b06edc1ac83625f885"
+    },
+    "C40_read_only_source": {
+      "head": "5f926df6d3126266a9c88c82c06544060008c33c",
+      "tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+      "clean": true,
+      "runtime_test_active_and_unchanged": true
+    }
+  },
+  "C39_grid_pairings": [
+    {
+      "reference_recipe": "default",
+      "pairing": "reference_boot1_to_candidate_boot1",
+      "step_cost_change_pct": 0.912036828870133,
+      "ci95_pct": 0.08743237763887847,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "default",
+      "pairing": "reference_boot1_to_candidate_boot2",
+      "step_cost_change_pct": 0.860276876844579,
+      "ci95_pct": 0.08366370164521161,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "default",
+      "pairing": "reference_boot2_to_candidate_boot1",
+      "step_cost_change_pct": 1.3208186751084483,
+      "ci95_pct": 0.07642464214614861,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "default",
+      "pairing": "reference_boot2_to_candidate_boot2",
+      "step_cost_change_pct": 1.268849050090326,
+      "ci95_pct": 0.0720554863753167,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "copy",
+      "pairing": "reference_boot1_to_candidate_boot1",
+      "step_cost_change_pct": 0.5211231203766431,
+      "ci95_pct": 0.08649460416150127,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "copy",
+      "pairing": "reference_boot1_to_candidate_boot2",
+      "step_cost_change_pct": 0.4695636763919042,
+      "ci95_pct": 0.08271367816787638,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference_recipe": "copy",
+      "pairing": "reference_boot2_to_candidate_boot1",
+      "step_cost_change_pct": -0.016720376904921785,
+      "ci95_pct": 0.09674429401829304,
+      "native_pair_verdict": "same"
+    },
+    {
+      "reference_recipe": "copy",
+      "pairing": "reference_boot2_to_candidate_boot2",
+      "step_cost_change_pct": -0.06800394940305043,
+      "ci95_pct": 0.09341596056168502,
+      "native_pair_verdict": "same"
+    }
+  ],
+  "saved_copy_reference_grid_repeat_change_pct": 0.537933441780547,
+  "copy_probe_native_sha256": {
+    "candidate-39": "0c691718c6ed598b4f72891f90a2e335936ebf336780b76f1ad97d8611f22d50",
+    "candidate-39-repeat": "0c691718c6ed598b4f72891f90a2e335936ebf336780b76f1ad97d8611f22d50"
+  },
+  "fixed_m_simulations_not_serving_performance": [
+    {
+      "category": "prose",
+      "native_tokens_per_step": 2.265,
+      "m8_hybrid_tokens_per_step": 2.27,
+      "m16_hybrid_tokens_per_step": 2.265,
+      "m8_vs_m16_hybrid_change_pct": 0.22075055187638082,
+      "m8_oracle_tokens_per_step": 2.271,
+      "m16_oracle_tokens_per_step": 2.265
+    },
+    {
+      "category": "copy",
+      "native_tokens_per_step": 16.029,
+      "m8_hybrid_tokens_per_step": 16.075,
+      "m16_hybrid_tokens_per_step": 16.696,
+      "m8_vs_m16_hybrid_change_pct": -3.719453761379987,
+      "m8_oracle_tokens_per_step": 16.966,
+      "m16_oracle_tokens_per_step": 16.978
+    },
+    {
+      "category": "edit",
+      "native_tokens_per_step": 14.249,
+      "m8_hybrid_tokens_per_step": 15.661,
+      "m16_hybrid_tokens_per_step": 16.32,
+      "m8_vs_m16_hybrid_change_pct": -4.037990196078434,
+      "m8_oracle_tokens_per_step": 16.785,
+      "m16_oracle_tokens_per_step": 16.773
+    },
+    {
+      "category": "tool",
+      "native_tokens_per_step": 6.773,
+      "m8_hybrid_tokens_per_step": 8.114,
+      "m16_hybrid_tokens_per_step": 8.737,
+      "m8_vs_m16_hybrid_change_pct": -7.1305940254091755,
+      "m8_oracle_tokens_per_step": 9.281,
+      "m16_oracle_tokens_per_step": 8.741
+    }
+  ],
+  "source_findings": [
+    "engine_grid invokes _dummy_run: target and DSpark draft forward, without CopyDrafter prepare_alloc/propose; overlap is on normal postprocess, so grid cost is not a direct measurement of overlap.",
+    "C38 explicit copy profile already uses the 6155-token budget and 59-row capture envelope which C39 automatically derives.",
+    "min_match8 adds an 8-token minimum matching tier while preserving longer-tier precedence, but adds a sixth source/reduction level.",
+    "Fixed-m suffix simulation is not the native longest-level/adaptive-budget policy and does not measure kernel cost, mixed scheduling or wall-clock throughput."
+  ],
+  "validation": {
+    "offline_C40_doctor": "configuration OK",
+    "git_diff_check": "passed",
+    "fresh_source_or_GPU_validation": "not run: no implementation patch is proposed"
+  },
+  "evidence": {
+    "experiments/2026-11-04-copy-default-screening/runs/2026-11-04-dgx/attempt-3/recipe-comparison.json": {
+      "sha256": "5fc21e8175934065e9127d6e730ca36b774111f1f6fdf3e35942ae297ec64928"
+    },
+    "experiments/2026-11-04-copy-default-screening/runs/2026-11-04-dgx/attempt-3/functional-revalidation.json": {
+      "sha256": "3297dc341af8d34965641e199c9fc428ae8b762f654328bfdbcd34ee96906a35"
+    },
+    "experiments/2026-11-04-copy-default-screening/runs/2026-11-04-dgx/attempt-3/source-receipt.json": {
+      "sha256": "07707630f4e91b14d06ce21f7c5ced68003bae0cdb6be53873263e1ab67df4e2"
+    },
+    "experiments/2026-10-26-spark-ds41f-candidate/candidate-39/vllm/0688-perf-dspark-enable-copy-drafts-by-default.patch": {
+      "sha256": "eb87dcd4e3cc2874a03b3bff409e33560dc87bc7abb18a87ca5b0eccde4601b8"
+    },
+    "experiments/2026-10-16-r6r/vllm/0139-Engine-cost-grid-time-the-cost-profile-s-dummy-steps.patch": {
+      "sha256": "9d0341c9b25d4ce02b6c1fb9d2ec75134bc7d3e071258f59aa4fd2470c0d9098"
+    },
+    "experiments/2026-10-26-spark-ds41f-candidate/candidate-38/tp3-copy.json": {
+      "sha256": "f49ea996a8e0fe1247f16c84a0d1ca4a95ddc1136acc6727070c6f90d3bb2d6d"
+    },
+    "servebench/engine.py": {
+      "sha256": "5d2a77b5679227d211095e7dca606356b76c0d8e7297aded4b6f401f39ab6469"
+    },
+    "experiments/2026-11-03-candidate-38-tp3-qualification/runs/2026-11-03-dgx1-3/performance-default/candidate-38/release-tp3/grid.json": {
+      "sha256": "876391b297edf9f10486621d4abed922449c1cc5d7035c300a62cd82d2be1348"
+    },
+    "experiments/2026-11-03-candidate-38-tp3-qualification/runs/2026-11-03-dgx1-3/performance-copy/candidate-38-copy/release-tp3/grid.json": {
+      "sha256": "3069eb33f885b0a0488f61e5e17c3c22571eeb490da573192e866057fb670d2f"
+    },
+    "experiments/2026-11-03-candidate-38-tp3-qualification/runs/2026-11-03-dgx1-3/performance-copy/candidate-38-copy-repeat/release-tp3/grid.json": {
+      "sha256": "4aa3439fd00fd5ef9ce62bb7c8fdf865d89928dc2b9f794b32182294aa1020cb"
+    },
+    "experiments/2026-11-03-candidate-38-tp3-qualification/runs/2026-11-03-dgx1-3/performance-default/candidate-38-repeat/release-tp3/grid.json": {
+      "sha256": "8a616c5883f5244a5bf53284ddc74792ac0dd0761a314fb766c146c1ab3e861a"
+    }
+  },
+  "recorded_C38_copy_vs_standard_grid_pairings": [
+    {
+      "reference": "candidate-38",
+      "candidate": "candidate-38-copy",
+      "step_cost_change_pct": 0.3888871277585526,
+      "ci95_pct": 0.08104345900142812,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference": "candidate-38",
+      "candidate": "candidate-38-copy-repeat",
+      "step_cost_change_pct": 0.9289125234500872,
+      "ci95_pct": 0.09269108594720095,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference": "candidate-38-repeat",
+      "candidate": "candidate-38-copy",
+      "step_cost_change_pct": 0.7955497609931639,
+      "ci95_pct": 0.0689964995280666,
+      "native_pair_verdict": "worse"
+    },
+    {
+      "reference": "candidate-38-repeat",
+      "candidate": "candidate-38-copy-repeat",
+      "step_cost_change_pct": 1.3377627309840712,
+      "ci95_pct": 0.08252209148542901,
+      "native_pair_verdict": "worse"
+    }
+  ],
+  "recorded_comparison_method": "servebench.suite.compare with servebench.__main__.compare_results tolerance=3.0; saved artifacts only, no GPU execution"
+}

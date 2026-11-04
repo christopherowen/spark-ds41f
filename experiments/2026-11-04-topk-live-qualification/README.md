@@ -39,7 +39,7 @@ Candidate-40 attempt 1 started at 15:34:15 UTC, with window
 `sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82`.
 The controller then yielded for the queued shared request, before seeding,
 functional work or timing. Serving measurements remain pending. The next
-copy-match and compiler rounds wait for this candidate's measurement review.
+compiler round waits for this candidate's measurement review.
 No promotion or bypass of TP4 correctness/release gates.
 
 ## Execution controls
@@ -156,3 +156,25 @@ the log is `/home/swank/tl-logs/topk-live-qualification/candidate-40-window-atte
 Fresh operator setup, staging, PID and initial hash receipts are preserved in
 `runs/2026-11-04-dgx/attempt-2`. Functional and serving-performance results remain
 pending. The owner paused recurring checks and requested direct waiting here.
+
+## Round reporting and performance review
+
+At each completed round, report 1030, C36, the previous candidate and the current
+candidate with explicit over/under and better/worse/no-proven-improvement verdicts.
+Keep pending results pending, distinguish inherited gains from the current patch,
+and include adverse latency, prefill, memory and engine rows. New candidates need
+both boots. C36's compatible archived full-suite reference has only one saved
+boot; no reference repeat or new old-image measurement is invented.
+
+The [recorded C39/C36 backfill](runs/reports/candidate-39-c36-backfill.json)
+supplements the existing C39 comparisons. It retains C39's faster fixed-row grid,
+essentially level C8/C4 serving output, and adverse single-user paired decode and
+mixed-prefill rows. The C39 change has no proven gain over its C38 parents.
+
+A measured optimization miss receives one review and at most one justified
+corrected attempt. A further miss must be highlighted and the optional
+optimization dropped, retaining all evidence. The [copy-policy review](../2026-11-04-copy-policy-review/README.md)
+has already dropped minimum-match-8 at review: no defensible correction or serving
+speedup was established. Required default behavior, safe envelope and PR878
+remain. C40's active image/source/workload is unchanged. The separate compiler
+round remains subject to its prerequisites and full qualification.

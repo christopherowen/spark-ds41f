@@ -16,11 +16,19 @@ visible. The current source's independent inactive scratch-read issue (#878)
 still prevents release qualification. No promotion is made.
 
 Next isolate the #878 liveness fix as a corrected default-enabled candidate, with
-its own clean source, image/gates and repeat core metrics. Then test minimum copy
-match 8 versus 16 if correctness permits, and evaluate #875's compiler work as a
-separate round. Fix the collector's expected-image input and ensure every quality
+its own clean source, image/gates and repeat core metrics. Evaluate #875's
+compiler work as a separate round when its prerequisites allow. Fix the
+collector's expected-image input and ensure every quality
 extra is audited before treating its parent phase exit as a pass. Do not change
 C39 or silently replace its measurements.
+
+The subsequent [copy-policy review](../2026-11-04-copy-policy-review/README.md)
+dropped the optional minimum-match-8 hypothesis before GPU testing. Its saved
+fixed-m simulations are adverse, not serving timings; the engine-grid path does
+not exercise copy overlap, so removing overlap is not a supported fix for its
+measured cost. No corrected source patch or speedup is asserted. Retain required
+default behavior and the independent correctness fix; C39 is not accepted as a
+performance improvement. Preserve all measured failures and adverse rows.
 
 Before release, address mixed-prefill first-chunk waits and tail latency, reduce
 copy-path engine overhead where useful, and capture missing timed KV occupancy,
