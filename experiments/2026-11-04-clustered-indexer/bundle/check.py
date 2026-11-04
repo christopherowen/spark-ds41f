@@ -31,6 +31,10 @@ def inputs(width, extents, mode, page_size=256):
             sf.fill_(127)
         if mode == 'unsupported' and extent:
             sf[0, 0] = 150
+        if mode == 'nan-key' and extent:
+            sf[0, 0] = 255
+        if mode == 'extreme':
+            sf.random_(96, 145, generator=g)
         for b in range(64):
             pool[physical, offset * 64 + b] = keys[:, b]
         for b in range(4):
@@ -42,12 +46,19 @@ def inputs(width, extents, mode, page_size=256):
         q.fill_(0x22)
         scales.fill_(127)
         weights.fill_(1 / 64)
+    if mode == 'extreme':
+        scales.random_(96, 145, generator=g)
+    if mode == 'nan-query':
+        scales[0, 0, 0] = 255
+    if mode == 'nan-weight':
+        weights[0, 0] = float('nan')
     lengths = torch.tensor(extents, dtype=torch.int32, device='cuda')
     active = torch.tensor([width], dtype=torch.int32, device='cuda')
     return q, scales, weights, pool, table, lengths, active
 
 
 def check(width, extents, mode, repeats):
+    torch.cuda.reset_peak_memory_stats()
     args = inputs(width, extents, mode)
     candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64))
     reference = IndexerV41Plan(width, 256)
@@ -55,19 +66,26 @@ def check(width, extents, mode, repeats):
     actual, evidence = candidate.run(*args)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    score_cpu, bound_cpu = scores.cpu(), evidence['bounds'].cpu()
     for r, extent in enumerate(extents):
         if extent:
             for c in range((extent + 63) // 64):
-                observed = scores[r, c*64:min((c+1)*64, extent)].float().max()
-                bound = evidence['bounds'][r, c].float()
-                assert bool(bound >= observed), (r, c, bound.item(), observed.item())
+                observed = score_cpu[r, c*64:min((c+1)*64, extent)].float().max()
+                bound = bound_cpu[r, c].float()
+                if bool(torch.isfinite(observed)):
+                    assert bool(bound >= observed), (r, c, bound.item(), observed.item())
+                else:
+                    assert bool(torch.isposinf(bound)), (r, c, bound.item(), observed.item())
     # Repeat with mutated written cache contents; stale envelopes must not survive.
     if mode == 'separable' and extents[0] > 1024:
         table, pool = args[4], args[3]
+        before = actual.clone()
         pool[table[0, 4].long(), :64].fill_(0x77)
+        pool[table[0, 4].long(), 256 * 64:256 * 64 + 4].fill_(130)
         expected, _ = reference.run(*args)
         actual, evidence = candidate.run(*args)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert not torch.equal(actual, before), 'mutation did not change the reference winners'
     latencies = []
     for _ in range(repeats):
         torch.cuda.synchronize()
@@ -96,8 +114,14 @@ def main():
             (1024, [0, 64, 1024], 'ties'),
             (4096, [1025, 4093], 'random'),
             (4096, [4093], 'unsupported'),
+            (4096, [4093], 'extreme'),
+            (4096, [4093], 'nan-key'),
+            (4096, [4093], 'nan-query'),
+            (4096, [4093], 'nan-weight'),
             (16384, [16383], 'separable'),
             (16384, [16383], 'random'),
+            (262144, [262143], 'separable'),
+            (262144, [262143], 'random'),
         ]:
             result['cases'].append(check(width, extents, mode, options.repeats))
             print(json.dumps(result['cases'][-1]), flush=True)
