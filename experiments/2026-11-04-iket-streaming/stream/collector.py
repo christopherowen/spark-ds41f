@@ -25,7 +25,7 @@ class Collector:
         fail_after_records=0,
         uniform_registers=False,
         managed=True,
-        synchronize_warps=True,
+        synchronize_warps=False,
     ):
         import torch
 
@@ -333,7 +333,7 @@ def enable(
     patched=False,
     uniform_registers=False,
     managed=True,
-    synchronize_warps=True,
+    synchronize_warps=False,
 ):
     global _ACTIVE
     if _ACTIVE is not None:
