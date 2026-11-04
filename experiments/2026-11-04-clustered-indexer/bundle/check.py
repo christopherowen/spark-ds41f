@@ -85,14 +85,14 @@ def inputs(width, extents, mode, page_size=256, *, unwritten_cache=False):
 
 
 def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=False,
-          profile_label=None, envelope_reference=False, matrix_bounds=False):
+          profile_label=None, envelope_reference=False, matrix_bounds=False, page_size=256):
     torch.cuda.reset_peak_memory_stats()
-    args = inputs(width, extents, mode, unwritten_cache=unwritten_cache)
-    candidate = ClusteredIndexerPlan(width, 256, seeds=min(32, width // 64),
+    args = inputs(width, extents, mode, page_size=page_size, unwritten_cache=unwritten_cache)
+    candidate = ClusteredIndexerPlan(width, page_size, seeds=min(32, width // 64),
                                      matrix_bounds=matrix_bounds)
     if envelope_reference:
-        candidate.envelope = reference_envelopes(width, 256)
-    reference = IndexerV41Plan(width, 256)
+        candidate.envelope = reference_envelopes(width, page_size)
+    reference = IndexerV41Plan(width, page_size)
     expected, scores = reference.run(*args)  # correctness only; never timed
     actual, evidence = candidate.run(*args)
     torch.cuda.synchronize()
@@ -103,11 +103,13 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
     lower = torch.empty(shape, dtype=torch.float32, device='cuda')
     upper = torch.empty_like(lower)
     old_lower, old_upper = torch.empty_like(lower), torch.empty_like(lower)
-    envelope_args = (args[3][:, :page_bytes(256)], args[4], args[5], args[6])
+    envelope_args = (args[3][:, :page_bytes(page_size)], args[4], args[5], args[6])
     candidate.envelope(*envelope_args, lower, upper)
-    reference_envelopes(width, 256)(*envelope_args, old_lower, old_upper)
-    torch.testing.assert_close(lower, old_lower, atol=0, rtol=0)
-    torch.testing.assert_close(upper, old_upper, atol=0, rtol=0)
+    reference_envelopes(width, page_size)(*envelope_args, old_lower, old_upper)
+    for row, extent in enumerate(extents):
+        count = (extent + 63) // 64
+        torch.testing.assert_close(lower[row, :count], old_lower[row, :count], atol=0, rtol=0)
+        torch.testing.assert_close(upper[row, :count], old_upper[row, :count], atol=0, rtol=0)
     del lower, upper, old_lower, old_upper
     # The scorer intentionally leaves scores past each extent unwritten. Copy
     # only the visible slice, including when initcheck tracks CUDA copies.
@@ -126,8 +128,8 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
     if mode == 'separable' and extents[0] > 1024:
         table, pool = args[4], args[3]
         before = actual.clone()
-        pool[table[0, 4].long(), :64].fill_(0x77)
-        pool[table[0, 4].long(), 256 * 64:256 * 64 + 4].fill_(130)
+        pool[table[0, 1024 // page_size].long(), :64].fill_(0x77)
+        pool[table[0, 1024 // page_size].long(), page_size * 64:page_size * 64 + 4].fill_(130)
         expected, _ = reference.run(*args)
         actual, evidence = candidate.run(*args)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -191,10 +193,11 @@ def check(width, extents, mode, repeats, *, unwritten_cache=False, cuda_graph=Fa
         profiler.export_chrome_trace(str(trace))
         print(profiler.key_averages().table(
             sort_by='self_device_time_total', row_limit=40), flush=True)
-    return {'width': width, 'extents': extents, 'mode': mode, 'identical': True,
+    return {'page_size': page_size, 'width': width, 'extents': extents, 'mode': mode, 'identical': True,
             'bound_execution': 'tensor-core' if matrix_bounds else 'scalar',
             'envelope_execution': 'archived-reduction' if envelope_reference else 'streamed',
             'envelopes_identical': True,
+            'envelope_identity_scope': 'visible clusters; inactive metadata intentionally unwritten',
             'unwritten_cache': unwritten_cache,
             'execution': 'cuda-graph' if cuda_graph else 'eager',
             'graph_dynamic_counts_identical': True if cuda_graph else None,
@@ -216,6 +219,7 @@ def main():
     parser.add_argument('--matrix-bounds', action='store_true')
     parser.add_argument('--envelope-reference', action='store_true',
                         help='time the archived, unreleased candidate reduction as a control')
+    parser.add_argument('--page-size', type=int, choices=[128,256], default=256)
     options = parser.parse_args()
     result = {'schema_version': 1, 'torch': torch.__version__,
               'gpu': torch.cuda.get_device_name(), 'capability': torch.cuda.get_device_capability(),
@@ -250,6 +254,7 @@ def main():
                                          cuda_graph=options.cuda_graph,
                                          envelope_reference=options.envelope_reference,
                                          matrix_bounds=options.matrix_bounds,
+                                         page_size=options.page_size,
                                          profile_label=(options.profile_label
                                                         if width == options.max_width else None)))
             print(json.dumps(result['cases'][-1]), flush=True)

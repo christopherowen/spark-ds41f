@@ -12,9 +12,9 @@ from vllm.models.deepseek_v4_1.tilelang.grouped_indexer import GroupedClusteredI
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan
 
 
-def check(width, rows, mode, grouped, cuda_graph=True, repeats=15):
+def check(width, rows, mode, grouped, cuda_graph=True, repeats=15, page_size=256):
     torch.cuda.reset_peak_memory_stats()
-    args = list(inputs(width, [width - 1], mode, unwritten_cache=True))
+    args = list(inputs(width, [width - 1], mode, page_size=page_size, unwritten_cache=True))
     generator = torch.Generator(device='cuda').manual_seed(width + rows + 51)
     for index in [0, 1, 2]:
         args[index] = args[index].repeat(rows, *([1] * (args[index].ndim - 1)))
@@ -27,9 +27,9 @@ def check(width, rows, mode, grouped, cuda_graph=True, repeats=15):
     args[5] = torch.tensor(extents, device='cuda', dtype=torch.int32)
     one_table = args[4]
     args[4] = one_table.repeat(rows, 1)
-    native = IndexerV41Plan(width, 256)
-    candidate = (GroupedClusteredIndexerPlan(width, 256) if grouped else
-                 ClusteredIndexerPlan(width, 256, matrix_bounds=True))
+    native = IndexerV41Plan(width, page_size)
+    candidate = (GroupedClusteredIndexerPlan(width, page_size) if grouped else
+                 ClusteredIndexerPlan(width, page_size, matrix_bounds=True))
     candidate_args = list(args)
     if grouped:
         candidate_args[4] = one_table
@@ -67,9 +67,9 @@ def check(width, rows, mode, grouped, cuda_graph=True, repeats=15):
     args[5].copy_(saved)
     args[6].fill_(width)
     # Mutate a written key in the same cache and replay the existing graph.
-    page = one_table[0, 4].long()
+    page = one_table[0, 1024 // page_size].long()
     args[3][page, :64].fill_(0x77)
-    args[3][page, 256*64:256*64+4].fill_(130)
+    args[3][page, page_size*64:page_size*64+4].fill_(130)
     changed, _ = native.run(*args)
     if mode == 'separable':
         assert not torch.equal(changed, expected), 'cache mutation did not change the winners'
@@ -83,7 +83,7 @@ def check(width, rows, mode, grouped, cuda_graph=True, repeats=15):
         replay()
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - start) * 1000)
-    return {'width': width, 'rows': rows, 'mode': mode, 'grouped_metadata': grouped, 'execution': 'cuda-graph' if cuda_graph else 'eager',
+    return {'page_size': page_size, 'width': width, 'rows': rows, 'mode': mode, 'grouped_metadata': grouped, 'execution': 'cuda-graph' if cuda_graph else 'eager',
             'identical': True, 'graph_visibility_and_mutation_identical': True if cuda_graph else None,
             'visibility_and_mutation_identical': True,
             'output_sha256': hashlib.sha256(actual.cpu().numpy().tobytes()).hexdigest(),
@@ -100,6 +100,7 @@ def main():
     parser.add_argument('--no-graph', action='store_true')
     parser.add_argument('--repeats', type=int, default=15)
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--page-size', type=int, choices=[128,256], default=256)
     options = parser.parse_args()
     result = {'schema_version': 1, 'passed': False, 'cases': []}
     try:
@@ -110,7 +111,7 @@ def main():
             cases = [(4096, 8, 'random'), (16384, 32, 'separable')]
         for width, rows, mode in cases:
             result['cases'].append(check(width, rows, mode, options.grouped,
-                                         not options.no_graph, options.repeats))
+                                         not options.no_graph, options.repeats, page_size=options.page_size))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:

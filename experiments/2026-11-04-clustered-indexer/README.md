@@ -303,3 +303,18 @@ Patch0011 prepares a static one-query bypass for the grouped API's maximum and
 table expansion. Existing GPU kernels and the other row-count path are unchanged.
 Two targeted graph processes plus initialization/memory checks are pending.
 A separate candidate-only wide-domain trace will locate its remaining cost.
+
+The one-query bypass passes both targeted graph processes plus initialization
+and memory checking, with unchanged source/reindex hashes. The full-width
+profile attributes37.4% of kernel time to bounds and36.8% to envelopes, including
+invisible planned keys. Patch0012 explicitly tests the producer/consumer
+interaction: a bounded512-CTA envelope grid writes only visible metadata, while
+tensor bounds skip invisible tiles and reads. Scalar bounds already skip them.
+All allocated planning shapes stay fixed; no metadata persists. Visible endpoint
+identity, graph rollback/empty/restore and strict initialization checks are gates.
+
+Native pages are256 keys at compression1 and128 at compression2. Source layer20
+uses256; dense owners2/8/14 use128. `native-pages.json` prepares independent
+128-page workloads with explicit page identity, rather than comparing hashes or
+timings across geometries. This expands fixtures and capture QA, not arithmetic.
+The domain and128-page hardware screens remain pending.

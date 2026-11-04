@@ -14,9 +14,9 @@ from vllm.models.deepseek_v4_1.tilelang import clustered_capture
 from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS, IndexerV41Plan
 
 
-def check(extent, duplicate):
-    width, page_size = 65536, 256
-    args = inputs(width, [extent], 'random', unwritten_cache=True)
+def check(extent, duplicate, page_size=256):
+    width = 65536
+    args = inputs(width, [extent], 'random', page_size=page_size, unwritten_cache=True)
     # Keep actual planning wider than visibility and use an overallocated pool.
     active = extent + 513
     args[6].fill_(active)
@@ -43,7 +43,7 @@ def check(extent, duplicate):
             assert not data['pool'][physical, count*64:page_size*64].count_nonzero()
             assert not data['pool'][physical, page_size*64+count*4:].count_nonzero()
         restored, span = restore_layout(data)
-        torch.testing.assert_close(restored[4], args[4][:, :(extent + 255)//256], atol=0, rtol=0)
+        torch.testing.assert_close(restored[4], args[4][:, :(extent + page_size-1)//page_size], atol=0, rtol=0)
         assert restored[3].stride(0) == args[3].stride(0)
         assert restored[3].data_ptr() % 256 == args[3].data_ptr() % 256
         plan = IndexerV41Plan(width, page_size, candidate_blocks=True)
@@ -63,7 +63,7 @@ def check(extent, duplicate):
         dense_path = next(Path(directory).glob('rank-*-dense-*.pt'))
         dense_result = replay_file(dense_path, cuda_graph=os.environ.get('PYTORCH_NO_CUDA_MEMORY_CACHING') != '1')
         assert dense_result['identical'] and not dense_result['source_interface']
-        return {'synthetic': True, 'full_candidate_replay_identical': True, 'extent': extent, 'duplicate_page': duplicate,
+        return {'page_size': page_size, 'synthetic': True, 'full_candidate_replay_identical': True, 'extent': extent, 'duplicate_page': duplicate,
                 'planned_width': width, 'active': active, 'address_span_bytes': span,
                 'row_stride_bytes': restored[3].stride(0),
                 'physical_pages': len(data['pool']), 'identical': True,
@@ -75,8 +75,8 @@ def check(extent, duplicate):
 def main():
     result = {'schema_version': 1, 'passed': False, 'cases': []}
     try:
-        for extent, duplicate in [(8193, False), (32769, True)]:
-            case = check(extent, duplicate)
+        for extent, duplicate, page_size in [(8193,False,256), (32769,True,256), (32769,True,128)]:
+            case = check(extent, duplicate, page_size)
             result['cases'].append(case)
             print(json.dumps(case), flush=True)
         result['passed'] = True

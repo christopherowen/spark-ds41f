@@ -42,6 +42,8 @@ with tempfile.TemporaryDirectory() as directory:
     source = RELATIVE.parent / 'source_indexer.py'
     assert (root / source).read_bytes() == (HERE / 'bundle/overlay' / source).read_bytes()
     ast.parse((root / source).read_text())
+    subprocess.run(['git', 'apply', str(HERE / 'vllm/0012-visible-metadata-domain.patch')],
+                   cwd=root, check=True)
     actual = (root / RELATIVE).read_bytes()
     expected = (HERE / 'bundle/overlay' / RELATIVE).read_bytes()
     assert actual == expected, 'patch and executable overlay differ'

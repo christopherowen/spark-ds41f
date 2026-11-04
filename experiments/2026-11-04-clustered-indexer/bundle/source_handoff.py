@@ -11,15 +11,15 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS, Indexer
 from vllm.models.deepseek_v4_1.tilelang.source_indexer import SourceClusteredIndexerPlan
 
 
-def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=False, *, fixture=None, candidate_factory=None):
+def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=False, *, fixture=None, candidate_factory=None, page_size=256):
     torch.cuda.reset_peak_memory_stats()
-    args = inputs(width, extents, mode, unwritten_cache=True) if fixture is None else fixture
+    args = inputs(width, extents, mode, page_size=page_size, unwritten_cache=True) if fixture is None else fixture
     rows = len(extents)
-    reference = IndexerV41Plan(width, 256, candidate_blocks=True)
+    reference = IndexerV41Plan(width, page_size, candidate_blocks=True)
     Plan = SourceClusteredIndexerPlan
     if source_reference:
         from vllm.models.deepseek_v4_1.tilelang.source_reference import SourceClusteredIndexerPlan as Plan
-    candidate = (candidate_factory or Plan)(width, 256)
+    candidate = (candidate_factory or Plan)(width, page_size)
     blocks = torch.empty((rows, CANDIDATE_BLOCKS), device='cuda', dtype=torch.int32)
     counts = torch.empty((rows,), device='cuda', dtype=torch.int32)
 
@@ -55,7 +55,7 @@ def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=Fa
             observed = evidence['compact_scores'][row, :count].view(torch.int16)
             full = scores[row].index_select(0, positions).view(torch.int16)
             torch.testing.assert_close(observed, full, atol=0, rtol=0)
-    reindex = IndexerV41Plan(CANDIDATE_BLOCKS * 8, 256, candidates=True)
+    reindex = IndexerV41Plan(CANDIDATE_BLOCKS * 8, page_size, candidates=True)
     next_args = list(args)
     next_args[0] = args[0].roll(1, dims=1)
     next_expected, _ = reindex.run(*next_args, blocks, counts)
@@ -93,10 +93,10 @@ def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=Fa
     row = rows - 1
     position = extents[row] - 65
     if position >= 0:
-        page = args[4][row, position // 256].long()
-        offset = position % 256
+        page = args[4][row, position // page_size].long()
+        offset = position % page_size
         args[3][page, offset*64:(offset+1)*64].fill_(0x77)
-        args[3][page, 256*64+offset*4:256*64+(offset+1)*4].fill_(130)
+        args[3][page, page_size*64+offset*4:page_size*64+(offset+1)*4].fill_(130)
         changed, _ = native()
         replay()
         compare(changed)
@@ -116,7 +116,7 @@ def check(width, extents, mode, cuda_graph=True, repeats=15, source_reference=Fa
             replay()
             torch.cuda.synchronize()
             latencies.append((time.perf_counter() - start) * 1000)
-    return {'width': width, 'extents': extents, 'mode': mode,
+    return {'page_size': page_size, 'width': width, 'extents': extents, 'mode': mode,
             'source_winners_identical': True, 'source_blocks_identical': True,
             'source_lengths_identical': True, 'reindex_identical': True,
             'graph_visibility_identical': True if cuda_graph else None, 'cache_mutation_identical': True, 'native_fallback': evidence['native_fallback'],
@@ -138,6 +138,7 @@ def main():
     parser.add_argument('--repeats', type=int, default=15)
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--source-reference', action='store_true')
+    parser.add_argument('--page-size', type=int, choices=[128,256], default=256)
     options = parser.parse_args()
     result = {'schema_version': 1, 'passed': False, 'cases': []}
     try:
@@ -147,12 +148,14 @@ def main():
                 (65536, [65535], 'extreme'), (65536, [65535], 'nan-key'),
                 (65536, [65535], 'nan-weight'), (262144, [262143], 'random'),
                 (1048576, [0, 37, 32769, 65535], 'random')]
+        if options.page_size == 128:
+            cases.append((524288, [0,37,32769,65535], 'random'))
         if options.quick:
             cases = [(65536, [65535], 'random'), (65536, [65535], 'separable')]
         for width, extents, mode in cases:
             if width > options.max_width:
                 continue
-            result['cases'].append(check(width, extents, mode, not options.no_graph, options.repeats, options.source_reference))
+            result['cases'].append(check(width, extents, mode, not options.no_graph, options.repeats, options.source_reference, page_size=options.page_size))
             print(json.dumps(result['cases'][-1]), flush=True)
         result['passed'] = True
     except Exception:

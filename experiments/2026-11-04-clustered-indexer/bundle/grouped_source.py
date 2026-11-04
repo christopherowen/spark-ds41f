@@ -10,8 +10,8 @@ from vllm.models.deepseek_v4_1.tilelang.source_indexer import SourceClusteredInd
 from vllm.models.deepseek_v4_1.tilelang.grouped_source_indexer import GroupedSourceClusteredIndexerPlan
 
 
-def check(width, rows, mode, grouped, cuda_graph, repeats):
-    args = list(inputs(width, [width-1], mode, unwritten_cache=True))
+def check(width, rows, mode, grouped, cuda_graph, repeats, page_size=256):
+    args = list(inputs(width, [width-1], mode, page_size=page_size, unwritten_cache=True))
     generator = torch.Generator(device='cuda').manual_seed(width + rows + 51)
     for index in (0, 1, 2):
         args[index] = args[index].repeat(rows, *([1] * (args[index].ndim-1)))
@@ -36,7 +36,7 @@ def check(width, rows, mode, grouped, cuda_graph, repeats):
             return self.plan.run(*owned_args)
 
     result = check_source(width, extents, mode, cuda_graph, repeats, fixture=tuple(args),
-                          candidate_factory=OwnedPlan if grouped else SourceClusteredIndexerPlan)
+                          candidate_factory=OwnedPlan if grouped else SourceClusteredIndexerPlan, page_size=page_size)
     result.update(rows=rows, grouped_metadata=grouped,
                   metadata_elements=0 if result['native_fallback'] else
                       2 * (1 if grouped else rows) * (width//64) * 128)
@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--repeats', type=int, default=15)
     parser.add_argument('--single-row-only', action='store_true')
+    parser.add_argument('--page-size', type=int, choices=[128,256], default=256)
     options = parser.parse_args()
     result = {'schema_version':1, 'passed':False, 'cases':[]}
     try:
@@ -62,7 +63,7 @@ def main():
         if not cases:
             raise ValueError('no cases selected')
         for width, rows, mode in cases:
-            case = check(width,rows,mode,options.grouped,not options.no_graph,options.repeats)
+            case = check(width,rows,mode,options.grouped,not options.no_graph,options.repeats,page_size=options.page_size)
             result['cases'].append(case)
             print(json.dumps(case),flush=True)
         result['passed'] = True
