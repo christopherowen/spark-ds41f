@@ -78,3 +78,12 @@ All 156 confirmation inputs now finish with zero generator errors. The complete
 receipt and retained interruption are in `runs/prepare-heldout-01`, and
 `heldout.set.json` seals their request/evaluation/grader hashes. Together with
 the 52-case pilot, all 208 cases are frozen before any RULER model request.
+
+An additional lean screen freezes all13 pilot tasks at32768 and131072 tokens
+(26 cases, `screen.set.json`) before any RULER model output. It selects only by
+task/length, keeps the original order, inputs, seed, grader and token allowance,
+and does not replace the full52 pilot or156 confirmation cases. The client uses
+`--stage screen` and records a distinct selection identity. The coordinator
+checks every frozen cache/grader checksum before reserving a model window, so
+missing offline inputs fail before any serving replacement. Longer-context
+qualification remains required even if the lean screen passes.

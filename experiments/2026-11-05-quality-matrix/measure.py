@@ -21,6 +21,7 @@ def main():
     p.add_argument('--private',required=True)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--split',choices=['pilot','heldout'],default='pilot')
+    p.add_argument('--ruler-stage',choices=['full','screen'],default='full')
     args=p.parse_args()
     assert not args.out.exists()
     cluster=read_cluster(args.profile);nodes=read_json(cluster['nodes_config'])
@@ -45,6 +46,7 @@ def main():
         command=[sys.executable,str(HERE.parent/folder/client),'--cache',args.cache,
                  '--private',args.private,'--out',str(args.out)]
         command+=['--concurrency','4'] if args.benchmark=='code' else ['--split',args.split]
+        if args.benchmark=='ruler':command+=['--stage',args.ruler_stage]
         child['process']=subprocess.Popen(command,cwd=ROOT)
         code=child['process'].wait()
         if code or halted:raise RuntimeError('benchmark failed: '+repr((code,halted)))

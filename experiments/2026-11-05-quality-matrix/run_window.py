@@ -106,9 +106,11 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True)
     p.add_argument('--benchmark',choices=['code','ruler','longbench'],default='code')
     p.add_argument('--cache',type=Path);p.add_argument('--split',choices=['pilot','heldout'],default='pilot')
+    p.add_argument('--ruler-stage',choices=['full','screen'],default='full')
     p.add_argument('--candidate-config',type=Path,default=Path(w.REL)/'candidate.json')
     p.add_argument('--watchdog');p.add_argument('--preflight-only',action='store_true')
     args=p.parse_args();out=args.out.resolve()
+    assert args.benchmark=='ruler' or args.ruler_stage=='full','ruler-stage applies only to RULER'
     assert socket.gethostname()=='spark-0009','only the authorized idle sp1-sp4 group'
     if args.watchdog:return w.watchdog(args.watchdog,out)
     assert args.cache
@@ -128,7 +130,7 @@ def main():
     out.mkdir(parents=True)
     (out/'preflight-identity.json').write_text(json.dumps(states,indent=2)+'\n')
     (out/'source.json').write_text(json.dumps({'commit':commit,'benchmark':args.benchmark,
-        'cache':str(args.cache),'split':args.split,'nodes':w.NODES,'private':str(private),'candidate_config':str(candidate),
+        'cache':str(args.cache),'split':args.split,'ruler_stage':args.ruler_stage,'nodes':w.NODES,'private':str(private),'candidate_config':str(candidate),
         'rule':'same model and protocol; two fresh boots per arm; independent final-answer grading'},indent=2)+'\n')
     for profile in ('native','candidate','restore'):
         config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
@@ -142,6 +144,12 @@ def main():
         extractor=preparation.grader(args.cache)
         assert extractor('The correct answer is (C).')=='C','pinned offline extractor preflight'
         (out/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
+    elif args.benchmark=='ruler':
+        spec=importlib.util.spec_from_file_location('matrix_ruler_inputs',HERE.parent/'2026-11-05-context-quality/evaluate.py')
+        ruler=importlib.util.module_from_spec(spec);spec.loader.exec_module(ruler)
+        reference,manifest,cases,identity=ruler.load_inputs(args.cache,args.split,args.ruler_stage)
+        (out/'input-validation.json').write_text(json.dumps({'manifest_sha256':identity,'cases':len(cases),
+            'parent_manifest_sha256':reference['evaluation_sha256'],'stage':args.ruler_stage,'model_requests':0},indent=2)+'\n')
     baseline=None
     for i in range(7):
         metrics=urllib.request.urlopen('http://127.0.0.1:8000/metrics',timeout=15).read().decode()
@@ -230,6 +238,7 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
             command=[sys.executable,str(HERE/'measure.py'),'--profile',str(config),
                      '--benchmark',args.benchmark,'--cache',str(args.cache),'--split',args.split,
                      '--private',str(private/label),'--out',str(out/('answers-'+label+'.json'))]
+            if args.benchmark=='ruler':command+=['--ruler-stage',args.ruler_stage]
             w.run(command,out,'benchmark-'+label)
             generations[label]=json.loads((out/('answers-'+label+'.json')).read_text())
             grades[label]=grade(args.cache,private/label,out,label) if args.benchmark=='code' else generations[label]
