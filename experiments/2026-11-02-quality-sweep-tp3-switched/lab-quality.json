@@ -1,0 +1,167 @@
+{
+ "experiment": "experiments/2026-11-02-quality-sweep-tp3-switched",
+ "run": "quality-sweep-sp",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "fabric",
+   "config": "arm-c37.json",
+   "script": "scripts/probe_collectives.py",
+   "args": [
+    "--port-samples"
+   ],
+   "label": "probe-collectives"
+  },
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench_args": [
+    "--suites",
+    "quality,compliance",
+    "--compare",
+    "none"
+   ],
+   "arms": [
+    {
+     "config": "arm-c37.json",
+     "label": "c37"
+    },
+    {
+     "config": "arm-c37-poison.json",
+     "label": "c37-poison"
+    }
+   ],
+   "extras": [
+    [
+     "experiments/2026-10-25-final-names/loader/loader_report.py",
+     [
+      "--label",
+      "{label}",
+      "--nodes",
+      "sp5,sp6,sp7"
+     ],
+     "loader"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-25-kv-zeroing/prefix_extension.py",
+     [
+      "--threshold",
+      "6096"
+     ],
+     "prefix-extension"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/controls_digest.py",
+     [
+      "--tokens",
+      "96"
+     ],
+     "controls-digest"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/sampled_digest.py",
+     [
+      "--tokens",
+      "192"
+     ],
+     "sampled"
+    ],
+    [
+     "experiments/2026-09-25-vision/vision_check.py",
+     [],
+     "vision-check"
+    ],
+    [
+     "scripts/acceptance_sweep.py",
+     [
+      "--tokens",
+      "256"
+     ],
+     "acceptance-sweep"
+    ],
+    [
+     "experiments/2026-09-29-determinism/determinism.py",
+     [
+      "--repeats",
+      "5"
+     ],
+     "determinism-repeats"
+    ],
+    [
+     "experiments/2026-09-29-determinism/determinism_concurrent.py",
+     [],
+     "determinism-concurrent"
+    ],
+    [
+     "experiments/2026-10-24-prompt-logprobs-sink/prompt_logprobs_check.py",
+     [
+      "--label",
+      "{label}"
+     ],
+     "prompt-logprobs"
+    ],
+    [
+     "experiments/2026-10-25-logprob-token-ids/logprob_ids_check.py",
+     [
+      "--label",
+      "{label}"
+     ],
+     "logprob-ids"
+    ],
+    [
+     "experiments/2026-10-19-sink-rejection-v2/batch.py",
+     [],
+     "sink-batch"
+    ],
+    [
+     "experiments/2026-10-19-sink-rejection-v2/longctx.py",
+     [],
+     "sink-longctx"
+    ],
+    [
+     "experiments/2026-10-04-tp4-memory-tuning/long_context.py",
+     [
+      "--tokens",
+      "960000",
+      "--depths",
+      "0.1,0.9"
+     ],
+     "long-context-960k"
+    ],
+    [
+     "experiments/2026-10-25-kv-zeroing/kv_counters.py",
+     [
+      "--nodes",
+      "sp5,sp6,sp7"
+     ],
+     "counters"
+    ]
+   ]
+  }
+ ]
+}

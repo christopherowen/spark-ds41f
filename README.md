@@ -3,6 +3,20 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
+The next candidate is [candidate-39](experiments/2026-10-26-spark-ds41f-candidate/candidate-39/README.md).
+It makes CopyDrafter the default for greedy adaptive DSpark, fits the decode and
+capture envelopes automatically, and overlaps the copy work. Its canonical source
+is prepared; image and serving qualification are pending in the
+[measured rounds](experiments/2026-11-04-copy-default-screening/README.md).
+It builds on [candidate-38](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md),
+whose [TP3 qualification](experiments/2026-11-03-candidate-38-tp3-qualification/README.md)
+retains throughput gains, latency findings and small copy-recipe costs for review.
+The promoted release remains spark-ds41f-1030.
+Loop work follows the candidate's
+[containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
+preserve requested effort, end looping reasoning once, and stop continued
+degeneration while protecting legitimate repeated answers.
+
 Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
 profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is
@@ -219,7 +233,8 @@ differs only in cabling, transport and memory sizing):
   parallelism 3 (`tp3-triangle`), on DGX Spark 26.09.2 with kernel `7.0.0-1019-nvidia-64k`
   (`kho=off`), signed memory-saver DKMS 0.4.1 with UVM leaf-table packing enabled, no desktop,
   `vm.watermark_boost_factor=0`, and glibc malloc pinned (`MALLOC_ARENA_MAX=2`,
-  `MALLOC_MMAP_THRESHOLD_=1048576`);
+  `MALLOC_MMAP_THRESHOLD_=1048576`); vLLM's usage reporting off (`VLLM_NO_USAGE_STATS=1`,
+  `DO_NOT_TRACK=1`, in the recipe and the image);
 - dual ConnectX-7 200 GbE RoCE paths between every adjacent pair of nodes (`oneshot-ring4` on four
   nodes, `oneshot-direct` on three);
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (`19f2c20e`) with the
@@ -254,7 +269,7 @@ differs only in cabling, transport and memory sizing):
   (NVIDIA/nccl#2393) and the four-node switchless ring patches (bidirectional rings, balanced
   channels);
 - DeepSeek-V4.1-Flash-1017 (`1bae0e10`) native FP8/FP4/BF16 weights, with the TileLang vision
-  tower loaded (up to four images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
+  tower loaded (up to 67 images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
   see [images per request](docs/current-state.md#images-per-request)), served under both
   `deepseek-v4.1-flash` and the per-request GLP-steered `deepseek-v4.1-flash-weightless`
   (`0541-0542`, msuiche's 39-layer vector for 1017); the output head is stored in an exact 12-bit
@@ -838,7 +853,8 @@ not establish a loading slowdown. Plain `doctor` remains local.
 `build prepare` writes only under ignored `.work/build/`; see
 [docker/README.md](docker/README.md). `cluster sync` fetches a published commit and detaches every clean node
 checkout at that exact revision; it never copies a working tree or ignored files other than the site's
-node map. It then copies the image the profile names from the head to each node whose image layers differ.
+node map. It then copies the image the profile names from the head to each node whose
+ordered image layers or runtime configuration differ.
 A commit counts as published when a branch on `origin` contains it. The
 promoted configuration sets `deployment.branch: main`, so production deploys
 only from `main`; experiment configurations omit the field, so they stay

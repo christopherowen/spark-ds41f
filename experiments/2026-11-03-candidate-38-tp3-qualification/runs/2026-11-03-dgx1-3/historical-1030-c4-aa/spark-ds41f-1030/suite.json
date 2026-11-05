@@ -1,0 +1,326 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "release-tp3",
+  "version": 2,
+  "description": "Release measurement for three nodes (8 streams, 512K context), about 61 minutes a build: model behaviour on all 256 prompts at eight streams, the engine grid up to eight requests, eight and four streams in a closed loop, Poisson arrivals at 0.42 requests/s (about 80% of eight streams' rate on r6h) with goodput under a 2 s time to first token and 100 ms per output token, decode stalls while a cold 131K prompt prefills at three depths of the eight slots (3 and 6 streams, with short probes sent 2-14 s into it; 7 streams, which fills every slot during the prefill), and real-text prefill from 32K to 500K. Its grid needs the dev-mode collective RPC.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "concurrency": 8,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1,
+     "max_requests": 8
+    }
+   },
+   {
+    "id": "c8",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 8,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c4",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 4,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "poisson",
+    "command": "run",
+    "args": {
+     "mode": "poisson",
+     "rate": 0.42,
+     "warmup": 60,
+     "duration": 300,
+     "slo_ttft": 2,
+     "slo_tpot": 100,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "stall-3",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 3,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-6",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 6,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-7",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 7,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072,
+      262144,
+      500000
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "763f3fada1057871816f9410a27d60159a7cad5fe87756d49e4932c8004619a6",
+ "label": "spark-ds41f-1030",
+ "corpus": null,
+ "started_utc": "2026-10-30T02:02:12+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 465.7
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 77.4
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "output": "c8.json",
+   "exit": 0,
+   "seconds": 367.7
+  },
+  {
+   "id": "c4",
+   "command": "run",
+   "output": "c4.json",
+   "exit": 0,
+   "seconds": 365.8
+  },
+  {
+   "id": "poisson",
+   "command": "run",
+   "output": "poisson.json",
+   "exit": 0,
+   "seconds": 367.0
+  },
+  {
+   "id": "stall-3",
+   "command": "stall",
+   "output": "stall-3.json",
+   "exit": 0,
+   "seconds": 144.8
+  },
+  {
+   "id": "stall-6",
+   "command": "stall",
+   "output": "stall-6.json",
+   "exit": 0,
+   "seconds": 144.6
+  },
+  {
+   "id": "stall-7",
+   "command": "stall",
+   "output": "stall-7.json",
+   "exit": 0,
+   "seconds": 139.3
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 523.6
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-10-26-spark-ds41f-candidate/rc14/rc-tp3-dev.json",
+   "cluster_config_sha256": "d4f1e7bbcd23d0bc3f3773f25a51b4cd140697a01e0ed402950d2eee3c40308c",
+   "nodes_config": "config/nodes.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "swank",
+    "nodes": [
+     {
+      "name": "dgx1",
+      "rank": 0,
+      "management_ip": "10.0.1.71",
+      "head": true,
+      "roce_peer_hcas": {
+       "1": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "2": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.12.1.0/24",
+       "roceP2p1s0f0": "10.12.2.0/24",
+       "rocep1s0f1": "10.13.1.0/24",
+       "roceP2p1s0f1": "10.13.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx2",
+      "rank": 1,
+      "management_ip": "10.0.1.72",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ],
+       "2": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.23.1.0/24",
+       "roceP2p1s0f0": "10.23.2.0/24",
+       "rocep1s0f1": "10.12.1.0/24",
+       "roceP2p1s0f1": "10.12.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx3",
+      "rank": 2,
+      "management_ip": "10.0.1.73",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "1": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.13.1.0/24",
+       "roceP2p1s0f0": "10.13.2.0/24",
+       "rocep1s0f1": "10.23.1.0/24",
+       "roceP2p1s0f1": "10.23.2.0/24"
+      },
+      "roce_gid_index": 3
+     }
+    ]
+   },
+   "transport": "oneshot-direct",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-30-spark-ds41f-1030",
+   "image": "spark-ds41f:1030",
+   "client_commit": "19efdd6fe1f11a159c5f1989aaa3433682325ab2",
+   "client_dirty": false,
+   "client_host": "dgx1",
+   "nodes": {
+    "dgx1": {
+     "image_id": "sha256:7918fd6145b59c980d40c985eb30f0f06bcc1aecadf0fd9e3fc73baa4db0a93e",
+     "container_started_at": "2026-10-30T02:00:35.713220548Z",
+     "checkout": "19efdd6fe1f11a159c5f1989aaa3433682325ab2"
+    },
+    "dgx2": {
+     "image_id": "sha256:7918fd6145b59c980d40c985eb30f0f06bcc1aecadf0fd9e3fc73baa4db0a93e",
+     "container_started_at": "2026-10-30T02:00:34.96544254Z",
+     "checkout": "19efdd6fe1f11a159c5f1989aaa3433682325ab2"
+    },
+    "dgx3": {
+     "image_id": "sha256:7918fd6145b59c980d40c985eb30f0f06bcc1aecadf0fd9e3fc73baa4db0a93e",
+     "container_started_at": "2026-10-30T02:00:35.344221408Z",
+     "checkout": "19efdd6fe1f11a159c5f1989aaa3433682325ab2"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": []
+  }
+ },
+ "finished_utc": "2026-10-30T02:45:28+00:00"
+}

@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "run_id": "sp8-memcheck-dead-rows-20261103T020755Z",
+  "base_deployment_commit": "b28365c38a74c966032dcf558d8d1bb0a282d4b6",
+  "intent": "Run only the existing candidate-37 dead-row input-combine tests under Compute Sanitizer memcheck to look for invalid memory accesses; no serving reproduction.",
+  "intended_variable": "Compute Sanitizer memcheck instrumentation with PyTorch allocator caching disabled on the unchanged image.",
+  "source": {
+    "host_alias": "sp8",
+    "hostname": "spark-0016",
+    "image": "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+    "vllm_patch_head": "5b7cfa37fee42f96bfafbe09b7d30e8c0eda8575",
+    "vllm_tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "source_root": "/opt/spark-ds41f/candidate/vllm",
+    "git_metadata": "Absent: image contains exported source. Identity uses immutable image ID, source labels and recorded file hashes.",
+    "source_overlays": [],
+    "dependencies_installed": false
+  },
+  "toolchain": {
+    "compute_sanitizer": "2025.3.1.0 (build 36400806) public-release",
+    "nvcc": "13.0.88",
+    "gpu_and_driver": "NVIDIA GB10, 580.178.04, [N/A], [N/A]"
+  },
+  "guards": {
+    "dgx1_hold_absent_before_launch": true,
+    "sp8_hold_absent_under_lock": true,
+    "exclusive_nonblocking_lock": "/tmp/spark-lab-gpu.lock",
+    "preflight_containers": "",
+    "preflight_gpu_compute_processes": "",
+    "memory_limit_bytes": 25769803776,
+    "memory_swap_limit_bytes": 25769803776,
+    "shm_limit_bytes": 1073741824,
+    "wall_limit_seconds": 600,
+    "network": "none",
+    "sanitizer_mount_readonly": true,
+    "serving_or_cluster_operations": false
+  },
+  "execution": {
+    "started_utc": "2026-11-03T02:07:55.745513+00:00",
+    "ended_utc": "2026-11-03T02:07:56.720031+00:00",
+    "elapsed_seconds": 0.9745192459668033,
+    "container": "copy-fault-memcheck-20261103t020755z",
+    "argv": [
+      "docker",
+      "run",
+      "--name",
+      "copy-fault-memcheck-20261103t020755z",
+      "--gpus=all",
+      "--memory=24g",
+      "--memory-swap=24g",
+      "--shm-size=1g",
+      "--network=none",
+      "--ulimit",
+      "core=0",
+      "--mount",
+      "type=bind,source=/home/chris/spark-lab/copy-fault-forensics/memcheck-dead-rows-20261103T020755Z,target=/out",
+      "--mount",
+      "type=bind,source=/usr/local/cuda-13.0/compute-sanitizer,target=/opt/compute-sanitizer,readonly",
+      "--env",
+      "PYTORCH_NO_CUDA_MEMORY_CACHING=1",
+      "--env",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "--workdir",
+      "/opt/spark-ds41f/candidate/vllm",
+      "--entrypoint",
+      "/bin/bash",
+      "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+      "-lc",
+      "set -eu\nunset CUDA_LAUNCH_BLOCKING\n/opt/compute-sanitizer/compute-sanitizer --version\nnvcc --version\nprintf 'SOURCE_ROOT=%s\n' \"$PWD\"\nif test -d .git; then git rev-parse HEAD; git status --porcelain; else printf 'SOURCE_IDENTITY=exported image source, no Git metadata\n'; fi\nsha256sum tests/v1/worker/test_dead_rows.py vllm/v1/worker/gpu/input_batch.py\nprintf 'RELEVANT_ENVIRONMENT\n'\npython3 -c 'import json,os; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith((\"CUDA_\",\"PYTORCH_\",\"VLLM_\",\"SPARK_DS41F_\",\"TILELANG_\",\"NCCL_\"))},sort_keys=True,indent=2))'\nexec /opt/compute-sanitizer/compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 --log-file /out/memcheck-dead-rows.%p.log python3 -m pytest -q -rA tests/v1/worker/test_dead_rows.py::test_dead_rows_mark_rows_past_the_survival_cut tests/v1/worker/test_dead_rows.py::test_dead_row_cut_clamps_committed_tokens\n"
+    ],
+    "selectors": [
+      "tests/v1/worker/test_dead_rows.py::test_dead_rows_mark_rows_past_the_survival_cut",
+      "tests/v1/worker/test_dead_rows.py::test_dead_row_cut_clamps_committed_tokens"
+    ],
+    "exit_code": 255,
+    "timed_out": false,
+    "oom_killed": false,
+    "tests_executed": 0,
+    "instrumented_api_calls": 0,
+    "failure": "pytest conftest import failed: ModuleNotFoundError: No module named 'tblib'",
+    "sanitizer_report": "Target application terminated before first instrumented API call",
+    "positive_control_run": false
+  },
+  "memory_observations": {
+    "cap_enforced_by_container": true,
+    "oom_killed": false,
+    "peak_memory": "Not sampled; no test executed. Before/after /proc/meminfo retained in raw receipts."
+  },
+  "cleanup": {
+    "own_container_removed": true,
+    "post_containers": "",
+    "post_gpu_compute_processes": "",
+    "other_containers_or_services_changed": false
+  },
+  "conclusion": "Blocked by the immutable image test dependency before GPU instrumentation. This run supplies no memory-safety qualification, numerical-correctness evidence, serving-crash reproduction or performance measurement. No workaround or additional GPU run was attempted.",
+  "evidence": {
+    "remote_directory": "/home/chris/spark-lab/copy-fault-forensics/memcheck-dead-rows-20261103T020755Z",
+    "local_directory": "results/private/copy-fault-forensics/sp8/memcheck-dead-rows-20261103T020755Z",
+    "artifacts": [
+      {
+        "file": "command.json",
+        "bytes": 2042,
+        "sha256": "58c3107b1850e117dc9585f2f54bea4b74de905c3a408867472ff24f958b0172"
+      },
+      {
+        "file": "container-state.json",
+        "bytes": 874,
+        "sha256": "5e1001e40c3032c55caa51c89e3d1792fb3969669a70df12a06e476328718cd2"
+      },
+      {
+        "file": "image-identity.json",
+        "bytes": 8330,
+        "sha256": "e0b1342b4f64b7394e16e2618a1f51c550d45bee43803f9091812330cf9c5326"
+      },
+      {
+        "file": "memcheck-dead-rows.1.log",
+        "bytes": 110,
+        "sha256": "84b7f31aaa7fe67c00ded8172d7a3ffb016ee0ccf157978cb34e037ef9e25269"
+      },
+      {
+        "file": "preflight.json",
+        "bytes": 1905,
+        "sha256": "dbdf259b19ed9a1f2215efb5355d6be4b18a87ded8463d3fcd98bf0481075c8a"
+      },
+      {
+        "file": "result.json",
+        "bytes": 2087,
+        "sha256": "ea675398e0b75ced4c83976e4b4ab5d98646f87980bc0031231366fe78bbffe8"
+      },
+      {
+        "file": "sha256.json",
+        "bytes": 638,
+        "sha256": "b74cc6ec579f7b6a81d4a93258f63eb7edc06fc11ee3ea05d34280d7d161d915"
+      },
+      {
+        "file": "stdout-stderr.log",
+        "bytes": 1410,
+        "sha256": "e6b60bc7e57eebfcd1f4fee2c5f9642b94ec3613b416144e785c27ab68ed1a8a"
+      }
+    ],
+    "local_launcher": {
+      "path": "results/private/copy-fault-forensics/sp8-memcheck-launch.py",
+      "sha256": "05b3f8f155234fa1fcdd13fdd56cd7f76fa8ed091fb0757d81d08c56f3307157"
+    },
+    "remote_sha256_manifest_verified": true
+  }
+}

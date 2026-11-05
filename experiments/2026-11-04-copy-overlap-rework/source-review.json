@@ -1,0 +1,305 @@
+{
+  "recorded": "2026-11-04T21:22:56.586631+00:00",
+  "purpose_before_any_image_or_gpu_work": "C41 simplification: drop optional unproven copy preparation overlap complexity; correctness and no material core performance regression, no speedup claim",
+  "focused_review_verdict": "No defensible above-floor performance correction. Proposed readiness-event reuse withdrawn before measurement; overlap scheduling dropped for simplicity.",
+  "not_a_measured_corrected_failure": true,
+  "prior_policy_review": "experiments/2026-11-04-copy-policy-review/review.json",
+  "measured_evidence": {
+    "C39": {
+      "decision": "experiments/2026-11-04-copy-default-screening/decision.md",
+      "verdict": "No proven serving throughput gain over either saved C38 recipe after both repeat floors",
+      "adverse_grid_cost_vs_C38_standard_pct": [
+        0.86,
+        1.32
+      ],
+      "grid_does_not_invoke_copy_preparation_or_proposal": true
+    },
+    "C40": {
+      "published_evidence": "0afedcb0",
+      "decision": "experiments/2026-11-04-topk-live-qualification/decision.md",
+      "execution_commit": "1f134c7aad82bc63c95afed36f488becf2959a41",
+      "source_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+      "source_tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+      "image": "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82",
+      "serving_verdict": "Neutral aggregate throughput versus C39; retained for scratch-read correctness",
+      "grid_cost_change_vs_C39_pct": [
+        -0.48,
+        -0.3
+      ],
+      "grid_is_not_overlap_measurement": true
+    },
+    "old_results_or_baselines_modified": false
+  },
+  "withdrawn_proposal": {
+    "proposal": "Reuse prepare_alloc readiness event in attach_copy_draft_alloc instead of recording the second model-stream readiness event",
+    "source_finding": "prepare_alloc is immediately followed by attach; DSpark is queued only after attach, so the extra wait does not accidentally serialize substantial later DSpark work",
+    "cost_bound": "Available code establishes at most a redundant event record at that point, not an observed duration or a gain above approximately 0.3 percent paired serving floors; no compatible per-event/postprocess timing exists",
+    "decision": "Withdrawn before implementation/measurement; do not manufacture a speed correction or claim a measured corrected failure"
+  },
+  "source_delta": {
+    "base_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+    "head": "38ade7f947cb09c550c2bce077286e467c7fed8d",
+    "tree": "df6b6bc6841c1126b37be652c0e93c13debb8f42",
+    "patch": "experiments/2026-11-04-copy-overlap-rework/vllm/0001-dspark-simplify-copy-preparation-stream-ordering.patch",
+    "patch_sha256": "8c81f9944c86641fedc8d1da6a20aeeb67de64f24128a5089d139e40cede621e",
+    "source_branch": "feat/copy-overlap-readiness-review",
+    "patches_in_full_replay": 575,
+    "files": [
+      {
+        "path": "vllm/v1/worker/gpu/model_runner.py",
+        "insertions": 3,
+        "deletions": 6
+      },
+      {
+        "path": "vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+        "insertions": 10,
+        "deletions": 35
+      },
+      {
+        "path": "tests/v1/spec_decode/test_copy_drafts.py",
+        "insertions": 133,
+        "deletions": 68
+      }
+    ],
+    "removed": [
+      "new _prepared readiness event",
+      "_prepared_waiter",
+      "_join and its two calls",
+      "optional prepare copy/main stream arguments",
+      "runner preparation copy/main stream keywords"
+    ],
+    "retained": [
+      "existing fused _prepare/copy_match/copy_alloc/copy_apply",
+      "integer/float acceptance-state policy",
+      "older three-slot allocation ring and per-slot D2H completion events",
+      "existing asynchronous allocation attach before DSpark",
+      "requested default enablement",
+      "safe capture/decode envelope",
+      "PR878 inactive top-k scratch-read guard"
+    ],
+    "new_configuration_or_fallback": false,
+    "unchanged_fingerprints": [
+      {
+        "path": "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py",
+        "C40_sha256": "86492526e2b0c230cd79bd1dd8faa610ec56a6236db06069da963536f8e961fd",
+        "follow_on_sha256": "86492526e2b0c230cd79bd1dd8faa610ec56a6236db06069da963536f8e961fd",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/worker/gpu/async_utils.py",
+        "C40_sha256": "c1a7aa49805425ac0db266c8b65e866f0a9a2d2fbebb33f069c5fd4803c61790",
+        "follow_on_sha256": "c1a7aa49805425ac0db266c8b65e866f0a9a2d2fbebb33f069c5fd4803c61790",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/utils.py",
+        "C40_sha256": "48ddaa62db382e4bf93992c4aed1352c0d4a875eebe053e76a304978de7940ab",
+        "follow_on_sha256": "48ddaa62db382e4bf93992c4aed1352c0d4a875eebe053e76a304978de7940ab",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/config/speculative.py",
+        "C40_sha256": "4a7344eb2e126aaaaa1f4d97ba2f9504f685c29041ad30e59ab6630d75f2f2c3",
+        "follow_on_sha256": "4a7344eb2e126aaaaa1f4d97ba2f9504f685c29041ad30e59ab6630d75f2f2c3",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/config/vllm.py",
+        "C40_sha256": "fe35356a3290e807422c09e7952e2c33a76c5920fd5ad8266c4810b0c36402bc",
+        "follow_on_sha256": "fe35356a3290e807422c09e7952e2c33a76c5920fd5ad8266c4810b0c36402bc",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/models/deepseek_v4_1/tilelang/indexer.py",
+        "C40_sha256": "906039870d8dd00d933d1ee1c083510373292e951f971568b4d3cf9c59cbdbfc",
+        "follow_on_sha256": "906039870d8dd00d933d1ee1c083510373292e951f971568b4d3cf9c59cbdbfc",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/engine/core.py",
+        "C40_sha256": "08ade3bf645d006532a538a577fc426df0630a96cb961261809dadf1f7d10995",
+        "follow_on_sha256": "08ade3bf645d006532a538a577fc426df0630a96cb961261809dadf1f7d10995",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/executor/multiproc_executor.py",
+        "C40_sha256": "d5eb18335c91c8a3ebd00167f069d49a802c62c186613ac39e3dac7c3f085567",
+        "follow_on_sha256": "d5eb18335c91c8a3ebd00167f069d49a802c62c186613ac39e3dac7c3f085567",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/executor/uniproc_executor.py",
+        "C40_sha256": "3cb039b80fe9b03dc1122f93c1f8a4098ef1355104b317ff6df25358f4349494",
+        "follow_on_sha256": "3cb039b80fe9b03dc1122f93c1f8a4098ef1355104b317ff6df25358f4349494",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/v1/worker/gpu_worker.py",
+        "C40_sha256": "e6709946664e2fb341d43e121b5810472befa8f498e335f2b5b4db149bbc9562",
+        "follow_on_sha256": "e6709946664e2fb341d43e121b5810472befa8f498e335f2b5b4db149bbc9562",
+        "byte_identical": true
+      }
+    ]
+  },
+  "lifetime_review": {
+    "scope": "Frozen PP=1, V2 asynchronous profile; TP rank count separate; no universal arbitrary-PP claim",
+    "max_inflight": 2,
+    "allocation_ring_slots": 3,
+    "credit_rule": "Core returns early only while queue has credit; once two outputs are in flight it pops oldest and waits future.result before a subsequent cycle",
+    "delivery_chain": "Multiprocessing WorkerProc.enqueue_output calls AsyncOutput.get_output before publishing success; RoCE wrapper delegates inner.get_output; uniprocess AsyncOutputFuture.result also calls get_output",
+    "completion": "get_output synchronizes copy_draft_alloc_event before reading pinned NumPy view into independent list; old slot delivery is settled before fourth prepare reuses that slot/event",
+    "main_to_copy_wait_required_and_unchanged": true,
+    "new_preparation_event_re_recording": "Removed entirely; older per-slot completion event re-recording remains protected by the two-credit bound",
+    "source_locations": [
+      {
+        "path": "vllm/config/vllm.py",
+        "class": "VllmConfig",
+        "method": "max_concurrent_batches",
+        "line": 733,
+        "end_line": 743
+      },
+      {
+        "path": "vllm/v1/engine/core.py",
+        "class": "EngineCore",
+        "method": "step_with_batch_queue",
+        "line": 746,
+        "end_line": 880
+      },
+      {
+        "path": "vllm/v1/executor/multiproc_executor.py",
+        "class": "WorkerProc",
+        "method": "enqueue_output",
+        "line": 1170,
+        "end_line": 1187
+      },
+      {
+        "path": "vllm/v1/executor/uniproc_executor.py",
+        "class": "AsyncOutputFuture",
+        "method": "result",
+        "line": 38,
+        "end_line": 48
+      },
+      {
+        "path": "vllm/v1/worker/gpu/async_utils.py",
+        "class": "AsyncOutput",
+        "method": "get_output",
+        "line": 247,
+        "end_line": 311
+      },
+      {
+        "path": "vllm/v1/worker/gpu_worker.py",
+        "class": "_B12xRoceCheckedAsyncOutput",
+        "method": "get_output",
+        "line": 216,
+        "end_line": 228
+      }
+    ],
+    "extra_production_sync_or_policy_guard_added": false
+  },
+  "validation": {
+    "574_patch_pre_edit_canonical_replay": "runs/source-review/canonical-replay.json",
+    "575_patch_follow_on_canonical_replay": "runs/source-review/follow-on-replay.json",
+    "canonical_replay_passed": true,
+    "source_validation": "runs/source-review/source-validation.json",
+    "source_only_controls_passed": 5,
+    "source_only_control_limit": "AST/fingerprint/host-double controls do not execute or prove CUDA ordering",
+    "authored_gpu_regressions": [
+      "test_prepare_alloc_and_propose_follow_the_current_stream",
+      "test_async_alloc_ring_wrap_with_two_inflight_outputs_and_busy_copy_stream"
+    ],
+    "gpu_regression_status": "Authored, parsed and source-reviewed; not independently executed here",
+    "initial_failed_control": "runs/source-review/source-controls-initial-failure.json",
+    "initial_failed_control_cause": "AST test helper omitted annotated assignment; corrected helper, no production correction",
+    "read_only_inspection_errors": "runs/source-review/inspection-errors.json",
+    "pending": [
+      "complete Linux prepare and build check",
+      "actual image/source identity and release tests",
+      "new-image CUDA regression execution and sanitizer gates",
+      "every native functional outcome",
+      "two complete metric boots and all paired adverse rows",
+      "independent all-rank restoration verification",
+      "outstanding TP4 correctness/release gates"
+    ],
+    "logs": [
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/canonical-replay.log",
+        "bytes": 232818,
+        "sha256": "a13a58d87b9d21ab8df21b3cc12143140ba9178776598a0448fc1ff53a9a71c5",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/canonical-replay.log.gz",
+        "portable_sha256": "2f64581181b63771653334c8a58d816b30670e9f4ae8c0f1700fc2780aa90afb"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/doctor-tp3.log",
+        "bytes": 17,
+        "sha256": "5c4567d5f6e78fff55ba7b68fef63553cf2631cc914b4182ea570b376da537d1",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/doctor-tp3.log.gz",
+        "portable_sha256": "b5d431252084ea84ca3c8d35e9ef72bc3ffb0010c0850be39a3366e0539573b6"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/doctor-tp4.log",
+        "bytes": 17,
+        "sha256": "5c4567d5f6e78fff55ba7b68fef63553cf2631cc914b4182ea570b376da537d1",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/doctor-tp4.log.gz",
+        "portable_sha256": "b5d431252084ea84ca3c8d35e9ef72bc3ffb0010c0850be39a3366e0539573b6"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/follow-on-replay.log",
+        "bytes": 253669,
+        "sha256": "2c708bd1b0020bc59069ffe76ee473607dbb6ae8e98c16e72482c43a330a47d4",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/follow-on-replay.log.gz",
+        "portable_sha256": "1cc75d8a13eccd2496747f932046b0b04a82e64e426f91af9f0ea33d0022b514"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/parse.log",
+        "bytes": 34,
+        "sha256": "605308e5f3754e663c07c35748f8ea155bfac10a3fab94a98d0c83011bbdb585",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/parse.log.gz",
+        "portable_sha256": "b3cd7131aca53a34383ef3db50ea160d6a3a535921538e4a695bae23f39bc0a6"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/source-controls-initial-failure.log",
+        "bytes": 1753,
+        "sha256": "6cfe0a2abe655b32072e37c305298c46e397a66bc59a255f9623f58f15a7de5b",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/source-controls-initial-failure.log.gz",
+        "portable_sha256": "a7c0f402f62ef8de9764f72b0443a5172dec743fc1569e8de700999c6fc28374"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/source-controls.log",
+        "bytes": 865,
+        "sha256": "2545491c00772d9b70ad7e06914bebabf3e3b2ed3357a7c7603300d061f0a086",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/source-controls.log.gz",
+        "portable_sha256": "d61a4eeccaddb5bd678c1acfda12dd31cc2fffe9bc89f56fd770bf11257db40f"
+      },
+      {
+        "original": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/whitespace.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "portable": "experiments/2026-11-04-copy-overlap-rework/runs/source-review/whitespace.log.gz",
+        "portable_sha256": "f1b651238a58fe290baec6c5e32f3bdb1943dd2bd582f02569231f7a757c7837"
+      }
+    ]
+  },
+  "acceptance": {
+    "primary_saved_reference": "Both C40 boots, all four pairings and both candidate/reference repeat floors",
+    "simplification": "All correctness and identity gates pass; no material core regression beyond paired uncertainty/repeat floors. No serving gain required or claimed.",
+    "report": "1030, C36, previous and current candidate; signed over/under plus explicit better/worse/no-proven-improvement and missing-data limits",
+    "metrics": [
+      "throughput and per-user decode",
+      "TTFT/TPOT and actual ITL only where recorded",
+      "cold/mixed prefill and first-chunk waits",
+      "engine cost and draft acceptance",
+      "recorded cache/KV/preemptions only",
+      "host memory/swap",
+      "startup and thermals"
+    ],
+    "drop": "Highlight and reject a materially regressing simplification; do not manufacture speculative speed retries. Future optional performance optimization must earn relevant serving gain beyond both floors without material adverse core rows; at most one justified correction after a measured miss, then highlight/drop a second miss.",
+    "no_promotion": true
+  },
+  "operations": {
+    "deployment_commit_or_push": false,
+    "ssh_or_node_actions": false,
+    "image_build_or_gpu_work": false,
+    "old_image_remeasurement": false,
+    "only_disposable_source_commit_for_canonical_patch": true
+  }
+}

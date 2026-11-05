@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "run_id": "sp8-initcheck-copy-state-noconftest-20261103T021504Z",
+  "base_deployment_commit": "b28365c38a74c966032dcf558d8d1bb0a282d4b6",
+  "intent": "Run the existing candidate-37 CopyDrafter state tests under initcheck.",
+  "intended_variable": "Sanitizer instrumentation and disabled PyTorch allocator caching on unchanged candidate-37 runtime source.",
+  "source": {
+    "host_alias": "sp8",
+    "hostname": "spark-0016",
+    "image": "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+    "vllm_patch_head": "5b7cfa37fee42f96bfafbe09b7d30e8c0eda8575",
+    "vllm_tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "git_metadata": "Absent in exported image; immutable image ID, recorded labels and actual imported file hashes retained.",
+    "source_overlays": [],
+    "dependencies_installed": false,
+    "selected_imported_files": [
+      {
+        "module": "tests.v1.spec_decode.test_copy_drafts",
+        "path": "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_copy_drafts.py",
+        "sha256": "c253edd11175d372a4978027372538796b12731cde16b883fcbfb5b04dff13f4"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.spec_decode.copy_drafts",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+        "sha256": "caed58e8c641cae78626fb8dab34758573bac407fc092915691bd9ac6e9e1cc8"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.spec_decode.tilelang_copy",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py",
+        "sha256": "89cd4cf39ad75b8992504afd5bc7d91a088dda0c64a66d314126553a4379187d"
+      },
+      {
+        "module": "vllm.v1.worker.gpu.tilelang_inputs",
+        "path": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py",
+        "sha256": "be6c93c468ca14dc645353f7a0069ef8f464b7dee356fb035e7abd269c3626f7"
+      }
+    ],
+    "all_imported_files_manifest": "imported-files.json",
+    "imported_files_count": 302
+  },
+  "toolchain": {
+    "compute_sanitizer": "2025.3.1.0 (build 36400806) public-release",
+    "nvcc": "13.0.88",
+    "gpu_and_driver": "NVIDIA GB10, 580.178.04, [N/A], [N/A]"
+  },
+  "guards": {
+    "dgx1_hold_absent_before_launch": true,
+    "sp8_hold_absent_under_lock": true,
+    "exclusive_nonblocking_lock": "/tmp/spark-lab-gpu.lock",
+    "preflight_containers": "",
+    "preflight_gpu_compute_processes": "",
+    "memory_limit_bytes": 25769803776,
+    "memory_swap_limit_bytes": 25769803776,
+    "shm_limit_bytes": 1073741824,
+    "wall_limit_seconds": 600,
+    "network": "none",
+    "sanitizer_mount_readonly": true,
+    "serving_or_cluster_operations": false
+  },
+  "harness_adjustment": {
+    "option": "--noconftest",
+    "option_verified_in_image_help": true,
+    "omitted": "All conftest.py files, including root conftest with missing tblib import, HTTP reset, cleanup/dynamo reset and logging restoration. Selected tests take no required fixtures and allocate their own inputs.",
+    "runtime_code_modified": false,
+    "import_manifest_wrapper": "pytest.main plus recording imported module paths and SHA256 after test completion; wrapper preserved in exact argv."
+  },
+  "execution": {
+    "started_utc": "2026-11-03T02:15:04.971619+00:00",
+    "ended_utc": "2026-11-03T02:15:30.108291+00:00",
+    "elapsed_seconds": 25.136678128968924,
+    "container": "copy-fault-initcheck-20261103t021504z",
+    "argv": [
+      "docker",
+      "run",
+      "--name",
+      "copy-fault-initcheck-20261103t021504z",
+      "--gpus=all",
+      "--memory=24g",
+      "--memory-swap=24g",
+      "--shm-size=1g",
+      "--network=none",
+      "--ulimit",
+      "core=0",
+      "--mount",
+      "type=bind,source=/home/chris/spark-lab/copy-fault-forensics/initcheck-copy-state-noconftest-20261103T021504Z,target=/out",
+      "--mount",
+      "type=bind,source=/usr/local/cuda-13.0/compute-sanitizer,target=/opt/compute-sanitizer,readonly",
+      "--env",
+      "PYTORCH_NO_CUDA_MEMORY_CACHING=1",
+      "--env",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "--workdir",
+      "/opt/spark-ds41f/candidate/vllm",
+      "--entrypoint",
+      "/bin/bash",
+      "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+      "-lc",
+      "set -eu\nunset CUDA_LAUNCH_BLOCKING\n/opt/compute-sanitizer/compute-sanitizer --version\nnvcc --version\nprintf 'SOURCE_ROOT=%s\n' \"$PWD\"\nif test -d .git; then git rev-parse HEAD; git status --porcelain; else printf 'SOURCE_IDENTITY=exported image source, no Git metadata\n'; fi\nsha256sum tests/v1/spec_decode/test_copy_drafts.py vllm/v1/worker/gpu/input_batch.py\nprintf 'RELEVANT_ENVIRONMENT\n'\npython3 -c 'import json,os; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith((\"CUDA_\",\"PYTORCH_\",\"VLLM_\",\"SPARK_DS41F_\",\"TILELANG_\",\"NCCL_\"))},sort_keys=True,indent=2))'\npython3 -m pytest --noconftest --help > /out/pytest-help.txt\ngrep -F -- --noconftest /out/pytest-help.txt\nexec /opt/compute-sanitizer/compute-sanitizer --tool initcheck --target-processes all --error-exitcode 86 --log-file /out/initcheck-copy-state.%p.log python3 -c 'import hashlib,json,pathlib,sys\nimport pytest\ntry:\n    result=pytest.main(['\"'\"'--noconftest'\"'\"','\"'\"'-q'\"'\"','\"'\"'-rA'\"'\"',*sys.argv[1:]])\nfinally:\n    files=[]\n    for name,module in sorted(sys.modules.items()):\n        path=getattr(module,'\"'\"'__file__'\"'\"',None)\n        if path and (name.startswith('\"'\"'vllm.'\"'\"') or '\"'\"'test_copy_drafts'\"'\"' in name or name in ('\"'\"'torch'\"'\"','\"'\"'tilelang'\"'\"','\"'\"'tvm_ffi'\"'\"','\"'\"'pytest'\"'\"')):\n            p=pathlib.Path(path)\n            if p.is_file(): files.append({'\"'\"'module'\"'\"':name,'\"'\"'path'\"'\"':str(p),'\"'\"'sha256'\"'\"':hashlib.sha256(p.read_bytes()).hexdigest()})\n    pathlib.Path('\"'\"'/out/imported-files.json'\"'\"').write_text(json.dumps(files,indent=2)+'\"'\"'\\n'\"'\"')\nsys.exit(result)\n' tests/v1/spec_decode/test_copy_drafts.py::test_copy_select_follows_the_reference_over_a_copy tests/v1/spec_decode/test_copy_drafts.py::test_copy_select_judges_only_its_pending_copy tests/v1/spec_decode/test_copy_drafts.py::test_kernels_replay_in_a_cuda_graph tests/v1/spec_decode/test_copy_drafts.py::test_a_slot_starts_afresh_with_each_request tests/v1/spec_decode/test_copy_drafts.py::test_prepare_alloc_matches_propose_and_updates_slot_draft_limits tests/v1/spec_decode/test_copy_drafts.py::test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync\n"
+    ],
+    "selectors": [
+      "tests/v1/spec_decode/test_copy_drafts.py::test_copy_select_follows_the_reference_over_a_copy",
+      "tests/v1/spec_decode/test_copy_drafts.py::test_copy_select_judges_only_its_pending_copy",
+      "tests/v1/spec_decode/test_copy_drafts.py::test_kernels_replay_in_a_cuda_graph",
+      "tests/v1/spec_decode/test_copy_drafts.py::test_a_slot_starts_afresh_with_each_request",
+      "tests/v1/spec_decode/test_copy_drafts.py::test_prepare_alloc_matches_propose_and_updates_slot_draft_limits",
+      "tests/v1/spec_decode/test_copy_drafts.py::test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap_without_sync"
+    ],
+    "exit_code": 0,
+    "timed_out": false,
+    "oom_killed": false,
+    "tests_passed": 6,
+    "tests_skipped": 0,
+    "sanitizer_reports": [
+      {
+        "file": "initcheck-copy-state.1.log",
+        "error_summaries": [
+          0
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+      }
+    ]
+  },
+  "positive_control_validation": {
+    "run_id": "sp8-sanitizer-controls-20261103T021256Z",
+    "fixture_sha256": "ae0efde3795470ff0b92b8fe3f25cd6257d3354491278082920abc8c27aa7a82",
+    "memcheck_clean": "exit 0, zero errors",
+    "memcheck_oob": "exit 86, invalid global read at sanitizer_control.cu:16; subsequent launch failure reported",
+    "initcheck_clean": "exit 0, zero errors",
+    "initcheck_uninitialized": "exit 86, uninitialized global memory read at sanitizer_control.cu:16"
+  },
+  "memory_observations": {
+    "cap_enforced_by_container": true,
+    "oom_killed": false,
+    "peak_memory": "Not sampled. Before/after /proc/meminfo retained in raw receipts."
+  },
+  "cleanup": {
+    "own_container_removed": true,
+    "post_containers": "",
+    "post_gpu_compute_processes": "",
+    "other_containers_or_services_changed": false
+  },
+  "conclusion": "The selected standalone tests passed with no reported sanitizer errors. Scope is these inputs and kernels only; no neural target/DSpark forward, distributed rank layout or failing-step replay was exercised. Instrumentation changes timing, so this does not exclude a timing-dependent serving fault or establish its first nonfinite producer.",
+  "evidence": {
+    "remote_directory": "/home/chris/spark-lab/copy-fault-forensics/initcheck-copy-state-noconftest-20261103T021504Z",
+    "local_directory": "results/private/copy-fault-forensics/sp8/initcheck-copy-state-noconftest-20261103T021504Z",
+    "artifacts": [
+      {
+        "file": "command.json",
+        "bytes": 5496,
+        "sha256": "0b1b24a4efcc44c7c176afd758d4d6bec736162a350a98114899977f0bf81fd8"
+      },
+      {
+        "file": "container-state.json",
+        "bytes": 874,
+        "sha256": "0503fcf999a0b641befc0e79e78eea7b77351f0ee4252fbf8030385430ab1173"
+      },
+      {
+        "file": "image-identity.json",
+        "bytes": 8330,
+        "sha256": "e0b1342b4f64b7394e16e2618a1f51c550d45bee43803f9091812330cf9c5326"
+      },
+      {
+        "file": "imported-files.json",
+        "bytes": 64870,
+        "sha256": "3658227c242971ca0f1c792558d035c4893de20683bb00321344b3df8aebd5da"
+      },
+      {
+        "file": "initcheck-copy-state.1.log",
+        "bytes": 62,
+        "sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425"
+      },
+      {
+        "file": "preflight.json",
+        "bytes": 1905,
+        "sha256": "44f1c190a91f2079d5d176ff5020aac24193d1e2dac6c06e880189b3d1e24e91"
+      },
+      {
+        "file": "pytest-help.txt",
+        "bytes": 20730,
+        "sha256": "966310fb7dfd81ea8e88df226cad4d1df5b485b5d6396bdde934316aa399a849"
+      },
+      {
+        "file": "result.json",
+        "bytes": 2086,
+        "sha256": "7e18f42048aeb00279abc7bf81610b2664e9be7a16b6e55b56c823a15a6adb7e"
+      },
+      {
+        "file": "sha256.json",
+        "bytes": 822,
+        "sha256": "2f127a6c60a1a2d689123d7aba18c740049ac7d90cf64ad87f7cc3638f55d2da"
+      },
+      {
+        "file": "stdout-stderr.log",
+        "bytes": 8303,
+        "sha256": "400a560cfff3566e480dc2d14e85704f6a8c1bd5195cdb54920997d67a516397"
+      }
+    ],
+    "remote_sha256_manifest_verified": true
+  }
+}

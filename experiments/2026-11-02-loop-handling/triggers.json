@@ -1,0 +1,70 @@
+{
+ "about": "Known loop and collapse triggers, each with where it was seen and what the loop handling must do with it. probes.py sends each one and checks its expectation. expect: clean = finishes by itself with no degenerate run; bounded = may degenerate, but must stop with finish_reason repetition before its run passes max_run tokens; kept = legitimate repetition that must finish by itself, never with finish_reason repetition.",
+ "triggers": [
+  {
+   "id": "sink-say-hi",
+   "source": "experiments/2026-10-19-thinking-collapse (3eedded6): a sampled token turns into an attention sink; the reference reproduces it",
+   "messages": [{"role": "user", "content": "Say hi."}],
+   "thinking": true, "effort": "high", "temperature": 0, "seeds": [0], "max_tokens": 300,
+   "expect": "clean"
+  },
+  {
+   "id": "sink-thanks",
+   "source": "experiments/2026-10-19-thinking-collapse (3eedded6)",
+   "messages": [{"role": "user", "content": "Thanks!"}],
+   "thinking": true, "effort": "high", "temperature": 0, "seeds": [0], "max_tokens": 300,
+   "expect": "clean"
+  },
+  {
+   "id": "quoted-soup-max",
+   "source": "#787 comments 6564042421 and 6565237128: an agent at thinking level max quoted a 'Vila' collapse and fell into it inside its own reasoning; replayed on candidate-36 (sp5, 2026-11-02) the model continued ' Vila' at p 0.83-0.93",
+   "messages": [{"role": "user", "content": "My agent produced the output below and then stopped responding. Explain, step by step, what went wrong and how a server could detect it early.\n\n\"The windowed check would NOT be caught even inside the reasoning block because: Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Estud compar Vila Vila Vila Vila Vila Vila Vila Vila Vila Estud compar Vila Vila Vila Vila Vila Vila Vila Vila Vila Evelyn Laud\\Facade Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Eucharistic Tripadvisor Vila Vila Vila Vila Vila Vila Vila Vila 市教育局 Vila Vila Vila Vila Vila Vila Vila Vila Vila Vila Escola Fest Vila Vila Vila Vila Vila Vila Vila\""}],
+   "thinking": true, "effort": "max", "temperature": 1.0, "seeds": [0, 1, 2, 3, 4], "max_tokens": 6000,
+   "expect": "bounded", "max_run": 600
+  },
+  {
+   "id": "quoted-stall-max",
+   "source": "#787 comment 6564982828: reasoning at max stalled on 'Let me do it.' at 163 output tokens and the answer collapsed into token soup after the forced end",
+   "messages": [{"role": "user", "content": "Continue this plan from where it stops and then give the final answer: compute 17 * 23 + 4.\n\nPlan: First multiply. Let me do it. Let me do it. Let me do it. Let me do it. Let me do it. Let me do it."}],
+   "thinking": true, "effort": "max", "temperature": 1.0, "seeds": [0, 1, 2, 3, 4], "max_tokens": 4000,
+   "expect": "bounded", "max_run": 600
+  },
+  {
+   "id": "repeat-word-200",
+   "source": "#787 comment 6564781507: a requested long repetition is legitimate and must not be cut",
+   "messages": [{"role": "user", "content": "Write the word hello 200 times, separated by single spaces, and nothing else."}],
+   "thinking": false, "effort": null, "temperature": 0, "seeds": [0], "max_tokens": 1000,
+   "expect": "kept"
+  },
+  {
+   "id": "zero-array-128",
+   "source": "a C array literal of 128 zeros: 256 tokens of ', 0'; candidate-37's answer rule stops it at its 24th token",
+   "messages": [{"role": "user", "content": "Write the C declaration `static const int z[128] = { ... };` spelling out all 128 zeros explicitly, with no loops, macros or shorthand. Output only the code."}],
+   "thinking": false, "effort": null, "temperature": 0, "seeds": [0], "max_tokens": 1200,
+   "expect": "kept"
+  },
+  {
+   "id": "separator-table",
+   "source": "#787 comment 6564709937: legitimate messages carried 199-token runs of one token (separator rules) at a distinct-token ratio of 0.82-0.84",
+   "messages": [{"role": "user", "content": "Print a plain-text report: a title line, then a separator line of exactly 200 '=' characters written as '= ' pairs (an equals sign followed by a space, 200 times), then a 10-row table of the first ten primes and their squares, then the same separator line again."}],
+   "thinking": false, "effort": null, "temperature": 0, "seeds": [0], "max_tokens": 2000,
+   "expect": "kept"
+  },
+  {
+   "id": "long-context-max",
+   "source": "#787 comment 6565237128: the two severe collapses with recorded context were at 212K and 380K tokens, both at max; context and effort are confounded. Run with effort high as well to separate them.",
+   "context_tokens": 200000,
+   "messages": [{"role": "user", "content": "Above is this repository's documentation. Which three operational rules in it are most likely to be broken by an automated agent, and why? Reason carefully before answering."}],
+   "thinking": true, "effort": "max", "temperature": 1.0, "seeds": [0, 1], "max_tokens": 16000,
+   "expect": "bounded", "max_run": 600, "periodic": true
+  },
+  {
+   "id": "long-context-high",
+   "source": "the control arm of long-context-max",
+   "context_tokens": 200000,
+   "messages": [{"role": "user", "content": "Above is this repository's documentation. Which three operational rules in it are most likely to be broken by an automated agent, and why? Reason carefully before answering."}],
+   "thinking": true, "effort": "high", "temperature": 1.0, "seeds": [0, 1], "max_tokens": 16000,
+   "expect": "bounded", "max_run": 600, "periodic": true
+  }
+ ]
+}

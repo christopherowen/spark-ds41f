@@ -8,10 +8,20 @@ record says so (``token_times: "approximate"``).
 """
 
 import json
+import os
 import time
 import urllib.request
 
 TIMEOUT_S = 900.0
+STREAM_POLICY_ENV = "SPARK_DS41F_BENCH_STREAM_POLICY"
+RECORDED_STREAM_POLICY = "recorded-1030"
+
+
+def stream_policy() -> str:
+    policy = os.environ.get(STREAM_POLICY_ENV, "current")
+    if policy not in ("current", RECORDED_STREAM_POLICY):
+        raise ValueError(f"unsupported stream collector policy: {policy}")
+    return policy
 
 
 def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
@@ -24,6 +34,7 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
     ``error`` (None when the request completed). A set ``stop`` event (threading.Event)
     ends the stream at its next chunk and closes the connection, which aborts the
     request; the record then has ``stopped`` true and no error."""
+    legacy = stream_policy() == RECORDED_STREAM_POLICY
     options = {"include_usage": True}
     if continuous_usage:
         options["continuous_usage_stats"] = True
@@ -55,7 +66,7 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
                     record["error"] = "server: " + (detail.get("message") if isinstance(detail, dict) else str(detail))[:300]
                     break
                 usage = event.get("usage") or usage
-                tokens = (event.get("usage") or {}).get("completion_tokens")
+                tokens = None if legacy else (event.get("usage") or {}).get("completion_tokens")
                 emitted = False
                 for choice in event.get("choices") or []:
                     record["finish_reason"] = choice.get("finish_reason") or record["finish_reason"]
@@ -63,13 +74,16 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
                     for key in ("content", "reasoning_content", "reasoning"):
                         if isinstance(delta.get(key), str) and delta[key]:
                             emitted = True
-                    if choice.get("token_ids"):
+                    if not legacy and choice.get("token_ids"):
                         emitted = True
-                progressed = continuous_usage and counted and tokens is not None and tokens > prev_tokens
+                progressed = (not legacy and continuous_usage and counted
+                              and tokens is not None and tokens > prev_tokens)
                 if not emitted and not progressed:
                     continue
                 if record["first"] is None:
                     record["first"] = now
+                if legacy:
+                    tokens = (event.get("usage") or {}).get("completion_tokens")
                 if tokens is None:
                     counted = False
                 else:

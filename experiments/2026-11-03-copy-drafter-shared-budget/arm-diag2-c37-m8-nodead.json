@@ -1,0 +1,46 @@
+{
+ "notes": "Diagnosis of #852's trigger on candidate-37 at tp3-switched: copy drafts at min match 8, dead rows off, the non-syncing nonfinite census (read every 32 steps), the stale-read counter with its ring, and a device-side census of the attention metadata: a live row whose request index or position is negative (window_row zeroes its lengths, 0676 then skips it and the output projection reads stale scratch) or a query_start_loc end that differs from the token count. Both the target's and the drafter's metadata builders are covered. The router zeroes a non-finite row's partials instead of asserting.",
+ "extends": {
+  "config": "config/candidate-37-tp3-switched-dev.local.json"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{checkout}/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{checkout}/experiments/2026-11-03-copy-drafter-shared-budget/overlay/census-async-v2/vllm/models/deepseek_v4_1/tilelang/router.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/router.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-03-copy-drafter-shared-budget/overlay/census-async-v2/vllm/models/deepseek_v4_1/sparse_mla.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sparse_mla.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-03-copy-drafter-shared-budget/overlay/census-async-v2/vllm/v1/worker/gpu/model_runner.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-03-copy-drafter-shared-budget/overlay/census-async-v2/vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/copy_drafts.py",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0"
+  }
+ },
+ "serve_options": {
+  "--max-num-batched-tokens": "6155",
+  "--max-cudagraph-capture-size": "59",
+  "--compilation-config": "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,59]}",
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":3,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035,\"copy_drafts\":{\"min_match\":8,\"initial_drafts\":8,\"max_drafts\":16}}"
+ }
+}

@@ -283,7 +283,7 @@ rollback.
 | Page-size profiles | 64 KiB selected (`tp4-ring`, `tp3-triangle`); 4 KiB (`tp3-triangle-4k`) retains 2.2 GiB KV and a 262,144-token limit |
 | Output head & display carve-out | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`), bit-identical to the checkpoint, with FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`); kept in regular memory on `tp4-ring` (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0`) and in the GB10 display carve-out on `tp3-triangle` (`=1`) |
 | Reference precision | DeepSeek's `inference/model.py` term for term: FP32 logits, exact FP32 mHC stream projection (three TF32 parts per weight), shared expert SwiGLU in FP32 with one rounding, MoE partials rounded once per rank, and WO-A's input through `act_quant` (E4M3, UE8M0 per 32, vLLM 0177, 0179) |
-| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":4}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
+| Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":67}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
 | DSpark speculative decoding | 5 draft tokens, draft TP = node count, fixed linear step cost budget (`adaptive_verification_row_cost: 0.035`, vLLM 0184, nothing timed at boot), dead verification rows below survival 0.2 (`0504`), block rejection with fresh draws per round (`0228`), sink draft-zero rejection on by default (`0221, 0223`), vocabulary-parallel greedy drafts and shard argmax verification (`0112-0114`) |
 | Collectives | sparknet 0.5.0 one-shot RoCE all-reduce (up to 2 MiB) and all-gather (`oneshot-ring4` on TP4, `oneshot-direct` on TP3), TP broadcast on one-shot all-gather (`0185`), GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`), no fallback (`0142`) |
 | CUDA graphs & warmup | `FULL_AND_PIECEWISE`, capture sizes 1-96 on `tp4-ring` (1-48 on `tp3-triangle`); all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
@@ -304,15 +304,18 @@ memory guards are unchanged.
 
 ## Images per request
 
-`--limit-mm-per-prompt {"image":4}` in the recipe's `serve_args` is the recipe's chosen
-per-request limit, set when the vision tower was enabled
-([experiments/2026-09-25-vision](../experiments/2026-09-25-vision/README.md)). It is not a
-limit of the model. vLLM counts every image in a request, and a chat client resends its
-history, so the images retained in earlier turns count too: once a conversation holds a
-fifth image, every later turn fails with
-`400: At most 4 image(s) may be provided in one prompt`.
+`--limit-mm-per-prompt {"image":67}` is the current default per-request limit,
+requested by the owner on 2026-11-04. It counts every image in a request,
+including images a chat client resends with conversation history. Requests
+with more than 67 images receive
+`400: At most 67 image(s) may be provided in one prompt`.
 
-A site profile raises the limit by writing another count in that entry (`{"image":8}`), or
+The [default-change record](../manifests/runtime-defaults/2026-11-04-images-67.json)
+preserves the distinction from the frozen spark-ds41f-1030 recipe, which used
+four images. Historical qualification and memory observations below retain
+that original count; 67 has not been serving-qualified here.
+
+A site profile raises the limit by writing another count in that entry (`{"image":80}`), or
 omits both entries to take vLLM's default of 999 per prompt. `{"image":0}` (or
 `--language-model-only`) skips the vision tower and its 0.9 GiB of weights on every rank.
 A profile's `serve_args` is the complete command, so the change is made in the profile's
@@ -334,7 +337,7 @@ qualified here.
 on the 1025 image (experiments/2026-10-26-site-landmines):
 - **Per image in flight:** about 19 MiB at 1,302 px, 61-74 MiB for a 12 MP photo, 310 MiB at
   48 MP, and 790 MiB at vLLM's default ceiling of 178.9 MP.
-- **The danger at the default:** four images at that ceiling peaked at 5.2 GiB (JPEG) and
+- **Measured at the former four-image default:** four images at that ceiling peaked at 5.2 GiB (JPEG) and
   8.4 GiB (PNG with alpha). dgx1 serves the triangle with about 4.4 GiB above its 3 GiB
   guard, so one such request could stop the service.
 

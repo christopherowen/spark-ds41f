@@ -475,6 +475,9 @@ def collect_manifest_data() -> dict[str, Any]:
             cluster.get("glp", {}).get("served_model_name", "deepseek-v4.1-flash-weightless"),
         ],
         "glp": cluster.get("glp"),
+        "max_request_images": json.loads(
+            cluster["serve_args"][cluster["serve_args"].index("--limit-mm-per-prompt") + 1]
+        )["image"],
         "drafts": int(cluster["drafts"]),
         "kernel_backend": cluster["kernel_backend"],
         "hosts": promoted_manifest.get("hosts", {}),
@@ -695,7 +698,7 @@ def render_current_state_active_settings(data: dict[str, Any]) -> str:
         ),
         (
             "Image input",
-            "TileLang vision tower loaded (`--limit-mm-per-prompt '{\"image\":4}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request))",
+            f"TileLang vision tower loaded (`--limit-mm-per-prompt '{{\"image\":{data['max_request_images']}}}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request))",
         ),
         (
             "DSpark speculative decoding",

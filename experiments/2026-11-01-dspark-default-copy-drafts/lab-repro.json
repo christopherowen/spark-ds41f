@@ -1,0 +1,68 @@
+{
+ "experiment": "experiments/2026-11-01-dspark-default-copy-drafts",
+ "run": "copy-nan-repro-sp",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench": false,
+   "arms": [
+    {
+     "config": "experiments/2026-11-01-dspark-default-copy-drafts/repro/arm-c37-census-m8.json",
+     "label": "c37-m8"
+    },
+    {
+     "config": "experiments/2026-11-01-dspark-default-copy-drafts/repro/arm-c37-no0676-census-m8.json",
+     "label": "no0676-m8"
+    }
+   ],
+   "extras": [
+    [
+     "experiments/2026-10-23-next-release/acceptance/copy_probe.py",
+     [
+      "--prompts",
+      "3"
+     ],
+     "copy-probe"
+    ],
+    [
+     "experiments/2026-11-01-dspark-default-copy-drafts/repro/suite_single_stream.py",
+     [
+      "{label}",
+      "{run}"
+     ],
+     "single-stream"
+    ],
+    [
+     "experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py",
+     [
+      "{label}"
+     ],
+     "census"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "3",
+      "--tokens",
+      "1024"
+     ],
+     "c8-distinct"
+    ],
+    [
+     "experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py",
+     [
+      "{label}"
+     ],
+     "census-c8"
+    ]
+   ]
+  }
+ ]
+}

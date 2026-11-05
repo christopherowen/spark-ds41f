@@ -1,0 +1,28 @@
+dspark: simplify copy preparation stream ordering
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+On top of: 5f926df6d3126266a9c88c82c06544060008c33c (C40)
+
+Drop the unproven side-stream preparation/readiness machinery. Run the
+unchanged fused match/allocation before DSpark on the current model stream,
+then attach the existing asynchronous allocation delivery before DSpark.
+FIFO ordering replaces the extra readiness event and join. This is an
+explicit simplification, with no serving speedup claim.
+
+Keep the allocation ring and per-slot D2H completion events. For the frozen
+PP=1 async profile, two in-flight outputs and get_output completion before
+queue credit returns protect the three-slot ring across wrap. Preserve the
+fused copy kernels, integer/float copy-state policy, default enablement,
+safe capture/decode envelope and inactive top-k scratch-read guard.
+
+Quality: proposals and allocation values must remain identical; delayed
+copies must finish before a slot is reused. Replace the side-stream test
+with current-stream equivalence and add delayed async ring-wrap coverage
+under the enforced two-output bound. No new configuration or fallback.
+
+Tests: five source-only controls, Python 3.12 parse, whitespace and both
+C40 offline profile doctors passed. CUDA regressions were authored but not
+executed here. Full Linux/image/release gates and both serving boots remain
+required; no performance or GPU claim is established by source inspection.
+
+Upstream status: local follow-on patch; not submitted.

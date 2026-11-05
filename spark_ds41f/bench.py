@@ -2028,7 +2028,10 @@ def serve_arg(cluster: dict, flag: str) -> str | None:
 
 
 def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Path) -> dict:
+    from servebench.client import stream_policy
     name = cluster["container"]["name"]
+    images = {}
+    inspection_problems = []
     identity = {
         "cluster_config": config_name,
         "cluster_config_sha256": sha256(config_path),
@@ -2041,19 +2044,29 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
         "client_commit": repository_revision(),
         "client_dirty": bool(repository_dirty()),
         "client_host": socket.gethostname(),
+        "client_stream_policy": stream_policy(),
         "nodes": {},
     }
     for node in nodes["nodes"]:
         container = run_ssh(nodes, node, "docker", "inspect", "--format", "{{.Image}} {{.State.StartedAt}}", name)
         checkout = run_ssh(nodes, node, "git", "-C", repository_path(cluster), "rev-parse", "HEAD")
-        image_id, _, started_at = container.stdout.strip().partition(" ")
+        image_id, _, started_at = (container.stdout.strip() if container.returncode == 0 else "").partition(" ")
         identity["nodes"][node["name"]] = {
             "image_id": image_id or None,
             "container_started_at": started_at or None,
             "checkout": checkout.stdout.strip() or None,
         }
+        try:
+            image = read_running_image(nodes, node, image_id)
+        except ValueError as error:
+            inspection_problems.append(f"{node['name']}: {error}")
+        else:
+            images[node["name"]] = image
+            identity["nodes"][node["name"]].update(image_content_identity(image))
+            identity["nodes"][node["name"]]["image_labels"] = image["Config"].get("Labels") or {}
+    inspection_problems.extend(running_image_problems(cluster, images))
     problems, warnings = split_findings(live_doctor(cluster, nodes))
-    identity["live_problems"] = [str(problem) for problem in problems]
+    identity["live_problems"] = list(dict.fromkeys(str(problem) for problem in [*inspection_problems, *problems]))
     identity["live_warnings"] = [str(warning) for warning in warnings]
     return identity
 

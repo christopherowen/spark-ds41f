@@ -1,0 +1,228 @@
+From 5569e8ed811195353b20c23002299d03ebf49e3e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 22:49:20 +0100
+Subject: [PATCH] Align frozen-runner qualification fixtures
+
+Base: 30e56e093b33a9f45d6f58d032d65ed5055a2105 (tree c3a9bf4be9b672f11c99f0c3098778a901dbae99).
+
+Rationale: port the existing candidate-38 test-only corrections 0685, 0686 and 0687 to the storage qualification harness. Stand-in runners/workers must expose the methods and fields the frozen runtime reads. Native-memory accounting uses a controlled free-memory input while real CUDA allocation and graph cleanup still run.
+
+Quality: no runtime source or arithmetic changes; assertions are retained and the native accounting assertion becomes exact. These files are mounted only in test containers.
+
+Tests: all three original patches apply cleanly to a fresh canonical source worktree. GB10 rerun is pending; retain the original failed gate.
+
+Upstream status: local qualification fixtures for the LIL source; reused from the repository test fixes, not a serving change.
+---
+ tests/v1/worker/test_gpu_model_runner_v2.py   | 32 ++++++++++++++++---
+ ...gpu_model_runner_v2_cudagraph_profiling.py | 20 ++++++++++--
+ tests/v1/worker/test_gpu_worker.py            | 15 +++++++++
+ 3 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index f4ef5d2b42..a3645c64c7 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import contextlib
+-from types import SimpleNamespace
++from types import MethodType, SimpleNamespace
+ from weakref import ref
+ 
+ import numpy as np
+@@ -57,6 +57,8 @@ def test_boundary_capture_uses_recovered_accepted_state(
+     events = []
+     runner = GPUModelRunner.__new__(GPUModelRunner)
+     runner.is_last_pp_rank = False
++    # One bonus token and the drafter's three drafts: the sampled rows are kept whole.
++    runner.num_draft_steps = runner.num_speculative_steps = 3
+     runner.cache_config = SimpleNamespace(use_kda_recoverssm=recovery)
+     runner.req_states = SimpleNamespace(
+         num_computed_tokens=SimpleNamespace(gpu=torch.tensor([19])),
+@@ -123,6 +125,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+     )
+     runner.speculator = None
+     runner.speculative_config = None
++    runner.copy_drafter = None
+     runner.req_states = []
+     runner.input_buffers = SimpleNamespace(query_start_loc=None)
+     runner.vocab_size = 1
+@@ -248,6 +251,9 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
+         vllm_config=vllm_config,
+         parallel_config=parallel_config,
+     )
++    # The block-table geometry helpers initialize_kv_cache calls on itself.
++    for name in ("_block_table_max_model_len", "_block_table_width", "_group_cp_size"):
++        setattr(runner, name, MethodType(getattr(GPUModelRunner, name), runner))
+ 
+     class _CapturedWidths(Exception):
+         pass
+@@ -402,7 +408,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
+         },
+     )
+     dispatched_tasks = []
+-    dp_sync = object()
++    # The DP sync carries whether the step skips its drafts.
++    dp_sync = SimpleNamespace(skip_drafts=False)
+     cudagraph_stats = object()
+     scheduler_output = SimpleNamespace(
+         boundary_logits_only=True,
+@@ -448,6 +455,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
+         parallel_config=SimpleNamespace(),
+         observability_config=SimpleNamespace(cudagraph_metrics=cudagraph_metrics),
+         num_speculative_steps=0,
++        num_draft_steps=0,
++        uniform_decode_query_len=1,
+         decode_query_len=1,
+         cudagraph_manager=None,
+         gather_batch_req_state=lambda *args: (SimpleNamespace(num_tokens=1), 1),
+@@ -599,9 +608,21 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+     init_fails: bool,
+     dummy_run_fails: bool,
+ ):
++    from vllm.v1.core import kv_cache_utils
++
+     runner = GPUModelRunner.__new__(GPUModelRunner)
+     runner.model_config = SimpleNamespace(architecture=architecture)
+     runner.max_num_tokens = 4096
++    runner.vllm_config = vllm_config = object()
++    kv_cache_spec = object()
++    runner.get_kv_cache_spec = lambda: kv_cache_spec
++    groups = [object(), object()]
++    group_calls: list[object] = []
++    monkeypatch.setattr(
++        kv_cache_utils,
++        "get_kv_cache_groups",
++        lambda config, spec: group_calls.append((config, spec)) or groups,
++    )
+     events: list[object] = []
+ 
+     def init_kv(_, *, num_blocks=None):
+@@ -640,9 +661,11 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+     else:
+         runner._profile_deepseek_v4_attention(prepare)
+ 
+-    assert events[0] == ("init-kv", 1)
++    # The null block and one block per KV cache group of the model's spec.
++    assert group_calls == [(vllm_config, kv_cache_spec)]
++    assert events[0] == ("init-kv", 1 + len(groups))
+     if init_fails:
+-        assert events == [("init-kv", 1), "cleanup"]
++        assert events == [("init-kv", 1 + len(groups)), "cleanup"]
+     else:
+         assert events[1] == "prepare"
+         assert events[2] == (
+@@ -774,6 +797,7 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+         output_copy_stream=None,
+         check_ep_fault=False,
+         speculator=None,
++        sink=None,
+         num_speculative_steps=num_speculative_steps,
+         device=torch.device("cpu"),
+         postprocess_sampled=Mock(),
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+index 1a6eb342f5..942b47c4ca 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+@@ -815,12 +815,27 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+     allocation_bytes = 64 << 20
+     memory: dict[str, int] = {}
+     native_pointer = None
++    native_allocated = 0
+ 
+     torch.accelerator.synchronize()
+     gc.collect()
+     torch.accelerator.empty_cache()
+     memory["before"] = torch.accelerator.memory_reserved()
+ 
++    # The driver's free-memory reading is the one input of the native measurement
++    # the test does not control, and on a device whose memory is the host's (GB10)
++    # it moves with the host while nothing is allocated: 41 MiB of spread over 3 s
++    # on an idle node. Model it as what this process holds, Torch's reservations
++    # and the test's own cudaMalloc, so the native delta is exact; the cudaMalloc
++    # and cudaFree below still run against the driver.
++    _, total_memory = torch.accelerator.get_memory_info()
++
++    def memory_info():
++        reserved = torch.accelerator.memory_reserved()
++        return total_memory - reserved - native_allocated, total_memory
++
++    monkeypatch.setattr(torch.accelerator, "get_memory_info", memory_info)
++
+     def _init(r):
+         r.events.append("init")
+         kv_cache = torch.empty(allocation_bytes, dtype=torch.uint8, device="cuda")
+@@ -835,11 +850,12 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+         )
+ 
+     def _capture_model(*, profile_only: bool = False) -> int:
+-        nonlocal native_pointer
++        nonlocal native_pointer, native_allocated
+         before_free = torch.accelerator.get_memory_info()[0]
+         if native_bytes:
+             error, native_pointer = runtime.cudaMalloc(native_bytes)
+             assert error == runtime.cudaError_t.cudaSuccess
++            native_allocated = native_bytes
+         for owner in (
+             runner.cudagraph_manager,
+             runner.speculator.cudagraph_manager,
+@@ -867,7 +883,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
+         assert memory["after"] == memory["before"]
+         native_before, native_after, measured = runner.cudagraph_native_memory_profile
+         assert measured == graph_estimate == memory["measured"]
+-        assert native_after - native_before >= native_bytes
++        assert native_after - native_before == native_bytes
+     finally:
+         if native_pointer is not None:
+             assert (
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 8a9002a4b7..ebc979320d 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -499,6 +499,7 @@ def test_execute_model_waits_previous_pp_send_before_forward(
+         model_runner=SimpleNamespace(execute_model=run_model),
+         annotate_profile=lambda scheduler_output: nullcontext(),
+         _pp_send_work=[previous_tensor_send],
++        _roce_failure=lambda: None,
+     )
+     scheduler_output = SimpleNamespace(
+         total_num_scheduled_tokens=4, num_scheduled_tokens={"r0": 4}
+@@ -591,6 +592,14 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
+                 cudagraph_capture_sizes=[8, 4],
+             )
+         ),
++        # Kernel preparation and the ranks' rendezvous precede the profile; the
++        # one-shot collectives' failure report names a stopped GPU, not memory.
++        _prepare_kernels=lambda: None,
++        _startup_rendezvous=lambda phase: None,
++        _roce_failure=lambda: None,
++    )
++    worker._determine_available_memory = lambda: (
++        gpu_worker.Worker._determine_available_memory(worker)
+     )
+ 
+     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+@@ -693,6 +702,9 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
+         observability_config=SimpleNamespace(
+             jit_monitor_mode="off", jit_monitor_verbose=False
+         ),
++        _roce_failure=lambda: None,
++        _startup_rendezvous=lambda stage: None,
++        _startup_heartbeat=None,
+     )
+     saved = []
+     monkeypatch.setattr(
+@@ -751,6 +763,9 @@ def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+         observability_config=SimpleNamespace(
+             jit_monitor_mode="off", jit_monitor_verbose=False
+         ),
++        _roce_failure=lambda: None,
++        _startup_rendezvous=lambda stage: None,
++        _startup_heartbeat=None,
+     )
+     monkeypatch.setattr(
+         gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+-- 
+2.54.0 (Apple Git-157)
+

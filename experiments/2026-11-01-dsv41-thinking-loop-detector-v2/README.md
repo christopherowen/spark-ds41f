@@ -1,5 +1,12 @@
 # DeepSeek-V4.1-Flash Loop Detector v2: Default Loop Detection, Windowed Hardening & Completion Receipts
 
+Historical experiment, incorporated through candidate-37's `0674` and refined
+by candidate-38's `0679`. The current
+[loop containment scope](../2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment)
+and [two-boot evidence](../2026-11-03-candidate-38-reproduction/README.md#loop-result)
+govern the next candidate's work. The patches and results below are retained as
+the record of this earlier stage, not parallel deployment choices.
+
 Follow-up to [`#787`](https://github.com/christopherowen/spark-ds41f/pull/787) ([`#787 (comment)`](https://github.com/christopherowen/spark-ds41f/pull/787#issuecomment-6559214555)) addressing the detector shortcomings identified during production deployment of `candidate-32..35` (`0656-feat-v1-break-in-think-reasoning-loops-via-dynamic-T.patch`) and making loop detection a default feature across both `<think>` and post-`</think>` / non-`<think>` generation.
 
 ## Shortcomings Addressed

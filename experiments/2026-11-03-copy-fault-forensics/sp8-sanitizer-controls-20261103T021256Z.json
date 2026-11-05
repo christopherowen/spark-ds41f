@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "run_id": "sp8-sanitizer-controls-20261103T021256Z",
+  "base_deployment_commit": "b28365c38a74c966032dcf558d8d1bb0a282d4b6",
+  "intent": "Validate sanitizer tools with reviewed clean and deliberate-fault controls.",
+  "intended_variable": "Diagnostic standalone CUDA fixture, separate from inference source.",
+  "source": {
+    "host_alias": "sp8",
+    "hostname": "spark-0016",
+    "image": "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+    "vllm_patch_head": "5b7cfa37fee42f96bfafbe09b7d30e8c0eda8575",
+    "vllm_tree": "af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33",
+    "git_metadata": "Absent in exported image; immutable image ID, recorded labels and actual imported file hashes retained.",
+    "source_overlays": [],
+    "dependencies_installed": false,
+    "selected_imported_files": [],
+    "all_imported_files_manifest": null,
+    "imported_files_count": 0,
+    "fixture": "experiments/2026-11-03-copy-fault-forensics/sanitizer_control.cu",
+    "compiled_binary_sha256": "92a3700abb4b48ebe78d27ca7efab435db37ded7cc5f0eed3ca02823f8eb54eb"
+  },
+  "toolchain": {
+    "compute_sanitizer": "2025.3.1.0 (build 36400806) public-release",
+    "nvcc": "13.0.88",
+    "gpu_and_driver": "NVIDIA GB10, 580.178.04, [N/A], [N/A]"
+  },
+  "guards": {
+    "dgx1_hold_absent_before_launch": true,
+    "sp8_hold_absent_under_lock": true,
+    "exclusive_nonblocking_lock": "/tmp/spark-lab-gpu.lock",
+    "preflight_containers": "",
+    "preflight_gpu_compute_processes": "",
+    "memory_limit_bytes": 25769803776,
+    "memory_swap_limit_bytes": 25769803776,
+    "shm_limit_bytes": 1073741824,
+    "wall_limit_seconds": 600,
+    "network": "none",
+    "sanitizer_mount_readonly": true,
+    "serving_or_cluster_operations": false
+  },
+  "harness_adjustment": null,
+  "execution": {
+    "started_utc": "2026-11-03T02:12:56.962717+00:00",
+    "ended_utc": "2026-11-03T02:13:00.996633+00:00",
+    "elapsed_seconds": 4.033921743975952,
+    "container": "copy-fault-controls-20261103t021256z",
+    "argv": [
+      "docker",
+      "run",
+      "--name",
+      "copy-fault-controls-20261103t021256z",
+      "--gpus=all",
+      "--memory=24g",
+      "--memory-swap=24g",
+      "--shm-size=1g",
+      "--network=none",
+      "--ulimit",
+      "core=0",
+      "--mount",
+      "type=bind,source=/home/chris/spark-lab/copy-fault-forensics/sanitizer-controls-20261103T021256Z,target=/out",
+      "--mount",
+      "type=bind,source=/usr/local/cuda-13.0/compute-sanitizer,target=/opt/compute-sanitizer,readonly",
+      "--env",
+      "PYTORCH_NO_CUDA_MEMORY_CACHING=1",
+      "--env",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "--workdir",
+      "/opt/spark-ds41f/candidate/vllm",
+      "--entrypoint",
+      "/bin/bash",
+      "sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a",
+      "-lc",
+      "set -eu\nunset CUDA_LAUNCH_BLOCKING\n/opt/compute-sanitizer/compute-sanitizer --version\nnvcc --version\nsha256sum /out/sanitizer_control.cu\nnvcc -lineinfo -o /out/sanitizer-control /out/sanitizer_control.cu\nsha256sum /out/sanitizer-control\npython3 - <<'CONTROLS'\nimport json,pathlib,subprocess,time\nresults=[]\nfor tool,mode,expected in [('memcheck','clean',0),('memcheck','oob',86),('initcheck','clean',0),('initcheck','uninitialized',86)]:\n    name='control-'+tool+'-'+mode\n    argv=['/opt/compute-sanitizer/compute-sanitizer','--tool',tool,'--target-processes','all','--error-exitcode','86','--log-file','/out/'+name+'.%p.log','/out/sanitizer-control',mode]\n    t=time.monotonic()\n    with open('/out/'+name+'.stdout-stderr.log','wb') as out:\n        result=subprocess.run(argv,stdout=out,stderr=subprocess.STDOUT)\n    results.append({'tool':tool,'mode':mode,'argv':argv,'exit_code':result.returncode,'expected_exit_code':expected,'elapsed_seconds':time.monotonic()-t})\npathlib.Path('/out/control-results.json').write_text(json.dumps(results,indent=2)+'\\n')\nprint(json.dumps(results,indent=2))\nraise SystemExit(0 if all(r['exit_code']==r['expected_exit_code'] for r in results) else 1)\nCONTROLS\n"
+    ],
+    "selectors": [],
+    "exit_code": 0,
+    "timed_out": false,
+    "oom_killed": false,
+    "tests_passed": 0,
+    "tests_skipped": 0,
+    "sanitizer_reports": [
+      {
+        "file": "control-initcheck-clean.126.log",
+        "error_summaries": [
+          0
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+      },
+      {
+        "file": "control-initcheck-uninitialized.141.log",
+        "error_summaries": [
+          1
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= Uninitialized __global__ memory read of size 4 bytes\n=========     at read_value(const int *, int *, int)+0x50 in sanitizer_control.cu:16\n=========     by thread (0,0,0) in block (0,0,0)\n=========     Address 0xfa6e29000000\n=========     Saved host backtrace up to driver entry point at kernel launch time\n=========         Host Frame: main [0xac53] in sanitizer-control\n========= \n========= ERROR SUMMARY: 1 error\n"
+      },
+      {
+        "file": "control-memcheck-clean.96.log",
+        "error_summaries": [
+          0
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+      },
+      {
+        "file": "control-memcheck-oob.111.log",
+        "error_summaries": [
+          2
+        ],
+        "text": "========= COMPUTE-SANITIZER\n========= Invalid __global__ read of size 4 bytes\n=========     at read_value(const int *, int *, int)+0x50 in sanitizer_control.cu:16\n=========     by thread (0,0,0) in block (0,0,0)\n=========     Access to 0xf613eae00004 is out of bounds\n=========     and is 1 bytes after the nearest allocation at 0xf613eae00000 of size 4 bytes\n=========     Saved host backtrace up to driver entry point at kernel launch time\n=========         Host Frame: main [0xac53] in sanitizer-control\n========= \n========= Program hit cudaErrorLaunchFailure (error 719) due to \"unspecified launch failure\" on CUDA API call to cudaDeviceSynchronize.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame: main [0xac6f] in sanitizer-control\n========= \n========= Target application returned an error\n========= ERROR SUMMARY: 2 errors\n"
+      }
+    ],
+    "controls": [
+      {
+        "tool": "memcheck",
+        "mode": "clean",
+        "argv": [
+          "/opt/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--target-processes",
+          "all",
+          "--error-exitcode",
+          "86",
+          "--log-file",
+          "/out/control-memcheck-clean.%p.log",
+          "/out/sanitizer-control",
+          "clean"
+        ],
+        "exit_code": 0,
+        "expected_exit_code": 0,
+        "elapsed_seconds": 0.6548931839643046
+      },
+      {
+        "tool": "memcheck",
+        "mode": "oob",
+        "argv": [
+          "/opt/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--target-processes",
+          "all",
+          "--error-exitcode",
+          "86",
+          "--log-file",
+          "/out/control-memcheck-oob.%p.log",
+          "/out/sanitizer-control",
+          "oob"
+        ],
+        "exit_code": 86,
+        "expected_exit_code": 86,
+        "elapsed_seconds": 1.3174571660347283
+      },
+      {
+        "tool": "initcheck",
+        "mode": "clean",
+        "argv": [
+          "/opt/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "initcheck",
+          "--target-processes",
+          "all",
+          "--error-exitcode",
+          "86",
+          "--log-file",
+          "/out/control-initcheck-clean.%p.log",
+          "/out/sanitizer-control",
+          "clean"
+        ],
+        "exit_code": 0,
+        "expected_exit_code": 0,
+        "elapsed_seconds": 0.5570043359766714
+      },
+      {
+        "tool": "initcheck",
+        "mode": "uninitialized",
+        "argv": [
+          "/opt/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "initcheck",
+          "--target-processes",
+          "all",
+          "--error-exitcode",
+          "86",
+          "--log-file",
+          "/out/control-initcheck-uninitialized.%p.log",
+          "/out/sanitizer-control",
+          "uninitialized"
+        ],
+        "exit_code": 86,
+        "expected_exit_code": 86,
+        "elapsed_seconds": 0.5536527690128423
+      }
+    ]
+  },
+  "positive_control_validation": {
+    "run_id": "sp8-sanitizer-controls-20261103T021256Z",
+    "fixture_sha256": "ae0efde3795470ff0b92b8fe3f25cd6257d3354491278082920abc8c27aa7a82",
+    "memcheck_clean": "exit 0, zero errors",
+    "memcheck_oob": "exit 86, invalid global read at sanitizer_control.cu:16; subsequent launch failure reported",
+    "initcheck_clean": "exit 0, zero errors",
+    "initcheck_uninitialized": "exit 86, uninitialized global memory read at sanitizer_control.cu:16"
+  },
+  "memory_observations": {
+    "cap_enforced_by_container": true,
+    "oom_killed": false,
+    "peak_memory": "Not sampled. Before/after /proc/meminfo retained in raw receipts."
+  },
+  "cleanup": {
+    "own_container_removed": true,
+    "post_containers": "",
+    "post_gpu_compute_processes": "",
+    "other_containers_or_services_changed": false
+  },
+  "conclusion": "Both sanitizer tools distinguished reviewed clean and intentional-fault CUDA controls on the same GPU/image/toolchain.",
+  "evidence": {
+    "remote_directory": "/home/chris/spark-lab/copy-fault-forensics/sanitizer-controls-20261103T021256Z",
+    "local_directory": "results/private/copy-fault-forensics/sp8/sanitizer-controls-20261103T021256Z",
+    "artifacts": [
+      {
+        "file": "command.json",
+        "bytes": 2153,
+        "sha256": "8cec34d89755674f617f6f29882ad2d634f9375ba61d1c10289ae4bebeadfe85"
+      },
+      {
+        "file": "container-state.json",
+        "bytes": 872,
+        "sha256": "52a66600952a82418e52dcd7983234881e6d3f71f4a19c7dc4adfc36737bfd6a"
+      },
+      {
+        "file": "control-initcheck-clean.126.log",
+        "bytes": 62,
+        "sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425"
+      },
+      {
+        "file": "control-initcheck-clean.stdout-stderr.log",
+        "bytes": 19,
+        "sha256": "a372a84935b4d1f7f8cb032f069e20eea831c7f515694d4843527678ca52b974"
+      },
+      {
+        "file": "control-initcheck-uninitialized.141.log",
+        "bytes": 453,
+        "sha256": "7f7d2b98ab4eb3a1e573e122267c34bc4601b4134f47e1a29531a45113b173cb"
+      },
+      {
+        "file": "control-initcheck-uninitialized.stdout-stderr.log",
+        "bytes": 27,
+        "sha256": "7771eeac4cd8fa5c4f2783ed1158a02f08ad789adad22771dc593c485e2aa251"
+      },
+      {
+        "file": "control-memcheck-clean.96.log",
+        "bytes": 62,
+        "sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425"
+      },
+      {
+        "file": "control-memcheck-clean.stdout-stderr.log",
+        "bytes": 19,
+        "sha256": "a372a84935b4d1f7f8cb032f069e20eea831c7f515694d4843527678ca52b974"
+      },
+      {
+        "file": "control-memcheck-oob.111.log",
+        "bytes": 880,
+        "sha256": "8b21a9d1842b3b3ad545368b9c6cc56fff4b4581fb70c3c62ed38a95e8be61ec"
+      },
+      {
+        "file": "control-memcheck-oob.stdout-stderr.log",
+        "bytes": 51,
+        "sha256": "07b26196a3e6268b0a2a5a3361ac9cfea84eeff759c35c7a6a4547a33be5ba25"
+      },
+      {
+        "file": "control-results.json",
+        "bytes": 1787,
+        "sha256": "ca2df374b4041177ab2ad94e7a542933dd7c8e7186d8ae4c891d01056a45c83f"
+      },
+      {
+        "file": "image-identity.json",
+        "bytes": 8330,
+        "sha256": "e0b1342b4f64b7394e16e2618a1f51c550d45bee43803f9091812330cf9c5326"
+      },
+      {
+        "file": "preflight.json",
+        "bytes": 1905,
+        "sha256": "17470e3316139d5010e5ccadca4dd96000df09c903287abdf6698f3ee0efa708"
+      },
+      {
+        "file": "result.json",
+        "bytes": 2083,
+        "sha256": "9326d874320094e1b897a044c802b5a0d232704e2a732cd3b7a764683d63d955"
+      },
+      {
+        "file": "sanitizer-control",
+        "bytes": 978656,
+        "sha256": "92a3700abb4b48ebe78d27ca7efab435db37ded7cc5f0eed3ca02823f8eb54eb"
+      },
+      {
+        "file": "sanitizer_control.cu",
+        "bytes": 1675,
+        "sha256": "ae0efde3795470ff0b92b8fe3f25cd6257d3354491278082920abc8c27aa7a82"
+      },
+      {
+        "file": "sha256.json",
+        "bytes": 1706,
+        "sha256": "4c579d730c6621a4b13f6be6bd86a3f842091d8b5dc2a5046bc14c8b0abfc205"
+      },
+      {
+        "file": "stdout-stderr.log",
+        "bytes": 2304,
+        "sha256": "ae38239310ec45339c56b5ab4f852c00b0129adc3eb498cd1d43e72ffda1fc91"
+      }
+    ],
+    "remote_sha256_manifest_verified": true
+  }
+}

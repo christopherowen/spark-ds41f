@@ -1,0 +1,75 @@
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                       tokens requests   rows  yield  wasted  by position (survival/coverage)
+c8       candidate-38-tail         16.621     7.20  21.28  0.781    4.66  0:0.713/1.000 1:0.335/0.541 2:0.150/0.244 3:0.072/0.112 4:0.037/0.056 [cond/yield 0:0.713/0.713 1:0.470/0.618 2:0.449/0.616 3:0.481/0.644 4:0.513/0.662]
+c8       candidate-38-tail-repeat  16.618     7.20  21.28  0.781    4.66  0:0.713/1.000 1:0.335/0.541 2:0.150/0.244 3:0.072/0.112 4:0.037/0.056 [cond/yield 0:0.713/0.713 1:0.469/0.618 2:0.449/0.615 3:0.480/0.643 4:0.512/0.661]
+c4       candidate-38-tail          8.711     3.80  12.41  0.702    3.69  0:0.671/1.000 1:0.340/0.682 2:0.161/0.346 3:0.079/0.158 4:0.040/0.075 [cond/yield 0:0.671/0.671 1:0.506/0.498 2:0.474/0.465 3:0.491/0.499 4:0.507/0.537]
+c4       candidate-38-tail-repeat   8.725     3.80  12.42  0.702    3.70  0:0.674/1.000 1:0.342/0.691 2:0.161/0.344 3:0.079/0.160 4:0.040/0.075 [cond/yield 0:0.674/0.674 1:0.508/0.495 2:0.471/0.469 3:0.490/0.492 4:0.511/0.535]
+
+######## candidate-38-tail-repeat -> candidate-38-tail
+suite tp3-c4-tail-confirmation (878a9f33774c): candidate-38-tail-repeat -> candidate-38-tail
+
+== model
+model behaviour: candidate-38-tail-repeat -> candidate-38-tail
+  greedy responses identical: 256/256
+  acceptance_length           2.246 ->    2.246  -0.00%
+  verified_per_draft          1.946 ->    1.946  -0.01%
+  accepted_per_verified       0.640 ->    0.640  +0.00%
+  acceptance by draft position: 0: 0.697->0.697, 1: 0.582->0.582, 2: 0.564->0.564, 3: 0.600->0.600, 4: 0.607->0.607
+  teacher-forced over 65536 positions in 256 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31340 -> 1.31340 (+0.000%)
+
+== grid
+metric                     candidate-38 candidate-38   change    ±95%  verdict
+decode 1x2 rows @4K              18.185       18.210   +0.14%   0.15%  same
+decode 4x8 rows @4K              20.627       20.646   +0.09%   0.19%  same
+decode 8x16 rows @4K             21.853       21.772   -0.37%   0.21%  better
+decode 1x3 rows @4K              18.426       18.399   -0.14%   0.17%  same
+decode 4x12 rows @4K             21.044       21.067   +0.11%   0.25%  same
+decode 8x24 rows @4K             23.314       23.292   -0.10%   0.40%  same
+decode 1x6 rows @4K              19.403       19.357   -0.23%   0.37%  same
+decode 2x12 rows @4K             20.120       20.264   +0.71%   0.39%  worse
+decode 4x24 rows @4K             22.616       22.731   +0.51%   0.36%  worse
+decode 8x48 rows @4K             28.272       28.390   +0.42%   0.80%  same
+decode 1x3 rows @64K             18.767       18.474   -1.56%   0.71%  better
+decode 8x24 rows @64K            23.255       23.180   -0.32%   0.26%  better
+decode 1x3 rows @256K            18.572       18.403   -0.91%   0.41%  better
+decode 8x24 rows @256K           23.158       23.188   +0.13%   0.15%  same
+decode 1x3 rows @1016K           18.425       18.399   -0.14%   0.15%  same
+decode geometric mean (15)                             -0.11%   0.06%  better
+intervals hold for all 15 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 423
+
+== c8
+metric                 candidate-38 candidate-38   change    ±95%  verdict
+output tok/s                163.577      163.723   +0.09%   1.17%  same
+decode tok/s, paired         20.590       20.628   +0.08%   0.03%  better
+engine steps/s                9.853        9.860   +0.07%   2.93%  same
+output tokens/step           16.618       16.621   +0.02%   3.48%  same
+accepted/draft                1.307        1.308   +0.05%   6.51%  same
+TTFT p50 s                    0.347        0.345   -0.49%          same (no interval)
+TTFT p99 s                    0.421        0.420   -0.30%          same (no interval)
+TTFT, paired                  0.347        0.345   -0.18%   0.15%  better
+TPOT p50 ms                  48.155       48.067   -0.18%          same (no interval)
+TPOT p99 ms                  65.010       64.969   -0.06%          same (no interval)
+per-user tok/s p50           20.673       20.714   +0.20%          same (no interval)
+paired: 194 requests in both windows, each the same prompt on both builds; 194 streamed in as many chunks on both
+speculative log-tps: total +0.09% (1+tau +0.03%, steps/s +0.07%, reqs/step -0.00%; rows/step +0.01%, row yield +0.01%)
+
+== c4
+metric                 candidate-38 candidate-38   change    ±95%  verdict
+output tok/s                126.190      126.097   -0.07%   1.61%  same
+decode tok/s, paired         31.653       31.265   +0.07%   0.52%  same
+engine steps/s               14.473       14.487   +0.09%   2.18%  same
+output tokens/step            8.725        8.711   -0.16%   3.44%  same
+accepted/draft                1.297        1.290   -0.49%   6.54%  same
+TTFT p50 s                    0.251        0.251   -0.03%          same (no interval)
+TTFT p99 s                    0.324        0.315   -2.84%          same (no interval)
+TTFT, paired                  0.251        0.251   +0.15%   2.47%  same
+TPOT p50 ms                  31.145       31.800   +2.10%          same (no interval)
+TPOT p99 ms                  41.373       40.816   -1.34%          same (no interval)
+per-user tok/s p50           32.108       31.446   -2.06%          same (no interval)
+paired: 148 requests in both windows, each the same prompt on both builds; 30 streamed in as many chunks on both
+speculative log-tps: total -0.06% (1+tau -0.28%, steps/s +0.09%, reqs/step +0.12%; rows/step -0.15%, row yield -0.00%)

@@ -6,6 +6,30 @@ describe what runs. Every figure here was measured on this stack; each idea
 enters as an ordinary experiment under `experiments/` and is promoted only by the
 owner.
 
+## Recent candidate decisions
+
+- C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
+  performance claim showed no proven serving-throughput gain against either
+  saved C38 recipe. Preserve the adverse engine-grid cost and original collector
+  failures with their separate revalidation; do not repeat the image.
+- C40 retains the independent scratch-read correctness fix with neutral aggregate
+  serving performance. It is the best validated corrected default-enabled base,
+  not a new serving-speedup claim or a promotion.
+- C41 attempted to remove optional overlap complexity, declared as simplification
+  before measurement. Correctness passed, serving throughput was neutral, but
+  grid cost rose 0.206–0.409% and cold 524K prefill fell 0.181–0.667% against
+  C40. The focused review found no defensible new correction; reject C41 and
+  retain C40. Attribution is unresolved because those pure workloads bypass
+  the changed preparation calls. No extra rebuild or old-image remeasurement.
+  See the [full measured decision](experiments/2026-11-04-copy-overlap-rework/decision.md).
+- The minimum-match-8 policy hypothesis was dropped at source review, not counted
+  as a failed serving benchmark. A future copy-policy idea needs a bounded
+  expected benefit and budget-binding mixed copy/edit/tool correctness evidence.
+- The distinct TileLang refresh in #875 is maintenance/feature preservation.
+  Review its known independent correctness follow-ups #879–#883 and explicitly
+  qualify the selected source/interaction stack before runtime use. Individual
+  author-provided standalone passes do not qualify a combined compiler/image.
+
 ## Goal
 
 Step time and the bench matrix are proxies. The outcome that matters is
@@ -626,15 +650,16 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
   single-stage write-after-read races in raw paged kernels, and mbarrier init fences.
 
 - **Temperature 0 is deterministic since r6f** (see Speculative decoding).
-- **Reasoning loops in long, compacted agent sessions.** Untested here, and
-  reported on other DS4.1 stacks: after several context compactions, hidden
-  reasoning degrades into short repeated lines and grows each turn. The
-  DS4.1 encoder keeps reasoning for every assistant step since the last user
-  message, which is the feedback path. Replay a long compacted transcript at
-  reasoning effort 75 and 100, with DSpark on and off, and scan the reasoning
-  for short repeated lines. Add that scan as a debug-only eval check, and
-  record finish reasons in `workload` windows so a loop shows up as
-  length-capped requests.
+- **Loop containment: qualify candidate-38's existing path.** The
+  [current scope and remaining checks](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment)
+  replace the broad effort/DSpark sweep. Two boots reproduce seeded looping at
+  effort 100 and 75 with detection off; default detection ends reasoning, and
+  the clean fixture is unchanged. Preserve effort semantics and the safeguards
+  for legitimate repeated answers. Next: the older-build long-context canary
+  in [#864](https://github.com/christopherowen/spark-ds41f/issues/864), a compacted
+  tool session, and normal candidate inference/performance qualification.
+  Spontaneous onset remains an open question; the effort-85 proposal #862 is
+  retired from the candidate plan.
 
 - **BF16 sparse attention** (patch 0023, off in configuration): measure its
   fidelity with a teacher-forced comparison against

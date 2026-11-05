@@ -1,0 +1,51 @@
+{
+  "experiment": "experiments/2026-11-03-candidate-38-reproduction",
+  "run": "candidate-38-copy-m8-nodead-sp",
+  "jobs": [
+    {
+      "kind": "measure",
+      "profile": "lean",
+      "bench": false,
+      "bracket": false,
+      "arms": [
+        {
+          "config": "arm-copy-m8-nodead.json",
+          "label": "copy-m8-nodead",
+          "startup_memory": true
+        },
+        {
+          "config": "arm-copy-m8-nodead.json",
+          "label": "copy-m8-nodead-repeat",
+          "startup_memory": true
+        }
+      ],
+      "extras": [
+        [
+          "experiments/2026-10-23-next-release/acceptance/copy_probe.py",
+          ["--prompts", "3"],
+          "copy-probe"
+        ],
+        [
+          "suite_single_stream.py",
+          ["{label}", "{run}"],
+          "single-stream"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          ["--streams", "8", "--samples", "3", "--tokens", "1024"],
+          "c8-distinct"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          ["--streams", "16", "--samples", "3", "--tokens", "1024"],
+          "c16-distinct"
+        ],
+        [
+          "collect_runtime.py",
+          ["--config", "experiments/2026-11-03-candidate-38-reproduction/arm-copy-m8-nodead.json", "--run", "{run}", "--label", "{label}"],
+          "runtime"
+        ]
+      ]
+    }
+  ]
+}

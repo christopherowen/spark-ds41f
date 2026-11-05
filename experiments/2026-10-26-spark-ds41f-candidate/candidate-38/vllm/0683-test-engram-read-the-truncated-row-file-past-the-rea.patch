@@ -1,0 +1,67 @@
+From f6fe2e8fe6fd5d1ab5d12c8ef8a894c7a64cfe35 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:34 +0100
+Subject: [PATCH 683/687] test(engram): read the truncated row file past the
+ reader's row cache
+
+Base: candidate-38's patch head 753354cf4 (tree 37b34b8f), the series of
+experiments/2026-10-26-spark-ds41f-candidate/candidate-38/vllm/series.
+
+Rationale: test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows
+truncates one table's row file and expects the next step's read to fail with
+"short Engram row read". Since the reader gained a user-space row cache
+(56873181ff, #759 and #754: a 4-way set-associative cache of the rows it has
+read, filled after every step), a step whose rows were all read before is
+served from the cache and reads no file. The test's last steps reuse the ids of
+the step before them, so the truncation went unread: failure() stayed None for
+the test's 30 s wait and its `in` check raised TypeError. The same failure was
+reported on candidate-36's image (#846).
+
+The test now builds its disk reader with cache_rows=0: the Engram module's
+EngramDiskRows name is patched with that partial before the model is made (the
+reader opens in process_weights_after_loading), so every step of the test reads
+the files and the truncation is read. The cache is right to serve what it has
+(a checkpoint is immutable while serving); its own tests are
+tests/kernels/test_deepseek_v41_engram_rows.py.
+
+Quality: no runtime change; a test-only patch.
+
+Tests: tests/models/test_deepseek_v4_1_engram.py in spark-ds41f:candidate-38 on
+dgx4 (GB10): 43 passed (was 42 passed, 1 failed).
+
+Upstream status: not applicable; the disk Engram reader and its tests are this
+deployment's.
+---
+ tests/models/test_deepseek_v4_1_engram.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 33be3b2284..753ea9690c 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import functools
+ import gc
+ import json
+ import pickle
+@@ -427,6 +428,14 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+ ):
+     """Accepted GPU history, images, padding and failures cross the eager boundary."""
+     make_model, weights, paths = tiny_engram_checkpoint
++    # The reader serves rows it has read before from its row cache (a checkpoint
++    # is immutable while serving). Every step of this test reads the files, so
++    # the truncation below is read.
++    monkeypatch.setattr(
++        engram_module,
++        "EngramDiskRows",
++        functools.partial(engram_module.EngramDiskRows, cache_rows=0),
++    )
+     root, target, session = make_model("disk")
+     resident_root, resident, resident_session = make_model("device")
+     _load_checkpoint(root, tmp_path)
+-- 
+2.54.0 (Apple Git-157)
+

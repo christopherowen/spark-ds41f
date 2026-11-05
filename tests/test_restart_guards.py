@@ -300,14 +300,14 @@ class SyncImageTest(unittest.TestCase):
     def sync(self, *, at: str = "rev", problem: str | None = None, differ=(), failing: str | None = None):
         loads = []
 
-        def load(_nodes, node, tag, layers):
+        def load(_nodes, node, tag, identity):
             loads.append(node["name"])
             return f"{node['name']}: failed to load {tag}" if node["name"] == failing else None
 
         out = io.StringIO()
         with mock.patch.object(spark, "repository_revision", return_value=at), \
                 mock.patch.object(spark, "configuration", return_value=(IMAGE_CLUSTER, NODES3, {})), \
-                mock.patch.object(spark, "image_copies", return_value=(["sha256:l"], problem, list(differ))), \
+                mock.patch.object(spark, "image_copies", return_value=({"image_content_sha256": "same"}, problem, list(differ))), \
                 mock.patch.object(spark, "load_image", side_effect=load), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             code = spark.sync_image(argparse.Namespace(cluster_config="config/c.json"), "rev", "config/c.json")
@@ -347,29 +347,29 @@ class LocalImageTest(unittest.TestCase):
             return spark.local_image(IMAGE_CLUSTER, tag, "config/c.json")
 
     def test_the_recipes_build_is_given(self) -> None:
-        image = {"RootFS": {"Layers": ["sha256:a", "sha256:b"]}, "Config": {"Labels": {"vllm.tree": "t"}}}
-        self.assertEqual(self.inspect(0, image), (["sha256:a", "sha256:b"], None))
+        image = {"RootFS": {"Layers": ["sha256:" + "a" * 64, "sha256:" + "b" * 64]},
+                 "Config": {"Labels": {"vllm.tree": "t"}}}
+        self.assertEqual(self.inspect(0, image), (spark.image_content_identity(image), None))
 
     def test_an_unbuilt_image_names_the_build(self) -> None:
         _, problem = self.inspect(1, stderr="Error response from daemon: No such image: img")
         self.assertIn("bin/spark --cluster-config config/c.json build image --apply", problem)
 
     def test_a_stale_build_of_the_tag_is_not_given(self) -> None:
-        image = {"RootFS": {"Layers": ["sha256:a"]}, "Config": {"Labels": {"vllm.tree": "old"}}}
+        image = {"RootFS": {"Layers": ["sha256:" + "a" * 64]}, "Config": {"Labels": {"vllm.tree": "old"}}}
         _, problem = self.inspect(0, image)
         self.assertIn("another build (label vllm.tree='old', the profile expects 't')", problem)
         # Another tag (build distribute --tag) is not the profile's image: its labels are not checked.
-        self.assertEqual(self.inspect(0, image, tag="other"), (["sha256:a"], None))
+        self.assertEqual(self.inspect(0, image, tag="other"), (spark.image_content_identity(image), None))
 
 
 class BuildDistributeTest(unittest.TestCase):
-    def test_nodes_with_this_hosts_layers_are_skipped(self) -> None:
+    def test_nodes_with_this_hosts_content_are_skipped(self) -> None:
         loads = []
         args = argparse.Namespace(apply=True, cluster_config="config/cluster.json", tag=None)
-        held = {"dgx1": ["sha256:l"], "dgx2": [], "dgx3": ["sha256:old"]}
+        differ = NODES3["nodes"][1:]
         with mock.patch.object(spark, "configuration", return_value=(IMAGE_CLUSTER, NODES3, {})), \
-                mock.patch.object(spark, "local_image", return_value=(["sha256:l"], None)), \
-                mock.patch.object(spark, "image_layers", side_effect=lambda _n, node, _t: held[node["name"]]), \
+                mock.patch.object(spark, "image_copies", return_value=({"image_content_sha256": "same"}, None, differ)), \
                 mock.patch.object(spark, "load_image", side_effect=lambda _n, node, *_: loads.append(node["name"])), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(spark.command_build_distribute(args), 0)

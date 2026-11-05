@@ -1,0 +1,103 @@
+From 5541bf1fa03c78bd5fb2ab60898739526c0404cd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 17:24:25 +0100
+Subject: [PATCH] Remove the unused Engram overlap environment option
+
+Base: candidate-39 plus the strict sequence-parallel MoE contract. The overlap setting has no consumer in this source.
+
+Rationale: delete the stale declaration and reject its presence before model setup instead of silently accepting a no-op.
+
+Quality: Engram I/O, overlap scheduling and GPU kernels are unchanged. Tests: option-registry and startup-rejection CPU regressions pending Spaceport validation.
+
+Upstream status: local, not submitted.
+---
+ .../test_deepseek_v41_serving_contract.py     | 27 +++++++++++++++++++
+ vllm/envs.py                                  |  5 ----
+ vllm/model_executor/models/config.py          |  8 ++++++
+ 3 files changed, 35 insertions(+), 5 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v41_serving_contract.py
+
+diff --git a/tests/models/test_deepseek_v41_serving_contract.py b/tests/models/test_deepseek_v41_serving_contract.py
+new file mode 100644
+index 0000000000..4244efcac3
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_serving_contract.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Removed serving choices fail before model construction or GPU work."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm import envs
++from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
++
++RETIRED = ("VLLM_DS41_ENGRAM_OVERLAP",)
++
++
++@pytest.mark.parametrize("name", RETIRED)
++@pytest.mark.parametrize("value", ["0", "1"])
++def test_retired_setting_is_rejected_before_model_setup(monkeypatch, name, value):
++    for setting in RETIRED:
++        monkeypatch.delenv(setting, raising=False)
++    monkeypatch.setenv(name, value)
++    with pytest.raises(ValueError, match=name):
++        DeepseekV41ForCausalLMConfig.verify_and_update_config(SimpleNamespace())
++
++
++@pytest.mark.parametrize("name", RETIRED)
++def test_retired_setting_is_not_an_environment_option(name):
++    assert name not in envs.environment_variables
+diff --git a/vllm/envs.py b/vllm/envs.py
+index ff1f2e1fd4..8088e4f40a 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -224,7 +224,6 @@ if TYPE_CHECKING:
+     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
+     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+-    VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     VLLM_DS41_IKET: str | None = None
+     VLLM_DS41_IKET_CTAS: int = 0
+     VLLM_DS41_IKET_ITERS: int = 0
+@@ -1921,10 +1920,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_STARTUP_HEARTBEAT_TIMEOUT_S": lambda: float(
+         os.getenv("VLLM_STARTUP_HEARTBEAT_TIMEOUT_S", "120")
+     ),
+-    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+-    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+-        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
+-    ),
+     # Debug only: instrument every TileLang kernel with IKET phase ranges and keep
+     # TileLang's caches under this directory (models/deepseek_v4_1/tilelang/iket.py).
+     # Traces need the process to run under NVIDIA's run-iket profiler.
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index bd0e0098a6..305930597c 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import TYPE_CHECKING, Any
+ 
+ from vllm.logger import init_logger
+@@ -581,6 +582,13 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+ 
+     @staticmethod
+     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
++        retired_options = ("VLLM_DS41_ENGRAM_OVERLAP",)
++        supplied = [name for name in retired_options if name in os.environ]
++        if supplied:
++            raise ValueError(
++                "DeepSeek V4.1 no longer accepts these retired settings: "
++                + ", ".join(supplied)
++            )
+         from vllm.platforms import current_platform
+         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+-- 
+2.54.0 (Apple Git-157)
+

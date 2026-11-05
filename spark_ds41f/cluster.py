@@ -90,52 +90,72 @@ def missing_profile(node: dict, cluster_config: str) -> str:
             "receives only committed files and the site map, so commit the profile, publish it and sync")
 
 
-def image_layers(nodes: dict, node: dict, tag: str) -> list[str]:
-    """The tag's layers on a node, or [] when the node lacks it.
+def inspected_image(output: str, context: str) -> tuple[dict, dict]:
+    """Decode exactly one inspected image and validate its store-independent content."""
+    try:
+        images = json.loads(output)
+        if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+            raise ValueError("inspection must contain exactly one image")
+        image = images[0]
+        identity = image_content_identity(image)
+    except (ValueError, TypeError) as error:
+        raise SystemExit(f"{context}: invalid image inspection: {error}") from error
+    return image, identity
 
-    The layers (uncompressed content digests, in order) of one image are the same on every
-    node whatever its storage. The image ID is not: Docker's containerd image store names an
-    image by its manifest, the overlay2 driver by its config, so a faithful copy between the
-    two changes the ID (#488)."""
-    result = run_ssh(nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}")
-    return json.loads(result.stdout) if result.returncode == 0 else []
+
+def image_identity(nodes: dict, node: dict, tag: str) -> dict | None:
+    """The selected tag's content, or None only when Docker reports it missing.
+
+    Ordered layers and runtime Config survive faithful copies between Docker stores;
+    Docker image IDs may differ. An inspection error is not a missing image to repair.
+    """
+    result = run_ssh(nodes, node, "docker", "image", "inspect", tag)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if result.returncode == 1 and "no such image" in detail.lower():
+            return None
+        raise SystemExit(f"{node['name']}: cannot inspect {tag}: {detail}")
+    _, identity = inspected_image(result.stdout, f"{node['name']}: {tag}")
+    return identity
 
 
-def local_image(cluster: dict, tag: str, cluster_config: str) -> tuple[list[str], str | None]:
-    """This host's layers of the tag, and why they must not be copied to the nodes (None
+def local_image(cluster: dict, tag: str, cluster_config: str) -> tuple[dict | None, str | None]:
+    """This host's content of the tag, and why it must not be copied to the nodes (None
     when they may): the host lacks the tag, or holds another build than the profile expects."""
     result = subprocess.run(["docker", "image", "inspect", tag], text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode:
         detail = result.stderr.strip()
-        if "no such image" in detail.lower():
-            return [], (f"{tag} is not built on this host: "
+        if result.returncode == 1 and "no such image" in detail.lower():
+            return None, (f"{tag} is not built on this host: "
                         f"bin/spark --cluster-config {cluster_config} build image --apply")
-        return [], f"cannot inspect {tag} on this host: {detail}"
-    image = json.loads(result.stdout)[0]
+        raise SystemExit(f"cannot inspect {tag} on this host: {detail}")
+    image, identity = inspected_image(result.stdout, f"this host's {tag}")
     if tag == cluster["container"]["image"]:
         labels = image["Config"].get("Labels") or {}
         for key, wanted in cluster["container"].get("expected_labels", {}).items():
             if labels.get(key) != wanted:
-                return [], (f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
-                            f"the profile expects {wanted!r}): remove it and build it again")
-    return image["RootFS"]["Layers"], None
+                return None, (f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
+                            f"the profile expects {wanted!r}): provide the profile's exact qualified "
+                            "image; do not replace an immutable tag")
+    return identity, None
 
 
-def image_copies(cluster: dict, nodes: dict, cluster_config: str) -> tuple[list[str], str | None, list[dict]]:
-    """The profile's image on this host: its layers, why they must not be copied (or None),
+def image_copies(cluster: dict, nodes: dict, cluster_config: str,
+                 tag: str | None = None) -> tuple[dict | None, str | None, list[dict]]:
+    """The selected image on this host: its content, why it must not be copied (or None),
     and the nodes whose copy differs, inspected concurrently."""
-    tag = cluster["container"]["image"]
-    layers, problem = local_image(cluster, tag, cluster_config)
+    tag = tag or cluster["container"]["image"]
+    identity, problem = local_image(cluster, tag, cluster_config)
     if problem:
-        return layers, problem, []
+        return identity, problem, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
-        found = list(pool.map(lambda node: image_layers(nodes, node, tag), nodes["nodes"]))
-    return layers, None, [node for node, held in zip(nodes["nodes"], found) if held != layers]
+        found = list(pool.map(lambda node: image_identity(nodes, node, tag), nodes["nodes"]))
+    return identity, None, [node for node, held in zip(nodes["nodes"], found) if held != identity]
 
 
-def load_image(nodes: dict, node: dict, tag: str, layers: list[str]) -> str | None:
-    """Copy this host's tag to a node over its transfer link and check the node's layers;
+def load_image(nodes: dict, node: dict, tag: str, identity: dict) -> str | None:
+    """Copy this host's tag to a node over its transfer link and check its full content;
     None on success, else the failure."""
     target = transfer_target(nodes, node)
     pipeline = (
@@ -152,8 +172,8 @@ def load_image(nodes: dict, node: dict, tag: str, layers: list[str]) -> str | No
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         return f"{node['name']}: failed to load {tag}: {detail}"
-    if image_layers(nodes, node, tag) != layers:
-        return f"{node['name']}: image layers for {tag} do not match after load"
+    if image_identity(nodes, node, tag) != identity:
+        return f"{node['name']}: image content for {tag} does not match after load"
     return None
 
 
@@ -412,13 +432,13 @@ def sync_image(args: argparse.Namespace, revision: str, cluster_config: str) -> 
     # Read again: the checkout can be ROOT, and the deployed profile may name another image.
     cluster, nodes, _ = configuration(args)
     tag = cluster["container"]["image"]
-    layers, problem, differ = image_copies(cluster, nodes, cluster_config)
+    identity, problem, differ = image_copies(cluster, nodes, cluster_config)
     if problem:
         print(f"WARN: image not copied: {problem}", file=sys.stderr)
         return 0
     for node in differ:
         started = time.monotonic()
-        failure = load_image(nodes, node, tag, layers)
+        failure = load_image(nodes, node, tag, identity)
         if failure:
             print(f"ERROR: {failure}", file=sys.stderr)
             return 1

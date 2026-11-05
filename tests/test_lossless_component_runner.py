@@ -1,0 +1,496 @@
+"""Native gate and failure-restoration checks without SSH, containers or GPUs."""
+
+import importlib.util
+import copy
+import gzip
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parents[1] / "experiments/2026-11-04-lossless-memory"
+spec = importlib.util.spec_from_file_location("lossless_component_runner", HERE / "run_component.py")
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+
+class ComponentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.here = self.root / "experiments/memory"
+        self.hold = {"holder": runner.HOLDER, "window": "owned", "production_config": runner.RESTORE}
+        self.closed, self.health = [], []
+        self.foreign_after_failure = False
+        self.management_failure = False
+        self.restore_refused = False
+        self.image_failure = True
+        self.plan_failure = False
+        self.kernel_passes = False
+        self.full_gate_passes = None
+        self.lab_calls = []
+        self.suite_calls = []
+        self.stop_plans, self.stop_applies = [], []
+        self.image = {"Id": "sha256:" + "a" * 64, "Layers": ["sha256:" + "b" * 64],
+                      "Labels": {"local.spark-ds41f.vllm.tree": "c" * 40, "org.opencontainers.image.revision": "d" * 40}}
+        self.images = {f"dgx{i}": self.image for i in (1, 2, 3)}
+        self.nodes = {"nodes": [{"name": f"dgx{i}", "rank": i - 1, "head": i == 1} for i in (1, 2, 3)]}
+        self.cluster = {"container": {"name": "serving", "image": "candidate", "expected_labels": self.image["Labels"]}}
+        self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": []})
+        self.write(self.here / "expert-scales/image.json", {"run": "image", "jobs": []})
+        self.write(self.here / "functional-reference.json", {"checks": []})
+        self.write(self.root / "build/images" / ("a" * 16 + ".json"),
+                   {"image_id": self.image["Id"], "tag": "candidate", "compile_jobs": 2,
+                    "min_available_gib": 80, "built_utc": "fixture", "deployment_commit": "d" * 40})
+        for kind in ("kernel", "full-gate"):
+            bundle = self.here / (kind + "-bundle")
+            self.write(bundle / "candidate.json", {"image": "candidate"})
+            self.write(self.here / ("expert-scales/" + kind + ".json"),
+                       {"run": kind, "jobs": [{"bundles": [{"bundle": str(bundle.relative_to(self.root))}]}]})
+
+    def write(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+        if path == self.root / "hold.json":
+            self.hold = value
+
+    def close(self, reason):
+        self.closed.append(reason)
+        self.hold = None
+        return True
+
+    def process(self, argv, **kwargs):
+        if "bin/spark" in argv and "cluster" in argv:
+            if "stop" in argv:
+                if "--apply" in argv:
+                    self.stop_applies.append(argv)
+                    self.assertEqual(argv[:-1], self.stop_plans[-1])
+                else:
+                    self.stop_plans.append(argv)
+            if "--apply" in argv:
+                return SimpleNamespace(returncode=0)
+            refused = self.restore_refused and "start" in argv
+            return SimpleNamespace(returncode=0, stdout="live: running: 3 nodes\nshape: unchanged\n" +
+                                   ("--apply would refuse" if refused else "plan only"), stderr="")
+        if "scripts/lab.py" in argv:
+            kind = Path(argv[3]).stem
+            self.lab_calls.append(kind)
+            if kind == "image" and self.image_failure:
+                kwargs["stdout"].write("ssh: connect timed out" if self.management_failure else "build failed")
+                if self.foreign_after_failure:
+                    self.hold = {"holder": "spark-lab: foreign", "window": "foreign"}
+                return SimpleNamespace(returncode=1)
+            if kind in ("kernel", "full-gate"):
+                passed = self.kernel_passes if kind == "kernel" or self.full_gate_passes is None else self.full_gate_passes
+                spec = json.loads((self.root / argv[3]).read_text())
+                directory = self.root / spec["jobs"][0]["bundles"][0]["bundle"]
+                inputs = {str(p.relative_to(directory)): runner.hashlib.sha256(p.read_bytes()).hexdigest()
+                          for p in directory.rglob("*") if p.is_file()}
+                native = {"agree": True, "verdicts": [{"node": node, "image": self.image["Id"],
+                          "passed": passed, "exit": 0, "errors": [], "failed": [],
+                          "inputs_sha256": inputs} for node in self.images]}
+                run_name = spec["run"]
+                self.write(self.root / "results/private/lab" / run_name / "verdicts.json", native)
+        if "bin/spark" in argv and "--suite" in argv:
+            self.suite_calls.append(argv[argv.index("--suite") + 1])
+        if argv[:2] == ["docker", "run"]:
+            output = next(value.split("source=", 1)[1].split(",target=", 1)[0]
+                          for value in argv if value.endswith("target=/out"))
+            self.write(Path(output) / "report.json", {"all_identical": False})
+        return SimpleNamespace(returncode=0)
+
+    def ssh(self, nodes, node, *argv):
+        if argv == ("true",):
+            self.health.append(node["name"])
+            return SimpleNamespace(returncode=0)
+        if argv[0] in ("bash", "head"):
+            return SimpleNamespace(returncode=0, stdout="engine log", stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(self.image))
+
+    def invoke(self, *, out="results/private/component", extra=(), through="gate"):
+        lab = SimpleNamespace(read_hold=lambda: self.hold, HOLD=self.root / "hold.json", now=lambda: "fixture",
+                              window_should_close=lambda hold: None, published_problems=lambda: [],
+                              plan=lambda spec: [spec["run"]],
+                              plan_problems=lambda steps: ["missing configuration"] if self.plan_failure else [],
+                              beat=lambda note: None, write_json_atomic=self.write, window_close=self.close,
+                              production_live=lambda: True, stop_cluster=lambda: True,
+                              start_memory_samplers=lambda out: {},
+                              stop_memory_samplers=lambda samplers: {name: {"min_available_gib": 8} for name in self.images})
+        spark = SimpleNamespace(configuration=lambda args: (self.cluster, self.nodes, {}), run_ssh=self.ssh,
+                                build_inputs=lambda upstreams: {}, build_directory=lambda inputs: self.root / "build",
+                                repository_path=lambda config: self.root)
+        def output(argv, **kwargs):
+            if "status" in argv:
+                return b""
+            if "ls-files" in argv:
+                directory = self.root / argv[-1]
+                return ("\0".join(str(p.relative_to(self.root)) for p in directory.rglob("*") if p.is_file()) + "\0").encode()
+            return "d" * 40
+        process = SimpleNamespace(run=self.process, STDOUT=runner.subprocess.STDOUT, check_output=output)
+        argv = ["run_component.py", "--component", "expert-scales", "--window", "owned", "--through", through,
+                "--out", out, "--apply", *extra]
+        with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=lab, spark=spark, subprocess=process,
+                            os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"),
+                                               getuid=lambda: 1000, getgid=lambda: 1000)), patch.object(sys, "argv", argv):
+            return runner.main()
+
+    def test_failed_build_restores_only_its_owned_window(self):
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(len(self.closed), 1)
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertTrue(receipt["restored"])
+        self.assertFalse(receipt["completed"])
+
+    def test_invalid_plan_cannot_reach_an_image_or_serving_operation(self):
+        self.plan_failure = True
+        self.assertEqual(self.invoke(), 1)
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertEqual(receipt["steps"], [])
+        self.assertTrue(receipt["preflight_problems"])
+        self.assertTrue(receipt["restored"])
+
+    def test_actual_image_plan_paths_resolve_before_window_operations(self):
+        for arm in ("expert-scales", "engram"):
+            spec = json.loads((HERE / arm / "image.json").read_text())
+            steps = runner.lab.plan(spec)
+            with patch.object(runner.lab, "arm_problems", return_value=[]):
+                self.assertEqual(runner.lab.plan_problems(steps), [])
+
+    def test_foreign_window_on_entry_never_starts_or_closes(self):
+        self.hold["holder"] = "foreign"
+        with self.assertRaises(SystemExit):
+            self.invoke()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.health, [])
+
+    def test_foreign_window_during_failure_is_left_alone(self):
+        self.foreign_after_failure = True
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.health, [])
+
+    def test_observed_management_loss_blocks_restoration_even_after_connectivity_recovers(self):
+        self.management_failure = True
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.hold["holder"], "lossless-memory-hardware-review")
+
+    def test_refused_restore_plan_keeps_a_review_hold(self):
+        self.restore_refused = True
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.hold["holder"], "lossless-memory-restoration-review")
+
+    def test_failed_native_gate_cannot_start_a_serving_boot(self):
+        self.image_failure = False
+        self.assertEqual(self.invoke(), 1)
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertFalse(receipt.get("gates_passed", False))
+        self.assertFalse(any(r["log"].startswith("boot-") for r in receipt["steps"]))
+        self.assertTrue(receipt["restored"])
+
+    def test_all_three_native_ranks_can_complete_the_gate_only_stage(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.assertEqual(self.invoke(), 0)
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertTrue(receipt["gates_passed"])
+        self.assertTrue(receipt["completed"])
+        self.assertTrue(receipt["restored"])
+
+    def test_identical_layers_with_a_different_image_configuration_cannot_reach_native_gates(self):
+        self.image_failure = False
+        original = self.ssh
+        def inspect(nodes, node, *argv):
+            process = original(nodes, node, *argv)
+            if argv[:3] == ("docker", "image", "inspect") and node["name"] == "dgx2":
+                changed = json.loads(process.stdout)
+                changed["Id"] = "sha256:" + "f" * 64
+                process.stdout = json.dumps(changed)
+            return process
+        self.ssh = inspect
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.lab_calls, ["image"])
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertIn("image identity", receipt["error"])
+        self.assertTrue(receipt["restored"])
+
+    def prepare_failed_full_gate(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.full_gate_passes = False
+        self.assertEqual(self.invoke(), 1)
+        self.hold = {"holder": runner.HOLDER, "window": "owned", "production_config": runner.RESTORE}
+        self.lab_calls.clear()
+        return "results/private/component/receipt.json"
+
+    def test_retained_passed_component_can_precede_a_distinct_new_full_gate(self):
+        prior = self.prepare_failed_full_gate()
+        path = self.here / "expert-scales/full-gate.json"
+        spec = json.loads(path.read_text())
+        spec["run"] = "full-gate-fixtures"
+        self.write(path, spec)
+        self.full_gate_passes = True
+        self.image_failure = True  # neither image nor component may run again
+        self.kernel_passes = False
+        self.assertEqual(self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", prior)), 0)
+        self.assertEqual(self.lab_calls, ["full-gate"])
+        receipt = json.loads((self.root / "results/private/resumed/receipt.json").read_text())
+        self.assertTrue(receipt["gates_passed"])
+        self.assertEqual(receipt["reused_kernel_from"], prior)
+
+    def test_reusing_component_does_not_overwrite_prior_full_gate_observations(self):
+        prior = self.prepare_failed_full_gate()
+        with self.assertRaisesRegex(SystemExit, "distinct retained run"):
+            self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", prior))
+        self.assertEqual(self.lab_calls, [])
+
+    def test_a_changed_fixture_cannot_reuse_a_pass_with_an_unchanged_candidate_json(self):
+        fixture = self.here / "kernel-bundle/fixture.py"
+        fixture.write_text("before")
+        prior = self.prepare_failed_full_gate()
+        path = self.here / "expert-scales/full-gate.json"
+        spec = json.loads(path.read_text())
+        spec["run"] = "full-gate-fixtures"
+        self.write(path, spec)
+        fixture.write_text("after")
+        self.full_gate_passes = True
+        self.assertEqual(self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", prior)), 1)
+        self.assertEqual(self.lab_calls, [])
+
+    def test_external_fixture_must_match_its_previous_published_commit(self):
+        bundle = self.root / "bundle"
+        self.write(bundle / "candidate.json", {"mounts": [["shared.py", "/b/shared.py"]]})
+        source = self.root / "shared.py"
+        source.write_bytes(b"original")
+        with patch.object(runner, "ROOT", self.root), patch.object(runner.subprocess, "check_output", return_value=b"original"):
+            self.assertIn("shared.py", runner.retained_external_sources(bundle, {"commit": "d" * 40}))
+            source.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "changed"):
+                runner.retained_external_sources(bundle, {"commit": "d" * 40})
+
+    def test_a_failed_component_cannot_be_reused_as_a_pass(self):
+        self.image_failure = False
+        self.assertEqual(self.invoke(), 1)
+        self.hold = {"holder": runner.HOLDER, "window": "owned", "production_config": runner.RESTORE}
+        self.lab_calls.clear()
+        self.full_gate_passes = True
+        self.assertEqual(self.invoke(out="results/private/resumed", extra=("--reuse-kernel-from", "results/private/component/receipt.json")), 1)
+        self.assertEqual(self.lab_calls, [])
+
+    def test_zero_exit_is_insufficient_when_native_verdict_fails_or_rank_is_missing(self):
+        native = {"agree": True, "verdicts": [{"node": name, "image": self.image["Id"],
+                  "passed": True, "exit": 0} for name in self.images]}
+        runner.native_kernel_gate(native, self.images)
+        native["verdicts"][0]["passed"] = False
+        with self.assertRaises(ValueError):
+            runner.native_kernel_gate(native, self.images)
+        native["verdicts"].pop(0)
+        with self.assertRaises(ValueError):
+            runner.native_kernel_gate(native, self.images)
+
+    def test_io_observation_requires_process_identity_and_complete_nonnegative_counters(self):
+        keys = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes")
+        value = {"container": "candidate", "monotonic_start_ns": 1, "monotonic_end_ns": 2,
+                 "processes": {"42": {"start_ticks": 100, "io": dict.fromkeys(keys, 0)}},
+                 "nvme_diskstats": {"nvme0n1": [0] * 11}}
+        runner.io_gate(value, "candidate")
+        for bad in ("identity", "counter", "disk", "clock"):
+            row = json.loads(json.dumps(value))
+            if bad == "identity":
+                row["processes"]["42"]["start_ticks"] = 0
+            elif bad == "counter":
+                row["processes"]["42"]["io"]["read_bytes"] = -1
+            elif bad == "disk":
+                row["nvme_diskstats"] = {}
+            else:
+                row["monotonic_end_ns"] = 0
+            with self.assertRaises(ValueError, msg=bad):
+                runner.io_gate(row, "candidate")
+
+    def test_determinism_cannot_silently_drop_logprobs(self):
+        native = {"summary": "temperature-0 determinism", "identical": True, "logprobs": True,
+                  "reference_text_sha256": "short", "long_text_sha256": "long"}
+        runner.determinism_gate(json.dumps(native), logprobs=True)
+        native["logprobs"] = False
+        with self.assertRaises(ValueError):
+            runner.determinism_gate(json.dumps(native), logprobs=True)
+
+    def test_failed_recorded_model_identity_stops_before_companion_suite_or_repeat_boot(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": [{
+            "suite": ["primary", "companion"], "arms": [
+                {"label": label, "config": "candidate.json"} for label in ("first", "repeat")]}]})
+        reference = {"path": str(self.root / "reference.json.gz"), "sha256": "reference"}
+        with patch.object(runner, "recorded_model_reference", return_value=reference), \
+             patch.object(runner.suite, "load", return_value={}), \
+             patch.object(runner, "native_suite_gate", return_value={node: "first" for node in self.images}):
+            self.assertEqual(self.invoke(through="release"), 1)
+        self.assertEqual(self.suite_calls, ["primary"])
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertIn("recorded-model comparison", receipt["error"])
+        self.assertTrue(receipt["restored"])
+        self.assertFalse(receipt.get("completed"))
+        self.assertEqual([r["log"] for r in receipt["steps"] if r["log"].startswith("boot-")], ["boot-first.log"])
+        self.assertIn("first", receipt["model_identity"])
+
+    def test_each_serving_stop_applies_its_exact_inspected_profile(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": [{
+            "suite": ["primary"], "reference": "recorded", "arms": [
+                {"label": label, "config": "candidate.json"} for label in ("first", "repeat")]}]})
+        reference = {"path": str(self.root / "reference.json.gz"), "sha256": "reference"}
+        with patch.object(runner, "recorded_model_reference", return_value=reference), \
+             patch.object(runner.suite, "load", return_value={}), \
+             patch.object(runner, "native_suite_gate", side_effect=[
+                 {node: "first" for node in self.images}, {node: "repeat" for node in self.images}]), \
+             patch.object(runner, "native_model_gate"):
+            self.assertEqual(self.invoke(through="release"), 1)  # no fake functional report
+        self.assertEqual([argv[argv.index("--cluster-config") + 1] for argv in self.stop_applies],
+                         [runner.RESTORE, "candidate.json"])
+        self.assertTrue(self.closed)
+
+    def test_model_gate_requires_complete_exact_vectors_and_pinned_inputs(self):
+        candidate = self.root / "model.json.gz"
+        candidate.write_bytes(b"fixture")
+        reference = {"sha256": "ref", "provenance_sha256": "provenance", "analysis_sha256": "source",
+                     "sequences": 256, "positions": 65536}
+        row = {"path": "/evidence/candidate.json.gz", "sha256": runner.file_sha256(candidate),
+               "identical": True, "workload_identical": True, "corpus_identical": True,
+               "reference_sequences": 256, "candidate_sequences": 256,
+               "reference_positions": 65536, "candidate_positions": 65536,
+               "generation_differences": [], "score_differences": []}
+        for field in ("generation", "scores"):
+            for prefix in ("reference", "candidate"):
+                row[prefix + "_" + field + "_sha256"] = field
+        value = {"all_identical": True, "inference_requests": 0, "reference_sha256": "ref",
+                 "provenance_sha256": "provenance", "analysis_sha256": "source", "candidates": [row]}
+        runner.native_model_gate(value, candidate, reference)
+        for key, bad in (("identical", False), ("sha256", "other"), ("candidate_positions", 65535),
+                         ("generation_differences", [1]), ("score_differences", [1]),
+                         ("candidate_scores_sha256", "changed"), ("workload_identical", False)):
+            changed = copy.deepcopy(value)
+            changed["candidates"][0][key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.native_model_gate(changed, candidate, reference)
+
+        for key, bad in (("inference_requests", 1), ("analysis_sha256", "changed"),
+                         ("provenance_sha256", "changed"), ("candidates", [])):
+            changed = copy.deepcopy(value)
+            changed[key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.native_model_gate(changed, candidate, reference)
+
+    def test_cpu_model_report_uses_its_output_owner_without_dac_override(self):
+        with patch.object(runner.os, "getuid", return_value=1234), patch.object(runner.os, "getgid", return_value=5678):
+            argv = runner.model_gate_command(self.root / "candidate.json.gz", self.root / "output",
+                                             "sha256:image", {"path": str(self.root / "reference.json.gz")})
+        self.assertEqual(argv[argv.index("--user") + 1], "1234:5678")
+        self.assertIn("--cap-drop=ALL", argv)
+        self.assertNotIn("--privileged", argv)
+
+    def test_recorded_reference_is_checked_before_serving_operations(self):
+        self.write(self.here / "model-reference.json", {"model_path": str(self.root / "results/private/model.json.gz"),
+                   "model_bytes": 7, "model_sha256": "changed"})
+        model = self.root / "results/private/model.json.gz"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"fixture")
+        with patch.multiple(runner, HERE=self.here, ROOT=self.root):
+            with self.assertRaisesRegex(ValueError, "pinned evidence"):
+                runner.recorded_model_reference()
+        self.assertEqual(self.invoke(through="release"), 1)
+        self.assertEqual(self.lab_calls, [])
+
+    def test_functional_digests_require_exact_selected_outputs_and_workload(self):
+        reference = {"summary": "controls digests", "tokens": 96, "seed": 7,
+                     "digests": {"penalties/alone": "recorded", "penalties/c8": "recorded"}}
+        native = {**reference, "failed": []}
+        runner.functional_digest_gate(json.dumps(native), reference)
+        for key, bad in (("tokens", 95), ("seed", 8), ("digests", {"penalties/alone": "recorded"}),
+                         ("failed", ["penalties"])):
+            changed = copy.deepcopy(native)
+            changed[key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.functional_digest_gate(json.dumps(changed), reference)
+        changed = copy.deepcopy(native)
+        changed["digests"]["penalties/c8"] = "changed"
+        with self.assertRaises(ValueError):
+            runner.functional_digest_gate(json.dumps(changed), reference)
+        with self.assertRaises(ValueError):
+            runner.functional_digest_gate(json.dumps(native) + "\n" + json.dumps(native), reference)
+
+    def test_selected_reference_digests_and_scripts_match_original_archives(self):
+        manifest = json.loads((HERE / "functional-reference.json").read_text())
+        for check in manifest["checks"]:
+            archive = HERE / check["archive"]
+            self.assertEqual(runner.file_sha256(archive), check["archive_sha256"])
+            original = gzip.decompress(archive.read_bytes())
+            self.assertEqual(runner.hashlib.sha256(original).hexdigest(), check["native_sha256"])
+            rows = [json.loads(line) for line in original.decode().splitlines() if line.startswith("{")]
+            summary = next(row for row in rows if row.get("summary") == check["summary"])
+            self.assertEqual({key: summary["digests"][key] for key in check["digests"]}, check["digests"])
+            self.assertEqual(runner.file_sha256(HERE.parents[1] / check["script"]), check["script_sha256"])
+
+    def test_agent_workload_requires_every_request_and_all_four_categories(self):
+        rows = [{"category": category, "requests": 12, "errors": 0, "output_tokens": 100}
+                for category in ("prose", "copy", "edit", "tool")]
+        runner.agent_workload_gate("\n".join(map(json.dumps, rows)))
+        for change in ("partial", "error", "missing", "duplicate", "empty"):
+            changed = copy.deepcopy(rows)
+            if change == "partial":
+                changed[0]["requests"] = 11
+            elif change == "error":
+                changed[0]["errors"] = 1
+            elif change == "missing":
+                changed.pop()
+            elif change == "duplicate":
+                changed[0] = changed[1]
+            else:
+                changed[0]["output_tokens"] = 0
+            with self.assertRaises(ValueError, msg=change):
+                runner.agent_workload_gate("\n".join(map(json.dumps, changed)))
+
+    def test_suite_cannot_pass_with_a_failed_step_changed_image_or_missing_cooling_rank(self):
+        definition = {"name": "tiny", "steps": [{"id": "c1", "command": "run"}]}
+        index = {"suite": definition, "suite_sha256": runner.suite.digest(definition), "finished_utc": "done",
+                 "steps": [{"id": "c1", "command": "run", "exit": 0}], "metadata": {"identity": {
+                  "live_problems": [], "client_dirty": False, "client_commit": "commit", "cluster_config": "config",
+                  "client_stream_policy": runner.STREAM_POLICY,
+                  "nodes": {node: {"image_id": self.image["Id"], "checkout": "commit",
+                            "image_layers": self.image["Layers"], "container_started_at": "boot"} for node in self.images}}}}
+        conditions = {"halted": None, "fan_stop_failures": [],
+                      "memory": {node: {"min_available_gib": 8, "swap_growth_gib": 0} for node in self.images},
+                      "thermal": {node: {"thermal_slowdown_ms": 0} for node in self.images},
+                      "cooling": [{"node": node, "final_c": 50} for node in self.images],
+                      "fan_curve": [{"node": node} for node in self.images]}
+        directory = self.root / "suite"
+        def check():
+            self.write(directory / "suite.json", index)
+            self.write(directory / "conditions.json", conditions)
+            return runner.native_suite_gate(directory, definition, "config", "commit", self.images)
+        self.assertEqual(set(check()), set(self.images))
+        index["metadata"]["identity"]["client_stream_policy"] = "current"
+        with self.assertRaises(ValueError):
+            check()
+        index["metadata"]["identity"]["client_stream_policy"] = runner.STREAM_POLICY
+        index["steps"][0]["exit"] = 1
+        with self.assertRaises(ValueError):
+            check()
+        index["steps"][0]["exit"] = 0
+        index["metadata"]["identity"]["nodes"]["dgx1"]["image_id"] = "other"
+        with self.assertRaises(ValueError):
+            check()
+        index["metadata"]["identity"]["nodes"]["dgx1"]["image_id"] = self.image["Id"]
+        conditions["cooling"].pop()
+        with self.assertRaises(ValueError):
+            check()
+
+
+if __name__ == "__main__":
+    unittest.main()

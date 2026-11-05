@@ -1,0 +1,82 @@
+{
+ "experiment": "experiments/2026-11-03-copy-drafter-shared-budget",
+ "run": "shared-budget-diag-sp",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench": false,
+   "arms": [
+    {
+     "config": "arm-diag-c37-m8-nodead.json",
+     "label": "diag-c37-m8-nodead"
+    },
+    {
+     "config": "arm-no0676-c37-m8-nodead.json",
+     "label": "no0676-c37-m8-nodead"
+    }
+   ],
+   "extras": [
+    [
+     "experiments/2026-10-23-next-release/acceptance/copy_probe.py",
+     [
+      "--prompts",
+      "3"
+     ],
+     "copy-probe"
+    ],
+    [
+     "suite_single_stream.py",
+     [
+      "{label}",
+      "{run}"
+     ],
+     "single-stream"
+    ],
+    [
+     "experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py",
+     [
+      "{label}"
+     ],
+     "census"
+    ],
+    [
+     "limit_reads_logs.py",
+     [
+      "{label}"
+     ],
+     "reads"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "3",
+      "--tokens",
+      "1024"
+     ],
+     "c8-distinct"
+    ],
+    [
+     "experiments/2026-11-01-dspark-default-copy-drafts/repro/census_logs.py",
+     [
+      "{label}"
+     ],
+     "census-c8"
+    ],
+    [
+     "limit_reads_logs.py",
+     [
+      "{label}"
+     ],
+     "reads-c8"
+    ]
+   ]
+  }
+ ]
+}
