@@ -99,6 +99,22 @@ class GateTests(unittest.TestCase):
         self.assertTrue(result['passed']);self.assertEqual(result['wins'],['one'])
         self.assertEqual(len(result['incomplete']),2)
 
+    def test_shared_incomplete_is_zero_not_a_new_regression(self):
+        generations,grades=fixture('code')
+        for label in generations:
+            generations[label]['records'][0].update(status='incomplete',finish_reason='repetition')
+            grades[label]['records'][0]['correct']=False
+        result=check(generations,grades,'code')
+        self.assertTrue(result['passed']);self.assertEqual(len(result['incomplete']),4)
+        self.assertEqual(result['new_incomplete'],[])
+
+    def test_losing_a_completed_native_wrong_answer_still_rejects(self):
+        generations,grades=fixture('code')
+        for label in grades:grades[label]['records'][0]['correct']=False
+        generations['lsa-a']['records'][0].update(status='incomplete',finish_reason='length')
+        result=check(generations,grades,'code')
+        self.assertFalse(result['passed']);self.assertEqual(result['new_incomplete'],[{'id':'one','arm':'lsa-a'}])
+
     def test_changed_protocol_and_identity_are_invalid(self):
         for key,value in [('source_lock',{'protocol':'different'}),('manifest_sha256','different')]:
             benchmark='code' if key=='source_lock' else 'ruler'

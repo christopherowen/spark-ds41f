@@ -41,7 +41,10 @@ def early_result(generations,grades,label,benchmark):
         failures=load_answer_module('watch_quality').regressions(generations['native-a'],generations[label])
         return {'passed':not failures,'checks':failures}
     losses=early(grades['native-a'],grades[label],benchmark)
-    incomplete=[r['id'] for r in generations[label]['records'] if r['status']!='complete' or r['finish_reason']!='stop']
+    baseline={r['id']:r for r in generations['native-a']['records']}
+    incomplete=[r['id'] for r in generations[label]['records']
+                if (r['status']!='complete' or r['finish_reason']!='stop')
+                and baseline[r['id']]['status']=='complete' and baseline[r['id']]['finish_reason']=='stop']
     return {'passed':not(losses or incomplete),'losses':losses,'incomplete':incomplete}
 
 
@@ -131,6 +134,7 @@ def main():
     (out/'preflight-identity.json').write_text(json.dumps(states,indent=2)+'\n')
     (out/'source.json').write_text(json.dumps({'commit':commit,'benchmark':args.benchmark,
         'cache':str(args.cache),'split':args.split,'ruler_stage':args.ruler_stage,'nodes':w.NODES,'private':str(private),'candidate_config':str(candidate),
+        'quality_gate_version':'observed-answer-and-completion-no-loss-v2',
         'rule':'same model and protocol; two fresh boots per arm; independent final-answer grading'},indent=2)+'\n')
     for profile in ('native','candidate','restore'):
         config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
@@ -230,7 +234,7 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
             assert not any(h['spark-request.json'] or h['spark3-request.json'] for h in w.each(w.HOLD_CODE,{'action':'read'}).values()),'pending requester'
             config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
             profile_action(config,'start',out,'boot-'+label)
-            if label=='lsa-a' and args.benchmark=='longbench':
+            if label=='lsa-a' and args.benchmark in ('longbench','ruler'):
                 with (out/'quality-observer-output.txt').open('x') as stream:
                     subprocess.Popen([sys.executable,str(HERE.parent/'2026-11-05-answer-quality/watch_quality.py'),
                         '--window',str(out),'--controller-root',str(ROOT)],cwd=ROOT,stdin=subprocess.DEVNULL,

@@ -42,13 +42,16 @@ def check(native, candidate):
                           and row.get('predicted') == row['expected'])
                 if graded != row['correct']:
                     raise ValueError(f'{name}/{row["id"]}: inconsistent grade')
-        wins, losses, incomplete, unstable = [], [], [], []
+        wins, losses, incomplete, new_incomplete, unstable = [], [], [], [], []
         strata = {}
         for pos, (case, _, _, domain) in enumerate(identity):
             rows = {name:p['records'][pos] for name,p in current.items()}
             for name,row in rows.items():
                 if row['status'] != 'complete' or row.get('finish_reason') != 'stop':
-                    incomplete.append({'id':case,'boot':name,'status':row['status']})
+                    item={'id':case,'boot':name,'status':row['status']}
+                    incomplete.append(item)
+                    if name.startswith('lsa-') and any(rows[n]['status']=='complete' and rows[n].get('finish_reason')=='stop' for n in ('native-a','native-b')):
+                        new_incomplete.append(item)
             for arm in ('native','lsa'):
                 a,b = rows[arm+'-a'],rows[arm+'-b']
                 if (a['correct'],a.get('predicted')) != (b['correct'],b.get('predicted')):
@@ -62,13 +65,14 @@ def check(native, candidate):
             if case in wins:bucket['wins'].append(case)
             if case in losses:bucket['losses'].append(case)
         row = {'name':baseline['name'],'independent_documents':len(identity),
-               'wins':wins,'losses':losses,'incomplete':incomplete,'unstable':unstable,'domains':strata}
+               'wins':wins,'losses':losses,'incomplete':incomplete,'new_incomplete':new_incomplete,'unstable':unstable,'domains':strata}
         phases.append(row)
         if losses:failures.append({'phase':row['name'],'reason':'new incorrect or incomplete answers','ids':losses})
-        if any(r['boot'].startswith('lsa-') for r in incomplete):
-            failures.append({'phase':row['name'],'reason':'candidate final-answer evaluation did not complete naturally'})
+        if new_incomplete:
+            failures.append({'phase':row['name'],'reason':'new candidate incompletion relative to a completed native response'})
         if unstable:failures.append({'phase':row['name'],'reason':'answer decisions differ between repeated boots'})
     return {'passed':not failures,'failures':failures,'phases':phases,
+            'gate_version':'observed-answer-and-completion-no-loss-v2',
             'independent_documents':len(documents),'promotion_qualified':False,
             'scope':'observed final-answer no-loss gate only; no claim about untested inputs or speed',
             'thinking_compared':False}

@@ -11,6 +11,21 @@ import time
 
 def regressions(native,candidate):
     assert native['complete']
+    if 'phases' not in native:
+        assert native['benchmark']==candidate['benchmark']=='RULER project protocol'
+        for key in ('manifest_sha256','protocol','split','stage'):
+            assert candidate.get(key)==native.get(key),key
+        expected={r['id']:r for r in native['records']};seen=set();failures=[]
+        for row in candidate['records']:
+            assert row['id'] not in seen;seen.add(row['id']);old=expected[row['id']]
+            assert all(row[k]==old[k] for k in ('prompt_sha256','task','family','generator_length'))
+            complete=row['status']=='complete' and row.get('finish_reason')=='stop'
+            assert 0<=row['score']<=100 and row['correct']==(complete and row['score']==100)
+            baseline_complete=old['status']=='complete' and old.get('finish_reason')=='stop'
+            if row['score']<old['score'] or (baseline_complete and not complete):
+                failures.append({'id':row['id'],'native_score':old['score'],'candidate_score':row['score'],
+                                 'candidate_status':row['status']})
+        return failures
     for key in ('split','selection_sha256','dataset_sha256','protocol'):
         assert candidate[key]==native[key],key
     failures=[]
@@ -25,7 +40,8 @@ def regressions(native,candidate):
             assert all(row[k]==baseline[k] for k in ('prompt_sha256','expected','domain'))
             complete=row['status']=='complete' and row.get('finish_reason')=='stop'
             assert row['correct']==(complete and row.get('predicted')==row['expected'])
-            if (baseline['correct'] and not row['correct']) or not complete:
+            baseline_complete=baseline['status']=='complete' and baseline.get('finish_reason')=='stop'
+            if (baseline['correct'] and not row['correct']) or (baseline_complete and not complete):
                 failures.append({'phase':phase['name'],'id':row['id'],'native_correct':baseline['correct'],
                                  'candidate_correct':row['correct'],'candidate_status':row['status']})
     return failures
@@ -44,7 +60,8 @@ def client_pids(root,out):
         except (OSError,UnicodeError,ValueError,IndexError):continue
     clients=[]
     for pid,(parent,argv) in processes.items():
-        if str(root/'experiments/2026-11-05-answer-quality/evaluate.py') not in argv:continue
+        clients=[root/('experiments/'+folder+'/evaluate.py') for folder in ('2026-11-05-answer-quality','2026-11-05-context-quality')]
+        if not any(str(p) in argv for p in clients):continue
         if parent not in processes:continue
         parents=[root/('experiments/'+folder+'/measure.py') for folder in ('2026-11-05-answer-quality','2026-11-05-quality-matrix')]
         if not any(str(p) in processes[parent][1] for p in parents):continue

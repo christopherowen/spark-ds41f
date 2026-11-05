@@ -21,11 +21,12 @@ The pinned official answer extractor runs on final content only, outside timing.
 There are no grading calls, comparison passes or host activation copies in the
 serving implementation.
 
-The candidate must complete every final answer naturally. A native budget-limit
-failure remains visible and scores zero, with all its generation time charged;
-it does not disqualify a candidate that completes and independently answers that
-question correctly. Baseline output is not an oracle. Protocol mismatches,
-candidate incompletion and lost native-correct answers still fail closed.
+Every incomplete answer remains visible and scores zero, with all its generation
+time charged. The no-loss gate rejects lost independently correct answers and
+any newly incomplete response where either native boot completed. A failure
+shared with both native boots is not a newly introduced regression, and remains
+zero in the full denominator. Baseline output is not an oracle. Protocol
+mismatches and repeated-boot instability still fail closed.
 
 `watch_quality.py` can observe public receipts from a separate published checkout
 without changing a running controller or serving source. Once the Native A arm

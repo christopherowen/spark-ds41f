@@ -117,3 +117,15 @@ The complete small upstream cache, including its license, is now copied with
 pinned checksums. Preflight validates and exercises the official extractor before
 taking leases or replacing serving, so a missing grader cannot cause another
 wasted model boot. No input, model protocol or grading rule changes.
+
+Gate version `observed-answer-and-completion-no-loss-v2` corrects an overly
+strict comparison rule before any RULER inference: shared native/candidate
+incompletion remains a zero-scored failure, but does not count as a new LSA
+regression. A lost correct answer, any newly incomplete response relative to
+either completed native boot, changed inputs/protocol or repeat-boot instability
+still rejects. Every case stays in the denominator with all time charged. This
+is a matched no-loss criterion, not a perfect-model requirement. Official scores,
+answer keys and executable tests do not change. The earlier strict coding
+rejection and its missing repeat boots remain historical; they are not relabeled
+as a completed qualification. The active compact pilot stays at its published
+controller revision and original gate throughout its window.

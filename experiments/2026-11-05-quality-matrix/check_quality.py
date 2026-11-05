@@ -29,20 +29,24 @@ def check(generations,grades,benchmark):
         key='source_lock' if benchmark=='code' else 'manifest_sha256'
         assert run[key]==first[key]
         assert grades[label]['complete'] and [r['id'] for r in grades[label]['records']]==ids
-    losses=[];wins=[];incomplete=[];unstable=[]
+    losses=[];wins=[];incomplete=[];new_incomplete=[];unstable=[]
     for i,identity in enumerate(ids):
         rows={label:g['records'][i] for label,g in generations.items()}
         scores={label:g['records'][i]['correct'] if benchmark=='code' else g['records'][i]['score'] for label,g in grades.items()}
         for label,row in rows.items():
-            if row['status']!='complete' or row['finish_reason']!='stop':incomplete.append({'id':identity,'arm':label})
+            if row['status']!='complete' or row['finish_reason']!='stop':
+                item={'id':identity,'arm':label};incomplete.append(item)
+                if label.startswith('lsa-') and any(rows[n]['status']=='complete' and rows[n]['finish_reason']=='stop' for n in ('native-a','native-b')):
+                    new_incomplete.append(item)
         for arm in ('native','lsa'):
             if scores[arm+'-a']!=scores[arm+'-b']:unstable.append({'id':identity,'arm':arm})
         old=max(scores['native-a'],scores['native-b']);new=min(scores['lsa-a'],scores['lsa-b'])
         if new<old:losses.append(identity)
         if new>old:wins.append(identity)
-    candidate_incomplete=[r for r in incomplete if r['arm'].startswith('lsa-')]
-    return {'passed':not(losses or candidate_incomplete or unstable),'benchmark':benchmark,'tasks':len(ids),
+    return {'passed':not(losses or new_incomplete or unstable),'benchmark':benchmark,'tasks':len(ids),
+            'gate_version':'observed-answer-and-completion-no-loss-v2',
             'wins':wins,'losses':losses,'incomplete':incomplete,'unstable':unstable,
+            'new_incomplete':new_incomplete,
             'promotion_qualified':False,'scope':'observed per-task no-loss only; no guarantee about untested inputs'}
 
 

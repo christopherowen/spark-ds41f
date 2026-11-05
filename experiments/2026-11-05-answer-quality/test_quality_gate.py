@@ -56,6 +56,31 @@ class QualityGate(unittest.TestCase):
         self.assertEqual(result['phases'][0]['wins'],['document-a'])
         self.assertEqual(len(result['phases'][0]['incomplete']),2)
 
+    def test_shared_incompletion_stays_zero_without_becoming_new_loss(self):
+        run=report(False)
+        run['phases'][0]['records'][0].update(status='truncated',finish_reason='length',predicted=None)
+        result=check([run,run],[run,run])
+        self.assertTrue(result['passed'])
+        self.assertEqual(len(result['phases'][0]['incomplete']),4)
+        self.assertEqual(result['phases'][0]['new_incomplete'],[])
+        self.assertEqual(regressions(run,run),[])
+
+    def test_ruler_observer_detects_fractional_loss_and_new_incompletion(self):
+        row={'id':'case','prompt_sha256':'frozen','task':'needle','family':'niah','generator_length':32768,
+             'score':100,'correct':True,'status':'complete','finish_reason':'stop'}
+        native={'benchmark':'RULER project protocol','complete':True,'manifest_sha256':'set',
+                'protocol':{'temperature':0},'split':'pilot','stage':'screen','records':[row]}
+        candidate=copy.deepcopy(native);candidate['complete']=False
+        candidate['records'][0].update(score=99,correct=False)
+        self.assertEqual(regressions(native,candidate)[0]['id'],'case')
+        candidate['records'][0]['prompt_sha256']='changed'
+        with self.assertRaises(AssertionError):regressions(native,candidate)
+        candidate=copy.deepcopy(native)
+        candidate['records'][0].update(status='incomplete',finish_reason='length',score=0,correct=False)
+        self.assertEqual(regressions(native,candidate)[0]['candidate_status'],'incomplete')
+        native=copy.deepcopy(candidate)
+        self.assertEqual(regressions(native,candidate),[])
+
     def test_one_bad_repeat_boot_cannot_be_hidden(self):
         result = check([report(),report()],[report(),report(False)])
         self.assertFalse(result['passed'])

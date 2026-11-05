@@ -33,3 +33,14 @@ to the screened prototype. `vllm/series` adds it after the eight preceding
 patches; the fresh nine-patch application equals both overlays. Before any model
 start, requalify this exact integrated class, including bind after frozen kernel
 declarations, actual/sanitizer/lifecycle checks and two fresh timing processes.
+
+The integrated retry at `cecb7aab` passes binding all70 declared calls across
+eight configurations after freezing the compiler cache, all12 actual batches,
+strict initialization with zero sanitizer errors and all six lifecycle cases.
+Two fresh timing processes retain source ratios1.075x,1.701x and2.042x for
+rows1/8/64. The single-row conditional interval[0.944,1.242] remains wide;
+the eight/64-row intervals are[1.643,1.762] and[2.010,2.074]. These are component
+results with small-sample assumptions, not request or quality guarantees.
+Every command/sample and memory observation remains in `runs/runtime-gates-01`.
+The lease releases at20:11:20 UTC with no remaining containers. The profile
+remains unpromoted and must face independent model quality/performance tests.

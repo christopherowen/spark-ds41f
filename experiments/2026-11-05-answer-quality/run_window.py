@@ -176,7 +176,11 @@ def main():
                 checks = []
                 for old,new in zip(base_answer['phases'],answer['phases']):
                     quality = paired(old['records'],new['records'])
-                    incomplete = [r['id'] for r in new['records'] if r['status'] != 'complete' or r.get('finish_reason') != 'stop']
+                    native_rows={r['id']:r for r in old['records']}
+                    incomplete = [r['id'] for r in new['records']
+                                  if (r['status'] != 'complete' or r.get('finish_reason') != 'stop')
+                                  and native_rows[r['id']]['status']=='complete'
+                                  and native_rows[r['id']].get('finish_reason')=='stop']
                     checks.append({'phase':new['name'],'losses':quality['losses'],'incomplete':incomplete})
                 if any(c['losses'] or c['incomplete'] for c in checks):
                     (out/('quality-reject-'+label+'.json')).write_text(json.dumps({'passed':False,'checks':checks,'scope':'early observed-regression rejection; not a two-boot performance comparison'},indent=2)+'\n')
