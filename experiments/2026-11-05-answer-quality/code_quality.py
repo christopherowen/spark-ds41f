@@ -87,6 +87,8 @@ def final_code(content):
         return None
     if '```' not in content:
         return content.strip()
+    if content.count('```') != 2:
+        return None
     blocks = re.findall(r'```(?:python|py)?\s*\n(.*?)```',content,re.DOTALL|re.IGNORECASE)
     return blocks[0].strip() if len(blocks) == 1 else None
 

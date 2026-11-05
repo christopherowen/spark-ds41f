@@ -55,6 +55,7 @@ class AnswerTests(unittest.TestCase):
         self.assertEqual(final_code('Here is the solution:\n```python\ndef f(): return 1\n```'),'def f(): return 1')
         self.assertEqual(final_code('def f(): return 1'),'def f(): return 1')
         self.assertIsNone(final_code('```python\ndef f(): return 1\n```\n```python\ndef f(): return 2\n```'))
+        self.assertIsNone(final_code('```javascript\nfunction f() {}\n```\n```python\ndef f(): return 2\n```'))
         self.assertIsNone(final_code(None))
 
     def test_superiority_counts_only_independent_task_wins_and_losses(self):
