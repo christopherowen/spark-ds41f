@@ -133,3 +133,10 @@ no GPU, no network, a read-only root/source/inputs, a temporary work directory,
 limited CPU/memory/processes and host UID/GID. Canonical solutions provide the
 independent expected outputs. Short coding prompts are a regression check and do
 not demonstrate long-context LSA quality gains. No coding model result is claimed.
+
+CPU-only checker preparation succeeds on sp8 in `runs/prepare-evalplus-01`:
+the official canonical HumanEval/0 solution passes all 7 base and 999 additional
+tests, and a deliberately wrong program fails both groups. The container has no
+GPU or network access; it is removed and the preparation reservation released.
+Eight local oracle/selection tests pass. This validates the grading path, not
+model coding quality.
