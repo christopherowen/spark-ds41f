@@ -50,9 +50,14 @@ def telemetry():
     fields = output('nvidia-smi', '--query-gpu=uuid,temperature.gpu,clocks.gr,clocks.mem,memory.used,power.draw',
                     '--format=csv,noheader,nounits').split(',')
     assert len(fields) == 6, fields
-    return {'time': time.time(), 'host_available_bytes': available, 'gpu_uuid': fields[0].strip(),
-            'temperature_c': float(fields[1]), 'graphics_mhz': float(fields[2]),
-            'memory_mhz': float(fields[3]), 'gpu_used_mib': float(fields[4]), 'power_w': float(fields[5])}
+    def number(value):
+        try:
+            return float(value)
+        except ValueError:
+            return None  # GB10 does not expose every discrete-GPU telemetry field.
+    return {'raw_gpu_fields': [field.strip() for field in fields], 'time': time.time(), 'host_available_bytes': available, 'gpu_uuid': fields[0].strip(),
+            'temperature_c': float(fields[1]), 'graphics_mhz': number(fields[2]),
+            'memory_mhz': number(fields[3]), 'gpu_used_mib': number(fields[4]), 'power_w': number(fields[5])}
 
 
 window = hold()
