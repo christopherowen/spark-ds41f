@@ -826,6 +826,7 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
         logprob.register_topk_scores_warmup(
             logits=pairs, vocab_size=257, logits_mode=False
         )
+        tilelang_logprob.register_ranks(pairs, 257, selected_scores=True)
     prepare.prepare_declared(registry)
     prepare.freeze("native score inputs warmup test")
     for dtype, _ in pairs:
@@ -847,6 +848,26 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
                 for topk in (0, 5):
                     actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
                     assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
+                if ids.stride(1) == 1:
+                    expected_ranks = torch.empty(3, device=DEVICE, dtype=torch.int64)
+                    tilelang_logprob.token_ranks(logits, ids[:, 0], expected_ranks)
+                    for logits_mode in (False, True):
+                        scores = torch.empty(
+                            ids.shape, device=DEVICE, dtype=torch.float32
+                        )
+                        ranks = torch.empty_like(expected_ranks)
+                        tilelang_logprob.prompt_scores_and_ranks(
+                            logits, ids, scores, ranks, logits_mode=logits_mode
+                        )
+                        expected = (
+                            logits.gather(1, ids.long()).float()
+                            if logits_mode
+                            else logprob.compute_token_logprobs(logits, ids)
+                        )
+                        assert torch.equal(
+                            scores.view(torch.uint8), expected.view(torch.uint8)
+                        )
+                        assert torch.equal(ranks, expected_ranks)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

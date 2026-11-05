@@ -100,3 +100,14 @@ normal rank/log-softmax paths reuse their bodies with the extra work disabled;
 their generated-program identity must be verified. New bitwise tests compare
 against the independent kernels for FP16/BF16/FP32 and both ID widths, including
 NaN, infinity and signed zero. No modified program is accepted without tests.
+
+## Fused-path precheck and unchanged-path proof
+
+The fused prompt path passes all 76 focused tests on both boots of source
+`73e25e5d5b68f9504760cc63bc8f018402668e5c`. Both native-input identity boots
+match all 120 per-case qualified CUDA programs, reference programs, input hashes
+and strides exactly. Their output checks also pass. This transfers the existing
+GPU qualification of normal score/selection paths; it does not substitute for
+performance measurements of the new fused paths or for host/model qualification.
+`0008` exercises both new prompt-score modes under startup cache freeze and
+formats a host-side sampler binding; it changes no GPU program.

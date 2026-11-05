@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Node-local isolated IKET run; serving source comes only from the pinned image.
+"""Isolated full-model CUDA inventory with a verified, published Python overlay.
 
 Run on sp8 with stdin from this file. This controller is an experiment input,
 not a serving overlay. It uses the already-published 43-layer harness on sp8.

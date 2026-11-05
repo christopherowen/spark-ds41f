@@ -133,6 +133,10 @@ spec = importlib.util.spec_from_file_location("previous_sampling", HERE / "contr
 previous_sampling = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = previous_sampling
 spec.loader.exec_module(previous_sampling)
+spec = importlib.util.spec_from_file_location("previous_collectives", HERE / "control/collectives.py")
+previous_collectives = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = previous_collectives
+spec.loader.exec_module(previous_collectives)
 flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
 
 
@@ -298,8 +302,13 @@ if args.family in ("gather", "all"):
                 collectives._rank_rows_tail(src, out, 3, count, 5 * src.element_size())
                 return out
 
+            def before(src=src, out=out, count=count):
+                previous_collectives.rank_rows_bytes_kernel()(src.view(-1).view(torch.uint8),
+                    out.view(-1).view(torch.uint8), 3, count, 5 * src.element_size())
+                return out
+
             run_case(f"gather-tail-{dtype}-{count}",
-                     dict(reference=reference, candidate=launch, previous=launch, null=reference),
+                     dict(reference=reference, candidate=launch, previous=before, null=reference),
                      expected, dict(world=3, shape=[count, 15],
                                     reference="same TensorIterator copy as movedim reshape, shared output"))
 

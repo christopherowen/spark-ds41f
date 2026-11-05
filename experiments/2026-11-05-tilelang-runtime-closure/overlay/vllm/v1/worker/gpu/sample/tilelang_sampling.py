@@ -3506,7 +3506,8 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
             and logits.shape[1] >= 4096
             else 1024
         )
-        _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized, span)(logits, out)
+        kernel = _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized, span)
+        kernel(logits, out)
     return out
 
 
