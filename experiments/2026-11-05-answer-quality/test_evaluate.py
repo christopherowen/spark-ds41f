@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import evaluate
 from prepare import select
+from summarize import paired
 
 
 class Response:
@@ -48,6 +49,16 @@ class AnswerTests(unittest.TestCase):
     def test_no_fuzzy_guess_for_missing_answer_format(self):
         row=self.run_case('I discussed the possibilities.')
         self.assertFalse(row['correct']);self.assertEqual(row['status'],'unparsed-final')
+
+    def test_superiority_counts_only_independent_task_wins_and_losses(self):
+        native=[{'id':str(i),'prompt_sha256':str(i),'expected':'A','correct':False} for i in range(5)]
+        lsa=[dict(r,correct=True) for r in native]
+        result=paired(native,lsa)
+        self.assertEqual(result['n_independent_documents'],5)
+        self.assertEqual(result['accuracy_delta'],1)
+        self.assertEqual(result['exact_one_sided_discordant_pair_p'],1/32)
+        self.assertEqual(paired(lsa,native)['exact_one_sided_discordant_pair_p'],1)
+        self.assertEqual(paired(lsa,lsa)['exact_one_sided_discordant_pair_p'],1)
 
     def test_frozen_selection_is_disjoint_and_order_independent(self):
         catalog=[{'id':f'{d}-{length}-{i}','domain':str(d),'prompt_tokens_untemplated':length,'context_sha256':f'context-{d}-{length}-{i}'}
