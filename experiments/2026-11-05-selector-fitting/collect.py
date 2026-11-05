@@ -96,6 +96,10 @@ def main():
     (out/'source.json').write_text(json.dumps({'commit':commit,'cases':[{k:v for k,v in r.items() if k!='prompt'} for r in cases],
         'purpose':'untimed native operand collection; no benchmark questions or fitted maps'},indent=2)+'\n')
     w.run([sys.executable,str(PAGE),'--out',str(out/'preflight'),'--preflight-only'],out,'preflight')
+    # Validate the remote payload and private output path before opening a GPU
+    # window, so a control error cannot spend a model boot and restoration.
+    checked = w.each(ARM,{'action':'check'})
+    (out/'capture-directory-check.json').write_text(json.dumps(checked,indent=2)+'\n')
     if args.preflight_only:return
     # Require a quiet restored service before taking its separate Spaceport
     # reservations. A queued user request yields after the current capture.
@@ -142,7 +146,6 @@ def main():
         try:
             w.REL = str(HERE.relative_to(ROOT));w.start('capture',out,'boot-capture')
         finally:w.REL = previous
-        w.each(ARM,{'action':'check'})
         private.mkdir(mode=0o700,parents=True,exist_ok=False)
         model = request('/v1/models')['data'][0]['id'];assert model == 'deepseek-v4.1-flash'
         for case in cases:
