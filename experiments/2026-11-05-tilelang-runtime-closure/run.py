@@ -57,7 +57,7 @@ def main():
     parser.add_argument(
         "--operations",
         nargs="+",
-        choices=["tests", "bench", "pair", "iket"],
+        choices=["tests", "bench", "pair", "iket", "identity"],
         default=["tests", "pair", "iket"],
     )
     parser.add_argument("--paired-rounds", type=int, choices=(120, 480), default=120)

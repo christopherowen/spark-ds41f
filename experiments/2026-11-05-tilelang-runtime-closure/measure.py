@@ -9,10 +9,11 @@ import json
 from pathlib import Path
 import sys
 import time
+import subprocess
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=("tests", "pair", "bench", "iket"))
+parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity"))
 parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
@@ -62,7 +63,69 @@ if args.operation == "tests":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     raise SystemExit(code)
 
-assert args.operation in ("pair", "bench"), "IKET uses the combined inventory harness"
+if args.operation == "identity":
+    native = HERE.parent / "2026-11-04-native-score-inputs"
+    original = (native / "measure.py").read_text()
+    reference = args.out / "reference"
+    reference.mkdir()
+    for name in ("tilelang_logprob.py", "tilelang_topk_ids.py"):
+        prior = HERE.parent / "2026-11-04-logits-scores/overlay/vllm/v1/worker/gpu/sample" / name
+        if not prior.exists():
+            # The selection source is unchanged by that prerequisite.
+            prior = HERE / "overlay/vllm/v1/worker/gpu/sample" / name
+        (reference / name).write_bytes(prior.read_bytes())
+    body = original[original.index("\nimport torch  # noqa: E402"):]
+    body = body.replace("    candidate=candidate,", "    candidate=candidate, combined_candidate=combined_candidate,")
+    args.operation = "pair"
+    context = dict(__name__="__main__", __file__=str(native / "measure.py"),
+                   HERE=native, args=args, reference_dir=reference,
+                   base=json.loads((native / "base.json").read_text()),
+                   candidate=json.loads((native / "candidate.json").read_text()),
+                   combined_candidate=candidate, source=source,
+                   Counter=Counter, hashlib=hashlib, json=json, Path=Path,
+                   subprocess=subprocess, sys=sys, time=time,
+                   statistics=__import__("statistics"))
+    exec(compile(body, str(native / "measure.py"), "exec"), context)
+    raise AssertionError("identity proof did not terminate")
+
+if args.operation == "iket":
+    harness = HERE.parent / "2026-10-31-iket-full-43l-and-runtime-opt/harness/iket_profile.py"
+    command = [sys.executable, str(harness), str(args.out / "profile"),
+               "--timeout", "300", "--single-pass-max-ts", "256", "--pool-gb", "0.25",
+               "--skip-raw-data-dump", "--", sys.executable, str(HERE / "iket_probe.py"),
+               "--out", str(args.out / "probe")]
+    (args.out / "iket-command.json").write_text(json.dumps(command, indent=2) + "\n")
+    subprocess.run(command, check=True)
+    decoded_paths = list((args.out / "profile/trace").rglob("iket.decoded_results.json"))
+    assert decoded_paths
+    launches = []
+    for path in decoded_paths:
+        decoded = json.loads(path.read_text())
+        strings = decoded["stringTable"]
+        captured = list(decoded["launches"])
+        graphs = decoded.get("graphLaunches") or {}
+        for group in graphs.values() if isinstance(graphs, dict) else graphs:
+            captured.extend(group if isinstance(group, list) else group.get("launches", []))
+        for launch in captured:
+            if not isinstance(launch, dict) or "ranges" not in launch:
+                continue
+            assert launch["ranges"] and launch["warpLifetimes"], launch["kernelName"]
+            assert all(r["endTs"] >= r["startTs"] for r in launch["ranges"])
+            launches.append(dict(kernel=launch["kernelName"], grid=launch["gridId"],
+                range_names=[strings[r["rangeNameIdx"]] for r in launch["ranges"]],
+                warps=len(launch["warpLifetimes"])))
+    names = {row["kernel"] for row in launches}
+    required = {"copy_logits", "collectives_rank_order_strided", "collectives_rank_order_sum",
+                "gather_columns_into", "collectives_rank_rows_bytes", "topk_log_softmax_ranks",
+                "token_ranks_scores", "topk_ids"}
+    assert required <= names, (required - names, names)
+    result = dict(identity, launches=launches, required=sorted(required),
+                  numerics=json.loads((args.out / "probe/numerics.json").read_text()),
+                  seconds=time.monotonic() - started)
+    (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    raise SystemExit(0)
+
+assert args.operation in ("pair", "bench")
 from vllm.v1.worker.gpu.sample import tilelang_sampling as sampling
 from vllm.models.deepseek_v4_1.tilelang import collectives, gather
 
