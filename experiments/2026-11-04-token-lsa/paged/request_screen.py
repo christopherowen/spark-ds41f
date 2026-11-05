@@ -87,9 +87,11 @@ def timed(url,case,payload):
     began = time.perf_counter()
     with urllib.request.urlopen(request,timeout=900) as response:
         body = response.read()
-    elapsed = time.perf_counter()-began
+    finished = time.perf_counter()
+    elapsed = finished-began
     result = json.loads(body)
     return {'id':case['id'],'input_sha256':identity,'seconds':elapsed,
+            'started_monotonic_s':began,'finished_monotonic_s':finished,
             'usage':result['usage'],'choices_sha256':digest([
                 {k:c.get(k) for k in ('index','text','finish_reason','stop_reason')}
                 for c in result['choices']]),'raw_token_capture':False}
@@ -107,7 +109,12 @@ def benchmark(url,directory,out):
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             cold = list(pool.map(lambda payload:timed(url,case,payload),payloads))
             warm = [list(pool.map(lambda payload:timed(url,case,payload),payloads)) for _ in range(3)]
-        result['cases'].append({'length':length,'concurrency':concurrency,'cold':cold,'cached_repeats':warm})
+        def totals(records):
+            wall = max(r['finished_monotonic_s'] for r in records)-min(r['started_monotonic_s'] for r in records)
+            outputs = sum(r['usage']['completion_tokens'] for r in records)
+            return {'first_send_to_last_response_s':wall,'completion_tokens':outputs,'aggregate_output_tokens_per_s':outputs/wall}
+        result['cases'].append({'length':length,'concurrency':concurrency,'cold':cold,'cached_repeats':warm,
+                                'cold_batch':totals(cold),'cached_batches':[totals(group) for group in warm]})
         Path(out).write_text(json.dumps(result,indent=2)+'\n')
 
 

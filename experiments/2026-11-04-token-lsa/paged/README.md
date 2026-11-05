@@ -122,3 +122,41 @@ independent all-node check at06:33:38UTC on November5 confirms clean checkouts,
 no experimental mounts/environment, and no reservations. The retry uses sp8
 and simplifies the identity loop to a static bound with guarded stores and a
 local predicate, retaining the same candidate identities/counts.
+
+
+At`a9c76f5d`, sp8 passes both fresh boundary/lifecycle processes and all four
+synthetic pipeline timing processes. The row256 versus row8 graph-GPU speedup
+is1.225x at32768 keys (joint95% interval1.147–1.309) and1.091x at131072 keys
+(interval0.938–1.299). These compare batching only, not LSA against native or
+whole requests. Workspace rises from3,074,112 to98,371,584 bytes. Required plan
+construction is reported separately. Complete samples and lifecycle receipts
+are in`../runs/sp8-batch-02`; the exclusive sp8 reservation and containers were
+removed after completion.
+
+The next screen measures diagnostic request performance independently of token
+qualification. Earlier screens stopped timing on any mismatch, leaving the
+request-performance question unanswered. An explicitly failed raw-token gate may
+now retain timings; it still disqualifies acceptance. Identity errors, absent raw
+IDs or malformed responses stop the screen. Reference and token comparisons stay
+outside timed requests. The repository's cooling, fan and memory controls cover
+all three nodes during each timed boot; thermal slowdown invalidates comparison.
+
+Predeclared interaction: use the qualified row256/covered-domain implementation
+with two selector operating points, aggressive64/512 and dense1536/native-source.
+Both differ from the same native control only through shortlist query/maintenance
+work; all admit the same73-byte cache geometry. The six fresh-process order is
+native-A, aggressive-A, wide-A, wide-B, aggressive-B, native-B. Compare each
+candidate against the two native boots; repeat the saved serial native gate and
+the current four-concurrent native gate to test reference stability. This is a
+synthetic screen, not production-agent qualification. No changed-token quality
+superiority is established. The window restores tracked C37 once on completion.
+
+Exact next invocation, from a clean published controller checkout on sp5:
+
+```sh
+python3 experiments/2026-11-04-token-lsa/paged/run_serving.py \
+  --out /home/chris/spark-lab/results/clustered-indexer/request-diagnostic-01 \
+  --reference-private /home/chris/spark-lab/private/token-lsa-paged/paged-serving-01 \
+  --diagnostic-profiles control-a:control aggressive-a:aggressive-fast \
+  wide-a:dense-1536-fast wide-b:dense-1536-fast aggressive-b:aggressive-fast control-b:control
+```

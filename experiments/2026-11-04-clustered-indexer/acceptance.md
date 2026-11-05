@@ -31,3 +31,9 @@ does not replace it.
 The target remains substantial request-level acceleration, repeated candidate
 boots and uncertainty. Released builds are not timed again. Runtime-window,
 memory/admission, coordinated-restore, publication and promotion rules remain.
+
+Diagnostic request timing may proceed after an explicitly recorded token mismatch.
+Such timings describe the failed candidate and cannot establish an accepted
+speedup. Input identity errors, missing raw IDs or malformed responses remain
+errors. Fidelity and performance are reported independently; acceptance requires
+both. Native repeat captures check whether the reference itself is stable.
