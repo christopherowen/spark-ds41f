@@ -30,7 +30,7 @@ invariance separately. Every timed row writes a live cache slot. Skipped-slot ch
 run separately; inputs cover the first/last RoPE positions and cache page edges. The arithmetic remains norm in FP32, BF16 round, then
 E4M3/UE8M0 quantization. No rescaling across the projection is allowed.
 
-Measure CUDA-graph chains with weights resident in L2, after a 128 MiB eviction,
+Measure CUDA-graph chains with weights resident in L2, after resetting persisting L2 priority in the benchmark context and a 128 MiB eviction,
 and after eviction racing the serving TileLang bulk L2 prefetch on another stream.
 Keep all raw samples and two fresh process/container runs. The prefetch arm races only the Q-B segments, not a reconstructed whole-model NEXT window. These are kernel-lab
 process restarts, not serving boots. A winning screen would require a separate
@@ -76,3 +76,5 @@ that failed before recovery are retained in `runs/recovery.txt`.
 Status: prepared; no performance conclusion until the raw receipts exist.
 
 Additional audit: index-key and compression normalization reduce each live row once; Engram gating reduces each distinct token/stream residual and key once. These do not duplicate a hidden-row norm across projection output tiles.
+
+Cache control follows the recorded GB10 L2-policy finding in `experiments/2026-10-25-moe-overlap`: evict-last lines survive an ordinary scrub even at zero set-aside. Cold and racing-prefetch trials therefore reset persisting priority before eviction; warm trials prime the exact graph immediately before timing. No device-wide setting or serving context is changed.

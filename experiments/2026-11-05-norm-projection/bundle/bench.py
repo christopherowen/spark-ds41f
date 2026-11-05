@@ -8,6 +8,7 @@ import statistics
 from types import SimpleNamespace
 
 import torch
+from cuda.bindings import driver as cu
 
 from vllm.models.deepseek_v4_1.tilelang import pdl
 from vllm.models.deepseek_v4_1.tilelang.cache_writer import RECORD_BYTES, write_cache
@@ -149,7 +150,7 @@ def main():
     emit(identity={"image_vllm_tree": "c061e5f6931306fa4655ba531428f639c365bf10",
                    "torch": torch.__version__, "gpu": torch.cuda.get_device_name(),
                    "rows": ROWS, "variants": VARIANTS, "sm_count": torch.cuda.get_device_properties(0).multi_processor_count, "weights": "seeded synthetic checkpoint shapes",
-                   "evict_bytes": 128 << 20, "prefetch_grid": 2,
+                   "evict_bytes": 128 << 20, "reset_persisting_l2_before_eviction": True, "prefetch_grid": 2,
                    "prefetch_block": 128, "prefetch_chunk": 4096})
     evict = torch.ones((128 << 20) // 4, device="cuda", dtype=torch.int32)
     prefetch = l2_prefetch_kernel(2, 128, 4096)
@@ -224,7 +225,16 @@ def main():
                     for variant in order:
                         start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
                         if mode != "l2":
+                            # GB10 evict-last lines survive a normal scrub. Reset
+                            # their priority in this benchmark's current context
+                            # before reading the 128 MiB eviction buffer.
+                            status, = cu.cuCtxResetPersistingL2Cache()
+                            assert status == cu.CUresult.CUDA_SUCCESS, status
                             evict.max()
+                        else:
+                            # Prime this exact chain immediately before its timed
+                            # 20-call graph, independent of the preceding arm.
+                            warm[variant].replay()
                         start.record()
                         {"l2": warm, "cold": graphs, "prefetch": racing}[mode][variant].replay()
                         end.record()
