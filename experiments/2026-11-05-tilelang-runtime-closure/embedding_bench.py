@@ -13,6 +13,8 @@ from vllm.models.deepseek_v4_1.tilelang import embedding
 
 p = argparse.ArgumentParser()
 p.add_argument('--out', type=Path, required=True)
+p.add_argument('--rounds', type=int, default=120)
+p.add_argument('--case-filter', type=Path)
 a = p.parse_args()
 here = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location(
@@ -59,6 +61,9 @@ for packed in (False, True):
                 storage = torch.randint(-8, rows, (count * stride + 1,), device='cuda', dtype=dtype)
                 ids = storage[1::stride]
                 assert ids.shape == (count,)
+                label = f'{packed}-{dtype}-{count}-{stride}'
+                if a.case_filter and label not in json.loads(a.case_filter.read_text()):
+                    continue
                 expected = torch.nn.functional.embedding(ids.clamp_min(0).long(), original)
 
                 def reference():
@@ -72,7 +77,7 @@ for packed in (False, True):
                 label = f'{packed}-{dtype}-{count}-{stride}'
                 launches = dict(reference=reference, candidate=candidate,
                                 previous=reference, null=reference)
-                measured, _ = measure(launches, flush, 20261105, expected)
+                measured, _ = measure(launches, flush, 20261105, expected, rounds=a.rounds)
                 profiles = {}
                 for role in ('reference', 'candidate'):
                     launches[role]()

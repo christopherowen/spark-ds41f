@@ -13,7 +13,7 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer", "activity", "embedding_bench"))
+parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer", "activity", "embedding_bench", "draft_bench"))
 parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "draft", "embedding", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
@@ -63,10 +63,19 @@ if args.operation == "tests":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     raise SystemExit(code)
 
+if args.operation == "draft_bench":
+    import runpy
+    script = HERE / "draft_bench.py"
+    sys.argv = [str(script), "--out", str(args.out)]
+    runpy.run_path(str(script), run_name="__main__")
+    raise SystemExit(0)
+
 if args.operation == "embedding_bench":
     import runpy
     script = HERE / "embedding_bench.py"
-    sys.argv = [str(script), "--out", str(args.out)]
+    sys.argv = [str(script), "--out", str(args.out), "--rounds", str(args.rounds)]
+    if args.case_filter:
+        sys.argv += ["--case-filter", str(args.case_filter)]
     runpy.run_path(str(script), run_name="__main__")
     raise SystemExit(0)
 
@@ -131,7 +140,9 @@ if args.operation == "iket":
     names = {row["kernel"] for row in launches}
     required = {"copy_logits", "collectives_rank_order_strided", "collectives_rank_order_sum",
                 "gather_columns_into", "collectives_rank_rows_bytes", "collectives_rank_rows_small", "topk_log_softmax_ranks",
-                "token_ranks_scores", "topk_ids"}
+                "token_ranks_scores", "topk_ids", "vocab_embedding", "vocab_packed_embedding",
+                "vocab_packed_markov_greedy_partials", "vocab_greedy_finish",
+                "select_first_argmax_embed"}
     normalized = {name.removesuffix("_kernel") for name in names}
     assert required <= normalized, (required - normalized, names)
     result = dict(identity, launches=launches, required=sorted(required),

@@ -81,6 +81,54 @@ for count in (7, 129):
         exercise(f"gather-tail-{count}-{dtype}",
                  lambda: collectives.concat_rank_shards(source, 3, (count, 5)), expected)
 
+
+# The native TP1 lookup, including negative and strided integer IDs.
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.models.deepseek_v4_1.tilelang import embedding, vocab
+from vllm.v1.worker.gpu.spec_decode.dspark.greedy import select_first_argmax
+from types import SimpleNamespace
+
+original = torch.randn((512, 256), device="cuda", dtype=torch.bfloat16)
+for packed in (False, True):
+    method = embedding.TileLangEmbeddingMethod()
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(original.clone(), requires_grad=False)
+    layer.shard_indices = SimpleNamespace(org_vocab_start_index=0, org_vocab_end_index=512,
+        num_org_vocab_padding=0, added_vocab_start_index=512, added_vocab_end_index=512)
+    layer.tp_size, layer.quant_method = 1, method
+    if packed:
+        method.process_weights_after_loading(layer)
+    for dtype in (torch.int32, torch.int64):
+        ids = torch.tensor([-4, 88, 1, 99, 7, 77], device="cuda", dtype=dtype)[::2]
+        expected = torch.nn.functional.embedding(ids.clamp_min(0).long(), original)
+        exercise(f"native-embedding-{packed}-{dtype}",
+                 lambda: VocabParallelEmbedding.forward(layer, ids), expected)
+
+# A complete single-rank fused Markov projection/selection/next embedding.
+packed = vocab.pack_bf16_weight(original)
+head = SimpleNamespace(weight=packed.values, weight_exception_rows=packed.exception_rows,
+    weight_exception_entries=packed.exception_entries, weight_row_offsets=packed.row_offsets,
+    packed_bf16_in_features=256, packed_bf16_exponent_base=packed.exponent_base,
+    tilelang_max_rows=16, tilelang_markov_head=True)
+vocab.prepare_packed_head(head, torch.float32)
+markov = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
+base = torch.randn((2, 512), device="cuda")
+reference = (vocab.project_head(head, markov) + base)[:, :257].argmax(-1)
+pairs = torch.empty((2, 4), device="cuda")
+out_ids = torch.empty(2, dtype=torch.int64, device="cuda")
+step = torch.empty_like(markov)
+confidence = torch.empty_like(markov)
+
+def fused_step():
+    vocab.project_head_markov_greedy_pairs(head, markov, base, vocab=257,
+                                         vocab_start=0, out=pairs)
+    select_first_argmax(pairs, out_ids, pair_width=4,
+                        embed=(original, step, confidence))
+    return out_ids, step, confidence
+
+exercise("single-rank-fused-Markov", fused_step,
+         (reference, original[reference], original[reference]))
+
 for id_dtype in (torch.int32, torch.int64):
     logits = torch.randn((5, 264), device="cuda")[:, :257]
     ids = torch.randint(257, (10,), device="cuda", dtype=id_dtype)[::2]

@@ -57,20 +57,23 @@ def main():
     parser.add_argument(
         "--operations",
         nargs="+",
-        choices=["tests", "bench", "pair", "iket", "identity", "copy_screen", "wire", "transfer", "activity", "embedding_bench"],
+        choices=["tests", "bench", "pair", "iket", "identity", "copy_screen", "wire", "transfer", "activity", "embedding_bench", "draft_bench"],
         default=["tests", "pair", "iket"],
     )
-    parser.add_argument("--paired-rounds", type=int, choices=(120, 480), default=120)
+    parser.add_argument("--paired-rounds", type=int, choices=(120, 480, 2048), default=120)
     parser.add_argument("--case-filter", type=Path)
     parser.add_argument("--boots", type=int, nargs="+", choices=(1, 2), default=[1, 2])
     parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "draft", "embedding", "all"), default="sampler")
     args = parser.parse_args()
     if args.case_filter:
-        assert args.operations in (["pair"], ["activity"]), "filtered runs contain only paired jobs"
+        assert args.operations in (["pair"], ["activity"], ["embedding_bench"]), "filtered runs contain only paired jobs"
         case_filter = (ROOT / args.case_filter).resolve()
         assert case_filter.is_file() and case_filter.is_relative_to(
             ROOT / "experiments"
         )
+
+    if args.paired_rounds == 2048:
+        assert args.operations == ["embedding_bench"] and args.case_filter
 
     assert socket.gethostname() == "spark-0016", "authorized only on idle sp8"
     assert not capture(["git", "-C", str(ROOT), "status", "--porcelain"]), (
@@ -255,7 +258,7 @@ def main():
                 "--out",
                 "/out/" + label,
             ]
-            if job["operation"] in ("pair", "activity"):
+            if job["operation"] in ("pair", "activity", "embedding_bench", "draft_bench"):
                 cmd += ["--rounds", str(args.paired_rounds)]
                 if args.case_filter:
                     cmd += ["--case-filter", "/r/" + str(case_filter.relative_to(ROOT))]

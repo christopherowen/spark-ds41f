@@ -47,9 +47,15 @@ def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=6
                 torch.cuda.current_stream().synchronize()
     profile.export_chrome_trace(str(out))
     trace = json.loads(out.read_text())
-    kernels = sorted((e for e in trace['traceEvents'] if e.get('cat') == 'kernel'),
-                     key=lambda e: e['ts'])
-    assert len(kernels) == rounds * len(launches) * 2 * samples, (len(kernels), samples)
+    all_kernels = sorted((e for e in trace['traceEvents'] if e.get('cat') == 'kernel'),
+                         key=lambda e: e['ts'])
+    expected_count = rounds * len(launches) * 2 * samples
+    assert len(all_kernels) == 2 * expected_count, (len(all_kernels), samples)
+    flush_kernels, kernels = all_kernels[::2], all_kernels[1::2]
+    # zero_ is an ATen fill in this image. Retain and validate it separately:
+    # the operation timer, like the original event interval, starts after flush.
+    assert all('FillFunctor<unsigned char>' in e['name'] for e in flush_kernels)
+    assert all('FillFunctor<unsigned char>' not in e['name'] for e in kernels)
     assert len({e['args']['stream'] for e in kernels}) == 1
     cursor, pairs, names = 0, [], {}
     for order in orders:
@@ -76,4 +82,7 @@ def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=6
     return dict(pairs=pairs, log_ratios=logs, samples_per_replay=samples,
                 timer='CUPTI GPU activity start/end, one stream, no CUDA event nodes in graphs',
                 activity_kernels=len(kernels), role_kernels=names,
+                cache_flush=dict(count=len(flush_kernels),
+                    kernels=sorted({e['name'] for e in flush_kernels}),
+                    mean_duration_us=statistics.fmean(e['dur'] for e in flush_kernels)),
                 trace_sha256=hashlib.sha256(out.read_bytes()).hexdigest()), None

@@ -268,3 +268,30 @@ input/table contiguity guard still rejected them. `0017` relaxes only the native
 input side; packed table and output requirements remain strict. No GPU program
 changes. Both full test boots and the performance screen are rerun; the first
 failure remains part of the evidence.
+
+## Focused final results and precision extension
+
+Both embedding boots pass 127 tests. All four inspected parallel CUDA sources
+(two ID widths, plain/packed) are byte-identical to their previous programs.
+Of 32 public-route timing cases, three have lower primary means but insufficient
+precision on one boot each. One fixed 2,048-round extension is predeclared for
+`embedding-extension-cases.json`: the large-case observed variance needs roughly
+900 or more rounds to resolve its ~0.2% change at five standard errors. Both
+boots must retain a non-increasing primary mean and pass extension and pooled
+zero-margin bounds. No further extension is allowed to rescue this variant.
+The same full input-generation traversal preserves IDs and weight hashes.
+
+The first CUPTI tail attempt records two kernels per sample: the cache flush is
+an ATen uint8 fill in this image, followed by the actual copy. The original event
+timer excluded the flush too. The activity parser now validates strict alternating
+flush/copy pairs and retains flush counts, names and average durations separately.
+A diagnostic reconstruction of the retained first pilot gives the tiny BF16
+copy ratio 0.8731 with upper bound 0.8794; fresh complete two-boot qualification
+is still required. No prior event result is relabeled.
+
+`draft_bench.py` compares complete five-position TP1 Markov sampling, including
+embeddings and confidence layout, with shared precomputed backbone/base logits.
+The original method branch and fused branch are measured with identical W1/W2,
+confidence weights, anchors and inputs at 1/8/16 requests and both score widths.
+IKET probes now include native embeddings and the single-rank fused Markov
+projection, finish and next-token embedding, in eager and graph modes.
