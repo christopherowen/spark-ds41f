@@ -1,0 +1,65 @@
+{
+  "scope": "All completed processing ran on sp8 unless marked local/interrupted. No GPU or serving run commands executed.",
+  "commands": [
+    {
+      "id": "initial-local-incomplete",
+      "command": "bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3.json build prepare --only vllm",
+      "result": "interrupted; no successful receipt"
+    },
+    {
+      "id": "cpu-1",
+      "command": "CPU-only Docker dependency image + TileLang import adapter; pytest --noconftest -p no:cacheprovider -q tests/models/test_deepseek_v4_1_ced_sp.py tests/models/test_deepseek_v4_1_ced_model.py tests/models/test_deepseek_v4_1_sp_prefill.py",
+      "receipt": "receipts/cpu-1.log"
+    },
+    {
+      "id": "cpu-2",
+      "command": "experiments/2026-11-05-ced-local-boundary/cpu.sh /home/chris/spark-lab/ced-local-boundary/vllm",
+      "receipt": "receipts/cpu-2.log"
+    },
+    {
+      "id": "fresh-source",
+      "command": "git clone --shared --no-checkout /home/chris/spark-lab/ced-local-boundary/vllm /home/chris/spark-lab/ced-local-boundary/fresh-vllm; git checkout -b verify/ced-local-boundary 19f2c20ed4d64ae22bd009ceacadd85e2a81e354; apply every ordered series path with git -c user.name='Christopher Owen' -c user.email=3221756+christopherowen@users.noreply.github.com am --quiet --committer-date-is-author-date PATCH; git diff --check 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 HEAD",
+      "receipts": [
+        "receipts/fresh-base.log",
+        "receipts/fresh-candidate.log"
+      ]
+    },
+    {
+      "id": "compile",
+      "command": "CPU-only container from cpu.sh, same source mount and limits, entrypoint python3 /check/compile.py",
+      "receipt": "receipts/kernel-compile-4.log",
+      "prior_errors": [
+        "receipts/kernel-compile.log",
+        "receipts/kernel-compile-2.log",
+        "receipts/kernel-compile-3.log"
+      ]
+    },
+    {
+      "id": "doctor",
+      "command": "bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json doctor",
+      "receipt": "receipts/doctor-candidate.log"
+    },
+    {
+      "id": "build-inputs",
+      "command": "bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json build prepare; bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json build check",
+      "receipt": "receipts/build-inputs-2.log",
+      "prior_error": "receipts/build-inputs.log"
+    },
+    {
+      "id": "tp3-plan",
+      "command": "scripts/lab.py run experiments/2026-11-05-ced-local-boundary/qualify-tp3.json --dry-run",
+      "receipt": "receipts/plan-tp3.log"
+    },
+    {
+      "id": "tp4-plan",
+      "command": "scripts/lab.py run experiments/2026-11-05-ced-local-boundary/qualify-tp4.json --dry-run",
+      "receipt": "receipts/plan-tp4.log",
+      "result": "site ring map missing; no runtime operation"
+    },
+    {
+      "id": "reproduce-final-series",
+      "command": "python3 experiments/2026-11-05-ced-local-boundary/verify_source.py --cache ../vllm --destination ../reproduce-vllm",
+      "receipt": "receipts/reproduce-source.log"
+    }
+  ]
+}

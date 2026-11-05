@@ -1,0 +1,469 @@
+From 2b320049a5df8e62e1b3ee70f53304d6d55a15e3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:57:21 +0000
+Subject: [PATCH] Keep CED boundary normalization local and select residual
+ rows before gather
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Integration base: candidate-36 at 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+
+The boundary needs every normalized row for global KV construction, but
+only selected replay rows of the four-stream residual carry. Normalize
+local SP rows, gather the global KV input and exchange compact carry slots.
+Keep the full-carry path for dense selections whose slots would cost more.
+
+Quality: retain the native weights, projections, replay selection and
+rank-order arithmetic. Integer ownership selection introduces no floating
+reduction and preserves signed zero and nonfinite payloads.
+
+Tests: 122 CPU tests passed, one GPU-only test skipped; full base series
+reapplies to the recorded tree. Added GPU mapping/graph cases are pending
+hardware qualification. No measured serving-throughput gain is claimed.
+Upstream status: experimental source-fork review; not proposed for promotion.
+---
+ .../kernels/test_deepseek_v41_tilelang_ced.py |  37 ++++
+ tests/models/test_deepseek_v4_1_ced_sp.py     | 192 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/ced.py              |  31 +++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  35 +++-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |   7 +-
+ vllm/models/deepseek_v4_1/tilelang/ced.py     |  29 +++
+ 6 files changed, 318 insertions(+), 13 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_ced_sp.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_ced.py b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+index 84ba69ed0..b7a3e1c47 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_ced.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+@@ -425,3 +425,40 @@ def test_ced_slots_and_routing_mask_match_the_torch_chain(rows):
+     expected = (indices >= 0) & ~gather_rows(is_padding, indices)
+     actual = ced.routing_mask(indices, is_padding)
+     assert actual.dtype == torch.bool and torch.equal(actual, expected)
++
++
++@pytest.mark.parametrize("world_size", [2, 3, 4])
++@pytest.mark.parametrize("rows", [1, 2, 31, 32, 33, 6144, 16384])
++def test_ced_sp_indices_and_graph_replay(world_size, rows):
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    local_rows = (rows + world_size - 1) // world_size
++    values = [-1, 0, rows - 1, rows, rows + 3, 0]
++    values += [
++        boundary + delta
++        for boundary in range(local_rows, rows, local_rows)
++        for delta in (-1, 0, 1)
++    ]
++    indices = torch.tensor(values, dtype=torch.int64, device="cuda")
++    local, merged = torch.empty_like(indices), torch.empty_like(indices)
++    kernel = ced.sp_indices_kernel()
++    for rank in range(world_size):
++        start = rank * local_rows
++        kernel(indices, local, merged, start, local_rows, rows)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            kernel(indices, local, merged, start, local_rows, rows)
++        for shift in (0, 1, -2):
++            changed = torch.tensor(values, dtype=torch.int64) + shift
++            indices.copy_(changed)
++            graph.replay()
++            valid = (changed >= 0) & (changed < rows)
++            own = valid & (changed >= start) & (changed < start + local_rows)
++            want_local = torch.where(own, changed - start, -1)
++            want_merged = torch.where(
++                valid,
++                changed // local_rows * len(values) + torch.arange(len(values)),
++                -1,
++            )
++            assert torch.equal(local.cpu(), want_local)
++            assert torch.equal(merged.cpu(), want_merged)
+diff --git a/tests/models/test_deepseek_v4_1_ced_sp.py b/tests/models/test_deepseek_v4_1_ced_sp.py
+new file mode 100644
+index 000000000..90ff0d9f6
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_ced_sp.py
+@@ -0,0 +1,192 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CED boundary selection and real model orchestration with CPU collectives.
++
++Integer GPU mapping and graph replay are tested in the TileLang CED suite.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++from tests.models.test_deepseek_v4_1_ced_model import _gather, _Layer, _scatter
++from tests.models.test_deepseek_v4_1_sp_prefill import _World
++from vllm.models.deepseek_v4_1 import ced, sp_prefill
++from vllm.models.deepseek_v4_1.nvidia import model as native
++
++
++def _index_reference(indices, local, merged, start, local_rows, total_rows):
++    valid = (indices >= 0) & (indices < total_rows)
++    own = valid & (indices >= start) & (indices < start + local_rows)
++    local.copy_(torch.where(own, indices - start, -1))
++    merged.copy_(
++        torch.where(
++            valid, indices // local_rows * len(indices) + torch.arange(len(indices)), -1
++        )
++    )
++
++
++def _copy_rows(source, indices, output, *, scatter):
++    assert not scatter
++    valid = (indices >= 0) & (indices < source.shape[0])
++    output.zero_()
++    output[valid] = source[indices[valid]]
++
++
++def _cpu_collectives(monkeypatch, world):
++    monkeypatch.setattr(ced.ced_kernels, "sp_indices_kernel", lambda: _index_reference)
++    monkeypatch.setattr(ced.ced_kernels, "copy_rows", _copy_rows)
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
++    )
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
++    )
++    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: False)
++
++
++@pytest.mark.parametrize("world_size", [2, 3, 4])
++@pytest.mark.parametrize("rows", [1, 2, 31, 32, 33])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_selected_sp_carries_preserve_bits(monkeypatch, world_size, rows, dtype):
++    world = _World(world_size)
++    _cpu_collectives(monkeypatch, world)
++    layout = sp_prefill.SPRows(rows, world_size, 0)
++    # Include signed zero and nonfinite payloads: an arithmetic reduction cannot
++    # stand in for selection. The final SP rank can contain only padding.
++    bits = torch.tensor([0, -32768, 0x7FC1, 0x7F80, -128, 0x3F80], dtype=torch.int16)
++    full = bits.repeat((layout.padded_rows * 4 + 5) // 6)[: layout.padded_rows * 4]
++    full = full.view(torch.bfloat16).reshape(layout.padded_rows, 4).to(dtype)
++    indices = torch.tensor([rows - 1, 0, -1, rows, rows + 11, rows - 1])
++    expected = full.new_zeros((len(indices), 4))
++    valid = (indices >= 0) & (indices < rows)
++    expected[valid] = full[indices[valid]]
++
++    def run(rank):
++        sp = sp_prefill.SPRows(rows, world_size, rank)
++        local = full[sp.start : sp.start + sp.local_rows]
++        return ced.gather_sp_rows(sp, indices, local, local[:, :2])
++
++    integer_dtype = torch.int16 if dtype == torch.bfloat16 else torch.int32
++    for actual, narrow in world.run(run):
++        assert torch.equal(actual.view(integer_dtype), expected.view(integer_dtype))
++        assert torch.equal(
++            narrow.view(integer_dtype), expected[:, :2].contiguous().view(integer_dtype)
++        )
++    empty = ced.gather_sp_rows(layout, indices[:0], full[: layout.local_rows])
++    assert empty[0].shape == (0, 4)
++    with pytest.raises(ValueError, match="expects"):
++        ced.gather_sp_rows(layout, indices, full[:0])
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++@pytest.mark.parametrize(
++    "rows, selection", [(31, "sparse"), (32, "sparse"), (33, "dense"), (1025, "replay")]
++)
++def test_sp_ced_boundary_matches_full_carry(monkeypatch, world_size, rows, selection):
++    world = _World(world_size)
++    _cpu_collectives(monkeypatch, world)
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(
++        native, "get_tensor_model_parallel_world_size", lambda: world_size
++    )
++    monkeypatch.setattr(native, "get_tensor_model_parallel_rank", lambda: world.rank)
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++    monkeypatch.setattr(native, "gather_rows", _gather)
++    monkeypatch.setattr(native, "scatter_rows", _scatter)
++    positions = torch.arange(100, 100 + rows)
++    ids = torch.arange(rows)
++    inputs = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2) / 8
++    if selection == "dense":
++        indices = torch.arange(rows - 1)
++    elif selection == "replay":
++        indices = torch.arange(rows - 128, rows)
++    else:
++        indices = torch.tensor([rows // 3 - 1, rows // 3, rows - 1, -1])
++    layout = sp_prefill.SPRows(rows, world_size, 0)
++    compact_exchange = len(indices) * world_size < rows
++
++    def partial(result, padded_rows):
++        padded = result.new_zeros((padded_rows, *result.shape[1:]))
++        if world.rank == 0:
++            padded[: result.shape[0]] = result
++        return world.reduce_scatter(padded, 0)
++
++    def run(min_rows):
++        shared, row_work, pre_rows = {}, [], []
++        layers = nn.ModuleList(_Layer(i, shared, row_work) for i in range(4))
++        for index, layer in enumerate(layers):
++            attention = layer.attn.forward
++            experts = layer.ffn.forward
++            pre = layer.mhc.pre
++
++            def attn(positions, hidden, scaling, original=attention):
++                sp = sp_prefill.current()
++                if sp is not None:
++                    hidden = sp.gather(hidden)
++                result = original(positions, hidden, scaling)
++                return result if sp is None else partial(result, sp.padded_rows)
++
++            def ffn(hidden, ids, *, reduce_scatter_rows=None, original=experts):
++                result = original(hidden, ids)
++                return (
++                    result
++                    if reduce_scatter_rows is None
++                    else partial(result, reduce_scatter_rows)
++                )
++
++            def track_pre(residual, *args, original=pre, index=index, **kwargs):
++                pre_rows.append((index, residual.shape[0]))
++                return original(residual, *args, **kwargs)
++
++            layer.attn.forward, layer.ffn.forward, layer.mhc.pre = attn, ffn, track_pre
++        target = SimpleNamespace(
++            embed_input_ids=lambda _: inputs,
++            prefill_sp_min_rows=min_rows,
++            prefill_sp_unreduced=False,
++            disk_engram=False,
++            engram_hash=None,
++            start_layer=0,
++            end_layer=4,
++            ced_decoder_start=2,
++            layers=layers,
++            aux_hidden_state_layers={2, 3, 4},
++            _sink_columns=None,
++            _graph_out=lambda index, rows: None,
++            glp=None,
++            norm=lambda hidden: hidden,
++        )
++        output, aux = native.DeepseekV4Model.forward(
++            target, ids, positions, None, inputs_embeds=inputs, ced_indices=indices
++        )
++        return output, aux, shared, pre_rows
++
++    expected, expected_aux, context, _ = run(0)
++    for output, aux, shared, pre_rows in world.run(lambda rank: run(4)):
++        assert torch.equal(output, expected)
++        for actual, want in zip(aux, expected_aux, strict=True):
++            assert torch.equal(actual, want)
++        assert shared["global_rows"] == rows
++        assert torch.equal(shared["global"], context["global"])
++        # First pre call at the boundary is normalization; post_pre also calls
++        # the mock pre, now with compact rows, after attention.
++        assert next(count for index, count in pre_rows if index == 2) == (
++            layout.local_rows if compact_exchange else rows
++        )
++
++
++def test_sp_index_mapping_is_declared_before_cache_freeze(monkeypatch):
++    calls = []
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    monkeypatch.setattr(
++        ced.prepare, "declare", lambda declaration, **kw: calls.extend(declaration())
++    )
++    state = ced.CEDState(8, 512, (128, 256, 512), "cpu")
++    state.warmup(5120, 4, pipeline=True, sink_columns=True)
++    assert (ced.ced_kernels.sp_indices_kernel, (), {}) in calls
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 88db39de4..dcbd2105e 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -14,6 +14,7 @@ from .tilelang import ced as ced_kernels
+ from .tilelang import columns, prepare
+ 
+ if TYPE_CHECKING:
++    from .sp_prefill import SPRows
+     from .sparse_mla import DeepseekV41B12xMetadata
+ 
+ CED_WINDOW = 128
+@@ -43,6 +44,35 @@ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+     return output
+ 
+ 
++def gather_sp_rows(
++    sp: SPRows, indices: torch.Tensor, *sources: torch.Tensor
++) -> tuple[torch.Tensor, ...]:
++    """Select global rows from local SP carries without gathering the full carry.
++
++    Each rank contributes one slot per selected row; only its owning rank fills
++    the slot. After a grouped gather, integer selection reads that owner's slot.
++    No floating-point reduction is introduced, including for signed zero and NaN.
++    """
++    from .sp_prefill import SPRows
++
++    for source in sources:
++        if source.shape[0] != sp.local_rows:
++            raise ValueError(
++                f"CED SP gather expects {sp.local_rows} rows, got {source.shape}"
++            )
++    if not indices.numel():
++        return tuple(source[:0] for source in sources)
++    local = torch.empty_like(indices)
++    merged = torch.empty_like(indices)
++    ced_kernels.sp_indices_kernel()(
++        indices, local, merged, sp.start, sp.local_rows, sp.num_tokens
++    )
++    selected = tuple(gather_rows(source, local) for source in sources)
++    compact = SPRows(indices.numel() * sp.world_size, sp.world_size, sp.rank)
++    gathered = compact.gather_many(*selected)
++    return tuple(gather_rows(source, merged) for source in gathered)
++
++
+ def scatter_rows(
+     source: torch.Tensor, indices: torch.Tensor, full_rows: int
+ ) -> torch.Tensor:
+@@ -194,6 +224,7 @@ class CEDState:
+         prepare.declare(
+             lambda: [
+                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
++                prepare.call(ced_kernels.sp_indices_kernel),
+                 prepare.call(ced_kernels.token_metadata_kernel),
+                 prepare.call(ced_kernels.routing_mask_kernel),
+                 prepare.call(ced_kernels.slots_kernel),
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 88663a15b..dec14a6de 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -55,7 +55,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
+ from .. import kernels, l2_prefetch, sp_prefill
+ from ..attention import DeepseekV4Attention
+-from ..ced import ced_decoder_start, gather_rows, scatter_rows
++from ..ced import ced_decoder_start, gather_rows, gather_sp_rows, scatter_rows
+ from ..common.engram import Engram, EngramLayout, NgramHashState
+ from ..glp import glp_steering
+ 
+@@ -402,14 +402,23 @@ class DeepseekV4DecoderLayer(nn.Module):
+         if ced_indices is not None:
+             # Decoder global KV needs every encoder row, but decoder queries,
+             # residual updates and experts only need the selected replay rows.
+-            self.attn.prepare_global_kv(positions, x)
+             del x_q
++            if sp_rows is not None:
++                # Normalize local rows, gather only the normalized global KV
++                # input, and exchange the selected replay rows of the carry.
++                x = sp_rows.gather(x)
++                residual, post_mix, res_mix, attn_pre = gather_sp_rows(
++                    sp_rows, ced_indices, residual, post_mix, res_mix, attn_pre
++                )
++                sp_rows = None
++            else:
++                residual = gather_rows(residual, ced_indices)
++                post_mix = gather_rows(post_mix, ced_indices)
++                res_mix = gather_rows(res_mix, ced_indices)
++                attn_pre = gather_rows(attn_pre, ced_indices)
++            self.attn.prepare_global_kv(positions, x)
+             x = gather_rows(x, ced_indices)
+             x_q = self.mhc.cast_rows(x)
+-            residual = gather_rows(residual, ced_indices)
+-            post_mix = gather_rows(post_mix, ced_indices)
+-            res_mix = gather_rows(res_mix, ced_indices)
+-            attn_pre = gather_rows(attn_pre, ced_indices)
+             positions = (
+                 gather_rows(positions, ced_indices)
+                 if ced_positions is None
+@@ -801,7 +810,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     ) -> torch.Tensor | IntermediateTensors:
+         sp = None
+         # With CED the encoder layers (before ced_decoder_start) still run on
+-        # every row; SP covers them and hands full rows to the boundary layer.
++        # every row; the boundary gathers global KV inputs and compact carries.
+         sp_layers_available = ced_indices is None or (
+             self.ced_decoder_start is not None
+             and self.start_layer < self.ced_decoder_start
+@@ -915,9 +924,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             start=self.start_layer,
+         ):
+             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
+-            if sp is not None and boundary_indices is not None:
+-                # The CED boundary layer builds the decoder's global KV from every
+-                # encoder row, then compacts; gather the carried rows first.
++            if (
++                sp is not None
++                and boundary_indices is not None
++                and boundary_indices.numel() * sp.world_size >= sp.num_tokens
++            ):
++                # A dense selection (including prompt logprobs) would exchange
++                # more compact slots than full rows. Keep the full-carry path.
+                 hidden_states, residual, post_mix, res_mix, pre_mix = (
+                     None if t is None else sp.gather(t)
+                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+@@ -951,6 +964,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 ced_input_ids=ced_input_ids,
+                 aux_out=pending_aux_out,
+             )
++            if boundary_indices is not None:
++                sp = None  # The boundary returns replicated compact decoder rows.
+             if pending_aux_out is not None:
+                 aux_hidden_state = pending_aux_out
+                 pending_aux_out = None
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index ed03400d2..bdc59a933 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -28,9 +28,10 @@ which every rank shares, so no agreement between ranks is needed. SP is off
+ only where it cannot apply: tensor parallel size 1, pipeline parallelism,
+ static sequence parallelism and request boundary checkpoints. With CED
+ compaction, only the encoder layers before ``ced_decoder_start`` run on
+-every row: SP covers those, and the carried rows are gathered back in full
+-before the boundary layer, which builds the decoder's global KV from every
+-row and then compacts.
++every row: SP covers those and the boundary's row-wise normalization. The
++boundary gathers its normalized input for full global KV construction and only
++the selected replay rows of its residual carry. Dense selections keep the full
++carry gather when compact slots would cost at least as many rows.
+ 
+ ## Rows
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 2ad2a07c6..b86809aee 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -10,6 +10,35 @@ import tilelang.language as T
+ _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def sp_indices_kernel():
++    """Map selected global rows to local rows and owning gathered slots."""
++    count = T.dynamic("count")
++
++    @T.prim_func
++    def ced_sp_indices(
++        indices: T.Tensor((count,), T.int64),
++        local: T.Tensor((count,), T.int64),
++        merged: T.Tensor((count,), T.int64),
++        start: T.int64,
++        local_rows: T.int64,
++        total_rows: T.int64,
++    ):
++        with T.Kernel(T.ceildiv(count, 256), threads=256) as block:
++            for lane in T.Parallel(256):
++                row = block * 256 + lane
++                if row < count:
++                    index = indices[row]
++                    valid = (index >= 0) & (index < total_rows)
++                    own = valid & (index >= start) & (index < start + local_rows)
++                    local[row] = T.if_then_else(own, index - start, -1)
++                    merged[row] = T.if_then_else(
++                        valid, index // local_rows * count + row, -1
++                    )
++
++    return ced_sp_indices
++
++
+ # Predicated global loads (zero when off). They are volatile, so the compiler
+ # keeps them where they are written, ahead of the stores and branches that use
+ # them, instead of sinking each into its first use.
+-- 
+2.43.0
+
