@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import spark_ds41f as spark
 from spark_ds41f import lab
+from spark_ds41f.bench import THERMAL_FIELDS, parse_thermal, BOARD_CEILING_C, THERMAL_HEADROOM_FLOOR_C
 
 EXP = Path(__file__).resolve().parent
 HOLDER = "norm-projection-boundaries"
@@ -73,27 +74,35 @@ def cleanup():
 atexit.register(cleanup)
 signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit('Runner terminated; cleaning up its own kernel container'))
 
-def telemetry():
+def telemetry(gpu=False):
     data={}
     for line in Path('/proc/meminfo').read_text().splitlines():
         if line.startswith(('MemAvailable:', 'SwapFree:', 'SwapTotal:')):
             key, rest=line.split(':',1); data[key]=int(rest.split()[0])*1024
     data['time']=datetime.datetime.now(datetime.timezone.utc).isoformat()
     data['hottest_c']=max(float(p.read_text())/1000 for p in Path('/sys/class/thermal').glob('thermal_zone*/temp'))
+    if gpu:
+        query=subprocess.run(['nvidia-smi','--query-gpu='+','.join(THERMAL_FIELDS),'--format=csv,noheader,nounits'],text=True,capture_output=True,timeout=10)
+        if query.returncode: raise RuntimeError(query.stderr or 'GPU telemetry failed')
+        data['gpu']=parse_thermal(query.stdout.strip()+','+str(data['hottest_c']*1000))
     return data
 
 def heartbeat():
     with (EXP/'runs/telemetry.jsonl').open('a') as f:
         tick=0
         while not stop.wait(5):
-            f.write(json.dumps(telemetry())+'\n'); f.flush()
             tick+=1
-            if tick%6==0:
-                try: reservation('refresh')
-                except Exception as e:
-                    print('Heartbeat failed:',e,flush=True)
-                    os.kill(os.getpid(),signal.SIGTERM)
-                    return
+            try:
+                sample=telemetry(gpu=tick%3==0)
+                f.write(json.dumps(sample)+'\n'); f.flush()
+                headroom=sample.get('gpu',{}).get('headroom_c')
+                if sample['MemAvailable'] < 16*(1<<30) or sample['hottest_c'] >= BOARD_CEILING_C or (headroom is not None and headroom < THERMAL_HEADROOM_FLOOR_C):
+                    raise RuntimeError('Memory or thermal limit reached')
+                if tick%6==0: reservation('refresh')
+            except Exception as e:
+                print('Monitoring failed:',e,flush=True)
+                os.kill(os.getpid(),signal.SIGTERM)
+                return
 
 def main():
     global held
@@ -130,12 +139,12 @@ def main():
             fan=spark.start_fan_curve(nodes,[target])
             problems=spark.fan_curve_problems(fan)
             if problems: raise RuntimeError(problems)
-            before=telemetry()
+            before=telemetry(gpu=True)
             try:
                 result=lab.kernel_local(str(EXP/'bundle'),str(EXP/'runs'/f'run-{run}'),False)
             finally:
                 spark.stop_fan_curve(nodes,[target],fan)
-            records.append({'run':run,'exit':result,'before':before,'after':telemetry(),'cooling':cooling,'fan':fan,'commit':commit})
+            records.append({'run':run,'exit':result,'before':before,'after':telemetry(gpu=True),'cooling':cooling,'fan':fan,'commit':commit})
             (EXP/'runs/run-records.json').write_text(json.dumps(records,indent=2)+'\n')
             if result: raise RuntimeError(f'Kernel run {run} failed; preserved output')
     finally:

@@ -63,7 +63,7 @@ python3 scripts/lab.py kernel-local experiments/2026-11-05-norm-projection/bundl
 ```
 
 The runner refreshes its hold every 30 seconds, records memory and temperature
-every five seconds, releases the hold in `finally`, and never changes serving
+every five seconds and the standard GPU clock/power/slowdown fields every fifteen seconds, enforces memory and thermal limits, releases the hold in `finally`, and never changes serving
 state. Its labeled kernel container is stopped on interruption before its hold is released; loss of the heartbeat reservation terminates only that container. It gives up after one hour if the window stays occupied. Start it as a
 bounded user service with `CPUQuota=200%`, `MemoryMax=4G`, `TasksMax=128`,
 `RuntimeMaxSec=7200`, `TimeoutStopSec=45`; the Docker containers have their own limits above.
