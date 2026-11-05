@@ -41,13 +41,22 @@ recovery ran on Spaceport with a two-CPU/8-GiB limit and the shared CPU lock.
 `runs/` retains the unsuccessful setup and checks as well as the passing runs.
 `commands.md` gives reproduction and limitations; `qualification.md` gives the
 remaining gates. `results.json` distinguishes host checks, measured component
-results and unmeasured serving outcomes. No source-complete image build or build check has run because
-only vLLM inputs were prepared.
+results and unmeasured serving outcomes. No source-complete image build or build
+check has run because only vLLM inputs were prepared.
 
-Acceptance requires a repeatable incremental serving improvement beyond both
-candidate and compatible saved-reference repeat margins, with exact integer
-metadata, preserved target sampling/verification, rank agreement and no startup,
-cancellation, streaming, deadlock or memory regression. Keep the candidate a
-performance experiment; neutral performance is not sufficient to accept it.
-The candidate profile has launch disabled. Nothing here approves a cluster
-operation, changes the promoted recipe, or updates an immutable baseline.
+The owner accepts a demonstrated correctness improvement with preserved
+performance; a speedup is not mandatory for such a repair. That route requires a
+concrete affected-path reproducer that fails before and passes after, plus
+performance evidence that excludes a meaningful regression within the existing
+comparison/noise bounds. An interval that merely includes zero is inconclusive.
+
+This candidate currently demonstrates integer-result equivalence and a component
+speedup. No pre-existing correctness failure has been demonstrated, so the tests
+do not qualify it as a correctness repair. Full serving latency, throughput and
+memory remain unmeasured; they must not be labelled neutral. Continue to qualify
+this performance experiment against compatible saved references, preserving
+native arithmetic, target sampling/verification, batch invariance, supported
+features, rank agreement and startup/cancellation/streaming behavior. Optional
+future tuning must not block an independently evidenced correctness repair.
+The candidate profile has launch disabled. Promoted configuration and immutable
+baselines are unchanged; promotion and merging remain separate owner decisions.

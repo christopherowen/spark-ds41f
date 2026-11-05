@@ -65,6 +65,22 @@ active frontend qualification hold and another task's request existed.
    mix lean/full protocols, infer missing repeats or treat the old host-gap bound
    as a contemporary baseline. No comparable saved reference means inconclusive.
 
-A repeatable serving gain beyond both repeat margins is required. A component
-win alone does not qualify the change. Owner acceptance, configuration/docs and
-a new immutable baseline are separate promotion work and are not authorized here.
+The owner also accepts correctness improvements with preserved performance.
+For that route, first demonstrate a concrete affected-path failure in the old
+implementation and a pass in the repair, including relevant boundaries and
+failure/cancellation behavior. Preserve native arithmetic, batch invariance and
+supported features. Keep optional tuning separate from an independently useful
+repair.
+
+Prove performance preservation using the material affected latency, throughput
+and memory metrics, exact identities, repeated candidate runs and compatible
+saved references. State the existing comparison/noise bound before interpreting
+results and require the uncertainty bound to exclude a meaningful regression;
+a confidence interval merely spanning zero does not establish no loss. Preserve
+unfavorable samples. A materially underpowered comparison is inconclusive.
+
+The current metadata change has no demonstrated pre-existing correctness defect:
+its tests show equivalence, and its speedup is scoped to the component fixture.
+It cannot qualify through the correctness route without such evidence. Its full
+serving behavior is still unmeasured. Owner acceptance, configuration/docs and a
+new immutable baseline are separate promotion work and are not authorized here.
