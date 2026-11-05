@@ -91,3 +91,11 @@ CPU-only pinned container (`runs/copy-check-03`): all MXFP4 codes/scales, the
 leading 32 directions, and invariance to query-weight sign for the squared
 metric. The container and reservation are removed. This is a synthetic contract
 check; no model-derived metric has been fitted.
+
+`metric/` prepares the construction-only implementation of the fixed 32D probe.
+It projects block means for grouping, then writes the original 128D centroids in
+the same 73-byte layout. Query scoring and fine scoring are unchanged. The map is
+not trained, loaded or used by any current serving profile. Its separate GPU
+fixture must check map-sensitive partitioning, exact original-space centroids,
+untouched native records, partial-write no-ops, graph replay and page recycling.
+No component speed or model-quality result is claimed.
