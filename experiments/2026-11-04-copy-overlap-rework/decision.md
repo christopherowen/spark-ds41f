@@ -40,8 +40,10 @@ eight native image gates, including 8,075 tests and strict actual-source top-k
 initialization checking. It then safely yielded for the shared queue before any
 serving work. Preserve its scheduling error and actual exit 1; this is not a
 measured candidate failure. Independent all-rank C36 restoration checks passed.
-The unchanged image can resume only after full local gate-evidence review and
-fresh shared-capacity/source checks, using a distinct attempt. No C41 serving
+The unchanged image passed full local gate-evidence review and fresh shared
+capacity/source checks, then resumed as the sole attempt-2 controller at
+07:42:15 UTC on 2026-11-05. It uses the original qualified image and execution
+commit; no build, gate or serving point has been repeated. No C41 serving
 performance verdict is available. See [qualification.md](qualification.md) and
 the retained original receipts for execution state.
 

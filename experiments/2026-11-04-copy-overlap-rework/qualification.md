@@ -1,5 +1,11 @@
 # Qualification packet
 
+Current execution: attempt 2 is active from the unchanged completed image gate.
+Do not launch another controller, synchronize active nodes, rebuild/re-gate or
+repeat a serving point. Execution commit remains
+`0da35cc9668ff491065446b2a842fe996a73e80f`; later evidence commits are not runtime
+authority. Performance remains pending.
+
 Purpose declared before measurement: remove optional overlap complexity while
 preserving correctness and avoiding a material incremental performance
 regression. The focused rework and its withdrawn unmeasured event-reuse proposal
@@ -86,14 +92,36 @@ private and their hashes are published. The tested resume validator accepts the
 exact original handoff and image receipts. Full original builder evidence and
 actual DGX4 image identity passed the separate local audit before resume.
 
-The foreign short window is `dgx1-1793863306`. Its original request was left
+The foreign short window was `dgx1-1793863306`. Its original request was left
 untouched; after it acquired its own window and fulfilled that request, our
 return request was atomically queued at 07:22:10 UTC. Do not stage or launch
 under that foreign window. Once it releases, re-read actual holds/requests,
 fulfill only the exact matching return request, verify clean source/restoration
 and stage the frozen published execution commit if needed. Resume with attempt
 2 and the original completed gate; never rebuild, re-gate or repeat a serving
-point. No C41 functional or performance measurement has started.
+point. At that scheduling boundary, no C41 functional or performance
+measurement had started.
+
+The foreign slot released normally; the exact return request was fulfilled and
+short source-staging window `dgx1-1793864305` opened at 07:38:25 UTC. Named plans
+showed existing C36 live with unchanged TP3 shape. Git-based cluster sync placed
+all three serving checkouts at the frozen execution commit; the owned DGX4
+worktree already matched. All four were clean, DGX4 was idle and the actual
+image/original gate receipt were unchanged. The named C36 doctor passed, with
+all running containers unchanged across this staging. It closed at 07:40:52 UTC
+without a restart or clock change.
+
+The sole resumed controller launched at 07:42:15 UTC: PID 190054, supervisor
+190053. Window `dgx1-1793864574` opened at 07:42:54 UTC. At the compact 07:44:21
+UTC check, both processes and heartbeat were healthy, no request or final exit
+existed, and identical-image seeding was active. No gate was repeated. The native
+receipt is `results/private/lab/candidate-41-round-attempt-2/receipt.json`; actual
+wait exit will appear only at completion in
+`/home/swank/tl-logs/copy-overlap-rework/setup/exit-attempt-2.json`. Twelve original
+operator files and hashes are retained in
+`runs/2026-11-05-dgx/attempt-2/operator-setup`. Direct waiting uses compact native
+state only; serving metrics are collected and analyzed locally after both boots
+and independent final C36 restoration verification.
 
 An earlier operator command failed local Python parsing before any SSH/native
 controller action; absence checks and the original error record are retained.
