@@ -24,6 +24,7 @@ exchange directly.
 # annotations eagerly, and the symbolic shape must resolve.
 import math
 from dataclasses import dataclass
+from functools import cache
 
 import tilelang
 import tilelang.language as T
@@ -405,6 +406,21 @@ def rank_rows_kernel():
     return collectives_rank_rows
 
 
+_TAIL_DIV = r"""
+__device__ __forceinline__ unsigned vllm_tail_div(
+    unsigned n, unsigned d, unsigned magic) {
+  if (d == 1) return n;
+  unsigned q = __umulhi(n, magic);
+  return q - (static_cast<unsigned long long>(q) * d > n);
+}
+"""
+
+
+@cache
+def _tail_div_magic(divisor: int) -> int:
+    return 0 if divisor == 1 else ((1 << 32) + divisor - 1) // divisor
+
+
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def rank_rows_bytes_kernel(unit: int = 1):
     """Tail/unaligned rank rows as opaque 1-, 2- or 4-byte payloads."""
@@ -419,15 +435,21 @@ def rank_rows_bytes_kernel(unit: int = 1):
         world: T.int32,
         rows: T.int32,
         row_units: T.int32,
+        row_magic: T.uint32,
+        span_magic: T.uint32,
     ):
         with T.Kernel(T.ceildiv(output_units, 256), threads=256) as block:
+            T.import_source(_TAIL_DIV)
             index = block * 256 + T.get_thread_binding()
             if index < output_units:
-                row = index // (world * row_units)
-                col = index % (world * row_units)
-                dst[index] = src[
-                    ((col // row_units) * rows + row) * row_units + col % row_units
-                ]
+                n = T.cast(index, T.uint32)
+                unit = T.cast(row_units, T.uint32)
+                span = T.cast(world, T.uint32) * unit
+                row = T.call_extern("uint32", "vllm_tail_div", n, span, span_magic)
+                col = n - row * span
+                rank = T.call_extern("uint32", "vllm_tail_div", col, unit, row_magic)
+                local = col - rank * unit
+                dst[index] = src[(rank * T.cast(rows, T.uint32) + row) * unit + local]
 
     return collectives_rank_rows_bytes
 
@@ -443,6 +465,8 @@ def _rank_rows_tail(gathered, out, world, rows, row_bytes):
         world,
         rows,
         row_bytes // unit,
+        _tail_div_magic(row_bytes // unit),
+        _tail_div_magic(world * (row_bytes // unit)),
     )
 
 
@@ -466,7 +490,7 @@ def concat_rank_shards(
     of ``shard_shape``) as the shards concatenated along their last dimension, in
     one TileLang launch. Whole aligned 16-byte packs retain the vector path;
     tails and unaligned rows use byte copies, including opaque complex payloads.
-    CPU and rank-one callers retain None for their reference/view-only path."""
+    CPU callers retain None; rank-one results are views."""
     width = shard_shape[-1]
     row_bytes = width * gathered.element_size()
     if len(shard_shape) < 2 or not gathered.is_cuda:
@@ -478,6 +502,8 @@ def concat_rank_shards(
     ):
         raise ValueError("rank shards must be contiguous and match the declared shape")
     rows = math.prod(shard_shape[:-1])
+    if world == 1:
+        return gathered.view(shard_shape)
     out = gathered.new_empty(*shard_shape[:-1], world * width)
     if rows and width:
         if row_bytes % 16 == 0 and gathered.data_ptr() % 16 == 0:

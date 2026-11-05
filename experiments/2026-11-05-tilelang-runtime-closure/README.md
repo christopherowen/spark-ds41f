@@ -111,3 +111,22 @@ GPU qualification of normal score/selection paths; it does not substitute for
 performance measurements of the new fused paths or for host/model qualification.
 `0008` exercises both new prompt-score modes under startup cache freeze and
 formats a host-side sampler binding; it changes no GPU program.
+
+## Fourth combined screen
+
+Both boots pass 1,167 correctness checks. Device measurements still reject the
+4,096-element copy tile at 96 padded FP32 rows (+2.47% / +1.66%). The word-copy
+tail path also remains unresolved. Both timing boots are retained; the queued
+IKET/model jobs were yielded after the current atomic boot for an owner-authorized
+native retention check. No timed job was interrupted.
+
+`copy_screen.py` separately compares pitched CUDA DMA with a 128-thread,
+two-element scalar TileLang copy; it does not change the runtime until a
+backend qualifies. `0009` removes generic device integer division from tail
+addressing using exact host-computed reciprocals and returns rank-one gathers as
+views. Its 10,070 independent integer-division checks pass; GPU tests are pending.
+All 594 patches reproduce source tree `d18eb2a61a5c02b4d7c8747f621a4438889db43e`.
+
+Large evidence files are stored as deterministic gzip with original and stored
+SHA-256 hashes in `runs/compressed-evidence.json`; every decompressed payload
+was verified byte-for-byte before replacing its text representation.

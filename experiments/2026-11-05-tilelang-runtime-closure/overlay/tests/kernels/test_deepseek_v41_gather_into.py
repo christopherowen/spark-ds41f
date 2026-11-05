@@ -96,12 +96,17 @@ def test_bad_layouts_fail_explicitly():
     "dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.int64, torch.complex64]
 )
 @pytest.mark.parametrize("width", [1, 5, 17])
-def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):
+@pytest.mark.parametrize("world", [1, 2, 3, 4, 8])
+def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width, world):
     from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
 
-    src = torch.arange(3 * 7 * width, device="cuda").to(dtype).view(21, width)
-    expected = torch.cat(list(src.view(3, 7, width)), dim=1)
-    got = concat_rank_shards(src, 3, (7, width))
+    src = (
+        torch.arange(world * 7 * width, device="cuda").to(dtype).view(world * 7, width)
+    )
+    expected = torch.cat(list(src.view(world, 7, width)), dim=1)
+    got = concat_rank_shards(src, world, (7, width))
+    if world == 1:
+        assert got.data_ptr() == src.data_ptr()
     assert got is not None
     assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
 
@@ -111,3 +116,19 @@ def test_overlapping_output_rows_are_rejected_before_launch():
     output = torch.empty((1, 32), device="cuda").expand(4, 32)
     with pytest.raises(ValueError, match="rows must not overlap"):
         gather_columns_into(src, (output,), 2)
+
+
+@pytest.mark.parametrize("divisor", [1, 2, 3, 5, 7, 15, 17, 257, 65535, 2**31 - 1])
+def test_tail_address_division_matches_integer_arithmetic(divisor):
+    import random
+
+    from vllm.models.deepseek_v4_1.tilelang.collectives import _tail_div_magic
+
+    rng = random.Random(divisor)
+    magic = _tail_div_magic(divisor)
+    values = [0, 1, divisor - 1, divisor, divisor + 1, 2**31 - 1, 2**32 - 1]
+    values += [rng.randrange(1 << 32) for _ in range(1000)]
+    for n in values:
+        q = n if divisor == 1 else (n * magic) >> 32
+        q -= q * divisor > n
+        assert q == n // divisor
