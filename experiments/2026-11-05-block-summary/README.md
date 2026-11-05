@@ -51,8 +51,10 @@ Independent verification confirms the lease is absent and the checkout clean.
 The separate runtime preparation writes means only after a physical page is
 complete, leaves partial pages directly scored, and uses the native fine scorer
 with ordered block candidates. It performs no clustering, reference scoring,
-host copies or grading. Both native and candidate profiles reserve the same
-100 bytes/key. Mechanical, graph/lifecycle, initialization, actual replay and
+host copies or grading. The component diagnostic control reserves the same 100 bytes/key. The final
+model comparison uses `native.json`, retaining the actual native 68-byte/key
+layout, against the candidate 100-byte/key layout. Its cache and admission costs
+therefore remain in the acceptance comparison. Mechanical, graph/lifecycle, initialization, actual replay and
 component-speed gates are required before any all-node model startup.
 
 `check_quality.py` in the answer-quality experiment enforces the final-answer
@@ -61,3 +63,33 @@ missing tasks, changed budgets, empty workloads and reasoning divergence. An
 audit of existing receipts accepts the dense-only/native-source setting's
 observed answer quality and rejects the source1024 setting's lost completion.
 That acceptance is quality-only: the former setting still fails the speed goal.
+
+
+Runtime gates use published source `66e012581beba809d6c5757fe622257efd42d5dd`.
+The mechanics job passes all six cases: both page sizes, both indexer interfaces,
+mixed owners, native-byte preservation, mean bits, graph replay, page reuse,
+257-row chunking and a source plan of 1M. It takes 257.04 seconds including cold
+compilation, which is not a performance measurement. Allocator peaks are
+777,711,616 allocated and 1,044,381,696 reserved bytes. A foreign request arrives
+during that job; the controller releases before the next job at 14:09:05 UTC.
+The retained error receipt records this orderly yield, not a failed kernel.
+The next window resumes actual replay and strict initialization checks without
+repeating the completed mechanics gate.
+
+`benchmark_runtime.py` is a separate performance-only process. It uses the four
+already-diagnostic validation captures with original physical page IDs and
+visible lengths, at 1, 8 and 64 captured queries. Native retains its 68-byte/key
+layout; block8 uses 100. Native-before / candidate / native-after graph timing
+brackets each case. Page-completion construction is measured separately, for
+one page and all captured complete pages. Neither reference scoring nor answer
+grading enters these timers. Two fresh processes remain required. These are
+component timings on captured prefill queries, not decode-query or request
+speed measurements, nor a fresh independent quality benchmark.
+
+Full-model answer phases additionally collect server draft acceptance and
+prefill/decode counters outside every request timer. Their purpose is to
+separate selector cost from changes in speculative progress; no cause is
+assumed before measurement. The first observed new wrong/incomplete answer
+against a successful matched native answer ends the candidate cohort and
+restores the service. Such a rejected partial cohort is not a two-boot speed
+qualification.

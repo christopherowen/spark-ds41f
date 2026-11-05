@@ -28,6 +28,7 @@ def main():
     parser.add_argument('--cache',type=Path)
     parser.add_argument('--split',choices=['pilot','heldout'],default='pilot')
     parser.add_argument('--candidate-config',default=PROFILE_ROOT+'/aggressive-fast.json')
+    parser.add_argument('--native-config',default=PROFILE_ROOT+'/control.json')
     parser.add_argument('--controls-from',type=Path,help='published same-day native receipts with identical model and client inputs')
     parser.add_argument('--watchdog')
     parser.add_argument('--preflight-only',action='store_true')
@@ -49,7 +50,10 @@ def main():
     assert subprocess.check_output(['git','branch','-r','--contains',commit],cwd=ROOT,text=True).strip()
     candidate = Path(args.candidate_config)
     assert not candidate.is_absolute() and '..' not in candidate.parts and (ROOT/candidate).is_file()
+    native_config = Path(args.native_config)
+    assert not native_config.is_absolute() and '..' not in native_config.parts and (ROOT/native_config).is_file()
     if args.controls_from:
+        assert str(native_config) == PROFILE_ROOT+'/control.json', 'custom native profile requires fresh controls'
         import datetime
         import hashlib
         reference = (ROOT/args.controls_from).resolve()
@@ -65,6 +69,7 @@ def main():
             'experiments/2026-11-04-clustered-indexer/replay/overlay/indexer.py',
             'experiments/2026-11-04-token-lsa/bundle/overlay/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py',
             'experiments/2026-11-05-answer-quality/evaluate.py',
+            'experiments/2026-11-05-answer-quality/api_metrics.py',
             'experiments/2026-11-05-answer-quality/measure.py',
             'experiments/2026-11-05-answer-quality/prepare.py']
         unchanged += [str(p.relative_to(ROOT)) for p in (ROOT/PROFILE_ROOT/'overlay').glob('*.py')]
@@ -84,8 +89,14 @@ def main():
                 refs[name] = hashlib.sha256(raw).hexdigest()
         (out/'reference-controls.json').write_text(json.dumps({'source':str(relative),'files':refs},indent=2)+'\n')
     (out/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
-    (out/'source.json').write_text(json.dumps({'commit':commit,'split':args.split,'sources_lock':json.loads((HERE/'sources.lock.json').read_text())},indent=2)+'\n')
+    (out/'source.json').write_text(json.dumps({'commit':commit,'split':args.split,'native_config':str(native_config),'candidate_config':str(candidate),'sources_lock':json.loads((HERE/'sources.lock.json').read_text())},indent=2)+'\n')
     w.run([sys.executable,str(source),'--out',str(out/'preflight'),'--preflight-only'],out,'preflight')
+    for label,config in [('native',native_config),('candidate',candidate)]:
+        previous = w.REL
+        try:
+            w.REL = str(config.parent)
+            w.run(w.spark(config.stem,'doctor'),out,'preflight-'+label+'-profile')
+        finally:w.REL = previous
     if args.preflight_only:
         return
     baseline = None
@@ -134,7 +145,7 @@ def main():
         w.run(w.spark('control','cluster','sync','--revision',commit),out,'sync-plan')
         w.run(w.spark('control','cluster','sync','--revision',commit,'--apply'),out,'sync-apply')
         jobs = [('native-a','control'),('lsa-a',candidate.stem),('lsa-b',candidate.stem),('native-b','control')]
-        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'candidate_config':str(candidate),'controls_from':str(args.controls_from) if args.controls_from else None,'split':args.split,'rule':'independent final-answer grading; no native output oracle'},indent=2)+'\n')
+        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'native_config':str(native_config),'candidate_config':str(candidate),'controls_from':str(args.controls_from) if args.controls_from else None,'split':args.split,'rule':'independent final-answer grading; no native output oracle'},indent=2)+'\n')
         completed = ['native-a','native-b'] if args.controls_from else []
         for label,profile in jobs:
             if args.controls_from and label.startswith('native-'):
@@ -143,7 +154,7 @@ def main():
             holds = w.each(w.HOLD_CODE,{'action':'read'})
             assert not any(h['spark-request.json'] or h['spark3-request.json'] for h in holds.values()),'pending requester'
             previous = w.REL
-            config = candidate if label.startswith('lsa-') else Path(PROFILE_ROOT)/'control.json'
+            config = candidate if label.startswith('lsa-') else native_config
             try:
                 w.REL = str(config.parent)
                 w.start(config.stem,out,'boot-'+label)
@@ -153,6 +164,21 @@ def main():
             w.run([sys.executable,str(HERE/'measure.py'),'--profile',str(config),
                    '--cache',str(args.cache),'--split',args.split,'--private',str(private),
                    '--out',str(out/('answers-'+label+'.json'))],out,'benchmark-'+label)
+            if label.startswith('lsa-'):
+                from summarize import paired
+                base_answer = json.loads((out/'answers-native-a.json').read_text())
+                answer = json.loads((out/('answers-'+label+'.json')).read_text())
+                assert answer.get('complete') and base_answer.get('complete')
+                assert answer['protocol'] == base_answer['protocol'] and answer['selection_sha256'] == base_answer['selection_sha256']
+                assert len(answer['phases']) == len(base_answer['phases']) > 0
+                checks = []
+                for old,new in zip(base_answer['phases'],answer['phases']):
+                    quality = paired(old['records'],new['records'])
+                    incomplete = [r['id'] for r in new['records'] if r['status'] != 'complete' or r.get('finish_reason') != 'stop']
+                    checks.append({'phase':new['name'],'losses':quality['losses'],'incomplete':incomplete})
+                if any(c['losses'] or c['incomplete'] for c in checks):
+                    (out/('quality-reject-'+label+'.json')).write_text(json.dumps({'passed':False,'checks':checks,'scope':'early observed-regression rejection; not a two-boot performance comparison'},indent=2)+'\n')
+                    raise RuntimeError('candidate final-answer quality regression; restore before further benchmarks')
             completed.append(label)
             (out/'completed.json').write_text(json.dumps({'at':w.stamp(),'completed':completed},indent=2)+'\n')
     except Exception:

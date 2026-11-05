@@ -11,6 +11,7 @@ import urllib.request
 import uuid
 
 from prepare import LOCK,digest,grader
+from api_metrics import snapshot,finish
 
 
 def one(url,case,payload,extract,private):
@@ -90,6 +91,8 @@ def main():
                 payload['cache_salt'] = uuid.uuid4().hex
         current = dict(phase,records=[])
         report['phases'].append(current)
+        metric_prefix = args.out.with_name(args.out.stem+'-'+phase['name'])
+        before = snapshot(args.url,metric_prefix.with_name(metric_prefix.name+'-metrics-before.txt'))
         # map preserves frozen task order even when completions finish out of order.
         with ThreadPoolExecutor(max_workers=phase['concurrency']) as pool:
             futures = [pool.submit(one,args.url,c,p,extract,private) for c,p in zip(cases,payloads)]
@@ -108,6 +111,8 @@ def main():
         current.update(wall_seconds=wall,correct=correct,total=len(rows),accuracy=correct/len(rows),
                        correct_answers_per_second=correct/wall,
                        median_request_seconds=statistics.median(r['seconds'] for r in rows))
+        current['server_metrics'] = finish(args.url,before,len(rows),
+            metric_prefix.with_name(metric_prefix.name+'-metrics-after.txt'))
         args.out.write_text(json.dumps(report,indent=2)+'\n')
     report['complete'] = True
     args.out.write_text(json.dumps(report,indent=2)+'\n')

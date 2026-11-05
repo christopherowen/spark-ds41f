@@ -192,3 +192,11 @@ about78% longer than native. The table response reaches65,536 thinking tokens on
 both boots without final content. This is recorded as incomplete, not as a wrong
 completed answer. C37 restoration and independent all-node verification pass.
 Full results and the misleading raw-token-rate increase are in `results.md`.
+
+
+Subsequent finer-summary comparisons use `--native-config` to retain the actual
+native cache layout. A custom native profile requires fresh controls. Server
+counter snapshots are collected outside timed phases and requests, with exact
+request coverage and idle checks. They report speculative acceptance and mean
+server prefill/decode latencies; missing/reset/contaminated counters fail closed.
+These diagnostics do not enter the serving algorithm.
