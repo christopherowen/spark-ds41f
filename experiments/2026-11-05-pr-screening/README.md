@@ -43,3 +43,10 @@ request/serving gain beyond both repeat margins and avoid material core costs.
 The owner's four-build report still distinguishes component-only findings from
 serving gains. The result-transfer dense-path host cost and the gather tiny-tail
 uncertainty remain unresolved. C42's running source/image matrix is untouched.
+
+The two new TP1 drafts (#914 native embedding IDs and #915 fused Markov drafting)
+also apply independently after exact C40, preserving its default copy and
+scratch-read fix. All three declared files per PR match their authored hashes.
+Their source checks do not qualify the outstanding TP1 timing or full-model
+inventories, and a TP3 repeat cannot establish a TP1 benefit. They remain draft;
+no topology, hardware or serving change is made for these source reviews.

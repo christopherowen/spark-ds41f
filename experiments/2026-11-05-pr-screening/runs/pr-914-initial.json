@@ -1,0 +1,82 @@
+{
+  "body": "TP1 embedding currently clamps IDs and converts them to int64 before lookup. This experiment folds negative-ID normalization into TileLang lookup and reads native int32/int64 strides; plain TP1 tables use TileLang too.\n\nBoth boots pass all 127 embedding checks, including 36 new public eager/graph cases. Four inspected parallel CUDA programs remain byte-identical. Of 32 public-route timing cases, three have lower means but insufficient precision on one boot; a fixed 2,048-round extension is predeclared. The patch remains draft until the zero-margin timing gates and final full-model inventories pass.\n\nRecords the exact candidate-38 base, independent patch, source equivalence, fresh application, and local checks. No promoted configuration or serving changes. Built-image, real-weight, and physical-network qualification remain separate.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/README.md",
+      "additions": 28,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/base.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/candidate.json",
+      "additions": 9,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/checks/focused-boot-1.json",
+      "additions": 127,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/checks/focused-boot-2.json",
+      "additions": 127,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/checks/local.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/overlay/tests/kernels/test_deepseek_v41_tilelang_embedding.py",
+      "additions": 348,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/overlay/vllm/model_executor/layers/vocab_parallel_embedding.py",
+      "additions": 895,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/overlay/vllm/models/deepseek_v4_1/tilelang/embedding.py",
+      "additions": 723,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/source-equivalence.json",
+      "additions": 9,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/vllm/0001-native-embedding-ids.patch",
+      "additions": 407,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-embedding-ids/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefOid": "faaa36b264fad8973cb854a9dc324d6b574daf53",
+  "isDraft": true,
+  "number": 914,
+  "title": "Fold TP1 ID preparation into TileLang embedding",
+  "updatedAt": "2026-11-05T16:22:07Z"
+}
