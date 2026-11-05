@@ -86,6 +86,14 @@ def run_case(q,scales,weights,pool,table,lengths,active,width,page,source,*,coar
             selector.run(b['scores'],b['counts'],active,selected,values,scratch=work)
             torch.testing.assert_close(selected,b['selected'],atol=0,rtol=0)
             torch.testing.assert_close(values.view(torch.int16),b['values'].view(torch.int16),atol=0,rtol=0)
+            # A separate stable sort checks the larger merge route independently.
+            for row,extent in enumerate(b['counts'].cpu().tolist()):
+                keep=min(extent,plan.block_budget)
+                winners=torch.argsort(b['scores'][row,:extent],descending=True,stable=True)[:keep]
+                winners=torch.sort(winners).values.to(torch.int32)
+                torch.testing.assert_close(b['selected'][row,:keep],winners,atol=0,rtol=0)
+                assert bool((b['selected'][row,keep:]==-1).all())
+
         for row,extent in enumerate(lengths.cpu().tolist()):
             full = extent//page*(page//8)
             if full > plan.block_budget:
@@ -104,7 +112,7 @@ def run_case(q,scales,weights,pool,table,lengths,active,width,page,source,*,coar
                 torch.testing.assert_close(blocks[row],expected_blocks[row],atol=0,rtol=0)
                 torch.testing.assert_close(counts[row],expected_counts[row],atol=0,rtol=0)
     result = {'retained_native_score_bits_equal':True,'ordered_valid_candidates':True,
-              'covered_domain_native_outputs_equal':True,'coarse_oracle_checked':coarse_oracle}
+              'covered_domain_native_outputs_equal':True,'coarse_oracle_checked':coarse_oracle,'independent_stable_topk_checked':coarse_oracle and source}
     if int(lengths.min()) >= 512:
         result['native_top512_key_recall'] = recall(expected,out)
         if source and int(lengths.min()) >= 16384:
@@ -170,7 +178,7 @@ def strict():
             for limit in (0,37,page-1,page,page+1,max(extents)):
                 print('CHECK '+json.dumps({'page':page,'source':source,'limit':limit}),flush=True)
                 lengths = torch.tensor([min(n,limit) for n in extents],dtype=torch.int32,device='cuda')
-                run_case(q,scales,weights,pool,table,lengths,active,width,page,source)
+                run_case(q,scales,weights,pool,table,lengths,active,width,page,source,coarse_oracle=source)
             cases.append({'page':page,'source':source,'unwritten_pool_and_table_suffix':True,'empty_partial_and_pruned_rows':True})
             print('CASE '+json.dumps(cases[-1]),flush=True)
     return {'passed':True,'strict_fixture':True,'cases':cases,'performance_measured':False}
