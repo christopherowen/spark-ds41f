@@ -1,0 +1,50 @@
+import json
+import unittest
+
+import run_hardware as runner
+
+
+class GateTests(unittest.TestCase):
+    def test_false_summary_is_failure_even_when_process_exits_zero(self):
+        with self.assertRaises(ValueError):
+            runner.gate_summary(json.dumps({"summary": "greedy", "identical": False}), "greedy")
+
+    def test_missing_or_duplicate_summary_fails(self):
+        for text in ("", "{}", '{"summary":"x"}\n{"summary":"x"}'):
+            with self.assertRaises(ValueError):
+                runner.gate_summary(text, "greedy")
+
+    def test_control_batch_mismatch_or_failure_fails(self):
+        for result in ({"failed": ["json"], "digests": {"json/alone": "a"}},
+                       {"failed": [], "digests": {"json/alone": "a", "json/c8": "b"}}):
+            with self.assertRaises(ValueError):
+                runner.gate_summary(json.dumps({"summary": "controls", **result}), "controls")
+
+    def test_valid_signature_is_preserved_for_cross_arm_comparison(self):
+        text = json.dumps({"summary": "greedy", "identical": True,
+                           "reference_sha256": "a" * 64, "long_sha256": "b" * 64})
+        self.assertEqual(runner.gate_summary(text, "greedy"),
+                         {"reference_sha256": "a" * 64, "long_sha256": "b" * 64})
+
+    def test_foreign_holder_window_or_restore_profile_is_not_ours(self):
+        ours = {"holder": runner.HOLDER, "window": "window-1", "production_config": runner.RESTORE}
+        self.assertTrue(runner.owns(ours, "window-1"))
+        for change in ({"holder": "spark-lab: another task"}, {"window": "window-2"},
+                       {"production_config": "config/cluster.json"}):
+            self.assertFalse(runner.owns({**ours, **change}, "window-1"))
+        self.assertFalse(runner.owns(None, "window-1"))
+
+    def test_actual_start_shape_change_spelling_refused(self):
+        for text in ("live: running\nshape:   CHANGES nodes", "live: running\n--apply would refuse: no"):
+            with self.assertRaises(ValueError):
+                runner.validate_plan(text, "start")
+
+    def test_stop_format_and_start_shape_are_distinguished(self):
+        runner.validate_plan("live: running\ndgx1: stop exact container", "stop")
+        runner.validate_plan("live: running\nshape: unchanged", "start")
+        with self.assertRaises(ValueError):
+            runner.validate_plan("live: running", "start")
+
+
+if __name__ == "__main__":
+    unittest.main()

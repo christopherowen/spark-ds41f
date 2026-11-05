@@ -227,3 +227,8 @@ and source identities, not raw generated text. Future policy work needs current
 trace inputs and boundary costs on the same source, then separate boot/repeat
 serving tests at c1/c4/c8/c16 and scored agent traffic. A trace-only run must not
 be used for timing, and any serving replacement still requires authorization.
+
+The owner supplied that hardware-testing authorization on 2026-11-06. The
+separate `experiments/2026-11-06-verification-budget-hardware/` directory holds
+the one-variable runtime profiles and guarded execution plan. This offline
+record remains unchanged evidence; hardware results are pending there.
