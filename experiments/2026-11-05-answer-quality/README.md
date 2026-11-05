@@ -200,3 +200,13 @@ counter snapshots are collected outside timed phases and requests, with exact
 request coverage and idle checks. They report speculative acceptance and mean
 server prefill/decode latencies; missing/reset/contaminated counters fail closed.
 These diagnostics do not enter the serving algorithm.
+
+
+`generate_code.py` completes the separate HumanEvalPlus generation client: all
+164 frozen tasks, one attempt, temperature0, seed0, high thinking and 65,536
+maximum generated tokens. It regenerates/validates every prompt from the pinned
+dataset before requests, records public hashes/timing/usage only, and saves
+final program samples plus full responses privately on the node. CPU execution
+and grading remain separate restricted jobs. Mock transport checks cover final
+versus reasoning separation, truncation, empty final content, model identity and
+shared protocol fields. No model coding result is claimed.
