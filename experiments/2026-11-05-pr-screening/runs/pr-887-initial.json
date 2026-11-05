@@ -1,0 +1,259 @@
+{
+  "baseRefOid": "3095e3f294bf65f5e65c6ba6dd2b21984abe5864",
+  "body": "Gather directly into the compressor/vision output buffers with one TileLang layout/unpadding/store kernel. Tail copies preserve opaque aligned words, rank-one results stay views, and tiny tails map a warp directly to each rank/row. Explicit geometry and disjoint-output checks replace the ATen layout-copy path.\n\nThe final composed source passes 1,266 correctness tests on both boots. All 24 main fused-gather GPU cases pass the zero-margin, five-standard-error gate on both boots. Larger-tail programs also qualify. Two tiny-tail event-based cases remain unresolved: event intervals are about 4 us around ~1 us kernels. Direct paired CUPTI kernel-duration checks are pending; the earlier results are retained. This PR stays in draft for those checks and the full-model inventory.\n\nFresh application of the independent series reproduces its recorded source tree; gather factories, wrappers, constants and non-shared files match the tested combination exactly. Doctor and diff checks pass. Actual NIC traffic and distributed serving remain release gates because the original dim-zero gather changes transport dispatch. No promoted recipe or serving process changes. See `experiments/2026-11-05-gather-tail-performance`.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-gather-stores/README.md",
+      "additions": 97,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/analyze.py",
+      "additions": 91,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/base.json",
+      "additions": 17,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/candidate.json",
+      "additions": 18,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/decision.md",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/measure.py",
+      "additions": 261,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/tests/kernels/test_deepseek_v41_gather_into.py",
+      "additions": 113,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/tests/models/test_deepseek_v4_1_compressor.py",
+      "additions": 580,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/vllm/models/deepseek_v4_1/compressor.py",
+      "additions": 367,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py",
+      "additions": 724,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+      "additions": 478,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/overlay/vllm/models/deepseek_v4_1/tilelang/gather.py",
+      "additions": 156,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/results.json",
+      "additions": 1130,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/run.py",
+      "additions": 275,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/runs/local.json",
+      "additions": 103,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/runs/native-v1.json",
+      "additions": 4564,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/runs/native-v2.json",
+      "additions": 5130,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/vllm/0001-gather.patch",
+      "additions": 622,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-gather-stores/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/README.md",
+      "additions": 31,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/base.json",
+      "additions": 18,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/candidate.json",
+      "additions": 19,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/checks.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/main-results.json",
+      "additions": 538,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/kernels/test_deepseek_v41_gather_into.py",
+      "additions": 134,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/kernels/test_deepseek_v41_tilelang_collectives.py",
+      "additions": 449,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/models/test_deepseek_v4_1_compressor.py",
+      "additions": 580,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/compressor.py",
+      "additions": 367,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py",
+      "additions": 724,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+      "additions": 551,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/tilelang/gather.py",
+      "additions": 156,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/source-equivalence.json",
+      "additions": 23,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/vllm/0002-word-tails-and-rank-rows.patch",
+      "additions": 282,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-gather-tail-performance/vllm/series",
+      "additions": 2,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/tilelang-gather-stores",
+  "headRefOid": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+  "isDraft": true,
+  "mergeable": "MERGEABLE",
+  "number": 887,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:37:01Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42046725433/job/127311577823",
+      "name": "repository",
+      "startedAt": "2026-11-05T14:37:01Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:37:01Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42046725433/job/127311629853",
+      "name": "changes",
+      "startedAt": "2026-11-05T14:37:06Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:37:01Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42046725433/job/127311579420",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-05T14:37:01Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:37:01Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42046725433/job/127311579233",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-05T14:37:01Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Fuse gathered column layout conversion and final buffer stores"
+}

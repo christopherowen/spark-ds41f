@@ -1,0 +1,572 @@
+{
+  "record_type": "Prior paired standalone evidence, preserved without re-identifying the runs",
+  "research_commit": "ad40ec2379053fe132c3167ce19ade22877224c9",
+  "research_url": "https://github.com/christopherowen/spark-ds41f/tree/ad40ec2379053fe132c3167ce19ade22877224c9/experiments/2026-11-04-tilelang-kernel-review",
+  "tested_compiler_tree": "710925bbde5faa60a8af1422621bffb02919551b",
+  "current_candidate_head": "40392749df636be5882cd4ef36cb15154274d213",
+  "identity_note": "The candidate commit is deterministic git-am metadata; its complete source tree equals the previously tested compiler tree. These receipts do not qualify a new runtime image.",
+  "finding": "The parent produces incorrect BF16 GEMM results in one fresh process and passes in the other, demonstrating an intermittent race. The fixed compiler passes 200 poisoned-output launches in both processes. In the paired microkernel, fixed specialization is 2.33% and 2.37% slower than specialization disabled, so the runtime workaround stays in place.",
+  "runs": {
+    "ws3661-base-a-v2": {
+      "label": "ws3661-base-a-v2",
+      "started_utc": "2026-11-04T01:37:39.814579+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3661-base-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3661-base-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3661-base-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3661"
+      ],
+      "before_memory_bytes": 122709098496,
+      "start_hottest_c": 47.7,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 1,
+      "ended_utc": "2026-11-04T01:37:47.827045+00:00",
+      "memory_aborted": false,
+      "output_sha256": "5ce49696948cd84886a60822402a7fe45c1d82e6809c70ce0e502da809111f86",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "ws-disabled-False",
+          "status": "failed",
+          "error": "Traceback (most recent call last):\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 23, in check\n    details = function()\n              ^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 309, in <lambda>\n    check(f\"ws-disabled-{disabled}\", lambda disabled=disabled: upstream_test(3661,\n                                                               ^^^^^^^^^^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 77, in upstream_test\n    getattr(module, name)()\n  File \"/review/variants/pr3661/testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py\", line 162, in test_ws_publishes_synchronous_fp8_conversion\n    torch.testing.assert_close(c, expected, rtol=0, atol=0)\n  File \"/usr/local/lib/python3.12/dist-packages/torch/testing/_comparison.py\", line 1631, in assert_close\n    raise error_metas[0].to_error(msg)\nAssertionError: Tensor-likes are not equal!\n\nMismatched elements: 256 / 524288 (0.0%)\nGreatest absolute difference: 2048.0 at index (352, 944)\nGreatest relative difference: 0.004638671875 at index (352, 944)\n"
+        },
+        {
+          "name": "ws-disabled-True",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": true,
+            "timing": {
+              "mean_us": 161.78951009114584,
+              "ci95_us": 0.6421406475276669,
+              "samples_us": [
+                162.055419921875,
+                162.0145263671875,
+                161.04115295410156,
+                161.8269500732422,
+                161.24143981933594,
+                163.22332763671875,
+                162.7576904296875,
+                161.34121704101562,
+                160.60386657714844
+              ]
+            }
+          }
+        }
+      ],
+      "min_host_available_bytes": 121648451584,
+      "max_hottest_c": 57.4,
+      "files": {
+        "command.json": {
+          "bytes": 1546,
+          "sha256": "e218e3a84f9545ca24bef58b416431a975dd37b58c4f283d756ac9c6610b4999"
+        },
+        "memory.jsonl": {
+          "bytes": 768,
+          "sha256": "687519f9cc47adbc3573d7ec1792eb997c77a7fb22bb18850565dc87faef1668"
+        },
+        "output.txt": {
+          "bytes": 2501,
+          "sha256": "5ce49696948cd84886a60822402a7fe45c1d82e6809c70ce0e502da809111f86"
+        },
+        "result.json": {
+          "bytes": 1729,
+          "sha256": "e515f2f80a737c041d09997ad698a8ffb87df7f7d079faa0834eb963dbfaba6b"
+        },
+        "standalone.json": {
+          "bytes": 2008,
+          "sha256": "d86111cfa5816925e087e46f4d8f44b4d983fa55cc8d1df2aff6cad33cc06ad0"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-False-0.cu": {
+          "bytes": 5708,
+          "sha256": "e1031565a367dedc2508c6578a4cafae15dea98dbcdd34faea6b569f50242fec"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-True-0.cu": {
+          "bytes": 8109,
+          "sha256": "8b127f560f69fc8e70d307bb8fbf0cd873d40a35db167ccf8f73b9d75c8799ab"
+        }
+      }
+    },
+    "ws3661-base-b-v2": {
+      "label": "ws3661-base-b-v2",
+      "started_utc": "2026-11-04T01:59:25.975386+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3661-base-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3661-base-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3661-base-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3661"
+      ],
+      "before_memory_bytes": 123852808192,
+      "start_hottest_c": 46.3,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:59:34.986401+00:00",
+      "memory_aborted": false,
+      "output_sha256": "39fb0568cb6fc694c300f6a0cadf4139227b5387dd45fc98300830e41b7e48e1",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "ws-disabled-False",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": false,
+            "timing": {
+              "mean_us": 164.59473503960504,
+              "ci95_us": 0.8495668593116168,
+              "samples_us": [
+                165.7357177734375,
+                163.77197265625,
+                165.5821075439453,
+                163.8098907470703,
+                163.77244567871094,
+                163.7833251953125,
+                164.4982452392578,
+                163.76284790039062,
+                166.6360626220703
+              ]
+            }
+          }
+        },
+        {
+          "name": "ws-disabled-True",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": true,
+            "timing": {
+              "mean_us": 160.71663750542535,
+              "ci95_us": 0.5970958333642086,
+              "samples_us": [
+                162.20982360839844,
+                161.03091430664062,
+                160.2348175048828,
+                161.7265625,
+                160.1260223388672,
+                160.1427764892578,
+                160.13792419433594,
+                160.59117126464844,
+                160.24972534179688
+              ]
+            }
+          }
+        }
+      ],
+      "min_host_available_bytes": 122335830016,
+      "max_hottest_c": 57.4,
+      "files": {
+        "command.json": {
+          "bytes": 1546,
+          "sha256": "fc9510967dba5479b5ef2736d732e319360340157b679c327620ff207fe970da"
+        },
+        "memory.jsonl": {
+          "bytes": 864,
+          "sha256": "a38af691bffc5deff3a0a85a8bdbb0d2a2cf300f45ee6b49af5e81c0f7053a7a"
+        },
+        "output.txt": {
+          "bytes": 1723,
+          "sha256": "39fb0568cb6fc694c300f6a0cadf4139227b5387dd45fc98300830e41b7e48e1"
+        },
+        "result.json": {
+          "bytes": 1729,
+          "sha256": "e83d5979c1b6e87264b6e32020a71b9a570c55c6e510a40a31477247d9a71b77"
+        },
+        "standalone.json": {
+          "bytes": 1392,
+          "sha256": "6856e0a4f201337e42915a0d49128c21557afcda4a61417e4e28c0deba276ddc"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-False-0.cu": {
+          "bytes": 5708,
+          "sha256": "e1031565a367dedc2508c6578a4cafae15dea98dbcdd34faea6b569f50242fec"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-True-0.cu": {
+          "bytes": 8109,
+          "sha256": "8b127f560f69fc8e70d307bb8fbf0cd873d40a35db167ccf8f73b9d75c8799ab"
+        }
+      }
+    },
+    "ws3661-pr3661-a-v2": {
+      "label": "ws3661-pr3661-a-v2",
+      "started_utc": "2026-11-04T01:37:47.828442+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3661",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3661-pr3661-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3661-pr3661-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3661-pr3661-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3661",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3661"
+      ],
+      "before_memory_bytes": 123251998720,
+      "start_hottest_c": 52.5,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:37:56.840239+00:00",
+      "memory_aborted": false,
+      "output_sha256": "df2f1313a6dde3aea8c770a0547c38dd48cb5d9e6cb768736b7ecdfde6dfaee1",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "ws-disabled-False",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": false,
+            "timing": {
+              "mean_us": 165.34488423665366,
+              "ci95_us": 0.501218822269668,
+              "samples_us": [
+                166.71798706054688,
+                165.5799102783203,
+                165.1757049560547,
+                165.21192932128906,
+                165.6038360595703,
+                164.720703125,
+                164.6934356689453,
+                165.69602966308594,
+                164.7044219970703
+              ]
+            }
+          }
+        },
+        {
+          "name": "ws-disabled-True",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": true,
+            "timing": {
+              "mean_us": 161.57881842719183,
+              "ci95_us": 0.5366213708455906,
+              "samples_us": [
+                163.09274291992188,
+                161.8711700439453,
+                161.5122833251953,
+                162.200927734375,
+                161.0755157470703,
+                161.068603515625,
+                161.10067749023438,
+                161.21160888671875,
+                161.07583618164062
+              ]
+            }
+          }
+        }
+      ],
+      "min_host_available_bytes": 122075086848,
+      "max_hottest_c": 59.0,
+      "files": {
+        "command.json": {
+          "bytes": 1558,
+          "sha256": "7cceeb7e0c23be2ac5bc846a9ccea32eab584e670fd312c00ea09764a2f2fc7c"
+        },
+        "memory.jsonl": {
+          "bytes": 864,
+          "sha256": "6501c0fd64387022a8bed972e0dfa206ebe3c7614be879251159c87f4943c40b"
+        },
+        "output.txt": {
+          "bytes": 1728,
+          "sha256": "df2f1313a6dde3aea8c770a0547c38dd48cb5d9e6cb768736b7ecdfde6dfaee1"
+        },
+        "result.json": {
+          "bytes": 1741,
+          "sha256": "aa1fe989ef7f1b5838e9b9317bac7e3911ce4ba210ef3d07bf3eaf6aa563f468"
+        },
+        "standalone.json": {
+          "bytes": 1393,
+          "sha256": "ba0976db49b5e56af284b625033c7acf23bc436bd4e4424e1ce08e4f6eff2acf"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-False-0.cu": {
+          "bytes": 5737,
+          "sha256": "6dd2fe198f7f38434402177319c51865f401548281c139549ead0913ea641f28"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-True-0.cu": {
+          "bytes": 8109,
+          "sha256": "8b127f560f69fc8e70d307bb8fbf0cd873d40a35db167ccf8f73b9d75c8799ab"
+        }
+      }
+    },
+    "ws3661-pr3661-b-v2": {
+      "label": "ws3661-pr3661-b-v2",
+      "started_utc": "2026-11-04T01:59:34.988067+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3661",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3661-pr3661-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3661-pr3661-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3661-pr3661-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3661",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3661"
+      ],
+      "before_memory_bytes": 123625291776,
+      "start_hottest_c": 54.7,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:59:44.000491+00:00",
+      "memory_aborted": false,
+      "output_sha256": "d5abcbcfc18c8c718dd1fe79d78511dc5f039f98430d7a3a0929f560ad67bcb1",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "ws-disabled-False",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": false,
+            "timing": {
+              "mean_us": 164.33035956488715,
+              "ci95_us": 0.7181752266140444,
+              "samples_us": [
+                166.60800170898438,
+                164.044921875,
+                164.414306640625,
+                164.79852294921875,
+                163.87059020996094,
+                163.6880645751953,
+                163.69366455078125,
+                164.1868133544922,
+                163.66835021972656
+              ]
+            }
+          }
+        },
+        {
+          "name": "ws-disabled-True",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py::test_ws_publishes_synchronous_fp8_conversion",
+            "compiled_kernels": 1,
+            "forced_ws_off": true,
+            "timing": {
+              "mean_us": 160.5308363172743,
+              "ci95_us": 0.8658854520523169,
+              "samples_us": [
+                163.37782287597656,
+                160.64886474609375,
+                160.166015625,
+                160.29458618164062,
+                160.52505493164062,
+                159.76109313964844,
+                159.7406005859375,
+                159.73939514160156,
+                160.5240936279297
+              ]
+            }
+          }
+        }
+      ],
+      "min_host_available_bytes": 122010427392,
+      "max_hottest_c": 59.6,
+      "files": {
+        "command.json": {
+          "bytes": 1558,
+          "sha256": "1aad18d33841c9bf176d770b32332311d4f311061cd904d607cf4e1cef9ae268"
+        },
+        "memory.jsonl": {
+          "bytes": 864,
+          "sha256": "4d628e440b4cc64ab18caa130e053ce72269d0d3b7fe5bfac9627cca8d8123e2"
+        },
+        "output.txt": {
+          "bytes": 1729,
+          "sha256": "d5abcbcfc18c8c718dd1fe79d78511dc5f039f98430d7a3a0929f560ad67bcb1"
+        },
+        "result.json": {
+          "bytes": 1741,
+          "sha256": "3919ac2b497cbee2ba39053cae2b5df904302f6313fa942c4f32710c67f93543"
+        },
+        "standalone.json": {
+          "bytes": 1394,
+          "sha256": "0698e504145ff2620d23a4805b0106f9f8f7b3075014c3d1c91ae5b671b2bee2"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-False-0.cu": {
+          "bytes": 5737,
+          "sha256": "6dd2fe198f7f38434402177319c51865f401548281c139549ead0913ea641f28"
+        },
+        "test_ws_publishes_synchronous_fp8_conversion-ws-off-True-0.cu": {
+          "bytes": 8109,
+          "sha256": "8b127f560f69fc8e70d307bb8fbf0cd873d40a35db167ccf8f73b9d75c8799ab"
+        }
+      }
+    }
+  },
+  "evidence_sha256": "1e70f1bb38a4799904fa36bd8a0d83da809d19900f358ed45bf4f9a317a5f44b",
+  "new_gpu_runs": [],
+  "serving_operations": [],
+  "candidate_image_built": false
+}

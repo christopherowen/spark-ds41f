@@ -1,0 +1,211 @@
+{
+  "baseRefOid": "3095e3f294bf65f5e65c6ba6dd2b21984abe5864",
+  "body": "Replace sampler dtype and strided copies with registered TileLang kernels, using vector loads and a column-first grid for aligned inputs. Large aligned FP32 copies use native pitched CUDA DMA; dense FP32 retains DMA. General layouts use TileLang without an ATen compute fallback. Sampling order, masks, raw-logit preservation and RNG stay unchanged.\n\nThe revised candidate passes all 18 GPU timing cases on both boots under a zero-margin, five-standard-error gate, with exact program/binding equality for unchanged DMA. Both boots pass 120 tests, including live graph payloads and side streams. The 96-row padded FP32 case is now about 2% faster. Historical regressions and rejected alternatives are preserved.\n\nFresh patch application reproduces the source tree; all three files match the composed qualified source. Doctor and diff checks pass. Built-image and full serving qualification remain; no promoted config or serving process changed. See `experiments/2026-11-05-sampler-copy-performance` for the selected series, strict gates and evidence links.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-sampler-copy/README.md",
+      "additions": 86,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/analyze.py",
+      "additions": 91,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/base.json",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/candidate.json",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/decision.md",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/measure.py",
+      "additions": 191,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/overlay/tests/kernels/test_deepseek_v41_copy_logits.py",
+      "additions": 75,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/overlay/vllm/v1/worker/gpu/sample/sampler.py",
+      "additions": 500,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/overlay/vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+      "additions": 3745,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/results.json",
+      "additions": 664,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/run.py",
+      "additions": 275,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/runs/local.json",
+      "additions": 169,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/runs/native-v1.json",
+      "additions": 3325,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/vllm/0001-sampler.patch",
+      "additions": 192,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-sampler-copy/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/README.md",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/base.json",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/candidate.json",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/checks.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/overlay/tests/kernels/test_deepseek_v41_copy_logits.py",
+      "additions": 123,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/overlay/vllm/v1/worker/gpu/sample/sampler.py",
+      "additions": 500,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/overlay/vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+      "additions": 3791,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/results.json",
+      "additions": 444,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/source-equivalence.json",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/vllm/0002-qualified-copy-routing.patch",
+      "additions": 186,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-sampler-copy-performance/vllm/series",
+      "additions": 2,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/tilelang-sampler-copy",
+  "headRefOid": "667ef55e7bad0e235248c175a181f3e04273247d",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 885,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:55:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040126315/job/127288434250",
+      "name": "repository",
+      "startedAt": "2026-11-05T13:55:40Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:55:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040126315/job/127288435445",
+      "name": "changes",
+      "startedAt": "2026-11-05T13:55:40Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:55:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040126315/job/127288502563",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-05T13:55:48Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:55:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040126315/job/127288514286",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-05T13:55:49Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Replace sampler cast and strided-copy kernels with TileLang"
+}

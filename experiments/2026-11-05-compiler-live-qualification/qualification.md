@@ -1,0 +1,39 @@
+# C42 qualification state
+
+Prepared for one guarded compiler interaction round; no image or controller has
+started. The selected source is unchanged corrected default-enabled C40 plus
+only the declared TileLang refresh/fix stack. Its canonical identities and
+unmodified authored patches are in the hash-bound README/source review. Actual
+image digest remains unknown. Later main/evidence publication is not a reason
+to synchronize an active owned or foreign window.
+
+All58 source artifacts and23 test/static/helper assets verify locally. Source
+replay, doctors and normalized runtime renders pass. Functional/performance
+specifications match C40 after identity-only normalization, with40 ordered
+functional outcomes and both full metric boots required. The current stream
+collector is selected explicitly to preserve C40 behavior. The18 offline
+control checks pass;755 repository tests pass with5 skips. Local complete build
+inputs/submodules are unavailable and the original incomplete check is retained.
+Full guarded Linux preparation/check remains mandatory before image build.
+
+The nine ordered image gates include official release tests, actual-image
+strict top-k initialization checking and two fresh installed-compiler feature
+processes. Canonical tests/static assertions/examples support are isolated from
+the installed compiler import path. Actual loaded library paths/hashes are
+bound before/after tests. All outcomes must pass before distribution/serving.
+Interrupted owned containers are cleaned by token/CID and independently checked
+again by the builder; unverified cleanup latches conservative review.
+
+Use regular shared scheduling, fresh actual holds/requests and named C36 live
+plans. Require one published clean exact commit across all serving nodes and
+owned DGX4 build checkout. Stage with bin/spark cluster sync and no restart of
+an already-matching C36. Do not act under the existing lossless-memory window.
+Open exactly one controller only after source staging and fresh guards.
+
+No earlier image/release is remeasured. Preserve all failed preparations/gates
+and every adverse point. After both metric boots verify actual supervisor exit,
+independent all-rank named C36 restoration, portable source hashes and local
+semantic audits. Compare1030,C36,both saved C40 boots, both C39 and both C38
+recipes, retaining all pairings and missing-data limits. No promotion or bypass
+of outstanding TP4 release gates is implied. The recurring schedule remains
+paused; direct waiting continues here.

@@ -1,0 +1,175 @@
+{
+  "baseRefOid": "c6f97ac10092c1b42037fc3a0a456a5647490c11",
+  "body": "`raw_logits` and `processed_logits` still gather, cast and mask selected scores through ATen. This candidate emits FP32 scores in one TileLang kernel, preserving values, ranks and ordering, and preparing all dtype/id/mask variants before the startup cache freezes. Invalid custom-id columns stay `-inf` without dereferencing their ids.\n\nThe reviewable source change is `experiments/2026-11-04-logits-scores/vllm/0001-selected-logits.patch`; its overlay is an exact export after the frozen candidate-38 stack. No promoted recipe, lock or default mode changes.\n\nValidation on owner-authorized idle sp8, using candidate-38's immutable image and published source `d28bb742`:\n\n- 87 tests passed on each of two container boots, covering dtype/stride/mask contracts, nonfinite values, graph replay, frozen-cache startup, prompt chunks, speculative chunks and custom ids in all four modes.\n- 36 paired operation timing cases passed on each of two boots. The six dtype/mask profiler inventories show one TileLang candidate kernel and no ATen GPU kernels. Measured operation times range from level to 67.72% shorter; this is not a serving-throughput result.\n- Two native IKET captures each contain 12 selected-logit launches, including eager and CUDA-graph replay, with decoded load/store ranges and checked numerical outputs.\n- All 572 base patches and this patch reproduce in a fresh tree. Doctor, export/syntax checks and new-code lint pass; three inherited test lint diagnostics are recorded. Source composition with #885, #886 and #887 also passes.\n\nNative receipts, commands, hashes and memory observations are retained; minimum host MemAvailable was 112.33 GiB. The sp8 reservation and container are removed. No serving operation was performed. Full build inputs are not prepared locally; full-image and full-model release qualification remain before promotion.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-logits-scores/README.md",
+      "additions": 88,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/analyze.py",
+      "additions": 84,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/base.json",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/candidate.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/decision.md",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/iket_probe.py",
+      "additions": 45,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/measure.py",
+      "additions": 290,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/overlay/tests/v1/worker/test_gpu_rejection_sampler_chunking.py",
+      "additions": 145,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/overlay/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+      "additions": 698,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/overlay/tests/v1/worker/test_gpu_verified_logprob_token_ids.py",
+      "additions": 520,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/overlay/vllm/v1/worker/gpu/sample/logprob.py",
+      "additions": 201,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/overlay/vllm/v1/worker/gpu/sample/tilelang_logprob.py",
+      "additions": 498,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/results.json",
+      "additions": 1812,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/run.py",
+      "additions": 278,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/runs/composition.json",
+      "additions": 10,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/runs/fresh-source.json",
+      "additions": 18,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/runs/local.json",
+      "additions": 43,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/runs/native-v1.json",
+      "additions": 7485,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/vllm/0001-selected-logits.patch",
+      "additions": 417,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-logits-scores/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/tilelang-logits-scores",
+  "headRefOid": "a470608f91a6c1fa42a1fdde9815625715b2c1c9",
+  "isDraft": false,
+  "mergeable": "UNKNOWN",
+  "number": 893,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:37:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41869218089/job/126711373963",
+      "name": "repository",
+      "startedAt": "2026-11-04T16:37:41Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:37:40Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41869218089/job/126711374834",
+      "name": "changes",
+      "startedAt": "2026-11-04T16:37:41Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:37:41Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41869218089/job/126711376195",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-04T16:37:41Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:37:41Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41869218089/job/126711375743",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-04T16:37:41Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Fuse selected-logit outputs in TileLang"
+}

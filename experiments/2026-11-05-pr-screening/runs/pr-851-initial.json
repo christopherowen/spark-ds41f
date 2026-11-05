@@ -1,0 +1,109 @@
+{
+  "baseRefOid": "15cba190221de06e4d582585384d3391c8aa7666",
+  "body": "A start that fails because of node state costs a full boot cycle before it says why. Three ways this happens:\n\n- a worker is missing the image (`cluster start --apply` doesn't distribute it, so the start fails);\n- a node's checkout is behind the head (any merge on the head blocks every start until the nodes are synced again);\n- the profile isn't in any commit, so it only exists on the host that wrote it.\n\nAll three refusals are correct, but each one shows up late. This change makes `cluster sync` the single command that brings every node in line. It also makes the `cluster start` plan list every problem `--apply` would stop on, along with the command that fixes it.\n\n## Changes\n\n- **`cluster sync --apply` copies the image.** As its last step, sync copies the image the profile names from the head to every node whose image layers differ (the existing `docker save | ssh docker load` path). The plan without `--apply` lists those nodes. If the head lacks the right build, sync only warns, because a lab image step may build after the sync. If the checkout isn't at the deployed commit, sync copies nothing and says so.\n- **Uncommitted profiles are refused before any checkout.** If a node lacks the profile and the deployed commit doesn't include it (for example an ignored `*.local.json`), sync stops before fetching and says to commit and publish the profile.\n- **The `cluster start` plan runs the full preflight.** It runs the same read-only checks as `--apply`, both on this host and on every node, and prints `preflight: clean` or every finding. Findings that sync repairs are marked as drift: a node checkout behind the head, a missing committed profile, or a worker image that's missing or stale. Drift findings end with:\n  ```\n  fix: bin/spark --cluster-config <profile> cluster sync --apply gives every node this commit and its image\n  ```\n  If the head itself lacks the right image, the finding names `build image --apply` instead. `--apply` still refuses and changes nothing on the nodes; it now prints the same fix line.\n- **`build distribute` shares the image helpers** with sync. It now refuses a host build whose labels don't match the profile.\n\nDocs updated: `docs/setup.md`, `docs/doctor.md`, `README.md`, `AGENTS.md`.\n\n## Behaviour to note\n\n- Lab's `sync_checkouts()` runs `cluster sync --apply` with the production profile. That sync will now also copy the production image to any node whose layers differ, which can add a few minutes the first time.\n- Sync still never copies an ignored cluster profile. Only the site's node map and `site.json` are copied.\n\n## Verification\n\n- `python -m unittest discover -s tests`: 635 tests OK. New tests cover the plan's preflight and fix line, drift classification on the head and on workers, image copy and skip, failed loads, the uncommitted-profile refusal, local image label checks, and `build distribute`.\n- `bin/spark doctor` exits 0; `git diff --check` is clean; `scripts/render_docs.py --check` is clean.\n- Not yet run against the cluster: the image copy and the node preflight were exercised only through unit tests.\n",
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "additions": 4,
+      "deletions": 2,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "README.md",
+      "additions": 2,
+      "deletions": 1,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "docs/doctor.md",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "docs/setup.md",
+      "additions": 4,
+      "deletions": 2,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "spark_ds41f/build.py",
+      "additions": 8,
+      "deletions": 34,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "spark_ds41f/cli.py",
+      "additions": 4,
+      "deletions": 2,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "spark_ds41f/cluster.py",
+      "additions": 207,
+      "deletions": 39,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "tests/test_doctor.py",
+      "additions": 1,
+      "deletions": 2,
+      "changeType": "MODIFIED"
+    },
+    {
+      "path": "tests/test_restart_guards.py",
+      "additions": 224,
+      "deletions": 7,
+      "changeType": "MODIFIED"
+    }
+  ],
+  "headRefName": "cluster-sync-image",
+  "headRefOid": "c15e2c699277dc65f40e42f80758f12d0af33582",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 851,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-02T15:36:07Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41473188651/job/125371928174",
+      "name": "repository",
+      "startedAt": "2026-11-02T15:36:17Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-02T15:36:07Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41473188651/job/125371840528",
+      "name": "changes",
+      "startedAt": "2026-11-02T15:36:08Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-02T15:36:07Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41473188651/job/125371841759",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-02T15:36:08Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-02T15:36:07Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41473188651/job/125371842575",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-02T15:36:08Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "cluster: sync copies the profile's image, and the start plan runs the full preflight"
+}

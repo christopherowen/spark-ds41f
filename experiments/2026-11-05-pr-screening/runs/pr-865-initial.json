@@ -1,0 +1,385 @@
+{
+  "baseRefOid": "6d59eaebf4ae569075f88b0466051dfcca053699",
+  "body": "A second receipt from the site of #346, for the record, not a promotion request. The ring moved from r6u to **spark-ds41f-1030** in two stages on one day, with the same client battery. Everything is in `experiments/2026-11-03-site-tp4-1030-1017/`, in the template layout (README, base, candidate, two arms, results, decision, `runs/`, plus `host/` for the 64 KiB preparation as run).\n\n**Setup:**\n- 4 x ASUS Ascent GX10, Secure Boot on, `host.fan_control: false`;\n- the `spark-ds41f:1030` image built with `bin/spark build image --apply`;\n- `tp4-ring` with one served name (`glp` unset), 1M context, 16 sequences, KV 10.5 GiB, 64 images per prompt;\n- started with `--unqualified-shape` on both hosts.\n\n**Stage 1: the engine, on the stock 4 KiB host** (`6.17.0-1032-nvidia`, 580.173.02, no memory saver). Against r6u the same day:\n- decode steps 8-10% shorter;\n- aggregate +10.2/+9.5/+5.6/+4.7% at C1/C4/C8/C16;\n- cold prefill +10-18%;\n- qeval text identical (71/75), vision/tools 7/7;\n- 4-5 GiB more MemAvailable per node.\n\n**Stage 2: the host, to the recipe's** `7.0.0-1019-nvidia-64k` with memory saver 0.4.1 (DKMS, signed with a site MOK key; loaded srcversion `37A4D127AE60F1F3AE60A02`), 580.178.04, `kho=off`:\n\n| on the 64 KiB host | 16,384 (recipe) | 8,192 |\n|---|---:|---:|\n| aggregate C1 / C4 / C8 / C16 | 98.8 / 241.6 / 363.7 / 512.5 | 97.3 / 238.9 / 357.8 / 507.7 |\n| salted cold prefill ~13K / 54K / 109K | 6,781 / 7,482 / 7,544 | 6,438 / 7,224 / 7,218 |\n| ~990K needle | pass, 5,590 tok/s | pass, 5,410 tok/s |\n| short request beside a 545K cold prefill: TTFT | 3.27 s | 1.53 s |\n| ... then gap between streamed chunks | 2.3-2.9 s | 1.3-1.5 s |\n| lowest MemAvailable through the battery | 23.1-24.6 GiB | 26.1-27.6 GiB |\n\n- At 8,192 the 64 KiB host is speed-neutral against stage 1 (-0.6..+1.4%) and holds about 2.4 GiB more per node. That figure covers the whole host change, headless items and `watermark_boost_factor=0` included.\n- The site serves 8,192, because agent and chat traffic share the engine. The 16,384 stall agrees with tp4-ring's note that steps beside a long prompt are about twice as long.\n\n**Other notes in the README:**\n- 580.173.02 is no longer published. The 580.178.04 driver pulls the 4 KiB `7.0.0-1024-nvidia` in as the newest kernel, so a GRUB pin before apt is needed.\n- `nvidia-cdi-refresh` fails during the upgrade.\n- Warm reboots with a monitor and keyboard attached latched all four GB10 clocks (only a cold drain cleared it); four later warm reboots with nothing attached did not. One Xid 119 after an enrollment boot.\n- The build base's Docker Hub tag is gone, but its digest still pulls.\n- `doctor --live` still checks fan-control kernel inventory with `fan_control: false`, and its weight-fragmentation check resolves the snapshot's relative links on the host.\n\n**Limits:**\n- one boot per configuration;\n- the site's own battery rather than `bin/spark bench` (no fan control installed);\n- the stall probe is one request per budget;\n- no soak or agent replay.\n\nThe receipt carries no private addresses, hostnames or serials (the arms' head address is a documentation address).\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/README.md",
+      "additions": 140,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/base.json",
+      "additions": 10,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/candidate-arm-4k.json",
+      "additions": 42,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/candidate-arm-64k.json",
+      "additions": 37,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/candidate.json",
+      "additions": 36,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/decision.md",
+      "additions": 23,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/host/check-boot.sh",
+      "additions": 53,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/host/pin-default-64k.sh",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/host/prepare-64k.sh",
+      "additions": 172,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/host/rails.sh",
+      "additions": 21,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/host/reboot-64k-once.sh",
+      "additions": 21,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/results.json",
+      "additions": 267,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/bench.txt",
+      "additions": 66,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/idletest.txt",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/mem-after-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/mem-before-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/needle-1m.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/needle.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/prefill-sweep.jsonl",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/qeval.json",
+      "additions": 986,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/qeval.txt",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-4k-8192/vision.txt",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/bench.txt",
+      "additions": 66,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/idletest.txt",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/mem-after-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/mem-before-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/memwatch.tsv",
+      "additions": 398,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/needle-1m.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/needle.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/prefill-sweep.jsonl",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/qeval.json",
+      "additions": 986,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/qeval.txt",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/stall.jsonl",
+      "additions": 3,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-16384/vision.txt",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/bench.txt",
+      "additions": 66,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/idletest.txt",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/mem-after-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/mem-before-1m.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/memwatch.tsv",
+      "additions": 406,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/needle-1m.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/needle.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/prefill-sweep.jsonl",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/qeval.json",
+      "additions": 986,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/qeval.txt",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/stall.jsonl",
+      "additions": 3,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/1030-64k-8192/vision.txt",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/memwatch.sh",
+      "additions": 22,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/bench.txt",
+      "additions": 66,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/idletest.txt",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/needle.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/qeval.json",
+      "additions": 986,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/qeval.txt",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/r6u-same-day/vision.txt",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/stall_probe.py",
+      "additions": 49,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-03-site-tp4-1030-1017/runs/tests.sh",
+      "additions": 17,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "receipt/2026-11-03-tp4-1030-1017",
+  "headRefOid": "b141c02d4e7e86e8c657a11c9b3987062fa0225c",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 865,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-03T14:49:15Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41657013776/job/125989906081",
+      "name": "repository",
+      "startedAt": "2026-11-03T14:46:37Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-03T14:46:44Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41657013776/job/125989906269",
+      "name": "changes",
+      "startedAt": "2026-11-03T14:46:37Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-03T14:46:44Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41657013776/job/125990013146",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-03T14:46:44Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-03T14:46:44Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41657013776/job/125990012595",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-03T14:46:44Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "experiments: external site receipt - spark-ds41f-1030 at tp4-ring on 4 KiB and on the 64 KiB host (DeepSeek-V4.1-Flash-1017)"
+}

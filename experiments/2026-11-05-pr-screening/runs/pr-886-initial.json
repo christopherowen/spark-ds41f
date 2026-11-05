@@ -1,0 +1,151 @@
+{
+  "baseRefOid": "3095e3f294bf65f5e65c6ba6dd2b21984abe5864",
+  "body": "Replace rank-order reduction fallbacks with TileLang kernels that read native strides and accumulate in FP32 in exact rank order. The existing packed BF16 kernel stays unchanged. Runtime shapes share startup-declared preparation keys; aliases, empty inputs and unsupported types are handled explicitly.\n\nThe controlled follow-up passes all 24 GPU cases on both boots under a zero-margin, five-standard-error gate. The retained packed path is proved equal by exact generated program and argument bindings, resolving its earlier timing artifact. Replaced paths have no ATen compute launch. The composed suite passes 1,167 tests twice; source factories, wrappers and constants match this independent patch exactly.\n\nFresh source-series application, doctor and diff checks pass. Historical unfavorable timings are retained. This qualifies local GPU arithmetic; built-image, physical multi-rank and serving checks remain. No promoted recipe or serving process changes. See `experiments/2026-11-05-rank-order-qualification`.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/README.md",
+      "additions": 89,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/analyze.py",
+      "additions": 91,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/base.json",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/candidate.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/decision.md",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/measure.py",
+      "additions": 217,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/overlay/tests/kernels/test_deepseek_v41_rank_order_strided.py",
+      "additions": 135,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/overlay/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+      "additions": 658,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/results.json",
+      "additions": 896,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/run.py",
+      "additions": 275,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/runs/local.json",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/runs/native-v1.json",
+      "additions": 4433,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/vllm/0001-reduction.patch",
+      "additions": 457,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-rank-order-strides/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-rank-order-qualification/README.md",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-rank-order-qualification/results.json",
+      "additions": 15995,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/tilelang-rank-sum",
+  "headRefOid": "82cd8b74c23f35d55916571acb722dbf86e40e97",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 886,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:58:05Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040470585/job/127289702066",
+      "name": "repository",
+      "startedAt": "2026-11-05T13:58:05Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:58:05Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040470585/job/127289701543",
+      "name": "changes",
+      "startedAt": "2026-11-05T13:58:05Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:58:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040470585/job/127289711476",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-05T13:58:06Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:58:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42040470585/job/127289711795",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-05T13:58:06Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Replace CUDA rank-order reduction fallbacks with TileLang"
+}

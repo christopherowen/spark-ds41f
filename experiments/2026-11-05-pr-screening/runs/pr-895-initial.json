@@ -1,0 +1,655 @@
+{
+  "baseRefOid": "a470608f91a6c1fa42a1fdde9815625715b2c1c9",
+  "body": "Scoring and top-k kernels now read token IDs in their producer's integer width and layout. Repeated int64 widening and contiguous materializations are removed. Small transposed selections use a block-sized shared tile; larger selections retain the qualified native-stride program. FP32 arithmetic/order, ranks and serialized token values stay unchanged.\n\nStacked on #893. The final dispatch selects only per-case GPU programs qualified on both timing boots, with a five-standard-error upper time ratio at most 1 or verified identity with the prerequisite program. It adds no conversion buffer or GPU launch. There is no regression allowance and no unqualified-program reuse.\n\nValidation on owner-authorized idle sp8 using candidate-38 by immutable image digest:\n\n- All 120 GPU cases verified on both fresh final boots: 112 exactly match qualified v6 programs and eight exactly match the shared-stage programs qualified over 480 mirrored rounds per boot in v7. Reference code, input hashes and strides match too; every output is checked independently. No new timings are claimed for identical programs.\n- 673 correctness checks pass on each boot, including native layouts, 31/32/33 boundaries, prompt/speculative scores, wire IDs, graphs and cold startup freeze.\n- Both expanded IKET captures decode all 56 expected launches with phase ranges and warp lifetimes, explicitly exercising shared staging and aligned vector loads. Minimum sampled host memory available: 111.08 GiB, with no guard stop.\n- The full candidate-38/prerequisite/patch stack applies in a fresh tree. Composition with #885, #886 and #887 also applies cleanly (source check only). Doctor, export hashes, parsing and diff checks pass; no new lint diagnostics. Complete build inputs are not prepared locally.\n\nAll rejected sources and unfavorable observations remain in the experiment. Full-image/full-model and host enqueue performance qualification remain before promotion. Serving and promoted configuration, locks and baselines were not changed.\n\n[Experiment and complete retained evidence](https://github.com/christopherowen/spark-ds41f/tree/605828e5b83f19bdf6d71073230c68bfb4a0127e/experiments/2026-11-04-native-score-inputs).\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/.gitattributes",
+      "additions": 6,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/README.md",
+      "additions": 335,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/analyze.py",
+      "additions": 87,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/analyze_final.py",
+      "additions": 113,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/analyze_pairs.py",
+      "additions": 132,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/analyze_shared.py",
+      "additions": 117,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/base.json",
+      "additions": 29,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v1.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v2.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v3.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v4.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v5.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v6.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v7.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate-v8.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/candidate.json",
+      "additions": 24,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v3/identity.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v3/tilelang_logprob.py",
+      "additions": 524,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v3/tilelang_topk_ids.py",
+      "additions": 489,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v6/identity.json",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v6/tilelang_logprob.py",
+      "additions": 543,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/control/v6/tilelang_topk_ids.py",
+      "additions": 509,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/decision.md",
+      "additions": 33,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/extension-cases.json",
+      "additions": 32,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/extension-plan.json",
+      "additions": 36,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/iket_probe.py",
+      "additions": 85,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/measure.py",
+      "additions": 587,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+      "additions": 833,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/tests/v1/worker/test_gpu_tilelang_topk_ids.py",
+      "additions": 588,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/vllm/v1/worker/gpu/sample/logprob.py",
+      "additions": 200,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/vllm/v1/worker/gpu/sample/prompt_logprob.py",
+      "additions": 227,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/vllm/v1/worker/gpu/sample/tilelang_logprob.py",
+      "additions": 570,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/overlay/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py",
+      "additions": 509,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-final.json",
+      "additions": 4222,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v4-events.json",
+      "additions": 10768,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v4.json",
+      "additions": 11158,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v6-primary.json",
+      "additions": 11891,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v6.json",
+      "additions": 11955,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v7.json",
+      "additions": 4673,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired-results-v8.json",
+      "additions": 4567,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/paired.py",
+      "additions": 160,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/performance-gate-v4.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/performance-gate-v6.json",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/performance-gate-v7.json",
+      "additions": 6,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/performance-gate-v8.json",
+      "additions": 6,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/performance-gate.json",
+      "additions": 20,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/results-v1.json",
+      "additions": 6568,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/results-v2.json",
+      "additions": 6568,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/results-v3.json",
+      "additions": 6568,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/results.json",
+      "additions": 6568,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/run.py",
+      "additions": 297,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-final.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v1.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v2.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v3.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v4.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v5.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v6.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v7.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition-v8.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/composition.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v1.json",
+      "additions": 18,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v2.json",
+      "additions": 19,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v3.json",
+      "additions": 19,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v4.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v6.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source-v7.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/fresh-source.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-final.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v1.json",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v2.json",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v3.json",
+      "additions": 16,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v4.json",
+      "additions": 32,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v5.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v6.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v7.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local-v8.json",
+      "additions": 34,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/local.json",
+      "additions": 16,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-final.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v1.json",
+      "additions": 22679,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v2.json",
+      "additions": 22686,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v3.json",
+      "additions": 22782,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v4-events.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v4.json",
+      "additions": 338866,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v5.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v6-extension.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v6.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v7.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/runs/native-v8.json",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/test_paired.py",
+      "additions": 26,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0001-native-score-inputs.patch",
+      "additions": 467,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0002-contiguous-masks.patch",
+      "additions": 79,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0003-compact-id-addressing.patch",
+      "additions": 117,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0004-retire-native-id-inputs.patch",
+      "additions": 171,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0005-native-layout-addressing.patch",
+      "additions": 203,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0006-producer-mask-fixture.patch",
+      "additions": 35,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0007-shared-selected-logits.patch",
+      "additions": 175,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0008-one-warp-staging.patch",
+      "additions": 62,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/0009-qualified-block-staging.patch",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-native-score-inputs/vllm/series",
+      "additions": 9,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/native-score-inputs",
+  "headRefOid": "605828e5b83f19bdf6d71073230c68bfb4a0127e",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 895,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T21:18:48Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41914899651/job/126871870699",
+      "name": "repository",
+      "startedAt": "2026-11-04T21:18:48Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T21:18:48Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41914899651/job/126871872016",
+      "name": "changes",
+      "startedAt": "2026-11-04T21:18:48Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T21:18:48Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41914899651/job/126871872221",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-04T21:18:48Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T21:18:48Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41914899651/job/126871873198",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-04T21:18:48Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Avoid token-id materialization in scoring kernels"
+}

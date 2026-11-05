@@ -1,0 +1,109 @@
+{
+  "baseRefOid": "3c7b455eec27c436f76f08ed28efb30135c86f4f",
+  "body": "A strided native sampled-token column triggers an ATen packing kernel during the nonblocking CPU handoff, even when scoring itself creates no copy. Transfer its physical span through PyTorch's existing asynchronous DMA and preserve the logical CPU view. Dense and multi-column transfers keep their existing route; native dtype, offsets and allocator/stream ownership stay under PyTorch.\n\nBoth boots pass all 26 transfer tests in the 1,266-case combined suite. All 12 changed-path complete transfer cases pass a zero-margin, five-standard-error gate on both boots, with means about 11\u201316% lower. Both 16-case public score-to-CPU inventories contain no ATen packing kernel. The extra transferred hole bytes are explicit in the evidence. Dense-path host overhead and full serving remain separate checks.\n\nThe existing output suite covers both ID widths, shifted offsets, empty/single/multiple rows, strides through 33, adaptive boundaries and side-stream lifetime. Fresh patch application reproduces the expected tree; doctor and diff checks pass. No serving process or promoted recipe changes. See `experiments/2026-11-05-native-result-transfer`; raw successful and initial failing inventories remain on `feat/tilelang-runtime-closure`.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/README.md",
+      "additions": 32,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/base.json",
+      "additions": 10,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/candidate.json",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/checks.json",
+      "additions": 7,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/overlay/tests/v1/test_outputs.py",
+      "additions": 307,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/overlay/vllm/v1/outputs.py",
+      "additions": 496,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/qualification.json",
+      "additions": 1131,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/vllm/0001-native-column-transfer.patch",
+      "additions": 94,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-native-result-transfer/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/native-result-transfer",
+  "headRefOid": "edd884dc7393d1df6e05c804a738851dc8370356",
+  "isDraft": true,
+  "mergeable": "MERGEABLE",
+  "number": 913,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:28:25Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42045336513/job/127306639632",
+      "name": "repository",
+      "startedAt": "2026-11-05T14:28:25Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:28:25Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42045336513/job/127306639927",
+      "name": "changes",
+      "startedAt": "2026-11-05T14:28:25Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:28:25Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42045336513/job/127306640431",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-05T14:28:25Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T14:28:25Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42045336513/job/127306640910",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-05T14:28:25Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Avoid GPU packing during native score-ID transfer"
+}

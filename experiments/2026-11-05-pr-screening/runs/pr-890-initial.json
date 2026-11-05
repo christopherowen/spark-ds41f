@@ -1,0 +1,421 @@
+{
+  "baseRefOid": "be80e776be2cbad0cdbf298dcd8137c68334ec84",
+  "body": "Failed or cancelled frontend operations can retain memory indefinitely in two places:\n\n- Request submission registers prompts before the engine send, but `generate()` has no collector handle until submission returns. A failed send can leave prompts and partial sampling children with no engine completion to release them.\n- Utility calls register a pending future before encoding/sending and previously remove it only on reply. Encoding/send errors and cancellations can accumulate futures when no reply will arrive.\n\nMake submission own rollback until it returns the collector, using the original internal ID to clean up sampling children without aborting another request with the same external ID. Bound utility futures to their caller's lifetime, preserve original errors/results, and handle late replies and synchronous cancellation races safely.\n\nCarry both narrow source patches in an isolated candidate-39 recipe. The combined recipe is `experiments/2026-11-04-utility-call-cleanup/tp3.json`; promoted configuration and immutable baselines are unchanged. `AUDIT.md` records other ownership paths inspected, the opt-in Responses history store, and a data-parallel routing concern outside the TP3/TP4 recipe.\n\nSpaceport sp8 validation, using an immutable candidate-38 image in isolated CPU-only containers:\n\n| Suite | Original source | Corrected source |\n| --- | --- | --- |\n| Request submission | 8 failures, 2 passes | 10 passes |\n| Utility lifetime | 14 failures, 6 passes | 20 passes |\n\nNo errors or skips. Request controls include sixteen failed 65,536-token submissions; utility controls include 64 failed calls per client type. Successful completion, utility results/errors, cancellation, partial sampling children, reused external IDs, late replies and concurrent callers are covered. Exact hashes, native pytest exits, JUnit, commands, container states and setup failures are retained in the experiments.\n\nAll 575 ordered patches replayed in a fresh clean source worktree to head `07733cc7611ad3822b313778bc3504f4233709d0`, tree `ff08b5ed9f909de67fa74590e321ed634d2e54a3`. Doctor, experiment-local release-test classification, 50 repository unit checks and `git diff --check` pass. The initial stale patch-count check and earlier setup failures are preserved.\n\nRelated: #884. Both leak paths also exist in candidate-36. These tests establish ownership defects, not the full source or rate of overnight memory drift, nor a candidate-38-specific regression. No DGX experiment, GPU workload or serving restart was performed. The new image, full release gate and serving/performance qualification remain pending; complete build inputs were unavailable for `build check`. Keep this draft and #884 open until that evidence exists.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/README.md",
+      "additions": 118,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/base.json",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/decision.md",
+      "additions": 19,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/release-tests.json",
+      "additions": 222,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/results.json",
+      "additions": 80,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/run_spaceport.py",
+      "additions": 159,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/run_tests.py",
+      "additions": 121,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/doctor-tp3-dev.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/doctor-tp3.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/index.json",
+      "additions": 78,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/repository-checks.txt",
+      "additions": 84,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/source-preparation-attempt1.txt",
+      "additions": 33,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/source-preparation-attempt2.txt",
+      "additions": 3,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt1/control/controller.log",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt1/corrected/controller.log",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt1/receipt.json",
+      "additions": 110,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/control/control.json",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/control/control.log",
+      "additions": 430,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/control/control.xml",
+      "additions": 381,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/control/controller.log",
+      "additions": 432,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/corrected/controller.log",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/corrected/corrected.json",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/corrected/corrected.log",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/corrected/corrected.xml",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/spaceport-attempt2/receipt.json",
+      "additions": 183,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/runs/test-classification.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/source.json",
+      "additions": 209,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/tp3-dev.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/tp3.json",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/upstreams.lock.json",
+      "additions": 427,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/vllm/0001-rollback-failed-submissions.patch",
+      "additions": 303,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-request-submission-cleanup/vllm/series",
+      "additions": 575,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/AUDIT.md",
+      "additions": 63,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/README.md",
+      "additions": 91,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/base.json",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/release-tests.json",
+      "additions": 223,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/results.json",
+      "additions": 77,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/run_spaceport.py",
+      "additions": 159,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/run_tests.py",
+      "additions": 121,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/doctor-attempt1.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/doctor-attempt2.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/index.json",
+      "additions": 70,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/repository-checks.txt",
+      "additions": 84,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/source-comparison.json",
+      "additions": 23,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/source-replay.txt",
+      "additions": 13,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/control/control.json",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/control/control.log",
+      "additions": 549,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/control/control.xml",
+      "additions": 480,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/control/controller.log",
+      "additions": 551,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/controller.txt",
+      "additions": 5,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/corrected/controller.log",
+      "additions": 14,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/corrected/corrected.json",
+      "additions": 38,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/corrected/corrected.log",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/corrected/corrected.xml",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/spaceport-attempt1/receipt.json",
+      "additions": 183,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/runs/test-classification.txt",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/source.json",
+      "additions": 210,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/tp3.json",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/upstreams.lock.json",
+      "additions": 427,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/vllm/0001-release-abandoned-utility-calls.patch",
+      "additions": 296,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-04-utility-call-cleanup/vllm/series",
+      "additions": 575,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/request-submission-cleanup",
+  "headRefOid": "f48abc8125dda6bb4368268e3f849c953536ad15",
+  "isDraft": true,
+  "mergeable": "MERGEABLE",
+  "number": 890,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:09:10Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41864526760/job/126695195610",
+      "name": "repository",
+      "startedAt": "2026-11-04T16:09:11Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:09:10Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41864526760/job/126695196847",
+      "name": "changes",
+      "startedAt": "2026-11-04T16:09:11Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:09:11Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41864526760/job/126695198684",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-04T16:09:11Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-04T16:09:11Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/41864526760/job/126695197670",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-04T16:09:11Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Release failed frontend submissions and abandoned utility calls"
+}

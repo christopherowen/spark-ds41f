@@ -1,0 +1,139 @@
+{
+  "baseRefOid": "605828e5b83f19bdf6d71073230c68bfb4a0127e",
+  "body": "Prompt logprobs previously allocated chunk result buffers, scanned ranks separately and concatenated three outputs. This patch writes final slices and fuses ranks into the selected-score pass, preserving exact score/rank bits and native ID layouts.\n\nAll 10 prompt GPU timing cases pass a zero-margin gate on both boots. Two predeclared precision extensions pass independently and pooled; the full-vocabulary log-probability case is about 32% faster. Two focused boots pass 76 tests each; the combined suite passes 1,167 tests twice. All 120 unaffected normal score programs retain their qualified code and bindings.\n\nStacked on #895. Fresh patch application reproduces the recorded tree; doctor and diff checks pass. Built-image, full model and physical-fabric qualification remain release gates. No serving runtime or promoted configuration changes. Raw evidence, including unsuccessful variants, is retained on `feat/tilelang-runtime-closure`; this patch's six files match that source byte-for-byte.\n",
+  "files": [
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/README.md",
+      "additions": 42,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/base.json",
+      "additions": 15,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/candidate.json",
+      "additions": 12,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/checks.json",
+      "additions": 8,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/confidence-extension.json",
+      "additions": 102,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/tests/v1/worker/test_gpu_logprob_ranks.py",
+      "additions": 151,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+      "additions": 904,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/vllm/v1/worker/gpu/sample/logprob.py",
+      "additions": 200,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/vllm/v1/worker/gpu/sample/prompt_logprob.py",
+      "additions": 232,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/vllm/v1/worker/gpu/sample/tilelang_logprob.py",
+      "additions": 737,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/overlay/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py",
+      "additions": 522,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/source-equivalence.json",
+      "additions": 11,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/vllm/0001-fused-prompt-outputs.patch",
+      "additions": 600,
+      "deletions": 0,
+      "changeType": "ADDED"
+    },
+    {
+      "path": "experiments/2026-11-05-prompt-score-output/vllm/series",
+      "additions": 1,
+      "deletions": 0,
+      "changeType": "ADDED"
+    }
+  ],
+  "headRefName": "feat/prompt-score-output",
+  "headRefOid": "400d05e3080dcbc22aca8633633af6c2f8b609e5",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 912,
+  "state": "OPEN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:54:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42039887990/job/127287613404",
+      "name": "repository",
+      "startedAt": "2026-11-05T13:54:06Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:54:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42039887990/job/127287665864",
+      "name": "changes",
+      "startedAt": "2026-11-05T13:54:12Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:54:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42039887990/job/127287658182",
+      "name": "patch-stacks",
+      "startedAt": "2026-11-05T13:54:12Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-05T13:54:06Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/christopherowen/spark-ds41f/actions/runs/42039887990/job/127287613717",
+      "name": "nccl-adaptive-plans",
+      "startedAt": "2026-11-05T13:54:06Z",
+      "status": "COMPLETED",
+      "workflowName": "validate"
+    }
+  ],
+  "title": "Fuse prompt score outputs and rank calculation"
+}
