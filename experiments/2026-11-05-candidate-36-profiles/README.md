@@ -39,7 +39,7 @@ These checks validate configurations; they do not probe a physical network.
 
 The first verifier setup attempt missed the repository import path; the second
 used an example head address that differed from the profile's rendezvous address.
-Their logs and the second attempt's findings are preserved under `runs/`.
+The setup failure and the second attempt's findings are preserved under `runs/`.
 
 Commands:
 
