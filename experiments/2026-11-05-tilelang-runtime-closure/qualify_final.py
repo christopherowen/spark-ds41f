@@ -15,9 +15,10 @@ p = argparse.ArgumentParser()
 p.add_argument("--runs", type=Path, default=HERE / "runs")
 p.add_argument("--full", type=Path, default=HERE / "runs/full-native-embedding-v20")
 p.add_argument("--prior-full", type=Path)
-p.add_argument("--draft-run", default="draft-performance-v22")
+p.add_argument("--run-map", type=Path, default=HERE / "accepted-runs.json")
 p.add_argument("--out", type=Path, default=HERE / "qualification.json")
 a = p.parse_args()
+run_map = json.loads(a.run_map.read_text())
 
 
 def read(path):
@@ -116,7 +117,7 @@ for boot in (1, 2):
         embedding[key][row["name"]] = result
     assert len(embedding[key]) == 32 and len(additional) == 3
 
-    drafting[key] = {r["name"]: brief(r) for r in point(a.draft_run, "draft_bench", boot)["cases"]}
+    drafting[key] = {r["name"]: brief(r) for r in point(run_map["drafting"][key], "draft_bench", boot)["cases"]}
     assert len(drafting[key]) == 6
     transfer[key] = {str((r["dtype"], r["rows"], r["stride"])): brief(r)
                      for r in point("final-wire-v9", "transfer", boot)["cases"]}
@@ -124,11 +125,11 @@ for boot in (1, 2):
     wires = point("final-wire-v9", "wire", boot)["cases"]
     assert len(wires) == 16 and all(not r["aten_kernels"] for r in wires)
     wire[key] = dict(cases=len(wires), aten_kernels=0)
-    test = point("final-tests-v21", "tests", boot)
+    test = point(run_map["tests"][key], "tests", boot)
     assert test["pytest_exit"] == 0 and set(test["outcomes"]) == {"passed"}
     assert test["candidate"]["head"] == read(HERE / "candidate.json")["head"]
     tests[key] = test["outcomes"]
-    instrumented = point("final-iket-v21", "iket", boot)
+    instrumented = point(run_map["iket"][key], "iket", boot)
     assert instrumented["numerics"]["count"] == 33 and len(instrumented["required"]) == 14
     iket[key] = dict(numerical_cases=33, eager_and_graph=True,
                      required_factories=instrumented["required"],
@@ -158,7 +159,7 @@ unresolved = {family: {boot: [name for name, row in cases.items() if not row["pa
                       for boot, cases in boots.items()}
               for family, boots in families.items()}
 passed = not any(names for boots in unresolved.values() for names in boots.values())
-result = dict(candidate=read(HERE / "candidate.json"), passed=passed,
+result = dict(candidate=read(HERE / "candidate.json"), run_map=run_map, passed=passed,
               families=families, unresolved=unresolved, tests=tests, wire=wire,
               iket=iket, full_model=full,
               scope="Changed GPU paths, complete changed-path CPU result transfers, and the recorded 43-layer dummy-weight request. Both boots must pass a five-standard-error upper ratio <=1 or proven identical GPU program/bindings.",

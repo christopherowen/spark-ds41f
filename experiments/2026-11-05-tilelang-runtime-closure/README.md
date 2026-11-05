@@ -322,3 +322,10 @@ then stopped before measurement: it supplied a BF16 confidence weight to the
 FP32 confidence-head contract. Its corrected fixture uses the actual FP32
 weight, records all shared weight/input hashes and forwards the declared round
 count. Production source is unchanged; the failed fixture remains evidence.
+
+The corrected drafting boot passes all six cases. A foreign request arrived
+before its second boot, so the controller yielded with only boot one complete.
+Its outer receipt also hit a variable-shadowing error, corrected separately;
+the numerical and timing results remain intact. Remaining boots now have
+individual immutable run directories in `accepted-runs.json`. The controller
+validates completed jobs before reuse and never reruns a completed boot.
