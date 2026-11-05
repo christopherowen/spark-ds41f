@@ -1,7 +1,7 @@
-"""Paired CUPTI kernel durations without CUDA event nodes in the timed graphs.
+"""Paired CUPTI kernel durations with the original CUDA event ordering markers.
 
 External graph events add about 3 us to the ~1 us tail kernels. Keep those raw
-results; use hardware activity timestamps to resolve actual compute duration.
+results; use hardware activity timestamps for compute and retain event intervals too.
 """
 import hashlib
 import json
@@ -13,15 +13,20 @@ import statistics
 def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=64):
     import torch
 
-    graphs = {}
+    graphs, events = {}, {}
     for role, launch in launches.items():
         launch()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        events[role] = [(torch.cuda.Event(enable_timing=True, external=True),
+                         torch.cuda.Event(enable_timing=True, external=True))
+                        for _ in range(samples)]
         with torch.cuda.graph(graph):
-            for _ in range(samples):
+            for begin, end in events[role]:
                 flush.zero_()
+                begin.record()
                 actual = launch()
+                end.record()
         graph.replay()
         torch.cuda.synchronize()
         values = actual if isinstance(actual, tuple) else (actual,)
@@ -34,7 +39,7 @@ def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=6
             graph.replay()
     torch.cuda.synchronize()
     rng = random.Random(seed)
-    orders = []
+    orders, event_intervals = [], []
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                            torch.profiler.ProfilerActivity.CUDA]) as profile:
         for _ in range(rounds):
@@ -42,9 +47,13 @@ def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=6
             rng.shuffle(order)
             order += order[::-1]
             orders.append(order)
+            intervals = {role: [] for role in launches}
             for role in order:
                 graphs[role].replay()
-                torch.cuda.current_stream().synchronize()
+                events[role][-1][1].synchronize()
+                intervals[role].append([begin.elapsed_time(end) * 1000
+                                        for begin, end in events[role]])
+            event_intervals.append(intervals)
     profile.export_chrome_trace(str(out))
     trace = json.loads(out.read_text())
     all_kernels = sorted((e for e in trace['traceEvents'] if e.get('cat') == 'kernel'),
@@ -80,7 +89,8 @@ def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=6
                            / statistics.fmean(t for a in r['times_us']['reference'] for t in a))
                    for r in pairs] for role in launches if role != 'reference'}
     return dict(pairs=pairs, log_ratios=logs, samples_per_replay=samples,
-                timer='CUPTI GPU activity start/end, one stream, no CUDA event nodes in graphs',
+                timer='CUPTI GPU activity start/end, original external-event ordering retained',
+                event_intervals_us=event_intervals,
                 activity_kernels=len(kernels), role_kernels=names,
                 cache_flush=dict(count=len(flush_kernels),
                     kernels=sorted({e['name'] for e in flush_kernels}),

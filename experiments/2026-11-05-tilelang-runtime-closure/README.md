@@ -295,3 +295,12 @@ The original method branch and fused branch are measured with identical W1/W2,
 confidence weights, anchors and inputs at 1/8/16 requests and both score widths.
 IKET probes now include native embeddings and the single-rank fused Markov
 projection, finish and next-token embedding, in eager and graph modes.
+
+The event-free activity repeat stops on its final case's ordering check: graph
+launch scheduling can overlap the next cache flush with a copy. All records are
+retained. The corrected activity protocol restores the original explicit event
+ordering markers and also records their intervals; acceptance uses CUPTI kernel
+start/end durations. Both clocks now describe the same original graph workload.
+This preserves the cache-flush/copy alternation and avoids treating GPU start
+order as capture order when independent graph nodes can overlap. Complete fresh
+two-boot runs are required; the partial run is not promoted to a final result.
