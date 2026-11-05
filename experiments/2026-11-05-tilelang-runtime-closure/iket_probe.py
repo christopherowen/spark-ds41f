@@ -27,7 +27,7 @@ def exercise(label, launch, expected):
     def check(actual):
         outputs = actual if isinstance(actual, tuple) else (actual,)
         assert len(outputs) == len(values)
-        assert all(torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+        assert all(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
                    for a, b in zip(outputs, values, strict=True)), label
 
     check(launch())

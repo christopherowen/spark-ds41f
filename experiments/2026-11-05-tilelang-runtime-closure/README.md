@@ -212,3 +212,10 @@ are diagnostic, never sufficient qualification. Full serving remains separate.
 Transfer-case count correction: the matrix contains 2 ID widths × 4 row counts ×
 3 strides + 2 lifetime cases = 26, not 50. Both combined totals remain 1,266.
 Patch descriptions and the narrow PR now use the actual 26-case count.
+
+`final-iket-v10` stops in the probe's independent byte-comparison helper: FP32
+`.float()` retains a sliced input's non-unit column stride, which cannot be
+reinterpreted directly as bytes. The helper now materializes logical values on
+both sides before its byte comparison. The raw failure remains on sp8 and will
+be archived. This changes no production code. Full-model inventory runs first
+in the resumed queue so additional runtime kernels are discovered promptly.
