@@ -21,7 +21,7 @@ class GateTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('matrix_preflight',Path(__file__).with_name('run_window.py'))
         controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
         with tempfile.TemporaryDirectory() as folder:
-            home=Path(folder);cache=home/'cache';cache.mkdir()
+            home=Path(folder).resolve();cache=home/'cache';cache.mkdir()
             out=home/'spark-lab/results/test'
             with patch.object(controller.socket,'gethostname',return_value='spark-0009'), \
                  patch.object(controller.subprocess,'check_output',side_effect=['published\n','','origin/branch\n']), \
