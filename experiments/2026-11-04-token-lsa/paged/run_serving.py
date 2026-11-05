@@ -38,7 +38,7 @@ roots=['/home/chris/projects/spark-ds41f','/home/chris/spark-lab/checkouts/clust
 print(json.dumps({'image':x['Image'],'running':x['State']['Running'],
  'checkouts':{p:{'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=p,text=True).strip(),
                  'status':subprocess.check_output(['git','status','--porcelain'],cwd=p,text=True)} for p in roots},
- 'experiment_mounts':[m['Destination'] for m in x['Mounts'] if any(s in m['Source'] for s in ['clustered-indexer','token-lsa','selector-fitting','block-summary'])],
+ 'experiment_mounts':[m['Destination'] for m in x['Mounts'] if any(s in m['Source'] for s in ['clustered-indexer','token-lsa','selector-fitting','block-summary','block-load'])],
  'search_env':[e for e in x['Config']['Env'] if e.startswith(('VLLM_DS41_CLUSTERED_SEARCH=','VLLM_DS41_PAGE_'))]}))
 ''')
     assert all(v['image'] == w.IMAGE and v['running'] and not v['experiment_mounts'] and not v['search_env']
