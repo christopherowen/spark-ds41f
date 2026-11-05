@@ -28,3 +28,27 @@ building. A future serving implementation would have to maintain required
 statistics on cache writes and include their full cost in request timing. No
 reference, grading or duplicate scoring would enter timed serving. No candidate
 is qualified by this proxy alone.
+
+The screen completes at runtime commit
+`ff00c355de3173400435db95488b493161261c91` in `runs/screen-01`. The zero-margin
+control exactly reproduces original keys and source handoffs/counts on every
+capture. Fitting selects beta0.01: its aggregate fitting recall is 75.50% versus
+75.30% at zero. Larger margins degrade it, down to 40.94% at beta1; every result
+is retained.
+
+On the reused diagnostic document, dense top512 recall changes by +0.59, +0.13
+and +0.25 percentage points in layers2/8/14. Source top512 key recall improves
+by +0.32 points, and source handoff-block recall by +0.28. The full per-query
+values and comparison are retained. Adjacent queries do not increase the
+independent document count beyond one.
+
+Conclusion: this small teacher-agreement gain establishes neither superior
+final answers nor request performance. The margin remains an offline probe; it
+does not enter timed serving. No model-quality ranking or promotion is claimed.
+
+The standalone Torch allocator peaks at 376,239,104 allocated bytes and
+648,019,968 reserved bytes. Those statistics exclude full-model memory
+qualification. The lease is released at13:09:22 UTC, with no containers remaining.
+Independent verification confirms our lease is absent and the checkout is clean;
+by that check the other work has resumed under its own distinct lease. Both
+serving clusters remain untouched by the standalone screen.
