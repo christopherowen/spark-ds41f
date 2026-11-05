@@ -14,3 +14,12 @@ processes, including single-page, all-page and skipped-slot costs and memory.
 The published preceding summary timings are comparison evidence; do not rewrite
 them. Keep every error. No request or answer-quality claim follows. Any runtime
 integration requires the full package/kernel/lifecycle and admission gates.
+
+The first screen (`0a5570c2`, `runs/screen-01`) fails before GPU execution:
+the maintenance-only bundle inherited the timing mounts and omitted the host
+sanitizer directory. `execv` cannot find its tool. No equivalence or performance
+result is produced. The error, exact command and lease release are retained;
+there are no remaining containers. The retry adds the same pinned sanitizer
+mount used by the prior qualified bundles and disables the PyTorch allocation
+cache for strict checking. The kernel, operands, expected bytes and timers are
+unchanged.
