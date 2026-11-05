@@ -89,6 +89,20 @@ def main():
     assert torch.cuda.is_available(), (
         "GPU required; this program must not publish simulated timings"
     )
+    import vllm
+
+    package_root = Path(vllm.__file__).resolve().parent.parent
+    expected_sources = json.loads(
+        Path(__file__).with_name("micro-source-hashes.json").read_text()
+    )
+    for relative, expected in expected_sources.items():
+        actual = hashlib.sha256((package_root / relative).read_bytes()).hexdigest()
+        assert actual == expected, (
+            relative,
+            "runtime source mismatch",
+            actual,
+            expected,
+        )
     torch.set_num_threads(1)
     device = torch.device("cuda")
     stream = torch.cuda.Stream()
@@ -102,6 +116,7 @@ def main():
         cases=[],
         status="running",
     )
+    result["verified_runtime_sources"] = expected_sources
     result["script_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
     def save():
