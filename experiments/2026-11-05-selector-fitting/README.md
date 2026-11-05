@@ -26,3 +26,13 @@ This profile is untimed: copies and synchronization perturb execution. Never
 mount this capture hook in a timed LSA or native control profile. No capture run,
 performance result or quality improvement is claimed. A future collection must
 use the authorized, reserved all-node window and restore C37 after its jobs.
+
+Preparation applies the scratch guard and this experiment's ordered patch in a
+fresh named C36 tree; all three overlays match byte-for-byte and `diff --check`
+passes (`runs/local/source-check.json`). An initial attempt used a repository
+without the C36 object; that refusal and the correction are retained. The
+CPU-only pinned-container copy checks pass on sp8 for 128/256-key pages, 64 rows,
+different query tables, physical aliases, partial pages, zeroed saved tails,
+arming/graph/decode skips and overwrite refusal (`runs/copy-check-01`). The
+container and reservation are removed. These checks do not replace native GPU
+replay, which is still required before any fit.
