@@ -151,3 +151,12 @@ restored and accepted by the strict reference guard. The old 8192-token cohort i
 not a comparator. The 45 held-out documents remain unseen. No outcome is assumed.
 The separate mechanical check covers 98,305 visible keys, both page sizes,
 9 owners/rows, graph replay, source handoff and selected native score bits.
+
+The source-1024 mechanical check passes on sp8 in
+`runs/source-budget-check-01`: both page sizes, 9 rows/owners, visible 98,305-key
+pruned domains, native selected-score bits, source handoff/counts, partial pages,
+graph replay and recycled pages. All six hot mounted sources remain identical
+to the previously fresh-applied C36 patch series (`runs/local-source-1024`).
+No source code inside the timed implementation changes. The standalone test
+reservation and container are removed. Model quality and request timing for this
+new operating point have not been measured.
