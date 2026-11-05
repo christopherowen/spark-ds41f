@@ -1,0 +1,147 @@
+{
+ "kernel": "topk_log_softmax_ranks_kernel",
+ "ctas": 1,
+ "iters": 1,
+ "granularity": "phase",
+ "warps": 1,
+ "payloads": false,
+ "sites": [
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 387,
+   "last_line": 421,
+   "statement": "selected_rank[0] = logits[((((int64_t)((int)blockIdx.x)) * logits_stride) + token_ids[(((int64_t)((int)blockIdx.x)) * id_row)])];",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "compute.reduce",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 424,
+   "last_line": 428,
+   "statement": "best[0] = vllm_max(best[0], __shfl_xor_sync((uint)4294967295, best[0], 16, 32));",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "wait.sync",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 432,
+   "last_line": 432,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "settled": true,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 470,
+   "last_line": 522,
+   "statement": "for (int step_1 = 0; step_1 < (vocab >> 11); ++step_1)",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "compute.reduce#2",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 527,
+   "last_line": 616,
+   "statement": "se[0] = vllm_add(se[0], __shfl_xor_sync((uint)4294967295, se[0], 16, 32));",
+   "loops": 0,
+   "settled": true,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "wait.sync#2",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 617,
+   "last_line": 621,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "settled": true,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 622,
+   "last_line": 629,
+   "statement": "if (((int)threadIdx.x) == 0)",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "load.global#3",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 632,
+   "last_line": 632,
+   "statement": "float value_8 = vllm_sub(vllm_shifted(logits[((((int64_t)((int)blockIdx.x)) * logits_stride) + token_ids[(((((int64_t)c) * (int64_t)1024) + (((int64_t)((int)blo",
+   "loops": 1,
+   "loop_trips": null,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  },
+  {
+   "kernel": "topk_log_softmax_ranks_kernel",
+   "range": "store.global#2",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 633,
+   "last_line": 633,
+   "statement": "output[(((((int64_t)c) * (int64_t)1024) + (((int64_t)((int)blockIdx.x)) * ((int64_t)topk))) + ((int64_t)((int)threadIdx.x)))] = value_8;",
+   "loops": 1,
+   "loop_trips": null,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 18
+  }
+ ]
+}

@@ -1,0 +1,87 @@
+{
+ "kernel": "token_ranks_scores_kernel",
+ "ctas": 1,
+ "iters": 1,
+ "granularity": "phase",
+ "warps": 1,
+ "payloads": false,
+ "sites": [
+  {
+   "kernel": "token_ranks_scores_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 25,
+   "last_line": 46,
+   "statement": "if (((0 <= token_ids[(((int64_t)((int)blockIdx.x)) * id_stride)]) && (token_ids[(((int64_t)((int)blockIdx.x)) * id_stride)] < 257)))",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "token_ranks_scores_kernel",
+   "range": "compute.reduce",
+   "phase": "compute",
+   "kinds": [
+    "reduce"
+   ],
+   "first_line": 52,
+   "last_line": 52,
+   "statement": "total[0] = tl::AllReduce<tl::SumOp, 256, 1, 0, tl::NamedBarrier<256>>::run(total[0], (&(workspace[0])));",
+   "loops": 0,
+   "settled": true,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "token_ranks_scores_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 53,
+   "last_line": 53,
+   "statement": "output[((int64_t)((int)blockIdx.x))] = ((int64_t)total[0]);",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "token_ranks_scores_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 57,
+   "last_line": 61,
+   "statement": "if (((0 <= ids[((((int64_t)((int)blockIdx.x)) * id_row) + (((((int64_t)group) * (int64_t)256) + ((int64_t)((int)threadIdx.x))) * id_col))]) && (ids[((((int64_t)",
+   "loops": 1,
+   "loop_trips": null,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 10
+  },
+  {
+   "kernel": "token_ranks_scores_kernel",
+   "range": "store.global#2",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 62,
+   "last_line": 62,
+   "statement": "scores[(((((int64_t)group) * (int64_t)256) + (((int64_t)((int)blockIdx.x)) * ((int64_t)columns))) + ((int64_t)((int)threadIdx.x)))] = condval_2;",
+   "loops": 1,
+   "loop_trips": null,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 10
+  }
+ ]
+}

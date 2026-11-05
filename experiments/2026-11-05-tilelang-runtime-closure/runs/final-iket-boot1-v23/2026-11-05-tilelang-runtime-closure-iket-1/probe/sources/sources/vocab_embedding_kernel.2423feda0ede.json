@@ -1,0 +1,55 @@
+{
+ "kernel": "vocab_embedding_kernel",
+ "ctas": 1,
+ "iters": 1,
+ "granularity": "phase",
+ "warps": 1,
+ "payloads": false,
+ "sites": [
+  {
+   "kernel": "vocab_embedding_kernel",
+   "range": "load.global",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 22,
+   "last_line": 22,
+   "statement": "token = ((int64_t)ids[(((int64_t)((int)blockIdx.x)) * id_stride)]);",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 6
+  },
+  {
+   "kernel": "vocab_embedding_kernel",
+   "range": "load.global#2",
+   "phase": "load",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 38,
+   "last_line": 43,
+   "statement": "if ((int64_t)0 <= row)",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 6
+  },
+  {
+   "kernel": "vocab_embedding_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 44,
+   "last_line": 44,
+   "statement": "*(int4*)(out + ((((int64_t)((int)blockIdx.x)) * (int64_t)128) + (((int64_t)((int)threadIdx.x)) * (int64_t)4))) = *(int4*)(data + 0);",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 6
+  }
+ ]
+}
