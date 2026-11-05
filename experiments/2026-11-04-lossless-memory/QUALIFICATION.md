@@ -123,6 +123,8 @@ python3 experiments/2026-11-04-lossless-memory/run_component.py \
 The controller builds and distributes one image, requires its original successful
 build/import-smoke receipt, and checks every rank's native component and full-gate
 verdict. A zero lab exit with a failed test verdict cannot start serving measurement.
+All ranks must have the same full image identity and filesystem layers. Every
+serving stop applies the exact inspected profile and records its native exit.
 It then boots the candidate twice through inspected coordinated plans, without a
 shape override. It requires startup memory samples, complete native suite exits,
 the gated image on every rank, cool starts and unchanged boot identity across
