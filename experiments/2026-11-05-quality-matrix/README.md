@@ -156,3 +156,11 @@ rejects the ignored `container.env` field before hardware reservation. A separat
 process-discovery fix lets the fail-fast observer identify only its exact owned
 evaluator; a simulated process-table test protects that boundary. The original
 score-based end-of-arm rejection remains unchanged.
+
+The rejected direct-merge RULER run also illustrates the need to separate output
+length from engine speed: native generates38383 tokens including37759 thinking,
+LSA14087 including13486 thinking. Server prefill totals270.30 versus258.68
+seconds (about4.3% lower); decode totals302.35 versus122.38, but decode seconds
+per generated token are about10.3% higher for LSA. These are single-arm
+post-request counters from a quality-rejected run, not a performance qualification
+or proof of faster token generation. All unsuccessful time remains charged.
