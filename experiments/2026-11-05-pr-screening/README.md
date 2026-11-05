@@ -14,9 +14,11 @@ outstanding TP4 release gate is bypassed.
 The first completed reviews retain unique evidence #865/#911 with their
 original limits and correct #851 image matching after its failed parent case.
 Source-only CLI correctness is verified with repository/guard tests; it does
-not claim a serving gain. C42 will separately qualify the compiler refresh plus
-its five existing correctness fixes as an explicit interaction. The original
-patch bytes, parent failures and exact combined source identity are retained.
+not claim a serving gain. C42 built the compiler refresh plus five existing
+fixes, then failed one required IKET integration test before serving. Its failed
+image and all results remain preserved. The owner's clarification reopened
+875/879–883 for one focused correction of the new #880 prepared-kernel defect;
+there is no C42 performance verdict. See the current disposition update.
 
 Other unique kernel/frontend/research work remains separate. Read actual shared
 holds/requests before every hardware operation. Do not duplicate another active
@@ -42,7 +44,7 @@ win alone. Performance enhancements must earn a relevant complete operation or
 request/serving gain beyond both repeat margins and avoid material core costs.
 The owner's four-build report still distinguishes component-only findings from
 serving gains. The result-transfer dense-path host cost and the gather tiny-tail
-uncertainty remain unresolved. C42's running source/image matrix is untouched.
+uncertainty remain unresolved. C42's failed source/image evidence is unchanged.
 
 The two new TP1 drafts (#914 native embedding IDs and #915 fused Markov drafting)
 also apply independently after exact C40, preserving its default copy and

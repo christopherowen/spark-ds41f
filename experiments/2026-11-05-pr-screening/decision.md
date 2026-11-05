@@ -1,3 +1,18 @@
+# Current decision after owner clarification
+
+Continue every PR through a defensible disposition. C42 built successfully but
+failed one required IKET integration test before any serving measurement. Its
+failed image is rejected; the compiler idea has no performance verdict. The
+earlier closure of875/879–883 applied the bounded rework rule too broadly:
+pre-existing fixes had not corrected this new integration defect. All six PRs
+are reopened at their unchanged heads. One focused #880 correction is assigned,
+with a distinct new source/image and full gates before measurement. C44's
+metadata-only proposal remains withdrawn. The [update and scope](runs/compiler-rework-disposition.json)
+supersede the historical idea-drop and closure decisions below. C40 remains the
+validated default-enabled base. C43 frontend cleanup stays independent on C40.
+
+## Previous decisions retained as history
+
 # Current decision
 
 The PR queue is not complete. Retain unique work, merge reviewed evidence and

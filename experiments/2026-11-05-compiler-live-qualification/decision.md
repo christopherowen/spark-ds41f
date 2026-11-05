@@ -1,3 +1,27 @@
+# Failed C42 image; focused compiler correction pending
+
+C42 compiled and built its image successfully. The required IKET integration
+test then failed before serving or performance work. Its native failure,
+8073 passes/360 skips/one failure, image and original errors remain unchanged.
+There is no C42 performance verdict beyond **unmeasured**.
+
+The owner questioned rejecting the idea before qualification. The earlier
+stack-wide drop counted pre-existing authored fixes as the rework round, even
+though they had not corrected this newly discovered integration defect. That
+interpretation is superseded: reopen875/879–883 and give #880 one focused
+correction that preserves ordinary cache-disabled bypass while honoring explicit
+prepared objects. A distinct corrected source and image must pass the retained
+feature, release and functional gates before both full performance boots. Never
+rerun C42 or waive the failing gate. C44 remains withdrawn: VERSION alone does
+not fix this branch. C40 remains the validated base while rework is pending.
+
+See the [disposition update](../2026-11-05-pr-screening/runs/compiler-rework-disposition.json)
+and [reopening receipt](../2026-11-05-pr-screening/runs/compiler-rework-reopen.json).
+The previous disposition is retained below as history, superseded only in its
+idea-drop and PR-closure decisions.
+
+## Earlier disposition, superseded in scope
+
 # Reject C42; retain C40
 
 The corrected compiler stack fails its retained-feature gate. All136 manifest
