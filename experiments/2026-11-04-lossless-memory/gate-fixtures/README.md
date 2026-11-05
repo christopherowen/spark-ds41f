@@ -24,7 +24,8 @@ failed observation is overwritten.
 After the original window restores production, the controller can reuse its
 exact image and passed native component gate with `--reuse-kernel-from`. It
 requires the same per-rank image identities/layers, original successful build
-receipt, native verdict hash and bundle hash. It refuses prior serving boots,
+receipt, native verdict hash, every tracked bundle input and mounted external
+source against its previous published commit. Non-Git bundle files are refused. It refuses prior serving boots,
 a failed component gate, or existing output for the replacement full gate.
 Every selected test must then pass in the new full gate before either serving
 boot can start. Reusing both completed gates remains a separate option.
