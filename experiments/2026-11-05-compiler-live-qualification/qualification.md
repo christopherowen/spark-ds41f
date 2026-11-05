@@ -13,7 +13,10 @@ specifications match C40 after identity-only normalization, with40 ordered
 functional outcomes and both full metric boots required. The current stream
 collector is selected explicitly to preserve C40 behavior. The18 offline
 control checks pass;755 repository tests pass with5 skips. Local complete build
-inputs/submodules are unavailable and the original incomplete check is retained.
+inputs were initially unavailable and the original incomplete check is retained.
+Official repository TileLang preparation subsequently passed and its full
+recursive submodule identity independently verified; this is source preparation,
+not compiler execution. Other complete build inputs still require Linux preparation.
 Full guarded Linux preparation/check remains mandatory before image build.
 
 The nine ordered image gates include official release tests, actual-image
