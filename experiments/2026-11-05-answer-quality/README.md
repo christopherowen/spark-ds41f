@@ -160,3 +160,21 @@ to the previously fresh-applied C36 patch series (`runs/local-source-1024`).
 No source code inside the timed implementation changes. The standalone test
 reservation and container are removed. Model quality and request timing for this
 new operating point have not been measured.
+
+The complete larger-budget four-boot pilot is published in [results.md](results.md)
+and `runs/pilot-window-02`: native 8/12 on both boots, LSA 9/12 on both, all
+responses naturally completed. Total request time is 3.6% higher with LSA; useful
+correct-answer throughput is 8.56% higher in this pilot. The one paired win has
+p=0.5, so general quality superiority is not established. C37 restoration and
+independent all-node verification pass. Every run and its conditions are retained.
+
+Next source-retention pilot command, after publishing that restored reference:
+
+```sh
+python3 experiments/2026-11-05-answer-quality/run_window.py \
+  --out /home/chris/spark-lab/results/answer-quality/pilot-window-03 \
+  --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877/policy-65536-v1 \
+  --split pilot \
+  --candidate-config experiments/2026-11-05-answer-quality/source-1024-fast.json \
+  --controls-from experiments/2026-11-05-answer-quality/runs/pilot-window-02
+```
