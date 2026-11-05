@@ -67,14 +67,23 @@ def select(catalog):
             if low <= item['prompt_tokens_untemplated'] < high:
                 groups.setdefault((item['domain'],name),[]).append(item)
     result = {'pilot':[],'heldout':[],'strata':[]}
+    used = set()
     for (domain,name),rows in sorted(groups.items()):
         rows.sort(key=lambda x:hashlib.sha256((spec['split_seed']+domain+name+x['id']).encode()).hexdigest())
-        a,b = spec['pilot_per_domain_bin'],spec['heldout_per_domain_bin']
-        assert len(rows) >= a+b, (domain,name,len(rows))
-        result['pilot'] += [x['id'] for x in rows[:a]]
-        result['heldout'] += [x['id'] for x in rows[a:a+b]]
+        available = [x for x in rows if x['context_sha256'] not in used]
+        assert available, (domain,name,'no independent pilot context')
+        chosen = available[0];used.add(chosen['context_sha256'])
+        result['pilot'].append(chosen['id'])
         result['strata'].append({'domain':domain,'bin':name,'eligible':len(rows),
-                                'pilot':[x['id'] for x in rows[:a]],'heldout':[x['id'] for x in rows[a:a+b]]})
+                                'pilot':[chosen['id']],'heldout':[]})
+    for stratum in result['strata']:
+        for row in groups[stratum['domain'],stratum['bin']]:
+            if row['context_sha256'] not in used:
+                result['heldout'].append(row['id']);stratum['heldout'].append(row['id'])
+                used.add(row['context_sha256'])
+                if len(stratum['heldout']) == spec['heldout_per_domain_bin']:
+                    break
+        assert stratum['heldout'], (stratum['domain'],stratum['bin'],'no independent heldout context')
     assert not set(result['pilot']) & set(result['heldout'])
     assert len(result['strata']) == 12, 'all six domains and both token bins required'
     result.update(dataset_sha256=LOCK['dataset']['sha256'],source_revision=LOCK['revision'],
@@ -84,12 +93,35 @@ def select(catalog):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command',choices=['download','catalog'])
+    parser.add_argument('command',choices=['download','catalog','export'])
     parser.add_argument('--cache',type=Path,required=True)
     parser.add_argument('--tokenizer',type=Path)
     args = parser.parse_args()
     if args.command == 'download':
         download(args.cache)
+        return
+    if args.command == 'export':
+        assert digest(args.cache/'data.json') == LOCK['dataset']['sha256']
+        catalog = json.loads((args.cache/'catalog.json').read_text())
+        data = {x['_id']:x for x in json.loads((args.cache/'data.json').read_text())}
+        for row in catalog:
+            row['context_sha256'] = hashlib.sha256(data[row['id']]['context'].encode()).hexdigest()
+        (args.cache/'catalog.json').write_text(json.dumps(catalog,indent=2)+'\n')
+        selection = select(catalog)
+        meta = {x['id']:x for x in catalog}
+        text = template(args.cache)
+        selection['artifact_sha256'] = {}
+        for split in ('pilot','heldout'):
+            path = args.cache/(split+'-requests.jsonl')
+            with path.open('w') as handle:
+                for identity in selection[split]:
+                    item = data[identity]
+                    rendered = prompt(item,text)
+                    assert hashlib.sha256(rendered.encode()).hexdigest() == meta[identity]['prompt_sha256']
+                    handle.write(json.dumps(dict(meta[identity],prompt=rendered,answer=item['answer']))+'\n')
+            selection['artifact_sha256'][path.name] = digest(path)
+        (args.cache/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
+        print(json.dumps({'artifacts':selection['artifact_sha256'],'pilot':len(selection['pilot']),'heldout':len(selection['heldout'])}))
         return
     from tokenizers import Tokenizer
     assert digest(args.cache/'data.json') == LOCK['dataset']['sha256']
@@ -100,7 +132,8 @@ def main():
         rendered = prompt(item,text)
         catalog.append({'id':item['_id'],'domain':item['domain'],'difficulty':item['difficulty'],
             'benchmark_length':item['length'],'prompt_tokens_untemplated':len(tokenizer.encode(rendered).ids),
-            'prompt_sha256':hashlib.sha256(rendered.encode()).hexdigest()})
+            'prompt_sha256':hashlib.sha256(rendered.encode()).hexdigest(),
+            'context_sha256':hashlib.sha256(item['context'].encode()).hexdigest()})
     (args.cache/'catalog.json').write_text(json.dumps(catalog,indent=2)+'\n')
     selection = select(catalog)
     (args.cache/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')

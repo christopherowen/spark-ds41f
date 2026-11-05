@@ -36,7 +36,32 @@
         262144
       ]
     },
-    "split_seed": "answer-quality-2026-11-05-v1",
-    "selection": "SHA256(seed + domain + bin + id), pilot first and heldout next; disjoint, frozen before generation; no truncation"
+    "split_seed": "answer-quality-2026-11-05-v2",
+    "selection": "SHA256(seed + domain + bin + id), select pilot first and heldout next; unique document-context hashes across both splits; no truncation",
+    "pilot_phases": [
+      {
+        "name": "serial-cold",
+        "concurrency": 1,
+        "cache_reuse": false
+      }
+    ],
+    "heldout_phases": [
+      {
+        "name": "serial-cold",
+        "concurrency": 1,
+        "cache_reuse": false
+      },
+      {
+        "name": "four-cold",
+        "concurrency": 4,
+        "cache_reuse": false
+      },
+      {
+        "name": "four-cached",
+        "concurrency": 4,
+        "cache_reuse": true
+      }
+    ],
+    "sparse_strata": "up to four heldout independent contexts per stratum, at least one; freeze before generation"
   }
 }

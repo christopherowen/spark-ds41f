@@ -22,13 +22,16 @@ There are no grading calls, comparison passes or host activation copies in the
 serving implementation.
 
 The pilot freezes one example per domain and untemplated-token bin (8K–64K and
-64K–256K), covering all six domains. A disjoint four examples per stratum form the
-held-out confirmation set. Selection uses a pinned SHA256 ordering, never model
+64K–256K), covering all six domains. Up to four independent document contexts per stratum form the
+held-out confirmation set (all remaining independent contexts when a stratum is
+sparse, at least one). No document context crosses the split. Selection uses a pinned SHA256 ordering, never model
 outcomes. Prompts are complete: no truncation, RAG, extra hints or task rewrites.
 Actual server prompt lengths and cached-token usage are recorded separately.
 Token counts used for selection omit the fixed chat template overhead.
 
-Native-A, LSA-A, LSA-B and native-B use two clean fresh serving boots per arm.
+The pilot measures serial cold requests. Held-out confirmation additionally
+measures four concurrent cold requests and their cached replay. Native-A, LSA-A,
+LSA-B and native-B use two clean fresh serving boots per arm.
 Answer accuracy, paired wins/losses, invalid/truncated responses, wall time,
 correct answers per second, reasoning/output counts, cold/cached usage and
 per-domain/context results remain separate. Repeated boots do not double the
@@ -45,3 +48,14 @@ commands and every run/error under `runs/`; unfavorable outcomes are retained.
 
 EvalPlus executable coding tests and fresh RULER task generation are subsequent
 checks, not claimed results. They will be independently pinned before use.
+
+
+Input-preparation errors are retained in `runs/prepare-longbench-01` and `02`:
+the first CPU container could not write its output under the image default user;
+the retry used the host UID/GID and exposed a sparse short structured-data
+stratum (two independent contexts). Before any model output was generated, the
+selection rule was revised to keep one pilot and up to four independent held-out
+contexts per stratum, with at least one. Repeated questions from the same source
+context cannot cross pilot/held-out or inflate independent task counts. No GPU
+or serving operation occurred in those preparation attempts; both leases were
+released and both CPU containers removed.
