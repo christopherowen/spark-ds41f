@@ -13,7 +13,7 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen"))
+parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire"))
 parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
@@ -63,10 +63,11 @@ if args.operation == "tests":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     raise SystemExit(code)
 
-if args.operation == "copy_screen":
+if args.operation in ("copy_screen", "wire"):
     import runpy
-    sys.argv = [str(HERE / "copy_screen.py"), "--out", str(args.out)]
-    runpy.run_path(str(HERE / "copy_screen.py"), run_name="__main__")
+    script = HERE / ("copy_screen.py" if args.operation == "copy_screen" else "wire_probe.py")
+    sys.argv = [str(script), "--out", str(args.out)]
+    runpy.run_path(str(script), run_name="__main__")
     raise SystemExit(0)
 
 if args.operation == "identity":
@@ -122,7 +123,7 @@ if args.operation == "iket":
                 warps=len(launch["warpLifetimes"])))
     names = {row["kernel"] for row in launches}
     required = {"copy_logits", "collectives_rank_order_strided", "collectives_rank_order_sum",
-                "gather_columns_into", "collectives_rank_rows_bytes", "topk_log_softmax_ranks",
+                "gather_columns_into", "collectives_rank_rows_bytes", "collectives_rank_rows_small", "topk_log_softmax_ranks",
                 "token_ranks_scores", "topk_ids"}
     normalized = {name.removesuffix("_kernel") for name in names}
     assert required <= normalized, (required - normalized, names)

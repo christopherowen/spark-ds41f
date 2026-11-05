@@ -153,3 +153,19 @@ slowdown allowance. Filters use the full family traversal to preserve RNG inputs
 Controllers now honor queued reservations between atomic jobs and can resume a
 specific boot with `--boots`. They release sp8 and exit 75 when another check is
 queued; they never interrupt the current timed job.
+
+## Final focused screens
+
+The actual public sampler passes all 18 timing cases on both boots and 120
+correctness tests per boot. Gather passes 147 tests per boot. Its two 129-row
+tails pass; the two 7-row, 105-word tails remain unresolved. `0011` tests a
+single 128-thread block for only tails of at most 128 opaque words; wrapper
+validation and the explicit output bound make redundant source checks unnecessary.
+Larger tails retain their previously measured program. All 596 patches reproduce
+source tree `ae0dea96608c81e28ca41f1ebce5a10c4ffdf1a7` in the fresh prepared tree.
+
+`wire_probe.py` inventories the real nonblocking CPU result conversion for both
+ID widths, dense and strided IDs, zero/five alternatives and both score modes.
+This checks whether an apparently copy-free GPU result adds a packing kernel
+when it leaves the GPU. Its result is pending; no assumption about that path is
+used to claim complete coverage.

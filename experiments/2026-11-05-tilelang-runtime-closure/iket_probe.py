@@ -74,10 +74,12 @@ for world, parts, local, width in ((3, 1, 16, 45), (4, 2, 16, 64)):
 
     exercise(f"gather-{world}-{parts}", launch, expected)
 
-for dtype in (torch.uint8, torch.bfloat16, torch.float32):
-    source = torch.arange(105, device="cuda").to(dtype).view(21, 5)
-    expected = source.view(3, 7, 5).movedim(0, 1).reshape(7, 15)
-    exercise(f"gather-tail-{dtype}", lambda: collectives.concat_rank_shards(source, 3, (7, 5)), expected)
+for count in (7, 129):
+    for dtype in (torch.uint8, torch.bfloat16, torch.float32):
+        source = torch.arange(3 * count * 5, device="cuda").to(dtype).view(3 * count, 5)
+        expected = source.view(3, count, 5).movedim(0, 1).reshape(count, 15)
+        exercise(f"gather-tail-{count}-{dtype}",
+                 lambda: collectives.concat_rank_shards(source, 3, (count, 5)), expected)
 
 for id_dtype in (torch.int32, torch.int64):
     logits = torch.randn((5, 264), device="cuda")[:, :257]

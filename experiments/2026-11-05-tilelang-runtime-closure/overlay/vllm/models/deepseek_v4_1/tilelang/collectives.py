@@ -454,12 +454,54 @@ def rank_rows_bytes_kernel(unit: int = 1):
     return collectives_rank_rows_bytes
 
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+)
+def rank_rows_small_kernel(unit: int):
+    """One 128-thread block for at most 128 opaque output words."""
+    dtype = {1: T.uint8, 2: T.uint16, 4: T.uint32}[unit]
+    source_units, output_units = T.dynamic("source_units, output_units")
+
+    @T.prim_func
+    def collectives_rank_rows_small(
+        src: T.Tensor((source_units,), dtype),
+        dst: T.Tensor((output_units,), dtype),
+        world: T.int32,
+        rows: T.int32,
+        row_units: T.int32,
+        row_magic: T.uint32,
+        span_magic: T.uint32,
+    ):
+        with T.Kernel(1, threads=128):
+            T.import_source(_TAIL_DIV)
+            index = T.get_thread_binding()
+            if index < output_units:
+                n = T.cast(index, T.uint32)
+                width = T.cast(row_units, T.uint32)
+                span = T.cast(world, T.uint32) * width
+                row = T.call_extern("uint32", "vllm_tail_div", n, span, span_magic)
+                col = n - row * span
+                rank = T.call_extern("uint32", "vllm_tail_div", col, width, row_magic)
+                local = col - rank * width
+                dst[index] = src[(rank * T.cast(rows, T.uint32) + row) * width + local]
+
+    return collectives_rank_rows_small
+
+
 def _rank_rows_tail(gathered, out, world, rows, row_bytes):
     unit = next(
         n for n in (4, 2, 1) if row_bytes % n == 0 and gathered.data_ptr() % n == 0
     )
     dtype = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[unit]
-    rank_rows_bytes_kernel(unit)(
+    factory = (
+        rank_rows_small_kernel
+        if out.numel() * out.element_size() // unit <= 128
+        else rank_rows_bytes_kernel
+    )
+    factory(unit)(
         gathered.view(-1).view(dtype),
         out.view(-1).view(dtype),
         world,
@@ -480,6 +522,7 @@ def rank_rows_calls() -> list[prepare.TileLangCall]:
         if get_tp_group().world_size < 2
         else [prepare.call(rank_rows_kernel)]
         + [prepare.call(rank_rows_bytes_kernel, unit) for unit in (1, 2, 4)]
+        + [prepare.call(rank_rows_small_kernel, unit) for unit in (1, 2, 4)]
     )
 
 
