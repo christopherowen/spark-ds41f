@@ -1,7 +1,8 @@
 # Decision
 
-No variable qualifies for release. Reject the three measured hot-FP8 Huffman
-layouts; retain the isolated expert-scale and Engram arms for target measurement.
+No variable qualifies for release. Reject all ten measured hot-FP8 layouts
+(three Huffman, three fixed-field and four independent-plane LZ4); retain the
+isolated expert-scale and Engram arms for target measurement.
 Cold prefix storage needs a model-compatible restoration path before timing.
 
 - FP8: all six fresh GPU containers reconstructed every sampled weight byte and
@@ -12,7 +13,13 @@ Cold prefix storage needs a model-compatible restoration path before timing.
   Decode cost exceeds saved traffic in this standalone shared-memory consumer.
   This is neither GEMM nor serving performance. A cheaper exact representation
   would need a new paired GPU screen, then unchanged GEMM arithmetic and two
-  serving boots. Plain LZ4 selects RAW on the sampled hot FP8 tiles.
+  serving boots. Plain LZ4 selects RAW on the sampled hot FP8 tiles. The six
+  fixed-field runs also reconstruct exactly, save 8.687% and take 1.362–1.912
+  times their paired raw duration. The eight independent-plane LZ4 runs save
+  5.232–6.299% and take 1.740–4.698 times their paired raw duration. Every
+  first/repeat ratio interval is above 1. The families use different consumer
+  widths, so their absolute times are not a cross-family comparison. Complete
+  native evidence is retained in each family's `gpu-results.json` archive map.
 - Expert scales: reuse the existing exact compaction design in an isolated
   promoted-base arm. Prior persistent-memory observations are hypotheses for this
   arm. Unchanged scale words, kernel/output bits and two serving boots are required.

@@ -112,7 +112,10 @@ Those are repeated decoder microbenchmarks, **not** serving boots. All six
 target runs passed byte reconstruction and failed the performance gate; see
 `fp8/gpu-results.json`. Six further fixed-field runs also passed their exact-byte
 gates and lost to the paired word-sized raw control; see
-`fp8/fixed/gpu-results.json`. A winning byte consumer
+`fp8/fixed/gpu-results.json`. Eight independent-plane LZ4 runs also pass their
+byte gates and lose to the paired eight-byte consumer across four layouts; see
+`fp8/plane-lz4/gpu-results.json`. All ten tested layouts are rejected.
+A winning byte consumer
 still requires a fused GEMM consumer and the two full serving boots before any
 release claim. No inference kernel calls this prototype.
 

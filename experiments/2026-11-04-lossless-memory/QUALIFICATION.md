@@ -1,8 +1,9 @@
 # Qualification sequence
 
 These are measurement candidates. The standalone FP8 GPU screen ran and rejected
-all three tested Huffman layouts and all three fixed-field layouts. Each of the
-twelve fresh containers passed its exact-byte gate. The isolated scale image built
+all three tested Huffman layouts, all three fixed-field layouts and all four
+independent-plane LZ4 layouts. Each of the twenty fresh containers passed its
+exact-byte gate. The isolated scale image built
 and passed its component gate on every rank; its first full gate failed inherited
 fixtures and did not start serving measurement. Engram remains unbuilt. No
 serving improvement or release acceptance is claimed.
@@ -158,6 +159,10 @@ vectors, non-finite scores, a different corpus/workload and any numeric change
 fail the gate. Returned top/given-token scores are not a complete vocabulary
 distribution; the exact kernel/scale/row tests remain required too. The recorded
 reference self-check validates this analysis path and is not candidate evidence.
+An offline comparison of the original and repeat observations already recorded
+on October 30 also matches all 256 sequences and 65,536 returned score vectors
+exactly; see `recorded-reference-repeat.json`. It issues no inference requests
+and supplies no candidate qualification or new released-build measurement.
 Both candidate comparisons must pass before a release proposal claims unchanged
 recorded model behavior.
 
@@ -213,8 +218,9 @@ the claimed benefit. A capacity gain is reported as capacity, not invented TPS.
 
 ## Remaining conditional work
 
-- FP8: all three tested GPU Huffman decoders were byte exact and slower than
-  their paired raw consumers. Reject these layouts. Even a faster future byte
+- FP8: all ten tested GPU Huffman, fixed-field and independent-plane LZ4
+  layouts were byte exact and slower than their paired raw consumers. Reject
+  these layouts. Even a faster future byte
   consumer would not qualify a fused GEMM. Port only a measured viable layout, retain exact
   accumulation order, then give that new image its own full serving qualification.
 - Cold prefix: the store is a bounded CPU prototype. First export only written,
