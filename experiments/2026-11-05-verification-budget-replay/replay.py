@@ -104,6 +104,7 @@ def analyze(trace_path, grid_paths, context=4096):
         "scorable_steps_by_concurrency": dict(sorted(counts.items())),
         "limitations": [
             "The trace is r4a/2026-09-26; current source, checkpoint arithmetic and workloads differ.",
+            "The trace does not record context lengths; the selected grid context is not a verified workload match.",
             "Both objectives are restricted to measured cells; neither is the unrestricted current policy.",
             "Observed fresh confidences are used for both objectives; stale host scheduling and future batch trajectories are not replayed.",
             "The grid uses dummy inputs and full live rows; no fresh dead-row or expert-union cost is available.",
