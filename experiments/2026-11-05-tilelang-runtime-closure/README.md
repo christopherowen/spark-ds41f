@@ -188,7 +188,7 @@ Both full prompt confidence extensions pass, including their pooled bounds.
 
 The final combined candidate passes 1,266 tests on its first boot. The controller
 yielded before the repeat boot for a queued owner-authorized sp8 check; no test
-or timing job was interrupted. `0014` moves the same 50 transfer cases into the
+or timing job was interrupted. `0014` moves the same 26 transfer cases into the
 existing output suite, following its contribution guide; runtime and GPU source
 are unchanged. All 599 patches reproduce `9c4c49ec3bbcec299f3f48eb87012106789a0303`.
 The inventory accepts the generated `_kernel` suffix on the harness markers.
@@ -208,3 +208,7 @@ CUPTI hardware activity start/end timestamps, no event nodes in those graphs.
 Every replay, kernel name, stream, sample count and positive duration is validated;
 the five-standard-error, zero-margin gate is unchanged. Single inventory samples
 are diagnostic, never sufficient qualification. Full serving remains separate.
+
+Transfer-case count correction: the matrix contains 2 ID widths × 4 row counts ×
+3 strides + 2 lifetime cases = 26, not 50. Both combined totals remain 1,266.
+Patch descriptions and the narrow PR now use the actual 26-case count.
