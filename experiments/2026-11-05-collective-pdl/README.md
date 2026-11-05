@@ -122,6 +122,10 @@ cases fork a side stream after the producer, so that event orders the producer;
 the measured launch chain still includes the collective and its consumer. This
 is controlled resource contention, not a model-layer or serving result. A
 within-process interval cannot substitute for serving boot/repeat variability.
+`analyze_launch_chain.py` retains all cells and reports pointwise Student-t
+intervals on the two independent process-round means/differences (df=1), without
+pooling replays or automatically choosing a winner. These exploratory intervals
+are not adjusted for multiple comparisons.
 
 ## Acceptance and workload identity
 
