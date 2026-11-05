@@ -134,7 +134,8 @@ class ComponentTests(unittest.TestCase):
         argv = ["run_component.py", "--component", "expert-scales", "--window", "owned", "--through", through,
                 "--out", out, "--apply", *extra]
         with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=lab, spark=spark, subprocess=process,
-                            os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"))), patch.object(sys, "argv", argv):
+                            os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"),
+                                               getuid=lambda: 1000, getgid=lambda: 1000)), patch.object(sys, "argv", argv):
             return runner.main()
 
     def test_failed_build_restores_only_its_owned_window(self):
@@ -378,12 +379,21 @@ class ComponentTests(unittest.TestCase):
             changed["candidates"][0][key] = bad
             with self.assertRaises(ValueError, msg=key):
                 runner.native_model_gate(changed, candidate, reference)
+
         for key, bad in (("inference_requests", 1), ("analysis_sha256", "changed"),
                          ("provenance_sha256", "changed"), ("candidates", [])):
             changed = copy.deepcopy(value)
             changed[key] = bad
             with self.assertRaises(ValueError, msg=key):
                 runner.native_model_gate(changed, candidate, reference)
+
+    def test_cpu_model_report_uses_its_output_owner_without_dac_override(self):
+        with patch.object(runner.os, "getuid", return_value=1234), patch.object(runner.os, "getgid", return_value=5678):
+            argv = runner.model_gate_command(self.root / "candidate.json.gz", self.root / "output",
+                                             "sha256:image", {"path": str(self.root / "reference.json.gz")})
+        self.assertEqual(argv[argv.index("--user") + 1], "1234:5678")
+        self.assertIn("--cap-drop=ALL", argv)
+        self.assertNotIn("--privileged", argv)
 
     def test_recorded_reference_is_checked_before_serving_operations(self):
         self.write(self.here / "model-reference.json", {"model_path": str(self.root / "results/private/model.json.gz"),

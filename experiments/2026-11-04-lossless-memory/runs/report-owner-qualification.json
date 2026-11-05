@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "scope": "offline CPU report-writer correction; no serving candidate measurement or released-build rerun",
+  "base_commit": "e562b692a77922122b527520a7bec4d6c61f2bdb",
+  "window": "dgx1-1793877834",
+  "native_control": {
+    "exit": 1,
+    "source_commit": "e562b692a77922122b527520a7bec4d6c61f2bdb",
+    "image_id": "sha256:8927ac9dc2e0694834b034c44e91cc0969d845f9338786717e97cfa99e8af2ca",
+    "error": "PermissionError writing /out/report.json; no report published and no model identity pass claimed",
+    "serving_requests": 0,
+    "gpu_requests": 0,
+    "available_before_bytes": 10456072192,
+    "image_user": "root",
+    "caller_uid": 1000,
+    "caller_gid": 1000,
+    "directory_uid": 1000,
+    "directory_gid": 1000,
+    "directory_mode": "0o775",
+    "docker_security_options": [
+      "name=apparmor",
+      "name=seccomp,profile=builtin",
+      "name=cgroupns"
+    ]
+  },
+  "correction": "Run the CPU comparison as the invoking UID/GID; retain cap-drop=ALL, read-only filesystem/input mounts, no network and the original 1 GiB cap. Serving image and runtime user remain unchanged.",
+  "local_runs": [
+    {
+      "tests": 27,
+      "seconds": 0.153,
+      "exit": 1,
+      "errors": 1,
+      "error": "New test inserted before an existing loop, leaving out-of-scope fixture names; corrected test placement."
+    },
+    {
+      "tests": 27,
+      "seconds": 0.141,
+      "exit": 0
+    },
+    {
+      "tests": 723,
+      "seconds": 43.455,
+      "exit": 0
+    }
+  ],
+  "checks": [
+    {
+      "command": "bin/spark doctor",
+      "exit": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0
+    }
+  ],
+  "archives": [
+    {
+      "archive": "runs/model-control-original-permission-failure.json.gz",
+      "uncompressed_sha256": "4a6b714e8f0390a9f1671104a6e64011a5ee34892fddc5ff9ed30d4c4ed313d1"
+    },
+    {
+      "archive": "runs/report-owner-local-initial-tests.log.gz",
+      "uncompressed_sha256": "2f37edf0b3b9bac8f2c38896f1f937bf2c3b30d1e8f943535d47d7a5e0ea95c8"
+    },
+    {
+      "archive": "runs/report-owner-local-focused-tests.log.gz",
+      "uncompressed_sha256": "e98dbc4556e83890fe7df5b97c2a8f1ffde849061595baa3808563d66b7f6f35"
+    },
+    {
+      "archive": "runs/report-owner-local-repository-tests.log.gz",
+      "uncompressed_sha256": "ae41df7e57396d2b7c6cd16bf4b9d7534603b978461768ee0f90a4d03f5cf222"
+    }
+  ],
+  "runtime_source_or_build_inputs_changed": false,
+  "native_retry_pending": true,
+  "conclusion": "Local tests pass. Retain the original failed native control and require a distinct retry after publishing/staging corrected source, before expensive candidate gates."
+}
