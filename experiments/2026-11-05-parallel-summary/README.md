@@ -59,3 +59,13 @@ coarse/fine checks, strict initialization, lifecycle/recycling and two complete
 selector timing processes. Model recipe `native-source-tp4.json` is an explicit
 interaction of the existing native-source dispatch with the two separately
 screened exact optimizations; it has no answer or request qualification yet.
+
+Integrated source `f8b66cd5` passes64 declared calls (including both maintenance
+kernels) across eight configurations after cache freeze, all12 actual coarse/
+fine checks, zero strict initialization errors and six lifecycle/recycling cases.
+Two fresh complete-selector processes retain the preceding component behavior;
+required maintenance independently measures10.22–10.79 microseconds per dense
+page and16.67–16.88 per source page, with full snapshots28.64–29.23 and91.00–91.58.
+All samples and memory remain in `runs/runtime-gates-01`. The lease releases
+at21:10:48 UTC with no containers. Final-answer and request qualification remain
+separate; no whole-model gain is inferred from these maintenance timings.

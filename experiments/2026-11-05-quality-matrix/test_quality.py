@@ -33,6 +33,17 @@ class GateTests(unittest.TestCase):
         self.assertFalse(controller.early_result(changed,changed,'lsa-a','longbench')['passed'])
         self.assertFalse(controller.quality_result(changed,changed,'longbench')['passed'])
 
+    def test_environment_override_must_resolve_before_a_window(self):
+        spec=importlib.util.spec_from_file_location('matrix_environment',Path(__file__).with_name('run_window.py'))
+        controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
+        config=Path('experiments/2026-11-05-native-source/tp4.json')
+        self.assertEqual(controller.validate_environment_profile(config)['VLLM_DS41_PAGE_NATIVE_SOURCE'],'1')
+        bad={'container':{'env':{'VLLM_DS41_PAGE_NATIVE_SOURCE':'1'}},
+             'environment':{'VLLM_DS41_PAGE_NATIVE_SOURCE':'0'}}
+        with patch('spark_ds41f.config.read_cluster',return_value=bad):
+            with self.assertRaisesRegex(AssertionError,'container.env is unsupported'):
+                controller.validate_environment_profile(config)
+
     def test_custom_profile_does_not_change_restoration_authority(self):
         spec=importlib.util.spec_from_file_location('matrix_profile',Path(__file__).with_name('run_window.py'))
         controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)

@@ -47,10 +47,10 @@ def regressions(native,candidate):
     return failures
 
 
-def client_pids(root,out):
+def client_pids(root,out,proc_root=Path('/proc')):
     """Find exact measure/evaluate parent-child pairs for this output path."""
     processes={}
-    for path in Path('/proc').iterdir():
+    for path in proc_root.iterdir():
         if not path.name.isdecimal():continue
         try:
             argv=(path/'cmdline').read_bytes().split(b'\0');argv=[a.decode() for a in argv if a]
@@ -58,15 +58,15 @@ def client_pids(root,out):
             parent=int((path/'stat').read_text().rsplit(')',1)[1].split()[1])
             processes[int(path.name)]=(parent,argv)
         except (OSError,UnicodeError,ValueError,IndexError):continue
-    clients=[]
+    found=[]
+    clients=[root/('experiments/'+folder+'/evaluate.py') for folder in ('2026-11-05-answer-quality','2026-11-05-context-quality')]
+    parents=[root/('experiments/'+folder+'/measure.py') for folder in ('2026-11-05-answer-quality','2026-11-05-quality-matrix')]
     for pid,(parent,argv) in processes.items():
-        clients=[root/('experiments/'+folder+'/evaluate.py') for folder in ('2026-11-05-answer-quality','2026-11-05-context-quality')]
         if not any(str(p) in argv for p in clients):continue
         if parent not in processes:continue
-        parents=[root/('experiments/'+folder+'/measure.py') for folder in ('2026-11-05-answer-quality','2026-11-05-quality-matrix')]
         if not any(str(p) in processes[parent][1] for p in parents):continue
-        clients.append(pid)
-    return clients
+        found.append(pid)
+    return sorted(found)
 
 
 def main():

@@ -27,3 +27,21 @@ inspection also verifies both page sizes route source and reindex plans and thei
 declarations to native, while dense plans retain the compact route. This is
 cache/dispatch qualification only. The four-boot RULER26 pilot is separate and
 must retain all score, completion, timing and restoration observations.
+
+The first model attempt at `727595b8` is invalidated during Native A, before
+any candidate boot or request. Inspection finds the new profile placed its flag
+under `set.container.env`, which the runtime does not read; the effective flag
+remains0. The earlier CPU dispatch check tests behavior with the flag explicitly
+set to1; it did not validate the resolved recipe. The exact owned evaluator is
+interrupted, all partial native records remain retained, and the existing
+coordinator restores C37. The invalid attempt is not quality/performance evidence.
+
+The corrected profiles use `set.environment`; resolved configuration now shows1.
+A coordinator preflight rejects unsupported `container.env` before any reservation,
+and its test covers both the wrong field and the actual corrected profile.
+The out-of-band observer also fixes an unrelated local-name collision in process
+identity discovery; a simulated process-table test requires exact parent, output
+and script identity and returns only PIDs. The end-of-arm gate already rejected
+the earlier genuine retrieval score loss; no score or quality rule changes.
+The failed attempt and independent restoration are retained under
+`../2026-11-05-quality-matrix/runs/native-source-ruler-screen-window-01`.

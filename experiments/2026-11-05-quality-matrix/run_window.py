@@ -57,6 +57,13 @@ def profile_action(config,action,*args):
     finally:w.REL=previous
 
 
+def validate_environment_profile(config):
+    from spark_ds41f.config import read_cluster
+    cluster=read_cluster(str(config))
+    assert 'env' not in cluster.get('container',{}), 'container.env is unsupported; use set.environment and verify the resolved environment before a window'
+    return cluster['environment']
+
+
 def runtime_identity():
     return w.each('''import json,subprocess
 from pathlib import Path
@@ -120,6 +127,7 @@ def main():
     assert args.cache.is_dir()
     candidate=args.candidate_config
     assert not candidate.is_absolute() and '..' not in candidate.parts and (ROOT/candidate).is_file()
+    validate_environment_profile(candidate)
     private=Path.home()/'spark-lab/private/quality-matrix'/out.relative_to(Path.home()/'spark-lab/results')
     assert not out.exists() and not private.exists()
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()

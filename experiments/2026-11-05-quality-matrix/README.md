@@ -144,3 +144,15 @@ the exact image, clean equal serving revisions, no experimental mounts or
 environment and no remaining reservations on all four nodes. The next ordinary
 experiment changes only the existing native-source dispatch setting; the failed
 result is never relabeled or replaced.
+
+The first native-source attempt (`727595b8`,
+`runs/native-source-ruler-screen-window-01`) stops during Native A after detecting
+a misplaced profile flag, before any candidate boot or request. All partial
+native results remain. C37 restores at21:14:01 UTC; independent all-node image,
+clean-checkout, mount/environment and reservation verification passes. This is
+an invalid setup attempt, not a native-source result. The corrected profile
+resolves the flag at the runtime's top-level environment, and new preflight
+rejects the ignored `container.env` field before hardware reservation. A separate
+process-discovery fix lets the fail-fast observer identify only its exact owned
+evaluator; a simulated process-table test protects that boundary. The original
+score-based end-of-arm rejection remains unchanged.
