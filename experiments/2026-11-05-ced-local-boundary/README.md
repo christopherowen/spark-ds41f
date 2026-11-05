@@ -52,8 +52,8 @@ coordinated small reads and edits after the recovery instruction.
   Importing source without the CPU adapter then failed because `tilelang_utils`
   intentionally exposes no TileLang backend on CPU. `cpu.py` supplies the installed
   TileLang definitions for declaration-only tests; it never executes a GPU kernel.
-- `cpu-1.log`: 121 passed, 1 GPU-only test skipped. A startup declaration regression
-  test was then added. `cpu-2.log`: 122 passed, 1 skipped, 10.51 s. These use the real
+- `cpu-1.txt`: 121 passed, 1 GPU-only test skipped. A startup declaration regression
+  test was then added. `cpu-2.txt`: 122 passed, 1 skipped, 10.51 s. These use the real
   model/layer forwards with mathematical stand-ins and simulated collectives; they
   do not certify native GPU arithmetic or distributed hardware behavior.
 - The final CPU process peaked at 1,262,240 KiB RSS (1.204 GiB). Host MemAvailable
@@ -63,13 +63,13 @@ coordinated small reads and edits after the recovery instruction.
   All new-code/test lint passes with the source project's Ruff 0.14.0. Three
   inherited diagnostics in model/SP files remain untouched (unused import and two
   long lines). Whitespace checks pass.
-- `fresh-base.log` replays all 558 base patches in a clean checkout and reproduces
+- `fresh-base.txt` replays all 558 base patches in a clean checkout and reproduces
   the recorded base head/tree. An inherited whitespace warning is retained.
-  `fresh-candidate.log` applies the new patch, reproduces its head/tree and passes
+  `fresh-candidate.txt` applies the new patch, reproduces its head/tree and passes
   the full series whitespace check.
 - Offline kernel parsing passed. Compilation attempts 1–3 used an obsolete target
   string, omitted the target context, then named a nonexistent context helper.
-  Those harness errors are retained. `kernel-compile-4.log` compiles the actual
+  Those harness errors are retained. `kernel-compile-4.txt` compiles the actual
   kernel for SM121 through the installed TileLang/CUDA toolchain without a GPU.
   Peak process RSS was 1,207,936 KiB. GPU execution and graph replay remain pending.
 - Doctor first rejected Spaceport's switched map for a triangle profile. The
@@ -78,7 +78,7 @@ coordinated small reads and edits after the recovery instruction.
   doctor. These ignored maps are not deployment artifacts.
 - Build input preparation first rejected an inherited patch count of 558; the new
   source manifest correctly records 559. Complete inputs were then prepared in a
-  separate directory from verified cached inputs. `build-inputs-2.log` records a
+  separate directory from verified cached inputs. `build-inputs-2.txt` records a
   passing full `build check`. No image build or GPU smoke has run.
 - The TP3 boot/repeat plan passes `lab.py --dry-run` (13 steps). The TP4 plan
   initially resolved an old 1025 reference through its archived base; both specs

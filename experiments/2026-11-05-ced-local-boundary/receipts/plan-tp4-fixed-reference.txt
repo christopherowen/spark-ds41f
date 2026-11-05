@@ -1,0 +1,15 @@
+run ced-local-boundary-tp4: 13 steps; production config/cluster.json
+  1. boot experiments/2026-11-05-ced-local-boundary/tp4.json (candidate-boot, memory sampled to ready)
+  2. save the boot's measured step costs > results/private/determinism/ced-local-boundary-tp4/curves-candidate-boot.json
+  3. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite release --compare none --output results/private/suites/ced-local-boundary-tp4/candidate-boot --label candidate-boot
+  4. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite single-stream --compare none --output results/private/suites/ced-local-boundary-tp4-single-stream/candidate-boot --label candidate-boot
+  5. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite sampled --compare none --output results/private/suites/ced-local-boundary-tp4-sampled/candidate-boot --label candidate-boot
+  6. boot experiments/2026-11-05-ced-local-boundary/tp4.json (candidate-repeat, memory sampled to ready)
+  7. save the boot's measured step costs > results/private/determinism/ced-local-boundary-tp4/curves-candidate-repeat.json
+  8. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite release --compare none --output results/private/suites/ced-local-boundary-tp4/candidate-repeat --label candidate-repeat --corpus results/private/suites/ced-local-boundary-tp4/candidate-boot/model.json.gz
+  9. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite single-stream --compare none --output results/private/suites/ced-local-boundary-tp4-single-stream/candidate-repeat --label candidate-repeat
+ 10. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp4.json bench --suite sampled --compare none --output results/private/suites/ced-local-boundary-tp4-sampled/candidate-repeat --label candidate-repeat
+ 11. python3 scripts/servebench_suite_table.py ced-local-boundary-tp4 candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp4 candidate-repeat > results/private/lab/ced-local-boundary-tp4-table.txt
+ 12. python3 scripts/servebench_suite_table.py ced-local-boundary-tp4-single-stream candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp4-single-stream candidate-repeat > results/private/lab/ced-local-boundary-tp4-single-stream-table.txt
+ 13. python3 scripts/servebench_suite_table.py ced-local-boundary-tp4-sampled candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp4-sampled candidate-repeat > results/private/lab/ced-local-boundary-tp4-sampled-table.txt
+config/nodes-ring4.local.json is missing: run `cp config/examples/nodes-ring4.json config/nodes-ring4.local.json` and edit it for your site (docs/setup.md, Site configuration)

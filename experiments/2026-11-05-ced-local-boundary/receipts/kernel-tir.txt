@@ -1,0 +1,31 @@
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 11-05 22:57:24 [interface.py:369] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+W1105 22:57:24.346000 1 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+(func_or_mod: 'tirx.PrimFunc | tvm.IRModule', target: 'str | Target' = 'auto', target_host: 'str | Target | None' = None, runtime_only: 'bool' = False, enable_host_codegen: 'bool' = False, enable_device_compile: 'bool' = False) -> 'CompiledArtifact'
+# from tvm.script import tirx as T
+
+@T.prim_func
+def ced_sp_indices(indices_handle: T.handle, local_handle: T.handle, merged_handle: T.handle, start: T.int64, local_rows: T.int64, total_rows: T.int64):
+    count = T.int32()
+    indices = T.match_buffer(indices_handle, (count,), "int64", strides=(1,))
+    local = T.match_buffer(local_handle, (count,), "int64", strides=(1,))
+    merged = T.match_buffer(merged_handle, (count,), "int64", strides=(1,))
+    # with T.sblock("root"):
+    for bx in T.thread_binding((count + 256 - 1) // 256, thread="blockIdx.x"):
+        tx: T.int32 = T.launch_thread_idx(0)
+        ty: T.int32 = T.launch_thread_idx(1)
+        tz: T.int32 = T.launch_thread_idx(2)
+        with T.sblock("tilelang_root"):
+            T.reads()
+            T.writes()
+            T.sblock_attr({"tl.launch_threads": [256, 1, 1]})
+            for lane in T.parallel(256):
+                row: T.int32 = bx * 256 + lane
+                if row < count:
+                    index: T.int64 = indices[row]
+                    valid: T.bool = T.bitwise_and(index >= T.int64(0), index < total_rows)
+                    own: T.bool = T.bitwise_and(T.bitwise_and(valid, index >= start), index < start + local_rows)
+                    local[row] = T.if_then_else(own, index - start, T.int64(-1))
+                    merged[row] = T.if_then_else(valid, index // local_rows * T.Cast("int64", count) + T.Cast("int64", row), T.int64(-1))

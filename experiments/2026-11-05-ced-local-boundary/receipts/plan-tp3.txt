@@ -1,0 +1,14 @@
+run ced-local-boundary-tp3: 13 steps; production config/cluster.json
+  1. boot experiments/2026-11-05-ced-local-boundary/tp3.json (candidate-boot, memory sampled to ready)
+  2. save the boot's measured step costs > results/private/determinism/ced-local-boundary-tp3/curves-candidate-boot.json
+  3. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite release-tp3 --compare none --output results/private/suites/ced-local-boundary-tp3/candidate-boot --label candidate-boot
+  4. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite single-stream --compare none --output results/private/suites/ced-local-boundary-tp3-single-stream/candidate-boot --label candidate-boot
+  5. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite sampled --compare none --output results/private/suites/ced-local-boundary-tp3-sampled/candidate-boot --label candidate-boot
+  6. boot experiments/2026-11-05-ced-local-boundary/tp3.json (candidate-repeat, memory sampled to ready)
+  7. save the boot's measured step costs > results/private/determinism/ced-local-boundary-tp3/curves-candidate-repeat.json
+  8. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite release-tp3 --compare none --output results/private/suites/ced-local-boundary-tp3/candidate-repeat --label candidate-repeat --corpus results/private/suites/ced-local-boundary-tp3/candidate-boot/model.json.gz
+  9. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite single-stream --compare none --output results/private/suites/ced-local-boundary-tp3-single-stream/candidate-repeat --label candidate-repeat
+ 10. bin/spark --cluster-config experiments/2026-11-05-ced-local-boundary/tp3.json bench --suite sampled --compare none --output results/private/suites/ced-local-boundary-tp3-sampled/candidate-repeat --label candidate-repeat
+ 11. python3 scripts/servebench_suite_table.py ced-local-boundary-tp3 candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp3 candidate-repeat > results/private/lab/ced-local-boundary-tp3-table.txt
+ 12. python3 scripts/servebench_suite_table.py ced-local-boundary-tp3-single-stream candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp3-single-stream candidate-repeat > results/private/lab/ced-local-boundary-tp3-single-stream-table.txt
+ 13. python3 scripts/servebench_suite_table.py ced-local-boundary-tp3-sampled candidate-boot manifests/suites/2026-10-30-spark-ds41f-1030-tp3-sampled candidate-repeat > results/private/lab/ced-local-boundary-tp3-sampled-table.txt
