@@ -62,3 +62,37 @@ total request time. It is unqualified for promotion. The predeclared wider-sourc
 probe tests whether more selective source work can recover latency while keeping
 the completed-answer quality lead. Learned-metric preparation remains separate;
 no fitted map has run in serving.
+
+## Wider source shortlist: rejected
+
+`pilot-window-03` uses published commit
+`7b7e853dc12721e45a70b9b4d93f8e257cf39447` and source budget1024, keeping dense
+budget64 and row capacity256 fixed. The source selection is approximate again.
+It reuses the restored, published same-day native controls only after the guard
+verifies identical protocol, client, native recipe and mounted kernel bytes.
+
+Both fresh candidate boots score **8/12**, with **11 completed answers and one
+truncation** each. Wall times are **1126.13 / 1126.42 s**, versus native's
+631.35 / 631.42 s: **78.4% higher latency**. Correct-answer throughput is 0.5606
+of native (joint95% timing-only interval [0.5579, 0.5633]). The independent
+in-context win remains, offset by failure to complete the table question;
+paired accuracy difference is zero, p=0.75. An incomplete response is not an
+incorrect completed final answer.
+
+The table request consumes the full 65,536-token allowance entirely in reasoning
+on both boots, taking 695.4 / 695.8 s. Native finishes correctly in about250 s.
+A higher allowance could let this response finish, but would add to its already
+larger request time; it cannot repair this setting's latency regression.
+
+Each candidate boot generates **85,061 tokens**, versus native's39,767. Aggregate
+output tokens per workload second would look roughly20% higher, despite much
+worse completed-answer time and no accuracy gain. Token rate alone is therefore
+a misleading success metric for these changed reasoning paths.
+
+All memory/thermal controls pass. C37 is restored at
+`2026-11-05T11:55:17.153254+00:00` and independently verified on all three nodes,
+with clean checkouts, no experimental mounts/environment and all holds removed.
+The [complete receipts](runs/pilot-window-03/) preserve the unfavorable run,
+reference-control hashes, conditions and every comparison. The 45 held-out
+questions remain unseen. This source setting is rejected; the fitted-metric
+preparation remains unqualified and outside serving.

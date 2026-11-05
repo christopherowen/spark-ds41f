@@ -185,3 +185,10 @@ retained native scores, source handoff and graph/recycling behavior. This covers
 the coarse segmented-selection route of the serving recipe in addition to the
 9-owner smaller-width fixture. The standalone container and reservation are
 removed before the model window. This is not full-visible-1M quality coverage.
+
+The source-1024 follow-up is complete and rejected (`runs/pilot-window-03`):
+both fresh boots score8/12 with one truncation each, taking1126.13/1126.42 s,
+about78% longer than native. The table response reaches65,536 thinking tokens on
+both boots without final content. This is recorded as incomplete, not as a wrong
+completed answer. C37 restoration and independent all-node verification pass.
+Full results and the misleading raw-token-rate increase are in `results.md`.
