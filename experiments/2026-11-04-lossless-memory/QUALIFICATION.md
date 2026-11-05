@@ -132,7 +132,12 @@ per rank and rejects a run exceeding that evidence bound.
 
 The same second boot runs quality, prefix reuse, four concurrent 485K-context
 requests with forced output, and token/logprob equivalence across traffic shapes
-and greedy/gathered paths. No logprob fallback or quality tolerance is accepted.
+and greedy/gathered paths. It also requires exact recorded deterministic-control
+and vision digests, then runs the existing prose/copy/edit/tool workload (12
+requests per category, zero recorded errors and complete category results). This last workload
+is an ordinary agent smoke check; model/byte identity remains a separate gate.
+These checks follow all timed suites and do not warm their caches. No logprob
+fallback or quality tolerance is accepted.
 The controller stops on a failed gate. A management failure latches a review hold
 instead of starting another serving container. A foreign window is never closed.
 Production is restored once at the end of the owned window.
@@ -174,6 +179,15 @@ exactly; see `recorded-reference-repeat.json`. It issues no inference requests
 and supplies no candidate qualification or new released-build measurement.
 Both candidate comparisons must pass before a release proposal claims unchanged
 recorded model behavior.
+
+`functional-reference.json` pins the two original 1030 functional JSONL records
+and their unchanged probe scripts. The selected deterministic-control scenarios
+keep their original parameters; sampled penalties are outside this workload.
+Every selected digest must match exactly. Original JSONL records lack independent
+all-rank image attestation, so their existing qualification spec/label and the
+published baseline link this supplementary evidence. They replace neither the
+pinned-image model reference nor exact kernel/weight/row verification. Both
+complete original JSONL files remain archived, including unselected observations.
 
 `gate-fixtures/` records test-only corrections for the inherited full-gate
 fixture failures. The original failure is retained; no serving qualification
