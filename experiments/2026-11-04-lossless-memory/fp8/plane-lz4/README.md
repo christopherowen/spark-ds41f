@@ -24,8 +24,26 @@ history for more warp-level work: its two CPU preparations save 5.2325% and
 produce identical payload hashes. The 2 KiB form keeps its original P4L1 ABI;
 smaller independent chunks use P4L2. Both reconstruct every source byte.
 
-The CUDA byte-consumer prototype and driver are prepared but have not been
-compiled or run on the target. They are not serving integration or a speed claim.
+All eight target runs compiled and passed the full checkpoint-byte oracle,
+all-encoding/boundary fixtures and independent consumer checksum. All four
+layouts lost to their paired raw consumer and are rejected:
+
+| Stream bytes | Threads | Storage saving | First/repeat coded/raw time | Exploratory 95% ratio interval |
+| --- | --- | --- | --- | --- |
+| 512 | 128 | 5.232% | 2.099 / 2.075 | [2.015, 2.117] |
+| 512 | 256 | 5.232% | 1.799 / 1.740 | [1.730, 1.824] |
+| 2048 | 128 | 6.299% | 4.698 / 4.676 | [4.672, 4.700] |
+| 2048 | 256 | 6.299% | 4.589 / 4.600 | [4.588, 4.602] |
+
+Storage includes every descriptor and the actual 128 MiB repeated working set.
+These are standalone integer byte consumers, not GEMM or serving measurements.
+The target image supplies LZ4 1.9.4, binary SHA-256
+`d1482a2f74152881d8b83708fedae7bca039f5608024f1178dc21a17df9887a7`;
+the local preparation library is separately pinned in its CPU receipts.
+`gpu-results.json` records all observations and analysis/source identities.
+`../../runs/plane-lz4-gpu-artifacts/` retains original native JSON, verdicts,
+stdout/stderr, controller and restoration evidence. No unfavorable run is omitted.
+Window `dgx1-1793863306` restored Candidate 36 at 07:28:19 UTC on 2026-11-05.
 
 The canonical target matrix pairs 512/2048-byte streams with 128/256 threads,
 then repeats each point in a fresh container (eight jobs total). Both arms use
