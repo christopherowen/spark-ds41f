@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--inputs',type=Path,required=True)
     parser.add_argument('--replay-receipt',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--stages',action='store_true',help='separate diagnostic stage timing after whole-plan timing')
     args = parser.parse_args()
     assert not args.out.exists()
     sha = lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
@@ -87,6 +88,25 @@ def main():
                    'visible_range':[int(lengths.min()),int(lengths.max())],
                    'native_before':before,'block8':candidate,'native_after':after,
                    'native_over_block8':native_ms/candidate['median_ms']}
+            if args.stages:
+                plan = plans['block8']
+                scratch = buffers['block8'][0]
+                b = dict(zip(plan._specs(rows),scratch))
+                def stage_scratch(name,p):return [b[f'{name}_{i}'] for i in range(len(p.scratch_specs(rows)))]
+                calls = {
+                    'mean_scores':lambda:plan.score(q.view(torch.uint8),scales.view(torch.uint8).reshape(rows,32,4),weights,pool.view(torch.bfloat16),table,lengths,active,b['scores'],b['counts']),
+                    'coarse_topk':lambda:plan.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=stage_scratch('coarse',plan.coarse)),
+                    'assemble':lambda:plan.assemble(b['selected'],lengths,active,b['candidates'],b['candidate_lengths']),
+                    'fine_score_and_top512':lambda:plan.final.run(q,scales,weights,pool,table,lengths,active,b['candidates'],b['candidate_lengths'],out=buffers['block8'][1],scratch=stage_scratch('final',plan.final))}
+                if source:
+                    calls.update(source_top2048=lambda:plan.select_blocks.run(b['final_0'],b['candidate_lengths'],active,b['compact'],b['block_values'],counts=buffers['block8'][3],scratch=stage_scratch('blocks',plan.select_blocks)),
+                                 source_remap=lambda:plan.remap(b['compact'],b['candidates'],buffers['block8'][2]))
+                row['diagnostic_stages'] = {}
+                for name,call_stage in calls.items():
+                    stage_graph = graph_of(call_stage)
+                    row['diagnostic_stages'][name] = sample(stage_graph)
+                    del stage_graph
+                del call_stage,calls,stage_scratch,b,plan
             result['cases'].append(row)
             args.out.write_text(json.dumps(result,indent=2)+'\n')
             print('CASE '+json.dumps(row),flush=True)
