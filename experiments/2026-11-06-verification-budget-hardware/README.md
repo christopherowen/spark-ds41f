@@ -5,6 +5,16 @@ testing on 2026-11-06, including coordinated replacement and restoration. This
 extends the offline `2026-11-05-verification-budget-replay` experiment. No
 hardware result or speedup is claimed yet.
 
+Remote preflight at `3014f382` passed eight runner tests, all three profile
+doctors, the native six-arm dry run and the guarded runner's read-only plan.
+The tests took 0.10 s / 25,696 KiB maximum process RSS under one CPU/2 GiB on
+sp8. The resolved profiles differ only in row cost (notes excluded). The
+initial row010 doctor failed because overlay option values do not expand
+recipe placeholders; the correction supplies the resolved TP3 values, with a
+regression check. Both attempts remain in `runs/preflight/`. A clean isolated
+dgx1 checkout is prepared at that published commit; its doctor passes. The
+canonical serving checkouts have not been synchronized or changed.
+
 One causal variable: `adaptive_verification_row_cost`, 0.035 control versus
 0.01 and 0.02. Every arm uses the same existing immutable C40 image, source
 lock, native arithmetic, CopyDrafter settings, TP3 triangle, eight active slots,
