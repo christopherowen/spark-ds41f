@@ -1,0 +1,47 @@
+# Completed-answer quality and useful throughput
+
+Base: `6cc2d6b1`; serving source and immutable C36 image are inherited from the
+page-owned selector experiment. Promoted configuration and release evidence are
+unchanged. One intended variable: native selection versus the current aggressive
+centroid selector. Reasoning may differ. The measured outcome is a completed
+answer graded against independent benchmark ground truth, plus total request and
+workload time including reasoning and summary maintenance.
+
+The first benchmark is LongBench v2. `sources.lock.json` pins the official code,
+zero-shot prompt, pure answer extractor, dataset revision/hash, model tokenizer,
+settings and outcome-independent task selection. The original benchmark license
+is cached with its source. Raw dataset, generated text and token IDs remain
+node-local. Do not score reasoning text or infer a final answer from it.
+
+The protocol keeps temperature 0, seed 0 and native high-effort thinking on both
+arms, allows 8192 generated tokens, and requires natural final-answer completion.
+Truncation, missing final content and missing/incorrect choices score zero; their
+categories remain separately visible. No native answer is used as ground truth.
+The pinned official answer extractor runs on final content only, outside timing.
+There are no grading calls, comparison passes or host activation copies in the
+serving implementation.
+
+The pilot freezes one example per domain and untemplated-token bin (8K–64K and
+64K–256K), covering all six domains. A disjoint four examples per stratum form the
+held-out confirmation set. Selection uses a pinned SHA256 ordering, never model
+outcomes. Prompts are complete: no truncation, RAG, extra hints or task rewrites.
+Actual server prompt lengths and cached-token usage are recorded separately.
+Token counts used for selection omit the fixed chat template overhead.
+
+Native-A, LSA-A, LSA-B and native-B use two clean fresh serving boots per arm.
+Answer accuracy, paired wins/losses, invalid/truncated responses, wall time,
+correct answers per second, reasoning/output counts, cold/cached usage and
+per-domain/context results remain separate. Repeated boots do not double the
+number of independent quality tasks. A superiority claim needs held-out evidence
+and uncertainty; a pilot win alone is not sufficient. No quality loss or promotion
+is authorized by a faster aggregate score.
+
+Prepare only pinned CPU-side benchmark inputs before opening a coordinated GPU
+window. The sp5–sp7 window uses their native reservations, heartbeat, idle guard,
+all-node clean commit sync, named cluster profiles and C37 restoration recipe.
+Read the live/shape plan before every apply. Restore once after the full window,
+then independently verify all nodes and release all reservations. Record exact
+commands and every run/error under `runs/`; unfavorable outcomes are retained.
+
+EvalPlus executable coding tests and fresh RULER task generation are subsequent
+checks, not claimed results. They will be independently pinned before use.
