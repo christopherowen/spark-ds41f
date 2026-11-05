@@ -1,0 +1,282 @@
+From 5977d3f62fddde1c79f5612c42f443d682a21bb4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 14:22:12 +0100
+Subject: [PATCH] Copy gather tails as words and map tiny rank rows directly
+
+Upstream base: 6ee0d76e987ab5a13a64032582bc3da945ce3eae. Rationale: remove byte-per-thread copies, device division and rank-one materialization. Aligned opaque words preserve payloads; tiny tails use a warp per rank/row with no division, larger tails use exact host-computed reciprocals. Quality: explicit validated bounds and disjoint outputs, unchanged packed path. Tests: 10,070 integer-reference checks, 147 gather tests per boot on previous variant; final direct-grid two-boot tests and strict timings pending. Upstream status: local experiment, not submitted.
+---
+ .../kernels/test_deepseek_v41_gather_into.py  |  31 ++++-
+ .../test_deepseek_v41_tilelang_collectives.py |  15 ++-
+ .../deepseek_v4_1/tilelang/collectives.py     | 121 ++++++++++++++----
+ 3 files changed, 133 insertions(+), 34 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_gather_into.py b/tests/kernels/test_deepseek_v41_gather_into.py
+index 49a70709fc..32d23a4662 100644
+--- a/tests/kernels/test_deepseek_v41_gather_into.py
++++ b/tests/kernels/test_deepseek_v41_gather_into.py
+@@ -93,15 +93,20 @@ def test_bad_layouts_fail_explicitly():
+ 
+ 
+ @pytest.mark.parametrize(
+-    "dtype", [torch.bfloat16, torch.float32, torch.int64, torch.complex64]
++    "dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.int64, torch.complex64]
+ )
+ @pytest.mark.parametrize("width", [1, 5, 17])
+-def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):
++@pytest.mark.parametrize("world", [1, 2, 3, 4, 8])
++def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width, world):
+     from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
+ 
+-    src = torch.arange(3 * 7 * width, device="cuda").to(dtype).view(21, width)
+-    expected = torch.cat(list(src.view(3, 7, width)), dim=1)
+-    got = concat_rank_shards(src, 3, (7, width))
++    src = (
++        torch.arange(world * 7 * width, device="cuda").to(dtype).view(world * 7, width)
++    )
++    expected = torch.cat(list(src.view(world, 7, width)), dim=1)
++    got = concat_rank_shards(src, world, (7, width))
++    if world == 1:
++        assert got.data_ptr() == src.data_ptr()
+     assert got is not None
+     assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+ 
+@@ -111,3 +116,19 @@ def test_overlapping_output_rows_are_rejected_before_launch():
+     output = torch.empty((1, 32), device="cuda").expand(4, 32)
+     with pytest.raises(ValueError, match="rows must not overlap"):
+         gather_columns_into(src, (output,), 2)
++
++
++@pytest.mark.parametrize("divisor", [1, 2, 3, 5, 7, 15, 17, 257, 65535, 2**31 - 1])
++def test_tail_address_division_matches_integer_arithmetic(divisor):
++    import random
++
++    from vllm.models.deepseek_v4_1.tilelang.collectives import _tail_div_magic
++
++    rng = random.Random(divisor)
++    magic = _tail_div_magic(divisor)
++    values = [0, 1, divisor - 1, divisor, divisor + 1, 2**31 - 1, 2**32 - 1]
++    values += [rng.randrange(1 << 32) for _ in range(1000)]
++    for n in values:
++        q = n if divisor == 1 else (n * magic) >> 32
++        q -= q * divisor > n
++        assert q == n // divisor
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index d6a1ce7169..5447b2aef5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -116,7 +116,6 @@ def topology(monkeypatch):
+     ring4_relay.cache_clear()
+ 
+ 
+-
+ def _run(inputs, collective=None, fabric=None):
+     world = len(inputs)
+     fabric = fabric or _Fabric(world)
+@@ -244,7 +243,6 @@ def test_every_other_topology_keeps_the_ring_relay(topology, value):
+         assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))
+ 
+ 
+-
+ @pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("rows", [1, 5, 8, 13])
+ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+@@ -437,8 +435,15 @@ def test_rank_shards_concatenate_like_movedim(world, shard, dtype):
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+-def test_rank_shards_of_partial_packs_are_left_to_torch():
++def test_rank_shards_of_partial_packs_preserve_payload_bits():
+     from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
+ 
+-    gathered = torch.zeros(8, 5, dtype=torch.bfloat16, device="cuda")
+-    assert concat_rank_shards(gathered, 2, (4, 5)) is None
++    gathered = (
++        torch.arange(40, dtype=torch.int16, device="cuda")
++        .view(torch.bfloat16)
++        .view(8, 5)
++    )
++    expected = gathered.view(2, 4, 5).movedim(0, 1).reshape(4, 10)
++    got = concat_rank_shards(gathered, 2, (4, 5))
++    assert got is not None and got.is_contiguous()
++    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index b2e2df42ac..bab3102461 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -24,6 +24,7 @@ exchange directly.
+ # annotations eagerly, and the symbolic shape must resolve.
+ import math
+ from dataclasses import dataclass
++from functools import cache
+ 
+ import tilelang
+ import tilelang.language as T
+@@ -234,32 +235,106 @@ def rank_rows_kernel():
+     return collectives_rank_rows
+ 
+ 
++_TAIL_DIV = r"""
++__device__ __forceinline__ unsigned vllm_tail_div(
++    unsigned n, unsigned d, unsigned magic) {
++  if (d == 1) return n;
++  unsigned q = __umulhi(n, magic);
++  return q - (static_cast<unsigned long long>(q) * d > n);
++}
++"""
++
++
++@cache
++def _tail_div_magic(divisor: int) -> int:
++    return 0 if divisor == 1 else ((1 << 32) + divisor - 1) // divisor
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def rank_rows_bytes_kernel():
+-    """The tail/unaligned all-gather layout conversion, as exact payload bytes."""
+-    source_bytes, output_bytes = T.dynamic("source_bytes, output_bytes")
++def rank_rows_bytes_kernel(unit: int = 1):
++    """Tail/unaligned rank rows as opaque 1-, 2- or 4-byte payloads."""
++    assert unit in (1, 2, 4)
++    dtype = {1: T.uint8, 2: T.uint16, 4: T.uint32}[unit]
++    source_units, output_units = T.dynamic("source_units, output_units")
+ 
+     @T.prim_func
+     def collectives_rank_rows_bytes(
+-        src: T.Tensor((source_bytes,), T.uint8),
+-        dst: T.Tensor((output_bytes,), T.uint8),
++        src: T.Tensor((source_units,), dtype),
++        dst: T.Tensor((output_units,), dtype),
+         world: T.int32,
+         rows: T.int32,
+-        row_bytes: T.int32,
++        row_units: T.int32,
++        row_magic: T.uint32,
++        span_magic: T.uint32,
+     ):
+-        with T.Kernel(rows, T.ceildiv(world * row_bytes, 256), threads=256) as (
+-            row,
+-            block,
+-        ):
+-            col = block * 256 + T.get_thread_binding()
+-            if col < world * row_bytes:
+-                dst[row * (world * row_bytes) + col] = src[
+-                    ((col // row_bytes) * rows + row) * row_bytes + col % row_bytes
+-                ]
++        with T.Kernel(T.ceildiv(output_units, 256), threads=256) as block:
++            T.import_source(_TAIL_DIV)
++            index = block * 256 + T.get_thread_binding()
++            if index < output_units:
++                n = T.cast(index, T.uint32)
++                unit = T.cast(row_units, T.uint32)
++                span = T.cast(world, T.uint32) * unit
++                row = T.call_extern("uint32", "vllm_tail_div", n, span, span_magic)
++                col = n - row * span
++                rank = T.call_extern("uint32", "vllm_tail_div", col, unit, row_magic)
++                local = col - rank * unit
++                dst[index] = src[(rank * T.cast(rows, T.uint32) + row) * unit + local]
+ 
+     return collectives_rank_rows_bytes
+ 
+ 
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def rank_rows_small_kernel(unit: int):
++    """One warp per rank/row: tiny tails need no device integer division."""
++    dtype = {1: T.uint8, 2: T.uint16, 4: T.uint32}[unit]
++    source_units, output_units = T.dynamic("source_units, output_units")
++
++    @T.prim_func
++    def collectives_rank_rows_small(
++        src: T.Tensor((source_units,), dtype),
++        dst: T.Tensor((output_units,), dtype),
++        world: T.int32,
++        rows: T.int32,
++        row_units: T.int32,
++    ):
++        with T.Kernel(world, rows, threads=32) as (rank, row):
++            for step in T.serial(T.ceildiv(row_units, 32)):
++                local = step * 32 + T.get_thread_binding()
++                if local < row_units:
++                    dst[(row * world + rank) * row_units + local] = src[
++                        (rank * rows + row) * row_units + local
++                    ]
++
++    return collectives_rank_rows_small
++
++
++def _rank_rows_tail(gathered, out, world, rows, row_bytes):
++    unit = next(
++        n for n in (4, 2, 1) if row_bytes % n == 0 and gathered.data_ptr() % n == 0
++    )
++    dtype = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[unit]
++    args = (
++        gathered.view(-1).view(dtype),
++        out.view(-1).view(dtype),
++        world,
++        rows,
++        row_bytes // unit,
++    )
++    if out.numel() * out.element_size() // unit <= 128:
++        rank_rows_small_kernel(unit)(*args)
++    else:
++        rank_rows_bytes_kernel(unit)(
++            *args,
++            _tail_div_magic(row_bytes // unit),
++            _tail_div_magic(world * (row_bytes // unit)),
++        )
++
++
+ def rank_rows_calls() -> list[prepare.TileLangCall]:
+     """The rank-major-to-concatenated launch of the TP group's last-dimension
+     all-gathers that NCCL carries (``concat_rank_shards``)."""
+@@ -268,7 +343,9 @@ def rank_rows_calls() -> list[prepare.TileLangCall]:
+     return (
+         []
+         if get_tp_group().world_size < 2
+-        else [prepare.call(rank_rows_kernel), prepare.call(rank_rows_bytes_kernel)]
++        else [prepare.call(rank_rows_kernel)]
++        + [prepare.call(rank_rows_bytes_kernel, unit) for unit in (1, 2, 4)]
++        + [prepare.call(rank_rows_small_kernel, unit) for unit in (1, 2, 4)]
+     )
+ 
+ 
+@@ -279,7 +356,7 @@ def concat_rank_shards(
+     of ``shard_shape``) as the shards concatenated along their last dimension, in
+     one TileLang launch. Whole aligned 16-byte packs retain the vector path;
+     tails and unaligned rows use byte copies, including opaque complex payloads.
+-    CPU and rank-one callers retain None for their reference/view-only path."""
++    CPU callers retain None; rank-one results are views."""
+     width = shard_shape[-1]
+     row_bytes = width * gathered.element_size()
+     if len(shard_shape) < 2 or not gathered.is_cuda:
+@@ -291,6 +368,8 @@ def concat_rank_shards(
+     ):
+         raise ValueError("rank shards must be contiguous and match the declared shape")
+     rows = math.prod(shard_shape[:-1])
++    if world == 1:
++        return gathered.view(shard_shape)
+     out = gathered.new_empty(*shard_shape[:-1], world * width)
+     if rows and width:
+         if row_bytes % 16 == 0 and gathered.data_ptr() % 16 == 0:
+@@ -302,13 +381,7 @@ def concat_rank_shards(
+                 row_bytes // 16,
+             )
+         else:
+-            rank_rows_bytes_kernel()(
+-                gathered.view(-1).view(torch.uint8),
+-                out.view(-1).view(torch.uint8),
+-                world,
+-                rows,
+-                row_bytes,
+-            )
++            _rank_rows_tail(gathered, out, world, rows, row_bytes)
+     return out
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
