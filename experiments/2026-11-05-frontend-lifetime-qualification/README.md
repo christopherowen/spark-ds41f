@@ -1,5 +1,14 @@
 # Frontend lifetime cleanup qualification
 
+**Current: C43 failed its release gate before serving or performance.** Actual
+wait exit1 and independently verified C36 restoration are preserved. Native
+recorded counts are8103 passed/360 skipped/one failed worker lazy-reference
+assertion. Focused source review identifies a likely test-pollution mechanism
+from changed process grouping; no runtime cause or speed verdict is inferred.
+Candidate46 is reserved for a minimal, assertion-preserving fixture correction.
+The original C43 image/gate is not resumed or repeated. See current results and
+decision; the source preparation/launch narrative below is retained history.
+
 Prepare PR890's two existing request/utility cleanup patches on the corrected,
 default-enabled C40 vLLM source. Purpose: correctness and bounded ownership on
 failed sends/cancellation, with neutral serving performance acceptable and no

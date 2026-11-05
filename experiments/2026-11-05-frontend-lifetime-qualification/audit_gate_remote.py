@@ -102,12 +102,15 @@ def main():
             xml_totals[kind] += 1
     assert totals == xml_totals and totals['passed'] > 0
     assert r['release_cache']['absent_before'] is True and r['release_cache']['image'] == IMAGE
+    assert Path(r['release_cache']['host_root']) == Path.home() / '.cache/spark-lab/qualification' / ('candidate-43-' + IMAGE.split(':')[1])
+    assert sha(OUT / 'gate-candidate-generated.json') == r['release_cache']['generated_bundle_sha256']
     assert sha(OUT / 'bundle/candidate.json') == r['release_cache']['actual_bundle_sha256']
     assert sha(OUT / 'gate-manifest.json') == r['gate_manifest']['sha256']
     assert r['topk_initcheck']['passed'] is True
     assert r['topk_initcheck']['source_sha256'] == '906039870d8dd00d933d1ee1c083510373292e951f971568b4d3cf9c59cbdbfc'
-    assert sha(OUT / 'topk-initcheck.log') == r['topk_initcheck']['log_sha256']
     topk = (OUT / 'topk-initcheck.log').read_text()
+    # The builder records the decoded text hash; raw byte hashes are retained below.
+    assert hashlib.sha256(topk.encode()).hexdigest() == r['topk_initcheck']['log_sha256']
     assert 'ERROR SUMMARY: 0 errors' in topk and 'exact top-k output' in topk
     paths = [p for p in sorted(OUT.rglob('*')) if p.is_file()]
     assert all(not p.is_symlink() for p in paths)

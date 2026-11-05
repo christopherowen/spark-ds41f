@@ -1,3 +1,28 @@
+# C43 failed its gate; focused diagnosis pending
+
+The image built successfully. Its release gate recorded8103 passed,360 skipped
+and one failed worker-module lazy-reference test before top-k initialization,
+functional or serving/performance phases. There is no C43 over/under. Actual
+supervisor wait exit1, restoredtrue and no native hardware/management/fan halt
+are recorded. Independent named C36 doctor and all three unchanged containers,
+correct image/profile and zero restarts pass; both C43 processes are absent.
+
+The assertion says sample.logprob._topk_log_softmax_kernel is already in module
+globals although expected to remain lazy. A focused review is checking actual
+runtime retention against test-process pollution/chunk grouping. Do not infer
+that the frontend cleanup caused it or drop the idea before that diagnosis.
+Candidate46 is reserved for a justified explicit correction, not a C43 rerun.
+Preserve C43 source, image and all original errors/results unchanged. No gate
+resume, repeated gate, serving measurement or promotion is permitted for C43.
+
+The next actual window belongs to verification budget hardware, after the prior
+request changed. Preserve foreign holds and requests. Further substantial source
+work and all bulk evidence processing are remote, with explicit CPU/memory
+limits and capacity coordination. The earlier prepared plan remains below as
+history and its success claims are not advanced by this failed round.
+
+## Prepared plan retained as history
+
 # Cleanup qualification prepared; serving verdict pending
 
 C43 uses exact PR890 frontend failed-send/cancellation and abandoned utility

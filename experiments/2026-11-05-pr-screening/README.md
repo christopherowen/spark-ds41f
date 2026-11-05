@@ -52,3 +52,23 @@ scratch-read fix. All three declared files per PR match their authored hashes.
 Their source checks do not qualify the outstanding TP1 timing or full-model
 inventories, and a TP3 repeat cannot establish a TP1 benefit. They remain draft;
 no topology, hardware or serving change is made for these source reviews.
+
+## Current follow-up
+
+C43 built, then failed one lazy-reference assertion at its138-file release gate
+(8103pass/360skip/1fail). No serving/performance phase ran. Independent C36
+restoration passed before the subsequent foreign window. Source review ties the
+failure to a test setter restoring a lazily resolved reference into module
+globals after the extra test files changed process grouping; worker runtime
+bytes are unchanged from C40. A focused, assertion-preserving fixture correction
+is in preparation as C46. Native failed evidence stays failed and immutable.
+C45 compiler correction is source-ready with22 CPU controls, awaiting its final
+validated runtime base and native qualification. C40 remains the qualified base.
+
+The queue now includes25 open PRs, including eight new unique proposals916–923.
+Do not merge an active hardware study mid-round: #917 has expanded from its
+prior offline evidence-only head to a separate row-cost hardware screen. No
+modeled3percent benefit is credited as measured throughput. New proposals and
+other owners' hardware authorizations remain separate from our qualification.
+All further substantial preparation, testing and bulk analysis run remotely
+with explicit CPU/memory limits and shared capacity; the Mac stays lightweight.
