@@ -19,7 +19,7 @@ def dependency_paths(root,benchmark):
     paths.add(cluster['upstreams_config'])
     for source,*_ in cluster['container']['mounts']:
         if source.startswith('{checkout}/'):paths.add(source.removeprefix('{checkout}/'))
-    paths.update(['spark_ds41f/config.py','spark_ds41f/cluster_recipe.py','spark_ds41f/topology.py','spark_ds41f/bench.py',
+    paths.update(['spark_ds41f/config.py','scripts/recipe.py','scripts/topology.py','spark_ds41f/bench.py',
                   'experiments/2026-11-05-quality-matrix/measure.py','experiments/2026-11-05-answer-quality/api_metrics.py'])
     folder='2026-11-05-answer-quality' if benchmark=='longbench' else '2026-11-05-context-quality'
     paths.add('experiments/'+folder+'/evaluate.py')

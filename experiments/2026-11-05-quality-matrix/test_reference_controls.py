@@ -23,6 +23,12 @@ class RecordedControls(unittest.TestCase):
             self.assertEqual(argv[1:3],['cat-file','-e']);return b''
         with patch.object(refs,'dependency_paths',return_value=['runtime.py']),patch.object(refs.subprocess,'check_output',side_effect=git):
             return refs.load(root,Path('reference'),benchmark,'pilot','screen' if benchmark=='ruler' else 'full',['node'])
+    def test_actual_dependency_files_exist(self):
+        root=Path(__file__).resolve().parents[2]
+        for benchmark in ('longbench','ruler'):
+            for name in refs.dependency_paths(root,benchmark):
+                self.assertTrue((root/name).is_file(),name)
+
     def test_complete_pair_is_returned_byte_for_byte_with_provenance(self):
         for benchmark in ('longbench','ruler'):
             with tempfile.TemporaryDirectory() as folder:
