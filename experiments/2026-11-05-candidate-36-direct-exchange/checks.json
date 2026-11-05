@@ -1,0 +1,51 @@
+{
+  "checks": [
+    {
+      "command": "bin/spark doctor",
+      "exit_code": 0,
+      "output": "configuration OK",
+      "phase": "before source change"
+    },
+    {
+      "command": "python3 -m unittest tests.test_source_locks",
+      "exit_code": 0,
+      "output": "3 tests passed",
+      "phase": "before source change"
+    },
+    {
+      "command": "bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp4.json build prepare --lock --only vllm",
+      "observations": [
+        "The full 559-patch stack applied in the fresh source-locking checkout; canonical identity was recorded and the final diff check passed.",
+        "The helper's second preparation checkout ran out of local disk space while applying patch 0650; it was automatically removed.",
+        "Remaining preparation and verification moved to DGX4 at the owner's request."
+      ],
+      "exit_code": 1
+    },
+    {
+      "command": "python3 -m unittest tests.test_source_locks tests.test_build",
+      "exit_code": 0,
+      "output": "17 tests passed in 134.721s"
+    },
+    {
+      "command": "bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp4.json doctor",
+      "exit_code": 1,
+      "output": [
+        "NCCL_IB_HCA is rendered from the node map and the transport; remove it from the environment",
+        "cluster and upstream locks name different baselines"
+      ],
+      "preexisting": true,
+      "evidence": "The inherited NCCL_IB_HCA, cluster promoted_baseline and lock generated_from_baseline match HEAD; neither issue was introduced by #846."
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "phase": "after source change"
+    }
+  ],
+  "expected_tree_matches_existing_846_measurement": true,
+  "gpu_runs": [],
+  "memory_observations": [],
+  "image_built": false,
+  "cluster_operations": [],
+  "local_cleanup_receipt": ".work/disk-cleanup-2026-11-05.json"
+}

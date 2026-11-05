@@ -1,4 +1,22 @@
-# Candidate 34 (`spark-ds41f:candidate-36`)
+# Candidate 36 with direct switched exchange (#846)
+
+The current build inputs add only #846 (vLLM patch `0675`) to candidate-36's
+original 558-patch `0001..0673` stack. Four ranks behind a switch exchange
+directly; the switchless ring keeps its neighbour relay. Candidate-37's loop
+detector and attention changes are not included.
+
+The updated stack has 559 patches, patch head `74e6e1920b3d`,
+and expected tree `bc7c9cd5e022`. This is the tree already measured
+in #846's candidate-36 experiment.
+
+The patched build uses `spark-ds41f:candidate-36`, with its lock and source
+manifest in this directory. The original image and all original test receipts
+remain recorded in [the backport record](../../2026-11-05-candidate-36-direct-exchange/README.md).
+`results.json` records the current build's qualification status.
+
+## Historical candidate-34 kernel audit
+
+The following audit predates #846 and describes the earlier kernel additions.
 
 Built directly on `candidate-33` (`0001..0663`, 548 patches) with 4 hardware-audited vLLM patches (`0664..0667`, 552 patches total; `patch_head` `635eab8b20c9`, `expected_tree` `9744f37b7ea6`, `patchset_sha256` `07b681514a53`):
 
