@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 p = argparse.ArgumentParser()
 p.add_argument('--out', type=Path, required=True)
 p.add_argument('--rounds', type=int, default=120)
+p.add_argument('--case-filter', type=Path)
 a = p.parse_args()
 path = Path('/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dspark_greedy_markov.py')
 spec = importlib.util.spec_from_file_location('draft_fixture', path)
@@ -73,6 +74,9 @@ for dtype in (torch.bfloat16, torch.float32):
             state.draft_token_confidence_probs = torch.empty((count, steps), device='cuda', dtype=torch.float32)
         assert torch.equal(old.input_buffers.input_ids, new.input_buffers.input_ids)
         h = states_hidden[:count * steps]
+        label = f'{dtype}-{count}'
+        if a.case_filter and label not in json.loads(a.case_filter.read_text()):
+            continue
 
         def reference():
             model.vocab_parallel_greedy = False
@@ -87,7 +91,6 @@ for dtype in (torch.bfloat16, torch.float32):
         expected = tuple(t.clone() for t in reference())
         launches = dict(reference=reference, candidate=candidate, previous=reference, null=reference)
         measured, _ = measure(launches, flush, 20261105, expected, rounds=a.rounds)
-        label = f'{dtype}-{count}'
         profiles = {}
         for role in ('reference', 'candidate'):
             launches[role]()

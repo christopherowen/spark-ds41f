@@ -117,7 +117,17 @@ for boot in (1, 2):
         embedding[key][row["name"]] = result
     assert len(embedding[key]) == 32 and len(additional) == 3
 
-    drafting[key] = {r["name"]: brief(r) for r in point(run_map["drafting"][key], "draft_bench", boot)["cases"]}
+    draft_primary = {r["name"]: r for r in point(run_map["drafting"][key], "draft_bench", boot)["cases"]}
+    drafting[key] = {name: brief(row) for name, row in draft_primary.items()}
+    draft_extra = point(run_map["draft_extension"][key], "draft_bench", boot)["cases"]
+    assert len(draft_extra) == 1
+    for followup in draft_extra:
+        original = draft_primary[followup["name"]]
+        for field in ("weight_sha256", "input_sha256", "ids_sha256"):
+            assert original[field] == followup[field], field
+        assert len(verify(followup)[0]) == 2048
+        extension = extend(verify(original)[0], verify(followup)[0])
+        drafting[key][followup["name"]].update(extension=extension, passed=extension["passed"])
     assert len(drafting[key]) == 6
     transfer[key] = {str((r["dtype"], r["rows"], r["stride"])): brief(r)
                      for r in point("final-wire-v9", "transfer", boot)["cases"]}

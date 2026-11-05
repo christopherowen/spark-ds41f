@@ -14,6 +14,7 @@ mapping = json.loads((HERE / "accepted-runs.json").read_text())
 jobs = [(mapping["drafting"]["2"], "draft_bench", "draft", 2)]
 jobs += [(mapping["iket"][str(boot)], "iket", "all", boot) for boot in (1, 2)]
 jobs += [(mapping["tests"][str(boot)], "tests", "all", boot) for boot in (1, 2)]
+jobs += [(mapping["draft_extension"][str(boot)], "draft_bench", "draft", boot) for boot in (1, 2)]
 results = []
 for name, operation, family, boot in jobs:
     path = OUT / name
@@ -25,10 +26,14 @@ for name, operation, family, boot in jobs:
         results.append(dict(run=name, boot=boot, exit=0, reused=True))
         print("REUSE", name, flush=True)
         continue
-    code = subprocess.run([sys.executable, str(HERE / "run.py"), "--experiments",
+    command = [sys.executable, str(HERE / "run.py"), "--experiments",
                            str(HERE.relative_to(ROOT)), "--run", name,
                            "--operations", operation, "--family", family,
-                           "--boots", str(boot)], cwd=ROOT).returncode
+                            "--boots", str(boot)]
+    if name in mapping["draft_extension"].values():
+        command += ["--paired-rounds", "2048", "--case-filter",
+                    str(HERE.relative_to(ROOT) / "draft-extension-cases.json")]
+    code = subprocess.run(command, cwd=ROOT).returncode
     results.append(dict(run=name, boot=boot, exit=code))
     (OUT / "recovery-v23.json").write_text(json.dumps(results, indent=2) + "\n")
     print("REMAINING", name, code, flush=True)
