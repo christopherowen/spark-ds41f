@@ -1,0 +1,40 @@
+# Independent coding and long-context qualification
+
+Base `39bdd99c`. One intended runtime variable: C36 Native68 versus the existing
+block8/query-reuse selector, with unchanged checkpoint, fine arithmetic, budgets
+and generation protocol. This separately qualifies the idle Spaceport sp1-sp4
+TP4 group. Its numbers are never pooled with the sp5-sp7 TP3 LongBench cohort.
+No promoted recipe or published release measurement changes.
+
+The tracked C37 four-node switched recipe is the restoration authority. A new
+node map selects sp1-sp4; clean isolated controller/serving checkouts preserve
+the original production repositories. All nodes synchronize to one published
+commit through named `bin/spark cluster sync` operations. Native token leases,
+an idle guard, a 30-second heartbeat and an independent 15-minute watchdog cover
+the complete window. Plans retain their exact live/shape review before applies.
+All configured nodes restore C37 once and release their holds at the end.
+
+`run_window.py --benchmark code` generates all 164 frozen HumanEvalPlus programs
+with one attempt, four concurrent cold requests, temperature0, seed0, high
+thinking and 65536 generated tokens. Reasoning and failed requests count in
+generation wall time. Grading is a separate CPU-only container job after each
+arm: pinned official base and plus tests, no network/GPU, read-only code/cache/
+samples, no capabilities, no privilege escalation, 2 CPUs, 4 GiB and 64 processes.
+Programs, full responses and reasoning remain private on the node, outside Git.
+Only hashes, counters, timing and executable-test verdicts are public. Grading
+time is separately recorded; it is not a serving-implementation operation.
+
+`--benchmark ruler --split pilot|heldout` uses the independently frozen context
+manifests and official final-content string-coverage metric. Every fractional
+score is compared per case, so aggregate gains cannot hide a lost target. These
+are project-protocol RULER tasks, not published leaderboard scores. All input
+preparation must finish and be frozen before an arm is eligible.
+
+The arm order is Native A, LSA A, LSA B, Native B. Observed regressions reject
+the candidate before further boots; final acceptance checks both repeats and
+every task, completion and answer-decision stability. A no-loss pass permits
+further evaluation only. It does not prove quality on untested inputs, a speed
+win, or promotion. Cooling starts below55C on every node, uses the existing fan
+policy, and retains memory, swap, thermal and failure observations for each arm.
+The existing TP3 LongBench window runs independently; shared-site activity is
+recorded rather than treating measurements on different groups as paired runs.

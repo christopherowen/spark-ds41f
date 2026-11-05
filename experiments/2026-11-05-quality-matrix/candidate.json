@@ -1,0 +1,65 @@
+{
+  "extends": {
+    "config": "experiments/2026-11-05-quality-matrix/native.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{home}/projects/spark-ds41f/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/replay/overlay/indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-token-lsa/bundle/overlay/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-token-lsa/paged/overlay/paged_shortlist.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/paged_shortlist.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-05-query-reuse/overlay/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/attention.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-05-block-summary/overlay/model_attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-token-lsa/paged/overlay/direct_shortlist.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/direct_shortlist.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-05-block-summary/overlay/block_shortlist.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-05-query-reuse/reuse_score.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/query_reuse.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_PAGE_SHORTLIST": "1",
+      "VLLM_DS41_PAGE_MODE": "block8",
+      "VLLM_DS41_PAGE_ROWS": "256",
+      "VLLM_DS41_PAGE_DENSE_BUDGET": "64",
+      "VLLM_DS41_PAGE_SOURCE_BUDGET": "512",
+      "VLLM_DS41_PAGE_NATIVE_SOURCE": "0"
+    }
+  },
+  "notes": "Same block8 query-reuse LSA and budgets as TP3 pilot; independent TP4 quality/performance qualification required."
+}
