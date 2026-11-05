@@ -14,7 +14,7 @@ is cached with its source. Raw dataset, generated text and token IDs remain
 node-local. Do not score reasoning text or infer a final answer from it.
 
 The protocol keeps temperature 0, seed 0 and native high-effort thinking on both
-arms, allows 8192 generated tokens, and requires natural final-answer completion.
+arms, allows 65536 generated tokens, and requires natural final-answer completion.
 Truncation, missing final content and missing/incorrect choices score zero; their
 categories remain separately visible. No native answer is used as ground truth.
 The pinned official answer extractor runs on final content only, outside timing.
@@ -72,8 +72,8 @@ Exact pilot command from the published, clean sp5 controller checkout:
 
 ```sh
 python3 experiments/2026-11-05-answer-quality/run_window.py \
-  --out /home/chris/spark-lab/results/answer-quality/pilot-window-01 \
-  --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877 \
+  --out /home/chris/spark-lab/results/answer-quality/pilot-window-02 \
+  --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877/policy-65536-v1 \
   --split pilot
 ```
 
@@ -87,3 +87,28 @@ same pilot; the held-out set remains unseen. No favorable result is assumed.
 published native receipts only on the same UTC day, for the identical split,
 source lock, native recipe, mounted kernels and benchmark clients; otherwise it
 refuses and requires fresh controls. Two fresh candidate boots remain required.
+
+
+Owner budget revision, 2026-11-05: allow substantially more thinking/output tokens
+and judge completed answers. The new shared allowance is 65,536 tokens with an
+1800-second request timeout; natural completion ends sooner. Every token and all
+elapsed time count. A finite common watchdog prevents a non-terminating request
+from occupying the shared lab indefinitely. The original 8192-token window is
+cancelled through its benchmark client and restored normally; its partial and
+completed runs remain historical diagnostics. No comparison mixes its settings
+with the larger-budget cohort. The exact same pilot/held-out document IDs and
+input hashes are retained; only the allowance and timeout change. Reference-
+control guards require fresh matched native runs because the protocol changed.
+The new input-cache namespace is `policy-65536-v1`.
+
+
+The owner-requested cancellation of `pilot-window-01` occurs during the second
+LSA boot. Native-A and LSA-A each finish 12 questions at 7/12 correct, with one
+truncation each; their wall times are 490.70 and 494.67 seconds. LSA has one
+independently correct answer native missed and one loss in the other direction.
+The partial repeat reproduces the first three LSA decisions. Native-B is not run.
+These are incomplete-cohort diagnostics at the former cap, not a superiority
+claim. C37 is restored at 09:58:26 UTC and independently verified on all three
+nodes with clean checkouts, no experiment mounts/environment and no reservations.
+Every partial/error receipt and the explicit owner budget-revision reason remain
+in `runs/pilot-window-01`. The new protocol starts fresh matched controls.
