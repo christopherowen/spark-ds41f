@@ -32,9 +32,10 @@ def main():
         row={'file':path.name,'sha256':sha(path),'page':page,'complete_pages':len(complete),'all_pool_bytes_equal':True}
         if args.timing:
             single=slots[len(slots)//2:len(slots)//2+1]
+            skipped=single-1
             row['single_complete_page']=sample(graph_of(lambda:summarize_parallel(page)(pool,pool.view(torch.bfloat16),single)))
             row['all_complete_pages']=sample(graph_of(lambda:summarize_parallel(page)(pool,pool.view(torch.bfloat16),slots)))
-            row['skip_only']=sample(graph_of(lambda:summarize_parallel(page)(pool,pool.view(torch.bfloat16),single-1)))
+            row['skip_only']=sample(graph_of(lambda:summarize_parallel(page)(pool,pool.view(torch.bfloat16),skipped)))
         result['actual'].append(row)
     assert len(result['actual'])==4
     # Native-quantized public random vectors span many scales, zeros and ties.
@@ -55,6 +56,17 @@ def main():
         equal(pool,slots,page)
         # Reuse the same page with changed keys and preserve unchanged slots.
         pool[0,:page*68].copy_(pool[2,:page*68]);equal(pool,slots,page)
+        # Leave skipped pages' keys unwritten for the initialization sanitizer.
+        strict=torch.empty(2,page*80,dtype=torch.uint8,device='cuda')
+        strict[0,:page*68].copy_(pool[0,:page*68])
+        strict[:,page*68:].fill_(91)
+        strict_slots=torch.tensor([-1,page-2,page-1,2*page-2,3*page-1],device='cuda',dtype=torch.int64)
+        summarize_parallel(page)(strict,strict.view(torch.bfloat16),strict_slots)
+        expected=pool[0:1].clone()
+        zero_slot=torch.tensor([page-1],device='cuda',dtype=torch.int64)
+        summarize_compact(page)(expected,expected.view(torch.bfloat16),zero_slot)
+        torch.testing.assert_close(strict[0,page*68:page*68+page//8*68],expected[0,page*68:page*68+page//8*68],atol=0,rtol=0)
+        assert bool((strict[1,page*68:]==91).all())
         result['synthetic'].append({'page':page,'scales_exponent_range':[-100,100],'zero_tie_sign_vectors':True,'skip_and_recycle_bytes_equal':True})
     result['memory']={'allocated_bytes':torch.cuda.max_memory_allocated(),'reserved_bytes':torch.cuda.max_memory_reserved()}
     result['passed']=True;print('RESULT '+json.dumps(result),flush=True)
