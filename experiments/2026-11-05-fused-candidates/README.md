@@ -23,3 +23,25 @@ pages, empty rows, nonfinite scores, ties and unwritten score/work suffixes. Kee
 all samples/errors and memory observations, including required mean maintenance.
 Raw operands remain private on sp8. No final-answer or request-speed claim is
 authorized by a component result.
+
+The first screen at `3530fddb` passes all39 adversarial candidate/count fixtures
+under both initialization and shared-memory race sanitizers, all12 captured
+coarse/fine checks, four strict initialization fixtures and six graph/cache/
+recycling cases. Two fresh processes retain source Native68/candidate ratios
+1.175x,1.779x and2.064x for rows1/8/64, with conditional joint95 intervals
+[1.066,1.306], [1.633,1.929] and[1.943,2.198]. These assume normal process
+medians with only two samples; no request-speed or model-quality claim follows.
+Dense single-row ratios remain0.893–0.894x and are still slower than native;
+larger dense batches retain a speed signal. All samples, required maintenance
+and memory observations remain in `runs/screen-01`. The lease releases
+at20:50:01 UTC, and an independent reader verifies no holds, containers or
+compute processes remain.
+
+The package integration replaces construction of the discarded coarse selector
+and separate assembler. It omits unused final selected-index/value admission,
+retains necessary intermediate merge buffers, and declares precisely its actual
+coarse kernels. The screened kernel body remains unchanged. `vllm/series` adds
+one patch after the preceding nine; fresh application from the pinned C36 base
+equals both runtime overlays. The new candidate profiles are unpromoted and
+must requalify frozen-call binding, the same correctness/sanitizer/lifecycle
+fixtures and two fresh timing processes before any model evaluation.
