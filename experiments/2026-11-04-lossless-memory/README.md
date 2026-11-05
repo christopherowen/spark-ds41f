@@ -6,6 +6,18 @@ revision `1bae0e1088993b9b82de08f59de5be5a34e42170`.
 The four investigations below are independent variables, not a combined arm.
 Promoted configuration, published baselines and recorded reference runs remain unchanged.
 
+## Completed expert-scale cohort
+
+The matched two-boot qualification completed and restored C36 at 17:15:54 UTC
+on 2026-11-05. Exact recorded model outputs and all functional gates pass. The
+model-load allocation counter fell by about 1.32–1.33 GiB per rank; serving
+throughput has no repeatable gain and some C8 comparisons flag a small slowdown.
+No release promotion is proposed. See [the full result](expert-scales/recorded-results.md).
+Engram remains unbuilt. Its packed-reader support exists in C36's source, but
+C36's `open_disk_rows` selects the original separate value/scale sources; the
+packed layout is still a distinct experiment. See the retained source audit in
+`runs/scales-recorded-two-boots/c36-engram-selection.json`.
+
 ## Required invariants
 
 - Every encoded block reconstructs the original bytes, including signed zero,

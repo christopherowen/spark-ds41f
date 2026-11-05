@@ -9,8 +9,21 @@ fixtures and did not start serving measurement; the corrected full gate passed
 7,337 tests with 355 skips on every rank. The first complete primary under the
 newer collector preserved all 256 generated sequences and 65,536 returned score
 vectors exactly. That window restored C36 after the queued collector handoff;
-the required matched two-boot cohort remains separate. Engram remains unbuilt.
+the subsequent matched two-boot cohort is now complete, with its own records below.
+Engram remains unbuilt.
 No serving improvement or release acceptance is claimed.
+
+## Completed expert-scale cohort
+
+The matched two-boot qualification completed and restored C36 at 17:15:54 UTC
+on 2026-11-05. Exact recorded model outputs and all functional gates pass. The
+model-load allocation counter fell by about 1.32–1.33 GiB per rank; serving
+throughput has no repeatable gain and some C8 comparisons flag a small slowdown.
+No release promotion is proposed. See [the full result](expert-scales/recorded-results.md).
+Engram remains unbuilt. Its packed-reader support exists in C36's source, but
+C36's `open_disk_rows` selects the original separate value/scale sources; the
+packed layout is still a distinct experiment. See the retained source audit in
+`runs/scales-recorded-two-boots/c36-engram-selection.json`.
 
 ## Source identities
 
@@ -36,8 +49,8 @@ restoration are retained in `expert-scales/first-primary-results.json` and its
 a controller; the corrected supervisor records the actual child exit. The later
 controller exit 1 records the deliberate window handoff, rather than a model or
 hardware failure. No missing companion, repeat or functional result is a pass.
-Engram image construction and both
-candidates' complete corrected qualification remain required. The first image attempt was
+The matched expert-scale cohort is now complete; Engram image construction and
+its complete corrected qualification remain required. The first image attempt was
 rejected before stopping service because its plan used a non-resolving profile
 path; `runs/component-plan-failure/` retains the original receipt and logs.
 Both plans now use complete repository-relative paths, and the controller
@@ -212,8 +225,9 @@ The saved C36 screen has one boot and uses the newer token-ID/empty-delta progre
 collector. Its client throughput, TTFT, TPOT and event gaps are not a matched
 comparison to this cohort's recorded policy. C36 can provide context through
 independently compatible engine counters or unchanged prefill workloads, with
-its missing repeat stated. It already contains both storage ideas, so a gain
-against 1030 cannot be called an incremental improvement to C36.
+its missing repeat stated. Its scale compaction is already present. Packed Engram reader support also exists,
+but C36's source selects the original separate planes; presence of its API is not
+activation. A gain against 1030 still cannot establish an incremental C36 gain.
 
 `functional-reference.json` pins the two original 1030 functional JSONL records
 and their unchanged probe scripts. The selected deterministic-control scenarios
