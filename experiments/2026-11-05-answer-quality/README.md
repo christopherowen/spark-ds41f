@@ -74,7 +74,8 @@ Exact pilot command from the published, clean sp5 controller checkout:
 python3 experiments/2026-11-05-answer-quality/run_window.py \
   --out /home/chris/spark-lab/results/answer-quality/pilot-window-02 \
   --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877/policy-65536-v1 \
-  --split pilot
+  --split pilot \
+  --candidate-config experiments/2026-11-05-answer-quality/native-source-fast.json
 ```
 
 
@@ -112,3 +113,11 @@ claim. C37 is restored at 09:58:26 UTC and independently verified on all three
 nodes with clean checkouts, no experiment mounts/environment and no reservations.
 Every partial/error receipt and the explicit owner budget-revision reason remain
 in `runs/pilot-window-01`. The new protocol starts fresh matched controls.
+
+
+The larger-budget `pilot-window-02` uses the already prepared native-source
+variant. Relative to its matched native controls, its intended variable is dense
+centroid selection plus required dense-summary maintenance; source/reindex
+selection remains native. Budget 65,536 is shared by both arms. The prior
+aggressive, lower-budget cohort is not a performance or quality comparator for
+this window. This is a new pilot operating point, not held-out confirmation.
