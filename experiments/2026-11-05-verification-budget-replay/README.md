@@ -109,6 +109,95 @@ It has aggregate counters, not the per-step confidences needed by this screen.
 See `experiments/2026-11-04-release-trace-replay/README.md`. No current
 agent-traffic or c16 policy validation is claimed.
 
+## Completion audit, 2026-11-06
+
+The stronger completion requirement does **not** turn this into a qualified
+performance implementation. It supports a narrower conclusion: the proposed
+cross-request allocator mechanism already exists and is optimal for its stated
+fixed-score, row-only-cost objective. Better cost or confidence estimates remain
+promising and unqualified. Retaining the current policy is an evidence decision,
+not proof that 0.035 is the fastest possible serving parameter.
+
+For request `i`, let `s(i,j)` be the product of conditional confidences through
+draft `j`. With confidences in [0,1], these scores are nonincreasing within a
+request. At fixed total budget `K`, the globally largest `K` scores maximize
+their sum. Ties can be ordered by request then position, preserving prefixes.
+Any other feasible prefix allocation has no larger sum. When cost depends only
+on total rows, maximizing this sum for every `K` and then taking the best
+expected-token/cost ratio exhausts the choices in that model. Equal allocation,
+independent request caps, or a different shared-pool implementation cannot add
+expected tokens under these assumptions. This argument does not cover
+miscalibrated/stale confidences, request-specific costs, fairness objectives,
+future batching, or floating-point equivalence between CPU and GPU.
+
+`audit.py` checks the exact pinned C38/C40 CPU `get_num_tokens` method (extracted
+without importing the GPU runtime, with an enforced whole-file SHA-256).
+It passes **160 exhaustive prefix comparisons**, each also checked with reversed
+request order, and **5 boundary checks**: 17-slot copy proposals, scheduler
+eligibility despite a zero rank-local limit, all-zero confidence, periodic
+exploration, and a zero logits allowance. The exhaustive cases include ties,
+variable capacities, logits clipping and mixed prefill. These are host-selector
+checks; they do not claim native GPU arithmetic or generated-output invariance.
+
+The additional screen varies only row cost: 0.01, 0.02, 0.035, 0.05 and 0.07,
+plus the already screened measured-cell denominator. All choices retain the
+same confidence ranker and measured row cells. For each frozen step an oracle
+can also choose a budget knowing the eventual matches; a second oracle can
+allocate those rows knowing which drafts match. A finite fractional optimization
+maximizes **total tokens / total modeled time** over all frozen steps. Merely
+maximizing each step's realized ratio would not give that bound; an independent
+exhaustive test and a counterexample check this distinction.
+
+| C40 4K cell screen | c1 | c4 | c8 |
+| --- | ---: | ---: | ---: |
+| Row cost 0.01, modeled change vs restricted 0.035 | -0.285% | +3.200% | +3.164% |
+| Row cost 0.02 | -0.049% | +2.619% | +2.169% |
+| Row cost 0.05 | -0.207% | -2.227% | -2.659% |
+| Row cost 0.07 | -0.819% | -4.405% | -5.271% |
+| Perfect future knowledge, budget only: model headroom bound | 3.027% | 5.368% | 5.027% |
+| Perfect future knowledge, budget and allocation: model bound | 3.027% | 7.779% | 10.292% |
+
+The saved repeat grid gives similar descriptive numbers; all outputs, including
+the 1030 grid, are in `runs/alternatives.json`. These bounds apply **only to the
+frozen old trace and three measured cells**, not actual serving throughput or
+unmeasured budgets. The parameter sweep uses the same observations throughout;
+it is not held-out policy selection. At 64K and 256K, recorded request/context
+pairs have only one measured row count, so every denominator chooses the same
+budget: zero difference there is absence of an alternative, not validation.
+c16 has no trace at any context. No confidence interval is attached to these
+model deltas; two existing cost grids cannot quantify the model's missing data.
+
+### Alternatives and remaining bottleneck
+
+| Alternative | Evidence and decision |
+| --- | --- |
+| Another global allocator, equal shares, or per-request caps | Already covered by global prefix ranking; zero fixed-score objective headroom at a fixed row-only cost. Preserve scheduler-shared eligibility and exploration. |
+| Lower row cost or measured-cell pricing | Still promising on this incomplete model at c4/c8. Not disproved. Historical 0.02 serving runs gave no throughput gain and later first tokens; current 0.01/0.02 require current traces and actual qualification. |
+| A fixed survival threshold | Recorded 0.2 serving test lost about 3.1% at c1 and 0.7% at c16; it ignores the batch's base cost (`2026-10-18-dspark-linear-budget`). |
+| Full static cost shape, cost scales 1/2/4, depth 3/5, marginal running-rate objective, confidence calibration | The retained historical replay already enumerates these; calibration/marginal changes are small in that model and full static serving results were inconclusive within drift. No current-stack advantage is established. |
+| Graph/head/dense boundary pricing | Candidate 15's artificial cliffs regressed. Current dispatch differs, including the 128-row head tile. Adjacent boundary measurements are missing; interpolating them would invent the deciding evidence. |
+| Stale host cutoff, fresh dead-row pricing, expert-union costs | Stale pruning previously regressed. Current marking uses fresh confidence; no joint current confidence/live-row/routing cost trace supports new pricing. |
+| Fresh host confidence or a learned long-run objective | Potentially changes synchronization, estimator feedback, future batches and fairness. The current trace cannot price those effects or prove seeded/tool behavior. No timing or implementation win is claimed. |
+
+The remaining bottleneck in this investigation is identification: the traces
+and costs do not jointly describe current serving work. A faster allocator
+cannot fix that. Current per-step confidence/proposal/acceptance/context data,
+boundary and live-row costs, and distinct-agent c1/c4/c8/c16 serving runs are
+still required to select between the promising denominators. Native arithmetic,
+batch invariance, seeded sampling, tools/grammar, fairness, throughput, latency,
+GPU memory and failure behavior of such a candidate remain untested. A boot
+and repeat boot with intervals against recorded references would be necessary;
+serving operations have not been authorized. This is not a fully proved
+performance result or an assertion of a global optimum.
+
+The audit used published deployment commit `2a769af2` and the original locked
+C40 prepared tree. **11 offline unit checks passed**; source checks and the
+alternative screen completed in 2.52 s with 64,448 KiB maximum process RSS,
+under one CPU core and a 2-GiB limit on sp8. Exact commands are in
+`audit-commands.sh`; native logs and input/script hashes are retained. The
+complete diff was reviewed; no runtime patch, arithmetic change, additional
+source preparation, image build, GPU operation or serving operation was added.
+
 ## Validation and resources
 
 - Remote `doctor`: configuration OK, exit 0. The isolated CPU checkout uses the
