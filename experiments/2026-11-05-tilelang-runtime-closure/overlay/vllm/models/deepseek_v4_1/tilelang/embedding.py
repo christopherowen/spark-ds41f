@@ -410,7 +410,8 @@ def vocab_embedding_packed(
         or values.shape[1] != row_bytes
         or out.shape != (tokens, in_features)
         or out.dtype != torch.bfloat16
-        or not (input_ids.is_contiguous() and values.is_contiguous())
+        or (not clamp_negative and not input_ids.is_contiguous())
+        or not values.is_contiguous()
         or not out.is_contiguous()
     ):
         raise ValueError(

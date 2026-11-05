@@ -1,0 +1,27 @@
+From 1ad6b99163bdfad7f40f45503c1abce0083bf672 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 16:27:45 +0100
+Subject: [PATCH] Admit native ID strides in packed embedding validation
+
+Upstream base: efe2ccab1744b9df2c549cad11ebd8312b4a93ec. Rationale: public strided tests exposed an old contiguity condition after kernel support was added. Only the native-ID specialization accepts strides; table and output validation stay strict. Quality: no GPU program change. Tests: rerun complete embedding matrix on two boots; initial 113 passes and two rejected-stride failures retained. Upstream status: local experiment, not submitted.
+---
+ vllm/models/deepseek_v4_1/tilelang/embedding.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index 5dd2639bd0..8a30d5e1f4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -410,7 +410,8 @@ def vocab_embedding_packed(
+         or values.shape[1] != row_bytes
+         or out.shape != (tokens, in_features)
+         or out.dtype != torch.bfloat16
+-        or not (input_ids.is_contiguous() and values.is_contiguous())
++        or (not clamp_negative and not input_ids.is_contiguous())
++        or not values.is_contiguous()
+         or not out.is_contiguous()
+     ):
+         raise ValueError(
+-- 
+2.54.0 (Apple Git-157)
+

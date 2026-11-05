@@ -261,3 +261,10 @@ rows and strides 1/2. It retains cold paired samples, inventories, input hashes
 and both parallel-specialization CUDA sources, so unchanged-path identity can
 be checked without assuming it. The fresh 601-patch source tree matches
 `155dbd0d578b2f1fb08729abcc945707f82d94ff`.
+
+`embedding-tests-v17` passes 113 cases then stops at two strided packed-ID
+validation failures. The new kernel supports those strides, but an old combined
+input/table contiguity guard still rejected them. `0017` relaxes only the native
+input side; packed table and output requirements remain strict. No GPU program
+changes. Both full test boots and the performance screen are rerun; the first
+failure remains part of the evidence.
