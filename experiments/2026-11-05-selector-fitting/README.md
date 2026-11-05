@@ -99,3 +99,10 @@ not trained, loaded or used by any current serving profile. Its separate GPU
 fixture must check map-sensitive partitioning, exact original-space centroids,
 untouched native records, partial-write no-ops, graph replay and page recycling.
 No component speed or model-quality result is claimed.
+
+The first synthetic projected-summary GPU gate passes on sp8
+(`metric/runs/metric-summary-check-01`). Switching the 32D map changes grouping
+as the independent partition oracle predicts; original-space centroids are
+bit-exact for the fixture, native bytes are untouched, partial writes are no-ops,
+and graph replay/page recycling pass at both page sizes. No trained map or model
+quality is tested. A separate strict initialization process is prepared next.
