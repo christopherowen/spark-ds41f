@@ -21,9 +21,9 @@ page = importlib.util.module_from_spec(spec);spec.loader.exec_module(page)
 w = page.w
 CAPTURE = Path.home()/'projects/spark-ds41f/cache/selector-fitting-20261105'
 
-ARM = '''import json,sys
+ARM = '''import json
 from pathlib import Path
-x=json.load(sys.stdin);p=Path.home()/'projects/spark-ds41f/cache/selector-fitting-20261105'
+x=DATA;p=Path.home()/'projects/spark-ds41f/cache/selector-fitting-20261105'
 if x['action']=='check':
  assert not p.exists() or not list(p.iterdir()),'capture directory is not empty'
  p.mkdir(parents=True,exist_ok=True,mode=0o700)
