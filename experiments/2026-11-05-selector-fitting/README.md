@@ -5,7 +5,8 @@ Base `65c6e62f`, immutable C36 image and source pin
 completed-answer benchmark. One intended variable for this preparation is
 collecting 64 native query rows per layer instead of a single row. Native model
 weights, scoring and attention remain unchanged; the live-list scratch guard is
-retained. No selector map is trained or qualified yet.
+retained. Four maps are now fitted out of band; the validation result below
+does not justify integrating this fixed-32D probe into serving.
 
 The diagnostic hook requires an explicit case/prompt hash in `arm.json`, skips
 startup and graph capture, and records three dense layers plus one source layer
@@ -83,19 +84,20 @@ eigenvalue. It reports retained query-direction energy on the untouched
 quality guarantee. Native BF16 score rounding and final answers still need their
 own checks. The planned use projects block features only during summary updates;
 it introduces no reference or grading work into queries. Actual key-retention
-validation and construction timing must precede any serving candidate. No maps
-have been fitted and this probe is not integrated into serving.
+validation and construction timing must precede any serving candidate. Fitting follows
+exact native replay; the completed fit and validation are recorded below. This
+probe remains outside serving.
 
 The revised capture-threshold checks and metric arithmetic contracts pass in the
 CPU-only pinned container (`runs/copy-check-03`): all MXFP4 codes/scales, the
 leading 32 directions, and invariance to query-weight sign for the squared
 metric. The container and reservation are removed. This is a synthetic contract
-check; no model-derived metric has been fitted.
+check; that stage uses synthetic inputs rather than a model-derived fitted map.
 
 `metric/` prepares the construction-only implementation of the fixed 32D probe.
 It projects block means for grouping, then writes the original 128D centroids in
-the same 73-byte layout. Query scoring and fine scoring are unchanged. The map is
-not trained, loaded or used by any current serving profile. Its separate GPU
+the same 73-byte layout. Query scoring and fine scoring are unchanged. The synthetic gate uses
+untrained maps; no current serving profile loads a fitted map. Its separate GPU
 fixture must check map-sensitive partitioning, exact original-space centroids,
 untouched native records, partial-write no-ops, graph replay and page recycling.
 No component speed or model-quality result is claimed.
@@ -113,7 +115,7 @@ construction is slower in point estimates: 0.216 versus 0.124 ms at page128,
 and 0.625 versus 0.463 ms at page256. All samples, original-before/after arms,
 process medians and broad two-process intervals remain in the comparison JSON.
 These synthetic construction results establish no request gain or quality gain.
-The map has not been fitted and is not integrated into serving. Its extra work
+At this construction-screen stage the map is unfitted; it remains outside serving. Its extra work
 would need to earn back cost through improved retained-key quality or a cheaper
 query operating point. Every standalone container and reservation is removed.
 
@@ -171,3 +173,43 @@ the unreachable table suffix with valid initialized addresses, preserving every
 visible mapping and the original Lengths/Active domain. Exact native physical
 geometry replay remains a separate prerequisite. All failed attempts and clean
 releases are retained; no serving code or arithmetic changes in this fix.
+
+The next CPU metadata attempt (`runs/actual-probe-04`) fails before GPU work:
+the read-only container lacks a writable temporary directory required by the
+PyTorch import. The corrected command supplies a bounded `/tmp` filesystem.
+The error and clean release are preserved.
+
+`runs/actual-probe-05` completes the actual validation at published commit
+`6a9558215f263068b72db86dfddd67f8676edb24`. CPU checks first verify all 12
+captures, preserving every visible table mapping and initializing unreachable
+suffixes. GPU execution then compares original versus fitted grouping on only
+`validation-a`, with dense budget64/source budget512 unchanged. Mean overlap
+with native selections is:
+
+| Interface | Original | Fitted | Difference |
+|---|---:|---:|---:|
+| Dense layer2, top512 keys | 62.06% | 62.30% | +0.24 points |
+| Dense layer8, top512 keys | 71.58% | 71.69% | +0.12 points |
+| Dense layer14, top512 keys | 79.01% | 79.47% | +0.46 points |
+| Source layer20, top512 keys | 86.17% | 86.05% | -0.12 points |
+| Source layer20, handoff blocks | 66.77% | 66.31% | -0.46 points |
+
+Every per-query value remains in the receipt. These are 64 adjacent prefill rows
+per interface from **one independent validation document**, not 256 independent
+quality trials. Dense rows see 33,624–33,656 keys; source rows see
+125,960–126,023. The larger planned widths do not inflate the visible domain.
+There is no decode, completed-answer or request-speed result for this map.
+
+Conclusion: this fixed-32D probe does not earn serving integration. Its small
+dense recall gains and source regression do not justify the slower construction
+measured earlier. This is a selection proxy, so it establishes no final-answer
+quality ranking. The existing unlearned serving candidate and its independent
+answer-quality evidence remain unchanged. No model configuration or release
+baseline is promoted.
+
+The untimed validation completes within its 16 GiB container limit without an
+OOM; peak host/GPU memory is not sampled and model memory remains unqualified.
+The reservation is removed at 12:53:46 UTC. Independent verification at
+12:54:07 finds no reservation, container or GPU process and a clean checkout at
+the exact runtime commit. The other waiting work is notified that sp8 is free.
+Both serving clusters remain untouched by these standalone checks.
