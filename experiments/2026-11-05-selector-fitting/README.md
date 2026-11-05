@@ -148,3 +148,24 @@ replay before fitting. The controller restores C37 at 12:15:01 UTC; an independe
 all-node check at 12:16:24 verifies the expected image, clean matching checkouts,
 no experimental mounts/environment, and no remaining reservations. No capture
 request is a completed-answer benchmark. The earlier failure remains preserved.
+
+Actual native replay passes in `runs/actual-probe-01`: all 12 rank-0 batches
+(768 rows) preserve selected native keys, visible BF16 score bits and source
+handoff/counts under reconstruction of the native physical geometry. This is
+untimed. The following CPU fit exits before training because its script is
+mounted at `/source`, shallower than its repository-root check expects. No map
+is written. The window releases its reservation with no containers remaining.
+The corrected command mounts the complete clean checkout at `/checkout`; it
+reuses the exact successful replay receipt rather than repeating the GPU job.
+
+`runs/actual-probe-02` fits the predeclared maps on only `fit-a`/`fit-b`, after
+verifying the native replay receipt. The 32D subspaces retain 79.5–82.0% of
+training query energy and 60.7–66.6% on the separate validation document. Those
+energy values establish neither key retention nor answer quality. The map SHA
+and all input identities are recorded; weights remain private on sp8. The GPU
+retention runner then refuses an ABI mismatch before returning a retention
+result: captures preserve a full-capacity table, while its compact page-score
+plan requires the narrower live-width table. The diagnostic now takes a
+contiguous live-width prefix, with explicit width/length guards. Exact native
+geometry replay remains a separate prerequisite. Both failed attempts and their
+clean releases are retained; no serving code or arithmetic changes in this fix.
