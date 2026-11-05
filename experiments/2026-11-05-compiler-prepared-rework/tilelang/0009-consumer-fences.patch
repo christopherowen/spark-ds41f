@@ -1,0 +1,444 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 11:40:37 +0100
+Subject: [PATCH] Fence TileLang consumer reads before releasing shared stages
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Local-base: b26f48b85790b832993f2c9d240dc3c39d6075e8, the five-patch refresh from deployment PR #875.
+Upstream-source: https://github.com/tile-ai/tilelang/pull/3537
+Upstream-head: d044264967190554349ad5ddebf478f4432478f6
+
+Rationale: Generic-proxy stage reads must finish before a consumer releases the stage for the next async-proxy TMA write. Emit the required proxy fence before consumer release.
+
+Quality: Changes synchronization only. Restrict the fence to generic-proxy reads; preserve the upstream treatment of async-only consumers. No numerical failure or serving speedup is claimed from the sampled workload.
+
+Tests: Two generated-code fence assertions and one SM121 numerical reproducer pass twice.
+Recorded compiler tree: 93d54ec9d049abe77cb7d0de3b9ebc1f98ca9951.
+See this candidate's results.json and immutable raw receipts. Full image,
+retained-feature and serving qualification remain separate gates.
+
+Upstream-status: open PR, checked 2026-11-04; pinned experimental backport.
+Remove this local backport when advancing to an upstream revision containing it.
+---
+
+diff --git a/src/cuda/transform/producer_consumer_ws.cc b/src/cuda/transform/producer_consumer_ws.cc
+index 9204c95c..b7e8a5a0 100644
+--- a/src/cuda/transform/producer_consumer_ws.cc
++++ b/src/cuda/transform/producer_consumer_ws.cc
+@@ -780,6 +780,151 @@ AnalyzeBufferDataAccess(const Stmt &stmt, const Var &buffer_data,
+   return detector.Result();
+ }
+ 
++/// Whether `stmt` may access the shared memory of any buffer whose data var is
++/// in `stage_data` through the generic proxy (ld/st.shared, ldmatrix, ...).
++///
++/// Only two consumers are known to touch shared memory exclusively through the
++/// async proxy: TMA stores (source operand) and GEMMs that lower to
++/// wgmma.mma_async or tcgen05.mma (A/B operands). The GEMM instruction is
++/// chosen exactly as LowerTileOp will choose it for the consumer partition
++/// (`thread_extent` threads); a GEMM under a condition on the thread index may
++/// see narrower thread bounds there, so it is treated as generic. Everything
++/// else that names a stage buffer, including calls this pass cannot classify,
++/// counts as a generic access.
++static bool HasGenericProxyAccess(const Stmt &stmt, const VarSet &stage_data,
++                                  const Target &target, const Var &thread_var,
++                                  const PrimExpr &thread_extent) {
++  class Detector : public StmtExprVisitor {
++  public:
++    Detector(const VarSet &stage_data, const Target &target,
++             const Var &thread_var, const PrimExpr &thread_extent)
++        : stage_data_(stage_data), target_(target), thread_var_(thread_var),
++          thread_extent_(thread_extent) {}
++
++    bool found{false};
++
++  private:
++    void VisitStmt(const Stmt &stmt) final {
++      if (!found) {
++        StmtExprVisitor::VisitStmt(stmt);
++      }
++    }
++
++    void VisitStmt_(const IfThenElseNode *op) final {
++      bool old = under_thread_condition_;
++      under_thread_condition_ =
++          old || UsesVar(op->condition, [this](const VarNode *v) {
++            return v == thread_var_.get();
++          });
++      StmtExprVisitor::VisitStmt_(op);
++      under_thread_condition_ = old;
++    }
++
++    void VisitExpr_(const CallNode *op) final {
++      Call call = GetRef<Call>(op);
++      TileOperator tile_op = ParseOperator(call);
++      if (!tile_op.defined()) {
++        StmtExprVisitor::VisitExpr_(op);
++        return;
++      }
++      // Only the operand arguments themselves are exempt; any other
++      // argument (scalars such as `clear_accum`) and the operands' own
++      // indices and extents are still checked.
++      std::vector<bool> async_arg = AsyncOperandArgs(call, tile_op);
++      for (size_t i = 0; i < op->args.size(); ++i) {
++        if (async_arg[i]) {
++          VisitAsyncOperand(op->args[i]);
++        } else {
++          VisitExpr(op->args[i]);
++        }
++      }
++    }
++
++    /// Argument positions of `call` that `tile_op` reads only through the
++    /// async proxy: the source of a TMA store, and A/B (args 0 and 1) of a
++    /// GEMM lowering to wgmma or tcgen05.
++    std::vector<bool> AsyncOperandArgs(const Call &call,
++                                       const TileOperator &tile_op) {
++      std::vector<bool> async_arg(call->args.size(), false);
++      if (ClassifyStmt(Evaluate(call), target_) == TileStmtKind::kTmaStore) {
++        async_arg[0] = true;
++        return async_arg;
++      }
++      const auto *gemm = tile_op.as<GemmNode>();
++      if (gemm == nullptr || under_thread_condition_) {
++        return async_arg;
++      }
++      const int64_t *threads = as_const_int(thread_extent_);
++      if (threads == nullptr) {
++        return async_arg;
++      }
++      String inst = gemm->GetGemmInstructionKey(*threads, target_);
++      if (inst == "cuda.wgmma" || inst == "cuda.tcgen05") {
++        async_arg[0] = true;
++        async_arg[1] = true;
++      }
++      return async_arg;
++    }
++
++    /// Visit an operand argument (BufferLoad, BufferRegion, or tl.region)
++    /// without counting its buffer reference, but still checking its
++    /// indices and extents.
++    void VisitAsyncOperand(const PrimExpr &arg) {
++      if (const auto *load = arg.as<BufferLoadNode>()) {
++        for (const PrimExpr &index : load->indices) {
++          VisitExpr(index);
++        }
++        return;
++      }
++      if (const auto *region = arg.as<BufferRegionNode>()) {
++        for (const Range &range : region->region) {
++          VisitExpr(range->min);
++          VisitExpr(range->extent);
++        }
++        return;
++      }
++      if (const auto *call = arg.as<CallNode>()) {
++        if (call->op.same_as(region()) && !call->args.empty()) {
++          VisitAsyncOperand(call->args[0]);
++          for (size_t i = 1; i < call->args.size(); ++i) {
++            VisitExpr(call->args[i]);
++          }
++          return;
++        }
++      }
++      VisitExpr(arg);
++    }
++
++    void Check(const Var &data) {
++      if (stage_data_.count(data)) {
++        found = true;
++      }
++    }
++
++    void VisitExpr_(const BufferLoadNode *op) final {
++      Check(op->buffer->data);
++      StmtExprVisitor::VisitExpr_(op);
++    }
++
++    void VisitStmt_(const BufferStoreNode *op) final {
++      Check(op->buffer->data);
++      StmtExprVisitor::VisitStmt_(op);
++    }
++
++    void VisitExpr_(const VarNode *op) final { Check(GetRef<Var>(op)); }
++
++    const VarSet &stage_data_;
++    const Target &target_;
++    const Var &thread_var_;
++    const PrimExpr &thread_extent_;
++    bool under_thread_condition_{false};
++  };
++
++  Detector detector(stage_data, target, thread_var, thread_extent);
++  detector(stmt);
++  return detector.found;
++}
++
+ class PreludeStmtsToPipelineLoopCollector
+     : public StmtFunctor<Optional<Array<Stmt>>(const Stmt &)> {
+ public:
+@@ -1623,7 +1768,51 @@ private:
+     // When barriers are merged, iterate over a single effective group.
+     int consumer_barrier_groups =
+         can_merge_tma_barriers ? 1 : num_producer_groups;
++    // A back-pressure arrive hands a stage back to TMA, whose writes go
++    // through the async proxy. Its release semantics only order this
++    // thread's earlier generic-proxy accesses of the stage against later
++    // generic-proxy accesses, so a consumer that touched a TMA-filled buffer
++    // through the generic proxy must issue fence.proxy.async before
++    // arriving; otherwise the next TMA load may overwrite the stage while
++    // those loads are still in flight. Every consumer thread arrives (the
++    // count is consumer_extent), so each thread fences its own accesses.
++    std::vector<VarSet> group_tma_buffers(consumer_barrier_groups);
++    std::vector<bool> group_needs_proxy_fence(consumer_barrier_groups, false);
++    for (size_t i = 0, tma_i = 0; i < flat_stmts.size(); ++i) {
++      if (kinds[i] != TileStmtKind::kTmaProducer) {
++        continue;
++      }
++      int g = can_merge_tma_barriers ? 0 : static_cast<int>(tma_i++);
++      Optional<Var> data = ExtractProducerWriteBufferData(flat_stmts[i]);
++      if (data.defined()) {
++        group_tma_buffers[g].insert(data.value());
++      } else {
++        group_needs_proxy_fence[g] = true; // unknown destination
++      }
++    }
++    for (int g = 0; g < consumer_barrier_groups; ++g) {
++      for (int ci = 0; ci < arrive_insert_pos[g] && !group_needs_proxy_fence[g];
++           ++ci) {
++        group_needs_proxy_fence[g] =
++            !moved_compute_stmts[ci] &&
++            HasGenericProxyAccess(consumer_compute_stmts[ci],
++                                  group_tma_buffers[g], target_,
++                                  thread_iv_->var, consumer_extent);
++      }
++    }
+     Array<Stmt> consumer_stmts;
++    // One fence covers every arrive until the next compute statement.
++    bool proxy_fenced = false;
++    auto emit_release = [&](int g) {
++      if (group_needs_proxy_fence[g] && !proxy_fenced) {
++        consumer_stmts.push_back(
++            Evaluate(Call(DataType::Handle(), fence_proxy_async(), {})));
++        proxy_fenced = true;
++      }
++      int bp_base = num_fwd + g * num_stages;
++      PrimExpr bp_id = IntImm(DataType::Int(32), bp_base) + c_stage_expr;
++      consumer_stmts.push_back(MakeArriveBarrier(barrier_buf, bp_id));
++    };
+     std::vector<bool> arrive_emitted(consumer_barrier_groups, false);
+     for (size_t ci = 0; ci < consumer_compute_stmts.size(); ++ci) {
+       for (const auto &stmt : prelude_waits_before_consumer[ci]) {
+@@ -1639,12 +1828,11 @@ private:
+       }
+       if (!moved_compute_stmts[ci]) {
+         consumer_stmts.push_back(consumer_compute_stmts[ci]);
++        proxy_fenced = false;
+       }
+       for (int g = 0; g < consumer_barrier_groups; ++g) {
+         if (arrive_insert_pos[g] == static_cast<int>(ci + 1)) {
+-          int bp_base = num_fwd + g * num_stages;
+-          PrimExpr bp_id = IntImm(DataType::Int(32), bp_base) + c_stage_expr;
+-          consumer_stmts.push_back(MakeArriveBarrier(barrier_buf, bp_id));
++          emit_release(g);
+           arrive_emitted[g] = true;
+         }
+       }
+@@ -1661,9 +1849,7 @@ private:
+       if (!arrive_emitted[g] &&
+           arrive_insert_pos[g] ==
+               static_cast<int>(consumer_compute_stmts.size())) {
+-        int bp_base = num_fwd + g * num_stages;
+-        PrimExpr bp_id = IntImm(DataType::Int(32), bp_base) + c_stage_expr;
+-        consumer_stmts.push_back(MakeArriveBarrier(barrier_buf, bp_id));
++        emit_release(g);
+       }
+     }
+     // Phase counter increment at end of consumer guarded iteration
+diff --git a/src/tl_templates/cuda/barrier.h b/src/tl_templates/cuda/barrier.h
+index d75249b1..fd7ed607 100644
+--- a/src/tl_templates/cuda/barrier.h
++++ b/src/tl_templates/cuda/barrier.h
+@@ -164,7 +164,9 @@ TL_DEVICE void mbarrier_cp_async_arrive_noinc(BarrierType &smem_mbar) {
+ 
+ template <bool kDependentFalse = false> TL_DEVICE void fence_proxy_async() {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+-  asm volatile("fence.proxy.async.shared::cta;" : :);
++  // The memory clobber keeps the compiler from moving shared-memory accesses
++  // across the fence, which would defeat its ordering.
++  asm volatile("fence.proxy.async.shared::cta;" : : : "memory");
+ #else
+   static_assert(kDependentFalse,
+                 "tl::fence_proxy_async requires sm_90 or later");
+diff --git a/testing/python/issue/test_tilelang_issue_3529.py b/testing/python/issue/test_tilelang_issue_3529.py
+new file mode 100644
+index 00000000..fdd7f3bf
+--- /dev/null
++++ b/testing/python/issue/test_tilelang_issue_3529.py
+@@ -0,0 +1,166 @@
++"""Regression test for issue #3529.
++
++Under automatic warp specialization, a consumer that reads a TMA-filled stage
++through the generic proxy (e.g. ``T.Parallel`` loads, ``ldmatrix``) must issue
++``fence.proxy.async`` before its back-pressure ``mbarrier.arrive``; otherwise
++the producer's next TMA load (async proxy) can overwrite the stage while those
++reads are still in flight. Consumers that only read the stage through wgmma
++(async proxy) need no fence.
++"""
++
++import re
++
++import tilelang
++import tilelang.language as T
++import tilelang.testing
++
++N, C, BK = 16384, 32, 64
++ROW_SCALE = 11.313708498984761
++
++
++@T.prim_func
++def exp_sum(
++    X: T.Tensor((N, C), T.float32),
++    R: T.Tensor((N, C), T.bfloat16),
++    M: T.Tensor((C,), T.float32),
++    P: T.Tensor((N // 256, C), T.float32),
++):
++    with T.Kernel(1, N // 256, threads=128) as (by, bz):
++        X_s = T.alloc_shared((BK, C), T.float32)
++        R_s = T.alloc_shared((BK, C), T.bfloat16)
++        M_s = T.alloc_shared((C,), T.float32)
++        e = T.alloc_fragment((C, BK), T.float32)
++        acc = T.alloc_fragment((C,), T.float32)
++        part = T.alloc_fragment((C,), T.float32)
++        T.copy(M[0:C], M_s)
++        T.clear(acc)
++        for kk in T.Pipelined(4, num_stages=3):
++            T.copy(X[kk * BK + 256 * bz : kk * BK + 256 * bz + BK, 0:C], X_s)
++            T.copy(R[kk * BK + 256 * bz : kk * BK + 256 * bz + BK, 0:C], R_s)
++            # Elementwise (generic-proxy) reads of the TMA-filled stage.
++            for i, j in T.Parallel(C, BK):
++                e[i, j] = T.exp(X_s[j, i] * T.Cast(T.float32, R_s[j, i]) / ROW_SCALE - M_s[i])
++            T.reduce_sum(e, part, dim=1)
++            for i in T.Parallel(C):
++                acc[i] = acc[i] + part[i]
++        T.copy(acc, P[bz, 0:C])
++
++
++def matmul(M, N, K, block_M, block_N, block_K, num_stages, threads=128, clear_from_stage=False):
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), T.float16),
++        B: T.Tensor((K, N), T.float16),
++        C: T.Tensor((M, N), T.float16),
++    ):
++        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            A_shared = T.alloc_shared((block_M, block_K), T.float16)
++            B_shared = T.alloc_shared((block_K, block_N), T.float16)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            T.clear(C_local)
++            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(B[ko * block_K, bx * block_N], B_shared)
++                if clear_from_stage:
++                    # A scalar generic-proxy read of the stage nested in an
++                    # otherwise wgmma-only GEMM call.
++                    T.gemm(A_shared, B_shared, C_local, clear_accum=A_shared[0, 0] > 1e4)
++                else:
++                    T.gemm(A_shared, B_shared, C_local)
++            T.copy(C_local, C[by * block_M, bx * block_N])
++
++    return main
++
++
++def _compile(func, pass_configs=None, **kwargs):
++    tilelang.disable_cache()
++    try:
++        return tilelang.compile(func, target="cuda", pass_configs=pass_configs or {}, **kwargs)
++    finally:
++        tilelang.enable_cache()
++
++
++def _consumer_releases_fenced(src):
++    """For every back-pressure ``mbarrier[...].arrive();`` in the consumer
++    branch of `src`, whether a ``tl::fence_proxy_async();`` precedes it with
++    only other arrives in between (one fence covers consecutive releases)."""
++    lines = [line.strip() for line in src.splitlines() if line.strip()]
++    split = next(i for i, line in enumerate(lines) if line.startswith("if (((int)threadIdx.x) < "))
++    depth, consumer_start = 0, None
++    for i in range(split, len(lines)):
++        if depth == 1 and lines[i].startswith("} else {"):
++            consumer_start = i
++            break
++        depth += lines[i].count("{") - lines[i].count("}")
++    assert consumer_start is not None, src
++    arrive = re.compile(r"mbarrier\[.*\]\.arrive\(\);")
++    releases = [i for i in range(consumer_start, len(lines)) if arrive.fullmatch(lines[i])]
++    assert releases, src
++    fenced = []
++    for i in releases:
++        j = i - 1
++        while arrive.fullmatch(lines[j]):
++            j -= 1
++        fenced.append(lines[j] == "tl::fence_proxy_async();")
++    return fenced
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_ws_generic_stage_reads_fence_before_release():
++    kernel = _compile(exp_sum, {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
++    src = kernel.get_kernel_source()
++    assert "if (((int)threadIdx.x) < 128)" in src, "expected warp specialization"
++    assert all(_consumer_releases_fenced(src)), src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_ws_mma_sync_stage_reads_fence_before_release():
++    # Without wgmma the GEMM reads the stage with ldmatrix (generic proxy).
++    kernel = _compile(matmul(512, 512, 512, 128, 128, 64, 3), {tilelang.PassConfigKey.TL_DISABLE_WGMMA: True}, out_idx=[2])
++    src = kernel.get_kernel_source()
++    assert "wgmma" not in src
++    assert all(_consumer_releases_fenced(src)), src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_ws_wgmma_only_consumer_has_no_release_fence():
++    kernel = _compile(matmul(512, 512, 512, 128, 128, 64, 3), out_idx=[2])
++    src = kernel.get_kernel_source()
++    assert "wgmma" in src
++    assert not any(_consumer_releases_fenced(src)), src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_ws_wgmma_with_nested_stage_read_fences_release():
++    # The wgmma operands are async-proxy reads, but `clear_accum` reads the
++    # stage through the generic proxy.
++    kernel = _compile(matmul(512, 512, 512, 128, 128, 64, 3, clear_from_stage=True), out_idx=[2])
++    src = kernel.get_kernel_source()
++    assert "wgmma" in src
++    assert all(_consumer_releases_fenced(src)), src
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(9, 0)
++def test_ws_generic_stage_reads_fast_math_correctness():
++    import torch
++
++    kernel = _compile(exp_sum, {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
++    g = torch.Generator(device="cuda").manual_seed(0)
++    X = torch.randn(N, C, device="cuda", generator=g) * 20
++    R = (torch.rand(N, C, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
++    arg = X.double() * R.double() / ROW_SCALE
++    M = arg.max(0).values.float().contiguous()
++    ref = torch.exp(arg - M.double()[None, :]).reshape(N // 256, 256, C).sum(1)
++    for _ in range(5):
++        P = torch.full((N // 256, C), float("nan"), device="cuda")
++        kernel(X, R, M, P)
++        torch.testing.assert_close(P.double(), ref, rtol=1e-3, atol=1e-3)
++
++
++if __name__ == "__main__":
++    tilelang.testing.main()

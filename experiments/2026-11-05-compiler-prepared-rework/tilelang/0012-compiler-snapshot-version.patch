@@ -1,0 +1,40 @@
+From a470d5daf8529fcf2b661f1119c8f4bb1aecc5e2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:17:59 +0100
+Subject: [PATCH] Namespace the corrected compiler snapshot by source version
+
+Upstream base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+with the ten unchanged compiler patches and explicit-preparation correction.
+Pre-metadata head: 2eb3e70abcb3ba523ef2d77549fb14646b704196
+Pre-metadata tree: 35f15411cf3af0fc06a1cb0097215b1372a40464
+
+Rationale: this compiler must not share the plain0.1.15 persistent cache
+identity with older source snapshots. The full immutable pre-metadata tree
+is encoded through the existing VERSION/package/cache-key mechanism; no
+circular final-tree hash or discovery of an unrelated native library.
+
+Quality: VERSION is the sole source delta in this patch. Algorithms, kernel
+outputs and numerical contracts are unchanged. Preserve old namespaces.
+Before first gate and first serving use on every rank, verify the new actual
+host namespace is absent, then actual module/distribution/pin/base-key
+version and namespace agree. Import and loaded-library hashes remain required.
+
+Tests: reviewed NO_VERSION_LABEL=1 provider/PEP440/CMake/backend mechanism;
+new literal provider/wheel/cache-key checks remain source-only. Full Linux
+wheel/image and every first native gate remain mandatory. No performance
+claim or repeated qualification of C42/C44 is implied.
+
+Upstream status: local source/provenance correction; not submitted.
+---
+ VERSION | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/VERSION b/VERSION
+index c34958a4..ca7eea59 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.1.15
++0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464
+-- 
+2.54.0 (Apple Git-157)
