@@ -26,10 +26,10 @@ class Workspace:
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--inputs',type=Path,required=True);p.add_argument('--replay-receipt',type=Path,required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--inputs',type=Path,required=True);p.add_argument('--replay-receipt',type=Path,required=True);p.add_argument('--approximate-source-prefill',action='store_true');args=p.parse_args()
     sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest();replay=json.loads(args.replay_receipt.read_text());assert replay['passed']
-    os.environ['VLLM_DS41_PAGE_NATIVE_DECODE']='1';os.environ['VLLM_DS41_PAGE_NATIVE_SOURCE']='1'
-    report={'passed':False,'performance_measured':False,'model_quality_tested':False,'scope':'captured prefill operands test graph dispatch correctness; not decode-query or request performance evidence','cases':[]}
+    os.environ['VLLM_DS41_PAGE_NATIVE_DECODE']='1';os.environ['VLLM_DS41_PAGE_NATIVE_SOURCE']='0' if args.approximate_source_prefill else '1'
+    report={'passed':False,'performance_measured':False,'model_quality_tested':False,'approximate_source_prefill':args.approximate_source_prefill,'scope':'captured prefill operands test graph dispatch correctness; not decode-query or request performance evidence','cases':[]}
     paths=sorted(args.inputs.glob('*-rank-0-*.pt'));assert len(paths)==12
     torch.cuda.reset_peak_memory_stats()
     for path in paths:
@@ -43,16 +43,17 @@ def main():
             table=torch.zeros(rows,width//page,dtype=torch.int32,device='cuda');n=min(table.shape[1],data['table'].shape[1]);table[:,:n].copy_(data['table'][:rows,:n])
             lengths,active=data['lengths'][:rows].cuda(),data['active'].cuda();saved_lengths=lengths.clone();saved_active=active.clone()
             native=IndexerV41Plan(width,page,candidate_blocks=source)
-            prefill=native if source else CompactShortlistPlan(width,page,row_cap=256)
+            sparse_prefill=not source or args.approximate_source_prefill
+            prefill=CompactShortlistPlan(width,page,candidate_blocks=source,row_cap=256) if sparse_prefill else native
             workspace=Workspace([native,prefill],rows);dispatch=method(Path('/tmp/phase_attention.py'),workspace)
-            plans=types.SimpleNamespace(index={'decode':prefill,'prefill':prefill},native_index={} if source else {'decode':native,'prefill':native})
+            plans=types.SimpleNamespace(index={'decode':prefill,'prefill':prefill},native_index={'decode':native,'prefill':native} if sparse_prefill else {})
             layer=types.SimpleNamespace(_tilelang=lambda:plans,indexer=types.SimpleNamespace(k_cache=types.SimpleNamespace(kv_cache=pool)),_active=active)
             for mode in ('decode','prefill'):
                 out=torch.empty(rows,512,dtype=torch.int32,device='cuda');blocks=torch.empty(rows,CANDIDATE_BLOCKS,dtype=torch.int32,device='cuda');count=torch.empty(rows,dtype=torch.int32,device='cuda')
                 def call():
                     dispatch(layer,mode,rows,output_indices=out,q_mxfp4=q,q_scales=s,query_weights=w,page_table=table,cache_lengths=lengths,candidate_output=blocks if source else None,candidate_output_lengths=count if source else None)
                 graph=graph_of(call)
-                teacher=native if mode=='decode' or source else prefill
+                teacher=native if mode=='decode' else prefill
                 expected=torch.empty_like(out);expected_blocks=torch.empty_like(blocks);expected_count=torch.empty_like(count)
                 scratch=[torch.empty(shape,dtype=dtype,device='cuda') for shape,dtype in teacher.scratch_specs(rows)]
                 options={'candidate_out':expected_blocks,'candidate_out_lengths':expected_count} if source else {}
@@ -64,7 +65,7 @@ def main():
                     torch.testing.assert_close(out,expected,atol=0,rtol=0)
                     if source:
                         torch.testing.assert_close(blocks,expected_blocks,atol=0,rtol=0);torch.testing.assert_close(count,expected_count,atol=0,rtol=0)
-                report['cases'].append({'file':path.name,'sha256':sha(path),'rows':rows,'source':source,'mode':mode,'native_selected':mode=='decode' or source,'exact_expected_outputs':True,'empty_and_restored_replays':True})
+                report['cases'].append({'file':path.name,'sha256':sha(path),'rows':rows,'source':source,'mode':mode,'native_selected':mode=='decode' or not sparse_prefill,'exact_expected_outputs':True,'empty_and_restored_replays':True})
                 del graph,call
         print('CASE '+json.dumps({'file':path.name,'completed_routes':6}),flush=True)
     assert len(report['cases'])==72;report['passed']=True

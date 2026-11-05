@@ -1,0 +1,1 @@
+Remote preparation stopped on an incorrect revision-versus-patch-head assertion before source mutation, publication or GPU work. Dispatch and doctor passed. All setup failures are retained. Retry checks the immutable prepared tree at the recorded patch head.

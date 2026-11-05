@@ -39,3 +39,13 @@ compute processes. The model recipe remains unqualified and unpromoted.
 With PyTorch memory caching disabled for strict checking, its allocator counters
 are zero/unavailable. They are not a measured zero-memory peak or an admission
 claim; full serving memory qualification remains required.
+
+A separately declared interaction setting, `approximate-source-tp4.json`, changes
+only source-prefill selection relative to this recipe: compact source prefill,
+with native source generation still enforced by the phase dispatch. This tests
+whether the faster source-prefill path can coexist with native generation's
+answer quality. It does not reuse the rejected all-phase source approximation
+as a qualified model result. The graph checker has an explicit optional mode
+for this route; both dense and source prefill must match their compact plans,
+and every generation route must match native, including source handoff. No
+model result, quality recovery or speed win is assumed for this interaction.
