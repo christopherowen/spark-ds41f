@@ -242,3 +242,22 @@ one unused fixture variable and one long fixture line); other checks pass.
 The first activity attempt stopped before any workload at an outdated operation
 assertion in the driver. `activity` is now admitted by that assertion as well as
 both argument parsers. The raw failed receipt will be archived.
+
+## Native TP1 embedding IDs
+
+Both single-rank drafting boots pass all 53 focused tests; their full model
+trace preserves the dummy request's token IDs and logprob bits. Call origins
+pin the remaining request clamps/casts to `VocabParallelEmbedding.forward`,
+which normalized IDs even when its TileLang method could read their native type.
+`0016` folds negative-ID normalization into the TP1 lookup. It also gives plain
+TP1 tables a TileLang lookup, supports flat native strides, and keeps parallel
+non-clamping specializations. Other quantization methods retain their existing
+preprocessing. Thirty-six new public eager/graph cases cover both table forms,
+both ID widths and empty/shifted/strided/matrix IDs. New GPU checks are pending.
+
+`embedding_bench.py` compares the actual public forward calls against the exact
+previous method for 32 cases: plain/packed BF16 tables, int32/int64 IDs, 1/8/96/4096
+rows and strides 1/2. It retains cold paired samples, inventories, input hashes
+and both parallel-specialization CUDA sources, so unchanged-path identity can
+be checked without assuming it. The fresh 601-patch source tree matches
+`155dbd0d578b2f1fb08729abcc945707f82d94ff`.
