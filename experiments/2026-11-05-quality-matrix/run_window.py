@@ -14,6 +14,7 @@ import uuid
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[1]
+sys.path.insert(0,str(ROOT))
 spec=importlib.util.spec_from_file_location('matrix_window',HERE.parent/'2026-11-04-clustered-indexer/serving/run_window.py')
 w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
 w.REL=str(HERE.relative_to(ROOT));w.NODES=['10.30.0.'+str(i) for i in range(9,13)]

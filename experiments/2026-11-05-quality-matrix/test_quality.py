@@ -4,6 +4,8 @@ import copy
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 from check_quality import canonical_check,check
@@ -32,6 +34,14 @@ class GateTests(unittest.TestCase):
         row.update(correct=False,status='truncated',finish_reason='length')
         self.assertFalse(controller.early_result(changed,changed,'lsa-a','longbench')['passed'])
         self.assertFalse(controller.quality_result(changed,changed,'longbench')['passed'])
+
+    def test_profile_preflight_imports_in_standalone_controller(self):
+        script=Path(__file__).with_name('run_window.py').resolve()
+        code=('import sys,runpy,pathlib;sys.path.insert(0,'+repr(str(script.parent))+');'
+              'module=runpy.run_path('+repr(str(script))+');'
+              'assert module["validate_environment_profile"](pathlib.Path("experiments/2026-11-05-native-source/tp4.json"))["VLLM_DS41_PAGE_NATIVE_SOURCE"]=="1"')
+        with tempfile.TemporaryDirectory() as folder:
+            subprocess.run([sys.executable,'-I','-c',code],cwd=folder,check=True,capture_output=True,text=True)
 
     def test_environment_override_must_resolve_before_a_window(self):
         spec=importlib.util.spec_from_file_location('matrix_environment',Path(__file__).with_name('run_window.py'))

@@ -45,3 +45,13 @@ and script identity and returns only PIDs. The end-of-arm gate already rejected
 the earlier genuine retrieval score loss; no score or quality rule changes.
 The failed attempt and independent restoration are retained under
 `../2026-11-05-quality-matrix/runs/native-source-ruler-screen-window-01`.
+
+The second attempt (`e851df79`) stops in the new CPU preflight before creating
+an output directory, taking a lease or changing serving: the standalone
+controller's import path lacks the repository package. Local in-process tests
+had inherited the test runner's root path. The controller now explicitly adds its
+repository root; a subprocess test starts in an unrelated temporary directory
+with an isolated Python import path and exercises the actual corrected profile.
+The original preflight traceback and launch receipt remain in
+`../2026-11-05-quality-matrix/runs/native-source-ruler-screen-window-02`.
+No GPU or model result is claimed for this attempt.
