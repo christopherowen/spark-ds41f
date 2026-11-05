@@ -307,4 +307,3 @@ def indexer_score_v41(
             )
 
     return indexer_score
-
