@@ -12,10 +12,12 @@ from vllm.models.deepseek_v4_1.tilelang.block_shortlist import summarize_blocks
 from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerTopK,IndexerV41Plan,indexer_score_v41,write_index_keys
 
 
-def coverage(selected,expected,width):
+def coverage(selected,expected,width,lengths,active,page):
     mask=torch.zeros(len(selected),width,dtype=torch.bool,device='cuda')
     mask.scatter_(1,selected.long(),True)
-    return mask.gather(1,(expected//8).long()).float().mean().item()
+    extent=torch.minimum(lengths,active[0])
+    always_keep=(expected>=((extent//page)*page)[:,None]) | (expected//8==((extent-1)//8)[:,None])
+    return (mask.gather(1,(expected//8).long()) | always_keep).float().mean().item()
 
 
 def main():
@@ -87,8 +89,8 @@ def main():
             row={'file':path.name,'sha256':sha(path),'rows':rows,'source':source,'page':page,
                  'visible_range':[int(lengths.min()),int(lengths.max())],
                  'quantized_mean_oracle_bits_equal':exact,'score_bit_differences':differences,
-                 'bf16_native_top512_coverage':coverage(selected['bf16'],expected,n),
-                 'fp4_native_top512_coverage':coverage(selected['fp4'],expected,n),
+                 'bf16_native_top512_coverage':coverage(selected['bf16'],expected,n,lengths,active,page),
+                 'fp4_native_top512_coverage':coverage(selected['fp4'],expected,n,lengths,active,page),
                  'bf16_before':before,'fp4':new,'bf16_after':after,
                  'bf16_over_fp4':statistics.median(before['samples_ms']+after['samples_ms'])/new['median_ms']}
             result['cases'].append(row);args.out.write_text(json.dumps(result,indent=2)+'\n')
