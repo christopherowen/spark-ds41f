@@ -76,3 +76,14 @@ python3 experiments/2026-11-05-answer-quality/run_window.py \
   --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877 \
   --split pilot
 ```
+
+
+The next predeclared operating-point probe changes only source/reindex candidate
+selection back to native (`native-source-fast.json`), keeping dense budget 64
+and row capacity 256 unchanged. This tests whether the source selection shared by
+later layers accounts for quality differences or query overhead. It will use the
+same pilot; the held-out set remains unseen. No favorable result is assumed.
+`--candidate-config` names the committed profile. `--controls-from` may reuse
+published native receipts only on the same UTC day, for the identical split,
+source lock, native recipe, mounted kernels and benchmark clients; otherwise it
+refuses and requires fresh controls. Two fresh candidate boots remain required.

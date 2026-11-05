@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--cache',type=Path)
     parser.add_argument('--split',choices=['pilot','heldout'],default='pilot')
+    parser.add_argument('--candidate-config',default=PROFILE_ROOT+'/aggressive-fast.json')
+    parser.add_argument('--controls-from',type=Path,help='published same-day native receipts with identical model and client inputs')
     parser.add_argument('--watchdog')
     parser.add_argument('--preflight-only',action='store_true')
     args = parser.parse_args()
@@ -45,6 +47,42 @@ def main():
     commit = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     assert not subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()
     assert subprocess.check_output(['git','branch','-r','--contains',commit],cwd=ROOT,text=True).strip()
+    candidate = Path(args.candidate_config)
+    assert not candidate.is_absolute() and '..' not in candidate.parts and (ROOT/candidate).is_file()
+    if args.controls_from:
+        import datetime
+        import hashlib
+        reference = (ROOT/args.controls_from).resolve()
+        relative = reference.relative_to(ROOT)
+        subprocess.run(['git','cat-file','-e','HEAD:'+str(relative/'restored.json')],cwd=ROOT,check=True)
+        restored = json.loads((reference/'restored.json').read_text())
+        assert restored['restored'] and restored['holds_removed']
+        recorded = json.loads((reference/'source.json').read_text())
+        assert recorded['split'] == args.split and recorded['sources_lock'] == LOCK
+        unchanged = ['config/cluster.json',
+            'experiments/2026-11-04-token-lsa/paged/control.json',
+            'experiments/2026-11-04-clustered-indexer/serving/restore.json',
+            'experiments/2026-11-04-clustered-indexer/replay/overlay/indexer.py',
+            'experiments/2026-11-04-token-lsa/bundle/overlay/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py',
+            'experiments/2026-11-05-answer-quality/evaluate.py',
+            'experiments/2026-11-05-answer-quality/measure.py',
+            'experiments/2026-11-05-answer-quality/prepare.py']
+        unchanged += [str(p.relative_to(ROOT)) for p in (ROOT/PROFILE_ROOT/'overlay').glob('*.py')]
+        for name in unchanged:
+            old = subprocess.check_output(['git','show',recorded['commit']+':'+name],cwd=ROOT)
+            assert old == (ROOT/name).read_bytes(), name+' changed; fresh native controls required'
+        refs = {}
+        for label in ('native-a','native-b'):
+            receipt = json.loads((reference/('benchmark-'+label+'-exit.json')).read_text())
+            assert receipt['exit'] == 0 and receipt['started_at'][:10] == datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            answer = json.loads((reference/('answers-'+label+'.json')).read_text())
+            assert answer['complete'] and answer['selection_sha256'] == LOCK['selection_sha256']
+            for suffix in ('.json','-conditions.json'):
+                name = 'answers-'+label+suffix
+                raw = (reference/name).read_bytes()
+                (out/name).write_bytes(raw)
+                refs[name] = hashlib.sha256(raw).hexdigest()
+        (out/'reference-controls.json').write_text(json.dumps({'source':str(relative),'files':refs},indent=2)+'\n')
     (out/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
     (out/'source.json').write_text(json.dumps({'commit':commit,'split':args.split,'sources_lock':json.loads((HERE/'sources.lock.json').read_text())},indent=2)+'\n')
     w.run([sys.executable,str(source),'--out',str(out/'preflight'),'--preflight-only'],out,'preflight')
@@ -95,16 +133,24 @@ def main():
         assert w.owns(token) and not errors
         w.run(w.spark('control','cluster','sync','--revision',commit),out,'sync-plan')
         w.run(w.spark('control','cluster','sync','--revision',commit,'--apply'),out,'sync-apply')
-        jobs = [('native-a','control'),('lsa-a','aggressive-fast'),('lsa-b','aggressive-fast'),('native-b','control')]
-        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'split':args.split,'rule':'independent final-answer grading; no native output oracle'},indent=2)+'\n')
-        completed = []
+        jobs = [('native-a','control'),('lsa-a',candidate.stem),('lsa-b',candidate.stem),('native-b','control')]
+        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'candidate_config':str(candidate),'controls_from':str(args.controls_from) if args.controls_from else None,'split':args.split,'rule':'independent final-answer grading; no native output oracle'},indent=2)+'\n')
+        completed = ['native-a','native-b'] if args.controls_from else []
         for label,profile in jobs:
+            if args.controls_from and label.startswith('native-'):
+                continue
             assert w.owns(token) and not errors
             holds = w.each(w.HOLD_CODE,{'action':'read'})
             assert not any(h['spark-request.json'] or h['spark3-request.json'] for h in holds.values()),'pending requester'
-            w.start(profile,out,'boot-'+label)
+            previous = w.REL
+            config = candidate if label.startswith('lsa-') else Path(PROFILE_ROOT)/'control.json'
+            try:
+                w.REL = str(config.parent)
+                w.start(config.stem,out,'boot-'+label)
+            finally:
+                w.REL = previous
             private = Path.home()/'spark-lab/private/answer-quality'/out.name/label
-            w.run([sys.executable,str(HERE/'measure.py'),'--profile',PROFILE_ROOT+'/'+profile+'.json',
+            w.run([sys.executable,str(HERE/'measure.py'),'--profile',str(config),
                    '--cache',str(args.cache),'--split',args.split,'--private',str(private),
                    '--out',str(out/('answers-'+label+'.json'))],out,'benchmark-'+label)
             completed.append(label)
