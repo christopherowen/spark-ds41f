@@ -100,6 +100,26 @@ class OwnedContainerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(gate.subprocess, "run", return_value=self.state("foreign")) as run:
             with self.assertRaisesRegex(RuntimeError, "cannot reach or validate"):
                 gate.cleanup_owned_container(Path(directory), "image-id", "owned", "gate-name")
+            self.assertEqual(run.call_count, 1)
+
+    def test_empty_or_partial_cidfile_checks_owned_name_before_claiming_absence(self):
+        for value in ("", "incomplete"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                boot = Path(directory)
+                (boot / "container.cid").write_text(value)
+                with mock.patch.object(gate.subprocess, "run", side_effect=[self.state(),
+                                       subprocess.CompletedProcess([], 0, "removed", "")]) as run:
+                    gate.cleanup_owned_container(boot, "image-id", "owned", "gate-name")
+                self.assertEqual(run.call_args_list[0].args[0], ["docker", "inspect", "gate-name"])
+                self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "container-id"])
+
+    def test_failed_removal_or_malformed_inspection_requires_review(self):
+        for values in ([self.state(), subprocess.CompletedProcess([], 1, "", "daemon lost")],
+                       [subprocess.CompletedProcess([], 0, "not-json", "")]):
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(gate.subprocess, "run", side_effect=values), \
+                    self.assertRaisesRegex(RuntimeError, "cannot reach or validate"):
+                gate.cleanup_owned_container(Path(directory), "image-id", "owned", "gate-name")
 
 
 class TestInputIsolationTests(unittest.TestCase):
@@ -125,26 +145,7 @@ class TestInputIsolationTests(unittest.TestCase):
                 for key in list(sys.modules):
                     if key == "examples" or key.startswith("examples."): del sys.modules[key]
                 sys.modules.update(previous)
-            self.assertEqual(run.call_count, 1)
 
-    def test_empty_or_partial_cidfile_checks_owned_name_before_claiming_absence(self):
-        for value in ("", "incomplete"):
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
-                boot = Path(directory)
-                (boot / "container.cid").write_text(value)
-                with mock.patch.object(gate.subprocess, "run", side_effect=[self.state(),
-                                       subprocess.CompletedProcess([], 0, "removed", "")]) as run:
-                    gate.cleanup_owned_container(boot, "image-id", "owned", "gate-name")
-                self.assertEqual(run.call_args_list[0].args[0], ["docker", "inspect", "gate-name"])
-                self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "container-id"])
-
-    def test_failed_removal_or_malformed_inspection_requires_review(self):
-        for values in ([self.state(), subprocess.CompletedProcess([], 1, "", "daemon lost")],
-                       [subprocess.CompletedProcess([], 0, "not-json", "")]):
-            with self.subTest(values=values), tempfile.TemporaryDirectory() as directory, \
-                    mock.patch.object(gate.subprocess, "run", side_effect=values), \
-                    self.assertRaisesRegex(RuntimeError, "cannot reach or validate"):
-                gate.cleanup_owned_container(Path(directory), "image-id", "owned", "gate-name")
 
 
 if __name__ == "__main__":

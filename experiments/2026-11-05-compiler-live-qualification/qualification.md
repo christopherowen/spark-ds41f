@@ -37,3 +37,9 @@ semantic audits. Compare1030,C36,both saved C40 boots, both C39 and both C38
 recipes, retaining all pairings and missing-data limits. No promotion or bypass
 of outstanding TP4 release gates is implied. The recurring schedule remains
 paused; direct waiting continues here.
+
+The first control-packet publication incorrectly claimed18 passing checks after
+a test-class grouping error. Original failure is preserved in preflight receipts.
+The grouping was corrected, then all18 checks independently passed before any
+image, GPU, reservation or serving operation. Runtime/compiler source was not
+changed by this test setup correction.
