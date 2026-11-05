@@ -15,11 +15,15 @@ raw pointer copy is added. CPU NumPy consumers already support these strides.
 
 The tradeoff is extra transferred hole bytes, recorded per case by the complete
 host-call/stream-wait benchmark. It must pass on both boots; a compute-only
-measurement cannot qualify it. Fifty tests exercise two ID widths, shifted
+measurement cannot qualify it. Twenty-six tests exercise two ID widths, shifted
 storage offsets, empty/single/multiple rows, strides through 33, adaptive request
 boundaries and a side-stream lifetime. Wire inventories check the actual public
 score-to-CPU path in both score modes, layouts, widths and alternative counts.
-Final qualification is pending.
+Both boots pass all 26 transfer cases inside the 1,266-case combined suite.
+All 12 changed-path complete transfer cases pass the strict five-standard-error,
+zero-margin gate in both boots (mean about 11–16% faster). All 16 public-path
+inventories contain no ATen packing kernel on either boot. Dense common-path
+host overhead and full serving remain separate checks.
 
 Raw evidence, exact commands, sources, memory observations and both initial and
 fixed inventories are retained in `experiments/2026-11-05-tilelang-runtime-closure`
