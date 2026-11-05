@@ -119,7 +119,7 @@ def main():
     thread.start()
     env = {
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "VLLM_PLUGINS": "",
-        "DO_NOT_TRACK": "1", "VLLM_NO_USAGE_STATS": "1", "MAX_JOBS": "4",
+        "DO_NOT_TRACK": "1", "VLLM_NO_USAGE_STATS": "1", "MAX_JOBS": "2",
         "VLLM_USE_V2_MODEL_RUNNER": "1", "VLLM_DS41_HEAD_DTYPE": "float32",
         "VLLM_DS41_PACKED_BF16_LM_HEAD": "1", "VLLM_L2_PREFETCH_KERNELS": "tilelang",
         "VLLM_L2_PREFETCH_GRID": "2", "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2",
@@ -127,7 +127,7 @@ def main():
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
         "VLLM_USE_BREAKABLE_CUDAGRAPH": "0", "VLLM_LATE_ADMISSION_LAYER": "30",
         "CUDA_DEVICE_MAX_CONNECTIONS": "32", "MALLOC_ARENA_MAX": "2",
-        "MALLOC_MMAP_THRESHOLD_": "1048576", "OMP_NUM_THREADS": "8",
+        "MALLOC_MMAP_THRESHOLD_": "1048576", "OMP_NUM_THREADS": "2",
         "SAFETENSORS_FAST_GPU": "1", "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
         "VLLM_ENGINE_READY_TIMEOUT_S": "1800", "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "900",
         "PYTHONPATH": "/b/harness:/b/scripts:/opt/spark-ds41f/candidate/vllm",
@@ -178,7 +178,7 @@ def main():
             memory = os.environ.get("IKET_MEMORY_GB", "100") + "g"
             argv = ["docker", "run", "--rm", "--name", CONTAINER, "--gpus", "all", "--ipc=host",
                     "--memory=" + memory, "--memory-swap=" + memory, "--ulimit=core=0",
-                    "--cpuset-cpus=5-9,15-19", "-v", f"{HARNESS}:/b:ro", "-v", f"{REPO}:/r:ro",
+                    "--cpuset-cpus=5-6,15-16", "-v", f"{HARNESS}:/b:ro", "-v", f"{REPO}:/r:ro",
                     "-v", f"{HOME_DIR / '.cache/huggingface'}:/hf:ro",
                     "-v", f"{OUT}:/out", "-v", f"{CACHE}:/c"]
             if mode == "nsys":

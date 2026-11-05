@@ -304,3 +304,13 @@ start/end durations. Both clocks now describe the same original graph workload.
 This preserves the cache-flush/copy alternation and avoids treating GPU start
 order as capture order when independent graph nodes can overlap. Complete fresh
 two-boot runs are required; the partial run is not promoted to a final result.
+
+## Recovery and resource limits
+
+After the workstation interruption, source preparation, compilation, tests,
+benchmarks and evidence processing run remotely on sp8. The Mac is limited to
+small edits and coordination. Controllers use four assigned CPU cores, two
+OpenMP threads, at most two build workers, and the existing memory guards.
+Published source and surviving results are reconciled before resuming; completed
+boots and immutable baselines are not rerun. Remote controllers are detached
+from the workstation connection so local interruptions cannot cancel them.
