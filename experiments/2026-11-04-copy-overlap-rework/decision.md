@@ -34,8 +34,18 @@ baseline. Do not infer performance equivalence for unrecorded workloads. Existin
 references also lack actual ITL tails, timed KV occupancy and raw cache hit/miss
 counts; TPOT must remain distinct from ITL.
 
-No image, GPU, serving or node-source work for C41 has started. Source review and
-canonical preparation are in progress. Shared reservations, clean published
-same-commit checkouts, named plans, guards and independently verified C36
-restoration remain mandatory. No release promotion or bypass of TP4 gates is
-implied. The recurring schedule remains paused at the owner's request.
+Source review and canonical preparation completed before qualification. Attempt
+1 at frozen execution commit `0da35cc9668ff491065446b2a842fe996a73e80f` passed all
+eight native image gates, including 8,075 tests and strict actual-source top-k
+initialization checking. It then safely yielded for the shared queue before any
+serving work. Preserve its scheduling error and actual exit 1; this is not a
+measured candidate failure. Independent all-rank C36 restoration checks passed.
+The unchanged image can resume only after full local gate-evidence review and
+fresh shared-capacity/source checks, using a distinct attempt. No C41 serving
+performance verdict is available. See [qualification.md](qualification.md) and
+the retained original receipts for execution state.
+
+Shared reservations, clean published same-commit checkouts, named plans, guards
+and independently verified C36 restoration remain mandatory. No release
+promotion or bypass of TP4 gates is implied. The recurring schedule remains
+paused at the owner's request.

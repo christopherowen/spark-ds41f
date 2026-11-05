@@ -11,7 +11,11 @@ C41 source is the exact C40 series plus one standalone follow-on patch:
 - vLLM head: `38ade7f947cb09c550c2bce077286e467c7fed8d`.
 - Tree: `df6b6bc6841c1126b37be652c0e93c13debb8f42`.
 - Ordered patchset: `3c6e010aab24a6de5c2c543e7c3fbc69abb491e552f3b15bd7b82c36137dd7ef`, 575 patches.
-- Actual image digest: unknown until the new image passes its gates.
+- Native qualified image digest: `sha256:38ff08bb1eb2495cb934e008b6f31a482aaa238c08b959aaf72cf2cb5658d29c`.
+  All eight native image gates passed. Independent local audit verified all 30
+  original builder artifacts, exact 136-file coverage, 14 XML reports and both
+  changed GPU regressions. The initialization log binds the actual native
+  source path/hash and zero errors, with no source overlay.
 
 Fresh canonical replay and the repository's independent `build prepare --only
 vllm` reproduce the head/tree. All 19 source-review artifact hashes verify.
@@ -66,9 +70,30 @@ The matching request was fulfilled and guarded source staging closed with all
 four checkouts clean at the frozen published execution commit, without a C36
 restart. The sole attempt-1 controller launched on 2026-11-05 at 06:29:27 UTC,
 opening window `dgx1-1793860208` at 06:30:08 UTC. A fresh compact source recheck
-confirmed all four checkouts still match. Image/gates are active; no serving
-performance result is available. Actual image digest remains unknown. Native
-outputs and launch/real-wait-exit receipts must be preserved.
+confirmed all four checkouts still match. The eight image gates finished at
+07:17:01 UTC: 8,075 tests passed, 360 skipped, and strict actual-source top-k
+initialization checking reported zero errors. The controller then honored the
+queued lossless-memory request before seeding or any serving phase. Its original
+`RuntimeError: window changed or closure requested`, restored=true and actual
+wait exit 1 at 07:17:20 UTC are preserved as scheduling history, not a measured
+candidate failure. Both original processes are absent.
+
+The independent named live doctor exited zero and all three original C36
+containers remained running at the expected image/profile with restart count
+zero at 07:18:53 UTC. Eleven portable head-side artifacts were downloaded and
+hashed locally under `runs/2026-11-05-dgx/attempt-1/handoff`; original logs remain
+private and their hashes are published. The tested resume validator accepts the
+exact original handoff and image receipts. Full original builder evidence and
+actual DGX4 image identity passed the separate local audit before resume.
+
+The foreign short window is `dgx1-1793863306`. Its original request was left
+untouched; after it acquired its own window and fulfilled that request, our
+return request was atomically queued at 07:22:10 UTC. Do not stage or launch
+under that foreign window. Once it releases, re-read actual holds/requests,
+fulfill only the exact matching return request, verify clean source/restoration
+and stage the frozen published execution commit if needed. Resume with attempt
+2 and the original completed gate; never rebuild, re-gate or repeat a serving
+point. No C41 functional or performance measurement has started.
 
 An earlier operator command failed local Python parsing before any SSH/native
 controller action; absence checks and the original error record are retained.
