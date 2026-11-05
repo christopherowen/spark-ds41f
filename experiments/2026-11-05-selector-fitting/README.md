@@ -116,3 +116,14 @@ These synthetic construction results establish no request gain or quality gain.
 The map has not been fitted and is not integrated into serving. Its extra work
 would need to earn back cost through improved retained-key quality or a cheaper
 query operating point. Every standalone container and reservation is removed.
+
+`metric/validate_retention.py` prepares the next untimed selection check. After
+all actual rank-0 captures replay natively and `fit_metric.py` fits on the two
+training documents, it compares original versus projected grouping on only the
+separate validation document. Both use dense budget64/source budget512 and the
+same native fine scorer. It measures overlap with native top512 keys and source
+handoff blocks, refusing padding/unsorted IDs as matches. Per-query values are
+reported, with independent document count one; replicated ranks and adjacent
+rows do not inflate N. Compact-address proxy execution has no timing claim and
+does not replace native geometry replay or completed-answer evaluation. No
+actual retention result is available before collection and fitting.
