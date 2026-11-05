@@ -45,3 +45,22 @@ The full build tree is unavailable locally; no image build is claimed. The model
 comparison uses actual Native68 with fresh controls. `native-source.json` is a
 predeclared quality fallback that keeps dense selection and restores native
 source/reindex handoff, with the same 100-byte layout and dense budget.
+
+
+The production-shaped version at `fd5958df` passes all 12 actual batches, strict
+initialization with zero errors and all six cache/graph/lifecycle cases. Two
+fresh processes reproduce dense8 1.35–1.39x, dense64 2.30x, source8 1.50x and
+source64 1.81x native component speed. Single-query cases remain slower. All
+samples, t intervals, commands and allocator observations remain in
+`runs/runtime-gates-01`. Release is 15:17:08 UTC with no containers; an independent
+reader subsequently sees no LSA lease or request.
+
+The first model window (`runs/pilot-window-01`, published source `ed3c1051`)
+boots Native68 successfully but the benchmark client stops before any request:
+its private output name collides with the historical 8192-token cohort's
+`pilot-window-01/native-a`. The previous data is untouched. All error/boot/restore
+receipts are retained. C37 is restored at 15:25:42 UTC and independently verified
+on all three nodes. The controller now derives the private path from the complete
+result namespace and checks absence during preflight, before opening a window.
+The retry uses a new result path. This is a client-path failure, not a quality
+or runtime result; no request-speed conclusion is drawn from the failed window.

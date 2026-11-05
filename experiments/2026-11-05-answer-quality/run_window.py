@@ -39,6 +39,8 @@ def main():
     if args.watchdog:
         return w.watchdog(args.watchdog,out)
     assert args.cache
+    private_root = Path.home()/'spark-lab/private/answer-quality'/out.relative_to(Path.home()/'spark-lab/results')
+    assert not private_root.exists(),'private output already exists; use a new complete result path'
     from prepare import LOCK,digest
     assert digest(args.cache/'selection.json') == LOCK['selection_sha256']
     selection = json.loads((args.cache/'selection.json').read_text())
@@ -160,7 +162,7 @@ def main():
                 w.start(config.stem,out,'boot-'+label)
             finally:
                 w.REL = previous
-            private = Path.home()/'spark-lab/private/answer-quality'/out.name/label
+            private = private_root/label
             w.run([sys.executable,str(HERE/'measure.py'),'--profile',str(config),
                    '--cache',str(args.cache),'--split',args.split,'--private',str(private),
                    '--out',str(out/('answers-'+label+'.json'))],out,'benchmark-'+label)
