@@ -45,3 +45,15 @@ one patch after the preceding nine; fresh application from the pinned C36 base
 equals both runtime overlays. The new candidate profiles are unpromoted and
 must requalify frozen-call binding, the same correctness/sanitizer/lifecycle
 fixtures and two fresh timing processes before any model evaluation.
+
+The exact integrated source `3ad74ef5` passes all62 declared calls across eight
+configurations after cache freeze, all39 adversarial cases under both
+sanitizers, all12 actual batches, four strict initialization fixtures and six
+lifecycle cases. Two fresh processes retain source ratios1.174x/1.783x/2.065x
+at rows1/8/64; the conditional joint95 intervals are[1.102,1.257],
+[1.736,1.832] and[1.905,2.227]. Dense single-query components remain slower.
+All samples, maintenance and memory observations are retained in
+`runs/runtime-gates-01`; the same limitations apply. The lease releases
+at20:56:32 UTC and independent verification finds no reservations, containers or
+compute processes. No request-speed or model-quality result is attributed to
+this integration, and no promotion follows.
