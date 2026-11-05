@@ -37,6 +37,7 @@ def main():
         return w.watchdog(args.watchdog,out)
     assert args.cache
     from prepare import LOCK,digest
+    assert digest(args.cache/'selection.json') == LOCK['selection_sha256']
     selection = json.loads((args.cache/'selection.json').read_text())
     assert selection['protocol'] == LOCK['protocol']
     assert digest(args.cache/(args.split+'-requests.jsonl')) == selection['artifact_sha256'][args.split+'-requests.jsonl']

@@ -67,6 +67,7 @@ def main():
     args = parser.parse_args()
     assert not args.out.exists()
     args.private.mkdir(mode=0o700,parents=True,exist_ok=False)
+    assert digest(args.cache/'selection.json') == LOCK['selection_sha256']
     selection = json.loads((args.cache/'selection.json').read_text())
     assert selection['protocol'] == LOCK['protocol'] and selection['dataset_sha256'] == LOCK['dataset']['sha256']
     path = args.cache/(args.split+'-requests.jsonl')

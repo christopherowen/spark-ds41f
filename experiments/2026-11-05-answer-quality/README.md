@@ -59,3 +59,20 @@ contexts per stratum, with at least one. Repeated questions from the same source
 context cannot cross pilot/held-out or inflate independent task counts. No GPU
 or serving operation occurred in those preparation attempts; both leases were
 released and both CPU containers removed.
+
+
+The frozen selection is 12 pilot and 45 held-out independent document contexts;
+`selection.json` and its SHA256 in the source lock are authoritative before any
+model evaluation. Successful CPU-only export is retained in
+`runs/prepare-longbench-03`. Input artifacts are SHA256-checked on the serving
+controller; the full dataset is not loaded beside the serving engine. The input
+preparation leases are released and no CPU containers remain.
+
+Exact pilot command from the published, clean sp5 controller checkout:
+
+```sh
+python3 experiments/2026-11-05-answer-quality/run_window.py \
+  --out /home/chris/spark-lab/results/answer-quality/pilot-window-01 \
+  --cache /home/chris/spark-lab/datasets/longbench-v2/ac35867b9c9436dc81c4c7535fe640ba7cf47877 \
+  --split pilot
+```
