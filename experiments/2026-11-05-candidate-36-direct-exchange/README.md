@@ -52,10 +52,44 @@ emitted a blank-line-at-EOF warning; the final upstream diff check in the
 locking pass passed. The remaining preparation and verification moved to DGX4
 at the owner's request; the failed local attempt is retained in `checks.json`.
 
-Full build contexts and wheel inputs are absent locally, so complete image
-`build check` and GPU tests are not run. No image is built or deployed.
+## DGX4 verification
+
+Published source commit: `27769d29dee779663e0e9495f07b4ea3d90a9e92`, checked out
+cleanly and detached in `/home/swank/projects/spark-ds41f-candidate-36-switched`.
+The main DGX checkout remained at `df50aa94efb5f7e897f9e1281a9e00c207dec762`.
+The isolated checkout uses DGX4's existing build cache and a node-local copy of
+its site map. Three setup attempts (missing map, unsupported command option,
+then a map symlink outside the checkout) are retained under `runs/`.
+
+[The successful run](runs/dgx4-verification.json) records:
+
+- all 559 patches prepared in 32.836 seconds, reproducing patch head
+  `74e6e1920b3d` and tree `bc7c9cd5e022`;
+- exactly #846's two serving files and two test modules differ from original
+  candidate-36; all four parse successfully;
+- all 17 source-lock and build tests pass (1.454 seconds);
+- the candidate doctor reports exactly the same two inherited errors;
+- `git diff --check` passes.
+
+The candidate has source inputs only; complete image build contexts were not
+prepared, so full image `build check` and GPU tests are not run. No image is
+built or deployed, and no serving operation is performed.
+
+## Local disk cleanup
+
+Removed 196 abandoned temporary Git pack files, reclaiming 71.21 GiB and
+leaving about 97 GiB free. Indexed temporary packs were removed only when all
+their objects were present in retained packs or loose objects. The cleanup
+preserved the working files, index, refs, worktrees and canonical packs;
+`git fsck --connectivity-only --no-dangling` passed. Exact inventory and hashes
+are in the local `.work/disk-cleanup-2026-11-05.json` receipt; `checks.json`
+retains the outcome summary.
+
+Disabled this local repository's automatic Git maintenance (`gc.auto=0`,
+`maintenance.auto=false`) to reduce the duplicate repack buildup. Previous
+values are recorded in the cleanup receipt.
 
 ## Conclusion
 
-#846 is added to candidate-36 under the existing name. Source validation is
-recorded here; the new image still needs building and hardware qualification.
+#846 is added to candidate-36 under the existing name. Source validation passed
+on DGX4; the updated image still needs building and hardware qualification.

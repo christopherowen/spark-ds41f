@@ -1,0 +1,76 @@
+{
+  "node": "dgx4",
+  "revision": "27769d29dee779663e0e9495f07b4ea3d90a9e92",
+  "started_at": "2026-11-05T19:35:36Z",
+  "checks": [
+    {
+      "name": "source-prepare",
+      "command": [
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp4.json",
+        "build",
+        "prepare",
+        "--only",
+        "vllm"
+      ],
+      "exit_code": 0,
+      "seconds": 32.836,
+      "output": "preparing .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-d769e577\n.git/rebase-apply/patch:422: new blank line at EOF.\n+\nwarning: 1 line adds whitespace errors.\nvllm: prepared 74e6e1920b3d (tree bc7c9cd5e022)\npartial preparation; run bin/spark build prepare for the complete inputs\n"
+    },
+    {
+      "name": "source-and-build-tests",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "tests.test_source_locks",
+        "tests.test_build"
+      ],
+      "exit_code": 0,
+      "seconds": 1.525,
+      "output": ".................\n----------------------------------------------------------------------\nRan 17 tests in 1.454s\n\nOK\n"
+    },
+    {
+      "name": "candidate-doctor",
+      "command": [
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp4.json",
+        "doctor"
+      ],
+      "exit_code": 1,
+      "seconds": 3.04,
+      "output": "ERROR: NCCL_IB_HCA is rendered from the node map and the transport; remove it from the environment\nERROR: cluster and upstream locks name different baselines\n"
+    },
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.005,
+      "output": ""
+    }
+  ],
+  "gpu_runs": [],
+  "serving_changes": [],
+  "source": {
+    "directory": "/home/swank/projects/spark-ds41f/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-d769e577/src/vllm",
+    "patch_head": "74e6e1920b3d5a2fd36769104a19e693f3ab4051",
+    "expected_tree": "bc7c9cd5e022969256a4465252113ab5af510340",
+    "changed_files": [
+      "tests/kernels/test_deepseek_v41_tilelang_collectives.py",
+      "tests/models/test_deepseek_v41_sp_project_reduce_scatter.py",
+      "vllm/distributed/device_communicators/pynccl.py",
+      "vllm/models/deepseek_v4_1/tilelang/collectives.py"
+    ],
+    "syntax_checked": true
+  },
+  "doctor_only_inherited_errors": true,
+  "complete_build_inputs_present": false,
+  "passed": true,
+  "finished_at": "2026-11-05T19:36:13Z"
+}

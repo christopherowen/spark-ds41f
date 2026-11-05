@@ -12,7 +12,9 @@ in #846's candidate-36 experiment.
 The patched build uses `spark-ds41f:candidate-36`, with its lock and source
 manifest in this directory. The original image and all original test receipts
 remain recorded in [the backport record](../../2026-11-05-candidate-36-direct-exchange/README.md).
-`results.json` records the current build's qualification status.
+DGX4 reproduced the complete patch stack and passed all 17 source-lock and build
+tests; its doctor reports the two inherited configuration errors documented in
+the backport record. `results.json` records the current build's qualification status.
 
 ## Historical candidate-34 kernel audit
 
