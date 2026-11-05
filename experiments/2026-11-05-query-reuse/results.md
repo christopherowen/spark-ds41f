@@ -29,6 +29,15 @@ superiority. Every final answer completes naturally at temperature0, seed0,
 high thinking and a 65536-token generation allowance. The hard quality checker
 also finds zero repeated-boot answer-decision instability.
 
+The three remaining LSA misses are completed but incorrect answers, reproduced
+on both boots. Native also misses all three. Their domains are code repository
+understanding (99829 server prompt tokens), structured data (16399) and
+single-document QA (211023). They use 2865, 120 and 3765 generated tokens,
+respectively, far below the shared 65536 allowance. Thus a higher token cap alone
+does not address these observed failures. A 12/12 score is a development target,
+not an established capability or a guarantee from faster attention. Improving
+these particular questions still requires confirmation on unseen documents.
+
 The speed improvement is uneven. Median request latency rises about 32.4%.
 On the long structured-data question, Native A takes 250.94s and 23999 generated
 tokens, while LSA A takes 165.84s and 13510 tokens; both answer correctly. Other
@@ -65,5 +74,20 @@ python3 experiments/2026-11-05-answer-quality/run_window.py \
   --candidate-config experiments/2026-11-05-query-reuse/full.json
 ```
 
-This pilot permits further evaluation only. Independent coding, longer-context,
-memory/admission and project performance-matrix gates remain outstanding.
+The confirmation attempt at source `e9eab460` stops during Native A: after 32
+serial-cold responses, the thermal guard reports sp7 at78C within4C of its
+slowdown limit and interrupts the client. This is a thermal stop, not an HTTP
+timeout or an LSA failure. Native has 20 correct responses and two 65536-token
+truncations at that point. No LSA confirmation request is sent. All partial
+results, temperatures, errors, exact commands and restoration receipts remain
+in `runs/heldout-window-01`; they do not qualify held-out quality or speed.
+C37 is restored at 18:42:38 UTC, and independent verification finds every rank
+clean with the exact restored image and no experimental state or reservations.
+The stock-cooled TP3 workload must not simply be repeated unchanged. A cooler,
+separately qualified topology needs its own matched measurement cohort.
+
+This pilot permits further evaluation only. The separate coding test records
+152/164 for both arms but fails the candidate completion gate on a repetition
+stop shared with Native; it is not a completed repeated-boot qualification.
+Held-out longer-context, memory/admission and project performance-matrix gates
+remain outstanding.

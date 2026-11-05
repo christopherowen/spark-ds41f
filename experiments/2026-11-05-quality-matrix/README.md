@@ -75,3 +75,23 @@ All 164 generated model programs still face the full official checker, including
 every `HumanEval/32` test. A model that solves that property more reliably can
 outscore the bundled reference. Earlier failure/restore evidence is retained in
 `runs/code-window-03`; C37 remains live and all leases are released.
+
+The fourth attempt (`a04214b3`) completes all 164 Native A and LSA A generations
+and both isolated grading jobs. Both score 152/164 against all official tests,
+with exactly the same failed task IDs and zero lost native-correct answers.
+Native has 162 natural completions; LSA has 163. Native reaches the 65536-token
+cap on `HumanEval/145`; LSA completes that task but its answer remains incorrect.
+Both stop for repetition on `HumanEval/64`, and both final programs are marked
+incomplete and incorrect. The strict candidate-completion gate rejects this run
+on that shared failure. It is not evidence of a newly introduced answer loss.
+
+Observed generation wall times are 1220.67 seconds (Native A) and 1052.83 seconds
+(LSA A), including thinking and unsuccessful responses. The coordinator restores
+without running LSA B or Native B, so these single-arm diagnostics do not qualify
+a speed improvement or a repeated-boot quality pass. Short coding prompts also
+mostly exercise the native covered-domain path; they do not establish sparse
+long-context quality. Every generation, grade, condition and rejection receipt
+is retained in `runs/code-window-04`; public receipts contain no program text.
+C37 is restored at 19:06:35 UTC. An independent reader verifies the exact image,
+clean equal serving revisions, no experimental mounts/environment and no holds
+or pending requests on all four nodes. No candidate is promoted.

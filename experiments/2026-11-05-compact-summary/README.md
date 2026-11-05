@@ -28,3 +28,19 @@ uses page128. Original logs, input/source identity and release remain retained
 in `runs/screen-01`. The probe now derives its tile from the native page geometry;
 neither captured operands nor outcome-independent selection changes. The retry
 uses a new result path and must still establish scorer feasibility.
+
+The geometry-corrected retry at `d1c923ce` passes in two fresh processes; all
+12 captured cases have zero score-bit differences against the independently
+decoded quantized-mean oracle. Single-row coarse scoring is 2.43–2.90x faster
+for dense inputs and 2.29–2.36x faster for source inputs than the BF16 scorer.
+The ratios are 1.70–1.81x / 1.45–1.48x at eight rows and 1.36–1.38x /
+1.23–1.25x at 64 rows (dense / source). Full samples, quantization construction
+costs and allocator observations remain in `runs/screen-02`.
+
+Quantization changes scores and selected keys: measured native-top512 coverage
+can fall by approximately 1.03 percentage points. This is a component feasibility
+pass, **not a serving implementation, request-speed result or answer-quality
+pass**. Integration must account for summary construction, layout/admission,
+initialization and cache/graph lifecycle before independently graded model tests.
+No runtime configuration changes. The sp8 lease is released at 18:37:46 UTC;
+the later independent read finds no remaining container, lease or request.
