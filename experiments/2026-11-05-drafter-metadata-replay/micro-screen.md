@@ -45,4 +45,10 @@ uv venv --python /usr/bin/python3 --system-site-packages /tmp/drafter-venv
 ```
 
 Boot 2 uses a new container, new cache and output path, and `--boot 2`.
+A final overlap probe queues a calibrated CUDA wait graph before each metadata
+step (short, medium and long waits), then compares the eager and query-graph paths.
+It challenges whether earlier GPU work hides the isolated host savings. It is a
+controlled overlap test, not a model execution or serving-throughput prediction.
+The six loaded runtime source files are hash-checked before measurement.
+
 No result is available at preparation time.

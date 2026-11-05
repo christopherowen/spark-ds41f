@@ -391,6 +391,53 @@ def main():
                 ),
                 flush=True,
             )
+    # Challenge the isolated gain: prior work on the same stream can hide host
+    # dispatch. This is a controlled overlap probe, not a model simulation.
+    methods, _ = fixture(8, 8, 8, 8192)
+    torch.cuda._sleep(1000)
+    result["overlap_probe"] = []
+    for cycles in (20000, 200000, 2000000):
+        head = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(head, stream=stream):
+            torch.cuda._sleep(cycles)
+        begin, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        begin.record()
+        for _ in range(32):
+            head.replay()
+        end.record()
+        end.synchronize()
+        head_us = begin.elapsed_time(end) * 1000 / 32
+        paired = []
+        for trial in range(args.trials):
+            row = {"trial": trial}
+            order = (
+                ("eager_full", "query_graph")
+                if trial % 2 == 0
+                else ("query_graph", "eager_full")
+            )
+            for arm in order:
+                torch.accelerator.synchronize()
+                started = time.perf_counter_ns()
+                for _ in range(32):
+                    head.replay()
+                    methods[arm]()
+                torch.accelerator.synchronize()
+                row[arm] = (time.perf_counter_ns() - started) / 32000
+            paired.append(row)
+        saved = summary([row["eager_full"] - row["query_graph"] for row in paired])
+        result["overlap_probe"].append(
+            {
+                "head_cycles": cycles,
+                "measured_head_us": head_us,
+                "trials": paired,
+                "paired_saved_us": saved,
+            }
+        )
+        save()
+        print(json.dumps({"head_us": head_us, "overlap_saved_us": saved}), flush=True)
     result["status"] = "pass"
     result["limitations"] = [
         "Component screen only; no model execution, rank communication or serving workload.",
