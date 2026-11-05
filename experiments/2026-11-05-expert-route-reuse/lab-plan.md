@@ -1,8 +1,9 @@
 # Pending hardware qualification
 
-Nothing in this plan authorizes execution. No cluster operation has been run.
-The current DGX hold belongs to another qualification and an existing request
-belongs to another task; neither was replaced.
+The owner explicitly authorized hardware testing and the necessary coordinated
+sync/stop/start/restart operations. No merge, promotion, cabling, topology,
+firmware, kernel or driver change is authorized. No operation has yet run for
+this experiment. Foreign holds and existing requests retain priority.
 
 ## First gate: isolated kernel correctness
 
@@ -24,7 +25,7 @@ processes, retaining both logs and memory/thermal observations:
 
 Use the image's existing packages through a `uv` system-site-packages environment;
 no replacement PyTorch, compiler, or checkpoint is needed. Cap host compilation
-at two CPUs and 8 GiB, with `MAX_JOBS=2` and `OMP_NUM_THREADS=2`. Run no GPU job
+at two CPUs and 16 GiB, with `MAX_JOBS=2` and `OMP_NUM_THREADS=2`. Run no GPU job
 while another holder is active. The cases cover gather, aligned TP3 down K,
 TP4's exact 64-column down tail, both route-ID widths, and prefill sizes 171/500.
 If any bit mismatch or native compilation failure occurs, retain it and stop
@@ -58,8 +59,8 @@ occupancy, cross-request overlap, repeated payload, and scale-tail waste.
 
 Before requesting a serving operation, finish and publish that collector, its
 arm profiles, and a lab specification; inspect the plans' `live:` and `shape:`
-lines. Only then request explicit approval for coordinated stop/start/restart/
-sync operations covering every configured node. Do not use a one-rank launch,
+lines. Then use the already authorized coordinated stop/start/restart/sync operations
+covering every configured node. Do not use a one-rank launch,
 dirty tree, rsync deployment, or `--change-shape` to bypass a refusal. TP4 must
 use its qualified node map and hardware window.
 
@@ -77,3 +78,24 @@ when the window ends, then release only this task's hold.
 
 Reject the patch as a performance change if gains do not survive these gates.
 Any promotion requires the owner's acceptance and a separate immutable baseline.
+
+
+## Published branch execution
+
+Keep the promoted recipe untouched. `cluster sync --revision <published SHA>`
+supports a clean experimental commit; the committed candidate profile can select
+`deployment.branch: feat/expert-route-reuse`. Read its `live:` and `shape:` plan
+lines, name that profile on every apply, and detach every configured node at the
+same published commit. The main-only queue is a separate restriction: do not
+merge an experiment or weaken the guard to satisfy it. Before taking a manual
+window, ensure no queue runner can race it, record the original deployment
+commit and restore profile, and arrange the existing heartbeat/watchdog path.
+Restore the original serving profile and commit before closing the window.
+
+The first benchmark uses unreleased same-commit panel zero as the paired causal
+control. It is not a rerun of a released baseline. Kernel speedups must survive
+the full path: representative cold 32K through 1M prefill, decode concurrency
+1/8/16, and distinct agent traffic, with candidate serving boot and repeat boot,
+95% intervals, exact workload/source/image identities and cooling/fan receipts.
+Use immutable recorded release references for release comparisons. A full-path
+regression, neutral result or remaining hardware block must remain explicit.

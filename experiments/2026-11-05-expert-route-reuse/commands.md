@@ -141,3 +141,68 @@ Source publication succeeded as draft
 patch was applied to a clean temporary index at the base and reproduced the
 candidate tree exactly (`runs/exported-patch-check.txt`). No ignored files or
 credentials are deployment inputs.
+
+
+## Stronger CPU audit and native-screen preparation
+
+The same image, two-CPU/eight-GiB limits and two shared CPU locks were used for:
+
+```sh
+python3 -m unittest discover -s experiments/2026-11-05-expert-route-reuse -p 'test_*.py' -v
+python3 experiments/2026-11-05-expert-route-reuse/analyze_ordering.py --output experiments/2026-11-05-expert-route-reuse/runs/ordering-bounds.json
+# Inside the existing CPU-only image/venv, with the candidate file mounted:
+/tmp/route-venv/bin/python /experiment/check_audit.py
+# With the untouched candidate-38 file mounted instead:
+/tmp/route-venv/bin/python /experiment/check_default_baseline.py
+```
+
+`audit-cpu-matrix-setup-failed.txt` records the failed `inspect.getfile(JITFunc)`
+probe. Using the module's `__file__` fixed it. The next complete matrix used an
+accidental topk=7; its JSON/log are retained with `-topk7` names. The final native
+matrix at topk=6 passes all 72 compiler cases, 48 aligned workspace cases and
+four plan-default cases. `audit-default-comparison.txt` confirms four old/final
+default source hashes match. These checks allocate no GPU memory.
+
+`audit-source-precommit.txt` retains the existing lint/type/import failures after
+the expanded source tests. Unrelated autoformat output was removed. Source
+commit `f3bfdf8b8c08870754cc3c756b75faa9156595e0` was exported as patch 0002 and
+published to the existing PR; its tree is in `base.json`.
+
+Hardware bundle `bundles/swizzle-screen/` binds source, test and benchmark hashes.
+The wrapper retains `kernel-local`'s serving refusal and shared GPU lock, makes
+lock acquisition nonblocking, caps Docker at two CPUs/16 GiB/no swap, and records
+five-second host thermal/memory readings. It aborts its own container at 85 C,
+below 12 GiB available memory, lost ownership, or 45 minutes. It starts below
+55 C with at least 24 GiB available. Performance modes require the existing
+performance fan service active. No fan software is installed by this experiment.
+The first host inspection found no fan service on sp8; performance there remains
+blocked unless the established fan policy is clarified. Correctness alone does
+not establish a speedup. The controller reads the dgx1 hold immediately before
+each invocation; the wrapper independently requires the exact node hold/window.
+
+```sh
+python3 experiments/2026-11-05-expert-route-reuse/run_screen.py \
+  --mode gate --process-id gate-a --holder expert-route-reuse \
+  --window WINDOW --out /node-local/new-receipt-directory --dry-run
+```
+
+Remove `--dry-run` only after publication, exclusive handoff and the documented
+hold/resource checks. Run gate, smoke, full A and full B as separate processes;
+these are process repeats, not serving boots. Full serving qualification remains
+separate. The paired screen uses eight input blocks, five timing replays per arm
+and three whole-plan calls per CUDA graph. Arm order rotates/reverses; all arms
+share weights, activations, routes, workspace and output address. It compares
+panels 0/1/2/3/4/8, TP3/TP4 shard geometry on one GPU, low-overlap synthetic
+routes, skew and M-tier boundaries. The 95% intervals use paired input-block
+means with t(7); raw values remain in every receipt. It checks output bits,
+unchanged IDs/weights and the same first 17 rows in a separate invocation.
+
+
+Screen preparation validation completed remotely under the same two CPU locks
+and 2-CPU/8-GiB user-unit caps: Python syntax compilation, 14 tests, static doctor,
+and the wrapper dry-run pass. `audit-exported-series.txt` reproduces source tree
+`8d20314f29ed7cc26b8c4e15f85046b36faaa6df` by applying both exported patches to a
+fresh index at the candidate-38 base. The earlier full 572-patch preparation is
+retained rather than repeated. `screen-dry-run.txt` records the exact bounded
+Docker plan. Complete task build inputs are still absent, so a full build check
+is deferred until preparation of a serving image.

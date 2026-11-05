@@ -9,9 +9,11 @@ Source review: [vLLM PR #5](https://github.com/christopherowen/vllm/pull/5),
 a draft based on the exact candidate-38 source. The exported experimental
 patch is in `vllm/`; no active profile selects it.
 
-Validation completed: 10 accounting tests, both six-case CPU code-generation
-runs, static doctor, fresh 572-patch source reproduction, and exported-patch
-tree reproduction passed. Existing source lint failures also reproduce on the
+Validation completed: 14 accounting/ordering tests, the initial six-case CPU
+code-generation runs, a 72-case native-shape CPU audit, 48 workspace checks,
+949,524 comparisons with the installed compiler rasterizer, static doctor, and
+fresh 572-patch source reproduction passed. Four final default-plan CUDA sources
+are byte-identical to the untouched candidate-38 default. Existing source lint failures also reproduce on the
 untouched base (three E501 lines, formatting, 122 typing errors, and three
 TileLang import-policy violations). GPU and model gates remain pending.
 
@@ -25,8 +27,11 @@ TileLang import-policy violations). GPU and model gates remain pending.
 - Prepared candidate tree: `c061e5f6931306fa4655ba531428f639c365bf10`.
 - CPU compiler environment: existing image
   `sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b`.
-- One source variable: honor the existing positive `swizzle_panel` argument in
-  `grouped_fp8_fp4_gemm`. The patch is experimental and is not in any active series.
+- Source candidate: `f3bfdf8b8c08870754cc3c756b75faa9156595e0`, tree
+  `8d20314f29ed7cc26b8c4e15f85046b36faaa6df`.
+- One source variable: honor explicitly positive `swizzle_panel` in
+  `grouped_fp8_fp4_gemm`; set the plan default to zero to preserve the existing
+  default emitted code. The two-patch stack is not in any active series.
 
 ## What is already implemented
 
@@ -100,26 +105,60 @@ These are logical payload formulas, not memory-controller counters.
 
 ## Swizzle defect and candidate
 
-The candidate plan already passes `prefill_swizzle_panel=3`, but its grouped
-GEMM body never calls `T.use_swizzle`. The option therefore does not affect
-emitted code. The experimental patch invokes that operation only for positive
-panels. Panel zero retains the existing scheduling. Logical payload accounting
-is unchanged; only block ordering can change cache locality.
+The candidate-38 plan default is `prefill_swizzle_panel=3`, but its grouped
+GEMM never calls `T.use_swizzle`: panels zero and three emit identical code.
+The initial patch activates positive panels. The audit then makes zero the
+explicit default, preserving the previous default schedule until hardware
+supports a choice. A positive caller option now changes block ordering only.
+Logical payload, route IDs/weights, packing and arithmetic are unchanged.
 
-The source regression checks that panel 3 emits `rasterization2DRow<3>` for gather,
-TP4 tail, and TP3 aligned K cases, and that panel 0 does not. Bit-equality tests
-alone could pass with an ignored option, so generated-code coverage is necessary.
-`check_codegen.py` also lowers those cases on CPU without device compilation.
-The existing GPU `test_prefill_swizzle_panel_matches_unswizzled_bits` remains
-required before treating the fix as qualified. No timing is inferred from
-code generation.
+Regression coverage goes through the plan factory for both TP shard widths and
+both projections. The final default and explicit zero sources match the old
+default byte-for-byte. Positive panels add just one logical-block remapping line
+in each of 72 CPU-lowered cases: M16/32/64, panels 0/1/2/3/4/8, native hidden
+5120, intermediate 576/768, 384 experts and top-6. These are source-generation
+checks, not native compilation or execution. GPU bit-equality cases additionally
+cover both native shard widths with eight experts to bound temporary memory.
+
+## Alternative and residual bounds
+
+`analyze_ordering.py` considers M16/32/64, both shard widths, six panel sizes,
+all-2/all-4 scale bounds and five explicitly synthetic route populations.
+`check_audit.py` compares its ordering with the installed compiler's actual C++
+rasterizer for 949,524 coordinates, including partial and oversized panels.
+The compiler header SHA-256 is
+`37b8b17dda33204c494586eeabebc6d8d08cec808c67bac46e8d847fd1f9517a`.
+
+| Alternative | Bound or observed offline result | Limitation |
+| --- | --- | --- |
+| More expert-union bookkeeping | Zero removable weight copies when each expert already fits one M tile | Actual workload occupancy is missing |
+| M16 to M32/M64 | Can reduce repeated logical weight loads; also changes padding, scratch and occupancy | Existing M64 screening is recorded in the 2026-10-26 TP3 memory experiment; do not remeasure that release |
+| Panel 2 versus 3 | For synthetic balanced 8192-row TP4 down, two tiles/expert, panel 2 keeps repeated weight keys one grid index apart; panel 3 has p95 199 | Linearized grid order is not GPU execution order, physical traffic or elapsed time |
+| 4-bit to 2-bit scale deltas everywhere | At most 1.51% (TP3) / 1.57% (TP4) of all-4-bit logical weight-plus-scale payload | Existing exact packing already selects narrow experts; the remaining real fraction is unknown |
+| Remove every scale load | At most 3.14% / 3.27% of the same logical payload | A hypothetical ceiling, not a viable exact implementation or speedup |
+| Remove unused TP4 scale-tail bits | At most 0.112% of that payload | FP4 tail is already exact; transactions may be unchanged |
+
+In the disjoint 48-row fixture, M16/32/64 all load the same expert weights while
+larger tiles increase padding and intermediate scratch. In the 17-row hot-expert
+fixture, M32 halves repeated logical payload against M16 while M64 gives no
+further payload reduction and doubles intermediate scratch. There is no
+universal best panel or tile height established by these fixtures. Fixed
+geometry, hardware scheduling, activation locality and true route distribution
+remain relevant. No global optimality claim is supported.
+
+The first audit accidentally passed topk=7 while exercising the compiler; its
+successful 72-case output is retained as `audit-cpu-matrix-topk7.*` and is not
+native-contract evidence. `audit-cpu-matrix.*` reruns the full matrix at topk=6.
+The initial compiler-file inspection TypeError is also retained.
 
 ## Execution record and remaining gate
 
 See `runs/` and `commands.md` for successful runs and failed setup attempts.
 All substantial work after the Mac recovery ran on `sp8`, with a two-CPU,
 8-GiB limit and shared CPU locks. The CPU containers had no network and no GPU.
-There was no serving operation and no GPU hold was acquired.
+At this audit checkpoint there was no serving operation and no GPU hold was
+acquired. The owner has subsequently authorized hardware tests and the necessary
+coordinated serving operations; foreign holds and queued requests still apply.
 
 Fresh application of all 572 candidate patches reproduced the exact head and
 tree above. The initial local preparation had failed with a full disk; its log

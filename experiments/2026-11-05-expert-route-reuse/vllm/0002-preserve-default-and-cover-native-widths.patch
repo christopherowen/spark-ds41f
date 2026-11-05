@@ -1,0 +1,123 @@
+From f3bfdf8b8c08870754cc3c756b75faa9156595e0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:34:58 +0000
+Subject: [PATCH] fix: keep expert swizzle opt-in and cover native widths
+
+Retain the prior unswizzled default until hardware comparisons qualify a
+panel. The ordering audit gives a counterexample to choosing panel 3
+universally: expert pairs can straddle its boundaries. Correct the cache
+and empty-tile documentation and verify default/explicit generated code.
+Extend GPU equality cases to native TP3/TP4 widths with eight experts to
+bound test memory; the compiler matrix separately covers all 384 experts.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Prepared-base: 1f33102547e4da5c64712390604695d1abd577c4
+Parent: 5cc36f7662f77330efe7d40c141e1d79d38e2c37
+Quality: preserve the actual old default; positive panels remain opt-in.
+Tests: 72 CPU lowering cases, 949524 compiler-header grid coordinates,
+48 workspace cases, four default-source comparisons against the base.
+GPU equality, batch invariance and serving performance remain pending.
+Upstream-status: draft review; no performance or promotion claim.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 37 +++++++++----------
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 11 +++---
+ 2 files changed, 23 insertions(+), 25 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index ed4477f5b..eed22bfa2 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -608,11 +608,14 @@ def test_prefill_tiles_give_the_decode_tiles_bits(
+     assert torch.equal(tiered_out.view(torch.int16), outs[32].view(torch.int16))
+ 
+ 
+-@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
++@pytest.mark.parametrize(
++    "hidden, intermediate, num_experts",
++    [(512, 256, 32), (384, 576, 32), (384, 768, 32), (5120, 576, 8), (5120, 768, 8)],
++)
+ @pytest.mark.parametrize("rows", [171, 500])
+ @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+-    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
++    rows, idx_dtype, hidden, intermediate, num_experts, topk=6
+ ):
+     """Swizzling the prefill grouped-GEMM CTA grid across ``prefill_swizzle_panel=3``
+     consecutive M-tiles changes only CTA scheduling order and keeps every output
+@@ -836,25 +839,19 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     )
+ 
+ 
+-@pytest.mark.parametrize("gather,k", [(True, 512), (False, 576), (False, 768)])
+-def test_grouped_gemm_emits_requested_prefill_swizzle(gather, k):
+-    """Bit equality alone cannot detect a scheduling option that is ignored."""
+-    for panel in (0, 3):
+-        kernel = grouped_fp8_fp4_gemm(
+-            32,
+-            384,
+-            k,
+-            6,
+-            gather,
+-            64,
+-            128,
+-            coded_scales=True,
+-            narrow_codes=True,
+-            trigger_after_loop=True,
+-            swizzle_panel=panel,
+-        )
+-        source = kernel.get_kernel_source()
++@pytest.mark.parametrize("intermediate", [576, 768])
++@pytest.mark.parametrize("stage", ["gate_up", "down"])
++def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
++    """The opt-in must change code; the default keeps the prior unswizzled path."""
++    sources = {}
++    for panel in (None, 0, 3):
++        options = {} if panel is None else {"prefill_swizzle_panel": panel}
++        plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
++        factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
++        source = factory(*args, **kwargs).get_kernel_source()
+         assert ("rasterization2DRow<3>" in source) == (panel == 3)
++        sources[panel] = source
++    assert sources[None] == sources[0]
+ 
+ 
+ def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 9754272a5..fb5277511 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -664,8 +664,9 @@ def grouped_fp8_fp4_gemm(
+     rasterizes the ``(N / block_N, tiles)`` grid in panels of ``swizzle_panel``
+     consecutive M-tiles, stepping M-tiles first within each column block ``bx``
+     and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
+-    expert share each ``bx`` weight slab in L2 while keeping unused padding
+-    tiles (``t >= used_tiles``) at the tail of the grid.
++    expert can access each ``bx`` weight slab closer together. Cache benefit
++    depends on occupancy and panel boundaries. Empty logical tiles still return
++    early but can interleave with live CTAs inside a partial panel.
+     """
+     block_K = FP4_TMA_K
+     tail = K % block_K
+@@ -1394,7 +1395,7 @@ class MoeExpertsV41Plan:
+         decode_block_M=16,
+         block_M=32,
+         prefill_block_M=64,
+-        prefill_swizzle_panel=3,
++        prefill_swizzle_panel=0,
+         block_N=128,
+         num_stages=3,
+         down_num_stages=2,
+@@ -1516,8 +1517,8 @@ class MoeExpertsV41Plan:
+         ``decode_block_M``; at the same height ``late_gate_up`` and ``late_down``,
+         which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
+         more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
+-        ``prefill_block_M``, whose GEMMs trigger late and swizzle their CTA grid across
+-        ``prefill_swizzle_panel`` consecutive M-tiles."""
++        ``prefill_block_M``, whose GEMMs trigger late and optionally swizzle across
++        ``prefill_swizzle_panel`` consecutive M-tiles (disabled by default)."""
+         config = dict(
+             block_N=self.block_N,
+             coded_scales=True,
+-- 
+2.43.0
+
