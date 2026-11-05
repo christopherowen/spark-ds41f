@@ -185,3 +185,10 @@ rank/row, eliminating all division in those at-most-128-word tails. Larger tails
 retain their already measured program. All 598 patches apply in the fresh
 prepared tree and reproduce `446dd388e525ae96c0c90c33350e5802b29ddd7e`.
 Both full prompt confidence extensions pass, including their pooled bounds.
+
+The final combined candidate passes 1,266 tests on its first boot. The controller
+yielded before the repeat boot for a queued owner-authorized sp8 check; no test
+or timing job was interrupted. `0014` moves the same 50 transfer cases into the
+existing output suite, following its contribution guide; runtime and GPU source
+are unchanged. All 599 patches reproduce `9c4c49ec3bbcec299f3f48eb87012106789a0303`.
+The inventory accepts the generated `_kernel` suffix on the harness markers.

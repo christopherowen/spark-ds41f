@@ -24,7 +24,7 @@ launches = db.execute(
 assert launches, "empty CUDA trace"
 windows = {}
 for marker, phase in (("iket_step_marker", "request"), ("iket_grid_marker", "grid")):
-    boundaries = [(begin, end) for begin, end, name, _ in launches if name == marker]
+    boundaries = [(begin, end) for begin, end, name, _ in launches if name.removesuffix("_kernel") == marker]
     assert len(boundaries) == 2, (marker, boundaries)
     windows[phase] = (boundaries[0][1], boundaries[1][0])
 
