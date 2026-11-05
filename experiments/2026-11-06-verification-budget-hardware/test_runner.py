@@ -2,9 +2,25 @@ import json
 import unittest
 
 import run_hardware as runner
+import tool_schema_gate
 
 
 class GateTests(unittest.TestCase):
+    def test_tool_and_schema_content_must_match_and_have_native_ids(self):
+        expected = {"label": "record-0", "value": 7}
+        message = {"content": json.dumps(expected), "tool_calls": [{"function": {
+            "name": "record", "arguments": json.dumps(expected)}}]}
+        choice = {"message": message, "token_ids": [1, 2, 3], "finish_reason": "stop"}
+        reply = {"choices": [choice]}
+        for mode in ("schema", "tool"):
+            self.assertEqual(tool_schema_gate.normalize(reply, mode, expected)["value"], expected)
+            with self.assertRaises(ValueError):
+                tool_schema_gate.normalize(reply, mode, {"label": "wrong", "value": 7})
+        with self.assertRaises(ValueError):
+            tool_schema_gate.normalize({"choices": [{**choice, "token_ids": None}]}, "schema", expected)
+        with self.assertRaises(ValueError):
+            tool_schema_gate.normalize({"choices": [{**choice, "finish_reason": "length"}]}, "tool", expected)
+
     def test_resolved_profiles_change_only_row_cost(self):
         def normalized(name):
             config = runner.lab.spark.read_cluster(f"{runner.EXPERIMENT}/{name}.json")

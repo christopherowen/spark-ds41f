@@ -30,6 +30,7 @@ GATES = [
     ("greedy", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide"]),
     ("sampled", "experiments/2026-10-24-tilelang-completion/sampled_digest.py", ["--tokens", "192"]),
     ("controls", "experiments/2026-10-24-tilelang-completion/controls_digest.py", ["--tokens", "96"]),
+    ("tool-schema", f"{EXPERIMENT}/tool_schema_gate.py", []),
 ]
 
 
@@ -45,6 +46,10 @@ def gate_summary(text, name):
     if len(records) != 1:
         raise ValueError(f"{name}: missing or ambiguous gate summary")
     result = records[0]
+    if name == "tool-schema":
+        if result.get("passed") is not True or len(result.get("signatures", {})) != 13:
+            raise ValueError("tool/schema gate is incomplete or failed")
+        return result["signatures"]
     if name in ("greedy", "sampled"):
         if result.get("identical") is not True or not re.fullmatch(r"[0-9a-f]{64}", result.get("reference_sha256", "")):
             raise ValueError(f"{name}: batch/seed invariance failed")
