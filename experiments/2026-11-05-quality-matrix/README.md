@@ -38,3 +38,13 @@ win, or promotion. Cooling starts below55C on every node, uses the existing fan
 policy, and retains memory, swap, thermal and failure observations for each arm.
 The existing TP3 LongBench window runs independently; shared-site activity is
 recorded rather than treating measurements on different groups as paired runs.
+
+The first window at `5f36b7b9` stops before any serving replacement or model
+request: coordinated sync requires its target Git checkout to exist. C37 remains
+live on all four ranks, the restoration check passes and every lease is removed.
+An independent later reader verifies all four images and absence of holds and
+experimental mounts. All failure/restore receipts remain in `runs/code-window-01`.
+The controller now prepares missing clean Git clones from the original clean
+repository while holding every node's lease. It then uses the named coordinated
+sync to fetch and detach every target at the published experiment commit; it
+never copies a working tree or ignored files. The retry uses a new output path.

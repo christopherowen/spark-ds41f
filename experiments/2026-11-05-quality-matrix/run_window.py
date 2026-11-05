@@ -137,6 +137,20 @@ def main():
         review={name:next((line for line in plan.splitlines() if line.startswith(name+':')),None) for name in ('live','shape')}
         assert all(review.values()) and 'unchanged' in review['shape'] and '--apply would refuse:' not in plan,review
         (out/'runtime-review.json').write_text(json.dumps(review,indent=2)+'\n')
+        bootstrap=w.each('''import json,subprocess
+from pathlib import Path
+hold=json.loads((Path.home()/'spark-hold.json').read_text());assert hold['token']==DATA['token']
+target=Path(DATA['serving']);created=not target.exists()
+if created:
+ target.parent.mkdir(parents=True,exist_ok=True)
+ source=Path.home()/'projects/spark-ds41f'
+ assert not subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip()
+ subprocess.run(['git','clone',str(source),str(target)],check=True,stdout=subprocess.DEVNULL)
+ subprocess.run(['git','remote','set-url','origin','https://github.com/christopherowen/spark-ds41f.git'],cwd=target,check=True)
+assert not subprocess.check_output(['git','status','--porcelain'],cwd=target,text=True).strip()
+print(json.dumps({'created':created,'checkout':str(target),'head_before_coordinated_sync':subprocess.check_output(['git','rev-parse','HEAD'],cwd=target,text=True).strip()}))
+''',{'serving':SERVING,'token':token})
+        (out/'bootstrap.json').write_text(json.dumps(bootstrap,indent=2)+'\n')
         w.run(w.spark('restore','cluster','sync','--revision',commit),out,'sync-plan')
         w.run(w.spark('restore','cluster','sync','--revision',commit,'--apply'),out,'sync-apply')
         w.run(w.spark('restore','doctor','--live'),out,'preflight-live')
