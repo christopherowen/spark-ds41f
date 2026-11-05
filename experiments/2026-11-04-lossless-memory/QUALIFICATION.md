@@ -236,6 +236,12 @@ The serving plans run the candidate's release suite, single-stream suite and
 sampled suite on two boots. They compare with immutable recorded 1030 references;
 the released image is never measured again. The primary release definitions are
 copied exactly from their recorded `suite.json`, preserving their fingerprints.
+Timed suites also select the recorded stream event policy and require it in the
+native identity. `collector/` records the historical source/fixtures, request
+compatibility audit and the first scale suite retained under the newer collector.
+The matched cohort has separate run IDs and full-gate reports. The same policy
+must be selected explicitly for any future standalone serving-plan execution:
+`SPARK_DS41F_BENCH_STREAM_POLICY=recorded-1030`.
 
 Before promotion, also run startup/cold-cache compilation checks, prefix and
 admission checks, and an ordinary agent workload. Keep stock and steered request

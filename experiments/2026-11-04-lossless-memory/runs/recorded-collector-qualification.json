@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "scope": "historical collector compatibility preparation; no released-build measurement",
+  "base_commit": "e5031394ff9d3f1798c958cf153d307966f56521",
+  "reference_client_commit": "19efdd6fe1f11a159c5f1989aaa3433682325ab2",
+  "intended_variable": "restore the recorded stream-event selection rule for a separately named two-boot serving cohort, with unchanged request bodies and runtime image",
+  "local_runs": [
+    {
+      "archive": "runs/recorded-collector-focused-tests.log.gz",
+      "uncompressed_sha256": "10f558fc2348a359667904c3c721ba608a4ea8113085db0573adf91bc0d65c57",
+      "tests": 31,
+      "seconds": 0.12,
+      "passed": true
+    },
+    {
+      "archive": "runs/recorded-collector-focused-repeat-tests.log.gz",
+      "uncompressed_sha256": "915310910b232ad04fb4fa8923de312359c8a62a0460ff5c550eee6ab932cc7d",
+      "tests": 31,
+      "seconds": 0.117,
+      "passed": true
+    },
+    {
+      "archive": "runs/recorded-collector-focused-final-tests.log.gz",
+      "uncompressed_sha256": "5ec202f609166d7b433f0d2d077bc5e8d1b71f85339266d01bb1bebe2feeb61a",
+      "tests": 31,
+      "seconds": 0.12,
+      "passed": true
+    },
+    {
+      "archive": "runs/recorded-collector-repository-tests.log.gz",
+      "uncompressed_sha256": "12690d75ee874445daba67047343a80eff0e85ebb0fcc783490123cfa5bad1dc",
+      "tests": 727,
+      "seconds": 43.503,
+      "passed": false
+    },
+    {
+      "archive": "runs/recorded-collector-repository-repeat-tests.log.gz",
+      "uncompressed_sha256": "f4a23acbf271485dacfd9b75e240ac910fb65417866cbec42dddfa43187d87a6",
+      "tests": 727,
+      "seconds": 40.777,
+      "passed": true
+    },
+    {
+      "archive": "runs/recorded-collector-repository-final-tests.log.gz",
+      "uncompressed_sha256": "a24434d50012ffa078829a15e35b3d7372a479222a268fcbe6905a05acc536f4",
+      "tests": 727,
+      "seconds": 42.056,
+      "passed": true
+    },
+    {
+      "archive": "runs/recorded-collector-repository-complete-tests.log.gz",
+      "uncompressed_sha256": "33d461caa56d7580f64fda1977cb95498a44816ba2f8f6cbb07fb6062643a3c6",
+      "tests": 727,
+      "seconds": 40.734,
+      "passed": true
+    }
+  ],
+  "fixture_generator": {
+    "archive": "runs/collector-fixture-generator.py.gz",
+    "uncompressed_sha256": "ec0e12c95f5f2717eae817383534bdf977f2f725f3aa0dfd655eddac24a43d31",
+    "command": ".venv312/bin/python .work/make_recorded_stream_fixtures.py",
+    "model_or_network_requests": 0,
+    "historical_cases": 4
+  },
+  "checks": [
+    {
+      "command": "bin/spark doctor",
+      "exit": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0
+    },
+    {
+      "command": "bin/spark --cluster-config experiments/2026-11-04-lossless-memory/expert-scales/tp3.json build check",
+      "exit": 0
+    },
+    {
+      "command": "bin/spark --cluster-config experiments/2026-11-04-lossless-memory/engram/tp3.json build check",
+      "exit": 0
+    }
+  ],
+  "preparation_errors": [
+    {
+      "stage": "fixture generation",
+      "exit": 1,
+      "error": "ModuleNotFoundError: servebench; the ignored helper directory was the initial import path",
+      "resolution": "Add the repository root before loading its benchmark modules."
+    },
+    {
+      "stage": "initial repository tests",
+      "tests": 727,
+      "failed": 1,
+      "error": "new test module lacked the required EOF main guard",
+      "resolution": "Add the guard; all subsequent complete repository runs pass."
+    },
+    {
+      "stage": "malformed historical stream fixture",
+      "exit": 1,
+      "error": "Historical collector raises AttributeError for an invalid non-dictionary usage object instead of returning a record",
+      "resolution": "Retain that historical exception as a fixture outcome; require identical legacy behavior."
+    }
+  ],
+  "handoff": {
+    "window": "dgx1-1793877834",
+    "request_since": "2026-11-05T12:31:17.234181+00:00",
+    "current_atomic_primary_suite_will_finish_intact": true,
+    "current_primary_run": "lossless-scales-release-tp3",
+    "matched_run": "lossless-scales-recorded-release-tp3",
+    "completed_image_and_original_component_retained_from": "results/private/lossless-memory-scales-round2/receipt.json",
+    "fresh_full_gate_run": "lossless-expert-scales-full-gate-recorded-collector",
+    "source_sync_during_active_serving": false
+  },
+  "runtime_image_or_arithmetic_changed": false,
+  "native_matched_serving_pending": true,
+  "conclusion": "727 final repository tests pass. Four independent historical stream fixtures match complete records/wire requests, including historical failure behavior. Current default collection remains unchanged. Preserve every initial-cohort observation; matched performance still requires its own two full boots."
+}

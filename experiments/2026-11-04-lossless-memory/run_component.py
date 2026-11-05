@@ -19,6 +19,7 @@ from spark_ds41f import lab
 from servebench import suite
 
 HOLDER = "spark-lab: owner-authorized lossless memory qualification"
+STREAM_POLICY = "recorded-1030"
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
 MANAGEMENT_ERRORS = ("ssh: connect", "cannot reach", "kex_exchange_identification",
                      "connection timed out during banner exchange", "memory telemetry stopped reporting",
@@ -132,6 +133,7 @@ def native_suite_gate(directory, definition, config, commit, images):
     identity = index["metadata"]["identity"]
     if (identity.get("live_problems") or identity.get("client_dirty")
             or identity.get("client_commit") != commit or identity.get("cluster_config") != config
+            or identity.get("client_stream_policy") != STREAM_POLICY
             or set(identity.get("nodes", {})) != set(images)):
         raise ValueError("suite has a different client, profile or rank set")
     if (set(conditions["memory"]) != set(images) or set(conditions["thermal"]) != set(images)
@@ -303,7 +305,7 @@ def main():
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     receipt = {"started": lab.now(), "window": args.window, "commit": commit,
                "component": args.component, "steps": [], "plans": [], "images": {}, "restored": False,
-               "release_promoted": False, "completed": False}
+               "release_promoted": False, "completed": False, "client_stream_policy": STREAM_POLICY}
     if previous is not None:
         receipt["reused_gates_from" if args.reuse_gates_from else "reused_kernel_from"] = str(reuse_path)
         receipt["prior_receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -514,7 +516,7 @@ def main():
                     if number and i == 0:
                         first = ROOT / "results/private/suites" / release["run"] / job["arms"][0]["label"] / "model.json.gz"
                         argv += ["--corpus", str(first.relative_to(ROOT))]
-                    run(argv, f"suite-{label}-{i}")
+                    run(["env", "SPARK_DS41F_BENCH_STREAM_POLICY=" + STREAM_POLICY, *argv], f"suite-{label}-{i}")
                     if args.component == "engram":
                         save_io("after-suite-" + str(i))
                     observed = native_suite_gate(directory, suite.load(name), profile, commit, receipt["images"])

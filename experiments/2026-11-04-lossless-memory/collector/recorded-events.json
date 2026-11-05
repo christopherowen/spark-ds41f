@@ -1,0 +1,321 @@
+{
+  "reference_client_commit": "19efdd6fe1f11a159c5f1989aaa3433682325ab2",
+  "reference_client_sha256": "e6b649459307cf0fb79031b53b4ab48e6c1c37aa2f40343f4fe919768e00133a",
+  "inference_requests": 0,
+  "scope": "synthetic streams processed by the unmodified historical collector; no model or network",
+  "cases": [
+    {
+      "name": "continuous-empty-deltas",
+      "continuous_usage": true,
+      "events": [
+        {
+          "choices": [
+            {
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 0
+          }
+        },
+        {
+          "choices": [
+            {
+              "delta": {},
+              "token_ids": [
+                1
+              ]
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 1
+          }
+        },
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "Hi"
+              },
+              "token_ids": [
+                2
+              ]
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 2
+          }
+        },
+        {
+          "choices": [
+            {
+              "delta": {},
+              "token_ids": [
+                3
+              ]
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3
+          }
+        },
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "!"
+              },
+              "token_ids": [
+                4
+              ],
+              "finish_reason": "length"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 4
+          }
+        },
+        {
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 4
+          }
+        }
+      ],
+      "payload": {
+        "model": "fixture",
+        "messages": [],
+        "max_tokens": 4
+      },
+      "expected_record": {
+        "sent": 0.0,
+        "first": 3.0,
+        "end": 7.0,
+        "events": [
+          [
+            3.0,
+            2
+          ],
+          [
+            5.0,
+            4
+          ]
+        ],
+        "prompt_tokens": 5,
+        "completion_tokens": 4,
+        "finish_reason": "length",
+        "token_times": "exact",
+        "error": null
+      },
+      "expected_wire": [
+        {
+          "url": "http://fixture/v1/chat/completions",
+          "method": "POST",
+          "body": {
+            "model": "fixture",
+            "messages": [],
+            "max_tokens": 4,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true,
+              "continuous_usage_stats": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "without-continuous-counts",
+      "continuous_usage": false,
+      "events": [
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "Hi"
+              }
+            }
+          ]
+        },
+        {
+          "choices": [
+            {
+              "delta": {},
+              "token_ids": [
+                2
+              ]
+            }
+          ]
+        },
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "!"
+              },
+              "finish_reason": "length"
+            }
+          ]
+        },
+        {
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3
+          }
+        }
+      ],
+      "payload": {
+        "model": "fixture",
+        "messages": [],
+        "max_tokens": 4
+      },
+      "expected_record": {
+        "sent": 0.0,
+        "first": 1.0,
+        "end": 5.0,
+        "events": [
+          [
+            1.0,
+            2
+          ],
+          [
+            3.0,
+            3
+          ]
+        ],
+        "prompt_tokens": 5,
+        "completion_tokens": 3,
+        "finish_reason": "length",
+        "token_times": "approximate",
+        "error": null
+      },
+      "expected_wire": [
+        {
+          "url": "http://fixture/v1/chat/completions",
+          "method": "POST",
+          "body": {
+            "model": "fixture",
+            "messages": [],
+            "max_tokens": 4,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "invalid-usage",
+      "continuous_usage": true,
+      "events": [
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "Hi"
+              },
+              "finish_reason": "length"
+            }
+          ],
+          "usage": "invalid"
+        }
+      ],
+      "payload": {
+        "model": "fixture",
+        "messages": [],
+        "max_tokens": 4
+      },
+      "expected_record": {
+        "raised": "AttributeError: 'str' object has no attribute 'get'"
+      },
+      "expected_wire": [
+        {
+          "url": "http://fixture/v1/chat/completions",
+          "method": "POST",
+          "body": {
+            "model": "fixture",
+            "messages": [],
+            "max_tokens": 4,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true,
+              "continuous_usage_stats": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "server-error",
+      "continuous_usage": true,
+      "events": [
+        {
+          "choices": [
+            {
+              "delta": {
+                "content": "Hi"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 1
+          }
+        },
+        {
+          "error": {
+            "message": "recorded fixture failure"
+          }
+        }
+      ],
+      "payload": {
+        "model": "fixture",
+        "messages": [],
+        "max_tokens": 4
+      },
+      "expected_record": {
+        "sent": 0.0,
+        "first": 1.0,
+        "end": 3.0,
+        "events": [
+          [
+            1.0,
+            1
+          ]
+        ],
+        "prompt_tokens": 5,
+        "completion_tokens": 1,
+        "finish_reason": null,
+        "token_times": "exact",
+        "error": "server: recorded fixture failure"
+      },
+      "expected_wire": [
+        {
+          "url": "http://fixture/v1/chat/completions",
+          "method": "POST",
+          "body": {
+            "model": "fixture",
+            "messages": [],
+            "max_tokens": 4,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true,
+              "continuous_usage_stats": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
