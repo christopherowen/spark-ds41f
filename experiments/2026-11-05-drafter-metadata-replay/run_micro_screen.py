@@ -37,6 +37,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--deployment-commit", required=True)
+    parser.add_argument("--boots", type=int, nargs="+", choices=(1, 2), default=[1, 2])
     args = parser.parse_args()
     assert socket.gethostname() == "spark-0016"
     assert (
@@ -67,6 +68,7 @@ def main():
         image=IMAGE,
         authorization=lease["authorization"],
         limits=dict(cpus=2, memory_bytes=8 * 1024**3, build_workers=2),
+        requested_boots=args.boots,
         jobs=[],
     )
     write(args.output / "identity.json", identity)
@@ -142,11 +144,17 @@ def main():
         own_request = False
         threading.Thread(target=heartbeat, daemon=True).start()
         fcntl.flock(cpu_lock, fcntl.LOCK_EX)
+        image = json.loads(output(["docker", "image", "inspect", IMAGE]))[0]
         write(
-            args.output / "gpu-before.json",
-            json.loads(output(["docker", "image", "inspect", IMAGE])),
+            args.output / "image.json",
+            {"id": image["Id"], "labels": image["Config"]["Labels"]},
         )
-        for boot in (1, 2):
+        assert (
+            output(["git", "-C", str(ROOT), "rev-parse", "HEAD"])
+            == args.deployment_commit
+        )
+        assert not output(["git", "-C", str(ROOT), "status", "--porcelain"])
+        for boot in args.boots:
             if (
                 request.exists()
                 and json.loads(request.read_text()).get("who") != HOLDER
@@ -158,10 +166,25 @@ def main():
             lease["job"] = f"metadata-screen-boot-{boot}"
             lease["heartbeat"] = utc()
             write(hold, lease)
+            until = time.monotonic() + 600
+            while (
+                float(
+                    output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=temperature.gpu",
+                            "--format=csv,noheader,nounits",
+                        ]
+                    )
+                )
+                >= 55
+            ):
+                assert time.monotonic() < until, "cooling timeout"
+                time.sleep(2)
             telemetry = output(
                 [
                     "nvidia-smi",
-                    "--query-gpu=timestamp,temperature.gpu,utilization.gpu,memory.used,clocks.sm",
+                    "--query-gpu=timestamp,temperature.gpu,utilization.gpu,memory.used,clocks.sm,fan.speed,power.draw,power.limit",
                     "--format=csv",
                 ]
             )
@@ -226,6 +249,14 @@ cat /sys/fs/cgroup/memory.peak > /out/container-memory-peak.txt
                 code = subprocess.run(
                     command, stdout=log, stderr=subprocess.STDOUT
                 ).returncode
+            after = output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=timestamp,temperature.gpu,utilization.gpu,memory.used,clocks.sm,fan.speed,power.draw,power.limit",
+                    "--format=csv",
+                ]
+            )
+            (dest / "after.csv").write_text(after + "\n")
             identity["jobs"].append(
                 dict(boot=boot, started=started, ended=utc(), exit=code)
             )
@@ -233,7 +264,7 @@ cat /sys/fs/cgroup/memory.peak > /out/container-memory-peak.txt
             print(f"Boot {boot} exited {code}.", flush=True)
             if code:
                 raise SystemExit(code)
-        identity["completed"] = len(identity["jobs"]) == 2 and all(
+        identity["completed"] = len(identity["jobs"]) == len(args.boots) and all(
             j["exit"] == 0 for j in identity["jobs"]
         )
     finally:
