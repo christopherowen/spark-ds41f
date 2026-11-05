@@ -37,6 +37,22 @@
     {
       "host": "dgx4",
       "result": "Both experimental profile doctors, fresh sparknet preparation, 755 deployment CPU tests and generated-doc checks pass"
+    },
+    {
+      "host": "dgx4",
+      "result": "The first CPU CUDA compilation succeeded, but inspection mistook a forward declaration for a kernel definition. The validation-only fix is fb027b4; the failure log is retained."
+    },
+    {
+      "host": "dgx4",
+      "result": "Entry 28, staged 28 and arrived 28 SM121 compilations pass with GPU exposure disabled; benchmark copy kernels also compile. No GPU execution was performed."
+    },
+    {
+      "host": "dgx4",
+      "result": "Complete current image inputs prepared and build check passed; this is input validation, not an image build or qualification."
+    },
+    {
+      "host": "Mac publication relay",
+      "result": "Normal alternative-branch Git pushes returned fatal error in commit_refs_rules. Git Data API created and published commits with identical tested trees; no repository rules or permissions changed."
     }
   ],
   "deployment_doctor": {
@@ -84,5 +100,63 @@
   "generated_docs": {
     "passed": true,
     "log": "runs/generated-docs.log"
-  }
+  },
+  "current_source_cpu_tests": {
+    "passed": true,
+    "commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+    "count": 98,
+    "log": "runs/source-recheck.log"
+  },
+  "current_build_inputs": {
+    "passed": true,
+    "directory": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-37df39d5",
+    "log": "runs/prepare-current.log",
+    "image_built": false
+  },
+  "cuda_compilation": {
+    "gpu_exposed": false,
+    "target": "sm_121",
+    "cases_per_phase": 28,
+    "phases": [
+      "entry",
+      "staged",
+      "arrived"
+    ],
+    "passed": true,
+    "receipts": [
+      "runs/compiled-entry/compile-results.json",
+      "runs/compiled-staged/compile-results.json",
+      "runs/compiled-arrived/compile-results.json"
+    ],
+    "failed_attempt": "runs/cpu-compile.log",
+    "scope": "compile and generated-code evidence; not GPU correctness"
+  },
+  "current_source_ci": {
+    "passed": true,
+    "commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+    "runs": [
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128284312",
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128292286"
+    ]
+  },
+  "alternative_ci": [
+    {
+      "phase": "staged",
+      "passed": true,
+      "commit": "641c5a385b6a9cd2b2f3a9f74580290aa79e8cc3",
+      "run": "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42129404228"
+    },
+    {
+      "phase": "arrived",
+      "passed": true,
+      "commit": "9671e431a1a468cc48d2147e196af67199308a4d",
+      "run": "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42130126993"
+    }
+  ],
+  "source_gate_controls": {
+    "passed": true,
+    "count": 4,
+    "log": "runs/source-gate-controls-final.log"
+  },
+  "authorization": "Owner authorized necessary coordinated hardware testing and service operations; existing holds/requests retain precedence. No merge, promotion or topology change is authorized."
 }

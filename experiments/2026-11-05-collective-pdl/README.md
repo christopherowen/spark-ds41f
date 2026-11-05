@@ -1,8 +1,9 @@
 # Collective launch overlap
 
 Status: source [PR #5](https://github.com/christopherowen/dgx-spark-networking/pull/5)
-is implemented and passes CPU checks. GPU ordering, fabric qualification and
-performance are pending. No serving change or promotion has been made.
+is implemented; CPU checks and 84 SM121 compilations pass. Three published
+trigger placements are ready for comparison. GPU ordering, fabric qualification
+and performance are pending. No serving change or promotion has been made.
 
 ## One variable
 
@@ -18,7 +19,9 @@ allocated. The risk to test is scheduling/resource contention and generated
 memory ordering, not a different arithmetic formula.
 
 The source starts at candidate-36/38's sparknet `1fd6a1f` / tree `8cc28a5c`,
-and the experiment pins `1a1205e` / tree `102a5730`. Candidate-38's vLLM
+and the entry candidate pins `fb027b4` / tree `1e1720f0`. The first
+`1a1205e` revision was replaced only to correct generated-source inspection
+of a forward declaration; the kernel implementation did not change. Candidate-38's vLLM
 series was freshly applied: 572 patches reproduce head `1f331025` and tree
 `c061e5f6`. [base.json](base.json) records the full identities, and
 [candidate.json](candidate.json) the delta. The candidate locks and triangle/ring
@@ -70,8 +73,16 @@ DGX4, CPU-only, `CPUQuota=200%`, `MemoryMax=8G`, `TasksMax=64`, nice 10:
   sparknet preparation reproduces the exact candidate commit and tree.
 - Source CI passes the Python 3.10/3.12/3.14, installed wheel, NCCL patch and
   Dockerfile checks. The receipt links the exact source commit and Actions runs.
-- Complete image inputs are absent; `build check` warns that the build directory
-  is not prepared. This is not a build pass.
+- Complete image inputs now pass `build check` at the current source pin. The
+  earlier incomplete-input warning remains in the original receipt. No candidate
+  image has been built.
+- Each of entry, staged and arrived passes 98 CPU checks. All-reduce BF16/F16/F32
+  and all-gather compile for every TP3 and TP4 rank: 28 SM121 specializations per
+  phase, 84 total. GPU access was explicitly disabled. Generated CUDA records
+  the dependency wait before the epoch and the intended trigger placement.
+- The synthetic benchmark's two copy kernels compile. Four CPU controller
+  checks cover bounded all-rank commands, variant identity, gate-log hashes and
+  rejecting a foreign or mismatched window before any hardware action.
 - New GPU tests are written but unrun: delayed PDL producers/consumers,
   cancellation-sensitive rank-order sums, mixed collective slot reuse, eager
   and graph execution, and generated CUDA's wait before the epoch read.
@@ -85,6 +96,33 @@ intervals are absent because no candidate boot has run.
 [commands.md](commands.md) records the offline commands and resource limits.
 The archived scripts retain the executed setup and validation commands.
 
+## Trigger-placement alternatives
+
+[alternatives.json](alternatives.json) pins three published trees: entry triggers
+immediately after the dependency wait; staged triggers after posting; arrived
+triggers after waiting for peers. Only trigger placement differs between them.
+The later placements test whether keeping waiting consumer CTAs out of the
+peer-wait interval leaves more capacity for side work. The winning placement
+must be measured; early triggering is not assumed to be best.
+
+The bounded [run-source-gates.py](run-source-gates.py) runs the full source GPU
+suite and fabric probe on every triangle rank before allowing that variant's
+benchmark. It checks exact window ownership, clean source/harness checkouts,
+image identity, every rank's verdict and prerequisite log hashes. Containers
+have two CPUs, 16 GiB with no extra swap (probe: 12 GiB), process and time limits.
+The controller requires 40 GiB free before launch, keeps the existing 24 GiB
+memory floor and thermal limits, cools below 55 C and maintains the window
+heartbeat. Management uncertainty stops further launches and retains the hold.
+
+The synthetic matrix has 7 row counts, all-reduce/all-gather/mixed chains and
+0/4/32 MiB of concurrent copy work. Each case has 40 samples of 16 graph chains.
+Two fresh process runs reverse the variant order. All rank samples, exact-output
+checks, graph/compile warmup, memory and thermal evidence are retained. Background
+cases fork a side stream after the producer, so that event orders the producer;
+the measured launch chain still includes the collective and its consumer. This
+is controlled resource contention, not a model-layer or serving result. A
+within-process interval cannot substitute for serving boot/repeat variability.
+
 ## Acceptance and workload identity
 
 This is a performance enhancement. Acceptance requires an incremental gain
@@ -94,7 +132,8 @@ regression. An unchanged arithmetic formula is not a GPU correctness result.
 Keep existing sampled batch-dependence as a limitation; do not relabel it as
 sampling invariance. No change to the sampler or its scheduling is intended.
 
-Use the standard recipe from candidate-38 and the same `release-tp3`,
+The triangle candidate inherits candidate-38 `tp3-dev.json`, including the dev
+RPC required by the engine grid. Use the same `release-tp3`,
 `single-stream` and `sampled` suite identities as
 `../2026-11-03-candidate-38-tp3-qualification/release-default.json`.
 The immediate reference is its saved standard boot/repeat under
@@ -116,18 +155,18 @@ DGX1-3 served candidate-36, image ID
 from `candidate-36/tp3-dev.json`; this is observed state, not a new configuration
 authority. Re-read the live profile, hold and node map before any operation.
 
-1. Obtain explicit authorization for coordinated stop/start/replacement/sync.
-   Recheck both the active hold and any waiting request. Use the existing
+1. The owner authorized coordinated stop/start/replacement/sync and hardware
+   testing. Recheck both the active hold and any waiting request. Use the existing
    published lab runner's idle/publish guards and heartbeat/watchdog; do not
    bypass a guard or take another holder's window. The experiment branch is
    not on main, so its own runner cannot open a window. The authorized runner
    must use its clean published deployment checkout; test source checkouts are
    separate, clean, detached at the exact published source commit on every rank.
 2. Inspect `bin/spark --cluster-config <verified-live-profile> cluster stop`
-   and its `live:`/`shape:` lines. Apply only after authorization. Run all
+   and its `live:`/`shape:` lines before applying. Run all
    triangle ranks together, one bounded container per rank, after cooling all
    nodes below 55 C. Do not launch a serving rank on its own.
-3. From the pinned sparknet source on every rank, run its fleet GPU suite and
+3. From each pinned sparknet source on every rank, run its fleet GPU suite and
    collective probe with the triangle map, both rails, the same source commit,
    and candidate-38's verified existing image. The fleet command is:
    `scripts/gpu-test-fleet.sh MAP oneshot-direct tp3-triangle IMAGE`.
@@ -137,7 +176,9 @@ authority. Re-read the live profile, hold and node map before any operation.
    --transport oneshot-direct --profile tp3-triangle --image IMAGE --
    --benchmark --counter-samples` for each configured rank. Preserve the normal
    timeout and capture all rail counters. Stop if management is lost.
-4. Only after those gates pass, prepare/check/build one immutable candidate
+4. After each variant passes those gates, run the two synthetic process rounds
+   before choosing a serving candidate. These runs may reject a variant but do
+   not establish a serving gain. Only then prepare/check/build one immutable candidate
    image under the build memory guard; distribute its one OCI digest using
    the coordinated tooling. Review each sync/start plan and its live/shape
    lines. Run the unpromoted triangle candidate for a boot and a repeat boot,
@@ -147,8 +188,13 @@ authority. Re-read the live profile, hold and node map before any operation.
    mixed stalls in seconds, greedy/teacher-forced identity, memory minimum,
    errors and 95% intervals. A small positive estimate within boot noise is
    not an accepted performance improvement.
+   The committed candidate overlay names `deployment.branch=feat/collective-overlap`;
+   `cluster sync --revision <exact published SHA>` permits testing it without a
+   merge. Capture the original commit and restore profile, exclude any main-syncing
+   queue runner, and validate restoration before changing canonical checkouts.
+   Do not weaken the lab's main-publication guard.
 5. Restore the pre-window service once through the authorized coordinated
-   runner, verify it, then release the hold. No merge or promotion is part of
+   runner, restore the original deployment commit/profile, verify it, then release the hold. No merge or promotion is part of
    this task. Repeat the fabric and serving gates on ring4 only in a separately
    authorized window when that topology is available; triangle results do not
    qualify the ring.

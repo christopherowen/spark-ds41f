@@ -31,3 +31,35 @@ incomplete image inputs; it does not qualify a build. Interrupted Mac work is
 recorded in `results.json` and is not counted as a passing run.
 
 After staging the complete experiment, `git diff --cached --check` also passed.
+
+
+## Extended offline checks
+
+Current source `fb027b4` passes the same bounded `make check`. The archived
+`prepare-alternatives.py` creates the two original tested commits; their
+published Git Data API commits have exactly the same trees (see
+`alternatives.json`). Both source alternatives pass 98 CPU checks and CI.
+
+`compile-sources.sh`, `compile-alternatives.sh` and `compile-benchmark.sh` run
+inside CPU-only containers (`--runtime=runc`, no GPU, no network, two CPUs,
+8 GiB memory and swap limit, 256 process limit). The source compile helpers
+assert generated-code ordering and produce native CUDA and hashed receipts.
+All 84 source cases and both benchmark copy kernels compile. The first failed
+inspection attempt is retained as `runs/cpu-compile.log`.
+
+`prepare-current.py` reuses verified clean prepared inputs and runs canonical
+`build prepare` and `build check` for the current source pin. The final check
+passes; no candidate image has been built. Heavy preparation remains remote
+and bounded by the same CPU/memory scope, using `/tmp/spark-source-preparation.lock`.
+Compilation uses `/tmp/spark-cpu-analysis.lock`.
+
+The new controller is plan-only by default. Its CPU controls run as:
+
+```sh
+COLLECTIVE_PDL_MAP=config/nodes.json /home/swank/spark-lab/collective-pdl/venv/bin/python experiments/2026-11-05-collective-pdl/test_source_gate_controls.py
+```
+
+Every applied source gate needs the exact owned window and clean published
+checkouts on all ranks. Benchmark mode additionally needs that variant's
+passing gate receipt and verifies each log hash. Applied hardware commands
+will be recorded in their own per-run receipt; none has run yet.
