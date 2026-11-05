@@ -5,6 +5,22 @@ import run_hardware as runner
 
 
 class GateTests(unittest.TestCase):
+    def test_resolved_profiles_change_only_row_cost(self):
+        def normalized(name):
+            config = runner.lab.spark.read_cluster(f"{runner.EXPERIMENT}/{name}.json")
+            config.pop("notes", None)
+            index = config["serve_args"].index("--speculative-config") + 1
+            speculative = json.loads(config["serve_args"][index])
+            cost = speculative.pop("adaptive_verification_row_cost")
+            config["serve_args"][index] = speculative
+            return config, cost
+        control, cost = normalized("control")
+        self.assertEqual(cost, .035)
+        for name, expected in (("row010", .01), ("row020", .02)):
+            candidate, cost = normalized(name)
+            self.assertEqual(cost, expected)
+            self.assertEqual(candidate, control)
+
     def test_false_summary_is_failure_even_when_process_exits_zero(self):
         with self.assertRaises(ValueError):
             runner.gate_summary(json.dumps({"summary": "greedy", "identical": False}), "greedy")
