@@ -12,6 +12,9 @@ SOURCES = ("fp8_probe.py", "fp8_probe.cu", "fp8_probe_frame.py",
 FIXED_SOURCES = ("fp8_fixed_probe.py", "fp8_fixed_probe.cu", "fp8_fixed_frame.py",
                  "collect_weights.py", "memory_codec.py")
 FIXED_EXACT_FLAG = "gpu_all_encodings_and_exception_boundaries_exact"
+PLANE_SOURCES = ("fp8_plane_lz4_probe.py", "fp8_plane_lz4_probe.cu", "fp8_plane_lz4_frame.py",
+                 "collect_weights.py", "memory_codec.py")
+PLANE_EXACT_FLAG = "gpu_all_encodings_and_stream_boundaries_exact"
 
 
 def source_hashes(sources=SOURCES):
@@ -79,3 +82,26 @@ def summarize(receipts, *, axis="lanes", exact_flag="gpu_all_encodings_and_long_
                          if max(ratios) < 1 and ci[1] < 1 and allocation_ratio < 1
                          else "reject this microdecoder layout"),
             "serving_performance_verified": False}
+
+
+def validate_plane(native, verdict, *, lanes, chunk_bytes, image, revision):
+    validate(native, verdict, lanes=lanes, image=image, revision=revision, axis="threads",
+             exact_flag=PLANE_EXACT_FLAG, sources=PLANE_SOURCES)
+    library = native.get("lz4", {})
+    binary = library.get("binary_sha256", "")
+    if (native.get("format") != "independent-plane-lz4-v1" or native.get("chunk_bytes") != chunk_bytes
+            or type(library.get("version")) is not int or library["version"] <= 0
+            or not isinstance(binary, str) or len(binary) != 64
+            or any(c not in "0123456789abcdef" for c in binary)):
+        raise ValueError("plane-LZ4 layout or immutable-image library identity differs")
+
+
+def summarize_plane(receipts):
+    if len(receipts) != 2 or any(receipts[0].get(key) != receipts[1].get(key)
+                                 for key in ("chunk_bytes", "format", "lz4")):
+        raise ValueError("first/repeat LZ4 streams or library differ")
+    if receipts[0].get("format") != "independent-plane-lz4-v1" or receipts[0].get("chunk_bytes") not in (512, 2048):
+        raise ValueError("unknown independent-plane layout")
+    result = summarize(receipts, axis="threads", exact_flag=PLANE_EXACT_FLAG)
+    result["chunk_bytes"] = receipts[0]["chunk_bytes"]
+    return result

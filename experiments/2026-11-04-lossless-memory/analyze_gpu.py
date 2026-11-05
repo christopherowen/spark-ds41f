@@ -10,7 +10,8 @@ import statistics
 import sys
 
 from collect_weights import family
-from fp8_results import FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, validate
+from fp8_results import (FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, summarize_plane,
+                         validate, validate_plane)
 
 HERE = Path(__file__).resolve().parent
 
@@ -27,7 +28,7 @@ def main():
     parser.add_argument("--cpu-summary", type=Path, default=HERE / "results.json")
     parser.add_argument("--archives", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--format", choices=("huffman", "fixed-fields"), default="huffman")
+    parser.add_argument("--format", choices=("huffman", "fixed-fields", "plane-lz4"), default="huffman")
     args = parser.parse_args()
     if args.archives.exists() or args.out.exists():
         parser.error("refusing to overwrite evidence")
@@ -44,28 +45,36 @@ def main():
     if controller.get("format", "huffman") != args.format:
         raise ValueError("controller receipt describes a different format")
     fixed = args.format == "fixed-fields"
-    prefix = "lossless-fp8-fixed" if fixed else "lossless-fp8"
+    plane = args.format == "plane-lz4"
+    prefix = "lossless-fp8-plane-lz4" if plane else "lossless-fp8-fixed" if fixed else "lossless-fp8"
     validation = {"axis": "threads", "exact_flag": FIXED_EXACT_FLAG,
                   "sources": FIXED_SOURCES} if fixed else {}
     summary_options = {key: value for key, value in validation.items() if key != "sources"}
     summaries = []
-    for lanes in ((128, 256, 512) if fixed else (32, 64, 128)):
+    layouts = ([(chunk, threads) for chunk in (512, 2048) for threads in (128, 256)] if plane
+               else [(None, lanes) for lanes in ((128, 256, 512) if fixed else (32, 64, 128))])
+    for chunk, lanes in layouts:
         pair = []
+        layout = f"{chunk}-{lanes}" if plane else str(lanes)
         for label in ("first", "repeat"):
-            name = f"{prefix}-{lanes}-{label}.json"
+            name = f"{prefix}-{layout}-{label}.json"
             native = json.loads((args.originals / ".cache/spark-lab/compile" / name).read_text())
-            bundle = f"bundle-{lanes}" + ("-repeat" if label == "repeat" else "")
-            worker = args.originals / "spark-lab/results" / f"{prefix}-kernel-{lanes}-{label}" / f"{bundle}-dgx1"
+            bundle = f"bundle-{layout}" + ("-repeat" if label == "repeat" else "")
+            worker = args.originals / "spark-lab/results" / f"{prefix}-kernel-{layout}-{label}" / f"{bundle}-dgx1"
             verdict = json.loads((worker / "verdict.json").read_text())
-            validate(native, verdict, lanes=lanes, image=base["image_id"], revision=base["model_revision"], **validation)
+            if plane:
+                validate_plane(native, verdict, lanes=lanes, chunk_bytes=chunk,
+                               image=base["image_id"], revision=base["model_revision"])
+            else:
+                validate(native, verdict, lanes=lanes, image=base["image_id"], revision=base["model_revision"], **validation)
             identity = {(s["name"], tuple(s["tile_origin"]), s["sha256"]) for s in native["inputs"]}
             if identity != expected:
                 raise ValueError("GPU checkpoint tiles differ from the CPU screen")
-            copied = args.controller / f"{prefix}-kernel-{lanes}-{label}.json"
+            copied = args.controller / f"{prefix}-kernel-{layout}-{label}.json"
             if json.loads(copied.read_text()) != native:
                 raise ValueError("controller and original native observations differ")
             pair.append(native)
-        summary = summarize(pair, **summary_options)
+        summary = summarize_plane(pair) if plane else summarize(pair, **summary_options)
         if summary != controller["summaries"][len(summaries)]:
             raise ValueError("recomputed uncertainty differs from the native summary")
         summary["median_kernel_ms_first_repeat"] = {
@@ -92,7 +101,7 @@ def main():
               "source_commit": controller["commit"], "window": controller["window"], "format": args.format,
               "base_image_id": base["image_id"], "model_revision": base["model_revision"],
               "cpu_input_manifest_sha256": cpu_reference["input_manifest_sha256"],
-              "checkpoint_tiles": len(expected), "fresh_containers": 6,
+              "checkpoint_tiles": len(expected), "fresh_containers": 2 * len(layouts),
               "all_checkpoint_and_special_encoding_bytes_exact": True,
               "serving_performance_verified": False, "model_equivalence_qualified": False,
               "restored": controller["restored"], "ended": controller["ended"],

@@ -26,3 +26,23 @@ smaller independent chunks use P4L2. Both reconstruct every source byte.
 
 The CUDA byte-consumer prototype and driver are prepared but have not been
 compiled or run on the target. They are not serving integration or a speed claim.
+
+The canonical target matrix pairs 512/2048-byte streams with 128/256 threads,
+then repeats each point in a fresh container (eight jobs total). Both arms use
+the same eight-byte shared consumer. Absolute times from the older word-sized
+controls are not a comparison. Every original byte, encoding/boundary fixture
+and source-derived consumer checksum must match before nine shuffled timed
+observations. The receipt also pins the LZ4 library actually inside the immutable
+image; local CPU preparation ratios do not predict target decoder throughput.
+
+```sh
+python3 experiments/2026-11-04-lossless-memory/run_fp8.py \
+  --window WINDOW_ID --format plane-lz4 --lanes 128 256 \
+  --chunk-bytes 512 2048 \
+  --out results/private/lossless-fp8-plane-lz4-round1 --apply
+```
+
+Use only an authorized, published, idle FP8 measurement window. The controller
+preserves foreign holds, validates every source/library/layout identity, and
+restores the recorded Candidate 36 profile at its end. `analyze_gpu.py --format
+plane-lz4` verifies original worker and controller copies before archiving them.
