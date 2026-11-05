@@ -1,10 +1,12 @@
 """Out-of-band checks for the no-loss decision, not serving instrumentation."""
 import importlib.util
+import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from check_quality import check
+from check_quality import canonical_check,check
 
 
 def fixture(benchmark):
@@ -17,6 +19,19 @@ def fixture(benchmark):
 
 
 class GateTests(unittest.TestCase):
+    def test_recorded_reference_failure_does_not_omit_model_tests(self):
+        path=Path(__file__).parent/'runs/code-window-03/grade-oracle/receipt.json'
+        receipt=json.loads(path.read_text())
+        result=canonical_check(receipt)
+        self.assertEqual(result['known_reference_failures'],['HumanEval/32'])
+        self.assertEqual(result['model_tasks_omitted'],[])
+        self.assertFalse(result['model_tests_changed'])
+        changed=copy.deepcopy(receipt);changed['records'][0]['correct']=False
+        with self.assertRaises(AssertionError):canonical_check(changed)
+        changed=copy.deepcopy(receipt)
+        next(r for r in changed['records'] if r['id']=='HumanEval/32')['plus']['passed_tests']-=1
+        with self.assertRaises(AssertionError):canonical_check(changed)
+
     def test_controller_reaches_read_only_identity_preflight(self):
         spec=importlib.util.spec_from_file_location('matrix_preflight',Path(__file__).with_name('run_window.py'))
         controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)

@@ -20,8 +20,9 @@ thinking and 65536 generated tokens. Reasoning and failed requests count in
 generation wall time. Grading is a separate CPU-only container job after each
 arm: pinned official base and plus tests, no network/GPU, read-only code/cache/
 samples, no capabilities, no privilege escalation, 2 CPUs, 4 GiB and 64 processes.
-Before timed model requests, the same isolated checker must accept all 164
-official canonical programs. This is oracle validation, not a model result.
+Before timed model requests, the same isolated checker validates all 164
+official canonical programs against the recorded reference behavior. This is
+oracle validation, not a model result; a reference program need not be perfect.
 Programs, full responses and reasoning remain private on the node, outside Git.
 Only hashes, counters, timing and executable-test verdicts are public. Grading
 time is separately recorded; it is not a serving-implementation operation.
@@ -57,3 +58,20 @@ creation. No serving action or model request occurs. The original controller
 log and launch receipt remain in `runs/code-window-02`. The canonical-program
 loop variable and runtime-identity helper now have distinct names; a read-only
 CLI preflight test reaches the identity guard without acquiring any machine.
+
+The third attempt (`c1a0f455`) synchronizes every clean target successfully but
+stops before replacing C37 or sending any model request. Its full reference
+check scores 163/164: the bundled `HumanEval/32` Newton iteration passes 100 base
+tests but fails 7 of 788 plus polynomial-residual checks. The official checker
+uses a mathematical root property rather than exact agreement with that
+reference's output. Independent execution on the pinned public inputs also
+finds large residuals/nonconvergence; floating-point details vary by platform.
+Requiring perfect reference code was an incorrect preflight assumption.
+
+The revised preflight accepts only all-pass reference behavior or this exact
+recorded program hash and base/plus counts; every other reference failure stops
+the window. **No model task, input, timeout, tolerance or grading rule changes.**
+All 164 generated model programs still face the full official checker, including
+every `HumanEval/32` test. A model that solves that property more reliably can
+outscore the bundled reference. Earlier failure/restore evidence is retained in
+`runs/code-window-03`; C37 remains live and all leases are released.

@@ -19,7 +19,7 @@ w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
 w.REL=str(HERE.relative_to(ROOT));w.NODES=['10.30.0.'+str(i) for i in range(9,13)]
 SERVING='/home/chris/spark-lab/checkouts/lsa-serving'
 IMAGE='sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713'
-from check_quality import check,early
+from check_quality import canonical_check,check,early
 
 
 def runtime_identity():
@@ -166,7 +166,8 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
                     case=cases[task_id]
                     stream.write(json.dumps({'id':task_id,'content':case['prompt']+case['canonical_solution'],'finish_reason':'stop'})+'\n')
             canonical=grade(args.cache,oracle,out,'oracle')
-            assert canonical['complete'] and all(r['correct'] for r in canonical['records']),'official canonical-program check failed; no model comparison is eligible'
+            validation=canonical_check(canonical)
+            (out/'oracle-validation.json').write_text(json.dumps(validation,indent=2)+'\n')
         generations={};grades={}
         for label,profile in [('native-a','native'),('lsa-a','candidate'),('lsa-b','candidate'),('native-b','native')]:
             assert w.owns(token) and not errors

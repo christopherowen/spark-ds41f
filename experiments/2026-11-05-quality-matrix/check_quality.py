@@ -2,6 +2,23 @@
 import json
 
 
+def canonical_check(receipt):
+    """Check the pinned reference behavior without relaxing any model test."""
+    assert receipt['complete'] and len(receipt['records'])==164
+    failures=[r for r in receipt['records'] if not r['correct']]
+    if failures:
+        assert len(failures)==1 and failures[0]['id']=='HumanEval/32',failures
+        row=failures[0]
+        assert row['base']['passed'] and row['base']['tests']==row['base']['passed_tests']==100
+        assert not row['plus']['passed'] and row['plus']['status']=='fail'
+        assert row['plus']['tests']==row['plus']['executed']==788 and row['plus']['passed_tests']==781
+        assert row['code_sha256']=='5fc21103508369bd5cd470d9713bf65c8c80e3b202c20a54f62e13a034a4c1b7'
+    return {'passed':True,'canonical_correct':164-len(failures),'tasks':164,
+            'known_reference_failures':[r['id'] for r in failures],
+            'model_tests_changed':False,'model_tasks_omitted':[],
+            'scope':'reference-program validation only; every model still faces all official base and plus tests'}
+
+
 def check(generations,grades,benchmark):
     assert set(generations)==set(grades)=={'native-a','lsa-a','lsa-b','native-b'}
     first=generations['native-a'];ids=[r['id'] for r in first['records']]
