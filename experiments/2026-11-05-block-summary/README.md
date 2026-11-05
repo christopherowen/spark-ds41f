@@ -93,3 +93,16 @@ assumed before measurement. The first observed new wrong/incomplete answer
 against a successful matched native answer ends the candidate cohort and
 restores the service. Such a rejected partial cohort is not a two-boot speed
 qualification.
+
+
+The resumed window (`runs/runtime-gates-02`) passes all 12 actual batches,
+including every mean, coarse score, retained fine score, candidate ordering and
+covered-domain native-output check. It takes 47.12 seconds. Strict initialization
+passes both interfaces and both page sizes, including empty/partial/pruned rows
+and invalid table suffixes, in 124.46 seconds with zero sanitizer errors.
+Actual-replay allocator peaks are 278,402,560 allocated and 285,212,672 reserved
+bytes. Strict allocator counters report zero because caching is disabled; these
+are not evidence of zero GPU memory use. The lease releases at 14:31:57 UTC with
+no remaining containers, and the next reader observes the foreign holder's new
+lease rather than any retained LSA reservation. These checks qualify mechanics,
+not final-answer quality or speed.
