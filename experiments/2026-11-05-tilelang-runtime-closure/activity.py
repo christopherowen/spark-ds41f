@@ -1,0 +1,79 @@
+"""Paired CUPTI kernel durations without CUDA event nodes in the timed graphs.
+
+External graph events add about 3 us to the ~1 us tail kernels. Keep those raw
+results; use hardware activity timestamps to resolve actual compute duration.
+"""
+import hashlib
+import json
+import math
+import random
+import statistics
+
+
+def measure_activity(launches, flush, seed, expected, out, rounds=120, samples=64):
+    import torch
+
+    graphs = {}
+    for role, launch in launches.items():
+        launch()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(samples):
+                flush.zero_()
+                actual = launch()
+        graph.replay()
+        torch.cuda.synchronize()
+        values = actual if isinstance(actual, tuple) else (actual,)
+        checks = expected if isinstance(expected, tuple) else (expected,)
+        assert all(torch.equal(v.view(torch.uint8), c.view(torch.uint8))
+                   for v, c in zip(values, checks, strict=True)), role
+        graphs[role] = graph
+    for _ in range(8):
+        for graph in graphs.values():
+            graph.replay()
+    torch.cuda.synchronize()
+    rng = random.Random(seed)
+    orders = []
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                           torch.profiler.ProfilerActivity.CUDA]) as profile:
+        for _ in range(rounds):
+            order = list(graphs)
+            rng.shuffle(order)
+            order += order[::-1]
+            orders.append(order)
+            for role in order:
+                graphs[role].replay()
+                torch.cuda.current_stream().synchronize()
+    profile.export_chrome_trace(str(out))
+    trace = json.loads(out.read_text())
+    kernels = sorted((e for e in trace['traceEvents'] if e.get('cat') == 'kernel'),
+                     key=lambda e: e['ts'])
+    assert len(kernels) == rounds * len(launches) * 2 * samples, (len(kernels), samples)
+    assert len({e['args']['stream'] for e in kernels}) == 1
+    cursor, pairs, names = 0, [], {}
+    for order in orders:
+        times = {role: [] for role in launches}
+        for role in order:
+            group = kernels[cursor:cursor + samples]
+            cursor += samples
+            assert len({e['name'] for e in group}) == 1
+            name = group[0]['name']
+            assert names.setdefault(role, name) == name
+            if role in ('reference', 'null'):
+                assert 'at::native' in name, name
+            elif role == 'candidate':
+                assert 'collectives_rank_rows_small' in name or 'collectives_rank_rows_bytes' in name, name
+            else:
+                assert 'collectives_rank_rows_bytes' in name, name
+            values = [e['dur'] for e in group]
+            assert all(math.isfinite(v) and v > 0 for v in values)
+            times[role].append(values)
+        pairs.append(dict(order=order, times_us=times))
+    logs = {role: [math.log(statistics.fmean(t for a in r['times_us'][role] for t in a)
+                           / statistics.fmean(t for a in r['times_us']['reference'] for t in a))
+                   for r in pairs] for role in launches if role != 'reference'}
+    return dict(pairs=pairs, log_ratios=logs, samples_per_replay=samples,
+                timer='CUPTI GPU activity start/end, one stream, no CUDA event nodes in graphs',
+                activity_kernels=len(kernels), role_kernels=names,
+                trace_sha256=hashlib.sha256(out.read_bytes()).hexdigest()), None

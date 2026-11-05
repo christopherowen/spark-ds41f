@@ -192,3 +192,19 @@ or timing job was interrupted. `0014` moves the same 50 transfer cases into the
 existing output suite, following its contribution guide; runtime and GPU source
 are unchanged. All 599 patches reproduce `9c4c49ec3bbcec299f3f48eb87012106789a0303`.
 The inventory accepts the generated `_kernel` suffix on the harness markers.
+
+## Actual kernel duration
+
+Both final combined boots pass 1,266 tests. Both fixed wire boots contain no ATen
+packing kernel in any of 16 public score-to-CPU cases. All 12 changed-path transfer
+cases pass both complete host-call/stream-wait gates; means are about 11–16% lower.
+
+The divide-free tiny-tail primary remains unresolved and is retained. Its earlier
+CUPTI inventory measured 0.96 us for the candidate and 1.056 us for the independent
+ATen reference, while external-event intervals averaged about 4 us for either.
+`activity.py` tests whether event-node overhead is obscuring the actual compute
+change: same inputs and balanced/mirrored roles, 120 rounds of 64 cold samples,
+CUPTI hardware activity start/end timestamps, no event nodes in those graphs.
+Every replay, kernel name, stream, sample count and positive duration is validated;
+the five-standard-error, zero-margin gate is unchanged. Single inventory samples
+are diagnostic, never sufficient qualification. Full serving remains separate.

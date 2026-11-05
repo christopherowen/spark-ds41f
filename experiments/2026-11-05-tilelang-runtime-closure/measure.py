@@ -13,7 +13,7 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer"))
+parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer", "activity"))
 parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
@@ -177,8 +177,13 @@ def inventory(label, launch):
 def run_case(name, launches, expected, data, identical=False):
     if args.case_filter and name not in json.loads(args.case_filter.read_text()):
         return
-    measured, _ = measure(launches, flush, 20261105, expected, args.rounds,
-                          samples_per_replay=64 if name.startswith("gather-tail") else 8)
+    if args.operation == "activity":
+        from activity import measure_activity
+        measured, _ = measure_activity(launches, flush, 20261105, expected,
+                                      args.out / (name + "-activity.trace.json"), args.rounds)
+    else:
+        measured, _ = measure(launches, flush, 20261105, expected, args.rounds,
+                              samples_per_replay=64 if name.startswith("gather-tail") else 8)
     profiles = {role: inventory(name + "-" + role, launch)
                 for role, launch in launches.items() if role != "null"}
     row = dict(name=name, data=data, identical_program=identical,
