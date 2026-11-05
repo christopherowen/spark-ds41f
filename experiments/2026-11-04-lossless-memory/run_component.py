@@ -74,7 +74,39 @@ def preflight(arm, through):
     return problems
 
 
-def native_kernel_gate(value, images):
+def bundle_hashes(bundle):
+    relative = str(bundle.relative_to(ROOT))
+    tracked = subprocess.check_output(["git", "ls-files", "-z", "--", relative], cwd=ROOT).decode().split("\0")
+    expected = {str((ROOT / path).relative_to(bundle)) for path in tracked if path}
+    files = {str(path.relative_to(bundle)): path for path in bundle.rglob("*") if path.is_file()}
+    if not expected or set(files) != expected:
+        raise ValueError("bundle contains missing or non-Git inputs")
+    return {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
+
+
+def retained_external_sources(bundle, previous):
+    candidate = json.loads((bundle / "candidate.json").read_text())
+    commit = previous.get("commit", "")
+    if not isinstance(commit, str) or len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+        raise ValueError("retained gate lacks a full published commit identity")
+    result = {}
+    for source, _destination in candidate.get("mounts", []):
+        path = (bundle / source).resolve()
+        if path.is_relative_to(bundle) and path.is_file():
+            continue  # Covered by the complete native bundle input map.
+        path = (ROOT / source).resolve()
+        if not path.is_relative_to(ROOT) or not path.is_file():
+            raise ValueError("cannot reuse unpinned external bundle input")
+        name = str(path.relative_to(ROOT))
+        original = subprocess.check_output(["git", "show", commit + ":" + name], cwd=ROOT)
+        current = path.read_bytes()
+        if current != original:
+            raise ValueError("external bundle source changed since its retained gate")
+        result[name] = hashlib.sha256(current).hexdigest()
+    return result
+
+
+def native_kernel_gate(value, images, *, inputs=None):
     rows = value.get("verdicts", [])
     if (value.get("agree") is not True or len(rows) != len(images)
             or {r.get("node") for r in rows} != set(images)):
@@ -84,6 +116,8 @@ def native_kernel_gate(value, images):
                 or row.get("errors") or row.get("failed")
                 or row.get("image") != images[row["node"]]["Id"]):
             raise ValueError("kernel gate failed or image differs")
+        if inputs is not None and row.get("inputs_sha256") != inputs:
+            raise ValueError("native bundle inputs differ from current tracked source")
 
 
 def native_suite_gate(directory, definition, config, commit, images):
@@ -135,8 +169,11 @@ def main():
     parser.add_argument("--window", required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--through", choices=("gate", "release"), default="release")
-    parser.add_argument("--reuse-gates-from", type=Path,
-                        help="reuse completed native image gates before any serving measurement")
+    reuse = parser.add_mutually_exclusive_group()
+    reuse.add_argument("--reuse-gates-from", type=Path,
+                       help="reuse completed native image gates before any serving measurement")
+    reuse.add_argument("--reuse-kernel-from", type=Path,
+                       help="reuse an image and passed component gate, then run a new full gate")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     arm = HERE / args.component
@@ -162,15 +199,21 @@ def main():
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT).strip():
         raise SystemExit("checkout is dirty")
     previous = None
-    if args.reuse_gates_from:
-        path = (ROOT / args.reuse_gates_from).resolve()
+    reuse_path = args.reuse_gates_from or args.reuse_kernel_from
+    if reuse_path:
+        path = (ROOT / reuse_path).resolve()
         if not path.is_relative_to(ROOT / "results/private"):
             parser.error("gate receipts must be retained native results")
         previous = json.loads(path.read_text())
-        if (previous.get("component") != args.component or previous.get("gates_passed") is not True
-                or previous.get("restored") is not True
+        if (previous.get("component") != args.component or previous.get("restored") is not True
+                or args.reuse_gates_from and previous.get("gates_passed") is not True
+                or args.reuse_kernel_from and not previous.get("kernel")
                 or any(s.get("log", "").startswith("boot-") for s in previous.get("steps", []))):
             raise SystemExit("prior execution lacks safely completed gates or already started serving measurement")
+        if args.reuse_kernel_from:
+            full = json.loads((arm / "full-gate.json").read_text())
+            if (ROOT / "results/private/lab" / full["run"] / "verdicts.json").exists():
+                raise SystemExit("full-gate observations already exist; use a distinct retained run")
     elif any((ROOT / "results/private/lab" / json.loads((arm / (n + ".json")).read_text())["run"]
               / "verdicts.json").exists() for n in ("kernel", "full-gate")):
         raise SystemExit("prior native gates exist; retain and review them before reusing")
@@ -184,7 +227,7 @@ def main():
                "component": args.component, "steps": [], "plans": [], "images": {}, "restored": False,
                "release_promoted": False, "completed": False}
     if previous is not None:
-        receipt["reused_gates_from"] = str(args.reuse_gates_from)
+        receipt["reused_gates_from" if args.reuse_gates_from else "reused_kernel_from"] = str(reuse_path)
         receipt["prior_receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     done, management_lost = threading.Event(), False
     active_profile, active_label = None, None
@@ -331,21 +374,25 @@ def main():
             spec = json.loads((arm / (name + ".json")).read_text())
             bundle = ROOT / spec["jobs"][0]["bundles"][0]["bundle"] / "candidate.json"
             bundle_sha = hashlib.sha256(bundle.read_bytes()).hexdigest()
-            if previous is None:
+            inputs = bundle_hashes(bundle.parent)
+            reusing = previous is not None and (name == "kernel" or bool(args.reuse_gates_from))
+            external = retained_external_sources(bundle.parent, previous) if reusing else {}
+            if not reusing:
                 run([sys.executable, "scripts/lab.py", "run", str((arm / (name + ".json")).relative_to(ROOT)),
                      "--production-config", RESTORE, "--keep-open"], name)
             path = ROOT / "results/private/lab" / spec["run"] / "verdicts.json"
             native = json.loads(path.read_text())
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if previous is not None and (previous[name]["sha256"] != digest
-                                         or previous[name]["bundle_sha256"] != bundle_sha):
+            if reusing and (previous[name]["sha256"] != digest
+                            or previous[name]["bundle_sha256"] != bundle_sha):
                 raise ValueError("retained native gate or its test bundle changed")
             management_lost |= any(marker in json.dumps(native).lower() for marker in MANAGEMENT_ERRORS)
             management_lost |= any(v.get("exit") == 255 for v in native.get("verdicts", []))
             receipt[name] = {"native": native, "path": str(path.relative_to(ROOT)),
-                             "sha256": digest, "bundle_sha256": bundle_sha}
+                             "sha256": digest, "bundle_sha256": bundle_sha,
+                             "inputs_sha256": inputs, "retained_external_sources_sha256": external}
             save()
-            native_kernel_gate(native, receipt["images"])
+            native_kernel_gate(native, receipt["images"], inputs=inputs)
         receipt["gates_passed"] = True
         if args.through == "release":
             previous_starts = None
