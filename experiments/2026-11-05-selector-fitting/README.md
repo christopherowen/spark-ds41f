@@ -36,3 +36,33 @@ different query tables, physical aliases, partial pages, zeroed saved tails,
 arming/graph/decode skips and overwrite refusal (`runs/copy-check-01`). The
 container and reservation are removed. These checks do not replace native GPU
 replay, which is still required before any fit.
+
+All-row synthetic native replay then passes on sp8 (`runs/replay-check-02`),
+including exact visible BF16 score bits, selected keys and source handoff/counts
+for both page sizes and 64 rows. A separate process with the CUDA allocator cache
+disabled and strict compute-sanitizer initcheck reports zero errors
+(`runs/initcheck-01`). The first replay launch used the wrong working directory
+and did not start a GPU container; that error is retained in `runs/replay-check-01`.
+Every standalone reservation is released and no containers remain.
+
+`collect.py` prepares two fitting documents and one validation document from
+entire, SHA-deduplicated Python standard-library files assigned to disjoint
+cohorts before capture. It uses no benchmark questions. The original file hashes,
+actual tokenizer counts, exact commit and every response/capture identity are
+recorded; prompts, responses and tensors stay private on the nodes. Replicated
+ranks are mechanical checks, not independent training examples: use rank 0 for a
+fit and keep document-level validation separate. Collection is not yet run.
+
+Future collection command, from the clean published sp5 controller checkout
+after the current answer-quality window restores C37 and releases all nodes:
+
+```sh
+python3 experiments/2026-11-05-selector-fitting/collect.py \
+  --out /home/chris/spark-lab/results/selector-fitting/capture-01
+```
+
+The runner performs all-node preflight, a quiet-service guard, exclusive native
+reservations, heartbeat/watchdog, published commit sync and named coherent
+capture startup. Each explicitly armed document has one untimed generation
+request. It disarms every node and restores C37 once before releasing holds.
+Every actual captured batch still needs exact native replay before fitting.
