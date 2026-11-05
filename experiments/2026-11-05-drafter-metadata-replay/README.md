@@ -6,6 +6,7 @@ before the query forward. The sole causal variable is the placement of that
 metadata work. No new kernel, draft length, target verification, sampling,
 collective, scheduling or copy-draft policy is introduced.
 
+The deployment review is [PR 919](https://github.com/christopherowen/spark-ds41f/pull/919).
 The source is [vLLM PR 3](https://github.com/christopherowen/vllm/pull/3), one commit
 on candidate-38 (`1f33102547e4da5c64712390604695d1abd577c4`). `base.json` records the
 source head, tree, patch fingerprint, deployment base and CPU test image. The

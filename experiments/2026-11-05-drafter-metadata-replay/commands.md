@@ -45,7 +45,7 @@ launching kernels. `--noconftest` omits unrelated model fixtures, not the fixtur
 in the tested graph file. The full graph suite passed 35 tests; final focused
 coverage passed 9, skipped the 3 CUDA cases and deselected 65 unrelated tests.
 The default unspecified-platform attempt had 33 passes and 2 host stream failures;
-it remains in `cpu-tests-2.log`. These are not GPU correctness results.
+it remains in `cpu-tests-2.log.gz`. These are not GPU correctness results.
 
 ## Source checks
 
@@ -58,10 +58,10 @@ RUFF_CACHE_DIR=/tmp/drafter-ruff-host .venv/bin/pre-commit run --files vllm/mode
 git diff --check
 ```
 
-`source-lint-1..4.log` retain every attempt. Two formatting adjustments and an
+`source-lint-1..4.log.gz` retain every attempt. Two formatting adjustments and an
 existing memory-query call in touched files were normalized to satisfy the
 repository hooks. All applicable hooks pass, including Ruff, mypy and accelerator
-API checks. The source commit reran those hooks successfully (`source-commit.log`).
+API checks. The source commit reran those hooks successfully (`source-commit.log.gz`).
 
 ## Deployment repository tests
 
