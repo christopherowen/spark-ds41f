@@ -6,8 +6,7 @@ encoder endpoint. The broad version also changed ordinary replay retention and w
 rejected; the final patch is limited to a multi-token replay suffix.
 
 Do not claim a TTFT improvement, production memory improvement or full-model
-equivalence from CPU results. Leave launch disabled until an authorized serving
-window can run the documented boot/repeat-boot gates with the exact built image.
+equivalence from CPU results. Use the authorized, exclusively owned serving window to run the documented boot/repeat-boot gates with the exact built image.
 No production configuration, published baseline or recorded benchmark is changed.
 
 The alternatives audit in `alternatives.md` supports retaining exactly the two

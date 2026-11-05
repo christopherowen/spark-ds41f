@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from tables_arms import report
+from compare import paired
 
 
 class ReportTest(unittest.TestCase):
@@ -26,6 +27,12 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(row['boot_mean_ttft_s'], [1, 3])
             self.assertEqual(row['mean_ttft_s'], 2)
             self.assertAlmostEqual(row['ci95_s'][1], 2 + 12.706204736)
+
+    def test_paired_changes_keep_boot_units(self):
+        row = paired([10, 20], [8, 16])
+        self.assertEqual(row["absolute_change"], -3)
+        self.assertAlmostEqual(row["percent_change"], -20)
+        self.assertAlmostEqual(row["absolute_change_ci95"][1], -3 + 12.706204736)
 
     def test_guard_failure_rejects_measurement(self):
         with tempfile.TemporaryDirectory() as d:

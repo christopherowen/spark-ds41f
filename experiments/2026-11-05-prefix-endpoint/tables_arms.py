@@ -56,4 +56,9 @@ def report(root, labels):
 if __name__ == '__main__':
     run, *labels = sys.argv[1:]
     root = Path(__file__).resolve().parents[2] / 'results/private/prefix-endpoint' / run
-    print(json.dumps(report(root, labels), indent=2))
+    if len(labels) == 4:
+        from compare import comparison
+        result = comparison(root, labels)
+    else:
+        result = report(root, labels)
+    print(json.dumps(result, indent=2))

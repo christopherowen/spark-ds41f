@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from window_lease import require_window
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -20,11 +21,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('url')
     parser.add_argument('--cluster-config', required=True)
+    parser.add_argument('--window-state', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     args, extra = parser.parse_known_args()
+    require_window(args.window_state)
     cluster, nodes, _ = configuration(args)
     if not cluster['deployment']['launch_enabled']:
         raise SystemExit('Candidate launch is disabled; serving qualification is not enabled')
+    identities = json.loads(Path(__file__).with_name('base.json').read_text())
+    tree = cluster['container']['expected_labels']['local.spark-ds41f.vllm.tree']
+    policies = {identities['candidate_tree']: 'candidate', identities['candidate_vllm_tree']: 'control'}
+    if tree not in policies:
+        raise SystemExit('Unknown source tree for this controlled comparison')
+    if '--endpoint-policy' in extra:
+        raise SystemExit('Endpoint policy is selected from the verified source identity')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     record_path = args.out.with_suffix('.conditions.json')
     with record_path.open('x') as record:
@@ -56,9 +66,10 @@ def main():
                 raise RuntimeError('; '.join(conditions['halted']))
             peak = PeakWatch(args.url)
             child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('probe.py')),
-                                      args.url, '--out', str(args.out), *extra], cwd=ROOT)
+                                      args.url, '--out', str(args.out), '--window-state', str(args.window_state), '--endpoint-policy', policies[tree], *extra], cwd=ROOT)
             while child.poll() is None:
                 try:
+                    require_window(args.window_state)
                     memory.check()
                     if conditions['halted']:
                         raise RuntimeError('; '.join(conditions['halted']))

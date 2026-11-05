@@ -11,6 +11,9 @@ import json
 import time
 import urllib.request
 from pathlib import Path
+from window_lease import require_window
+
+WINDOW_STATE = None
 
 
 def digest(value):
@@ -18,6 +21,7 @@ def digest(value):
 
 
 def post(url, body):
+    require_window(WINDOW_STATE)
     request = urllib.request.Request(
         url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
     )
@@ -78,14 +82,19 @@ def common_prefix(a, b):
 
 
 def main():
+    global WINDOW_STATE
     parser = argparse.ArgumentParser()
     parser.add_argument("url", nargs="?", default="http://127.0.0.1:8000")
+    parser.add_argument("--endpoint-policy", choices=["candidate", "control"], default="candidate")
     parser.add_argument("--model", default="deepseek-v4.1-flash")
     parser.add_argument("--repo", type=Path, default=Path("."))
+    parser.add_argument("--window-state", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--minimum-prompt-tokens", type=int, default=65536)
     parser.add_argument("--pressure-prompts", type=int, default=32)
     args = parser.parse_args()
+    WINDOW_STATE = args.window_state
+    require_window(WINDOW_STATE)
     args.url = args.url.rstrip("/")
     args.out.mkdir(parents=True, exist_ok=False)
     stream = (args.out / "requests.jsonl").open("x")
@@ -153,6 +162,8 @@ def main():
             if resend.get("cached_tokens") != (len(prompt) - 128) // 256 * 256:
                 failures.append("identical resend did not preserve the CED replay suffix")
     expected_endpoint = min(common_prefix(prompts[0], prompts[1]), len(prompts[1]) - 128) // 256 * 256
+    if args.endpoint_policy == "control":
+        expected_endpoint = min(expected_endpoint, (len(prompts[0]) - 128) // 256 * 256)
     if warm[1].get("cached_tokens") != expected_endpoint:
         failures.append(f"extension reused {warm[1].get('cached_tokens')} tokens; expected {expected_endpoint}")
     sibling_started = time.monotonic()
@@ -208,7 +219,7 @@ def main():
     pressure_reduced_reuse = after_pressure.get("cached_tokens", 0) < pressure_baseline.get("cached_tokens", 0)
     if not pressure_reduced_reuse:
         failures.append("pressure did not reduce reuse; increase pressure before accepting this gate")
-    summary = {"failures": failures, "passed": not failures,
+    summary = {"failures": failures, "passed": not failures, "endpoint_policy": args.endpoint_policy,
                "pressure_reduced_reuse": pressure_reduced_reuse,
                "sibling_batch_wall_s": sibling_wall,
                "distinct_agent_batch_wall_s": agent_wall,

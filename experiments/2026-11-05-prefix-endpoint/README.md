@@ -1,7 +1,8 @@
 # CED encoder endpoint retention
 
 Status: CPU validation passed; image construction and serving qualification pending.
-This experiment is not promoted. Both candidate profiles disable launch.
+This experiment is not promoted. Hardware testing is authorized; the candidate profiles select the published experiment branch.
+No production promotion or merge is authorized by this record.
 
 One variable changes: the block-granular, non-EAGLE cache coordinator retains the
 complete encoder prompt endpoint as well as its resend boundary when the configured
@@ -95,23 +96,26 @@ eviction frequency, full-model output equality and TTFT remain unmeasured.
 `lab-tp3.json` and `lab-tp4.json` each select only the candidate, with a boot and
 repeat boot and three native multi-turn workloads per boot. Choose only the site's
 qualified shape and node map. Do not run a released build again. No historical run
-of this exact workload exists here, so it cannot support an old-versus-new TTFT claim.
+of this exact workload exists here. The newly authorized controlled specification
+uses the unreleased parent for that causal comparison, as described in hardware-plan.md.
 
-Before execution: obtain explicit authorization for the coordinated serving change;
-honor the head node's hold/request files; publish the deployment commit; build once
+Hardware testing is authorized. Before execution, honor the head node's hold/request files; publish the deployment commit; build once
 on a remote build host, distribute one OCI digest to every rank, and verify its
-source labels. Record that digest, enable launch in a new reviewed commit, and use
+source labels. Record that digest and use
 `bin/spark cluster sync` with the named candidate profile and clean detached node
 checkouts. Read its `live:` and `shape:` plan lines. Do not change shape to bypass a
-refusal. No live action is authorized by this experiment directory.
+refusal. The authorization comes from the owner, not from this experiment directory.
+An existing foreign hold or request still blocks our GPU work.
 
-The specs pass the offline plan check; `cluster start --apply` and the probe
-guard refuse launch-disabled profiles until that preparation is complete. After the approved publication/build/qualification steps, on the head:
+The specs pass the offline plan check. A branch-only experiment cannot use the
+main-only lab runner: follow the coordinated branch workflow in `hardware-plan.md`,
+without changing the helper publication guard. After the approved publication/build/qualification steps, on the head:
 
 ```sh
 scripts/lab.py run experiments/2026-11-05-prefix-endpoint/lab-tp3.json --dry-run
 # Only in the authorized window, after inspecting the plan:
-scripts/lab.py run experiments/2026-11-05-prefix-endpoint/lab-tp3.json
+# The live main-only runner is used only if this commit is already on main.
+# Otherwise execute the reviewed branch workflow in hardware-plan.md.
 ```
 
 The runner coordinates all ranks, keeps the window through both boots, records
@@ -146,3 +150,12 @@ describe the reuse path and must not be presented as cold-prefill throughput gai
 Use matching recorded release suites separately for any deployment-wide verdict.
 Reject on any output mismatch, invalid prefix reuse, cleanup failure or memory-guard
 breach. Promotion still requires the owner's acceptance and a new immutable baseline.
+
+The exact upstream PR source also passes 275 CPU cache-manager tests (four known
+HiSparse cases deselected), recorded in `runs/upstream-pr-cpu.txt`. The controlled
+serving specification and restored-service workflow are in `hardware-plan.md`.
+
+The window-aware harness and restoration helper pass 16 CPU tests; the current
+comparison plan and offline TP3 doctor also pass. These are preparation checks, not
+hardware gains. Heartbeats must be written atomically so concurrent request checks
+never see a partial hold file.
