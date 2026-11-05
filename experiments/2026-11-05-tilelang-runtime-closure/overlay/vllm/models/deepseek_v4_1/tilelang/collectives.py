@@ -406,29 +406,44 @@ def rank_rows_kernel():
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def rank_rows_bytes_kernel():
-    """The tail/unaligned all-gather layout conversion, as exact payload bytes."""
-    source_bytes, output_bytes = T.dynamic("source_bytes, output_bytes")
+def rank_rows_bytes_kernel(unit: int = 1):
+    """Tail/unaligned rank rows as opaque 1-, 2- or 4-byte payloads."""
+    assert unit in (1, 2, 4)
+    dtype = {1: T.uint8, 2: T.uint16, 4: T.uint32}[unit]
+    source_units, output_units = T.dynamic("source_units, output_units")
 
     @T.prim_func
     def collectives_rank_rows_bytes(
-        src: T.Tensor((source_bytes,), T.uint8),
-        dst: T.Tensor((output_bytes,), T.uint8),
+        src: T.Tensor((source_units,), dtype),
+        dst: T.Tensor((output_units,), dtype),
         world: T.int32,
         rows: T.int32,
-        row_bytes: T.int32,
+        row_units: T.int32,
     ):
-        with T.Kernel(rows, T.ceildiv(world * row_bytes, 256), threads=256) as (
-            row,
-            block,
-        ):
-            col = block * 256 + T.get_thread_binding()
-            if col < world * row_bytes:
-                dst[row * (world * row_bytes) + col] = src[
-                    ((col // row_bytes) * rows + row) * row_bytes + col % row_bytes
+        with T.Kernel(T.ceildiv(output_units, 256), threads=256) as block:
+            index = block * 256 + T.get_thread_binding()
+            if index < output_units:
+                row = index // (world * row_units)
+                col = index % (world * row_units)
+                dst[index] = src[
+                    ((col // row_units) * rows + row) * row_units + col % row_units
                 ]
 
     return collectives_rank_rows_bytes
+
+
+def _rank_rows_tail(gathered, out, world, rows, row_bytes):
+    unit = next(
+        n for n in (4, 2, 1) if row_bytes % n == 0 and gathered.data_ptr() % n == 0
+    )
+    dtype = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[unit]
+    rank_rows_bytes_kernel(unit)(
+        gathered.view(-1).view(dtype),
+        out.view(-1).view(dtype),
+        world,
+        rows,
+        row_bytes // unit,
+    )
 
 
 def rank_rows_calls() -> list[prepare.TileLangCall]:
@@ -439,7 +454,8 @@ def rank_rows_calls() -> list[prepare.TileLangCall]:
     return (
         []
         if get_tp_group().world_size < 2
-        else [prepare.call(rank_rows_kernel), prepare.call(rank_rows_bytes_kernel)]
+        else [prepare.call(rank_rows_kernel)]
+        + [prepare.call(rank_rows_bytes_kernel, unit) for unit in (1, 2, 4)]
     )
 
 
@@ -473,13 +489,7 @@ def concat_rank_shards(
                 row_bytes // 16,
             )
         else:
-            rank_rows_bytes_kernel()(
-                gathered.view(-1).view(torch.uint8),
-                out.view(-1).view(torch.uint8),
-                world,
-                rows,
-                row_bytes,
-            )
+            _rank_rows_tail(gathered, out, world, rows, row_bytes)
     return out
 
 

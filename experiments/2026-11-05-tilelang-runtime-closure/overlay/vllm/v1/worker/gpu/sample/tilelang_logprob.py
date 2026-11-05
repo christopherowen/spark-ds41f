@@ -73,16 +73,22 @@ _BLOCK = 8192
 
 
 @tilelang.jit(pass_configs=_PASS)
-def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: int):
+def ranks_kernel(
+    vocab: int,
+    stride: int,
+    dtype: str,
+    id_dtype: str,
+    threads: int,
+    write_scores: bool = False,
+):
     rows = T.symbolic("rows")
     id_stride = T.dynamic("id_stride", "int64")
 
-    @T.prim_func
-    def token_ranks(
-        logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
-        token_ids: T.StridedTensor((rows,), (id_stride,), id_dtype),
-        output: T.Tensor((rows,), "int64"),
-    ):
+    columns = T.dynamic("columns")
+    id_row, id_col = T.dynamic("id_row, id_col", "int64")
+
+    @T.macro
+    def body(logits, token_ids, output, ids, scores):
         with T.Kernel(rows, threads=threads) as row:
             counts = T.alloc_fragment((_BLOCK,), "int32")
             total = T.alloc_fragment((1,), "int32")
@@ -105,6 +111,36 @@ def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: in
             T.reduce_sum(counts, total, dim=0)
             output[row] = T.cast(total[0], "int64")
 
+            if write_scores:
+                for group in T.serial(T.ceildiv(columns, threads)):
+                    col = group * threads + T.get_thread_binding()
+                    if col < columns:
+                        scores[row, col] = T.cast(
+                            logits[T.cast(row, T.int64), ids[row, col]], T.float32
+                        )
+
+    if write_scores:
+
+        @T.prim_func
+        def token_ranks_scores(
+            logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
+            token_ids: T.StridedTensor((rows,), (id_stride,), id_dtype),
+            output: T.Tensor((rows,), "int64"),
+            ids: T.StridedTensor((rows, columns), (id_row, id_col), id_dtype),
+            scores: T.Tensor((rows, columns), T.float32),
+        ):
+            body(logits, token_ids, output, ids, scores)
+
+        return token_ranks_scores
+
+    @T.prim_func
+    def token_ranks(
+        logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
+        token_ids: T.StridedTensor((rows,), (id_stride,), id_dtype),
+        output: T.Tensor((rows,), "int64"),
+    ):
+        body(logits, token_ids, output, logits, logits)
+
     return token_ranks
 
 
@@ -125,7 +161,12 @@ def rank_threads(dtype: torch.dtype) -> int:
     return 256 if dtype == torch.float32 else 512
 
 
-def register_ranks(logits: Sequence[tuple[torch.dtype, int]], vocab_size: int) -> None:
+def register_ranks(
+    logits: Sequence[tuple[torch.dtype, int]],
+    vocab_size: int,
+    *,
+    selected_scores: bool = False,
+) -> None:
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     if JitWarmupRegistry.active() is None:
@@ -133,11 +174,27 @@ def register_ranks(logits: Sequence[tuple[torch.dtype, int]], vocab_size: int) -
     from vllm.models.deepseek_v4_1.tilelang.prepare import declare
 
     declare(
-        lambda: [
-            rank_call(dtype, stride, vocab_size, id_dtype)
-            for dtype, stride in logits
-            for id_dtype in (torch.int32, torch.int64)
-        ]
+        lambda: (
+            [
+                rank_call(dtype, stride, vocab_size, id_dtype)
+                for dtype, stride in logits
+                for id_dtype in (torch.int32, torch.int64)
+            ]
+            + [
+                _call(
+                    ranks_kernel,
+                    vocab_size,
+                    stride,
+                    _DTYPES[dtype],
+                    _DTYPES[id_dtype],
+                    rank_threads(dtype),
+                    True,
+                )
+                for dtype, stride in logits
+                for id_dtype in (torch.int32, torch.int64)
+                if selected_scores
+            ]
+        )
     )
 
 
@@ -198,6 +255,7 @@ def topk_log_softmax_kernel(
     id_dtype: str = "int64",
     id_layout: str = "compact",
     prefetch_ids: bool = False,
+    include_ranks: bool = False,
 ):
     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
@@ -242,7 +300,7 @@ def topk_log_softmax_kernel(
                     raw[u * run + k] = logits[row, col0 + k]
 
     @T.macro
-    def fold_max(raw, peak, step, tx, guarded):
+    def fold_max(raw, peak, step, tx, guarded, selected_rank, rank_count):
         """Fold the step's elements into the thread's maxima, one a load; a column
         past the row is -inf."""
         for j in tuple(range(per)):
@@ -254,6 +312,10 @@ def topk_log_softmax_kernel(
                 -T.infinity(T.float32),
             )
             peak[j // run] = T.call_extern("float32", "vllm_max", peak[j // run], value)
+            if include_ranks:
+                rank_count[0] += T.cast(
+                    (column(step, j, tx) < vocab) & (value >= selected_rank[0]), T.int32
+                )
 
     @T.macro
     def fold_sum(raw, total, tally, maximum, step, tx, guarded):
@@ -282,16 +344,16 @@ def topk_log_softmax_kernel(
             )
             tally[j // run] = T.call_extern("float32", "vllm_add", tally[j // run], tie)
 
-    @T.prim_func
-    def topk_log_softmax(
-        output: T.Tensor((rows, topk), T.float32),
-        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
-        token_ids: T.StridedTensor((rows, topk), id_strides, id_dtype),
-        valid: T.Tensor((valid_rows, valid_cols), T.bool),
-    ):
+    @T.macro
+    def body(output, logits, token_ids, valid, ranks):
         with T.Kernel(rows, threads=threads) as row:
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
+            if include_ranks:
+                selected_rank = T.alloc_local((1,), T.float32)
+                rank_count = T.alloc_local((1,), T.int32)
+                rank_count[0] = 0
+                selected_rank[0] = T.cast(logits[row, token_ids[row, 0]], T.float32)
             if prefetch_ids:
                 T.assume(topk <= threads)
                 # Reuse the reduction barriers; each thread later reads its own slot.
@@ -323,10 +385,26 @@ def topk_log_softmax_kernel(
                 peak[u] = -T.infinity(T.float32)
             if guarded:
                 load(logits, raw, row, full, tx, True)
-                fold_max(raw, peak, full, tx, True)
+                fold_max(
+                    raw,
+                    peak,
+                    full,
+                    tx,
+                    True,
+                    selected_rank if include_ranks else best,
+                    rank_count if include_ranks else best,
+                )
             for step in T.serial(full):
                 load(logits, raw, row, full - 1 - step, tx, False)
-                fold_max(raw, peak, full - 1 - step, tx, False)
+                fold_max(
+                    raw,
+                    peak,
+                    full - 1 - step,
+                    tx,
+                    False,
+                    selected_rank if include_ranks else best,
+                    rank_count if include_ranks else best,
+                )
             best[0] = peak[0]
             for u in tuple(range(1, loads)):
                 best[0] = T.call_extern("float32", "vllm_max", best[0], peak[u])
@@ -361,6 +439,25 @@ def topk_log_softmax_kernel(
                 ),
             )
 
+            if include_ranks:
+                rank_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.int32)
+                for delta in (16, 8, 4, 2, 1):
+                    rank_count[0] += T.call_extern(
+                        "int32",
+                        "__shfl_xor_sync",
+                        T.uint32(0xFFFFFFFF),
+                        rank_count[0],
+                        delta,
+                    )
+                if tx % 32 == 0:
+                    rank_partial[tx // 32] = rank_count[0]
+                T.sync_threads()
+                if tx == 0:
+                    count = T.alloc_var(T.int32, init=0)
+                    for warp in T.unroll(_SOFTMAX_WARPS):
+                        count += rank_partial[warp]
+                    ranks[row] = T.cast(count, T.int64)
+
             # The selected tokens, 1024 at a time. Row offsets are 64-bit.
             row64 = T.cast(row, T.int64)
             for c in T.serial(T.ceildiv(topk, threads)):
@@ -381,6 +478,29 @@ def topk_log_softmax_kernel(
                             valid[row64, col], value, -T.infinity(T.float32)
                         )
                     output[row64, col] = value
+
+    if include_ranks:
+
+        @T.prim_func
+        def topk_log_softmax_ranks(
+            output: T.Tensor((rows, topk), T.float32),
+            logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+            token_ids: T.StridedTensor((rows, topk), id_strides, id_dtype),
+            valid: T.Tensor((valid_rows, valid_cols), T.bool),
+            ranks: T.Tensor((rows,), T.int64),
+        ):
+            body(output, logits, token_ids, valid, ranks)
+
+        return topk_log_softmax_ranks
+
+    @T.prim_func
+    def topk_log_softmax(
+        output: T.Tensor((rows, topk), T.float32),
+        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+        token_ids: T.StridedTensor((rows, topk), id_strides, id_dtype),
+        valid: T.Tensor((valid_rows, valid_cols), T.bool),
+    ):
+        body(output, logits, token_ids, valid, output)
 
     return topk_log_softmax
 
@@ -444,6 +564,16 @@ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
         for id_dtype in (torch.int32, torch.int64)
         for id_layout in ("compact", "row", "column", "transpose", "general")
         for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
+    ] + [
+        _call(
+            topk_log_softmax_kernel,
+            *topk_log_softmax_key(dtype, run, False, id_dtype, layout, False),
+            True,
+        )
+        for dtype in dict.fromkeys(logits_dtypes)
+        for run in _runs(dtype)
+        for id_dtype in (torch.int32, torch.int64)
+        for layout in ("compact", "row")
     ]
 
 
@@ -581,3 +711,27 @@ def gather_logits(
             output.view(torch.bool) if valid is None else valid,
         )
     return output
+
+
+def prompt_scores_and_ranks(logits, token_ids, scores, ranks, *, logits_mode=False):
+    """Unmasked selected prompt scores and their sampled-token ranks, one pass."""
+    if not logits.shape[0]:
+        return
+    if logits_mode:
+        kernel = _kernel(
+            ranks_kernel,
+            logits.shape[1],
+            logits.stride(0),
+            _DTYPES[logits.dtype],
+            _DTYPES[token_ids.dtype],
+            rank_threads(logits.dtype),
+            True,
+        )
+        kernel(logits, token_ids[:, 0], ranks, token_ids, scores)
+    else:
+        key = _score_key(logits, token_ids, False)
+        if key[-2] not in ("compact", "row"):
+            raise ValueError("prompt selected IDs must have unit column stride")
+        _kernel(topk_log_softmax_kernel, *key, True)(
+            scores, logits, token_ids, scores.view(torch.bool), ranks
+        )

@@ -40,7 +40,7 @@ def register_topk_scores_warmup(
             f"top-k logprobs' range 0..{tilelang_topk_ids.TOPK_IDS_MAX}"
         )
     tilelang_topk_ids.register_topk_ids(logits)
-    register_ranks(logits, vocab_size)
+    register_ranks(logits, vocab_size, selected_scores=logits_mode)
     if logits_mode:
         register_gather_logits(logits)
     else:

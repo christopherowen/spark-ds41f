@@ -76,9 +76,27 @@ algorithms while assigning only allocation/concatenation output destinations to
 shared buffers; no compute operation is elided from the reference. At zero
 alternatives the candidate ID result aliases the input and needs no GPU copy.
 
-All 586 patches through `0004` apply from the pinned upstream in a fresh source
+All 589 patches through `0004` apply from the pinned upstream in a fresh source
 tree, reproducing `701fd9619a4a2af710207f6469a58ede67ce37fc`. Doctor passes with
 the existing ignored site maps. Build check reports missing prepared build
 inputs; no new image has been built. Ruff on the new prompt change reports only
 three inherited diagnostics (the test docstring line and two TileLang DSL nested
 conditions); no new diagnostic is introduced.
+
+## Further independent corrections
+
+The column-first sampler still missed the strict gate at 96 padded FP32 rows
+(mean +0.54% on its first boot). `0005` tests a 4,096-element tile for large FP32
+matrices while retaining the 1,024-element tile for casts and small batches.
+`0006` copies gather tails in naturally aligned words on a flat grid instead of
+one byte per thread and one block per row. Each change affects its own kernel
+family and retains the packed reduction/gather programs.
+
+Prompt output alone removed concatenations but several expensive cases were
+still statistically unresolved. `0007` tests rank calculation in the existing
+selected-score pass: logits mode adds selected stores to the rank kernel;
+log-probability mode counts exact integer ranks while finding the maximum. The
+normal rank/log-softmax paths reuse their bodies with the extra work disabled;
+their generated-program identity must be verified. New bitwise tests compare
+against the independent kernels for FP16/BF16/FP32 and both ID widths, including
+NaN, infinity and signed zero. No modified program is accepted without tests.

@@ -69,18 +69,20 @@ def test_sampler_declarations_include_the_copy_specializations():
     calls = kernels.sampling_calls([torch.float16, torch.bfloat16, torch.float32])
     # The declaration goes through the same factory/key as the runtime launch.
     expected = [
-        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized)
+        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized, span)
         for d in (torch.float16, torch.bfloat16, torch.float32)
         for vectorized in (False, True)
+        for span in ((1024, 4096) if vectorized and d == torch.float32 else (1024,))
     ]
     assert all(c in calls for c in expected)
 
 
-@pytest.mark.parametrize("cols", [1020, 1024, 1028])
+@pytest.mark.parametrize("cols", [1020, 1024, 1028, 4092, 4096, 4100])
+@pytest.mark.parametrize("rows", [5, 96])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols):
+def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols, rows):
     pitch = (cols + 31) // 16 * 16
-    src = torch.randn((5, pitch), dtype=dtype, device="cuda")[:, :cols]
+    src = torch.randn((rows, pitch), dtype=dtype, device="cuda")[:, :cols]
     before = src.clone()
     got = kernels.copy_logits(src)
     torch.testing.assert_close(got, src.float(), rtol=0, atol=0)

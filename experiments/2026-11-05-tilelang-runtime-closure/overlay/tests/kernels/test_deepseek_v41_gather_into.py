@@ -93,7 +93,7 @@ def test_bad_layouts_fail_explicitly():
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16, torch.float32, torch.int64, torch.complex64]
+    "dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.int64, torch.complex64]
 )
 @pytest.mark.parametrize("width", [1, 5, 17])
 def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):

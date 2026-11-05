@@ -210,11 +210,13 @@ def compute_prompt_logprobs_with_chunking(
             tilelang_topk_ids.logprob_token_ids(
                 logits, num_prompt_logprobs, sampled, out=selected
             )
-        if logits_mode:
-            tilelang_logprob.gather_logits(logits, selected, out=scores[start:end])
-        else:
-            tilelang_logprob.topk_log_softmax(logits, selected, scores[start:end])
-        tilelang_logprob.token_ranks(logits, sampled, ranks[start:end])
+        tilelang_logprob.prompt_scores_and_ranks(
+            logits,
+            selected,
+            scores[start:end],
+            ranks[start:end],
+            logits_mode=logits_mode,
+        )
 
     return token_ids, scores, ranks
 

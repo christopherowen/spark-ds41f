@@ -541,6 +541,21 @@ def test_runner_declares_the_launched_calls(logits_mode):
         for id_layout in ("compact", "row", "column", "transpose", "general")
         for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
     }
+    expected |= {
+        (
+            id(tilelang_logprob.topk_log_softmax_kernel),
+            (
+                *tilelang_logprob.topk_log_softmax_key(
+                    dtype, run, False, id_dtype, layout, False
+                ),
+                True,
+            ),
+        )
+        for dtype in (torch.bfloat16, torch.float32)
+        for run in tls._runs(dtype)
+        for id_dtype in (torch.int32, torch.int64)
+        for layout in ("compact", "row")
+    }
     declared = _declared(registry)
     softmax = {
         call
@@ -832,3 +847,37 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
                 for topk in (0, 5):
                     actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
                     assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("mode", ["raw_logits", "raw_logprobs"])
+def test_fused_prompt_scores_match_independent_kernels_bit_for_bit(
+    dtype, id_dtype, mode
+):
+    from vllm.v1.worker.gpu.sample.prompt_logprob import (
+        compute_prompt_logprobs_with_chunking,
+    )
+
+    logits = torch.randn(1025, 257, device=DEVICE, dtype=dtype)
+    logits[0, :4] = torch.tensor(
+        [float("inf"), -float("inf"), -0.0, 0.0], device=DEVICE, dtype=dtype
+    )
+    logits[1, :4] = float("nan")
+    logits[2].fill_(-float("inf"))
+    ids = (torch.arange(2050, dtype=id_dtype, device=DEVICE) % 257)[::2]
+    actual = compute_prompt_logprobs_with_chunking(
+        ids, logits, lambda value: value, 5, mode
+    )
+    expected = [
+        logprob.compute_topk_scores(
+            logits[start : start + 1024],
+            5,
+            ids[start : start + 1024],
+            logits_mode=mode == "raw_logits",
+        )
+        for start in range(0, 1025, 1024)
+    ]
+    for got, parts in zip(actual, zip(*(tuple(row)[:3] for row in expected))):
+        want = torch.cat(parts)
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))

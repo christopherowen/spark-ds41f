@@ -232,8 +232,7 @@ if args.family in ("gather", "all"):
                 return out
 
             def launch(src=src, out=out, count=count):
-                collectives.rank_rows_bytes_kernel()(src.view(-1).view(torch.uint8),
-                    out.view(-1).view(torch.uint8), 3, count, 5 * src.element_size())
+                collectives._rank_rows_tail(src, out, 3, count, 5 * src.element_size())
                 return out
 
             run_case(f"gather-tail-{dtype}-{count}",
