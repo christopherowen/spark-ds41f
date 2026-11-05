@@ -23,21 +23,23 @@ class Tile:
         return len(self.payload) + 9  # uint64 offset and uint8 mode on device
 
 
-def pack(raw, lz4):
-    if len(raw) != TILE_BYTES:
+def pack(raw, lz4, chunk_bytes=PLANE_BYTES):
+    if len(raw) != TILE_BYTES or chunk_bytes not in (256, 512, 1024, 2048):
         raise ValueError("the probe requires a complete N128/K128 tile")
     planes = bitplanes(raw)
     entries, payload = bytearray(), bytearray()
-    for plane in range(8):
-        source = planes[plane * PLANE_BYTES:(plane + 1) * PLANE_BYTES]
+    data = HEADER.size + TILE_BYTES // chunk_bytes * ENTRY.size
+    for start in range(0, TILE_BYTES, chunk_bytes):
+        source = planes[start:start + chunk_bytes]
         compressed = lz4.compress(source)
         # Equal aligned size buys no bandwidth; keep that plane RAW.
-        coded = (len(compressed) + 15) // 16 * 16 < PLANE_BYTES
+        coded = (len(compressed) + 15) // 16 * 16 < chunk_bytes
         block = compressed if coded else source
-        entries.extend(ENTRY.pack(DATA + len(payload), len(block) | (0 if coded else RAW)))
+        entries.extend(ENTRY.pack(data + len(payload), len(block) | (0 if coded else RAW)))
         payload.extend(block)
         payload.extend(bytes(-len(payload) % 16))
-    frame = HEADER.pack(b"P4L1", 8, PLANE_BYTES, TILE_BYTES, 0) + entries + payload
+    magic = b"P4L1" if chunk_bytes == PLANE_BYTES else b"P4L2"
+    frame = HEADER.pack(magic, 8, chunk_bytes, TILE_BYTES, 0) + entries + payload
     tile = Tile(1, bytes(frame)) if len(frame) < TILE_BYTES else Tile(0, raw)
     if unpack(tile, lz4) != raw:
         raise ValueError("plane-LZ4 encoding failed exact reconstruction")
@@ -49,23 +51,28 @@ def unpack(tile, lz4):
         if len(tile.payload) != TILE_BYTES:
             raise ValueError("invalid RAW tile extent")
         return tile.payload
-    if tile.mode != 1 or not DATA <= len(tile.payload) < TILE_BYTES:
+    if tile.mode != 1 or not HEADER.size <= len(tile.payload) < TILE_BYTES:
         raise ValueError("invalid plane-LZ4 tile extent or mode")
-    if HEADER.unpack_from(tile.payload) != (b"P4L1", 8, PLANE_BYTES, TILE_BYTES, 0):
+    magic, count, chunk, size, reserved = HEADER.unpack_from(tile.payload)
+    if (count != 8 or size != TILE_BYTES or reserved or chunk not in (256, 512, 1024, 2048)
+            or magic != (b"P4L1" if chunk == PLANE_BYTES else b"P4L2")):
         raise ValueError("invalid plane-LZ4 header")
-    position, planes = DATA, bytearray()
-    for plane in range(8):
-        offset, flags = ENTRY.unpack_from(tile.payload, HEADER.size + plane * ENTRY.size)
+    streams = TILE_BYTES // chunk
+    position, planes = HEADER.size + streams * ENTRY.size, bytearray()
+    if len(tile.payload) < position:
+        raise ValueError("truncated plane-LZ4 directory")
+    for stream in range(streams):
+        offset, flags = ENTRY.unpack_from(tile.payload, HEADER.size + stream * ENTRY.size)
         length = flags & ~RAW
         raw = bool(flags & RAW)
         end = offset + length
         padded_end = (end + 15) // 16 * 16
-        if (offset != position or not 0 < length <= PLANE_BYTES
-                or raw and length != PLANE_BYTES or not raw and padded_end - offset >= PLANE_BYTES
+        if (offset != position or not 0 < length <= chunk
+                or raw and length != chunk or not raw and padded_end - offset >= chunk
                 or padded_end > len(tile.payload) or any(tile.payload[end:padded_end])):
             raise ValueError("invalid plane-LZ4 stream extent or padding")
         block = tile.payload[offset:end]
-        planes.extend(block if raw else lz4.decompress(block, PLANE_BYTES))
+        planes.extend(block if raw else lz4.decompress(block, chunk))
         position = padded_end
     if position != len(tile.payload):
         raise ValueError("unused plane-LZ4 payload")

@@ -18,3 +18,11 @@ A GPU probe must measure bounded independent-stream decode and the inverse
 bit permutation against the same word-sized RAW consumer. Every reconstructed
 GPU byte and consumer checksum must match before timing. A proxy win still
 needs an unchanged-arithmetic GEMM consumer and two serving boots.
+
+The 512-byte stream variant trades extra directory entries and shorter LZ4
+history for more warp-level work: its two CPU preparations save 5.2325% and
+produce identical payload hashes. The 2 KiB form keeps its original P4L1 ABI;
+smaller independent chunks use P4L2. Both reconstruct every source byte.
+
+The CUDA byte-consumer prototype and driver are prepared but have not been
+compiled or run on the target. They are not serving integration or a speed claim.

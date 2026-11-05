@@ -24,10 +24,11 @@ class PlaneLz4Tests(unittest.TestCase):
             self.skipTest("liblz4 is not installed")
         for raw in (bytes(range(256)) * 64, bytes(frame.TILE_BYTES),
                     random.Random(17).randbytes(frame.TILE_BYTES)):
-            tile = frame.pack(raw, self.lz4)
-            self.assertEqual(frame.unpack(tile, self.lz4), raw)
-            self.assertEqual(tile, frame.pack(raw, self.lz4))
-            self.assertEqual(tile.stored_bytes, len(tile.payload) + 9)
+            for chunk in (256, 512, 1024, 2048):
+                tile = frame.pack(raw, self.lz4, chunk)
+                self.assertEqual(frame.unpack(tile, self.lz4), raw)
+                self.assertEqual(tile, frame.pack(raw, self.lz4, chunk))
+                self.assertEqual(tile.stored_bytes, len(tile.payload) + 9)
         self.assertEqual(tile.mode, 0)
 
     def test_each_bit_coordinate_transposes_and_the_operation_is_its_inverse(self):
@@ -35,8 +36,9 @@ class PlaneLz4Tests(unittest.TestCase):
             for value in range(8):
                 word = 1 << (8 * plane + value)
                 self.assertEqual(frame.transpose8(word), 1 << (8 * value + plane))
+        generator = random.Random(41)
         for _ in range(20):
-            word = random.getrandbits(64)
+            word = generator.getrandbits(64)
             self.assertEqual(frame.transpose8(frame.transpose8(word)), word)
 
     def test_header_extents_and_padding_cannot_be_silently_accepted(self):

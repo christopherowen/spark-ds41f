@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--chunk-bytes", type=int, choices=(256, 512, 1024, 2048), default=2048)
     args = parser.parse_args()
     if args.out.exists():
         parser.error("refusing to overwrite evidence")
@@ -30,11 +31,11 @@ def main():
         raw = base64.b64decode(sample["data_base64"], validate=True)
         if len(raw) != TILE_BYTES or hashlib.sha256(raw).hexdigest() != sample["sha256"]:
             raise ValueError("sample shape or original-byte identity differs")
-        tile = pack(raw, lz4)
+        tile = pack(raw, lz4, args.chunk_bytes)
         coded = sum(not (ENTRY.unpack_from(tile.payload, HEADER.size + i * ENTRY.size)[1] & RAW)
-                    for i in range(8)) if tile.mode else 0
+                    for i in range(TILE_BYTES // args.chunk_bytes)) if tile.mode else 0
         rows.append({"name": sample["name"], "tile_origin": sample["tile_origin"],
-                     "sha256": sample["sha256"], "mode": tile.mode, "compressed_planes": coded,
+                     "sha256": sample["sha256"], "mode": tile.mode, "compressed_streams": coded,
                      "stored_bytes": tile.stored_bytes,
                      "payload_sha256": hashlib.sha256(tile.payload).hexdigest()})
     if not rows:
@@ -43,7 +44,8 @@ def main():
     here = Path(__file__).parent
     result = {"schema_version": 1, "scope": "exact CPU size feasibility; no GPU or serving measurement",
               "command": sys.argv, "input_manifest_sha256": hashlib.sha256(source).hexdigest(),
-              "model_revision": inputs["model_revision"], "tiles": len(rows), "rows": rows,
+              "model_revision": inputs["model_revision"], "chunk_bytes": args.chunk_bytes,
+              "tiles": len(rows), "rows": rows,
               "decoded_bytes": raw, "actual_stored_bytes": stored, "saving_pct": 100 * (1 - stored / raw),
               "library": {"version": lz4.version, "binary_sha256": lz4.binary_sha256},
               "source_sha256": {name: hashlib.sha256((here / name).read_bytes()).hexdigest() for name in
