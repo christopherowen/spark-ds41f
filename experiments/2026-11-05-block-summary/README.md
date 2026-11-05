@@ -130,3 +130,16 @@ check/timing program. All 12 actual batches must retain the independent visible
 coarse BF16 score bits, fine-score bits and ordering before two fresh timing
 processes. Any failed bit check rejects this optimization. This does not change
 summary representation, budgets, fine-score arithmetic or answer protocol.
+
+
+The stage diagnostic (`runs/stages-01`) identifies the mean scorer as the main
+cost: approximately 70–85% at 8/64 rows; assembly is a small share. The tile128
+probe passes coarse bits on all 12 captured batches but is slower still in its
+first timing process (native/candidate 0.31–0.46). It yields at 14:43:53 UTC on a
+foreign request; a second process would not rescue this clear screen failure.
+The single unfavorable process and orderly-yield error remain in
+`runs/tile128-01`. Its generic controller labels the check verdict as performance
+measured; that is a controller metadata error. The check's own result correctly
+says `performance_measured: false`; its elapsed time is not a performance sample.
+The generated CUDA exposes a CTA barrier inside every summary-row load iteration.
+The next experiment changes only that double-write initialization pattern.
