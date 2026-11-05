@@ -78,11 +78,32 @@ def validate_plan(text, operation):
         raise ValueError("start plan lacks shape evidence")
 
 
+def resume_arms(previous, current, arms):
+    """Only a clean, restored handoff may supply an ordered measured prefix."""
+    if (previous.get("completed") is not False or previous.get("restored") is not True
+            or previous.get("error") != "RuntimeError: handoff requested after completed arm"
+            or previous.get("restore_error")):
+        raise ValueError("resume requires a restored handoff, not a failed or completed stage")
+    for key in ("commit", "gate_sources", "images", "restore_profile", "stage", "screen_receipt_sha256"):
+        if previous.get(key) != current.get(key):
+            raise ValueError(f"resume {key} differs")
+    completed = previous.get("completed_arms", [])
+    if not 0 < len(completed) < len(arms):
+        raise ValueError("resume needs a nonempty incomplete prefix")
+    for measured, arm in zip(completed, arms):
+        if (measured.get("label"), measured.get("config")) != (
+                arm["label"], f"{EXPERIMENT}/{arm['config']}"):
+            raise ValueError("resume arms are not the planned ordered prefix")
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("screen", "qualify010", "qualify020", "restore"), default="screen")
     parser.add_argument("--window")
     parser.add_argument("--restore-commit", help="exact original deployment SHA captured before branch sync")
+    parser.add_argument("--resume-from", help="same-stage receipt from a restored handoff at this exact commit")
+    parser.add_argument("--screen-from", help="completed causal screen receipt for qualification after a handoff")
     parser.add_argument("--keep-open", action="store_true")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
@@ -95,9 +116,15 @@ def main():
         suites = ["release-tp3", "single-stream", "sampled"]
     if args.stage == "restore":
         arms = []
+    if args.resume_from and args.stage == "restore":
+        raise SystemExit("restoration cannot resume a measurement")
+    if args.screen_from and not args.stage.startswith("qualify"):
+        raise SystemExit("only qualification accepts an external completed screen")
     if not args.apply:
         print(json.dumps({"stage": args.stage, "arms": arms, "suites": suites,
                           "restore_profile": RESTORE, "image": IMAGE,
+                          "resume_from": args.resume_from,
+                          "screen_from": args.screen_from,
                           "requires_owned_window": HOLDER, "shape_change": False}, indent=2))
         return 0
     if os.uname().nodename != "dgx1" or not owns(lab.read_hold(), args.window):
@@ -163,12 +190,52 @@ def main():
             identities[node["name"]] = result.stdout.strip()
         receipt["images"] = identities; save()
         signatures = None
+        completed = []
+        def stage_path(value, stage):
+            path = Path(value).resolve()
+            base = (ROOT / "results/private/lab/verification-budget-hardware").resolve()
+            if not path.is_relative_to(base) or path.name != stage:
+                raise ValueError("resume artifacts must be native receipts for the same stage")
+            return path
         if args.stage.startswith("qualify"):
-            screen = out.parent / "screen"
-            if json.loads((screen / "receipt.json").read_text()).get("completed") is not True:
-                raise RuntimeError("qualification needs this window's completed causal screen")
-            signatures = json.loads((screen / "control035-a-signatures.json").read_text())
-        for index, arm in enumerate(arms):
+            source = (Path(args.screen_from).resolve() if args.screen_from
+                      else out.parent / "screen/receipt.json")
+            screen = stage_path(source.parent, "screen")
+            screen_receipt = json.loads(source.read_text())
+            if screen_receipt.get("completed") is not True:
+                raise RuntimeError("qualification needs a completed causal screen")
+            for key in ("commit", "gate_sources", "images", "restore_profile"):
+                if screen_receipt.get(key) != receipt.get(key):
+                    raise ValueError(f"qualification screen {key} differs")
+            control = next(arm for arm in screen_receipt["completed_arms"] if arm["label"] == "control035-a")
+            control_screen = stage_path(control.get("source_run", str(screen)), "screen")
+            signatures = json.loads((control_screen / "control035-a-signatures.json").read_text())
+            receipt.update(screen_receipt=str(source),
+                           screen_receipt_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+            save()
+        if args.resume_from:
+            source = Path(args.resume_from).resolve()
+            prior = json.loads(source.read_text())
+            source_run = stage_path(source.parent, args.stage)
+            completed = resume_arms(prior, receipt, arms)
+            for measured in completed:
+                # Older handoffs record their own directory implicitly.
+                measured.setdefault("source_run", str(source_run))
+                origin = stage_path(measured["source_run"], args.stage)
+                recorded = json.loads((origin / f"{measured['label']}-signatures.json").read_text())
+                if set(recorded) != {name for name, _, _ in GATES}:
+                    raise ValueError("resume signatures lack a required gate")
+                if signatures is not None and recorded != signatures:
+                    raise ValueError("resume signatures changed between completed arms")
+                signatures = recorded
+            if args.stage == "screen":
+                corpus = stage_path(completed[0]["source_run"], "screen") / arms[0]["label"] / "screen-suite/model.json.gz"
+                if not corpus.is_file():
+                    raise ValueError("resume model corpus is missing")
+            receipt.update(completed_arms=completed, resumed_from=str(source),
+                           resumed_receipt_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+            save()
+        for index, arm in enumerate(arms[len(completed):]):
             # A window's first arm includes its preceding coordinated sync.
             # Finish that job on a new request, then hand off before the next arm.
             if index and lab.window_should_close(lab.read_hold()):
@@ -249,13 +316,15 @@ def main():
                 output = out / label / stem
                 argv = [sys.executable, "bin/spark", "--cluster-config", config, "bench", "--suite", suite,
                         "--compare", "none", "--label", label, "--output", str(output)]
-                corpus = (out / arms[0]["label"] / stem / "model.json.gz" if args.stage == "screen"
+                first_screen = stage_path(completed[0]["source_run"], args.stage) if completed else out
+                corpus = (first_screen / arms[0]["label"] / stem / "model.json.gz" if args.stage == "screen"
                           else ROOT / PARENT / suite / "model.json.gz")
                 if corpus.exists() and output != corpus.parent:
                     argv += ["--corpus", str(corpus)]
                 with lab.Telemetry(str(output) + "-telemetry", config):
                     command(argv, label + "-" + stem)
-            receipt.setdefault("completed_arms", []).append({"label": label, "config": config, "ended": lab.now()})
+            receipt.setdefault("completed_arms", []).append({"label": label, "config": config,
+                                                            "source_run": str(out), "ended": lab.now()})
             save()
             active_arm = None
         success = True

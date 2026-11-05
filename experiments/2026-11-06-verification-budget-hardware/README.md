@@ -15,6 +15,11 @@ regression check. Both attempts remain in `runs/preflight/`. A clean isolated
 dgx1 checkout was prepared at that published commit; its doctor passed. At
 that preflight, the canonical serving checkouts remained unchanged.
 
+The expanded tool/schema gate at `e7fe9895` passed nine remote tests, all three
+profile doctors and both dry plans (0.11 s / 26,080 KiB maximum test RSS).
+Those receipts are in `runs/preflight/tool-schema-e7fe9895/`. This validates
+the harness and profile preparation; the HTTP gate still needs real hardware.
+
 The first window, `dgx1-1793922050`, subsequently opened from the captured
 original commit `2c4b23af` and synchronized the three clean checkouts to
 `297acf25`. Before a candidate boot, a CED prefill-boundary request arrived.
@@ -35,10 +40,10 @@ preflight found the exact image on dgx1, dgx2 and dgx3.
 
 ## Shared window and deployment
 
-The observed dgx1 hold belongs to the frontend lifetime qualification,
+At initial preparation the dgx1 hold belonged to the frontend lifetime qualification,
 window `dgx1-1793917240`; `norm-projection-boundaries` has the existing request.
-Neither file may be overwritten. The native lab queue had no pending/running
-specs. This experiment waits behind that handoff; it must not run through the
+Neither file was overwritten. The native lab queue had no pending/running
+specs. Current ownership must be read afresh; this experiment must not run through the
 generic `spark-lab` holder-prefix check while another task owns the window.
 Prefill work can take priority while this decode experiment is waiting.
 
@@ -85,6 +90,17 @@ also validates through `scripts/lab.py run <experiment>/screen.json --dry-run`,
 but **do not execute that spec with the main-syncing queue**. The guarded
 runner adds the functional gates and exact restoration sequence.
 
+After a request interrupts a stage at an arm boundary, `--resume-from` may
+reference that stage's native `receipt.json` in a later owned window. It
+requires a successfully restored handoff, the identical published commit,
+image identities and gate sources, and an ordered completed prefix. It checks
+the retained gate signatures and uses the original model corpus. Completed
+arms keep their original receipt paths and are not rerun. Other failures do
+not qualify for automatic resumption. For qualification after a screen's
+window closes, `--screen-from` names the completed screen receipt; the same
+commit/image/gate checks apply. Keep handoff times in the final comparison,
+because measurements spanning windows have additional environmental drift.
+
 ## Workload and decision
 
 The first stage uses six fresh boots in order 0.01, 0.035, 0.02, 0.02, 0.035,
@@ -97,7 +113,12 @@ later arms. The control is explicitly an unreleased C40 causal control on this
 new workload; it is not a rerun of the released 1030 reference.
 
 Before timing each arm, require the existing wide greedy token/logprob gate,
-seeded temperature-1 batch/repeat gate, and controls/tool/grammar digests.
+seeded temperature-1 batch/repeat gate, and sampling-control digests. The
+separate tool/schema gate sends 16 distinct requests in each combination of
+forced tool versus strict JSON schema, temperature 0 versus 1, and c1/c8/c16.
+It checks exact generated values and native token IDs across batching and
+policy arms. It also requires rejection of an invalid request followed by a
+successful ordinary request.
 False summary verdicts fail even when an old script exits zero. Signatures
 must agree across arms/boots; subsequent qualification also compares to the
 screen's control signatures. Native logs, source hashes, image identities,

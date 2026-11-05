@@ -6,6 +6,22 @@ import tool_schema_gate
 
 
 class GateTests(unittest.TestCase):
+    def test_resume_accepts_only_restored_ordered_handoff_at_identical_inputs(self):
+        arms = [{"label": "row010-a", "config": "row010.json"},
+                {"label": "control035-a", "config": "control.json"}]
+        identity = {"commit": "a" * 40, "stage": "screen", "gate_sources": {"gate": "hash"},
+                    "images": {"dgx1": "digest"}, "restore_profile": runner.RESTORE}
+        previous = {**identity, "completed": False, "restored": True,
+                    "error": "RuntimeError: handoff requested after completed arm",
+                    "completed_arms": [{"label": "row010-a", "config": f"{runner.EXPERIMENT}/row010.json"}]}
+        self.assertEqual(runner.resume_arms(previous, identity, arms), previous["completed_arms"])
+        for change in ({"completed": True}, {"restored": False}, {"error": "gate failed"},
+                       {"commit": "b" * 40}, {"gate_sources": {}}, {"images": {}},
+                       {"completed_arms": []}, {"completed_arms": [{"label": "control035-a"}]},
+                       {"restore_error": "failed"}):
+            with self.assertRaises(ValueError):
+                runner.resume_arms({**previous, **change}, identity, arms)
+
     def test_tool_and_schema_content_must_match_and_have_native_ids(self):
         expected = {"label": "record-0", "value": 7}
         message = {"content": json.dumps(expected), "tool_calls": [{"function": {
