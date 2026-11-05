@@ -21,7 +21,7 @@ The first GPU screen at `80c579c2` passes70 declared calls across eight
 configurations after cache freeze, all12 actual coarse/fine checks, four strict
 initialization fixtures with zero sanitizer errors and six lifecycle/recycling
 cases. On reused diagnostic captures, mean native-key recall increases about
-6–12 percentage points with no per-query key-recall loss. This is a fidelity
+2.3–12.2 percentage points with no per-query key-recall loss. This is a fidelity
 proxy on reused operands, not independent answer-quality evidence.
 
 Two fresh processes retain dense Native68/candidate ratios0.707–0.746 at one
