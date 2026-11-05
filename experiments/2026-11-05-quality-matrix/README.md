@@ -95,3 +95,13 @@ is retained in `runs/code-window-04`; public receipts contain no program text.
 C37 is restored at 19:06:35 UTC. An independent reader verifies the exact image,
 clean equal serving revisions, no experimental mounts/environment and no holds
 or pending requests on all four nodes. No candidate is promoted.
+
+`--benchmark longbench --split pilot|heldout` now runs the same frozen
+LongBench client and phase-aware quality gate on this cooler TP4 group. It
+validates the original selection and input hashes before taking leases, keeps
+all serial/cold/cached phases, and records four-node conditions. The TP3 thermal
+failure is retained; its partial timings are not reused as TP4 controls.
+`--candidate-config` selects a published experimental recipe while native and
+restoration authority stay fixed. The out-of-band observer can stop only this
+owned evaluator on a proven final-answer loss. Every model candidate still
+requires its own kernel/lifecycle qualification before a serving window.

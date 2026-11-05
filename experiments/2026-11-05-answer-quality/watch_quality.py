@@ -46,7 +46,8 @@ def client_pids(root,out):
     for pid,(parent,argv) in processes.items():
         if str(root/'experiments/2026-11-05-answer-quality/evaluate.py') not in argv:continue
         if parent not in processes:continue
-        if str(root/'experiments/2026-11-05-answer-quality/measure.py') not in processes[parent][1]:continue
+        parents=[root/('experiments/'+folder+'/measure.py') for folder in ('2026-11-05-answer-quality','2026-11-05-quality-matrix')]
+        if not any(str(p) in processes[parent][1] for p in parents):continue
         clients.append(pid)
     return clients
 
@@ -58,7 +59,7 @@ def main():
     assert window.is_relative_to(Path.home()/'spark-lab/results') and root.is_dir()
     assert args.poll_seconds>=1
     identity=json.loads((window/'window.json').read_text());token=identity['token']
-    assert identity['holder']=='independent-answer-quality-window'
+    assert identity['holder'] in ('independent-answer-quality-window','lsa-independent-quality-window')
     allowed=os.sched_getaffinity(0)-set(range(5,10))-set(range(15,20))
     if allowed:os.sched_setaffinity(0,allowed)
     (window/'quality-observer.json').write_text(json.dumps({'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

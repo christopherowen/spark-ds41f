@@ -71,7 +71,8 @@ def main():
         conditions={name:json.loads((out/('answers-'+name+'-conditions.json')).read_text())
                     if (out/('answers-'+name+'-conditions.json')).exists() else None for name in runs}
         result['conditions_passed']=all(v and not v['halted'] and not v['fan_stop_failures']
-            and len(v['thermal'])==3 and not any(t.get('thermal_slowdown_ms') for t in v['thermal'].values()) for v in conditions.values())
+            and len(v['thermal'])==len(jobs.get('nodes',['sp5','sp6','sp7']))
+            and not any(t.get('thermal_slowdown_ms') for t in v['thermal'].values()) for v in conditions.values())
         result['conclusion']='Pilot evidence only; held-out completed-answer and performance confirmation required.' if jobs['split']=='pilot' else 'Inspect paired quality, useful speed and every task/context category before any superiority or promotion decision.'
     else:
         result['missing_or_incomplete']=[name for name,r in runs.items() if not r or not r.get('complete')]

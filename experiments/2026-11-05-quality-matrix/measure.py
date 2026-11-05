@@ -16,7 +16,7 @@ from spark_ds41f.config import read_cluster,read_json
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--profile',required=True)
-    p.add_argument('--benchmark',choices=['code','ruler'],required=True)
+    p.add_argument('--benchmark',choices=['code','ruler','longbench'],required=True)
     p.add_argument('--cache',required=True)
     p.add_argument('--private',required=True)
     p.add_argument('--out',type=Path,required=True)
@@ -40,7 +40,7 @@ def main():
         if problems and not all(r['service']=='absent' for r in conditions['fan_curve']):
             raise RuntimeError('; '.join(problems))
         conditions['fan_warnings']=problems;memory.wait_ready()
-        folder='2026-11-05-answer-quality' if args.benchmark=='code' else '2026-11-05-context-quality'
+        folder='2026-11-05-context-quality' if args.benchmark=='ruler' else '2026-11-05-answer-quality'
         client='generate_code.py' if args.benchmark=='code' else 'evaluate.py'
         command=[sys.executable,str(HERE.parent/folder/client),'--cache',args.cache,
                  '--private',args.private,'--out',str(args.out)]

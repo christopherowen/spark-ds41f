@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 import statistics
+import subprocess
+import sys
 
 from check_quality import check
 
@@ -18,6 +20,9 @@ def main():
     args=p.parse_args();root=args.window;target=root/'comparison.json'
     assert not target.exists(),'refuse to overwrite evidence'
     source=json.loads((root/'source.json').read_text());benchmark=source['benchmark']
+    if benchmark=='longbench':
+        subprocess.run([sys.executable,str(HERE.parent/'2026-11-05-answer-quality/summarize.py'),str(root)],check=True)
+        return
     generations={};grades={};missing=[]
     for label in LABELS:
         generation=root/('answers-'+label+'.json')

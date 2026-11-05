@@ -19,6 +19,32 @@ def fixture(benchmark):
 
 
 class GateTests(unittest.TestCase):
+    def test_longbench_adapter_uses_its_phase_gate(self):
+        spec=importlib.util.spec_from_file_location('matrix_longbench',Path(__file__).with_name('run_window.py'))
+        controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
+        root=Path(__file__).parent.parent/'2026-11-05-query-reuse/runs/pilot-window-02'
+        runs={label:json.loads((root/('answers-'+label+'.json')).read_text())
+              for label in ('native-a','native-b','lsa-a','lsa-b')}
+        self.assertTrue(controller.quality_result(runs,runs,'longbench')['passed'])
+        self.assertTrue(controller.early_result(runs,runs,'lsa-a','longbench')['passed'])
+        changed=copy.deepcopy(runs)
+        row=next(r for r in changed['lsa-a']['phases'][0]['records'] if r['correct'])
+        row.update(correct=False,status='truncated',finish_reason='length')
+        self.assertFalse(controller.early_result(changed,changed,'lsa-a','longbench')['passed'])
+        self.assertFalse(controller.quality_result(changed,changed,'longbench')['passed'])
+
+    def test_custom_profile_does_not_change_restoration_authority(self):
+        spec=importlib.util.spec_from_file_location('matrix_profile',Path(__file__).with_name('run_window.py'))
+        controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
+        original=controller.w.REL
+        config=Path('experiments/2026-11-05-compact-runtime/candidate.json')
+        command=controller.profile_action(config,'doctor')
+        self.assertIn(str(config),command)
+        self.assertEqual(controller.w.REL,original)
+        with patch.object(controller.w,'start',side_effect=RuntimeError('boot failed')):
+            with self.assertRaises(RuntimeError):controller.profile_action(config,'start',None,'boot')
+        self.assertEqual(controller.w.REL,original)
+
     def test_recorded_reference_failure_does_not_omit_model_tests(self):
         path=Path(__file__).parent/'runs/code-window-03/grade-oracle/receipt.json'
         receipt=json.loads(path.read_text())

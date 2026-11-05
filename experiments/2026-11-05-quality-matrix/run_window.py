@@ -22,6 +22,38 @@ IMAGE='sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713'
 from check_quality import canonical_check,check,early
 
 
+def load_answer_module(name):
+    spec=importlib.util.spec_from_file_location('matrix_answer_'+name,HERE.parent/'2026-11-05-answer-quality'/(name+'.py'))
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
+
+
+def quality_result(generations,grades,benchmark):
+    if benchmark=='longbench':
+        return load_answer_module('check_quality').check(
+            [generations[n] for n in ('native-a','native-b')],
+            [generations[n] for n in ('lsa-a','lsa-b')])
+    return check(generations,grades,benchmark)
+
+
+def early_result(generations,grades,label,benchmark):
+    if benchmark=='longbench':
+        failures=load_answer_module('watch_quality').regressions(generations['native-a'],generations[label])
+        return {'passed':not failures,'checks':failures}
+    losses=early(grades['native-a'],grades[label],benchmark)
+    incomplete=[r['id'] for r in generations[label]['records'] if r['status']!='complete' or r['finish_reason']!='stop']
+    return {'passed':not(losses or incomplete),'losses':losses,'incomplete':incomplete}
+
+
+def profile_action(config,action,*args):
+    previous=w.REL
+    try:
+        w.REL=str(config.parent)
+        if action=='start':return w.start(config.stem,*args)
+        return w.spark(config.stem,action,*args)
+    finally:w.REL=previous
+
+
 def runtime_identity():
     return w.each('''import json,subprocess
 from pathlib import Path
@@ -72,14 +104,17 @@ def grade(cache,private,out,label):
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True)
-    p.add_argument('--benchmark',choices=['code','ruler'],default='code')
+    p.add_argument('--benchmark',choices=['code','ruler','longbench'],default='code')
     p.add_argument('--cache',type=Path);p.add_argument('--split',choices=['pilot','heldout'],default='pilot')
+    p.add_argument('--candidate-config',type=Path,default=Path(w.REL)/'candidate.json')
     p.add_argument('--watchdog');p.add_argument('--preflight-only',action='store_true')
     args=p.parse_args();out=args.out.resolve()
     assert socket.gethostname()=='spark-0009','only the authorized idle sp1-sp4 group'
     if args.watchdog:return w.watchdog(args.watchdog,out)
     assert args.cache
     assert args.cache.is_dir()
+    candidate=args.candidate_config
+    assert not candidate.is_absolute() and '..' not in candidate.parts and (ROOT/candidate).is_file()
     private=Path.home()/'spark-lab/private/quality-matrix'/out.relative_to(Path.home()/'spark-lab/results')
     assert not out.exists() and not private.exists()
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
@@ -93,9 +128,18 @@ def main():
     out.mkdir(parents=True)
     (out/'preflight-identity.json').write_text(json.dumps(states,indent=2)+'\n')
     (out/'source.json').write_text(json.dumps({'commit':commit,'benchmark':args.benchmark,
-        'cache':str(args.cache),'split':args.split,'nodes':w.NODES,'private':str(private),
+        'cache':str(args.cache),'split':args.split,'nodes':w.NODES,'private':str(private),'candidate_config':str(candidate),
         'rule':'same model and protocol; two fresh boots per arm; independent final-answer grading'},indent=2)+'\n')
-    for profile in ('native','candidate','restore'):w.run(w.spark(profile,'doctor'),out,'doctor-'+profile)
+    for profile in ('native','candidate','restore'):
+        config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
+        w.run(profile_action(config,'doctor'),out,'doctor-'+profile)
+    if args.benchmark=='longbench':
+        preparation=load_answer_module('prepare')
+        assert preparation.digest(args.cache/'selection.json')==preparation.LOCK['selection_sha256']
+        selection=json.loads((args.cache/'selection.json').read_text())
+        assert selection['protocol']==preparation.LOCK['protocol']
+        assert preparation.digest(args.cache/(args.split+'-requests.jsonl'))==selection['artifact_sha256'][args.split+'-requests.jsonl']
+        (out/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
     baseline=None
     for i in range(7):
         metrics=urllib.request.urlopen('http://127.0.0.1:8000/metrics',timeout=15).read().decode()
@@ -169,24 +213,31 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
             validation=canonical_check(canonical)
             (out/'oracle-validation.json').write_text(json.dumps(validation,indent=2)+'\n')
         generations={};grades={}
-        for label,profile in [('native-a','native'),('lsa-a','candidate'),('lsa-b','candidate'),('native-b','native')]:
+        jobs=[('native-a','native'),('lsa-a','candidate'),('lsa-b','candidate'),('native-b','native')]
+        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'split':args.split,'nodes':w.NODES,'candidate_config':str(candidate)},indent=2)+'\n')
+        for label,profile in jobs:
             assert w.owns(token) and not errors
             assert not any(h['spark-request.json'] or h['spark3-request.json'] for h in w.each(w.HOLD_CODE,{'action':'read'}).values()),'pending requester'
-            w.start(profile,out,'boot-'+label)
-            command=[sys.executable,str(HERE/'measure.py'),'--profile',w.REL+'/'+profile+'.json',
+            config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
+            profile_action(config,'start',out,'boot-'+label)
+            if label=='lsa-a' and args.benchmark=='longbench':
+                with (out/'quality-observer-output.txt').open('x') as stream:
+                    subprocess.Popen([sys.executable,str(HERE.parent/'2026-11-05-answer-quality/watch_quality.py'),
+                        '--window',str(out),'--controller-root',str(ROOT)],cwd=ROOT,stdin=subprocess.DEVNULL,
+                        stdout=stream,stderr=subprocess.STDOUT,start_new_session=True)
+            command=[sys.executable,str(HERE/'measure.py'),'--profile',str(config),
                      '--benchmark',args.benchmark,'--cache',str(args.cache),'--split',args.split,
                      '--private',str(private/label),'--out',str(out/('answers-'+label+'.json'))]
             w.run(command,out,'benchmark-'+label)
             generations[label]=json.loads((out/('answers-'+label+'.json')).read_text())
             grades[label]=grade(args.cache,private/label,out,label) if args.benchmark=='code' else generations[label]
             if label.startswith('lsa-'):
-                losses=early(grades['native-a'],grades[label],args.benchmark)
-                incomplete=[r['id'] for r in generations[label]['records'] if r['status']!='complete' or r['finish_reason']!='stop']
-                if losses or incomplete:
-                    (out/('quality-reject-'+label+'.json')).write_text(json.dumps({'passed':False,'losses':losses,'incomplete':incomplete},indent=2)+'\n')
+                result=early_result(generations,grades,label,args.benchmark)
+                if not result['passed']:
+                    (out/('quality-reject-'+label+'.json')).write_text(json.dumps(result,indent=2)+'\n')
                     raise RuntimeError('observed final-answer regression; restoring before further benchmarks')
             (out/'completed.json').write_text(json.dumps({'at':w.stamp(),'completed':list(generations)},indent=2)+'\n')
-        result=check(generations,grades,args.benchmark)
+        result=quality_result(generations,grades,args.benchmark)
         (out/'quality.json').write_text(json.dumps(result,indent=2)+'\n')
         assert result['passed'],'final repeated-boot quality gate failed'
     except Exception:
