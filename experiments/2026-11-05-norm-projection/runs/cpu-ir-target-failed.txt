@@ -1,0 +1,35 @@
+INFO 11-05 23:44:47 [importing.py:74] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 11-05 23:44:47 [importing.py:98] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 11-05 23:44:47 [interface.py:369] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+W1105 23:44:47.114000 1 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/target.py", line 103, in _validate_manual_target
+    Target(normalized_target)
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/target/target.py", line 145, in __init__
+    self.__init_handle_by_constructor__(_ffi_api.Target, target)
+  File "python/tvm_ffi/cython/object.pxi", line 355, in tvm_ffi.core.Object.__init_handle_by_constructor__
+  File "python/tvm_ffi/cython/object.pxi", line 183, in tvm_ffi.core.CObject.__init_handle_by_constructor__
+  File "python/tvm_ffi/cython/function.pxi", line 126, in tvm_ffi.core.ConstructorCall
+  File "python/tvm_ffi/cython/error.pxi", line 176, in tvm_ffi.core.CHECK_CALL
+  File "<unknown>", line 0, in tvm::TargetInternal::ConstructorDispatcher(tvm::ffi::PackedArgs, tvm::ffi::Any*)
+  File "<unknown>", line 0, in tvm::Target::Target(tvm::ffi::String const&)
+  File "/workspace/tilelang/3rdparty/tvm/src/target/target.cc", line 266, in static tvm::ffi::ObjectPtr<tvm::TargetNode> tvm::TargetInternal::FromString(const tvm::ffi::String&)
+ValueError: Cannot parse target string "cuda -arch=sm_121". CLI target string form (e.g. "llvm -mcpu=xxx") is no longer supported. Please use JSON dict form (e.g. {"kind": "llvm", "mcpu": "xxx"}) instead.. Target creation from string failed: cuda -arch=sm_121
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/screen/check_split_ir.py", line 14, in <module>
+    tilelang.lower(function,target="cuda -arch=sm_121",enable_host_codegen=False,enable_device_compile=False)
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py", line 237, in lower
+    context = create_backend_context(target, target_host, "auto")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py", line 320, in create_backend_context
+    normalized_target = determine_target(target, return_object=True)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/target.py", line 132, in determine_target
+    return_var = _validate_manual_target(target)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/target.py", line 105, in _validate_manual_target
+    raise AssertionError(
+AssertionError: Target cuda -arch=sm_121 is not supported. Pass target options as a dict when the target needs attributes.

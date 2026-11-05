@@ -46,6 +46,17 @@ def reservation(action):
         "            if req.exists() and json.loads(req.read_text()).get('who')==holder: req.unlink()\n" +
         "            print(json.dumps({'acquired':True}))\n" +
         "        except FileExistsError: print(json.dumps({'acquired':False}))\n" +
+        "elif action=='request':\n" +
+        "    if requester: print(json.dumps({'queued':False,'request':requester}))\n" +
+        "    else:\n" +
+        "        data={'who':holder,'why':'Resume published kernel-only DGX4 norm/projection boundary screen after the active job; no serving changes in this job','how_long':'30 minutes for two fresh process runs; yield after the active run on request','since':now,'branch':'feat/norm-projection-boundaries'}\n" +
+        "        try:\n" +
+        "            with req.open('x') as f: json.dump(data,f,indent=2)\n" +
+        "            print(json.dumps({'queued':True}))\n" +
+        "        except FileExistsError: print(json.dumps({'queued':False}))\n" +
+        "elif action=='cancel_request':\n" +
+        "    if requester and requester.get('who')==holder: req.unlink()\n" +
+        "    print(json.dumps({'cancelled':True}))\n" +
         "elif action=='refresh':\n" +
         "    if not record or record.get('holder')!=holder: raise RuntimeError('reservation lost')\n" +
         "    record['heartbeat']=now; temporary=p.with_name('spark-hold-norm-projection.tmp'); temporary.write_text(json.dumps(record,indent=2)); temporary.replace(p)\n" +
@@ -66,7 +77,9 @@ def stop_owned_container():
 
 def cleanup():
     global held
-    if not held: return
+    if not held:
+        reservation('cancel_request')
+        return
     stop_owned_container()
     stop.set()
     reservation('release')
@@ -112,15 +125,20 @@ def main():
     subprocess.run(['git','diff','--cached','--exit-code'],cwd=ROOT,check=True)
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     subprocess.run(['git','merge-base','--is-ancestor',commit,'origin/feat/norm-projection-boundaries'],cwd=ROOT,check=True)
+    records_path=EXP/'runs/run-records.json'
+    records=json.loads(records_path.read_text()) if records_path.exists() else []
+    if any(record['commit']!=commit or record['exit'] for record in records):
+        raise RuntimeError('Existing receipts need review; refusing to overwrite a different or failed run')
+    completed={record['run'] for record in records}
     deadline=time.monotonic()+3600
     while time.monotonic()<deadline:
         claim=reservation('claim')
         if claim.get('acquired'):
             held=True; break
+        reservation('request')
         time.sleep(30)
     if not held: raise RuntimeError('GPU window unavailable after one hour; no GPU work ran')
     thread=threading.Thread(target=heartbeat,daemon=True); thread.start()
-    records=[]
     try:
         if subprocess.check_output(['docker','ps','-q'],text=True).strip():
             raise RuntimeError('GPU node has a running container; no work started')
@@ -135,6 +153,8 @@ def main():
             return command[:2]+['--name',CONTAINER,'--label',f'spark.experiment={HOLDER}','--memory=12g','--memory-swap=12g','--cpus=2','--pids-limit=256']+command[2:]
         lab.bundle_command=bounded
         for run in (1,2):
+            if run in completed: continue
+            if (EXP/'runs'/f'run-{run}').exists(): raise RuntimeError('Existing output directory; refusing to overwrite it')
             if reservation('refresh').get('requested'): break
             cooling=spark.cool_nodes(nodes,[target],55,600)
             fan=spark.start_fan_curve(nodes,[target])
