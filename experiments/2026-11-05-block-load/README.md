@@ -37,3 +37,21 @@ are zeroed without loading an invalid table suffix. No new tensor allocation or
 GPU work is added by the view. An actual-score check precedes two fresh-process
 performance screens; initialization/lifecycle checks follow only if the screen
 finds a useful gain. Serving requires every gate plus final-answer evaluation.
+
+
+The page-copy actual check passes all 12 captured batches. Both fresh timing
+processes show dense64 native/candidate ratios 1.165–1.178 and source8/64
+1.187–1.283, while dense8 is approximately neutral. Single-query shapes still
+lose: dense0.66–0.69, source0.87–0.88. All samples and t intervals are in
+`runs/copy-01/comparison.json`. Allocator peaks are approximately 349 MB allocated
+and 373 MB reserved. Processes start at 52/54 C, end at 54/55 C, and report no
+active hardware thermal slowdown at the end. This is a useful component signal
+but not an all-shape, request-speed or answer-quality pass. The lease releases
+at 15:03:28 UTC with no containers left; a later independent reader finds no
+lease, request, container or GPU compute process.
+
+The next exact-arithmetic experiment decodes each packed query once per row
+into an explicitly admitted bounded workspace, then reuses it across all
+coarse scoring CTAs. Summary representation and selected-score arithmetic remain
+unchanged. This removes repeated computation rather than reducing quality or
+excluding work from timers. No model startup occurs until safety and speed gates.
