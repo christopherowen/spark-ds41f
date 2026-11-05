@@ -71,6 +71,8 @@ class WatchdogTest(unittest.TestCase):
                     return 'original\n'
                 if argv[0] == 'docker':
                     return 'image\n'
+                if argv[-2:] == ['doctor', '--live'] and not any('start' in call for call in calls):
+                    raise RuntimeError('candidate is live')
                 return 'live: stopped\nshape: unchanged\n' if 'cluster' in argv else ''
             with patch.object(guard, 'checked', side_effect=fake):
                 guard.restore(state, hold, root / 'out')
@@ -94,6 +96,8 @@ class WatchdogTest(unittest.TestCase):
                     return 'original\n'
                 if argv[0] == 'docker':
                     return 'image\n'
+                if argv[-2:] == ['doctor', '--live'] and not any('start' in call for call in calls):
+                    raise RuntimeError('candidate is live')
                 if 'sync' in argv and '--apply' in argv:
                     raise RuntimeError('sync failed')
                 return 'live: stopped\nshape: unchanged\n' if 'cluster' in argv else ''

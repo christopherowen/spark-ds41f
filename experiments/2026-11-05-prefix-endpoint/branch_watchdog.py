@@ -68,16 +68,23 @@ def restore(state, hold_path, output):
         raise RuntimeError('Restore image tag no longer names the captured digest')
     base = [str(controller / 'bin/spark'), '--cluster-config', state['restore_profile']]
     checked([*base, 'doctor'], controller, output / 'doctor-offline.txt')
-    steps = [('stop', []), ('sync', ['--revision', state['restore_commit']]), ('start', ['--replace'])]
-    for action, extra in steps:
+    already_restored = False
+    try:
+        checked([*base, 'doctor', '--live'], controller, output / 'doctor-before.txt')
+        already_restored = True
+    except RuntimeError:
+        pass
+    if not already_restored:
+        steps = [('stop', []), ('sync', ['--revision', state['restore_commit']]), ('start', ['--replace'])]
+        for action, extra in steps:
+            own()
+            argv = [*base, 'cluster', action, *extra]
+            plan = checked(argv, controller, output / f'{action}-plan.txt')
+            verify_plan(action, plan)
+            own()
+            checked([*argv, '--apply'], controller, output / f'{action}-apply.txt')
         own()
-        argv = [*base, 'cluster', action, *extra]
-        plan = checked(argv, controller, output / f'{action}-plan.txt')
-        verify_plan(action, plan)
-        own()
-        checked([*argv, '--apply'], controller, output / f'{action}-apply.txt')
-    own()
-    checked([*base, 'doctor', '--live'], controller, output / 'doctor-live.txt')
+        checked([*base, 'doctor', '--live'], controller, output / 'doctor-live.txt')
     own()
     (output / 'restored.json').write_text(json.dumps({
         'window': state['window'], 'commit': state['restore_commit'],

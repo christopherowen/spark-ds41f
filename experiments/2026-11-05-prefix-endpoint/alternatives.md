@@ -49,7 +49,7 @@ of GPU allocation or physical memory savings; all entries occupy the same fixed 
 Let N be the completed producer prompt, A the appended tokens, and B=256 the
 global hit-page size. With private replay R=128, no request can legally hit past
 
-    floor(min(N, N + A - R) / B) * B
+    max(0, floor(min(N, N + A - R) / B) * B)
 
 even if every encoder block is retained. For A >= 0 and R < B, this upper bound
 can take only the resend endpoint or the final complete producer endpoint.

@@ -118,8 +118,9 @@ scripts/lab.py run experiments/2026-11-05-prefix-endpoint/lab-tp3.json --dry-run
 # Otherwise execute the reviewed branch workflow in hardware-plan.md.
 ```
 
-The runner coordinates all ranks, keeps the window through both boots, records
-startup memory and per-step telemetry, and restores production once at the end.
+The coordinated commands cover all ranks. Keep the window across the measured
+boots, record startup memory and per-step telemetry, and restore production once
+at the end using the captured original commit and profile.
 The guarded probe reuses the repository memory watcher, with the configured
 memguard plus 1 GiB floor, cooling/fan requirements and thermal ceilings on every
 node. It stops requests if telemetry goes stale or a guard trips, and records memory,
@@ -155,7 +156,7 @@ The exact upstream PR source also passes 275 CPU cache-manager tests (four known
 HiSparse cases deselected), recorded in `runs/upstream-pr-cpu.txt`. The controlled
 serving specification and restored-service workflow are in `hardware-plan.md`.
 
-The window-aware harness and restoration helper pass 16 CPU tests; the current
+The window-aware harness and restoration helper pass 18 CPU tests; the current
 comparison plan and offline TP3 doctor also pass. These are preparation checks, not
 hardware gains. Heartbeats must be written atomically so concurrent request checks
 never see a partial hold file.
