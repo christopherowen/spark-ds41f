@@ -1,5 +1,5 @@
 {
-  "status": "unmeasured_candidate",
+  "status": "component_gain_serving_unqualified",
   "host_checks": {
     "graph_suite": {
       "passed": 35,
@@ -20,13 +20,39 @@
   "memory": {
     "cpu_test_container_peak_bytes": 900780032,
     "source_jobs_limit_bytes": 8589934592,
-    "gpu_memory_observations": null,
+    "gpu_memory_observations": {
+      "receipt": "runs/micro-20261106/summary.json",
+      "peak_tensor_bytes_each_boot": 1667584,
+      "container_peak_bytes": [
+        1189314560,
+        1189294080
+      ],
+      "limitations": "Whole screen including compilation, caches and all five arms; not incremental serving-graph memory. Driver free-memory deltas on unified-memory host are not attribution."
+    },
     "note": "CPU container cgroup memory.peak observed after tests; no inference about graph or serving memory."
   },
-  "gpu_runs": [],
+  "gpu_runs": [
+    {
+      "boot": 1,
+      "status": "pass",
+      "regressions_passed": 3,
+      "exact_comparisons": 192,
+      "receipt": "runs/micro-20261106/boot-1/measurements.json.gz"
+    },
+    {
+      "boot": 2,
+      "status": "pass",
+      "regressions_passed": 3,
+      "exact_comparisons": 192,
+      "receipt": "runs/micro-20261106/boot-2/measurements.json.gz"
+    }
+  ],
   "serving_runs": [],
-  "confidence_interval": null,
-  "performance_verdict": "no proven change; no measurements",
+  "confidence_interval": {
+    "method": "10000-draw paired bootstrap over 24 trials per boot; separate boot intervals, not a serving confidence interval",
+    "receipt": "runs/micro-20261106/summary.json"
+  },
+  "performance_verdict": "Component gain established on both fresh boots. At 8 requests/8K, 218.154 -> 5.128 us and 225.644 -> 5.096 us. With ~775 us queued GPU work, only 2.940 us and 2.663 us exposed saving. No serving gain established.",
   "historical_host_gap_bound": {
     "source": "experiments/2026-10-26-core-metrics-plan/runs/trace-waits-ports-rank0.txt",
     "step_ms": [

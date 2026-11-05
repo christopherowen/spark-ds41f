@@ -30,8 +30,8 @@ still required. Do not extrapolate these synthetic consumer timings to serving.
 Resources: Spaceport only, one GPU after its present job finishes, two CPUs,
 8 GiB memory, two build workers, isolated per-boot caches and output paths. The
 expected short screen is about five minutes; a cold compiler may take longer.
-The active dgx1 hold currently forbids GPU experiments. Execute only after that
-hold is released or the owner explicitly exempts this isolated Spaceport screen.
+The owner explicitly exempted this isolated Spaceport screen from the active
+dgx1 hold. Both boots completed under the Spaceport reservations and CPU lock.
 No serving-cluster operation is part of this screen.
 
 Invocation inside the immutable candidate-38 image with the three committed
@@ -51,4 +51,5 @@ It challenges whether earlier GPU work hides the isolated host savings. It is a
 controlled overlap test, not a model execution or serving-throughput prediction.
 The six loaded runtime source files are hash-checked before measurement.
 
-No result is available at preparation time.
+Both boots completed successfully. See [micro-results.md](micro-results.md) and
+`runs/micro-20261106/` for all raw paired samples, exact identities and receipts.

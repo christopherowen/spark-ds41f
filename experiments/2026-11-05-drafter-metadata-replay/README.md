@@ -25,7 +25,10 @@ Host regressions check refresh-before-query order, mutable buffer contents,
 padded capture shapes, mode/opt-in boundaries and fallback guards. The added CUDA
 regression compares every readable integer metadata row against eager execution
 for paged, compressed and circular caches after changed lengths, padding and slot
-reuse, with compilation frozen before capture. CUDA tests have not run.
+reuse, with compilation frozen before capture. All three CUDA cases passed on
+each of two fresh boots; 192 additional exact metadata/consumer comparisons
+passed per boot. [micro-results.md](micro-results.md) records before/after
+timings, alternative placements, the overlap challenge and memory observations.
 
 Historical rank-0 traces in
 `experiments/2026-10-26-core-metrics-plan/runs/trace-waits-ports-rank0.txt` show
@@ -37,8 +40,8 @@ All heavy preparation, environments, tests and publication after workstation
 recovery ran on Spaceport with a two-CPU/8-GiB limit and the shared CPU lock.
 `runs/` retains the unsuccessful setup and checks as well as the passing runs.
 `commands.md` gives reproduction and limitations; `qualification.md` gives the
-remaining gates. `results.json` distinguishes host checks from unmeasured GPU and
-serving outcomes. No source-complete image build or build check has run because
+remaining gates. `results.json` distinguishes host checks, measured component
+results and unmeasured serving outcomes. No source-complete image build or build check has run because
 only vLLM inputs were prepared.
 
 Acceptance requires a repeatable incremental serving improvement beyond both

@@ -5,7 +5,9 @@ Before any GPU job or node operation, read dgx1 `~/spark-hold.json`; yield to it
 holder. Preserve an existing `~/spark-request.json`. At preparation time both an
 active frontend qualification hold and another task's request existed.
 
-1. After a coordinated GPU slot becomes available, verify the clean source
+1. The three focused GPU metadata cases and the small placement screen passed
+   on two fresh Spaceport boots; see `micro-results.md`. The remaining broader
+   gates below have not run. For any further job, verify the clean source
    checkout is exactly the `candidate_source` commit in `base.json`. Use the
    immutable candidate-38 image with only this committed source delta overlaid,
    or a newly built candidate image with matching source labels. Keep resource
@@ -29,8 +31,9 @@ active frontend qualification hold and another task's request existed.
    its digest, source labels and whole release-gate result. Never overwrite an
    image tag or infer source identity from it.
 
-3. Serving validation requires explicit owner authorization for its named
-   coordinated operations. Before asking, produce the site-resolved TP3 plan
+3. The owner has authorized the normal coordinated operations needed for testing.
+   This does not bypass holds, queued requests or publication/restore rules.
+   Before a serving run, produce the site-resolved TP3 plan
    for all configured nodes and the exact restore profile observed by the window
    owner. The source-only `candidate.json` deliberately has launch disabled.
    Publish one clean deployment commit before node synchronization; use only

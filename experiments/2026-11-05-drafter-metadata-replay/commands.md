@@ -74,3 +74,21 @@ From the isolated deployment checkout on Spaceport:
 Result: 755 tests, 5 skipped, OK in 44.770 seconds. The native log includes
 synthetic benchmark fixtures against test servers. None are serving or GPU
 measurements, and none enter this experiment's performance results.
+
+## Authorized GPU screen, 2026-11-06 local date
+
+Exact deployment commit: `b752c7b8a44c19d9f0ed7879bb18eea773599624`.
+The clean source checkout was `a2b0ea500dc5022e23c4d6fc667254a806c984dc`.
+The first request yielded after boot 1 to a queued job; boot 2 resumed in a new
+container/cache after that job released its hold. Both exited zero.
+
+```sh
+.venv/bin/python -u experiments/2026-11-05-drafter-metadata-replay/run_micro_screen.py --deployment-commit b752c7b8a44c19d9f0ed7879bb18eea773599624 --output /home/chris/spark-lab/results/drafter-metadata-20261106-attempt1
+.venv/bin/python -u experiments/2026-11-05-drafter-metadata-replay/run_micro_screen.py --deployment-commit b752c7b8a44c19d9f0ed7879bb18eea773599624 --boots 2 --output /home/chris/spark-lab/results/drafter-metadata-20261106-attempt2
+```
+
+Here `.venv/bin/python` is the prepared source environment at
+`/home/chris/spark-lab/checkouts/vllm-drafter-orchestration-20261105/.venv/bin/python`,
+invoked from the deployment checkout. Each archived `command.json` contains the
+exact container command, mounts, environment and resource limits.
+`runs/micro-20261106/archives.json` hashes the retained raw outputs and summary.
