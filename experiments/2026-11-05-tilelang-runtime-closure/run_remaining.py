@@ -33,6 +33,8 @@ for name, operation, family, boot in jobs:
     if name in mapping["draft_extension"].values():
         command += ["--paired-rounds", "2048", "--case-filter",
                     str(HERE.relative_to(ROOT) / "draft-extension-cases.json")]
+    if operation == "tests" and boot == 2:
+        command += ["--cache-dir", str(OUT / mapping["tests"]["1"] / "tilelang-cache")]
     code = subprocess.run(command, cwd=ROOT).returncode
     results.append(dict(run=name, boot=boot, exit=code))
     (OUT / "recovery-v23.json").write_text(json.dumps(results, indent=2) + "\n")

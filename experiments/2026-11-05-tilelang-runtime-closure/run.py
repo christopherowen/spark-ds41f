@@ -62,9 +62,13 @@ def main():
     )
     parser.add_argument("--paired-rounds", type=int, choices=(120, 480, 2048), default=120)
     parser.add_argument("--case-filter", type=Path)
+    parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--boots", type=int, nargs="+", choices=(1, 2), default=[1, 2])
     parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "draft", "embedding", "all"), default="sampler")
     args = parser.parse_args()
+    if args.cache_dir:
+        assert args.cache_dir.is_dir()
+        assert args.cache_dir.resolve().is_relative_to(Path.home() / "spark-lab")
     if args.case_filter:
         assert args.operations in (["pair"], ["activity"], ["embedding_bench"], ["draft_bench"]), "filtered runs contain only paired jobs"
         case_filter = (ROOT / args.case_filter).resolve()
@@ -241,7 +245,7 @@ def main():
                 "-e",
                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
                 "-e",
-                "TILELANG_CACHE_DIR=/out/tilelang-cache",
+                "TILELANG_CACHE_DIR=" + ("/kernel-cache" if args.cache_dir else "/out/tilelang-cache"),
                 "-e",
                 "OMP_NUM_THREADS=2",
                 "-e",
@@ -260,6 +264,8 @@ def main():
                 "--out",
                 "/out/" + label,
             ]
+            if args.cache_dir:
+                cmd[2:2] = ["-v", str(args.cache_dir.resolve()) + ":/kernel-cache"]
             if job["operation"] in ("pair", "activity", "embedding_bench", "draft_bench"):
                 cmd += ["--rounds", str(args.paired_rounds)]
                 if args.case_filter:
