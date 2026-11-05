@@ -35,3 +35,7 @@ The ten-patch fresh source application equals the host overlay. All evidence and
 memory observations remain in `runs/graph-01`. The sp8 lease releases
 at21:51:31 UTC; independent verification finds no reservations, containers or
 compute processes. The model recipe remains unqualified and unpromoted.
+
+With PyTorch memory caching disabled for strict checking, its allocator counters
+are zero/unavailable. They are not a measured zero-memory peak or an admission
+claim; full serving memory qualification remains required.

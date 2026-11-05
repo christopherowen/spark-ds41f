@@ -183,3 +183,13 @@ LongBench payload. Reuse will first be eligible only when a complete matching
 cohort has been published. Tests cover valid pairs, changed code, stale/failed/
 incomplete/unstable controls, protocol/topology/split mismatch, thermal failures,
 unpublished evidence and restoration. No active controller is changed mid-run.
+
+The valid native-source screen (`821b5ec5`,
+`runs/native-source-ruler-screen-window-03`) completes all104 responses naturally:
+26/26 on every native and LSA boot, no lost answer or unstable score. LSA takes
+647.37/647.10 seconds versus native575.97/574.29: throughput is11.14% lower.
+Its generated length rises28.9% even though prefill and decode seconds per token
+improve. C37 restores at22:11:14 UTC; independent all-node verification passes.
+The complete [quality, performance and condition analysis](../2026-11-05-native-source/results.md)
+keeps this quality-preserving slowdown distinct from the earlier faster rejected
+recipe. No overall quality/speed winner is established.
