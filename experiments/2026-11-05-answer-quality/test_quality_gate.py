@@ -2,6 +2,7 @@ import copy
 import unittest
 
 from check_quality import check
+from watch_quality import regressions
 
 
 def report(correct=True):
@@ -14,6 +15,17 @@ def report(correct=True):
 
 
 class QualityGate(unittest.TestCase):
+    def test_partial_observer_uses_the_same_no_loss_rule(self):
+        native=report();candidate=report(False);candidate['complete']=False
+        self.assertEqual(regressions(native,candidate)[0]['id'],'document-a')
+        self.assertEqual(regressions(report(False),report()),[])
+        candidate['phases'][0]['records']=[]
+        self.assertEqual(regressions(native,candidate),[])
+
+    def test_observer_refuses_changed_prompt_before_any_action(self):
+        candidate=report(False);candidate['phases'][0]['records'][0]['prompt_sha256']='different'
+        with self.assertRaises(AssertionError):regressions(report(),candidate)
+
     def test_native_correct_candidate_wrong_is_rejected(self):
         result = check([report(),report()],[report(False),report(False)])
         self.assertFalse(result['passed'])

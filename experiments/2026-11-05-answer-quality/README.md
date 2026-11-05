@@ -27,6 +27,16 @@ it does not disqualify a candidate that completes and independently answers that
 question correctly. Baseline output is not an oracle. Protocol mismatches,
 candidate incompletion and lost native-correct answers still fail closed.
 
+`watch_quality.py` can observe public receipts from a separate published checkout
+without changing a running controller or serving source. Once the Native A arm
+is complete, it applies the same per-answer loss/completion rule to completed
+candidate responses. A proven loss is saved with exact input snapshots; only
+the matching benchmark evaluator child is terminated. The existing coordinated
+controller records the failed client, restores every serving rank and releases
+the window. The observer runs off the server's pinned CPU cores and makes no
+serving, activation or reference-model calls. It does not alter valid outputs or
+qualify speed from a rejected partial run.
+
 The pilot freezes one example per domain and untemplated-token bin (8K–64K and
 64K–256K), covering all six domains. Up to four independent document contexts per stratum form the
 held-out confirmation set (all remaining independent contexts when a stratum is
