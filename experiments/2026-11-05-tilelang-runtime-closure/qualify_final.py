@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 p = argparse.ArgumentParser()
 p.add_argument("--runs", type=Path, default=HERE / "runs")
 p.add_argument("--full", type=Path, default=HERE / "runs/full-native-embedding-v20")
-p.add_argument("--prior-full", type=Path)
+p.add_argument("--prior-full", type=Path, default=HERE / "runs/full-initial")
 p.add_argument("--run-map", type=Path, default=HERE / "accepted-runs.json")
 p.add_argument("--out", type=Path, default=HERE / "qualification.json")
 a = p.parse_args()
@@ -136,7 +136,8 @@ for boot in (1, 2):
     assert len(wires) == 16 and all(not r["aten_kernels"] for r in wires)
     wire[key] = dict(cases=len(wires), aten_kernels=0)
     test = point(run_map["tests"][key], "tests", boot)
-    assert test["pytest_exit"] == 0 and set(test["outcomes"]) == {"passed"}
+    assert test["pytest_exit"] == 0 and test["outcomes"] == {"passed": 1446}
+    assert test["family"] == "all"
     assert test["candidate"]["head"] == read(HERE / "candidate.json")["head"]
     tests[key] = test["outcomes"]
     instrumented = point(run_map["iket"][key], "iket", boot)
@@ -174,7 +175,8 @@ result = dict(candidate=read(HERE / "candidate.json"), run_map=run_map, passed=p
               iket=iket, full_model=full,
               scope="Changed GPU paths, complete changed-path CPU result transfers, and the recorded 43-layer dummy-weight request. Both boots must pass a five-standard-error upper ratio <=1 or proven identical GPU program/bindings.",
               remaining_release_gates=["built image", "real-weight quality and throughput",
-                                      "physical multi-node networking, including bulk NCCL"])
+                                      "physical multi-node networking, including bulk NCCL",
+                                      "untraced production features/workloads, including Engram and vision"])
 a.out.write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(dict(passed=passed, unresolved=unresolved, tests=tests,
                       full_model_request_kernels=7662), indent=2))

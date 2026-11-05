@@ -30,14 +30,14 @@ for marker, phase in (("iket_step_marker", "request"), ("iket_grid_marker", "gri
 
 
 def category(name, full):
-    if name in known:
-        return "tilelang"
     if "at::native" in full or "at::cuda::" in full:
         return "aten"
     if "nccl" in full.lower():
         return "nccl"
     if "cub::" in full:
         return "cub"
+    if name in known:
+        return "tilelang"
     return "unknown"
 
 

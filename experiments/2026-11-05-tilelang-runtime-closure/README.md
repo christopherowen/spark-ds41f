@@ -1,5 +1,39 @@
 # Complete the TileLang runtime replacements
 
+## Final local qualification — 2026-11-06
+
+The selected source is `1ad6b99163bdfad7f40f45503c1abce0083bf672`, tree
+`665f6e9f2cb6d079641d15a2bdfae522a2c43351`. All 602 patches reproduce that tree
+in the recorded fresh preparation. Both final boots pass 1,446 correctness tests
+and 33 eager/graph IKET numerical cases, covering all 14 required kernel families.
+
+Every declared local gate passes on both boots: 80 core GPU cases, 32 embedding
+cases, six complete drafting cases, and 12 complete changed-path CPU transfers.
+Each case requires a five-standard-error upper ratio <=1 or exact qualified
+program/binding identity. Predeclared precision extensions retain primary means
+and require both extension and pooled bounds to pass. Another 120 ordinary score
+program checks per boot preserve their qualified GPU programs. The 16 public wire
+cases per boot contain no ATen packing kernel.
+
+All four 43-layer dummy-weight traces contain 7,662 TileLang request launches,
+zero ATen/unknown request kernels, and unchanged token IDs/logprob bits. External
+namespaces are checked before generated short symbols; recomputing every complete
+inventory gives identical classifications. The traces use one GPU, TP3/TP4-shaped
+layers and disabled Engram. Startup and benchmark fixtures retain ATen/CUB work.
+Physical bulk collectives still select NCCL.
+
+See `qualification.json`, `runs/namespace-audit.json` and
+`runs/ordinary-score-identity.json`. Run `python3 qualify.py` remotely to rebuild
+the accepted summary from retained records. Streaming gzip verifies every original
+byte hash; original node artifacts remain intact. The chronology below retains
+unfavorable and inconclusive variants and tooling failures.
+
+The built image, real-weight quality/throughput, untraced production features
+(including Engram/vision) and physical networking remain release gates. The
+physical matrix and authorization boundary are in `fabric-qualification.md`.
+No promoted configuration, immutable baseline or serving process was changed.
+
+
 Base deployment: `9815f36b72e6caacf8565a181d271e522c8bafc9`, combining
 the five open replacement candidates (#885, #886, #887, #893 and #895).
 The promoted configuration and published baseline are unchanged.
