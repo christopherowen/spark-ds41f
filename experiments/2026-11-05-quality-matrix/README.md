@@ -105,3 +105,15 @@ failure is retained; its partial timings are not reused as TP4 controls.
 restoration authority stay fixed. The out-of-band observer can stop only this
 owned evaluator on a proven final-answer loss. Every model candidate still
 requires its own kernel/lifecycle qualification before a serving window.
+
+The first compact pilot (`08e6ff32`, `runs/compact-pilot-window-01`) boots Native
+successfully but stops before sending any model request: the copied frozen
+requests omit the pinned `upstream/pred.py` offline answer extractor. This is
+an input-preflight omission, not an answer or performance result. C37 restores
+at19:39:01 UTC and an independent all-node reader verifies clean checkouts,
+the exact image, no experimental mounts/environment and no remaining leases.
+All failed client, boot, condition and restore receipts remain retained.
+The complete small upstream cache, including its license, is now copied with
+pinned checksums. Preflight validates and exercises the official extractor before
+taking leases or replacing serving, so a missing grader cannot cause another
+wasted model boot. No input, model protocol or grading rule changes.

@@ -15,3 +15,10 @@ old tiles, physical IDs and replay hashes remain unchanged. No model response
 or held-out outcome informs the tile choice. Preserve every run/error/sample,
 memory observation and sp8 lease release in `runs/`. No model-quality or request
 performance claim can follow from this screen alone.
+
+The first screen at `5e4eb543` stops at Docker's duplicate-mount validation:
+the predecessor's unused probe and the new probe both target `/tmp/probe.py`.
+No container or kernel starts. Its original commands/error and released lease
+remain in `runs/screen-01`. The retry removes only the obsolete probe mount;
+every bundle's mount destinations are checked for uniqueness before publishing.
+The score factory, arithmetic and frozen operands remain unchanged.

@@ -139,6 +139,8 @@ def main():
         selection=json.loads((args.cache/'selection.json').read_text())
         assert selection['protocol']==preparation.LOCK['protocol']
         assert preparation.digest(args.cache/(args.split+'-requests.jsonl'))==selection['artifact_sha256'][args.split+'-requests.jsonl']
+        extractor=preparation.grader(args.cache)
+        assert extractor('The correct answer is (C).')=='C','pinned offline extractor preflight'
         (out/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
     baseline=None
     for i in range(7):
