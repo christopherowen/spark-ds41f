@@ -113,3 +113,12 @@ raw-token runs cover serial and four-concurrent requests; the native parallel
 reference is itself repeated before candidate measurements. Any mismatch stops
 ordinary qualification before candidate timing. Timed requests still omit token
 metadata. A finite synthetic screen does not qualify production-agent traffic.
+
+`batch-window-01` preserves a compiler failure before any model trial: both1536
+mechanical-compaction geometries pass, but the whole-domain compactor fails in
+`LegalizeNegativeIndex` with an int32/handle type error. No batch-boundary or
+request-speed pass is claimed. The controller restores C37 at22:11:30UTC; an
+independent all-node check at06:33:38UTC on November5 confirms clean checkouts,
+no experimental mounts/environment, and no reservations. The retry uses sp8
+and simplifies the identity loop to a static bound with guarded stores and a
+local predicate, retaining the same candidate identities/counts.

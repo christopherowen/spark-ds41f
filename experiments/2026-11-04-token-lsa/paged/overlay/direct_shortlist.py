@@ -36,6 +36,7 @@ def direct_candidates(width: int, page: int, budget: int, whole_domain: bool = F
             mask = T.alloc_local([1],T.int32)
             first = T.alloc_local([1],T.int32)
             last_present = T.alloc_local([1],T.int32)
+            covered = T.alloc_local([1],T.int32)
             membership = T.alloc_fragment([blocks],T.int32)
             keep = T.alloc_fragment([blocks],T.int32)
             ordered = T.alloc_fragment([blocks],T.int32)
@@ -43,10 +44,11 @@ def direct_candidates(width: int, page: int, budget: int, whole_domain: bool = F
             visible = T.ceildiv(extent,BLOCK)
             complete = extent//page*blocks
             partial = visible-complete
-            if whole_domain & (extent//page*buckets <= budget):
+            covered[0] = T.cast(whole_domain & (extent//page*buckets <= budget),T.int32)
+            if covered[0] != 0:
                 # The complete visible domain fits: no centroid scores or
                 # selection are needed. Construct its identity gather directly.
-                for iteration in T.serial(T.ceildiv(T.max(capacity-cta*32,0),ctas*32)):
+                for iteration in T.serial(tilelang.cdiv(capacity,ctas*32)):
                     for i in T.Parallel(32):
                         position = cta*32+iteration*ctas*32+i
                         if position < capacity:
