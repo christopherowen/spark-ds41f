@@ -22,7 +22,7 @@ IMAGE='sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713'
 from check_quality import check,early
 
 
-def identity():
+def runtime_identity():
     return w.each('''import json,subprocess
 from pathlib import Path
 x=json.loads(subprocess.check_output(['docker','inspect','spark-ds41f'],text=True))[0]
@@ -40,7 +40,7 @@ def restore(token,out,stem,finish_heartbeat=None):
     assert w.owns(token),'reservation changed; refusing another holder'
     code=w.run(w.spark('restore','doctor','--live'),out,stem+'-already-live',allow_failure=True)
     if code:w.start('restore',out,stem)
-    states=identity()
+    states=runtime_identity()
     assert all(s['image']==w.IMAGE and s['running'] and not s['experimental_mounts'] and not s['experimental_env']
                and all(not c['status'] for c in s['checkouts'].values()) for s in states.values()),states
     heads={s['checkouts'][SERVING]['head'] for s in states.values() if SERVING in s['checkouts']}
@@ -86,7 +86,7 @@ def main():
     assert not subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()
     assert subprocess.check_output(['git','branch','-r','--contains',commit],cwd=ROOT,text=True).strip()
     assert not any(any(h.values()) for h in w.each(w.HOLD_CODE,{'action':'read'}).values())
-    states=identity()
+    states=runtime_identity()
     assert all(s['image']==w.IMAGE and s['running'] and s['containers']==['spark-ds41f']
                and not s['experimental_mounts'] and not s['experimental_env']
                and all(not c['status'] for c in s['checkouts'].values()) for s in states.values()),states
@@ -162,9 +162,9 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
             cases=inputs(args.cache);oracle=private/'canonical'
             oracle.mkdir(mode=0o700,parents=True)
             with (oracle/'samples.jsonl').open('x') as stream:
-                for identity in LOCK['protocol']['task_ids']:
-                    case=cases[identity]
-                    stream.write(json.dumps({'id':identity,'content':case['prompt']+case['canonical_solution'],'finish_reason':'stop'})+'\n')
+                for task_id in LOCK['protocol']['task_ids']:
+                    case=cases[task_id]
+                    stream.write(json.dumps({'id':task_id,'content':case['prompt']+case['canonical_solution'],'finish_reason':'stop'})+'\n')
             canonical=grade(args.cache,oracle,out,'oracle')
             assert canonical['complete'] and all(r['correct'] for r in canonical['records']),'official canonical-program check failed; no model comparison is eligible'
         generations={};grades={}

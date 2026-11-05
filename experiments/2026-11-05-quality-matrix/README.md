@@ -50,3 +50,10 @@ The controller now prepares missing clean Git clones from the original clean
 repository while holding every node's lease. It then uses the named coordinated
 sync to fetch and detach every target at the published experiment commit; it
 never copies a working tree or ignored files. The retry uses a new output path.
+
+The second attempt (`9e8aead8`) catches a Python local-name collision in the
+new coordinator before identity preflight, lease acquisition or output-directory
+creation. No serving action or model request occurs. The original controller
+log and launch receipt remain in `runs/code-window-02`. The canonical-program
+loop variable and runtime-identity helper now have distinct names; a read-only
+CLI preflight test reaches the identity guard without acquiring any machine.

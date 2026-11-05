@@ -1,6 +1,9 @@
 """Out-of-band checks for the no-loss decision, not serving instrumentation."""
-import copy
+import importlib.util
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 from check_quality import check
 
 
@@ -14,6 +17,21 @@ def fixture(benchmark):
 
 
 class GateTests(unittest.TestCase):
+    def test_controller_reaches_read_only_identity_preflight(self):
+        spec=importlib.util.spec_from_file_location('matrix_preflight',Path(__file__).with_name('run_window.py'))
+        controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
+        with tempfile.TemporaryDirectory() as folder:
+            home=Path(folder);cache=home/'cache';cache.mkdir()
+            out=home/'spark-lab/results/test'
+            with patch.object(controller.socket,'gethostname',return_value='spark-0009'), \
+                 patch.object(controller.subprocess,'check_output',side_effect=['published\n','','origin/branch\n']), \
+                 patch.object(controller.w,'each',return_value={'node':{'spark-hold.json':None}}), \
+                 patch.object(controller,'runtime_identity',side_effect=RuntimeError('identity preflight reached')), \
+                 patch.object(Path,'home',return_value=home), \
+                 patch.object(controller.sys,'argv',['window','--out',str(out),'--cache',str(cache)]):
+                with self.assertRaisesRegex(RuntimeError,'identity preflight reached'):controller.main()
+            self.assertFalse(out.exists())
+
     def test_both_benchmarks_accept_unchanged_scores(self):
         for benchmark in ('code','ruler'):
             self.assertTrue(check(*fixture(benchmark),benchmark)['passed'])
