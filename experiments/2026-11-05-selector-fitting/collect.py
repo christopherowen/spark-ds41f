@@ -26,7 +26,8 @@ from pathlib import Path
 x=json.load(sys.stdin);p=Path.home()/'projects/spark-ds41f/cache/selector-fitting-20261105'
 if x['action']=='check':
  assert not p.exists() or not list(p.iterdir()),'capture directory is not empty'
- p.mkdir(parents=True,exist_ok=True)
+ p.mkdir(parents=True,exist_ok=True,mode=0o700)
+ p.chmod(0o700)
 elif x['action']=='arm':
  with (p/'arm.json').open('x') as f:json.dump(x['case'],f)
 elif x['action']=='disarm':
