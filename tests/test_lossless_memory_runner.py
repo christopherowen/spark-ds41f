@@ -68,7 +68,7 @@ class RunnerTests(unittest.TestCase):
                          "production_config": runner.RESTORE}
         return []
 
-    def invoke(self):
+    def invoke(self, *, format="huffman", lanes=32, chunk=None):
         fake_lab = SimpleNamespace(
             read_hold=lambda: self.hold,
             window_should_close=lambda hold: self.closure_reason if self.pending else None,
@@ -82,7 +82,10 @@ class RunnerTests(unittest.TestCase):
         process = SimpleNamespace(
             check_output=lambda argv, **kw: b"" if "status" in argv else "c" * 40,
             run=self.run_command, STDOUT=runner.subprocess.STDOUT)
-        argv = ["run_fp8.py", "--window", "owned", "--lanes", "32", "--out", "results/private/round", "--apply"]
+        argv = ["run_fp8.py", "--window", "owned", "--format", format, "--lanes", str(lanes),
+                "--out", "results/private/round", "--apply"]
+        if chunk is not None:
+            argv += ["--chunk-bytes", str(chunk)]
         with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=fake_lab,
                             subprocess=process, os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"))), \
                 patch.object(runner, "probe_management", return_value=self.management_unreachable), \
@@ -100,6 +103,15 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(receipt["restored"])
         self.assertNotIn("completed", receipt)
         self.assertIn("inexact decoder receipt", receipt["error"])
+
+    def test_failed_plane_lz4_gate_stops_the_matrix_and_restores_owned_window(self):
+        spec = json.loads((self.here / "fp8/kernel-32.json").read_text())
+        self.write(self.here / "fp8/plane-lz4/kernel-512-128.json", spec)
+        self.assertEqual(self.invoke(format="plane-lz4", lanes=128, chunk=512), 1)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(self.closed), 1)
+        self.assertTrue(self.receipt()["restored"])
+        self.assertNotIn("completed", self.receipt())
 
     def test_missing_native_verdict_restores_owned_window(self):
         self.omit_verdict = True
@@ -157,6 +169,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(set(specs)), 6)
         self.assertTrue(all("/fp8/fixed/" in path for path in specs))
         self.assertTrue(any("512-repeat" in path for path in specs))
+
+    def test_plane_lz4_plan_keeps_all_eight_observations_and_sources_distinct(self):
+        argv = ["run_fp8.py", "--window", "plan", "--format", "plane-lz4",
+                "--out", "results/private/plane-plan"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+            self.assertEqual(runner.main(), 0)
+        paths = json.loads(output.getvalue())["specs"]
+        self.assertEqual(len(set(paths)), 8)
+        runs, outputs = set(), set()
+        for path in paths:
+            spec = json.loads((runner.ROOT / path).read_text())
+            runs.add(spec["run"])
+            bundle = runner.ROOT / spec["jobs"][0]["bundles"][0]["bundle"]
+            candidate = json.loads((bundle / "candidate.json").read_text())
+            outputs.add(candidate["argv"][-1])
+            self.assertIn("--chunk-bytes", candidate["argv"])
+            for source, _ in candidate["mounts"]:
+                if not source.startswith("/"):
+                    self.assertTrue((runner.ROOT / source).is_file(), source)
+        self.assertEqual((len(runs), len(outputs)), (8, 8))
 
     def test_management_loss_never_launches_restoration(self):
         self.management_unreachable = ["dgx2"]

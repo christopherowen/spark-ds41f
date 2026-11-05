@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from spark_ds41f import lab
-from fp8_results import FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, validate
+from fp8_results import (FIXED_EXACT_FLAG, FIXED_SOURCES, summarize, summarize_plane,
+                         validate, validate_plane)
 
 HOLDER = "spark-lab: owner-authorized lossless FP8 decoder measurements"
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
@@ -36,27 +37,37 @@ def probe_management():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window", required=True)
-    parser.add_argument("--format", choices=("huffman", "fixed-fields"), default="huffman")
+    parser.add_argument("--format", choices=("huffman", "fixed-fields", "plane-lz4"), default="huffman")
     parser.add_argument("--lanes", type=int, choices=(32, 64, 128, 256, 512), nargs="+")
+    parser.add_argument("--chunk-bytes", type=int, choices=(512, 2048), nargs="+")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     fixed = args.format == "fixed-fields"
-    allowed = (128, 256, 512) if fixed else (32, 64, 128)
+    plane = args.format == "plane-lz4"
+    allowed = (128, 256) if plane else (128, 256, 512) if fixed else (32, 64, 128)
     args.lanes = args.lanes if args.lanes is not None else list(allowed)
     if not set(args.lanes).issubset(allowed):
         parser.error("parallelism does not belong to the chosen format")
     if len(set(args.lanes)) != len(args.lanes):
         parser.error("lane counts must be distinct")
+    if args.chunk_bytes and not plane:
+        parser.error("chunk bytes belong only to the independent-plane LZ4 format")
+    chunks = (args.chunk_bytes or [512, 2048]) if plane else [None]
+    if len(set(chunks)) != len(chunks):
+        parser.error("chunk sizes must be distinct")
     out = (ROOT / args.out).resolve()
     if not out.is_relative_to(ROOT / "results/private"):
         parser.error("native receipts must stay under results/private")
-    spec_root = HERE / "fp8" / "fixed" if fixed else HERE / "fp8"
+    spec_root = HERE / "fp8" / "plane-lz4" if plane else HERE / "fp8" / "fixed" if fixed else HERE / "fp8"
     validation = {"axis": "threads", "exact_flag": FIXED_EXACT_FLAG,
                   "sources": FIXED_SOURCES} if fixed else {}
     summary_options = {key: value for key, value in validation.items() if key != "sources"}
-    specs = [spec_root / f"kernel-{lanes}{suffix}.json"
-             for lanes in args.lanes for suffix in ("", "-repeat")]
+    layouts = [(chunk, lanes) for chunk in chunks for lanes in args.lanes]
+    def spec_path(chunk, lanes, suffix):
+        stem = f"kernel-{chunk}-{lanes}" if plane else f"kernel-{lanes}"
+        return spec_root / (stem + suffix + ".json")
+    specs = [spec_path(chunk, lanes, suffix) for chunk, lanes in layouts for suffix in ("", "-repeat")]
     if not args.apply:
         print(json.dumps({"window": args.window, "restore": RESTORE,
                           "specs": [str(p.relative_to(ROOT)) for p in specs],
@@ -109,14 +120,14 @@ def main():
                 raise RuntimeError("window changed or closure requested; preserve completed observations")
             receipt["queued_return_request"] = request
             save()
-        for lanes in args.lanes:
+        for chunk, lanes in layouts:
             pair = []
             for suffix in ("", "-repeat"):
                 if not owns():
                     raise RuntimeError("window changed or closure requested; preserve completed observations")
-                spec_path = spec_root / f"kernel-{lanes}{suffix}.json"
-                spec = json.loads(spec_path.read_text())
-                step = {"spec": str(spec_path.relative_to(ROOT)), "started": lab.now()}
+                path = spec_path(chunk, lanes, suffix)
+                spec = json.loads(path.read_text())
+                step = {"spec": str(path.relative_to(ROOT)), "started": lab.now()}
                 receipt["steps"].append(step)
                 save()
                 plan_argv = [sys.executable, "bin/spark", "--cluster-config", RESTORE,
@@ -153,12 +164,16 @@ def main():
                 native_path = lab.compile_cache(candidate) / Path(candidate["argv"][-1]).name
                 native = json.loads(native_path.read_text())
                 lab.write_json_atomic(out / (spec["run"] + ".json"), native)
-                validate(native, verdicts["verdicts"][0], lanes=lanes,
-                         image=base["image_id"], revision=base["model_revision"], **validation)
+                if plane:
+                    validate_plane(native, verdicts["verdicts"][0], lanes=lanes, chunk_bytes=chunk,
+                                   image=base["image_id"], revision=base["model_revision"])
+                else:
+                    validate(native, verdicts["verdicts"][0], lanes=lanes,
+                             image=base["image_id"], revision=base["model_revision"], **validation)
                 pair.append(native)
                 step["qualified_microbenchmark"] = True
                 save()
-            receipt["summaries"].append(summarize(pair, **summary_options))
+            receipt["summaries"].append(summarize_plane(pair) if plane else summarize(pair, **summary_options))
             save()
         receipt["completed"] = True
         code = 0
