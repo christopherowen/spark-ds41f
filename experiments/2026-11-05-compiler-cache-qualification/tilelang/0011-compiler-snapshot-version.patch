@@ -1,0 +1,37 @@
+From d297f60c852dab7dd4fd5a8cfd4ed0d02b071f2f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 21:41:32 +0000
+Subject: [PATCH] Namespace compiler snapshot caches by source version
+
+Upstream base: 2123e412ce2217b324c50c4ec967213906456ac5 with the unchanged
+ordered ten-patch compiler stack, head454202b2ba8d0cf10b8caf434a956755e039483f
+and pre-metadata treebae5fe12b58cdf364efeccbabc04cd08205c43b9.
+
+Rationale: different compiler snapshots advertising0.1.15 can select the same
+persistent JIT entries when optional library stamping is disabled. Give this
+snapshot an immutable local package version, used by its existing cache key
+and namespace. The suffix names the pre-metadata source tree, not itself.
+
+Quality: VERSION is the only changed file. Compiler passes, kernels, arithmetic,
+models and policies are unchanged. Existing caches are preserved rather than
+cleared or silently reused across compiler identities.
+
+Tests: source-only version provider under NO_VERSION_LABEL=1, PEP440/wheel
+parsing, source-derived CMake boundaries and cache-key/namespace disjointness.
+Actual Linux wheel/image, installed identity, full release/functional gates
+and both complete metric boots remain required; no serving gain is claimed.
+
+Upstream status: local experiment; not submitted upstream.
+---
+ VERSION | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/VERSION b/VERSION
+index c34958a4..43f1e5ca 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.1.15
++0.1.15+snapshot.bae5fe12b58cdf364efeccbabc04cd08205c43b9
+-- 
+2.54.0 (Apple Git-157)

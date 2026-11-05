@@ -1,0 +1,310 @@
+{
+  "recorded": "2026-11-05T21:52:49.799915+00:00",
+  "review_kind": "bounded_read_only_actual_native_failure_diagnosis",
+  "status": "independent_retained_feature_regression_confirmed_by_native_failure_and_source_routing",
+  "candidate": 42,
+  "execution_commit": "b6896b389c5bb0004e13fe9f4f941a31a60f87ca",
+  "image": "sha256:70e9abba12d83b79a268574a2057b096af2b9fc5fcbc1b07364d6eb580b1a35a",
+  "compiler_head": "454202b2ba8d0cf10b8caf434a956755e039483f",
+  "compiler_tree": "bae5fe12b58cdf364efeccbabc04cd08205c43b9",
+  "vllm_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+  "vllm_tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+  "native_file_counts_from_coordinator_audit": {
+    "manifest": 136,
+    "ok": 135,
+    "fail": 1,
+    "passed": 8073,
+    "skipped": 360,
+    "failed": 1,
+    "errors": 0
+  },
+  "independent_local_export_hash_verification": {
+    "artifacts": 29,
+    "all_matched": true
+  },
+  "sole_native_failure": {
+    "test": {
+      "classname": "tests.kernels.test_deepseek_v41_tilelang_iket",
+      "name": "test_on_matches_off_and_keeps_its_own_cache",
+      "file": "tests/kernels/test_deepseek_v41_tilelang_iket.py",
+      "line": "473",
+      "time": "13.310"
+    },
+    "kind": "failure",
+    "text": "tmp_path = PosixPath('/c/pytest-tmp-release/chunk003/test_on_matches_off_and_keeps_0')\n\n    @GPU\n    def test_on_matches_off_and_keeps_its_own_cache(tmp_path):\n        off = _run(tmp_path, \"off\")\n        cache = tmp_path / \"deployment-cache\"\n        before = sorted(str(p.relative_to(cache)) for p in cache.rglob(\"*\"))\n>       on = _run(tmp_path, \"on\", str(tmp_path / \"iket\"))\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\ntests/kernels/test_deepseek_v41_tilelang_iket.py:479: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\ntmp_path = PosixPath('/c/pytest-tmp-release/chunk003/test_on_matches_off_and_keeps_0')\nargs = ('on', '/c/pytest-tmp-release/chunk003/test_on_matches_off_and_keeps_0/iket')\n\n    def _run(tmp_path, *args):\n        env = _env(tmp_path / \"deployment-cache\")\n        process = subprocess.run(\n            [sys.executable, _script(tmp_path, KERNEL_SCRIPT), *args],\n            env=env,\n            capture_output=True,\n            text=True,\n            timeout=900,\n        )\n>       assert process.returncode == 0, process.stderr[-4000:]\nE       AssertionError: Traceback (most recent call last):\nE           File \"/c/pytest-tmp-release/chunk003/test_on_matches_off_and_keeps_0/script_1.py\", line 29, in <module>\nE             kernel = scale_add(1024)\nE                      ^^^^^^^^^^^^^^^\nE           File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 590, in __call__\nE             raise KernelNotPreparedError(f\"{error}; requested as {name}({call})\") from None\nE         tilelang.cache.kernel_cache.KernelNotPreparedError: TileLang kernel 'iket_test_scale_add' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)\nE         \nE       assert 1 == 0\nE        +  where 1 = CompletedProcess(args=['/usr/bin/python3', '/c/pytest-tmp-release/chunk003/test_on_matches_off_and_keeps_0/script_1.py...ng kernel \\'iket_test_scale_add\\' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)\\n').returncode\n\ntests/kernels/test_deepseek_v41_tilelang_iket.py:470: AssertionError"
+  },
+  "exact_inputs": {
+    "C42_JIT": {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-69650cdb/src/tilelang/tilelang/jit/__init__.py",
+      "sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+      "bytes": 31348
+    },
+    "C42_cache": {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-69650cdb/src/tilelang/tilelang/cache/kernel_cache.py",
+      "sha256": "9f896b700aa7b3efd5e7ad13e21bea0d331cd9d7f2612c0052c3ef23617782a0",
+      "bytes": 39604
+    },
+    "C44_JIT": {
+      "path": "experiments/2026-11-05-compiler-cache-qualification/.work/source/tilelang/jit/__init__.py",
+      "sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+      "bytes": 31348
+    },
+    "vllm_IKET_test": {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/tests/kernels/test_deepseek_v41_tilelang_iket.py",
+      "sha256": "852e28ea51422224f44b59c337e69788c8e96ae8e92a354040e6a15eebef7b02",
+      "bytes": 21357
+    },
+    "vllm_IKET_mode": {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/vllm/models/deepseek_v4_1/tilelang/iket.py",
+      "sha256": "3c8c53c5cbd0131be8295c9a6dee124a1411d69857f204f6738b9bace9e95af7",
+      "bytes": 37232
+    },
+    "vllm_prepare": {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/vllm/models/deepseek_v4_1/tilelang/prepare.py",
+      "sha256": "56e3226031a15a9201a9b87db88e8d43a5466bb733f042783e57ce37681022fb",
+      "bytes": 11864
+    },
+    "cache_bypass_patch": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/tilelang/0007-cache-bypass.patch",
+      "sha256": "a74def18cb3227bac51f76ae9346dd48ce2fe8f79773f2cb8b61fa8b21184ce9",
+      "bytes": 6813
+    },
+    "previous_provenance_review": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/preflight/cache-provenance-review.json",
+      "sha256": "30bacabea96cd7d1e45e1a21cafd346452379a0986f381e124e25ce29f5d0edb",
+      "bytes": 24055
+    },
+    "witness_script": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/preflight/iket_prepared_cache_witness.py",
+      "sha256": "f60b7be8d7183790a67704716c4cc604d8b09fec1dacbf1d4b98783f51e54f58",
+      "bytes": 6662
+    },
+    "witness_result": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/preflight/iket-prepared-cache-witness.json",
+      "sha256": "a2b512cfa5119365dd39f7068ffc583a518d1df1d01c0817a55caf8ec0154a08",
+      "bytes": 3814
+    },
+    "native_XML": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/2026-11-05-dgx/attempt-1/failed-export/raw/gate-native-results/chunk003.xml",
+      "sha256": "7635c9b6a35994e760a1548ee37d86237ed5c3ed7215beafd6472a3126d364f2",
+      "bytes": 125963
+    },
+    "native_export_receipt": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/2026-11-05-dgx/attempt-1/failed-export/receipt.json",
+      "sha256": "6fffe5f9ec7948ce507495a843b6a18eb6bfcdb1a7d146880720333086caa0c1",
+      "bytes": 8146
+    },
+    "native_builder_receipt": {
+      "path": "experiments/2026-11-05-compiler-live-qualification/runs/2026-11-05-dgx/attempt-1/failed-export/raw/builder/receipt.json",
+      "sha256": "b3618afd35aeb66e9b36c30dae6c97606dedd421ed690f8a3b03ba620daf18e6",
+      "bytes": 5955
+    }
+  },
+  "prepare_AST_sha256": "2cfbebf95156d5c57d3d132e919f80e9af19fc13f8b52db99c6f4d47eb92a91b",
+  "witness": {
+    "command": "/opt/homebrew/opt/python@3.12/bin/python3.12 -B experiments/2026-11-05-compiler-live-qualification/runs/preflight/iket_prepared_cache_witness.py",
+    "exit": 0,
+    "source_only": true,
+    "no_TileLang_TVM_Torch_import_or_GPU": true,
+    "result": {
+      "status": "source_control_flow_witness_passed",
+      "native_or_GPU_test": false,
+      "TileLang_TVM_Torch_imported": false,
+      "assumptions": [
+        "tilelang.prepare has populated the same call key in impl._kernel_cache, as the actual source does",
+        "IKET default no-persistent-cache mode has disabled cache and prepare.freeze(test) has frozen compilation",
+        "The object and parse key are doubles; no kernel is compiled or executed"
+      ],
+      "source": {
+        "pre_bypass_head": "925388ba06cdb4d210c820e03480e5b48d1d4723",
+        "pre_bypass_JIT_sha256": "7120a23f5408623f0be3b8320329b85770779f6a74c67f4eb3be26f9b14a4197",
+        "C42_head": "454202b2ba8d0cf10b8caf434a956755e039483f",
+        "C42_JIT_sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+        "C42_cache_sha256": "9f896b700aa7b3efd5e7ad13e21bea0d331cd9d7f2612c0052c3ef23617782a0",
+        "C44_head": "d297f60c852dab7dd4fd5a8cfd4ed0d02b071f2f",
+        "C44_JIT_sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+        "C42_C44_JIT_bytes_identical": true
+      },
+      "cases": {
+        "pre_bypass_prepared_frozen_cache_disabled": {
+          "returned_prepared_object": true,
+          "exception": null,
+          "cache_enabled": false,
+          "compile_attempts": 0,
+          "prepared_object_remains_in_wrapper_cache": true,
+          "JIT_call_AST_sha256": "17f7ad428e529ef1a8eada8a1706e9f119f616b7a61b213f387a2f4640903cb5",
+          "JIT_call_lines": [
+            545,
+            595
+          ],
+          "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+          "freeze_refusal_lines": [
+            68,
+            73
+          ]
+        },
+        "C42_prepared_frozen_cache_disabled": {
+          "returned_prepared_object": false,
+          "exception": "KernelNotPreparedError",
+          "message": "TileLang kernel 'iket_test_scale_add' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)",
+          "cache_enabled": false,
+          "compile_attempts": 1,
+          "prepared_object_remains_in_wrapper_cache": true,
+          "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+          "JIT_call_lines": [
+            546,
+            602
+          ],
+          "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+          "freeze_refusal_lines": [
+            68,
+            73
+          ]
+        },
+        "C42_prepared_frozen_cache_enabled": {
+          "returned_prepared_object": true,
+          "exception": null,
+          "cache_enabled": true,
+          "compile_attempts": 0,
+          "prepared_object_remains_in_wrapper_cache": true,
+          "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+          "JIT_call_lines": [
+            546,
+            602
+          ],
+          "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+          "freeze_refusal_lines": [
+            68,
+            73
+          ]
+        },
+        "C44_prepared_frozen_cache_disabled": {
+          "returned_prepared_object": false,
+          "exception": "KernelNotPreparedError",
+          "message": "TileLang kernel 'iket_test_scale_add' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)",
+          "cache_enabled": false,
+          "compile_attempts": 1,
+          "prepared_object_remains_in_wrapper_cache": true,
+          "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+          "JIT_call_lines": [
+            546,
+            602
+          ],
+          "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+          "freeze_refusal_lines": [
+            68,
+            73
+          ]
+        }
+      },
+      "conclusion": "The cache-bypass patch ignores a valid explicitly prepared wrapper object while cache is disabled; frozen compilation then refuses. VERSION-only C44 cannot correct this branch."
+    },
+    "limitation": "This witness uses a prepared-object and parse-key double. It executes actual extracted call/refusal methods; it is neither another native test nor a compiler/kernel run."
+  },
+  "source_chain": [
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/tests/kernels/test_deepseek_v41_tilelang_iket.py",
+      "lines": [
+        400,
+        407,
+        421,
+        422,
+        423,
+        453,
+        458,
+        461,
+        462,
+        473,
+        479
+      ],
+      "fact": "The failing child gets a fixture-local deployment-cache; on mode has no persistent-cache argument, prepares scale_add(1024), freezes(test), then calls scale_add(1024)."
+    },
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/vllm/models/deepseek_v4_1/tilelang/iket.py",
+      "lines": [
+        793,
+        812,
+        821,
+        824
+      ],
+      "fact": "The default IKET no-persistent-cache branch calls disable_cache()."
+    },
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm/vllm/models/deepseek_v4_1/tilelang/prepare.py",
+      "lines": [
+        133,
+        137
+      ],
+      "fact": "Outside a collecting registry, declare immediately calls tilelang.prepare(list(calls()))."
+    },
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-69650cdb/src/tilelang/tilelang/jit/__init__.py",
+      "lines": [
+        643,
+        650,
+        667,
+        670
+      ],
+      "fact": "prepare compiles pending calls and explicitly stores the prepared object in impl._kernel_cache[key]."
+    },
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-69650cdb/src/tilelang/tilelang/jit/__init__.py",
+      "lines": [
+        574,
+        583,
+        586,
+        590
+      ],
+      "fact": "The #880 bypass sets kernel=None whenever cache is disabled, even if that key was explicitly prepared; compile then raises the frozen error."
+    },
+    {
+      "path": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-69650cdb/src/tilelang/tilelang/cache/kernel_cache.py",
+      "lines": [
+        68,
+        72,
+        388,
+        389
+      ],
+      "fact": "The disabled-cache compile path refuses if frozen before any disk-cache identity/load lookup."
+    }
+  ],
+  "attribution": {
+    "patch": "tilelang/0007-cache-bypass.patch",
+    "deployment_PR": 880,
+    "applied_commit": "e5e221cf56c74fe726acaa0e9824afc47de31840",
+    "immediate_predecessor": "925388ba06cdb4d210c820e03480e5b48d1d4723",
+    "C42_JIT_identical_to_after_bypass_commit": true,
+    "classification": "retained IKET cache-disabled prepare/freeze compatibility regression",
+    "independent_of_shared_0_1_15_persistent_cache_provenance": true,
+    "no_observed_stale_binary_or_corruption_claim": true,
+    "no_serving_performance_verdict": true
+  },
+  "C44_disposition": {
+    "status": "withdrawn_unmeasured_due_to_independent_C42_retained_feature_failure",
+    "only_delta_VERSION": true,
+    "JIT_bytes_identical_to_C42": true,
+    "metadata_cannot_fix_this_branch": true,
+    "native_image_built": false,
+    "measured_failure": false,
+    "required_actual_fix_would_change_JIT_prepare_semantics": true,
+    "no_additional_algorithmic_retry_under_owner_limit": true
+  },
+  "prior_observations": {
+    "prior_shared_cache_provenance_review_remains_unchanged_and_its_possible_collision_finding_stands": true,
+    "native_release_verdict_remains_failed_and_original_errors_unchanged": true,
+    "C42_build_and_passed_individual_release_results_remain_observations_not_whole_stack_qualification": true,
+    "C42_topk_feature_functional_and_timed_phases": "not run, per native controller/builder audit supplied by coordinator",
+    "two_prior_fresh_authored_feature_processes": "Do not erase their own results or conflate them with this native failed retained-feature test. They do not establish full vLLM integration qualification."
+  },
+  "recommended_disposition": "Retain validated C40. Reject/drop C42 compiler integration under the predeclared corrected-stack criterion; withdraw metadata-only C44 unmeasured. Do not waive IKET, weaken the gate, run another algorithmic correction, retag/rebuild C42, or repeat completed valid image/gate points.",
+  "scope": {
+    "read_only_source_and_local_raw_evidence": true,
+    "no_GPU_Docker_SSH_node_hold_serving_hardware_actions": true,
+    "no_deployment_repo_commit_or_push": true,
+    "no_algorithm_or_test_changes": true
+  },
+  "uncertainties": [
+    "This local review does not independently inspect actual loaded DSO mappings or establish whether any old shared-cache binary was used in other passing gate files. That separate provenance limitation is preserved.",
+    "No C42 serving measurements exist, so no performance over/under is assigned."
+  ]
+}

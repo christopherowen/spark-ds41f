@@ -23,3 +23,11 @@ fixes. The existing exact patches are combined explicitly in C42, with fresh
 canonical source proof and no silent omission. Image, feature/release gates and
 two serving boots remain pending; neither combined quality nor performance is
 claimed yet. Other draft/active changes are not closed simply to empty the list.
+
+C42 compiler integration is rejected at the release gate (8073pass/360skip/1fail,
+zero serving points). The failed IKET prepared/frozen call is traced to #880's
+wrapper bypass, independent of the separate shared-cache identity gap. Metadata
+proposal C44 cannot fix it and is withdrawn unmeasured. Close875/879–883 as not
+adopted with this rejected dependency; standalone positive results for the other
+fixes remain valid within their own scope and are retained. No source branches
+or native images are deleted. Continue separate C43 frontend cleanup on C40.

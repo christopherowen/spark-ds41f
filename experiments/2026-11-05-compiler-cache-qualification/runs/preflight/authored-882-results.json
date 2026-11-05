@@ -1,0 +1,507 @@
+{
+  "record_type": "Prior paired standalone evidence, preserved without re-identifying the runs",
+  "research_commit": "ad40ec2379053fe132c3167ce19ade22877224c9",
+  "research_url": "https://github.com/christopherowen/spark-ds41f/tree/ad40ec2379053fe132c3167ce19ade22877224c9/experiments/2026-11-04-tilelang-kernel-review",
+  "tested_compiler_tree": "93d54ec9d049abe77cb7d0de3b9ebc1f98ca9951",
+  "current_candidate_head": "a500cfb06c620516243f9d71a1a814aa115f6d69",
+  "identity_note": "The candidate commit is deterministic git-am metadata; its complete source tree equals the previously tested compiler tree. These receipts do not qualify a new runtime image.",
+  "finding": "The parent fails both generated-code fence assertions in each process. The port passes both assertions and the fast-math numerical reproducer twice. The numerical reproducer also passes on the parent. Portable generic-read and mma.sync cases ran on SM121; Hopper-only WGMMA cases were excluded.",
+  "runs": {
+    "ws3537-base-a-v2": {
+      "label": "ws3537-base-a-v2",
+      "started_utc": "2026-11-04T01:38:01.843507+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3537-base-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3537-base-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3537-base-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3537"
+      ],
+      "before_memory_bytes": 123651686400,
+      "start_hottest_c": 49.1,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 1,
+      "ended_utc": "2026-11-04T01:38:08.852843+00:00",
+      "memory_aborted": false,
+      "output_sha256": "3d537125ea4cbbf7a536369afb137f6278b3001e8526744fa876e64c9cbc58e1",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "test_ws_generic_stage_reads_fence_before_release",
+          "status": "failed",
+          "error": "Traceback (most recent call last):\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 23, in check\n    details = function()\n              ^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 316, in <lambda>\n    check(name, lambda name=name: upstream_test(3537, \"testing/python/issue/test_tilelang_issue_3529.py\", name))\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 77, in upstream_test\n    getattr(module, name)()\n  File \"/review/variants/pr3537/testing/python/issue/test_tilelang_issue_3529.py\", line 114, in test_ws_generic_stage_reads_fence_before_release\n    assert all(_consumer_releases_fenced(src)), src\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern \"C\" __global__ void exp_sum_kernel(const float* __restrict__ M, float* __restrict__ P, const bfloat16_t* __restrict__ R, const float* __restrict__ X);\nextern \"C\" __global__ void __launch_bounds__(256, 1) exp_sum_kernel(const float* __restrict__ M, float* __restrict__ P, const bfloat16_t* __restrict__ R, const float* __restrict__ X) {\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\n  void* M_s = ((void*)((char*)buf_dyn_shmem + 0));\n  void* workspace = ((void*)((char*)buf_dyn_shmem + 128));\n  void* X_s = ((void*)((char*)buf_dyn_shmem + 1024));\n  void* R_s = ((void*)((char*)buf_dyn_shmem + 25600));\n  __shared__ __align__(16) uint64_t mbarrier_mem[7];\n  auto mbarrier = reinterpret_cast<Barrier*>(mbarrier_mem);\n  float acc[16];\n  float e[16];\n  float part[16];\n  if (tl::tl_shuffle_elect<0>()) {\n    mbarrier[0].init(1);\n    mbarrier[1].init(1);\n    mbarrier[2].init(1);\n    mbarrier[3].init(128);\n    mbarrier[4].init(128);\n    mbarrier[5].init(128);\n    mbarrier[6].init(1);\n  }\n  tl::fence_barrier_init();\n  __syncthreads();\n  if (tl::tl_shuffle_elect<256>()) {\n    mbarrier[6].arrive_and_expect_tx(128);\n    tl::tma_load((&(((float*)M_s)[0])), (&(M[0])), mbarrier[6], 128);\n  }\n  if (((int)threadIdx.x) < 128) {\n    tl::warpgroup_reg_dealloc<24>();\n    if (((int)threadIdx.x) < 32) {\n      for (int kk = 0; kk < 4; ++kk) {\n        mbarrier[((kk % 3) + 3)].wait(((kk / 3) ^ 1));\n        if (tl::tl_shuffle_elect<32>()) {\n          mbarrier[(kk % 3)].expect_transaction(8192);\n          tl::tma_load((&(((float*)X_s)[((kk % 3) * 2048)])), (&(X[((((int)blockIdx.y) * 8192) + (kk * 2048))])), mbarrier[(kk % 3)], 8192);\n          mbarrier[(kk % 3)].arrive_and_expect_tx(4096);\n          tl::tma_load((&(((bfloat16_t*)R_s)[((kk % 3) * 2048)])), (&(R[((((int)blockIdx.y) * 8192) + (kk * 2048))])), mbarrier[(kk % 3)], 4096);\n        }\n      }\n    }\n  } else {\n    tl::warpgroup_reg_alloc<240>();\n    #pragma unroll\n    for (int i = 0; i < 4; ++i) {\n      float broadcast_var = 0x0p+0f/*0.000000e+00*/;\n      *(float4*)(acc + (i * 4)) = make_float4(broadcast_var, broadcast_var, broadcast_var, broadcast_var);\n    }\n    for (int kk_1 = 0; kk_1 < 4; ++kk_1) {\n      if (kk_1 == 0) {\n        mbarrier[6].wait(0);\n      }\n      mbarrier[(kk_1 % 3)].wait((kk_1 / 3));\n      tl::__sync_thread_partial(3, 128);\n      #pragma unroll\n      for (int i_1 = 0; i_1 < 16; ++i_1) {\n        e[i_1] = expf((((((float*)X_s)[((((((kk_1 % 3) * 2048) + ((((int)threadIdx.x) & 63) * 32)) + (i_1 * 2)) + (((int)threadIdx.x) >> 6)) - 2)] * ((float)((bfloat16_t*)R_s)[((((((kk_1 % 3) * 2048) + ((((int)threadIdx.x) & 63) * 32)) + (i_1 * 2)) + (((int)threadIdx.x) >> 6)) - 2)])) / 0x1.6a09e667f3bcdp+3f/*1.131371e+01*/) - ((float*)M_s)[(((i_1 * 2) + (((int)threadIdx.x) >> 6)) - 2)]));\n      }\n      mbarrier[((kk_1 % 3) + 3)].arrive();\n      #pragma unroll\n      for (int i_2 = 0; i_2 < 16; ++i_2) {\n        part[i_2] = 0x0p+0f/*0.000000e+00*/;\n        part[i_2] = (part[i_2] + e[i_2]);\n        tl::__sync_thread_partial(3, 128);\n        part[i_2] = tl::AllReduce<tl::SumOp, 64, 1, 128, tl::NamedBarrier<128>>::run(part[i_2], (&(((float*)workspace)[0])));\n      }\n      #pragma unroll\n      for (int i_3 = 0; i_3 < 4; ++i_3) {\n        float4 __1;\n          float4 v_ = *(float4*)(acc + (i_3 * 4));\n          float4 v__1 = *(float4*)(part + (i_3 * 4));\n          *(float2*)(&(__1.x)) = tl::add2(*(float2*)(&(v_.x)), *(float2*)(&(v__1.x)));\n          *(float2*)(&(__1.z)) = tl::add2(*(float2*)(&(v_.z)), *(float2*)(&(v__1.z)));\n        *(float4*)(acc + (i_3 * 4)) = __1;\n      }\n    }\n    if ((((int)threadIdx.x) % 64) == 0) {\n      #pragma unroll\n      for (int i_4 = 0; i_4 < 16; ++i_4) {\n        P[((((((int)blockIdx.y) * 32) + (i_4 * 2)) + (((int)threadIdx.x) >> 6)) - 2)] = acc[i_4];\n      }\n    }\n  }\n}\n\n\n"
+        },
+        {
+          "name": "test_ws_mma_sync_stage_reads_fence_before_release",
+          "status": "failed",
+          "error": "Traceback (most recent call last):\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 23, in check\n    details = function()\n              ^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 316, in <lambda>\n    check(name, lambda name=name: upstream_test(3537, \"testing/python/issue/test_tilelang_issue_3529.py\", name))\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 77, in upstream_test\n    getattr(module, name)()\n  File \"/review/variants/pr3537/testing/python/issue/test_tilelang_issue_3529.py\", line 124, in test_ws_mma_sync_stage_reads_fence_before_release\n    assert all(_consumer_releases_fenced(src)), src\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern \"C\" __global__ void main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, half_t* __restrict__ C);\nextern \"C\" __global__ void __launch_bounds__(256, 1) main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, half_t* __restrict__ C) {\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 49152));\n  __shared__ __align__(16) uint64_t mbarrier_mem[6];\n  auto mbarrier = reinterpret_cast<Barrier*>(mbarrier_mem);\n  float C_local[128];\n  if (tl::tl_shuffle_elect<0>()) {\n    tl::prefetch_tma_descriptor(A_desc);\n    tl::prefetch_tma_descriptor(B_desc);\n  }\n  if (tl::tl_shuffle_elect<0>()) {\n    mbarrier[0].init(1);\n    mbarrier[1].init(1);\n    mbarrier[2].init(1);\n    mbarrier[3].init(128);\n    mbarrier[4].init(128);\n    mbarrier[5].init(128);\n  }\n  tl::fence_barrier_init();\n  __syncthreads();\n  if (((int)threadIdx.x) < 128) {\n    tl::warpgroup_reg_dealloc<24>();\n    if (((int)threadIdx.x) < 32) {\n      for (int ko = 0; ko < 8; ++ko) {\n        mbarrier[((ko % 3) + 3)].wait((((ko % 6) / 3) ^ 1));\n        if (tl::tl_shuffle_elect<32>()) {\n          mbarrier[(ko % 3)].expect_transaction(16384);\n          tl::tma_load(A_desc, mbarrier[(ko % 3)], (&(((half_t*)A_shared)[((ko % 3) * 8192)])), (ko * 64), (((int)blockIdx.y) * 128));\n          mbarrier[(ko % 3)].arrive_and_expect_tx(16384);\n          #pragma unroll\n          for (int i = 0; i < 2; ++i) {\n            tl::tma_load(B_desc, mbarrier[(ko % 3)], (&(((half_t*)B_shared)[(((ko % 3) * 8192) + (i * 4096))])), ((((int)blockIdx.x) * 128) + (i * 64)), (ko * 64));\n          }\n        }\n      }\n    }\n  } else {\n    tl::warpgroup_reg_alloc<240>();\n    #pragma unroll\n    for (int i_1 = 0; i_1 < 32; ++i_1) {\n      float broadcast_var = 0x0p+0f/*0.000000e+00*/;\n      *(float4*)(C_local + (i_1 * 4)) = make_float4(broadcast_var, broadcast_var, broadcast_var, broadcast_var);\n    }\n    for (int ko_1 = 0; ko_1 < 8; ++ko_1) {\n      mbarrier[(ko_1 % 3)].wait(((ko_1 % 6) / 3));\n      {\n        half_t A_local[32];\n        half_t B_local[32];\n        for (int ki = 0; ki < 4; ++ki) {\n          #pragma unroll\n          for (int i_2 = 0; i_2 < 4; ++i_2) {\n            tl::ptx_ldmatrix_x4((&(((half_t*)A_shared)[((((((((ko_1 % 3) * 8192) + (((((int)threadIdx.x) & 63) >> 5) * 4096)) + (i_2 * 1024)) + ((((int)threadIdx.x) & 15) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (ki >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (ki & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(A_local[(i_2 * 8)])));\n          }\n          #pragma unroll\n          for (int i_3 = 0; i_3 < 4; ++i_3) {\n            tl::ptx_ldmatrix_x4_trans((&(((half_t*)B_shared)[((((((((ko_1 % 3) * 8192) + (((((int)threadIdx.x) & 127) >> 6) * 4096)) + (ki * 1024)) + ((((int)threadIdx.x) & 15) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_3 >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_3 & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(B_local[(i_3 * 8)])));\n          }\n          for (int i_4 = 0; i_4 < 4; ++i_4) {\n            for (int j = 0; j < 4; ++j) {\n              tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_local + ((i_4 * 32) + (j * 8))), reinterpret_cast<const unsigned*>(A_local + (i_4 * 8)), reinterpret_cast<const unsigned*>(B_local + (j * 8)));\n              tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_local + (((i_4 * 32) + (j * 8)) + 4)), reinterpret_cast<const unsigned*>(A_local + (i_4 * 8)), reinterpret_cast<const unsigned*>(B_local + ((j * 8) + 4)));\n            }\n          }\n        }\n      }\n      mbarrier[((ko_1 % 3) + 3)].arrive();\n    }\n    #pragma unroll\n    for (int i_5 = 0; i_5 < 64; ++i_5) {\n      half_t C_local_cast[2];\n      uint1 __1;\n      float2 v_ = *(float2*)(C_local + (i_5 * 2));\n      ((half2*)(&__1))[0] = __float22half2_rn(((float2*)(&v_))[0]);\n      *(uint1*)(C_local_cast + 0) = __1;\n      *(uint1*)(C + ((((((((((((int)blockIdx.y) * 65536) + (((((int)threadIdx.x) & 63) >> 5) * 32768)) + ((i_5 >> 4) * 8192)) + ((i_5 & 1) * 4096)) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + (((int)blockIdx.x) * 128)) + ((((int)threadIdx.x) >> 6) * 64)) + (((i_5 & 15) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2)) - 128)) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n\n"
+        },
+        {
+          "name": "test_ws_generic_stage_reads_fast_math_correctness",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fast_math_correctness",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        }
+      ],
+      "min_host_available_bytes": 122289344512,
+      "max_hottest_c": 54.4,
+      "files": {
+        "command.json": {
+          "bytes": 1546,
+          "sha256": "4e841c8c46987d0aede9da16c473ad3c465c0d81c9d1df9d7cc861c52845fd78"
+        },
+        "memory.jsonl": {
+          "bytes": 672,
+          "sha256": "17775dedb9ac945340c63372e21bcef65a4537f69476529238b6c6fc2cee6530"
+        },
+        "output.txt": {
+          "bytes": 13287,
+          "sha256": "3d537125ea4cbbf7a536369afb137f6278b3001e8526744fa876e64c9cbc58e1"
+        },
+        "result.json": {
+          "bytes": 1729,
+          "sha256": "4e8628fe1de3c366f522c068b7f2250697a7e6d4c3161d2150a1b6ab18e5b656"
+        },
+        "standalone.json": {
+          "bytes": 12411,
+          "sha256": "38f4789b73149abb09eb78dfece6bcb2cd83d15be537fe641f801bcf3029e2d1"
+        },
+        "test_ws_generic_stage_reads_fast_math_correctness-ws-off-False-0.cu": {
+          "bytes": 4429,
+          "sha256": "e047d311abfbce9d632a1820fe3a70dd211da13049ea18f3711a56cbc6ae2166"
+        },
+        "test_ws_generic_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 4429,
+          "sha256": "e047d311abfbce9d632a1820fe3a70dd211da13049ea18f3711a56cbc6ae2166"
+        },
+        "test_ws_mma_sync_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 5324,
+          "sha256": "b0dca08d82b17bafbec3ccdd0634feb45c7511e0beab9561bf3b298cfdc9b8b8"
+        }
+      }
+    },
+    "ws3537-base-b-v2": {
+      "label": "ws3537-base-b-v2",
+      "started_utc": "2026-11-04T01:59:49.003379+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3537-base-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3537-base-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3537-base-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3537"
+      ],
+      "before_memory_bytes": 123584585728,
+      "start_hottest_c": 49.3,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 1,
+      "ended_utc": "2026-11-04T01:59:56.012995+00:00",
+      "memory_aborted": false,
+      "output_sha256": "5f16a060765fce81db67506c13f530e2dd3221f0b534b02c22a1908f2f6cd6a3",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "test_ws_generic_stage_reads_fence_before_release",
+          "status": "failed",
+          "error": "Traceback (most recent call last):\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 23, in check\n    details = function()\n              ^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 347, in <lambda>\n    check(name, lambda name=name: upstream_test(3537, \"testing/python/issue/test_tilelang_issue_3529.py\", name))\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 77, in upstream_test\n    getattr(module, name)()\n  File \"/review/variants/pr3537/testing/python/issue/test_tilelang_issue_3529.py\", line 114, in test_ws_generic_stage_reads_fence_before_release\n    assert all(_consumer_releases_fenced(src)), src\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern \"C\" __global__ void exp_sum_kernel(const float* __restrict__ M, float* __restrict__ P, const bfloat16_t* __restrict__ R, const float* __restrict__ X);\nextern \"C\" __global__ void __launch_bounds__(256, 1) exp_sum_kernel(const float* __restrict__ M, float* __restrict__ P, const bfloat16_t* __restrict__ R, const float* __restrict__ X) {\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\n  void* M_s = ((void*)((char*)buf_dyn_shmem + 0));\n  void* workspace = ((void*)((char*)buf_dyn_shmem + 128));\n  void* X_s = ((void*)((char*)buf_dyn_shmem + 1024));\n  void* R_s = ((void*)((char*)buf_dyn_shmem + 25600));\n  __shared__ __align__(16) uint64_t mbarrier_mem[7];\n  auto mbarrier = reinterpret_cast<Barrier*>(mbarrier_mem);\n  float acc[16];\n  float e[16];\n  float part[16];\n  if (tl::tl_shuffle_elect<0>()) {\n    mbarrier[0].init(1);\n    mbarrier[1].init(1);\n    mbarrier[2].init(1);\n    mbarrier[3].init(128);\n    mbarrier[4].init(128);\n    mbarrier[5].init(128);\n    mbarrier[6].init(1);\n  }\n  tl::fence_barrier_init();\n  __syncthreads();\n  if (tl::tl_shuffle_elect<256>()) {\n    mbarrier[6].arrive_and_expect_tx(128);\n    tl::tma_load((&(((float*)M_s)[0])), (&(M[0])), mbarrier[6], 128);\n  }\n  if (((int)threadIdx.x) < 128) {\n    tl::warpgroup_reg_dealloc<24>();\n    if (((int)threadIdx.x) < 32) {\n      for (int kk = 0; kk < 4; ++kk) {\n        mbarrier[((kk % 3) + 3)].wait(((kk / 3) ^ 1));\n        if (tl::tl_shuffle_elect<32>()) {\n          mbarrier[(kk % 3)].expect_transaction(8192);\n          tl::tma_load((&(((float*)X_s)[((kk % 3) * 2048)])), (&(X[((((int)blockIdx.y) * 8192) + (kk * 2048))])), mbarrier[(kk % 3)], 8192);\n          mbarrier[(kk % 3)].arrive_and_expect_tx(4096);\n          tl::tma_load((&(((bfloat16_t*)R_s)[((kk % 3) * 2048)])), (&(R[((((int)blockIdx.y) * 8192) + (kk * 2048))])), mbarrier[(kk % 3)], 4096);\n        }\n      }\n    }\n  } else {\n    tl::warpgroup_reg_alloc<240>();\n    #pragma unroll\n    for (int i = 0; i < 4; ++i) {\n      float broadcast_var = 0x0p+0f/*0.000000e+00*/;\n      *(float4*)(acc + (i * 4)) = make_float4(broadcast_var, broadcast_var, broadcast_var, broadcast_var);\n    }\n    for (int kk_1 = 0; kk_1 < 4; ++kk_1) {\n      if (kk_1 == 0) {\n        mbarrier[6].wait(0);\n      }\n      mbarrier[(kk_1 % 3)].wait((kk_1 / 3));\n      tl::__sync_thread_partial(3, 128);\n      #pragma unroll\n      for (int i_1 = 0; i_1 < 16; ++i_1) {\n        e[i_1] = expf((((((float*)X_s)[((((((kk_1 % 3) * 2048) + ((((int)threadIdx.x) & 63) * 32)) + (i_1 * 2)) + (((int)threadIdx.x) >> 6)) - 2)] * ((float)((bfloat16_t*)R_s)[((((((kk_1 % 3) * 2048) + ((((int)threadIdx.x) & 63) * 32)) + (i_1 * 2)) + (((int)threadIdx.x) >> 6)) - 2)])) / 0x1.6a09e667f3bcdp+3f/*1.131371e+01*/) - ((float*)M_s)[(((i_1 * 2) + (((int)threadIdx.x) >> 6)) - 2)]));\n      }\n      mbarrier[((kk_1 % 3) + 3)].arrive();\n      #pragma unroll\n      for (int i_2 = 0; i_2 < 16; ++i_2) {\n        part[i_2] = 0x0p+0f/*0.000000e+00*/;\n        part[i_2] = (part[i_2] + e[i_2]);\n        tl::__sync_thread_partial(3, 128);\n        part[i_2] = tl::AllReduce<tl::SumOp, 64, 1, 128, tl::NamedBarrier<128>>::run(part[i_2], (&(((float*)workspace)[0])));\n      }\n      #pragma unroll\n      for (int i_3 = 0; i_3 < 4; ++i_3) {\n        float4 __1;\n          float4 v_ = *(float4*)(acc + (i_3 * 4));\n          float4 v__1 = *(float4*)(part + (i_3 * 4));\n          *(float2*)(&(__1.x)) = tl::add2(*(float2*)(&(v_.x)), *(float2*)(&(v__1.x)));\n          *(float2*)(&(__1.z)) = tl::add2(*(float2*)(&(v_.z)), *(float2*)(&(v__1.z)));\n        *(float4*)(acc + (i_3 * 4)) = __1;\n      }\n    }\n    if ((((int)threadIdx.x) % 64) == 0) {\n      #pragma unroll\n      for (int i_4 = 0; i_4 < 16; ++i_4) {\n        P[((((((int)blockIdx.y) * 32) + (i_4 * 2)) + (((int)threadIdx.x) >> 6)) - 2)] = acc[i_4];\n      }\n    }\n  }\n}\n\n\n"
+        },
+        {
+          "name": "test_ws_mma_sync_stage_reads_fence_before_release",
+          "status": "failed",
+          "error": "Traceback (most recent call last):\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 23, in check\n    details = function()\n              ^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 347, in <lambda>\n    check(name, lambda name=name: upstream_test(3537, \"testing/python/issue/test_tilelang_issue_3529.py\", name))\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py\", line 77, in upstream_test\n    getattr(module, name)()\n  File \"/review/variants/pr3537/testing/python/issue/test_tilelang_issue_3529.py\", line 124, in test_ws_mma_sync_stage_reads_fence_before_release\n    assert all(_consumer_releases_fenced(src)), src\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern \"C\" __global__ void main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, half_t* __restrict__ C);\nextern \"C\" __global__ void __launch_bounds__(256, 1) main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, half_t* __restrict__ C) {\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 49152));\n  __shared__ __align__(16) uint64_t mbarrier_mem[6];\n  auto mbarrier = reinterpret_cast<Barrier*>(mbarrier_mem);\n  float C_local[128];\n  if (tl::tl_shuffle_elect<0>()) {\n    tl::prefetch_tma_descriptor(A_desc);\n    tl::prefetch_tma_descriptor(B_desc);\n  }\n  if (tl::tl_shuffle_elect<0>()) {\n    mbarrier[0].init(1);\n    mbarrier[1].init(1);\n    mbarrier[2].init(1);\n    mbarrier[3].init(128);\n    mbarrier[4].init(128);\n    mbarrier[5].init(128);\n  }\n  tl::fence_barrier_init();\n  __syncthreads();\n  if (((int)threadIdx.x) < 128) {\n    tl::warpgroup_reg_dealloc<24>();\n    if (((int)threadIdx.x) < 32) {\n      for (int ko = 0; ko < 8; ++ko) {\n        mbarrier[((ko % 3) + 3)].wait((((ko % 6) / 3) ^ 1));\n        if (tl::tl_shuffle_elect<32>()) {\n          mbarrier[(ko % 3)].expect_transaction(16384);\n          tl::tma_load(A_desc, mbarrier[(ko % 3)], (&(((half_t*)A_shared)[((ko % 3) * 8192)])), (ko * 64), (((int)blockIdx.y) * 128));\n          mbarrier[(ko % 3)].arrive_and_expect_tx(16384);\n          #pragma unroll\n          for (int i = 0; i < 2; ++i) {\n            tl::tma_load(B_desc, mbarrier[(ko % 3)], (&(((half_t*)B_shared)[(((ko % 3) * 8192) + (i * 4096))])), ((((int)blockIdx.x) * 128) + (i * 64)), (ko * 64));\n          }\n        }\n      }\n    }\n  } else {\n    tl::warpgroup_reg_alloc<240>();\n    #pragma unroll\n    for (int i_1 = 0; i_1 < 32; ++i_1) {\n      float broadcast_var = 0x0p+0f/*0.000000e+00*/;\n      *(float4*)(C_local + (i_1 * 4)) = make_float4(broadcast_var, broadcast_var, broadcast_var, broadcast_var);\n    }\n    for (int ko_1 = 0; ko_1 < 8; ++ko_1) {\n      mbarrier[(ko_1 % 3)].wait(((ko_1 % 6) / 3));\n      {\n        half_t A_local[32];\n        half_t B_local[32];\n        for (int ki = 0; ki < 4; ++ki) {\n          #pragma unroll\n          for (int i_2 = 0; i_2 < 4; ++i_2) {\n            tl::ptx_ldmatrix_x4((&(((half_t*)A_shared)[((((((((ko_1 % 3) * 8192) + (((((int)threadIdx.x) & 63) >> 5) * 4096)) + (i_2 * 1024)) + ((((int)threadIdx.x) & 15) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (ki >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (ki & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(A_local[(i_2 * 8)])));\n          }\n          #pragma unroll\n          for (int i_3 = 0; i_3 < 4; ++i_3) {\n            tl::ptx_ldmatrix_x4_trans((&(((half_t*)B_shared)[((((((((ko_1 % 3) * 8192) + (((((int)threadIdx.x) & 127) >> 6) * 4096)) + (ki * 1024)) + ((((int)threadIdx.x) & 15) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (i_3 >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_3 & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(B_local[(i_3 * 8)])));\n          }\n          for (int i_4 = 0; i_4 < 4; ++i_4) {\n            for (int j = 0; j < 4; ++j) {\n              tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_local + ((i_4 * 32) + (j * 8))), reinterpret_cast<const unsigned*>(A_local + (i_4 * 8)), reinterpret_cast<const unsigned*>(B_local + (j * 8)));\n              tl::mma_sync<tl::DataType::kFloat16, tl::DataType::kFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_local + (((i_4 * 32) + (j * 8)) + 4)), reinterpret_cast<const unsigned*>(A_local + (i_4 * 8)), reinterpret_cast<const unsigned*>(B_local + ((j * 8) + 4)));\n            }\n          }\n        }\n      }\n      mbarrier[((ko_1 % 3) + 3)].arrive();\n    }\n    #pragma unroll\n    for (int i_5 = 0; i_5 < 64; ++i_5) {\n      half_t C_local_cast[2];\n      uint1 __1;\n      float2 v_ = *(float2*)(C_local + (i_5 * 2));\n      ((half2*)(&__1))[0] = __float22half2_rn(((float2*)(&v_))[0]);\n      *(uint1*)(C_local_cast + 0) = __1;\n      *(uint1*)(C + ((((((((((((int)blockIdx.y) * 65536) + (((((int)threadIdx.x) & 63) >> 5) * 32768)) + ((i_5 >> 4) * 8192)) + ((i_5 & 1) * 4096)) + (((((int)threadIdx.x) & 31) >> 2) * 512)) + (((int)blockIdx.x) * 128)) + ((((int)threadIdx.x) >> 6) * 64)) + (((i_5 & 15) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2)) - 128)) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n\n"
+        },
+        {
+          "name": "test_ws_generic_stage_reads_fast_math_correctness",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fast_math_correctness",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        }
+      ],
+      "min_host_available_bytes": 122624782336,
+      "max_hottest_c": 56.6,
+      "files": {
+        "command.json": {
+          "bytes": 1546,
+          "sha256": "281c244e8266188faf1719958dd4353212d0b71918b39767b697783f1fab579b"
+        },
+        "memory.jsonl": {
+          "bytes": 672,
+          "sha256": "1c91e8642ed3ea01bcdbaa18f3e2bb7536129ce5e14394c4f388da08fa61f0f5"
+        },
+        "output.txt": {
+          "bytes": 13287,
+          "sha256": "5f16a060765fce81db67506c13f530e2dd3221f0b534b02c22a1908f2f6cd6a3"
+        },
+        "result.json": {
+          "bytes": 1729,
+          "sha256": "1e8db24ec003997ffe47951442cdd5e935b795026bf26ffda6fb2141a38a5eef"
+        },
+        "standalone.json": {
+          "bytes": 12411,
+          "sha256": "d66a835607d0220c895269a7d9430f1143cf9efbff329f8ec666f1ffe9d543fd"
+        },
+        "test_ws_generic_stage_reads_fast_math_correctness-ws-off-False-0.cu": {
+          "bytes": 4429,
+          "sha256": "e047d311abfbce9d632a1820fe3a70dd211da13049ea18f3711a56cbc6ae2166"
+        },
+        "test_ws_generic_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 4429,
+          "sha256": "e047d311abfbce9d632a1820fe3a70dd211da13049ea18f3711a56cbc6ae2166"
+        },
+        "test_ws_mma_sync_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 5324,
+          "sha256": "b0dca08d82b17bafbec3ccdd0634feb45c7511e0beab9561bf3b298cfdc9b8b8"
+        }
+      }
+    },
+    "ws3537-pr3537-a-v2": {
+      "label": "ws3537-pr3537-a-v2",
+      "started_utc": "2026-11-04T01:38:08.854356+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3537",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3537-pr3537-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3537-pr3537-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3537-pr3537-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3537",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3537"
+      ],
+      "before_memory_bytes": 123405852672,
+      "start_hottest_c": 49.6,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:38:15.864221+00:00",
+      "memory_aborted": false,
+      "output_sha256": "3393fee9e3d148cfc504ae7105a53a71398c7bdf6a8d9934551caa9c862410cc",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "test_ws_generic_stage_reads_fence_before_release",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fence_before_release",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        },
+        {
+          "name": "test_ws_mma_sync_stage_reads_fence_before_release",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_mma_sync_stage_reads_fence_before_release",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        },
+        {
+          "name": "test_ws_generic_stage_reads_fast_math_correctness",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fast_math_correctness",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        }
+      ],
+      "min_host_available_bytes": 121973043200,
+      "max_hottest_c": 54.8,
+      "files": {
+        "command.json": {
+          "bytes": 1558,
+          "sha256": "359c088910157811148ff5cc8f35b38fd6dac510f4e4d2b34f8a62ed1900f649"
+        },
+        "memory.jsonl": {
+          "bytes": 672,
+          "sha256": "000400a6414505581af2aa4137031c8695cdd8827dfaaa03794def5cb17c2b55"
+        },
+        "output.txt": {
+          "bytes": 1748,
+          "sha256": "3393fee9e3d148cfc504ae7105a53a71398c7bdf6a8d9934551caa9c862410cc"
+        },
+        "result.json": {
+          "bytes": 1741,
+          "sha256": "eafac1e2fca7eb0d5194045db2e2c0a546ae19e03982042aa80e62d10694562e"
+        },
+        "standalone.json": {
+          "bytes": 916,
+          "sha256": "0462577b62344b0c86e034924062b22ab32a70b22d594e3886937167a24bd8f7"
+        },
+        "test_ws_generic_stage_reads_fast_math_correctness-ws-off-False-0.cu": {
+          "bytes": 4460,
+          "sha256": "c1c7e540d29b85fd20d4ee0da2b696dc7f044d5a137329094c7c2e8f04c8121a"
+        },
+        "test_ws_generic_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 4460,
+          "sha256": "c1c7e540d29b85fd20d4ee0da2b696dc7f044d5a137329094c7c2e8f04c8121a"
+        },
+        "test_ws_mma_sync_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 5355,
+          "sha256": "ca9c0983d56be98bc0b8ec4ef4ff31905972a2b3687fbc17efd7f430ebec2759"
+        }
+      }
+    },
+    "ws3537-pr3537-b-v2": {
+      "label": "ws3537-pr3537-b-v2",
+      "started_utc": "2026-11-04T01:59:56.014241+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3537",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-ws3537-pr3537-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/ws3537-pr3537-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/ws3537-pr3537-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3537",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/standalone.py",
+        "ws3537"
+      ],
+      "before_memory_bytes": 123702517760,
+      "start_hottest_c": 49.7,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T02:00:03.022642+00:00",
+      "memory_aborted": false,
+      "output_sha256": "d4e0b9634ef7ed98f9de310023692b84cbd26d93e74e51b6ef22171c8c5619de",
+      "valid_for_comparison": true,
+      "checks": [
+        {
+          "name": "test_ws_generic_stage_reads_fence_before_release",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fence_before_release",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        },
+        {
+          "name": "test_ws_mma_sync_stage_reads_fence_before_release",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_mma_sync_stage_reads_fence_before_release",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        },
+        {
+          "name": "test_ws_generic_stage_reads_fast_math_correctness",
+          "status": "passed",
+          "details": {
+            "upstream_test": "testing/python/issue/test_tilelang_issue_3529.py::test_ws_generic_stage_reads_fast_math_correctness",
+            "compiled_kernels": 1,
+            "forced_ws_off": false
+          }
+        }
+      ],
+      "min_host_available_bytes": 122482475008,
+      "max_hottest_c": 54.9,
+      "files": {
+        "command.json": {
+          "bytes": 1558,
+          "sha256": "d89b81c2ddaf64deb1126271339f75822f765eb76b24f39ff16088b5f12f4f01"
+        },
+        "memory.jsonl": {
+          "bytes": 672,
+          "sha256": "9cb4488bf47d5417fec33c6816bf2c2d1d4bea2f1023be33ed785cd171c4a621"
+        },
+        "output.txt": {
+          "bytes": 1748,
+          "sha256": "d4e0b9634ef7ed98f9de310023692b84cbd26d93e74e51b6ef22171c8c5619de"
+        },
+        "result.json": {
+          "bytes": 1741,
+          "sha256": "4437f2332675eda585d8e4972dbb26af60e233b21ac332293b5ffa6b93b6b21d"
+        },
+        "standalone.json": {
+          "bytes": 916,
+          "sha256": "0462577b62344b0c86e034924062b22ab32a70b22d594e3886937167a24bd8f7"
+        },
+        "test_ws_generic_stage_reads_fast_math_correctness-ws-off-False-0.cu": {
+          "bytes": 4460,
+          "sha256": "c1c7e540d29b85fd20d4ee0da2b696dc7f044d5a137329094c7c2e8f04c8121a"
+        },
+        "test_ws_generic_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 4460,
+          "sha256": "c1c7e540d29b85fd20d4ee0da2b696dc7f044d5a137329094c7c2e8f04c8121a"
+        },
+        "test_ws_mma_sync_stage_reads_fence_before_release-ws-off-False-0.cu": {
+          "bytes": 5355,
+          "sha256": "ca9c0983d56be98bc0b8ec4ef4ff31905972a2b3687fbc17efd7f430ebec2759"
+        }
+      }
+    }
+  },
+  "evidence_sha256": "65f302130175980fc4f75ce8482c75f8ec48ffd80f1e5699f82212bea59bdf2a",
+  "new_gpu_runs": [],
+  "serving_operations": [],
+  "candidate_image_built": false
+}

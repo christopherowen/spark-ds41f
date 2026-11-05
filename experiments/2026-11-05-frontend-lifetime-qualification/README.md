@@ -51,3 +51,9 @@ A separate second official vLLM-only preparation subsequently passed and
 reproduced the declared head/tree. Its original log retains an intermediate
 patch whitespace warning; final source whitespace passed. The disk failure
 remains unchanged. Complete Linux inputs/checks and actual-image gates are pending.
+
+C42 subsequently failed its required IKET prepared/frozen check. The VERSION-only
+C44 proposal cannot fix that source branch and is withdrawn unmeasured. C43 now
+selects C40's unchanged old compiler. Its forthcoming release gate uses an isolated
+fresh directory, preserving the shared test cache C42 touched. Serving-rank
+caches were never touched by C42 because no image was distributed or booted.

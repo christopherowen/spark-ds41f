@@ -1,3 +1,24 @@
+# C42 final result: rejected quality gate
+
+C42 ended21:33:57UTC on2026-11-05 with actual wait exit1. The original native
+error is `RuntimeError: image-and-gate exited 1`: the release gate has8073
+passed,360 skipped,1 failed,0 errors across all136 manifest files. IKET's
+prepared/frozen cache-disabled call fails because #880 ignores its explicitly
+prepared wrapper object. Focused review and independent local method witness
+confirm this retained-feature regression. C44's VERSION-only source cannot fix
+it and is withdrawn unmeasured. Retain C40; do not resume or re-gate C42.
+
+No seed/distribution, functional, serving or performance phase ran; top-k
+initialization and compiler-feature processes did not run. No C42 performance
+over/under exists. All29 builder/gate and21 head artifacts verify locally.
+Independent C36 doctor/ranks passed with identical preexisting containers,
+correct image/profile and zero restarts; both native processes are absent.
+Only the exact matching own closure-only request was fulfilled/removed. The
+prior closure request does not reclassify the actual gate failure as sharing.
+See decision.md and runs/2026-11-05-dgx/attempt-1/README.md.
+
+## Original execution and preparation history
+
 # Qualification provenance review
 
 At21:27:19UTC a normal closure-only request was submitted for the owned C42

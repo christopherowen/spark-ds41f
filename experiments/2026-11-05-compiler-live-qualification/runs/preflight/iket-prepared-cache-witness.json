@@ -1,0 +1,93 @@
+{
+  "status": "source_control_flow_witness_passed",
+  "native_or_GPU_test": false,
+  "TileLang_TVM_Torch_imported": false,
+  "assumptions": [
+    "tilelang.prepare has populated the same call key in impl._kernel_cache, as the actual source does",
+    "IKET default no-persistent-cache mode has disabled cache and prepare.freeze(test) has frozen compilation",
+    "The object and parse key are doubles; no kernel is compiled or executed"
+  ],
+  "source": {
+    "pre_bypass_head": "925388ba06cdb4d210c820e03480e5b48d1d4723",
+    "pre_bypass_JIT_sha256": "7120a23f5408623f0be3b8320329b85770779f6a74c67f4eb3be26f9b14a4197",
+    "C42_head": "454202b2ba8d0cf10b8caf434a956755e039483f",
+    "C42_JIT_sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+    "C42_cache_sha256": "9f896b700aa7b3efd5e7ad13e21bea0d331cd9d7f2612c0052c3ef23617782a0",
+    "C44_head": "d297f60c852dab7dd4fd5a8cfd4ed0d02b071f2f",
+    "C44_JIT_sha256": "ba741e204f7a726dc768674a229f2ae9718f14e4324ccaeea427d96a5e043258",
+    "C42_C44_JIT_bytes_identical": true
+  },
+  "cases": {
+    "pre_bypass_prepared_frozen_cache_disabled": {
+      "returned_prepared_object": true,
+      "exception": null,
+      "cache_enabled": false,
+      "compile_attempts": 0,
+      "prepared_object_remains_in_wrapper_cache": true,
+      "JIT_call_AST_sha256": "17f7ad428e529ef1a8eada8a1706e9f119f616b7a61b213f387a2f4640903cb5",
+      "JIT_call_lines": [
+        545,
+        595
+      ],
+      "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+      "freeze_refusal_lines": [
+        68,
+        73
+      ]
+    },
+    "C42_prepared_frozen_cache_disabled": {
+      "returned_prepared_object": false,
+      "exception": "KernelNotPreparedError",
+      "message": "TileLang kernel 'iket_test_scale_add' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)",
+      "cache_enabled": false,
+      "compile_attempts": 1,
+      "prepared_object_remains_in_wrapper_cache": true,
+      "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+      "JIT_call_lines": [
+        546,
+        602
+      ],
+      "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+      "freeze_refusal_lines": [
+        68,
+        73
+      ]
+    },
+    "C42_prepared_frozen_cache_enabled": {
+      "returned_prepared_object": true,
+      "exception": null,
+      "cache_enabled": true,
+      "compile_attempts": 0,
+      "prepared_object_remains_in_wrapper_cache": true,
+      "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+      "JIT_call_lines": [
+        546,
+        602
+      ],
+      "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+      "freeze_refusal_lines": [
+        68,
+        73
+      ]
+    },
+    "C44_prepared_frozen_cache_disabled": {
+      "returned_prepared_object": false,
+      "exception": "KernelNotPreparedError",
+      "message": "TileLang kernel 'iket_test_scale_add' was not prepared: the kernel cache is frozen (test); requested as scale_add(1024)",
+      "cache_enabled": false,
+      "compile_attempts": 1,
+      "prepared_object_remains_in_wrapper_cache": true,
+      "JIT_call_AST_sha256": "6a0e81543bd13226b32b7d47c2cc04f498650bf72194955cbeff9adf537719f9",
+      "JIT_call_lines": [
+        546,
+        602
+      ],
+      "freeze_refusal_AST_sha256": "7ed9c96cc21c767ffce3b03848dadd38540f1c6fd1e11082c33b9019e80c7385",
+      "freeze_refusal_lines": [
+        68,
+        73
+      ]
+    }
+  },
+  "conclusion": "The cache-bypass patch ignores a valid explicitly prepared wrapper object while cache is disabled; frozen compilation then refuses. VERSION-only C44 cannot correct this branch."
+}

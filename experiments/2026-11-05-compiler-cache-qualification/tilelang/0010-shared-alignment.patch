@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 11:40:39 +0100
+Subject: [PATCH] Infer TileLang shared-memory alignment from every use
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Local-base: b26f48b85790b832993f2c9d240dc3c39d6075e8, the five-patch refresh from deployment PR #875.
+Upstream-source: https://github.com/tile-ai/tilelang/pull/3690
+Upstream-head: 277f2cd48553fafc99802238f52b6f0146b49f12
+
+Rationale: Infer shared-memory alignment from all buffer uses, including TMA descriptors, instead of conservatively aligning every arena to 1024 bytes.
+
+Quality: Changes allocation alignment and padding, not arithmetic. Descriptor and swizzle constraints must remain satisfied. The recorded tests establish correctness and codegen behavior, not a serving speedup.
+
+Tests: Nineteen alignment, packed-allocation and exact swizzled-TMA checks pass twice.
+Recorded compiler tree: e9a38e6d7c7cb40db6f219b266288e03e6e3ad70.
+See this candidate's results.json and immutable raw receipts. Full image,
+retained-feature and serving qualification remain separate gates.
+
+Upstream-status: open PR, checked 2026-11-04; pinned experimental backport.
+Remove this local backport when advancing to an upstream revision containing it.
+---
+
+diff --git a/src/cuda/codegen/codegen_cuda.cc b/src/cuda/codegen/codegen_cuda.cc
+index c4554d5f..6224f208 100644
+--- a/src/cuda/codegen/codegen_cuda.cc
++++ b/src/cuda/codegen/codegen_cuda.cc
+@@ -1723,7 +1723,7 @@ void CodeGenTileLangCUDA::PrintStorageScope(const std::string &scope,
+       scope == "shared.cluster_barrier") {
+     os << "__shared__ __align__(" << barrier_alignment_bytes_ << ") ";
+   } else if (scope == "shared.dyn") {
+-    os << "extern __shared__ __align__(1024) ";
++    os << "extern __shared__ __align__(" << dynamic_smem_alignment_ << ") ";
+   }
+ }
+ 
+@@ -6632,6 +6632,9 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
+   CodeGenC::DeclareFunction(gvar, f);
+   // clear previous generated state.
+   this->InitFuncState(f);
++  dynamic_smem_alignment_ = f->GetAttr<Integer>(tl::kDynamicSmemAlignment)
++                                .value_or(Integer(1024))
++                                ->value;
+   // reserve keywords
+   ReserveKeywordsAsUnique_();
+ 
+diff --git a/src/cuda/codegen/codegen_cuda.h b/src/cuda/codegen/codegen_cuda.h
+index 38311902..02a783f8 100644
+--- a/src/cuda/codegen/codegen_cuda.h
++++ b/src/cuda/codegen/codegen_cuda.h
+@@ -199,6 +199,8 @@ private:
+   // The alignment of the barrier array in shared memory
+   // Set to 16 to maintain minimum alignment requirements for async bulk copy
+   const int barrier_alignment_bytes_ = 16;
++  // Conservative fallback for device IR that bypasses shared-memory planning.
++  int64_t dynamic_smem_alignment_ = 1024;
+ 
+   std::unordered_map<const VarNode *, std::string> fragment_shapes;
+   std::unordered_map<const VarNode *, std::string> fragment_layouts;
+diff --git a/src/cuda/op/copy.cc b/src/cuda/op/copy.cc
+index a7478da8..d18de29a 100644
+--- a/src/cuda/op/copy.cc
++++ b/src/cuda/op/copy.cc
+@@ -2255,6 +2255,8 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
+     int loop_extent = plan.rest_size;
+     Array<PrimExpr> args = make_args(loop_var);
+     Map<String, ObjectRef> ann;
++    ann.Set(attr::kSmemAlignment,
++            Integer(SwizzleMode::FromOrdinal(desc.swizzle).SmemAlignment()));
+     if (is_cluster_barrier && TargetIsSm100(lower_args.target) && is_load) {
+       ann.Set("use_2cta", IntImm(DataType::Int(32), 1));
+     }
+@@ -2264,11 +2266,13 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
+       tma_copy = wrap_multicast(
+           tma_copy, For(loop_var, 0, loop_extent, ForKind::kUnrolled,
+                         Evaluate(Call(DataType::Handle(), tma_load_multicast(),
+-                                      build_multicast_args(args)))));
++                                      build_multicast_args(args), ann))));
+     }
+   } else {
+     Array<PrimExpr> args = make_args(std::nullopt);
+     Map<String, ObjectRef> ann;
++    ann.Set(attr::kSmemAlignment,
++            Integer(SwizzleMode::FromOrdinal(desc.swizzle).SmemAlignment()));
+     if (TargetIsSm100(lower_args.target) && is_load &&
+         (annotations.find("use_2cta") != annotations.end() ||
+          is_cluster_barrier)) {
+@@ -2278,7 +2282,7 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
+     if (use_multicast) {
+       tma_copy = wrap_multicast(
+           tma_copy, Evaluate(Call(DataType::Handle(), tma_load_multicast(),
+-                                  build_multicast_args(args))));
++                                  build_multicast_args(args), ann)));
+     }
+   }
+ 
+@@ -2495,6 +2499,11 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &lower_args,
+   auto shared_tensor = is_load ? dst : src;
+   auto global_tensor = is_load ? src : dst;
+ 
++  // Unlike tensor-map copies, linear bulk copies have no shared-memory swizzle.
++  if (lower_args.require_smem_alignment) {
++    lower_args.require_smem_alignment(shared_tensor->data, 16);
++  }
++
+   PrimExpr shared_elements = 1;
+   for (size_t i = 0; i < shared_range.size(); i++) {
+     shared_elements *= shared_range[i]->extent;
+@@ -2578,16 +2587,20 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &lower_args,
+          "invalid size.\n"
+       << "  Total_bytes = " << total_bytes << "\n";
+ 
++  Map<String, ObjectRef> ann;
++  ann.Set(attr::kSmemAlignment, Integer(16));
+   if (is_load) {
+     PrimExpr mbar_arg = barrier_base_id >= 0 ? mbar_handle : PrimExpr(0);
+     tma_copy = Evaluate(Call(DataType::Handle(), tma_load(),
+                              {shared_addr, global_addr, mbar_arg, total_bytes,
+-                              GetEvictionPolicy(op)}));
++                              GetEvictionPolicy(op)},
++                             ann));
+   } else {
+     int need_reduce = 0;
+     tma_copy = Evaluate(Call(DataType::Handle(), tma_store(),
+                              {global_addr, shared_addr, total_bytes,
+-                              need_reduce, GetEvictionPolicy(op)}));
++                              need_reduce, GetEvictionPolicy(op)},
++                             ann));
+   }
+ 
+   if (!is_load) {
+diff --git a/src/op/builtin.h b/src/op/builtin.h
+index f9f7891b..29d3b2a2 100644
+--- a/src/op/builtin.h
++++ b/src/op/builtin.h
+@@ -29,6 +29,10 @@ static constexpr const char *kAsyncCopyNoImplicitCommitWait =
+ static constexpr const char *kPipelineMbarPhaseExpr =
+     "tl.pipeline_mbar_phase_expr";
+ 
++// Alignment required by this lowered shared-memory instruction, not all uses
++// of its allocation. Missing metadata requires a conservative fallback.
++static constexpr const char *kSmemAlignment = "tl.smem_alignment";
++
+ static constexpr const char *kLocalVarInit = "tl.local_var_init";
+ static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
+ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
+@@ -58,6 +62,9 @@ inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(
+ static constexpr const char *kDebugMergeSharedMemoryAllocations =
+     "tl.debug_merge_shared_memory_allocations";
+ static constexpr const char *kSmemAlignmentMap = "tl.smem_alignment_map";
++// Required base alignment of the dynamic shared-memory arena after merging.
++static constexpr const char *kDynamicSmemAlignment =
++    "tl.dynamic_smem_alignment";
+ static constexpr const char *kDisableSafeMemoryLegalize =
+     "tl.disable_safe_memory_legalize";
+ static constexpr const char *kConfigIndexBitwidth = "tl.config_index_bitwidth";
+diff --git a/src/transform/merge_shared_memory_allocations.cc b/src/transform/merge_shared_memory_allocations.cc
+index d87e5f9e..bea43ff6 100644
+--- a/src/transform/merge_shared_memory_allocations.cc
++++ b/src/transform/merge_shared_memory_allocations.cc
+@@ -371,16 +371,13 @@ private:
+ class SharedMemoryAlignmentPlanner : public StmtExprVisitor {
+ 
+ public:
+-  // explicit_alignments carries the per-buffer requirements recorded by op
+-  // lowering (kSmemAlignmentMap); the scan below adds a conservative fallback
+-  // for shared vars that reach swizzle-sensitive instructions without an
+-  // explicit entry.
++  // Lowering's per-buffer map is a lower bound. Every instruction use must
++  // still contribute its own requirement, including unannotated raw calls.
+   static std::unordered_map<const VarNode *, int>
+   Plan(const Stmt &stmt,
+        const std::unordered_map<const VarNode *, int> &explicit_alignments) {
+     SharedMemoryAlignmentPlanner planner;
+     planner.shmem_alignment_map_ = explicit_alignments;
+-    planner.explicit_alignment_map_ = &explicit_alignments;
+     planner(stmt);
+     return planner.shmem_alignment_map_;
+   }
+@@ -389,36 +386,37 @@ private:
+   // Helper to record alignment for a shared/shared.dyn Var under alignment
+   // scope
+   void MarkSharedVarIfNeeded(const VarNode *op) {
+-    if (!op || !under_alignment_scope_)
++    if (!op || !alignment_scope_)
+       return;
+     auto ptr_type = op->type_annotation.as<PointerTypeNode>();
+     if (!ptr_type)
+       return;
+     auto scope = GetPtrStorageScope(GetRef<Var>(op));
+     if (scope == "shared" || scope == "shared.dyn") {
+-      // An explicit requirement recorded at lowering time is exact; keep it.
+-      if (explicit_alignment_map_->count(op))
+-        return;
+-      // TMA bulk-copy and MMA-descriptor operands have stricter shared-memory
+-      // alignment than ordinary shared accesses, and the exact requirement
+-      // depends on the operand's swizzle mode (up to 1024B for 128B swizzle).
+-      // Buffers without an explicit kSmemAlignmentMap entry get the worst
+-      // case: a misaligned base is not a launch error but silent data
+-      // corruption, so never under-align here.
+       int &slot = shmem_alignment_map_[op];
+-      slot = std::max(slot, 1024);
++      slot = std::max(slot, alignment_scope_);
+     }
+   }
+ 
+   void VisitExpr_(const CallNode *op) {
+     if (op->op.same_as(tl::tma_load()) || op->op.same_as(tl::tma_store()) ||
++        op->op.same_as(tl::tma_load_multicast()) ||
++        op->op.same_as(tl::tma_load_im2col()) ||
++        op->op.same_as(tl::tma_load_gather4()) ||
++        op->op.same_as(tl::tma_store_scatter4()) ||
+         op->op.same_as(tl::initialize_wgmma_descriptor()) ||
+         op->op.same_as(tl::initialize_tcgen05_descriptor())) {
+-      // These intrinsics introduce stricter SMEM alignment requirements; mark
+-      // the subtree.
+-      under_alignment_scope_ = true;
++      const int previous_alignment = alignment_scope_;
++      int alignment = 1024;
++      if (auto value = op->annotations.Get(attr::kSmemAlignment)) {
++        auto required = Downcast<IntImm>(value.value());
++        ICHECK(required->value >= 16 && required->value <= 1024 &&
++               (required->value & (required->value - 1)) == 0);
++        alignment = static_cast<int>(required->value);
++      }
++      alignment_scope_ = alignment;
+       StmtExprVisitor::VisitExpr_(op);
+-      under_alignment_scope_ = false;
++      alignment_scope_ = previous_alignment;
+     } else {
+       StmtExprVisitor::VisitExpr_(op);
+     }
+@@ -432,17 +430,14 @@ private:
+   void VisitExpr_(const BufferLoadNode *op) {
+     // If we encounter address_of(BufferLoad(...)) or any direct BufferLoad
+     // within an alignment scope, make sure we mark the underlying shared var.
+-    if (op && under_alignment_scope_) {
++    if (op && alignment_scope_) {
+       const VarNode *data_var = op->buffer->data.get();
+       MarkSharedVarIfNeeded(data_var);
+     }
+     StmtExprVisitor::VisitExpr_(op);
+   }
+ 
+-  bool under_alignment_scope_{false};
+-
+-  const std::unordered_map<const VarNode *, int> *explicit_alignment_map_{
+-      nullptr};
++  int alignment_scope_{0};
+   std::unordered_map<const VarNode *, int> shmem_alignment_map_;
+ };
+ 
+@@ -469,16 +464,15 @@ public:
+    * \brief plan the memory reuse for all the buffer allocated in the statement
+    * \param stmt the statement
+    */
+-  void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
+-                 bool enable_aggressive_merge = false, bool verbose = false,
+-                 bool disable_reuse = false,
+-                 const std::unordered_map<const VarNode *, int>
+-                     &explicit_alignments = {}) {
++  void
++  PlanReuse(const Stmt &stmt, bool is_dynamic = true,
++            bool enable_aggressive_merge = false, bool verbose = false,
++            bool disable_reuse = false,
++            const std::unordered_map<const VarNode *, int> &alignments = {}) {
+     SharedMemLinearAccessPatternFinder finder(is_dynamic,
+                                               enable_aggressive_merge, verbose);
+     finder(stmt);
+-    shmem_alignment_map_ =
+-        SharedMemoryAlignmentPlanner::Plan(stmt, explicit_alignments);
++    shmem_alignment_map_ = alignments;
+     if (disable_reuse) {
+       this->PlanSequentialLayout();
+     } else {
+@@ -1573,13 +1567,12 @@ private:
+   bool preserve_aliases_{true};
+ };
+ 
+-Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
+-                                  bool enable_aggressive_merge,
+-                                  int align_bytes = 16, bool verbose = false,
+-                                  bool preserve_aliases = true,
+-                                  bool disable_reuse = false,
+-                                  const std::unordered_map<std::string, int>
+-                                      &explicit_alignments_by_name = {}) {
++std::pair<Stmt, int> MergeSharedMemoryAllocations(
++    Stmt stmt, bool merge_static_smem, bool enable_aggressive_merge,
++    int align_bytes = 16, bool verbose = false, bool preserve_aliases = true,
++    bool disable_reuse = false,
++    const std::unordered_map<std::string, int> &explicit_alignments_by_name =
++        {}) {
+   AllocateCollector collector;
+   collector(stmt);
+   // The kSmemAlignmentMap attribute is keyed by buffer-var name (names are
+@@ -1600,12 +1593,22 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
+         }
+         return resolved;
+       };
++  auto dynamic_alignments = SharedMemoryAlignmentPlanner::Plan(
++      stmt, resolve(collector.dyn_shmem_allocs_));
++  // Offsets alone are insufficient: the arena base must satisfy every dynamic
++  // allocation's requirement, including when there is only one allocation.
++  int dynamic_alignment = std::max(16, align_bytes);
++  for (const auto &[var, alignment] : dynamic_alignments) {
++    if (collector.dyn_shmem_allocs_.count(var)) {
++      dynamic_alignment = std::max(dynamic_alignment, alignment);
++    }
++  }
+   if (collector.dyn_shmem_allocs_.size() > 1) {
+     SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+                                   align_bytes, preserve_aliases);
+     rewriter.PlanReuse(stmt, true,
+                        disable_reuse ? false : enable_aggressive_merge, false,
+-                       disable_reuse, resolve(collector.dyn_shmem_allocs_));
++                       disable_reuse, dynamic_alignments);
+     stmt = rewriter(std::move(stmt));
+   }
+   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
+@@ -1613,10 +1616,12 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
+                                   verbose, align_bytes, preserve_aliases);
+     rewriter.PlanReuse(stmt, false,
+                        disable_reuse ? false : enable_aggressive_merge, false,
+-                       disable_reuse, resolve(collector.static_shmem_allocs_));
++                       disable_reuse,
++                       SharedMemoryAlignmentPlanner::Plan(
++                           stmt, resolve(collector.static_shmem_allocs_)));
+     stmt = rewriter(std::move(stmt));
+   }
+-  return stmt;
++  return {std::move(stmt), dynamic_alignment};
+ }
+ 
+ using namespace tirx::transform;
+@@ -1647,11 +1652,13 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
+       }
+     }
+     auto *n = f.CopyOnWrite();
+-    n->body = tl::MergeSharedMemoryAllocations(
++    auto [body, dynamic_alignment] = tl::MergeSharedMemoryAllocations(
+         std::move(n->body), merge_static_smem, enable_aggressive_merge,
+         align_bytes, debug_merge_shared_memory_allocations, preserve_aliases,
+         disable_reuse, explicit_alignments);
+-    return f;
++    n->body = std::move(body);
++    return WithAttr(std::move(f), kDynamicSmemAlignment,
++                    Integer(dynamic_alignment));
+   };
+   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",
+                             {});
+diff --git a/testing/python/components/test_cuda_shared_memory_alias_codegen.py b/testing/python/components/test_cuda_shared_memory_alias_codegen.py
+index f4974cda..27d47114 100644
+--- a/testing/python/components/test_cuda_shared_memory_alias_codegen.py
++++ b/testing/python/components/test_cuda_shared_memory_alias_codegen.py
+@@ -29,7 +29,7 @@ def test_dynamic_shared_memory_merge_emits_named_aliases():
+     artifact = tilelang.lower(kernel, target="cuda")
+     source = artifact.kernel_source
+ 
+-    assert "extern __shared__ __align__(1024) uchar buf_dyn_shmem[];" in source
++    assert "extern __shared__ __align__(16) uchar buf_dyn_shmem[];" in source
+     assert "void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));" in source
+     assert "void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));" in source
+     assert "A_shared" in source
+@@ -64,7 +64,7 @@ def test_single_dynamic_fp4_allocation_uses_packed_size():
+ 
+     artifact = tilelang.lower(kernel, target="cuda")
+ 
+-    assert "extern __shared__ __align__(1024) fp4_e2_t A_shared[];" in artifact.kernel_source
++    assert "extern __shared__ __align__(16) fp4_e2_t A_shared[];" in artifact.kernel_source
+     assert _get_dynamic_shared_memory_bytes(artifact) == 64
+ 
+ 
+@@ -83,7 +83,7 @@ def test_merged_dynamic_fp4_allocations_use_packed_sizes_and_offsets():
+     artifact = tilelang.lower(kernel, target="cuda")
+     source = artifact.kernel_source
+ 
+-    assert "extern __shared__ __align__(1024) uchar buf_dyn_shmem[];" in source
++    assert "extern __shared__ __align__(16) uchar buf_dyn_shmem[];" in source
+     assert "void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));" in source
+     assert "void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));" in source
+     assert _get_dynamic_shared_memory_bytes(artifact) == 128
+diff --git a/testing/python/language/test_tilelang_language_tma_copy.py b/testing/python/language/test_tilelang_language_tma_copy.py
+index d7991459..ee16cfc3 100644
+--- a/testing/python/language/test_tilelang_language_tma_copy.py
++++ b/testing/python/language/test_tilelang_language_tma_copy.py
+@@ -841,6 +841,74 @@ def test_tma_copy_cluster_mask_multicast():
+         torch.testing.assert_close(B[rank], A)
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
++@pytest.mark.parametrize("merged", [False, True])
++def test_bulk_and_raw_descriptor_share_allocation(merged):
++    import re
++    import torch
++
++    @T.prim_func
++    def mixed(A: T.Tensor((128,), T.float16), B: T.Tensor((128,), T.float16), C: T.Tensor((16,), T.float16)):
++        with T.Kernel(1, threads=128):
++            mixed_shared = T.alloc_shared((128,), T.float16)
++            mbar = T.alloc_barrier(1)
++            if merged:
++                live_shared = T.alloc_shared((16,), T.float16)
++                T.copy(A[0:16], live_shared, prefer_instruction="sync")
++            T.copy(A, mixed_shared, prefer_instruction="tma")
++            T.copy(mixed_shared, B, prefer_instruction="sync")
++            T.sync_threads()
++            if T.get_thread_binding() == 0:
++                T.mbarrier_expect_tx(mbar, 256)
++                T.tma_load(
++                    T.create_tma_descriptor(6, 1, A.data, 128, 2, 128, 1, 0, 0, 0, 0),
++                    mbar[0],
++                    T.access_ptr(mixed_shared, "w"),
++                    0,
++                    0,
++                )
++                T.barrier_arrive(mbar)
++            T.barrier_wait(mbar, 0)
++            T.copy(mixed_shared, B, prefer_instruction="sync")
++            if merged:
++                T.copy(live_shared, C, prefer_instruction="sync")
++            else:
++                T.copy(A[0:16], C, prefer_instruction="sync")
++
++    kernel = tilelang.compile(mixed, out_idx=[1, 2], target="cuda")
++    source = kernel.get_kernel_source()
++    assert re.search(r"extern __shared__ __align__\(1024\)", source)
++    if merged:
++        alias = re.search(r"void\* mixed_shared = .*buf_dyn_shmem \+ (\d+)", source)
++        assert alias is not None
++        assert int(alias.group(1)) % 1024 == 0
++    a = torch.randn(128, dtype=torch.float16, device="cuda")
++    b, c = kernel(a)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(b, a, rtol=0, atol=0)
++    torch.testing.assert_close(c, a[:16], rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
++def test_bulk_only_retains_small_arena_alignment():
++    import re
++    import torch
++
++    @T.prim_func
++    def bulk(A: T.Tensor((128,), T.float16), B: T.Tensor((128,), T.float16)):
++        with T.Kernel(1, threads=128):
++            shared = T.alloc_shared((128,), T.float16)
++            T.copy(A, shared, prefer_instruction="tma")
++            T.copy(shared, B, prefer_instruction="tma")
++
++    kernel = tilelang.compile(bulk, out_idx=[1], target="cuda")
++    assert re.search(r"extern __shared__ __align__\(16\)", kernel.get_kernel_source())
++    a = torch.randn(128, dtype=torch.float16, device="cuda")
++    torch.testing.assert_close(kernel(a), a, rtol=0, atol=0)
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()
+     # test_tma_copy_pipeline_2_stages()
+diff --git a/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py b/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py
+index f82947b0..efeae1c2 100644
+--- a/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py
++++ b/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py
+@@ -90,6 +90,7 @@ def test_tma_swizzled_smem_uses_swizzle_period_alignment(dtype, columns, require
+     # for the generic TMA requirement, but not enough for any swizzle period.
+     kernel = _compile_kernel(MISALIGNING_PAD_ELEMS, dtype, columns)
+     source = kernel.get_kernel_source()
++    assert f"extern __shared__ __align__({required_alignment})" in source
+     pad_offset = _dynamic_smem_offset(source, "pad")
+     smem_offset = _dynamic_smem_offset(source, "smem")
+ 

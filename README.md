@@ -12,8 +12,11 @@ aggregate serving performance. [C41's overlap simplification](experiments/2026-1
 was rejected after its engine and cold-prefill costs failed the stated criterion.
 The [PR qualification queue](experiments/2026-11-05-pr-screening/README.md) records
 each source, purpose, outstanding gate and decision. [C42](experiments/2026-11-05-compiler-live-qualification/qualification.md)
-qualifies the compiler refresh and its existing correctness fixes as maintenance;
-its complete image/functional and repeat performance verdict remains pending.
+records the rejected compiler refresh and its existing correctness fixes. Its
+release gate lost required IKET prepare/freeze behavior, so no serving or
+performance measurement ran. The metadata-only C44 proposal is withdrawn
+unmeasured; the separate [C43 frontend cleanup](experiments/2026-11-05-frontend-lifetime-qualification/README.md)
+continues on C40.
 Each completed round reports compatible saved1030, C36, previous and current
 builds, signed changes, both repeat margins and retained adverse rows.
 The promoted release remains spark-ds41f-1030.

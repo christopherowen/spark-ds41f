@@ -1,0 +1,191 @@
+{
+  "started": "2026-11-05T20:47:57Z",
+  "commit": "b6896b389c5bb0004e13fe9f4f941a31a60f87ca",
+  "steps": [
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-42/image-dgx4.json",
+        "build",
+        "prepare"
+      ],
+      "started": "2026-11-05T20:47:58Z",
+      "log": "build-prepare.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:50:14Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-42/image-dgx4.json",
+        "build",
+        "check"
+      ],
+      "started": "2026-11-05T20:50:14Z",
+      "log": "build-check.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:50:17Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-42/image-dgx4.json",
+        "build",
+        "image"
+      ],
+      "started": "2026-11-05T20:50:17Z",
+      "log": "build-image.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:50:20Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-42/image-dgx4.json",
+        "build",
+        "image",
+        "--apply"
+      ],
+      "started": "2026-11-05T20:50:20Z",
+      "log": "build-image-apply.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:58:14Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "gate",
+        "/home/swank/projects/spark-ds41f-copy-default/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-a35ced21/src/vllm",
+        "5f926df6d3126266a9c88c82c06544060008c33c",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/gate-manifest.json"
+      ],
+      "started": "2026-11-05T20:58:15Z",
+      "log": "gate-manifest.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:58:16Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "bundle",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/gate-manifest.json",
+        "spark-ds41f:candidate-42",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/bundle",
+        "candidate-42"
+      ],
+      "started": "2026-11-05T20:58:16Z",
+      "log": "gate-bundle.log",
+      "exit": 0,
+      "ended": "2026-11-05T20:58:17Z"
+    },
+    {
+      "argv": [
+        "docker",
+        "run",
+        "--name",
+        "compiler-c42-gate",
+        "--rm",
+        "--gpus",
+        "all",
+        "--ipc=host",
+        "--ulimit=core=0",
+        "-e",
+        "DIRECT_IO_TEST_DIR=/c/direct-io-test",
+        "-e",
+        "ENGRAM_ROWS_TEST_DIR=/c/engram-rows-test",
+        "-e",
+        "HF_HUB_OFFLINE=1",
+        "-e",
+        "PYTHONPATH=/b",
+        "-e",
+        "TILELANG_CACHE_DIR=/c/tilelang-release-tests",
+        "--security-opt=seccomp=unconfined",
+        "--ulimit=memlock=-1:-1",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/bundle/manifest.json:/b/manifest.json:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/bundle/release_test_runner.py:/b/release_test_runner.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/bundle/tblib_stub.py:/b/tblib_stub.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-42-image/bundle/offline_skip.py:/b/offline_skip.py:ro",
+        "-v",
+        "/home/swank/.cache/spark-lab/compile:/c",
+        "-w",
+        "/opt/spark-ds41f/candidate/vllm",
+        "--entrypoint",
+        "python3",
+        "spark-ds41f:candidate-42",
+        "/b/release_test_runner.py",
+        "/b/manifest.json",
+        "/c/release-tests/candidate-42"
+      ],
+      "started": "2026-11-05T20:58:17Z",
+      "log": "release-tests.log",
+      "exit": 1,
+      "ended": "2026-11-05T21:33:38Z"
+    }
+  ],
+  "conditions": {
+    "halted": [],
+    "cooling": [
+      {
+        "node": "dgx4",
+        "start_c": 39.8,
+        "cooled": false,
+        "seconds": 0.0,
+        "final_c": 39.8
+      }
+    ],
+    "fan_curve": [
+      {
+        "node": "dgx4",
+        "service": "inactive",
+        "started": true,
+        "stopped": true
+      }
+    ],
+    "thermal": {
+      "dgx4": {
+        "max_gpu_c": 64.0,
+        "min_headroom_c": 22.0,
+        "max_system_c": 75.3,
+        "max_power_w": 98.85,
+        "thermal_slowdown_ms": 0.0,
+        "power_cap_ms": 421565.2
+      }
+    },
+    "memory": {
+      "dgx4": {
+        "min_available_gib": 97.91,
+        "swap_growth_gib": 0.0
+      }
+    },
+    "fan_stop_failures": []
+  },
+  "source": {
+    "vllm_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+    "expected_labels": {
+      "local.spark-ds41f.vllm.tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+      "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+      "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+      "local.spark-ds41f.tilelang.tree": "bae5fe12b58cdf364efeccbabc04cd08205c43b9",
+      "local.spark-ds41f.tile_kernels.tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+      "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+    },
+    "tilelang_head": "454202b2ba8d0cf10b8caf434a956755e039483f"
+  },
+  "image": "sha256:70e9abba12d83b79a268574a2057b096af2b9fc5fcbc1b07364d6eb580b1a35a",
+  "error": "RuntimeError: release-tests exited 1; []",
+  "ended": "2026-11-05T21:33:38Z"
+}

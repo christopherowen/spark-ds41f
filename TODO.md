@@ -25,10 +25,14 @@ owner.
 - The minimum-match-8 policy hypothesis was dropped at source review, not counted
   as a failed serving benchmark. A future copy-policy idea needs a bounded
   expected benefit and budget-binding mixed copy/edit/tool correctness evidence.
-- The distinct TileLang refresh in #875 is maintenance/feature preservation.
-  Review its known independent correctness follow-ups #879–#883 and explicitly
-  qualify the selected source/interaction stack before runtime use. Individual
-  author-provided standalone passes do not qualify a combined compiler/image.
+- C42's TileLang refresh plus existing #879–#883 fixes is rejected as maintenance:
+  8073 tests passed,360 skipped and the required IKET prepare/freeze check failed.
+  #880 ignores an explicitly prepared kernel when cache is disabled. A focused
+  review confirmed that VERSION-only C44 cannot fix this branch; withdraw C44
+  unmeasured and retain C40's compiler. No serving/performance point was run.
+  Preserve the separate cache-provenance gap and all failed native evidence in
+  experiments/2026-11-05-compiler-live-qualification. Subsequent release gates use
+  isolated fresh cache directories; no shared cache is deleted or baseline rerun.
 
 ## Goal
 

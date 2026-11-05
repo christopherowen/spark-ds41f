@@ -1,0 +1,573 @@
+{
+  "record_type": "Prior paired standalone evidence, preserved without re-identifying the runs",
+  "research_commit": "ad40ec2379053fe132c3167ce19ade22877224c9",
+  "research_url": "https://github.com/christopherowen/spark-ds41f/tree/ad40ec2379053fe132c3167ce19ade22877224c9/experiments/2026-11-04-tilelang-kernel-review",
+  "tested_compiler_tree": "e9a38e6d7c7cb40db6f219b266288e03e6e3ad70",
+  "current_candidate_head": "7768ff499c27a7e2a25b899141c0b7e0a2001e7a",
+  "identity_note": "The candidate commit is deterministic git-am metadata; its complete source tree equals the previously tested compiler tree. These receipts do not qualify a new runtime image.",
+  "finding": "All 19 checks pass in both fresh processes. The parent fails six generated-code assertions about unnecessarily large alignment; its sampled copies remain correct. The port also passes exact swizzled TMA copy checks. No runtime performance gain has been demonstrated.",
+  "runs": {
+    "alignment-base-a-v2": {
+      "label": "alignment-base-a-v2",
+      "started_utc": "2026-11-04T01:37:15.780103+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-alignment-base-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/alignment-base-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/alignment-base-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/pytest_run.py",
+        "-q",
+        "-rA",
+        "-p",
+        "no:cacheprovider",
+        "--junitxml=/out/junit.xml",
+        "/review/variants/pr3690/testing/python/components/test_cuda_shared_memory_alias_codegen.py",
+        "/review/variants/pr3690/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_and_raw_descriptor_share_allocation",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_only_retains_small_arena_alignment"
+      ],
+      "before_memory_bytes": 123954135040,
+      "start_hottest_c": 49.1,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 1,
+      "ended_utc": "2026-11-04T01:37:27.797419+00:00",
+      "memory_aborted": false,
+      "output_sha256": "3a58d705b1785b10c71d4e442b7cc9c0fbcd3d62a86af14d19ab05a3766149b0",
+      "valid_for_comparison": true,
+      "pytest": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "6",
+        "skipped": "0",
+        "tests": "19",
+        "time": "8.759",
+        "timestamp": "2026-11-04T01:37:17.810050+00:00",
+        "hostname": "abd9d5c07c2d"
+      },
+      "failed_tests": [
+        {
+          "name": "test_dynamic_shared_memory_merge_emits_named_aliases",
+          "message": "assert 'extern __shared__ __align__(16) uchar buf_dyn_shmem[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(const half_t* __restrict__ A, const half_t* __restrict__ B, half_t* __restrict__ C);\\nextern \"C\" __global__ void __launch_bounds__(32, 1) kernel_kernel(const half_t* __restrict__ A, const half_t* __restrict__ B, half_t* __restrict__ C) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));\\n  ((half_t*)A_shared)[0] = A[0];\\n  ((half_t*)B_shared)[0] = B[0];\\n  __syncthreads();\\n  C[0] = (((half_t*)A_shared)[0] + ((half_t*)B_shared)[0]);\\n}\\n\\n'"
+        },
+        {
+          "name": "test_single_dynamic_fp4_allocation_uses_packed_size",
+          "message": "assert 'extern __shared__ __align__(16) fp4_e2_t A_shared[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n'\n +  where '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n' = CompiledArtifact(host_mod=# from tvm.script import ir as I\\n# from tvm.script import tirx as T\\n\\n@I.ir_module\\nclass Module:\\n    @T.prim_func\\n    def kernel(self_handle: T.handle, args: T.handle, num_args: T.int32, result: T.handle(\"void\", \"global\")) -> T.int32:\\n        T.func_attr({\"calling_conv\": 1, \"global_symbol\": \"__tvm_ffi_kernel\", \"target\": T.target({\"keys\": [\"cpu\"], \"kind\": \"c\", \"tag\": \"\"}), \"thread_extent\": {}, \"tirx.is_entry_func\": True, \"tl.has_tma\": T.bool(False), \"tma_descriptor_args\": {}})\\n        assert num_args == 0, (\"RuntimeError\", [\"kernel: num_args should be 0\"])\\n        with T.attr(0, \"compute_scope\", \"kernel_compute_\"):\\n            T.call_packed(\"kernel_kernel\", 1, 1, 1, 1, 64)\\n        return 0, device_mod=# from tvm.script import ir as I\\n# from tvm.script import tirx as T\\n\\n@I.ir_module\\nclass Module:\\n    @T.prim_func\\n    def kernel_kernel():\\n        T.func_attr({\"calling_conv\": 2, \"dyn_shared_memory_buf\": 64, \"target\": T.target({\"arch\": \"sm_121a\", \"keys\": [\"cuda\", \"gpu\"], \"kind\": \"cuda\", \"max_num_threads\": 1024, \"tag\": \"\", \"thread_warp_size\": 32}), \"thread_extent\": {\"blockIdx.x\": 1, \"threadIdx.x\": 1, \"threadIdx.y\": 1, \"threadIdx.z\": 1}, \"tirx.is_global_func\": T.bool(True), \"tirx.kernel_launch_params\": [\"blockIdx.x\", \"threadIdx.x\", \"threadIdx.y\", \"threadIdx.z\", \"tirx.use_dyn_shared_memory\"], \"tirx.noalias\": True, \"tl.non_restrict_params\": []})\\n        bx = T.launch_thread(\"blockIdx.x\", 1)\\n        A_shared = T.alloc_buffer((127,), \"float4_e2m1fn\", scope=\"shared.dyn\")\\n        tx = T.launch_thread(\"threadIdx.x\", 1)\\n        ty = T.launch_thread(\"threadIdx.y\", 1)\\n        tz = T.launch_thread(\"threadIdx.z\", 1)\\n        A_shared_1 = T.decl_buffer((127,), \"float4_e2m1fn\", data=A_shared.data, scope=\"shared.dyn\")\\n        A_shared_1[126] = T.float4_e2m1fn(0.0), params=[], kernel_source='#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n', rt_mod=None, target={\"kind\":\"cuda\",\"tag\":\"\",\"keys\":[\"cuda\",\"gpu\"],\"host\":{\"kind\":\"c\",\"tag\":\"\",\"keys\":[\"cpu\"]},\"max_num_threads\":1024,\"thread_warp_size\":32,\"arch\":\"sm_121a\"}, target_host={\"kind\":\"c\",\"tag\":\"\",\"keys\":[\"cpu\"]}).kernel_source"
+        },
+        {
+          "name": "test_merged_dynamic_fp4_allocations_use_packed_sizes_and_offsets",
+          "message": "assert 'extern __shared__ __align__(16) uchar buf_dyn_shmem[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n  tl_fp4_packed_store((fp4_e2_2_t*)B_shared, 126, fp4_e2_t(0x1p+0f/*1.000000e+00*/));\\n  __syncthreads();\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 0, tl_fp4_packed_load((fp4_e2_2_t*)B_shared, 126));\\n}\\n\\n'"
+        },
+        {
+          "name": "test_tma_swizzled_smem_uses_swizzle_period_alignment[32B-swizzle]",
+          "message": "assert 'extern __shared__ __align__(256)' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out);\\nextern \"C\" __global__ void __launch_bounds__(256, 1) kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* pad = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* smem = ((void*)((char*)buf_dyn_shmem + 256));\\n  __shared__ __align__(16) uint64_t bar_mem[1];\\n  auto bar = reinterpret_cast<Barrier*>(bar_mem);\\n  if (tl::tl_shuffle_elect<0>()) {\\n    tl::prefetch_tma_descriptor(A_desc);\\n  }\\n  if (tl::tl_shuffle_elect<0>()) {\\n    bar[0].init(256);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (((int)threadIdx.x) < 32) {\\n    ((int*)pad)[((int)threadIdx.x)] = ((int)threadIdx.x);\\n  }\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<256>()) {\\n    bar[0].expect_transaction(4096);\\n    tl::fence_proxy_async();\\n    tl::tma_load(A_desc, bar[0], (&(((half_t*)smem)[0])), 0, 0);\\n  }\\n  bar[0].arrive();\\n  bar[0].wait(0);\\n  for (int i = 0; i < 8; ++i) {\\n    out[((((int)threadIdx.x) * 8) + i)] = ((half_t*)smem)[((((((int)threadIdx.x) >> 1) * 16) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 8)) + i)];\\n  }\\n  if (((int)threadIdx.x) == 0) {\\n    dummy[0] = ((int*)pad)[31];\\n  }\\n}\\n\\n'"
+        },
+        {
+          "name": "test_tma_swizzled_smem_uses_swizzle_period_alignment[64B-swizzle]",
+          "message": "assert 'extern __shared__ __align__(512)' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out);\\nextern \"C\" __global__ void __launch_bounds__(256, 1) kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* pad = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* smem = ((void*)((char*)buf_dyn_shmem + 512));\\n  __shared__ __align__(16) uint64_t bar_mem[1];\\n  auto bar = reinterpret_cast<Barrier*>(bar_mem);\\n  if (tl::tl_shuffle_elect<0>()) {\\n    tl::prefetch_tma_descriptor(A_desc);\\n  }\\n  if (tl::tl_shuffle_elect<0>()) {\\n    bar[0].init(256);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (((int)threadIdx.x) < 32) {\\n    ((int*)pad)[((int)threadIdx.x)] = ((int)threadIdx.x);\\n  }\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<256>()) {\\n    bar[0].expect_transaction(8192);\\n    tl::fence_proxy_async();\\n    tl::tma_load(A_desc, bar[0], (&(((half_t*)smem)[0])), 0, 0);\\n  }\\n  bar[0].arrive();\\n  bar[0].wait(0);\\n  for (int i = 0; i < 16; ++i) {\\n    out[((((int)threadIdx.x) * 16) + i)] = ((half_t*)smem)[(((((((int)threadIdx.x) >> 1) * 32) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 16)) + ((((i >> 3) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 8)) + (i & 7))];\\n  }\\n  if (((int)threadIdx.x) == 0) {\\n    dummy[0] = ((int*)pad)[31];\\n  }\\n}\\n\\n'"
+        },
+        {
+          "name": "test_bulk_only_retains_small_arena_alignment",
+          "message": "assert None\n +  where None = <function search at 0xe57743300c20>('extern __shared__ __align__\\\\(16\\\\)', '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B);\\nextern \"C\" __global__ void __launch_bounds__(128, 1) bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B) {\\n  __shared__ __align__(16) uint64_t A_to_shared_mbarrier_mem[1];\\n  auto A_to_shared_mbarrier = reinterpret_cast<Barrier*>(A_to_shared_mbarrier_mem);\\n  extern __shared__ __align__(1024) half_t shared[];\\n  if (tl::tl_shuffle_elect<0>()) {\\n    A_to_shared_mbarrier[0].init(1);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    A_to_shared_mbarrier[0].arrive_and_expect_tx(256);\\n    tl::tma_load((&(shared[0])), (&(A[0])), A_to_shared_mbarrier[0], 256);\\n  }\\n  A_to_shared_mbarrier[0].wait(0);\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    tl::tma_store((&(B[0])), (&(shared[0])), 256);\\n    tl::tma_store_arrive();\\n    tl::tma_store_wait<0, true>();\\n  }\\n}\\n\\n')\n +    where <function search at 0xe57743300c20> = <module 're' from '/usr/lib/python3.12/re/__init__.py'>.search\n +    and   '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B);\\nextern \"C\" __global__ void __launch_bounds__(128, 1) bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B) {\\n  __shared__ __align__(16) uint64_t A_to_shared_mbarrier_mem[1];\\n  auto A_to_shared_mbarrier = reinterpret_cast<Barrier*>(A_to_shared_mbarrier_mem);\\n  extern __shared__ __align__(1024) half_t shared[];\\n  if (tl::tl_shuffle_elect<0>()) {\\n    A_to_shared_mbarrier[0].init(1);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    A_to_shared_mbarrier[0].arrive_and_expect_tx(256);\\n    tl::tma_load((&(shared[0])), (&(A[0])), A_to_shared_mbarrier[0], 256);\\n  }\\n  A_to_shared_mbarrier[0].wait(0);\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    tl::tma_store((&(B[0])), (&(shared[0])), 256);\\n    tl::tma_store_arrive();\\n    tl::tma_store_wait<0, true>();\\n  }\\n}\\n\\n' = get_kernel_source()\n +      where get_kernel_source = <tilelang.jit.kernel.JITKernel object at 0xe5744e7b2480>.get_kernel_source"
+        }
+      ],
+      "skipped_tests": [],
+      "compiler": {
+        "tilelang_module": "/review/variants/base/tilelang/__init__.py",
+        "native_libraries": {
+          "build/lib/libstub_nvrtc.so": "752c9be6385894bc49884e5aab40fb38790d1669562ca5fe85c1f47e4a78b7b4",
+          "build/lib/libstub_cuda.so": "691a0571a520046165f2c7eac670a98fefaa36ae33aab42f03933d81d6e165b9",
+          "build/lib/tilelang_cython_wrapper.cpython-312-aarch64-linux-gnu.so": "b5e83df8a395ef088de231aa0120dbca2e359becfc2ef04bda5f6b1c88294a94",
+          "build/lib/tilelang_ascend_npu_exchange.cpython-312-aarch64-linux-gnu.so": "3b1afc27072c5abd967d746038f5030864a01e82649439ac5fd90f16b2933608",
+          "build/lib/libtvm_runtime.so": "647134be75aaa6567e190fb7c0d3fd095ba5930490e31d3c05881a8fae7775a8",
+          "build/lib/libtvm_ffi.so": "8338203a2d89b0279bcfba3f41527d79851e8384f1b315a11c5fc74abc0a3be3",
+          "build/lib/libstub_cudart.so": "ca5b48f63fe2d729f5d4192a53272b755de7f69d7d77ab3e983b6e9a59c6880e",
+          "build/lib/libtvm_compiler.so": "c83c11b29ab7ece516a5de4f129f3a29135812a53797cab22fb36a5a11974050",
+          "build/lib/libtilelang.so": "fb9d30c33a0611e560200fff74617d2a4551c926e1def637e2f8bc42358a9389",
+          "build/lib/tilelang_deepgemm_heuristics.cpython-312-aarch64-linux-gnu.so": "0ed989e6fc4b5f67f83aac94ed4ad8ece7df8ed5b0a47a68373549a0a26e2148",
+          "build/lib/libz3.so": "f62297e58d3498b6b4612f36ecdde4597bf68c60d17f9269cd33f4c23ff58b9d",
+          "build/lib/tilelang_pto_wrapper.cpython-312-aarch64-linux-gnu.so": "cd6a96a58a1409ed97caf273f0f578e2ce96ba09f418cec9353d71eeffb09b59"
+        }
+      },
+      "min_host_available_bytes": 121876951040,
+      "max_hottest_c": 53.7,
+      "files": {
+        "command.json": {
+          "bytes": 2109,
+          "sha256": "eafb92e886c9355e5b10fc53e9aa2c8666e32cdcfae2045df52149f4e54562d1"
+        },
+        "compiler.json": {
+          "bytes": 1479,
+          "sha256": "44c1ac8d0d84d9843c9eada077b36e97fa6069fec7989b524e415474a2427864"
+        },
+        "junit.xml": {
+          "bytes": 40967,
+          "sha256": "a8f9eda2903ed8da53b4f35372c6a5c5d7a9e365b0d4cd2646b94198726add49"
+        },
+        "memory.jsonl": {
+          "bytes": 1152,
+          "sha256": "14dd1fa6bed5bede7283310412078d6b7ffb6ac1a9e970216bf45e1c0d677d49"
+        },
+        "output.txt": {
+          "bytes": 31056,
+          "sha256": "3a58d705b1785b10c71d4e442b7cc9c0fbcd3d62a86af14d19ab05a3766149b0"
+        },
+        "result.json": {
+          "bytes": 2292,
+          "sha256": "7087aab2486d042157b0072b938b6d410541296f667c7986a14fd84fb573588e"
+        }
+      }
+    },
+    "alignment-base-b-v2": {
+      "label": "alignment-base-b-v2",
+      "started_utc": "2026-11-04T01:39:53.028247+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/base",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-alignment-base-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/alignment-base-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/alignment-base-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/base",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/pytest_run.py",
+        "-q",
+        "-rA",
+        "-p",
+        "no:cacheprovider",
+        "--junitxml=/out/junit.xml",
+        "/review/variants/pr3690/testing/python/components/test_cuda_shared_memory_alias_codegen.py",
+        "/review/variants/pr3690/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_and_raw_descriptor_share_allocation",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_only_retains_small_arena_alignment"
+      ],
+      "before_memory_bytes": 123948949504,
+      "start_hottest_c": 51.2,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 1,
+      "ended_utc": "2026-11-04T01:40:05.043267+00:00",
+      "memory_aborted": false,
+      "output_sha256": "09ec7ec15aa1777298e4747b3f613fde3346ec581fc17e2b1f5ac69d64c878a2",
+      "valid_for_comparison": true,
+      "pytest": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "6",
+        "skipped": "0",
+        "tests": "19",
+        "time": "8.781",
+        "timestamp": "2026-11-04T01:39:55.043168+00:00",
+        "hostname": "7104e0ea966f"
+      },
+      "failed_tests": [
+        {
+          "name": "test_dynamic_shared_memory_merge_emits_named_aliases",
+          "message": "assert 'extern __shared__ __align__(16) uchar buf_dyn_shmem[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(const half_t* __restrict__ A, const half_t* __restrict__ B, half_t* __restrict__ C);\\nextern \"C\" __global__ void __launch_bounds__(32, 1) kernel_kernel(const half_t* __restrict__ A, const half_t* __restrict__ B, half_t* __restrict__ C) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));\\n  ((half_t*)A_shared)[0] = A[0];\\n  ((half_t*)B_shared)[0] = B[0];\\n  __syncthreads();\\n  C[0] = (((half_t*)A_shared)[0] + ((half_t*)B_shared)[0]);\\n}\\n\\n'"
+        },
+        {
+          "name": "test_single_dynamic_fp4_allocation_uses_packed_size",
+          "message": "assert 'extern __shared__ __align__(16) fp4_e2_t A_shared[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n'\n +  where '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n' = CompiledArtifact(host_mod=# from tvm.script import ir as I\\n# from tvm.script import tirx as T\\n\\n@I.ir_module\\nclass Module:\\n    @T.prim_func\\n    def kernel(self_handle: T.handle, args: T.handle, num_args: T.int32, result: T.handle(\"void\", \"global\")) -> T.int32:\\n        T.func_attr({\"calling_conv\": 1, \"global_symbol\": \"__tvm_ffi_kernel\", \"target\": T.target({\"keys\": [\"cpu\"], \"kind\": \"c\", \"tag\": \"\"}), \"thread_extent\": {}, \"tirx.is_entry_func\": True, \"tl.has_tma\": T.bool(False), \"tma_descriptor_args\": {}})\\n        assert num_args == 0, (\"RuntimeError\", [\"kernel: num_args should be 0\"])\\n        with T.attr(0, \"compute_scope\", \"kernel_compute_\"):\\n            T.call_packed(\"kernel_kernel\", 1, 1, 1, 1, 64)\\n        return 0, device_mod=# from tvm.script import ir as I\\n# from tvm.script import tirx as T\\n\\n@I.ir_module\\nclass Module:\\n    @T.prim_func\\n    def kernel_kernel():\\n        T.func_attr({\"calling_conv\": 2, \"dyn_shared_memory_buf\": 64, \"target\": T.target({\"arch\": \"sm_121a\", \"keys\": [\"cuda\", \"gpu\"], \"kind\": \"cuda\", \"max_num_threads\": 1024, \"tag\": \"\", \"thread_warp_size\": 32}), \"thread_extent\": {\"blockIdx.x\": 1, \"threadIdx.x\": 1, \"threadIdx.y\": 1, \"threadIdx.z\": 1}, \"tirx.is_global_func\": T.bool(True), \"tirx.kernel_launch_params\": [\"blockIdx.x\", \"threadIdx.x\", \"threadIdx.y\", \"threadIdx.z\", \"tirx.use_dyn_shared_memory\"], \"tirx.noalias\": True, \"tl.non_restrict_params\": []})\\n        bx = T.launch_thread(\"blockIdx.x\", 1)\\n        A_shared = T.alloc_buffer((127,), \"float4_e2m1fn\", scope=\"shared.dyn\")\\n        tx = T.launch_thread(\"threadIdx.x\", 1)\\n        ty = T.launch_thread(\"threadIdx.y\", 1)\\n        tz = T.launch_thread(\"threadIdx.z\", 1)\\n        A_shared_1 = T.decl_buffer((127,), \"float4_e2m1fn\", data=A_shared.data, scope=\"shared.dyn\")\\n        A_shared_1[126] = T.float4_e2m1fn(0.0), params=[], kernel_source='#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) fp4_e2_t A_shared[];\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n}\\n\\n', rt_mod=None, target={\"kind\":\"cuda\",\"tag\":\"\",\"keys\":[\"cuda\",\"gpu\"],\"host\":{\"kind\":\"c\",\"tag\":\"\",\"keys\":[\"cpu\"]},\"max_num_threads\":1024,\"thread_warp_size\":32,\"arch\":\"sm_121a\"}, target_host={\"kind\":\"c\",\"tag\":\"\",\"keys\":[\"cpu\"]}).kernel_source"
+        },
+        {
+          "name": "test_merged_dynamic_fp4_allocations_use_packed_sizes_and_offsets",
+          "message": "assert 'extern __shared__ __align__(16) uchar buf_dyn_shmem[];' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/cuda_fp4.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel();\\nextern \"C\" __global__ void kernel_kernel() {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* B_shared = ((void*)((char*)buf_dyn_shmem + 64));\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 126, fp4_e2_t(0x0p+0f/*0.000000e+00*/));\\n  tl_fp4_packed_store((fp4_e2_2_t*)B_shared, 126, fp4_e2_t(0x1p+0f/*1.000000e+00*/));\\n  __syncthreads();\\n  tl_fp4_packed_store((fp4_e2_2_t*)A_shared, 0, tl_fp4_packed_load((fp4_e2_2_t*)B_shared, 126));\\n}\\n\\n'"
+        },
+        {
+          "name": "test_tma_swizzled_smem_uses_swizzle_period_alignment[32B-swizzle]",
+          "message": "assert 'extern __shared__ __align__(256)' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out);\\nextern \"C\" __global__ void __launch_bounds__(256, 1) kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* pad = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* smem = ((void*)((char*)buf_dyn_shmem + 256));\\n  __shared__ __align__(16) uint64_t bar_mem[1];\\n  auto bar = reinterpret_cast<Barrier*>(bar_mem);\\n  if (tl::tl_shuffle_elect<0>()) {\\n    tl::prefetch_tma_descriptor(A_desc);\\n  }\\n  if (tl::tl_shuffle_elect<0>()) {\\n    bar[0].init(256);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (((int)threadIdx.x) < 32) {\\n    ((int*)pad)[((int)threadIdx.x)] = ((int)threadIdx.x);\\n  }\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<256>()) {\\n    bar[0].expect_transaction(4096);\\n    tl::fence_proxy_async();\\n    tl::tma_load(A_desc, bar[0], (&(((half_t*)smem)[0])), 0, 0);\\n  }\\n  bar[0].arrive();\\n  bar[0].wait(0);\\n  for (int i = 0; i < 8; ++i) {\\n    out[((((int)threadIdx.x) * 8) + i)] = ((half_t*)smem)[((((((int)threadIdx.x) >> 1) * 16) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 8)) + i)];\\n  }\\n  if (((int)threadIdx.x) == 0) {\\n    dummy[0] = ((int*)pad)[31];\\n  }\\n}\\n\\n'"
+        },
+        {
+          "name": "test_tma_swizzled_smem_uses_swizzle_period_alignment[64B-swizzle]",
+          "message": "assert 'extern __shared__ __align__(512)' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out);\\nextern \"C\" __global__ void __launch_bounds__(256, 1) kernel_kernel(__grid_constant__ const CUtensorMap A_desc, int* __restrict__ dummy, half_t* __restrict__ out) {\\n  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];\\n  void* pad = ((void*)((char*)buf_dyn_shmem + 0));\\n  void* smem = ((void*)((char*)buf_dyn_shmem + 512));\\n  __shared__ __align__(16) uint64_t bar_mem[1];\\n  auto bar = reinterpret_cast<Barrier*>(bar_mem);\\n  if (tl::tl_shuffle_elect<0>()) {\\n    tl::prefetch_tma_descriptor(A_desc);\\n  }\\n  if (tl::tl_shuffle_elect<0>()) {\\n    bar[0].init(256);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (((int)threadIdx.x) < 32) {\\n    ((int*)pad)[((int)threadIdx.x)] = ((int)threadIdx.x);\\n  }\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<256>()) {\\n    bar[0].expect_transaction(8192);\\n    tl::fence_proxy_async();\\n    tl::tma_load(A_desc, bar[0], (&(((half_t*)smem)[0])), 0, 0);\\n  }\\n  bar[0].arrive();\\n  bar[0].wait(0);\\n  for (int i = 0; i < 16; ++i) {\\n    out[((((int)threadIdx.x) * 16) + i)] = ((half_t*)smem)[(((((((int)threadIdx.x) >> 1) * 32) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 16)) + ((((i >> 3) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 8)) + (i & 7))];\\n  }\\n  if (((int)threadIdx.x) == 0) {\\n    dummy[0] = ((int*)pad)[31];\\n  }\\n}\\n\\n'"
+        },
+        {
+          "name": "test_bulk_only_retains_small_arena_alignment",
+          "message": "assert None\n +  where None = <function search at 0xff43c8170c20>('extern __shared__ __align__\\\\(16\\\\)', '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B);\\nextern \"C\" __global__ void __launch_bounds__(128, 1) bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B) {\\n  __shared__ __align__(16) uint64_t A_to_shared_mbarrier_mem[1];\\n  auto A_to_shared_mbarrier = reinterpret_cast<Barrier*>(A_to_shared_mbarrier_mem);\\n  extern __shared__ __align__(1024) half_t shared[];\\n  if (tl::tl_shuffle_elect<0>()) {\\n    A_to_shared_mbarrier[0].init(1);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    A_to_shared_mbarrier[0].arrive_and_expect_tx(256);\\n    tl::tma_load((&(shared[0])), (&(A[0])), A_to_shared_mbarrier[0], 256);\\n  }\\n  A_to_shared_mbarrier[0].wait(0);\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    tl::tma_store((&(B[0])), (&(shared[0])), 256);\\n    tl::tma_store_arrive();\\n    tl::tma_store_wait<0, true>();\\n  }\\n}\\n\\n')\n +    where <function search at 0xff43c8170c20> = <module 're' from '/usr/lib/python3.12/re/__init__.py'>.search\n +    and   '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\\n#define _tl_orig_alignas alignas\\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\\n#include <cuda.h>\\n#undef alignas\\n#define alignas _tl_orig_alignas\\n#endif\\n#include <tl_templates/cuda/intrin.h>\\n#include <tl_templates/cuda/barrier.h>\\n#include <tl_templates/cuda/copy_sm90.h>\\n#include <tl_templates/cuda/reduce.h>\\n#include <tl_templates/cuda/scan.h>\\n#include <tl_templates/cuda/ldsm.h>\\n#include <tl_templates/cuda/threadblock_swizzle.h>\\n#include <tl_templates/cuda/debug.h>\\n#ifdef ENABLE_BF16\\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\\n#endif\\n\\nextern \"C\" __global__ void bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B);\\nextern \"C\" __global__ void __launch_bounds__(128, 1) bulk_kernel(const half_t* __restrict__ A, half_t* __restrict__ B) {\\n  __shared__ __align__(16) uint64_t A_to_shared_mbarrier_mem[1];\\n  auto A_to_shared_mbarrier = reinterpret_cast<Barrier*>(A_to_shared_mbarrier_mem);\\n  extern __shared__ __align__(1024) half_t shared[];\\n  if (tl::tl_shuffle_elect<0>()) {\\n    A_to_shared_mbarrier[0].init(1);\\n  }\\n  tl::fence_barrier_init();\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    A_to_shared_mbarrier[0].arrive_and_expect_tx(256);\\n    tl::tma_load((&(shared[0])), (&(A[0])), A_to_shared_mbarrier[0], 256);\\n  }\\n  A_to_shared_mbarrier[0].wait(0);\\n  __syncthreads();\\n  if (tl::tl_shuffle_elect<128>()) {\\n    tl::tma_store((&(B[0])), (&(shared[0])), 256);\\n    tl::tma_store_arrive();\\n    tl::tma_store_wait<0, true>();\\n  }\\n}\\n\\n' = get_kernel_source()\n +      where get_kernel_source = <tilelang.jit.kernel.JITKernel object at 0xff40d06aa570>.get_kernel_source"
+        }
+      ],
+      "skipped_tests": [],
+      "compiler": {
+        "tilelang_module": "/review/variants/base/tilelang/__init__.py",
+        "native_libraries": {
+          "build/lib/libstub_nvrtc.so": "752c9be6385894bc49884e5aab40fb38790d1669562ca5fe85c1f47e4a78b7b4",
+          "build/lib/libstub_cuda.so": "691a0571a520046165f2c7eac670a98fefaa36ae33aab42f03933d81d6e165b9",
+          "build/lib/tilelang_cython_wrapper.cpython-312-aarch64-linux-gnu.so": "b5e83df8a395ef088de231aa0120dbca2e359becfc2ef04bda5f6b1c88294a94",
+          "build/lib/tilelang_ascend_npu_exchange.cpython-312-aarch64-linux-gnu.so": "3b1afc27072c5abd967d746038f5030864a01e82649439ac5fd90f16b2933608",
+          "build/lib/libtvm_runtime.so": "647134be75aaa6567e190fb7c0d3fd095ba5930490e31d3c05881a8fae7775a8",
+          "build/lib/libtvm_ffi.so": "8338203a2d89b0279bcfba3f41527d79851e8384f1b315a11c5fc74abc0a3be3",
+          "build/lib/libstub_cudart.so": "ca5b48f63fe2d729f5d4192a53272b755de7f69d7d77ab3e983b6e9a59c6880e",
+          "build/lib/libtvm_compiler.so": "c83c11b29ab7ece516a5de4f129f3a29135812a53797cab22fb36a5a11974050",
+          "build/lib/libtilelang.so": "fb9d30c33a0611e560200fff74617d2a4551c926e1def637e2f8bc42358a9389",
+          "build/lib/tilelang_deepgemm_heuristics.cpython-312-aarch64-linux-gnu.so": "0ed989e6fc4b5f67f83aac94ed4ad8ece7df8ed5b0a47a68373549a0a26e2148",
+          "build/lib/libz3.so": "f62297e58d3498b6b4612f36ecdde4597bf68c60d17f9269cd33f4c23ff58b9d",
+          "build/lib/tilelang_pto_wrapper.cpython-312-aarch64-linux-gnu.so": "cd6a96a58a1409ed97caf273f0f578e2ce96ba09f418cec9353d71eeffb09b59"
+        }
+      },
+      "min_host_available_bytes": 121604702208,
+      "max_hottest_c": 54.4,
+      "files": {
+        "command.json": {
+          "bytes": 2109,
+          "sha256": "eaae376c201b7936321c997e01825247edfd74ccbc4eca846ad8b690bb2e81c5"
+        },
+        "compiler.json": {
+          "bytes": 1479,
+          "sha256": "44c1ac8d0d84d9843c9eada077b36e97fa6069fec7989b524e415474a2427864"
+        },
+        "junit.xml": {
+          "bytes": 40967,
+          "sha256": "e793306a183004752105d8c4b23abdadf24a3af49590aa5a880b1c65c3b11f81"
+        },
+        "memory.jsonl": {
+          "bytes": 1152,
+          "sha256": "a7506caacdd133414e02f3f8e9e4170a4a30e4c74325ca7264692bcb840b56bc"
+        },
+        "output.txt": {
+          "bytes": 31056,
+          "sha256": "09ec7ec15aa1777298e4747b3f613fde3346ec581fc17e2b1f5ac69d64c878a2"
+        },
+        "result.json": {
+          "bytes": 2292,
+          "sha256": "6c25feff282bc08010a0f22da9242174793a58ff96eb116c4cf2e8c4ef717dd7"
+        }
+      }
+    },
+    "alignment-pr3690-a-v2": {
+      "label": "alignment-pr3690-a-v2",
+      "started_utc": "2026-11-04T01:37:27.798795+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3690",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-alignment-pr3690-a-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/alignment-pr3690-a-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/alignment-pr3690-a-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3690",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/pytest_run.py",
+        "-q",
+        "-rA",
+        "-p",
+        "no:cacheprovider",
+        "--junitxml=/out/junit.xml",
+        "/review/variants/pr3690/testing/python/components/test_cuda_shared_memory_alias_codegen.py",
+        "/review/variants/pr3690/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_and_raw_descriptor_share_allocation",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_only_retains_small_arena_alignment"
+      ],
+      "before_memory_bytes": 122944155648,
+      "start_hottest_c": 47.7,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:37:39.813302+00:00",
+      "memory_aborted": false,
+      "output_sha256": "d53baec54bbc104992296dfa52cbd9140f4fc4dc6d3bb47cf6de41391e1af7b6",
+      "valid_for_comparison": true,
+      "pytest": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "19",
+        "time": "8.946",
+        "timestamp": "2026-11-04T01:37:29.794984+00:00",
+        "hostname": "5d45b4cbaebb"
+      },
+      "failed_tests": [],
+      "skipped_tests": [],
+      "compiler": {
+        "tilelang_module": "/review/variants/pr3690/tilelang/__init__.py",
+        "native_libraries": {
+          "build/lib/libstub_nvrtc.so": "752c9be6385894bc49884e5aab40fb38790d1669562ca5fe85c1f47e4a78b7b4",
+          "build/lib/libstub_cuda.so": "691a0571a520046165f2c7eac670a98fefaa36ae33aab42f03933d81d6e165b9",
+          "build/lib/tilelang_cython_wrapper.cpython-312-aarch64-linux-gnu.so": "b5e83df8a395ef088de231aa0120dbca2e359becfc2ef04bda5f6b1c88294a94",
+          "build/lib/tilelang_ascend_npu_exchange.cpython-312-aarch64-linux-gnu.so": "3b1afc27072c5abd967d746038f5030864a01e82649439ac5fd90f16b2933608",
+          "build/lib/libtvm_runtime.so": "647134be75aaa6567e190fb7c0d3fd095ba5930490e31d3c05881a8fae7775a8",
+          "build/lib/libtvm_ffi.so": "8338203a2d89b0279bcfba3f41527d79851e8384f1b315a11c5fc74abc0a3be3",
+          "build/lib/libstub_cudart.so": "ca5b48f63fe2d729f5d4192a53272b755de7f69d7d77ab3e983b6e9a59c6880e",
+          "build/lib/libtvm_compiler.so": "c83c11b29ab7ece516a5de4f129f3a29135812a53797cab22fb36a5a11974050",
+          "build/lib/libtilelang.so": "a94dc101833dae9da53b84d23e996001955846456e02008520bfe1f1942a8f56",
+          "build/lib/tilelang_deepgemm_heuristics.cpython-312-aarch64-linux-gnu.so": "0ed989e6fc4b5f67f83aac94ed4ad8ece7df8ed5b0a47a68373549a0a26e2148",
+          "build/lib/libz3.so": "f62297e58d3498b6b4612f36ecdde4597bf68c60d17f9269cd33f4c23ff58b9d",
+          "build/lib/tilelang_pto_wrapper.cpython-312-aarch64-linux-gnu.so": "cd6a96a58a1409ed97caf273f0f578e2ce96ba09f418cec9353d71eeffb09b59"
+        }
+      },
+      "min_host_available_bytes": 121788248064,
+      "max_hottest_c": 53.0,
+      "files": {
+        "command.json": {
+          "bytes": 2121,
+          "sha256": "e71407de070a5581c020993dcb0db39304287b2db3c077d9ffd79aa8500c0ac1"
+        },
+        "compiler.json": {
+          "bytes": 1481,
+          "sha256": "696aa0d674a2093023c0a11bdf8c13287001cc09f37098db2ef9733f8c10d879"
+        },
+        "junit.xml": {
+          "bytes": 3468,
+          "sha256": "74c096f275fb1c86a40ca98802524547266c8f3040a189791aff3a685b163458"
+        },
+        "memory.jsonl": {
+          "bytes": 1152,
+          "sha256": "8d8f1ad8f1d4154db19d235ad8f2902a8f0298b45bacc2b69c5be7c4be536519"
+        },
+        "output.txt": {
+          "bytes": 11082,
+          "sha256": "d53baec54bbc104992296dfa52cbd9140f4fc4dc6d3bb47cf6de41391e1af7b6"
+        },
+        "result.json": {
+          "bytes": 2304,
+          "sha256": "21bae0aca024206dd9cdde038b7f2b41cb177b08781a1b71dc7087ffc67e837b"
+        }
+      }
+    },
+    "alignment-pr3690-b-v2": {
+      "label": "alignment-pr3690-b-v2",
+      "started_utc": "2026-11-04T01:40:05.044526+00:00",
+      "image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+      "source": "variants/pr3690",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "tl-review-alignment-pr3690-b-v2",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--memory",
+        "24g",
+        "--memory-swap",
+        "24g",
+        "--shm-size",
+        "2g",
+        "--ulimit",
+        "core=0",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104,target=/review,readonly",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/runs/alignment-pr3690-b-v2,target=/out",
+        "--mount",
+        "type=bind,source=/home/chris/spark-lab/tilelang-review-20261104/cache/alignment-pr3690-b-v2,target=/cache",
+        "--env",
+        "PYTHONPATH=/review/variants/pr3690",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "TILELANG_CACHE_DIR=/cache/tilelang",
+        "--env",
+        "CUDA_CACHE_PATH=/cache/driver",
+        "--env",
+        "VLLM_PLUGINS=",
+        "--env",
+        "NO_GIT_VERSION=1",
+        "--workdir",
+        "/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+        "300",
+        "python3",
+        "/review/deployment/experiments/2026-11-04-tilelang-kernel-review/pytest_run.py",
+        "-q",
+        "-rA",
+        "-p",
+        "no:cacheprovider",
+        "--junitxml=/out/junit.xml",
+        "/review/variants/pr3690/testing/python/components/test_cuda_shared_memory_alias_codegen.py",
+        "/review/variants/pr3690/testing/python/transform/test_tilelang_transform_smem_swizzle_alignment.py",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_and_raw_descriptor_share_allocation",
+        "/review/variants/pr3690/testing/python/language/test_tilelang_language_tma_copy.py::test_bulk_only_retains_small_arena_alignment"
+      ],
+      "before_memory_bytes": 122835714048,
+      "start_hottest_c": 48.2,
+      "independent_sp8_authorized": true,
+      "dgx1_hold_modified": false,
+      "serving_operations": [],
+      "exit_code": 0,
+      "ended_utc": "2026-11-04T01:40:17.058909+00:00",
+      "memory_aborted": false,
+      "output_sha256": "a4ac20a6de8040919e9ac4d6271e0c34851cb2c0c47ee02bdf812bab55d4c003",
+      "valid_for_comparison": true,
+      "pytest": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "19",
+        "time": "8.872",
+        "timestamp": "2026-11-04T01:40:06.976829+00:00",
+        "hostname": "77f746185e70"
+      },
+      "failed_tests": [],
+      "skipped_tests": [],
+      "compiler": {
+        "tilelang_module": "/review/variants/pr3690/tilelang/__init__.py",
+        "native_libraries": {
+          "build/lib/libstub_nvrtc.so": "752c9be6385894bc49884e5aab40fb38790d1669562ca5fe85c1f47e4a78b7b4",
+          "build/lib/libstub_cuda.so": "691a0571a520046165f2c7eac670a98fefaa36ae33aab42f03933d81d6e165b9",
+          "build/lib/tilelang_cython_wrapper.cpython-312-aarch64-linux-gnu.so": "b5e83df8a395ef088de231aa0120dbca2e359becfc2ef04bda5f6b1c88294a94",
+          "build/lib/tilelang_ascend_npu_exchange.cpython-312-aarch64-linux-gnu.so": "3b1afc27072c5abd967d746038f5030864a01e82649439ac5fd90f16b2933608",
+          "build/lib/libtvm_runtime.so": "647134be75aaa6567e190fb7c0d3fd095ba5930490e31d3c05881a8fae7775a8",
+          "build/lib/libtvm_ffi.so": "8338203a2d89b0279bcfba3f41527d79851e8384f1b315a11c5fc74abc0a3be3",
+          "build/lib/libstub_cudart.so": "ca5b48f63fe2d729f5d4192a53272b755de7f69d7d77ab3e983b6e9a59c6880e",
+          "build/lib/libtvm_compiler.so": "c83c11b29ab7ece516a5de4f129f3a29135812a53797cab22fb36a5a11974050",
+          "build/lib/libtilelang.so": "a94dc101833dae9da53b84d23e996001955846456e02008520bfe1f1942a8f56",
+          "build/lib/tilelang_deepgemm_heuristics.cpython-312-aarch64-linux-gnu.so": "0ed989e6fc4b5f67f83aac94ed4ad8ece7df8ed5b0a47a68373549a0a26e2148",
+          "build/lib/libz3.so": "f62297e58d3498b6b4612f36ecdde4597bf68c60d17f9269cd33f4c23ff58b9d",
+          "build/lib/tilelang_pto_wrapper.cpython-312-aarch64-linux-gnu.so": "cd6a96a58a1409ed97caf273f0f578e2ce96ba09f418cec9353d71eeffb09b59"
+        }
+      },
+      "min_host_available_bytes": 121825587200,
+      "max_hottest_c": 55.4,
+      "files": {
+        "command.json": {
+          "bytes": 2121,
+          "sha256": "3e71e599a762d113870629b73b289807d053064012167fd599ba04f18509d826"
+        },
+        "compiler.json": {
+          "bytes": 1481,
+          "sha256": "696aa0d674a2093023c0a11bdf8c13287001cc09f37098db2ef9733f8c10d879"
+        },
+        "junit.xml": {
+          "bytes": 3468,
+          "sha256": "832bad40329e8f645c3cf1b14c3a5ea0b58e42c1d5ad8d1a629c1d930f227fb2"
+        },
+        "memory.jsonl": {
+          "bytes": 1152,
+          "sha256": "81afd8ad0743669ae91f81f3af58306745a3e17e4777121c6b1e7fd1ee830d0d"
+        },
+        "output.txt": {
+          "bytes": 11082,
+          "sha256": "a4ac20a6de8040919e9ac4d6271e0c34851cb2c0c47ee02bdf812bab55d4c003"
+        },
+        "result.json": {
+          "bytes": 2304,
+          "sha256": "7288b7dfa14ded7da424abf4d1efaf4734a63820544417628e7f9c57f993d56b"
+        }
+      }
+    }
+  },
+  "evidence_sha256": "9c520c9cab85c1e6a6c9c15d1d50c18359aa9967a512b38b0901b1528fb2e537",
+  "new_gpu_runs": [],
+  "serving_operations": [],
+  "candidate_image_built": false
+}
