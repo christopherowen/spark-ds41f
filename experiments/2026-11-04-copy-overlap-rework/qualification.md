@@ -62,6 +62,18 @@ previous C40 and current C41, with both C41/C40 boot pairings and reference and
 candidate repeat floors. C36's one compatible saved boot is a stated limit.
 No old image is remeasured. Restore first, then release shared capacity.
 
-No C41 image, GPU or serving work has started. The packet awaits normal shared
-scheduling. No promotion or bypass of outstanding TP4 release gates is implied.
-The recurring schedule remains paused; continue with direct waiting here.
+The matching request was fulfilled and guarded source staging closed with all
+four checkouts clean at the frozen published execution commit, without a C36
+restart. The sole attempt-1 controller launched on 2026-11-05 at 06:29:27 UTC,
+opening window `dgx1-1793860208` at 06:30:08 UTC. A fresh compact source recheck
+confirmed all four checkouts still match. Image/gates are active; no serving
+performance result is available. Actual image digest remains unknown. Native
+outputs and launch/real-wait-exit receipts must be preserved.
+
+An earlier operator command failed local Python parsing before any SSH/native
+controller action; absence checks and the original error record are retained.
+The corrected transport locally parsed both supervisor and remote program before
+its single launch. This is operator setup history, not candidate data.
+
+No promotion or bypass of outstanding TP4 release gates is implied. The recurring
+schedule remains paused; continue with direct waiting here.
