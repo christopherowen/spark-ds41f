@@ -85,3 +85,9 @@ own checks. The planned use projects block features only during summary updates;
 it introduces no reference or grading work into queries. Actual key-retention
 validation and construction timing must precede any serving candidate. No maps
 have been fitted and this probe is not integrated into serving.
+
+The revised capture-threshold checks and metric arithmetic contracts pass in the
+CPU-only pinned container (`runs/copy-check-03`): all MXFP4 codes/scales, the
+leading 32 directions, and invariance to query-weight sign for the squared
+metric. The container and reservation are removed. This is a synthetic contract
+check; no model-derived metric has been fitted.
