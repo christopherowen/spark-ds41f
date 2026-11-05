@@ -1,0 +1,41 @@
+........................F.                                               [100%]
+=================================== FAILURES ===================================
+_____ test_ced_endpoint_retention_respects_completion_and_eviction[False] ______
+
+cancelled = False
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_ced_endpoint_retention_respects_completion_and_eviction(cancelled):
+        manager = make_kv_cache_manager(
+            make_ced_kv_cache_config(), max_model_len=8192, hash_block_size=32
+        )
+        tokens = list(range(4224))
+        producer = make_request("producer", tokens, 32, sha256)
+        computed = 4096 if cancelled else len(tokens)
+        assert manager.allocate_slots(producer, computed) is not None
+        producer.num_computed_tokens = computed
+        producer.status = (
+            RequestStatus.FINISHED_ABORTED if cancelled else RequestStatus.FINISHED_STOPPED
+        )
+        manager.free(producer)
+        consumer = make_request("extension", tokens + [9000] * 129, 32, sha256)
+        hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+>       assert hit_tokens == computed
+E       assert 4096 == 4224
+
+tests/v1/core/test_prefix_caching.py:6228: AssertionError
+=============================== warnings summary ===============================
+vllm/__init__.py:7
+  /source/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+  No module named 'vllm._version'
+    from .version import __version__, __version_tuple__  # isort:skip
+
+../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_prefix_caching.py::test_ced_endpoint_retention_respects_completion_and_eviction[False]
+1 failed, 25 passed, 206 deselected, 15 warnings in 5.27s
+CPU_RECEIPT {"exit_code": 1, "peak_rss_kib": 1092104, "elapsed_s": 5.725562297971919, "cuda_initialized": false, "visible_devices": "", "cpu_limit": 2, "memory_limit_gib": 4}
