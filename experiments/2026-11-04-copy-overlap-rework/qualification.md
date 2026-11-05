@@ -1,10 +1,18 @@
 # Qualification packet
 
-Current execution: attempt 2 is active from the unchanged completed image gate.
-Do not launch another controller, synchronize active nodes, rebuild/re-gate or
-repeat a serving point. Execution commit remains
-`0da35cc9668ff491065446b2a842fe996a73e80f`; later evidence commits are not runtime
-authority. Performance remains pending.
+Current execution: COMPLETE. Attempt 2 ended successfully at 11:21:04 UTC on
+2026-11-05. All 40 functional and 26 performance outcomes passed; independent
+all-rank C36 restoration and absent controller/supervisor checks passed.
+C41 is REJECTED as a simplification because retained core costs exceed existing
+repeat-aware margins in the stated comparisons. Retain C40 as the corrected
+default-enabled base. This is not a serving-throughput gain claim for C40 or
+its existing overlap. See [measured report](runs/2026-11-05-dgx/attempt-2/README.md)
+and [decision](decision.md).
+
+The execution and scheduling text below preserves the original packet/history;
+it is not an instruction to repeat any completed build, gate or metric arm.
+Execution commit remained `0da35cc9668ff491065446b2a842fe996a73e80f` throughout.
+Later evidence publication is not a reason to synchronize any node.
 
 Purpose declared before measurement: remove optional overlap complexity while
 preserving correctness and avoiding a material incremental performance
@@ -146,3 +154,17 @@ its single launch. This is operator setup history, not candidate data.
 
 No promotion or bypass of outstanding TP4 release gates is implied. The recurring
 schedule remains paused; continue with direct waiting here.
+
+Final independent restoration was verified at 11:21:53 UTC. The actual wait exit
+was zero; both processes were absent and all three unchanged C36 containers had
+the named restoration profile and expected immutable image. No native error,
+restore error or management-loss latch was recorded. All 181 downloaded artifact
+hashes verify. The full audit, every adverse comparison, original scheduling and
+operator errors, and all six native guard/telemetry summaries remain retained.
+
+The telemetry review found seven software power-cap event-mask samples on dgx3
+in the repeat release suite despite zero recorded power-cap duration counters.
+Both observations are published; no causal or duration explanation is invented.
+The operator observer timeout remains unexplained, while all-rank native first
+release telemetry covers the gap and no runtime reset/relaunch occurred.
+The recurring schedule remains PAUSED.
