@@ -34,6 +34,7 @@ class ComponentTests(unittest.TestCase):
         self.full_gate_passes = None
         self.lab_calls = []
         self.suite_calls = []
+        self.stop_plans, self.stop_applies = [], []
         self.image = {"Id": "sha256:" + "a" * 64, "Layers": ["sha256:" + "b" * 64],
                       "Labels": {"local.spark-ds41f.vllm.tree": "c" * 40, "org.opencontainers.image.revision": "d" * 40}}
         self.images = {f"dgx{i}": self.image for i in (1, 2, 3)}
@@ -64,6 +65,12 @@ class ComponentTests(unittest.TestCase):
 
     def process(self, argv, **kwargs):
         if "bin/spark" in argv and "cluster" in argv:
+            if "stop" in argv:
+                if "--apply" in argv:
+                    self.stop_applies.append(argv)
+                    self.assertEqual(argv[:-1], self.stop_plans[-1])
+                else:
+                    self.stop_plans.append(argv)
             if "--apply" in argv:
                 return SimpleNamespace(returncode=0)
             refused = self.restore_refused and "start" in argv
@@ -194,6 +201,23 @@ class ComponentTests(unittest.TestCase):
         self.assertTrue(receipt["completed"])
         self.assertTrue(receipt["restored"])
 
+    def test_identical_layers_with_a_different_image_configuration_cannot_reach_native_gates(self):
+        self.image_failure = False
+        original = self.ssh
+        def inspect(nodes, node, *argv):
+            process = original(nodes, node, *argv)
+            if argv[:3] == ("docker", "image", "inspect") and node["name"] == "dgx2":
+                changed = json.loads(process.stdout)
+                changed["Id"] = "sha256:" + "f" * 64
+                process.stdout = json.dumps(changed)
+            return process
+        self.ssh = inspect
+        self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.lab_calls, ["image"])
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertIn("image identity", receipt["error"])
+        self.assertTrue(receipt["restored"])
+
     def prepare_failed_full_gate(self):
         self.image_failure = False
         self.kernel_passes = True
@@ -313,6 +337,23 @@ class ComponentTests(unittest.TestCase):
         self.assertFalse(receipt.get("completed"))
         self.assertEqual([r["log"] for r in receipt["steps"] if r["log"].startswith("boot-")], ["boot-first.log"])
         self.assertIn("first", receipt["model_identity"])
+
+    def test_each_serving_stop_applies_its_exact_inspected_profile(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": [{
+            "suite": ["primary"], "reference": "recorded", "arms": [
+                {"label": label, "config": "candidate.json"} for label in ("first", "repeat")]}]})
+        reference = {"path": str(self.root / "reference.json.gz"), "sha256": "reference"}
+        with patch.object(runner, "recorded_model_reference", return_value=reference), \
+             patch.object(runner.suite, "load", return_value={}), \
+             patch.object(runner, "native_suite_gate", side_effect=[
+                 {node: "first" for node in self.images}, {node: "repeat" for node in self.images}]), \
+             patch.object(runner, "native_model_gate"):
+            self.assertEqual(self.invoke(through="release"), 1)  # no fake functional report
+        self.assertEqual([argv[argv.index("--cluster-config") + 1] for argv in self.stop_applies],
+                         [runner.RESTORE, "candidate.json"])
+        self.assertTrue(self.closed)
 
     def test_model_gate_requires_complete_exact_vectors_and_pinned_inputs(self):
         candidate = self.root / "model.json.gz"

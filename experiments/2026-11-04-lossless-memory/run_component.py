@@ -440,8 +440,9 @@ def main():
                 if image["Labels"].get(key) != value:
                     raise ValueError("candidate source label differs: " + key)
             receipt["images"][node["name"]] = image
-        if len({tuple(v["Layers"]) for v in receipt["images"].values()}) != 1:
-            raise ValueError("candidate layers differ between ranks")
+        if (len({v["Id"] for v in receipt["images"].values()}) != 1
+                or len({tuple(v["Layers"]) for v in receipt["images"].values()}) != 1):
+            raise ValueError("candidate image identity or layers differ between ranks")
         builder = next(n["name"] for n in nodes["nodes"] if n["head"])
         image_id = receipt["images"][builder]["Id"]
         build_directory = spark.build_directory(spark.build_inputs(upstreams))
@@ -485,9 +486,8 @@ def main():
             for number, candidate in enumerate(job["arms"]):
                 guard()
                 label, profile = candidate["label"], candidate["config"]
-                plan(RESTORE if number == 0 else profile, ["stop"])
-                if not lab.stop_cluster():
-                    raise RuntimeError("coordinated stop failed")
+                argv = plan(RESTORE if number == 0 else profile, ["stop", "--parallel"])
+                run([*argv, "--apply"], "stop-" + label)
                 argv = plan(profile, ["start", "--replace"])
                 active_profile, active_label = profile, label
                 memory_out = ROOT / "results/private/determinism" / release["run"] / f"startup-memory-{label}"
