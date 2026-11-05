@@ -3,14 +3,19 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
-The next candidate is [candidate-39](experiments/2026-10-26-spark-ds41f-candidate/candidate-39/README.md).
-It makes CopyDrafter the default for greedy adaptive DSpark, fits the decode and
-capture envelopes automatically, and overlaps the copy work. Its canonical source
-is prepared; image and serving qualification are pending in the
-[measured rounds](experiments/2026-11-04-copy-default-screening/README.md).
-It builds on [candidate-38](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md),
-whose [TP3 qualification](experiments/2026-11-03-candidate-38-tp3-qualification/README.md)
-retains throughput gains, latency findings and small copy-recipe costs for review.
+The best validated corrected, default-enabled base is
+[candidate-40](experiments/2026-11-04-topk-live-qualification/README.md).
+[C39](experiments/2026-11-04-copy-default-screening/README.md) delivered default
+CopyDrafter behavior without a proven incremental serving-throughput gain;
+C40 retains the independent top-k scratch-read correctness fix with neutral
+aggregate serving performance. [C41's overlap simplification](experiments/2026-11-04-copy-overlap-rework/decision.md)
+was rejected after its engine and cold-prefill costs failed the stated criterion.
+The [PR qualification queue](experiments/2026-11-05-pr-screening/README.md) records
+each source, purpose, outstanding gate and decision. [C42](experiments/2026-11-05-compiler-live-qualification/qualification.md)
+qualifies the compiler refresh and its existing correctness fixes as maintenance;
+its complete image/functional and repeat performance verdict remains pending.
+Each completed round reports compatible saved1030, C36, previous and current
+builds, signed changes, both repeat margins and retained adverse rows.
 The promoted release remains spark-ds41f-1030.
 Loop work follows the candidate's
 [containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
