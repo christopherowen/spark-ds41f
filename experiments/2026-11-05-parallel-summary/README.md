@@ -23,3 +23,19 @@ there are no remaining containers. The retry adds the same pinned sanitizer
 mount used by the prior qualified bundles and disables the PyTorch allocation
 cache for strict checking. The kernel, operands, expected bytes and timers are
 unchanged.
+
+The corrected128-thread screen at `396a431f` passes full cache-byte equality
+on all four captures, both synthetic page sizes, unwritten skipped pages and
+recycling, with zero initialization/race errors. Two fresh processes measure
+dense single-page maintenance28.2–30.1 microseconds versus the preceding
+approximately52–53; source single-page54.7–55.2 is slightly worse. Full snapshots
+measure36.2–37.7 dense and131.9–132.2 source microseconds. Every timing, skip-only
+cost and memory observation is retained in `runs/screen-02`. The lease releases
+at21:01:44 UTC; an independent reader verifies no reservations or GPU processes.
+No runtime adoption follows from a mixed result.
+
+The next screen changes only threads per cooperative page CTA,128 to512.
+The arithmetic, operands and expected bytes remain identical. Require the same
+sanitizer/equality checks and two new timing processes before considering it.
+This tests whether more lanes reduce per-thread serial dimension work; retain
+both favorable and unfavorable page/batch results.

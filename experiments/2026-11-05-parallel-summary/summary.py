@@ -15,7 +15,7 @@ def summarize_parallel(page:int,slot_dtype:str='int64'):
     def update(Pool:T.StridedTensor([pages,page*80],[stride,1],T.uint8),
                Half:T.StridedTensor([pages,page*40],[stride//2,1],T.bfloat16),
                Slots:T.Tensor([rows],slot_dtype)):
-        with T.Kernel(rows,threads=128) as row:
+        with T.Kernel(rows,threads=512) as row:
             slot=Slots[row]
             sums=T.alloc_fragment([groups,32],T.float32)
             terms=T.alloc_fragment([groups,32],T.float32)

@@ -129,3 +129,18 @@ answer keys and executable tests do not change. The earlier strict coding
 rejection and its missing repeat boots remain historical; they are not relabeled
 as a completed qualification. The active compact pilot stays at its published
 controller revision and original gate throughout its window.
+
+The direct-merge RULER26 screen (`4210b137`, `runs/ruler-screen-window-01`)
+finishes Native A at26/26 and LSA A at25/26. All26 responses in each arm complete
+naturally. LSA loses `qa_1-l131072-s20272205`, a128K QA task, so the no-loss gate
+rejects before repeat boots. Single-arm generation times are576.68 versus384.95
+seconds; faster generation does not rescue this quality loss or qualify a speed
+claim. All other25 task scores match100. The case, score, input and shared
+protocol remain unchanged. No raw response or reference is exported.
+
+C37 restores at21:03 UTC; the precise timestamp and all commands, conditions and
+failure receipts are retained in that cohort. An independent reader verifies
+the exact image, clean equal serving revisions, no experimental mounts or
+environment and no remaining reservations on all four nodes. The next ordinary
+experiment changes only the existing native-source dispatch setting; the failed
+result is never relabeled or replaced.
