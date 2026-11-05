@@ -1,0 +1,175 @@
+From db5cd9a082b746a9fd733afc7b88c72f55228a20 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 21:19:42 +0100
+Subject: [PATCH] Stage transposed selected logits in shared memory during
+ normalization
+
+Upstream-base: d20a95fd3ef5a717353475ad983ada6afd933eff, after candidate-38, selected-logit source c88a692e98 and native-input patches 0001-0006.
+
+Rationale: late transposed-id gathers remain on the row reduction's critical path. The fixed 480-round follow-up still leaves a large BF16 case unqualified. For a transposed selection fitting one thread block, read the selected logits before the bulk reduction and retain their FP32 values in 4 KiB of shared memory. This hides dependent gather latency without the rejected global-output-buffer round trip. Other layouts and larger selections retain the existing native-input kernel.
+
+Quality: no new CUDA launch, global buffer, dtype/layout materialization or arithmetic reordering. FP32 staging preserves the exact value consumed by final normalization. Runtime dispatch bounds the shared array; tests cover both sides of the 1024-column boundary and startup freeze. Every specialization is declared before freeze.
+
+Tests: GPU numerical, boundary, graph, paired-performance and IKET qualification required. Recorded v6 results and its failed precision follow-up are retained in the deployment experiment.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      | 18 +++++--
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 47 +++++++++++++++----
+ 2 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index a60cb0f675..1b784863cf 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -531,7 +531,7 @@ def test_runner_declares_the_launched_calls(logits_mode):
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+             tilelang_logprob.topk_log_softmax_key(
+-                dtype, run, masked, id_dtype, id_layout
++                dtype, run, masked, id_dtype, id_layout, prefetch_ids
+             ),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+@@ -539,6 +539,7 @@ def test_runner_declares_the_launched_calls(logits_mode):
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
+         for id_layout in ("compact", "row", "column", "transpose", "general")
++        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
+     }
+     declared = _declared(registry)
+     softmax = {
+@@ -710,12 +711,21 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize(
+-    "layout", ["dense", "padded", "sliced", "transposed", "general"]
++    "layout,cols",
++    [
++        ("dense", 33),
++        ("padded", 33),
++        ("sliced", 33),
++        ("transposed", 33),
++        ("transposed", 1024),
++        ("transposed", 1025),
++        ("general", 33),
++    ],
+ )
+ @pytest.mark.parametrize("masked", [False, True])
+-def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
++def test_logprobs_read_native_ids(dtype, id_dtype, layout, cols, masked):
+     """ID strides change addressing, never log-softmax arithmetic."""
+-    rows, cols, vocab = 5, 33, 8193
++    rows, vocab = 5, 8193
+     logits = torch.randn(rows, vocab + 7, device=DEVICE, dtype=dtype)[:, :vocab]
+     ids = torch.randint(vocab, (rows, cols), device=DEVICE, dtype=id_dtype)
+     valid = torch.rand(rows, cols, device=DEVICE) > 0.3
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 05a0f98d23..f02a99c091 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -197,6 +197,7 @@ def topk_log_softmax_kernel(
+     masked: bool = False,
+     id_dtype: str = "int64",
+     id_layout: str = "compact",
++    prefetch_ids: bool = False,
+ ):
+     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
+     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
+@@ -291,6 +292,12 @@ def topk_log_softmax_kernel(
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
++            if prefetch_ids:
++                T.assume(topk <= threads)
++                # Reuse the reduction barriers; each thread later reads its own slot.
++                selected = T.alloc_shared((threads,), T.float32)
++                if tx < topk:
++                    selected[tx] = T.cast(logits[row, token_ids[row, tx]], T.float32)
+             raw = T.alloc_local((per,), logits_dtype)
+             peak = T.alloc_local((loads,), T.float32)
+             total = T.alloc_local((loads,), T.float32)
+@@ -359,7 +366,10 @@ def topk_log_softmax_kernel(
+             for c in T.serial(T.ceildiv(topk, threads)):
+                 col = c * threads + tx
+                 if col < topk:
+-                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
++                    if prefetch_ids:
++                        picked = selected[col]
++                    else:
++                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                     value = T.call_extern(
+                         "float32",
+                         "vllm_sub",
+@@ -381,8 +391,16 @@ def topk_log_softmax_key(
+     masked: bool = False,
+     id_dtype: torch.dtype = torch.int64,
+     id_layout: str = "compact",
++    prefetch_ids: bool = False,
+ ) -> tuple:
+-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], id_layout)
++    return (
++        _DTYPES[logits_dtype],
++        run,
++        masked,
++        _DTYPES[id_dtype],
++        id_layout,
++        prefetch_ids,
++    )
+ 
+ 
+ def _id_layout(ids: torch.Tensor) -> str:
+@@ -398,19 +416,34 @@ def _id_layout(ids: torch.Tensor) -> str:
+     return "general"
+ 
+ 
++def _score_key(logits: torch.Tensor, ids: torch.Tensor, masked: bool) -> tuple:
++    layout = _id_layout(ids)
++    return topk_log_softmax_key(
++        logits.dtype,
++        _triton_run(logits),
++        masked,
++        ids.dtype,
++        layout,
++        layout == "transpose" and ids.shape[1] <= _SOFTMAX_THREADS,
++    )
++
++
+ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
+     layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
+     return [
+         _call(
+             topk_log_softmax_kernel,
+-            *topk_log_softmax_key(dtype, run, masked, id_dtype, id_layout),
++            *topk_log_softmax_key(
++                dtype, run, masked, id_dtype, id_layout, prefetch_ids
++            ),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype)
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
+         for id_layout in ("compact", "row", "column", "transpose", "general")
++        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
+     ]
+ 
+ 
+@@ -436,13 +469,7 @@ def topk_log_softmax(
+         raise TypeError("token_ids must be int32 or int64")
+     kernel = _kernel(
+         topk_log_softmax_kernel,
+-        *topk_log_softmax_key(
+-            logits.dtype,
+-            _triton_run(logits),
+-            valid is not None,
+-            token_ids.dtype,
+-            _id_layout(token_ids),
+-        ),
++        *_score_key(logits, token_ids, valid is not None),
+     )
+     # The unmasked specialization never reads the dummy validity tensor.
+     kernel(
+-- 
+2.54.0 (Apple Git-157)
+

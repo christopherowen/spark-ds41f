@@ -1,0 +1,186 @@
+From 6bcb2d1caa6f3976b5779da8423bf5542de3d7bd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 14:13:58 +0100
+Subject: [PATCH] Vectorize sampler casts and use pitched DMA for large FP32
+ copies
+
+Upstream base: 486d01e07cf3ba37296a78a8a0cf8da26cf19295. Rationale: eliminate the scalar-copy slowdown while preserving small-batch parallelism. Quality: owned bit-exact FP32 outputs, unchanged source/RNG, explicit CUDA errors and native current-stream ordering. Tests: common candidate passes 1,167 checks twice; selected DMA screen passes twice; final sampler gate and new graph/side-stream cases pending. Upstream status: local experiment, not submitted.
+---
+ .../kernels/test_deepseek_v41_copy_logits.py  | 50 +++++++++++++-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 68 ++++++++++++++++---
+ 2 files changed, 106 insertions(+), 12 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_copy_logits.py b/tests/kernels/test_deepseek_v41_copy_logits.py
+index 6b8b655706..c08dd533c6 100644
+--- a/tests/kernels/test_deepseek_v41_copy_logits.py
++++ b/tests/kernels/test_deepseek_v41_copy_logits.py
+@@ -69,7 +69,55 @@ def test_sampler_declarations_include_the_copy_specializations():
+     calls = kernels.sampling_calls([torch.float16, torch.bfloat16, torch.float32])
+     # The declaration goes through the same factory/key as the runtime launch.
+     expected = [
+-        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d])
++        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized)
+         for d in (torch.float16, torch.bfloat16, torch.float32)
++        for vectorized in (False, True)
+     ]
+     assert all(c in calls for c in expected)
++
++
++@pytest.mark.parametrize("cols", [1020, 1024, 1028, 4092, 4096, 4100])
++@pytest.mark.parametrize("rows", [5, 96])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols, rows):
++    pitch = (cols + 31) // 16 * 16
++    src = torch.randn((rows, pitch), dtype=dtype, device="cuda")[:, :cols]
++    before = src.clone()
++    got = kernels.copy_logits(src)
++    torch.testing.assert_close(got, src.float(), rtol=0, atol=0)
++    assert got.is_contiguous() and got.data_ptr() != src.data_ptr()
++    assert torch.equal(src, before)
++
++
++@pytest.mark.parametrize("rows", [65535, 65536])
++def test_padded_copy_crosses_grid_y_limit(rows):
++    src = torch.randn((rows, 16), dtype=torch.float32, device="cuda")[:, :4]
++    got = kernels.copy_logits(src)
++    torch.testing.assert_close(got, src, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("rows", [32, 96])
++def test_large_pitched_copy_replays_into_owned_storage(rows):
++    backing = torch.randn((rows, 129296), device="cuda")
++    src = backing[:, :129280]
++    kernels.copy_logits(src)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        got = kernels.copy_logits(src)
++    for scale in (0.5, -2.0):
++        backing.mul_(scale)
++        graph.replay()
++        torch.cuda.synchronize()
++        assert got.data_ptr() != src.data_ptr()
++        assert torch.equal(got.view(torch.int32), src.view(torch.int32))
++
++
++def test_large_pitched_copy_uses_the_current_stream():
++    backing = torch.randn((32, 129296), device="cuda")
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        backing.mul_(2)
++        got = kernels.copy_logits(backing[:, :129280])
++    torch.cuda.current_stream().wait_stream(stream)
++    assert torch.equal(got, backing[:, :129280])
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index be2d8d5b56..05dbc6718f 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3439,30 +3439,58 @@ def declare(calls: Callable[[], list]) -> None:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_logits_kernel(dtype: str):
++def copy_logits_kernel(dtype: str, vectorized: bool = False):
+     """Own an FP32 logits copy, including cast and non-contiguous source rows."""
+     rows, cols, row_stride, col_stride = T.dynamic("rows, cols, row_stride, col_stride")
++    source_strides = (row_stride, 1) if vectorized else (row_stride, col_stride)
+ 
+     @T.prim_func
+     def copy_logits(
+-        src: T.StridedTensor((rows, cols), (row_stride, col_stride), dtype),
++        src: T.StridedTensor((rows, cols), source_strides, dtype),
+         dst: T.Tensor((rows, cols), T.float32),
+     ):
+-        with T.Kernel(rows, T.ceildiv(cols, 1024), threads=256) as (row, block):
++        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
++        grid_y = rows if vectorized else T.ceildiv(cols, 1024)
++        with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
++            row = by if vectorized else bx
++            block = bx if vectorized else by
+             tx = T.get_thread_binding()
+-            for j in T.unroll(4):
+-                col = block * 1024 + j * 256 + tx
+-                if col < cols:
+-                    dst[row, col] = T.cast(src[row, col], T.float32)
++            if vectorized:
++                T.assume(row_stride % 4 == 0)
++                T.assume(cols % 4 == 0)
++                col = block * 1024 + tx * 4
++                if col + 4 <= cols:
++                    for j in T.vectorized(4):
++                        dst[row, col + j] = T.cast(src[row, col + j], T.float32)
++            else:
++                for j in T.unroll(4):
++                    col = block * 1024 + j * 256 + tx
++                    if col < cols:
++                        dst[row, col] = T.cast(src[row, col], T.float32)
+ 
+     return copy_logits
+ 
+ 
++def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
++    from cuda.bindings import runtime as cudart
++
++    with torch.cuda.device(logits.device):
++        error, = cudart.cudaMemcpy2DAsync(
++            out.data_ptr(), out.stride(0) * 4,
++            logits.data_ptr(), logits.stride(0) * 4,
++            logits.shape[1] * 4, logits.shape[0],
++            cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
++            torch.cuda.current_stream(logits.device).cuda_stream,
++        )
++    if error != cudart.cudaError_t.cudaSuccess:
++        raise RuntimeError(f"pitched logits copy failed: {error}")
++
++
+ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+     """FP32-owned logits for processing; leave the raw logits unchanged.
+ 
+-    Dense FP32 is a device memcpy, which stays on PyTorch's DMA path. Casts and
+-    strided sources otherwise launch generic ATen kernels; use TileLang for them.
++    Dense FP32 uses PyTorch's DMA path. Wide aligned FP32 matrices above 8 MiB
++    use pitched DMA; smaller copies, casts and other strides use TileLang.
+     Tensor allocation and views do not launch compute kernels.
+     """
+     if (
+@@ -3476,8 +3504,25 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+         return out
+     if logits.dtype == torch.float32 and logits.is_contiguous():
+         out.copy_(logits)
++    elif (
++        logits.dtype == torch.float32
++        and logits.stride(1) == 1
++        and logits.shape[1] >= 65536
++        and logits.shape[1] % 16 == 0
++        and logits.numel() * 4 >= 8 << 20
++        and logits.stride(0) >= logits.shape[1]
++        and logits.stride(0) % 16 == 0
++        and logits.data_ptr() % 64 == 0
++    ):
++        _pitched_logits_copy(logits, out)
+     else:
+-        _kernel(copy_logits_kernel, _DTYPES[logits.dtype])(logits, out)
++        vectorized = (
++            logits.stride(1) == 1
++            and logits.shape[0] <= 65535
++            and logits.shape[1] % 4 == 0
++            and _triton_run(logits) > 1
++        )
++        _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized)(logits, out)
+     return out
+ 
+ 
+@@ -3506,8 +3551,9 @@ def sampling_calls(
+         for apply_temp in apply_temps
+     ]
+     calls += [
+-        _call(copy_logits_kernel, _DTYPES[dtype])
++        _call(copy_logits_kernel, _DTYPES[dtype], vectorized)
+         for dtype in dict.fromkeys(logits_dtypes)
++        for vectorized in (False, True)
+     ]
+     if temperature:
+         calls += [
+-- 
+2.54.0 (Apple Git-157)
+

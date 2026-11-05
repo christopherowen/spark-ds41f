@@ -24,3 +24,22 @@ implementation, overwrite a foreign request or synchronize an active window.
 Each newly measured round gets the four-build over/under report, retained adverse
 rows and both candidate/reference repeat margins. One focused rework is allowed
 on a miss; unsupported additional retries are dropped.
+
+## Subsequent source review
+
+Fresh canonical replay on C40 reproduces the sampler copy (#885), rank-order
+reduction (#886) and each ordered stage of selected logits/native IDs/prompt
+outputs/result transfer (#893/#895/#912/#913). All declared authored file hashes
+match at their respective stage, changed Python files parse and source whitespace
+passes. Exact copied patches and identities are in sources/ and runs/. One
+initial sampler replay used noncanonical committer metadata: its source tree
+matched C40 but the head assertion failed before applying the candidate. The
+original failed receipt/log and separate canonical success are preserved.
+
+These are source checks, not new compiler, image, host-overhead, physical-fabric
+or serving qualifications. No kernel PR is accepted on an authored component
+win alone. Performance enhancements must earn a relevant complete operation or
+request/serving gain beyond both repeat margins and avoid material core costs.
+The owner's four-build report still distinguishes component-only findings from
+serving gains. The result-transfer dense-path host cost and the gather tiny-tail
+uncertainty remain unresolved. C42's running source/image matrix is untouched.
