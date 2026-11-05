@@ -49,6 +49,8 @@ for path in sorted(root.rglob("*")):
                             compressed_sha256=digest(target)[1])
     path.unlink()
     count += 1
-ledger.write_text(json.dumps(dict(format="deterministic gzip; original bytes verified before replacement",
-                                  files=list(records.values())), indent=2) + "\n")
+temporary = ledger.with_name(ledger.name + ".tmp")
+temporary.write_text(json.dumps(dict(format="deterministic gzip; original bytes verified before replacement",
+                                     files=list(records.values())), indent=2) + "\n")
+temporary.replace(ledger)
 print("Compressed", count, "additional artifacts;", len(records), "total recorded.")

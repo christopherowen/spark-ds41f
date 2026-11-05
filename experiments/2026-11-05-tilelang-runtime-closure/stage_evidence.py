@@ -38,7 +38,8 @@ for source, name, needs_closure in sources:
     if (not source.is_dir() or target.exists()
             or (needs_closure and not (source / "closure.json").exists())):
         continue
-    target.mkdir()
+    working = target.with_name(target.name + ".staging")
+    working.mkdir()
     retained, count = [], 0
     for path in sorted(source.rglob("*")):
         if not path.is_file():
@@ -48,12 +49,16 @@ for source, name, needs_closure in sources:
             continue
         if path.suffix not in (".cu", ".py", ".json", ".jsonl", ".txt", ".log", ".xml", ".sqlite", ".gz"):
             continue
-        destination = target / path.relative_to(source)
+        destination = working / path.relative_to(source)
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.link(path, destination)
         count += 1
     records[name] = dict(source=str(source), staged_files=count,
                           raw_reports_retained_on_node=retained,
                           method="Hardlink selected closed-job artifacts; compression replaces only staging links. Original artifacts remain intact on sp8.")
+    (working / "evidence-source.json").write_text(json.dumps(records[name], indent=2) + "\n")
+    working.rename(target)
     print(name, count, "files", flush=True)
-ledger.write_text(json.dumps(records, indent=2) + "\n")
+temporary = ledger.with_name(ledger.name + ".tmp")
+temporary.write_text(json.dumps(records, indent=2) + "\n")
+temporary.replace(ledger)
