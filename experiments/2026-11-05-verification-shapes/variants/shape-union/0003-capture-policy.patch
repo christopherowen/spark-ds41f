@@ -1,0 +1,50 @@
+From 71837e4ec394addf29d9eca4e2fad628092b283a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:20:44 +0000
+Subject: [PATCH] Add general native-row captures beside exact native shapes
+
+Base: 8dea43f62a149a3aef2be4b24fa1c68e9b33407d. Experimental capture-policy alternative: compare row padding, request padding, and graph memory without changing native arithmetic or the capture limit. Native-row descriptors are added through the shared shape generator, avoiding extra mixed graphs. Tests: 70 CPU graph, warmup and context checks passed; 18 unrelated fixture-dependent cases deselected. GPU batch invariance, memory and latency remain unmeasured. Upstream status: unpromoted experiment, not a selected implementation.
+---
+ tests/v1/cudagraph/test_cudagraph_manager.py |  4 ++++
+ vllm/v1/worker/gpu/cudagraph_utils.py        | 11 ++++++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index 28d685b38..4c8769a88 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -627,6 +627,10 @@ def test_copy_verification_keeps_native_full_depth_captures(monkeypatch, max_num
+         for rows in range(reqs, reqs * 17 + 1):
+             desc = manager.dispatch(reqs, rows, None, 0, max_query_len=17)
+             assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
++    # Native row totals also serve more, shallower requests.
++    mixed_depth = manager.dispatch(7, 36, None, 0, max_query_len=17)
++    assert mixed_depth.cg_mode == CUDAGraphMode.FULL
++    assert mixed_depth.num_tokens == 36
+     # Queries outside the verification limit still use the mixed path.
+     mixed = manager.dispatch(3, 36, None, 0, max_query_len=18)
+     assert mixed.cg_mode == CUDAGraphMode.PIECEWISE
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index e431baf00..3e6dab59f 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -90,7 +90,16 @@ def dense_varlen_decode_shapes(
+         for width in sorted(widths)
+         if width > 1 and num_reqs * width <= max_capture_tokens
+     )
+-    return (*dense, *uniform)
++    native_rows = ()
++    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
++        native_rows = (
++            (min(rows, max_num_reqs), rows)
++            for rows in range(
++                uniform_query_len, max_num_reqs * uniform_query_len + 1, uniform_query_len
++            )
++            if rows <= max_capture_tokens
++        )
++    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
+ 
+ 
+ _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
+-- 
+2.43.0

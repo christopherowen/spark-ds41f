@@ -40,5 +40,5 @@ for reqs in (8,16):
         rows.append(dict(reqs=nr,live=nt,target=d.num_tokens,target_reqs=d.num_reqs,context=context))
         if nr<=2: assert d.num_tokens==nt
     full=[next(r for r in rows if r['reqs']==nr and r['live']==nr*6) for nr in range(1,reqs+1)]
-    results.append(dict(request_capacity=reqs,verification_width=width,row_capacity=cap,ladder=ladder,full_graph_count=len(m._capture_descs[mode.FULL]),context_graph_count=len(ctx),context_sizes=ctx,shape_count=len(rows),padding_histogram=dict(Counter(r['target']-r['live'] for r in rows)),native_full_depth=full,all_shapes=rows))
+    results.append(dict(request_capacity=reqs,verification_width=width,row_capacity=cap,ladder=ladder,full_graph_count=len(m._capture_descs[mode.FULL]),context_graph_count=len(ctx),piecewise_graph_count=len(m._capture_descs[mode.PIECEWISE]),context_sizes=ctx,shape_count=len(rows),padding_histogram=dict(Counter(r['target']-r['live'] for r in rows)),native_full_depth=full,all_shapes=rows))
 print(json.dumps(dict(provenance=provenance,scope='CPU-only dispatch enumeration; not GPU capture, latency, or memory measurements',results=results),indent=2))

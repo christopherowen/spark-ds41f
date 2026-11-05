@@ -1,0 +1,27 @@
+From 889b23c1bc92e262bf789def0b7eb0fd0191f4bf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:23:28 +0000
+Subject: [PATCH] Wrap native capture range arguments
+
+Base: 71837e4ec394addf29d9eca4e2fad628092b283a. Fix the new line-length finding without changing the parsed syntax tree. No arithmetic, quality, or runtime behavior changes. Tests: Python AST equality and whitespace check; the preceding capture-policy source passed 70 CPU checks. Upstream status: experimental companion cleanup, unpromoted.
+---
+ vllm/v1/worker/gpu/cudagraph_utils.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3e6dab59f..70f757de5 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -95,7 +95,9 @@ def dense_varlen_decode_shapes(
+         native_rows = (
+             (min(rows, max_num_reqs), rows)
+             for rows in range(
+-                uniform_query_len, max_num_reqs * uniform_query_len + 1, uniform_query_len
++                uniform_query_len,
++                max_num_reqs * uniform_query_len + 1,
++                uniform_query_len,
+             )
+             if rows <= max_capture_tokens
+         )
+-- 
+2.43.0

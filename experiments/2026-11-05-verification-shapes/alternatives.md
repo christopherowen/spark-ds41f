@@ -74,12 +74,24 @@ base, so the repaired intermediate request counts and heterogeneity matter.
 Each promising runtime candidate needs the exact image gate, native arithmetic,
 batch invariance, initialization/memory checks, and a candidate boot plus repeat
 boot with confidence intervals. Compare to saved release/candidate references;
-do not remeasure them. Preserve all losing alternatives. If no end-to-end gain
+do not remeasure released builds. A new, explicitly identified unreleased
+parent control is permitted when the saved candidate-40 runs cannot isolate the
+causal change. Preserve all losing alternatives. If no end-to-end gain
 survives or the graph memory cost is excessive, leave this proposal unadopted.
 
-None of these alternatives has GPU timing or memory evidence yet: the shared
-window is held by the frontend qualification job and the norm-kernel request is
-ahead of this task. Serving sync/stop/start/restart/restoration is additionally
-outside the authorization of this task. A finite search cannot prove a global
+All three first-screen policies now have actual source implementations, pinned
+profiles, and fresh source replays: 576 patches for the exact-native proposal
+and 578 for each variant. Each final implementation passes 70 focused CPU
+tests; 18 unrelated distributed-embedding tests are explicitly deselected.
+`runs/implemented-alternative-census.json` verifies that their real dispatch
+functions match the policy census and retain the same piecewise graph counts
+(16 at TP3, 22 at TP4). Non-copy coverage is unchanged. The variants and all
+setup failures are retained under `variants/` and `runs/`.
+
+None has GPU timing or memory evidence yet. The owner authorized the coordinated
+sync, stop/start/restart, candidate replacement and restoration needed for
+hardware testing. The shared window is still held by the frontend qualification
+job and the norm-kernel request is ahead of this task; authorization does not
+override that queue. A finite search cannot prove a global
 optimum; the current evidence also does not yet prove the strongest feasible
 hardware implementation.

@@ -75,9 +75,17 @@ configurations. Its padding histogram is not weighted by serving traffic.
   map kept outside Git. `git diff --check` passes. Ruff reports only three
   pre-existing findings in untouched lines: one long line in the context test
   and two unused imports in `dspark.py`; `runs/ruff.json` retains them.
-- `build check` reports the experimental build context is not prepared. Complete
-  build inputs are absent from this isolated checkout. The normal image build
-  includes a GPU smoke test, so it was not started under a foreign GPU hold.
+- Complete locked build inputs now pass `build prepare` and `build check` for
+  all three implemented policies. `seed_build_inputs.py` checks out exact Git
+  objects from remote caches, verifies heads/trees/submodules, and copies only
+  hash-verified wheels; the normal preparation command then exports and hashes
+  the contexts. `runs/build-preparation-commands.json` records each command and
+  outcome. The initial missing-context check is retained. No image build or GPU
+  smoke test has run under the foreign hold.
+- The first cache-seeding attempt encountered an empty nested `.gitmodules`
+  file; Git returns status 1 for its empty path query. The seeder now accepts
+  that empty result and safely resumes only exact clean checkouts. Both initial
+  and successful logs are retained; no upstream source or cache was modified.
 - Initial audit harness execution failed with `ValueError: empty body on
   ClassDef`: its method filter also stripped the descriptor dataclass. The
   harness was corrected before either recorded enumeration.
@@ -102,7 +110,7 @@ c1/c8/c16 serving result is available yet. Original release runs were not rerun.
 
 The separate unvalidated MXFP8 tail-read prototype is preserved outside this
 PR in the isolated remote workspace under
-`/home/chris/spark-work/verification-shapes/deployment/experiments/2026-11-05-mxfp8-live-rows`.
+`/home/chris/spark-work/verification-shapes/deployment-live-rows/experiments/2026-11-05-mxfp8-live-rows`.
 It is not part of this profile or source PR; no GEMM kernels change here.
 
 ## Reproduction
@@ -112,7 +120,7 @@ On a remote host with the pinned dependency image and a prepared source tree:
 ```sh
 .venv/bin/python experiments/2026-11-05-verification-shapes/audit_shapes.py /path/to/source > /path/to/new-shapes.json
 .venv/bin/python experiments/2026-11-05-verification-shapes/run_cpu_checks.py --source /path/to/source --out /path/to/new-cpu-run
-.venv/bin/python experiments/2026-11-05-verification-shapes/replay_source.py --cache /path/to/git-cache --destination /path/to/fresh-source
+.venv/bin/python experiments/2026-11-05-verification-shapes/replay_source.py --cache /path/to/git-cache --destination /path/to/fresh-source --out /path/to/new-replay-receipt
 bin/spark --cluster-config experiments/2026-11-05-verification-shapes/tp3.json doctor
 bin/spark --cluster-config experiments/2026-11-05-verification-shapes/tp3.json build check
 git diff --check
@@ -135,3 +143,14 @@ The follow-up [alternatives audit](alternatives.md) compares eight capture polic
 and bounds the matrix-tile savings of this proposal at zero for four representative
 wide dense projections. Native-row-only and union ladders remain credible
 competitors. The source PR is a coverage repair, not a proved hardware winner.
+
+On 2026-11-06 local time the owner explicitly authorized hardware testing,
+including normal coordinated sync, stop/start/restart or replacement needed for
+measurement and restoration. This removes the earlier authorization blocker;
+it does not permit a foreign hold, promotion, merging, or a topology change.
+
+The row-only and union alternatives are implemented and replayed, with final
+70-pass focused CPU checks for each. See `alternatives.md`, `variants/`, and
+`runs/implemented-alternative-census.json`; their actual descriptors match the
+structural comparison and add no piecewise graphs. They remain unmeasured on
+GPU, and no policy has been selected as a performance winner.

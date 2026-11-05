@@ -1,8 +1,8 @@
 """Fresh canonical replay of the experiment's pinned vLLM patch series."""
 import argparse,json,pathlib,subprocess
-p=argparse.ArgumentParser(); p.add_argument('--cache',type=pathlib.Path,required=True); p.add_argument('--destination',type=pathlib.Path,required=True); a=p.parse_args()
-exp=pathlib.Path(__file__).resolve().parent; dep=exp.parents[1]; lock=json.loads((exp/'upstreams.lock.json').read_text())['sources']['vllm']; src=a.destination.resolve(); commands=[]
-log=(exp/'runs/source-replay.txt').open('w')
+p=argparse.ArgumentParser(); p.add_argument('--cache',type=pathlib.Path,required=True); p.add_argument('--destination',type=pathlib.Path,required=True); p.add_argument('--variant',choices=('row-ladder','shape-union')); p.add_argument('--out',type=pathlib.Path,required=True); a=p.parse_args()
+exp=pathlib.Path(__file__).resolve().parent; dep=exp.parents[1]; model=exp/'variants'/a.variant if a.variant else exp; out=a.out.resolve(); out.mkdir(parents=True,exist_ok=False); lock=json.loads((model/'upstreams.lock.json').read_text())['sources']['vllm']; src=a.destination.resolve(); commands=[]
+log=(out/'source-replay.txt').open('w')
 def run(args):
  args=list(map(str,args)); commands.append(args); subprocess.run(args,check=True,stdout=log,stderr=subprocess.STDOUT)
 def rev(ref): return subprocess.check_output(['git','-C',str(src),'rev-parse',ref],text=True).strip()
@@ -17,6 +17,6 @@ try:
  assert rev('HEAD')==lock['patch_head']; assert rev('HEAD^{tree}')==lock['expected_tree']
  run(['git','-C',src,'diff','--check',lock['revision'],'HEAD'])
  result={'patch_count':len(paths),'head':rev('HEAD'),'tree':rev('HEAD^{tree}'),'base_reproduced':True,'passed':True}
- (exp/'runs/source-replay.json').write_text(json.dumps(result,indent=2)+'\n'); print(json.dumps(result))
+ (out/'source-replay.json').write_text(json.dumps(result,indent=2)+'\n'); print(json.dumps(result))
 finally:
- (exp/'runs/source-replay-commands.json').write_text(json.dumps(commands,indent=2)+'\n')
+ (out/'source-replay-commands.json').write_text(json.dumps(commands,indent=2)+'\n')

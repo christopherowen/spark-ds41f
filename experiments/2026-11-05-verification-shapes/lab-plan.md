@@ -22,9 +22,9 @@ norm-kernel request.
    live inputs and compare exact live results with independent eager references.
    If the separate MXFP8 investigation exposes a pre-existing tail read, stop
    qualification and record it; do not combine fixes without a new experiment.
-3. Only after those gates, request explicit authorization for the coordinated
-   three-node sync, stops, starts, repeat boot, and restoration. Resolve this
-   experiment's published deployment commit; all three nodes must be clean and
+3. The owner has authorized the coordinated three-node sync, stops, starts,
+   repeat boot and restoration needed for these tests. After the image gates and
+   exclusive window handoff, resolve this experiment's published deployment commit; all three nodes must be clean and
    detached at that exact commit. Distribute one verified image digest to all
    ranks. Use the normal shared window and watchdog. Inspect each plan's `live:`
    and `shape:` lines; never pass `--change-shape` to bypass a refusal.
@@ -57,11 +57,13 @@ norm-kernel request.
    reference. Report each workload's two-boot results and confidence intervals,
    acceptance/verified rows, actual target/context padded rows, memory, and any
    regression. Do not average away a failing cell or infer speed from row counts.
-   Restore the profile recorded by the current window once, then verify every
-   rank and live doctor before releasing the hold. The previous window recorded
+   Record the original deployment commit and restore profile before moving any
+   checkout. Restore both through coordinated sync/start commands, then verify
+   every rank and live doctor before releasing the hold. The previous window recorded
    candidate-36 TP3 development; re-read its authority before any restoration.
 
-The following commands are plans until `--apply` is explicitly authorized:
+The following commands print plans. The owner authorized their test operations;
+apply only in this task's exclusively held window after checking `live:`/`shape:`:
 
 ```sh
 bin/spark --cluster-config experiments/2026-11-05-verification-shapes/tp3-dev.json cluster sync --revision <published-experiment-commit>
@@ -75,3 +77,17 @@ Acceptance requires exact outputs, no unwritten or invalid accesses, a fitting
 memory budget on every rank, and a repeatable useful improvement beyond the
 recorded noise. Otherwise retain the unfavorable evidence and leave the source
 PR unadopted. No merge, baseline rewrite, or promotion is authorized by this plan.
+
+## Published branch and exclusive ownership
+
+The root experiment profile restricts `deployment.branch` to
+`feat/verification-shapes`; both alternative profiles inherit it. The existing
+coordinated CLI accepts `cluster sync --revision <exact published commit>` for
+that branch. No merge is needed to test it. Open the window through the normal
+published-main and idle guards, then execute the branch test from a separate
+clean checkout. Do not use the continuous main-only queue during this window.
+Check the exact holder and window ID before every mutation; the lab helper's
+shared `spark-lab` prefix is insufficient to identify this task. Keep its
+heartbeat and watchdog active. The watchdog does not restore a deployment
+checkout revision, so successful closure additionally requires explicitly
+restoring the recorded commit before releasing the hold.
