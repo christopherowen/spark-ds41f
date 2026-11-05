@@ -1,0 +1,189 @@
+W1105 22:26:16.711000 7 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+FEFEFEFEFF.FFFFFFFE                                                      [100%]
+==================================== ERRORS ====================================
+_ ERROR at teardown of test_outer_cancellation_waits_for_both_children[False] __
+/work/test_api_cancellation.py:45: in no_orphan_tasks
+    assert not leaked, [t.get_coro().__qualname__ for t in leaked]
+E   AssertionError: ['listen_for_disconnect']
+E   assert not [<Task cancelled name='Task-5' coro=<listen_for_disconnect() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:36>>]
+__ ERROR at teardown of test_outer_cancellation_waits_for_both_children[True] __
+/work/test_api_cancellation.py:45: in no_orphan_tasks
+    assert not leaked, [t.get_coro().__qualname__ for t in leaked]
+E   AssertionError: ['listen_for_disconnect']
+E   assert not [<Task cancelled name='Task-14' coro=<listen_for_disconnect() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:36>>]
+____ ERROR at teardown of test_disconnect_waits_for_abort_before_returning _____
+/work/test_api_cancellation.py:45: in no_orphan_tasks
+    assert not leaked, [t.get_coro().__qualname__ for t in leaked]
+E   AssertionError: ['test_disconnect_waits_for_abort_before_returning.<locals>.handle']
+E   assert not [<Task cancelled name='Task-22' coro=<test_disconnect_waits_for_abort_before_returning.<locals>.handle() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:101>>]
+______ ERROR at teardown of test_cancellation_scope_allows_async_cleanup _______
+/work/test_api_cancellation.py:45: in no_orphan_tasks
+    assert not leaked, [t.get_coro().__qualname__ for t in leaked]
+E   AssertionError: ['listen_for_disconnect']
+E   assert not [<Task cancelled name='Task-31' coro=<listen_for_disconnect() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:36>>]
+_ ERROR at teardown of test_four_long_requests_short_traffic_and_immediate_retry _
+/work/test_api_cancellation.py:45: in no_orphan_tasks
+    assert not leaked, [t.get_coro().__qualname__ for t in leaked]
+E   AssertionError: ['listen_for_disconnect', 'test_four_long_requests_short_traffic_and_immediate_retry.<locals>.handle', 'listen_for_disconnect', 'test_four_long_requests_short_traffic_and_immediate_retry.<locals>.handle']
+E   assert not [<Task cancelled name='Task-112' coro=<listen_for_disconnect() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/e...try.<locals>.handle() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:101>>]
+=================================== FAILURES ===================================
+____________ test_outer_cancellation_waits_for_both_children[False] ____________
+/work/test_api_cancellation.py:70: in test_outer_cancellation_waits_for_both_children
+    assert closed.is_set()
+E   assert False
+E    +  where False = is_set()
+E    +    where is_set = <asyncio.locks.Event object at 0xe9ce1e663cb0 [unset]>.is_set
+____________ test_outer_cancellation_waits_for_both_children[True] _____________
+/work/test_api_cancellation.py:70: in test_outer_cancellation_waits_for_both_children
+    assert closed.is_set()
+E   assert False
+E    +  where False = is_set()
+E    +    where is_set = <asyncio.locks.Event object at 0xe9ce1e66d340 [unset]>.is_set
+_______________ test_disconnect_waits_for_abort_before_returning _______________
+/work/test_api_cancellation.py:94: in test_disconnect_waits_for_abort_before_returning
+    assert not task.done()
+E   AssertionError: assert not True
+E    +  where True = <built-in method done of _asyncio.Task object at 0xe9ce1e43f340>()
+E    +    where <built-in method done of _asyncio.Task object at 0xe9ce1e43f340> = <Task finished name='Task-21' coro=<test_disconnect_waits_for_abort_before_returning.<locals>.handle() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:75> result=None>.done
+_________________ test_cancellation_scope_allows_async_cleanup _________________
+/work/test_api_cancellation.py:120: in test_cancellation_scope_allows_async_cleanup
+    assert closed.is_set()
+E   assert False
+E    +  where False = is_set()
+E    +    where is_set = <asyncio.locks.Event object at 0xe9ce1e66f4a0 [unset]>.is_set
+______________ test_listener_error_propagates_and_cleans_handler _______________
+/work/test_api_cancellation.py:143: in test_listener_error_propagates_and_cleans_handler
+    with pytest.raises(OSError, match='receive failed'):
+E   Failed: DID NOT RAISE OSError
+------------------------------ Captured log call -------------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-39' coro=<listen_for_disconnect() done, defined at /opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:36> exception=OSError('receive failed')>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py", line 39, in listen_for_disconnect
+    message = await request.receive()
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/test_api_cancellation.py", line 132, in receive
+    raise OSError('receive failed')
+OSError: receive failed
+_________________________ test_handler_error_preserved _________________________
+/work/test_api_cancellation.py:162: in test_handler_error_preserved
+    assert request.listener_closed.is_set()
+E   assert False
+E    +  where False = is_set()
+E    +    where is_set = <asyncio.locks.Event object at 0xe9ce1e695250 [unset]>.is_set
+E    +      where <asyncio.locks.Event object at 0xe9ce1e695250 [unset]> = <test_api_cancellation.Request object at 0xe9ce1e695040>.listener_closed
+_________ test_response_handoff_keeps_background_and_bytes[False-none] _________
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e696840>.app
+________ test_response_handoff_keeps_background_and_bytes[False-single] ________
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e6cfb30>.app
+_______ test_response_handoff_keeps_background_and_bytes[False-multiple] _______
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e6654c0>.app
+_________ test_response_handoff_keeps_background_and_bytes[True-none] __________
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e696810>.app
+________ test_response_handoff_keeps_background_and_bytes[True-single] _________
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e695070>.app
+_______ test_response_handoff_keeps_background_and_bytes[True-multiple] ________
+/work/test_api_cancellation.py:219: in test_response_handoff_keeps_background_and_bytes
+    assert request.app.state.server_load_metrics == 1
+E   assert 0 == 1
+E    +  where 0 = namespace(enable_server_load_tracking=True, server_load_metrics=0).server_load_metrics
+E    +    where namespace(enable_server_load_tracking=True, server_load_metrics=0) = namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)).state
+E    +      where namespace(state=namespace(enable_server_load_tracking=True, server_load_metrics=0)) = <test_api_cancellation.Request object at 0xe9ce1e697e60>.app
+__________ test_four_long_requests_short_traffic_and_immediate_retry ___________
+/work/test_api_cancellation.py:272: in test_four_long_requests_short_traffic_and_immediate_retry
+    assert not active and not retained
+E   assert (not {0, 1})
+=============================== warnings summary ===============================
+test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[True]
+  /usr/local/lib/python3.12/dist-packages/_pytest/unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <coroutine object test_outer_cancellation_waits_for_both_children.<locals>.handle at 0xe9ce1e4c2740>
+  
+  Traceback (most recent call last):
+    File "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py", line 111, in wrapper
+      return await func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  RuntimeError: coroutine ignored GeneratorExit
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+test_api_cancellation.py::test_disconnect_waits_for_abort_before_returning
+  /usr/local/lib/python3.12/dist-packages/_pytest/unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <coroutine object test_outer_cancellation_waits_for_both_children.<locals>.handle at 0xe9ce1e3dd540>
+  
+  Traceback (most recent call last):
+    File "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py", line 119, in wrapper
+      response = await func(*args, **kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  RuntimeError: coroutine ignored GeneratorExit
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+test_api_cancellation.py::test_listener_error_propagates_and_cleans_handler
+  /usr/local/lib/python3.12/dist-packages/_pytest/unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <coroutine object test_cancellation_scope_allows_async_cleanup.<locals>.handle at 0xe9ce1e3de240>
+  
+  Traceback (most recent call last):
+    File "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py", line 119, in wrapper
+      response = await func(*args, **kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  RuntimeError: coroutine ignored GeneratorExit
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+../usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:469
+  /usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:469: PytestCacheWarning: could not create cache path /work/.pytest_cache/v/cache/nodeids: [Errno 30] Read-only file system: '/work/pytest-cache-files-j_3you6j'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+../usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:423
+  /usr/local/lib/python3.12/dist-packages/_pytest/cacheprovider.py:423: PytestCacheWarning: could not create cache path /work/.pytest_cache/v/cache/lastfailed: [Errno 30] Read-only file system: '/work/pytest-cache-files-a6efvzsu'
+    config.cache.set("cache/lastfailed", self.lastfailed)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../work/test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[False]
+FAILED ../work/test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[True]
+FAILED ../work/test_api_cancellation.py::test_disconnect_waits_for_abort_before_returning
+FAILED ../work/test_api_cancellation.py::test_cancellation_scope_allows_async_cleanup
+FAILED ../work/test_api_cancellation.py::test_listener_error_propagates_and_cleans_handler
+FAILED ../work/test_api_cancellation.py::test_handler_error_preserved - asser...
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[False-none]
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[False-single]
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[False-multiple]
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[True-none]
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[True-single]
+FAILED ../work/test_api_cancellation.py::test_response_handoff_keeps_background_and_bytes[True-multiple]
+FAILED ../work/test_api_cancellation.py::test_four_long_requests_short_traffic_and_immediate_retry
+ERROR ../work/test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[False]
+ERROR ../work/test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[True]
+ERROR ../work/test_api_cancellation.py::test_disconnect_waits_for_abort_before_returning
+ERROR ../work/test_api_cancellation.py::test_cancellation_scope_allows_async_cleanup
+ERROR ../work/test_api_cancellation.py::test_four_long_requests_short_traffic_and_immediate_retry
+13 failed, 1 passed, 5 warnings, 5 errors in 0.27s
