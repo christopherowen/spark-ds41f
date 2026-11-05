@@ -23,3 +23,15 @@ native fallback declarations/admission must remain present. Full model startup,
 CUDA graph, independent answer, repeated-boot request and admission gates remain
 required. This experiment changes the generation route only; neither the exact
 fusion/maintenance changes nor a larger budget is added simultaneously.
+
+Source `f5820da9` passes72 graph routes across all12 frozen captured batches,
+rows1/8/64 and prefill/decode modes. Each graph replays its original visible
+extent, an empty extent and the restored extent, matching the expected existing
+plan's keys and source handoff exactly. Initialization checking reports zero
+errors. These are captured prefill operands used to test dispatch/graph
+correctness, not actual decode-query or request-speed evidence. Workspace is
+preallocated outside capture; the test performs reference work only out of band.
+The ten-patch fresh source application equals the host overlay. All evidence and
+memory observations remain in `runs/graph-01`. The sp8 lease releases
+at21:51:31 UTC; independent verification finds no reservations, containers or
+compute processes. The model recipe remains unqualified and unpromoted.
