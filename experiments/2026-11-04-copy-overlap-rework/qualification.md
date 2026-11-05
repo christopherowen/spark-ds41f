@@ -123,6 +123,22 @@ operator files and hashes are retained in
 state only; serving metrics are collected and analyzed locally after both boots
 and independent final C36 restoration verification.
 
+The native functional phase ended at 08:35:32 UTC with all 40 ordered script
+outcomes zero. Performance then began. At 09:18:49 UTC the first release suite
+had eight completed steps, all zero; its large-prefill step and the remaining
+suites/repeat were unfinished. This is not a whole-round performance result or
+a replacement for the final local semantic audit.
+
+The original local observer stopped after an SSH timeout. Its last successful
+snapshot was 08:32:27 UTC; the failure output has no exact timestamp. Four
+bounded read-only SSH checks succeeded by 09:14:57 UTC. The native controller,
+supervisor and same window continued, with fresh heartbeat and no reported
+management-loss latch in the compact 09:15 and 09:18 receipts. No network,
+hardware, source, serving or controller change was made. The cause remains
+unproven; preserve `operator-monitoring-timeout-review.json` and audit final
+native guards/telemetry. A new read-only observer (session 78860) follows the
+existing execution; it does not resume or repeat any native phase.
+
 An earlier operator command failed local Python parsing before any SSH/native
 controller action; absence checks and the original error record are retained.
 The corrected transport locally parsed both supervisor and remote program before
