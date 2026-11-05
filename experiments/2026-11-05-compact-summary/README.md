@@ -2,7 +2,7 @@
 
 Base `dd579b47`, C36 image and the existing captured operands. This out-of-band
 screen tests the interaction of MXFP4-encoded block8 means and the native MXFP4
-score kernel at a 32-key tile. The current serving candidate remains unchanged.
+score kernel at a 16/32-key tile for native page128/256. The current serving candidate remains unchanged.
 The hypothesis is that removing repeated BF16 query expansion and using compact
 mean operands can reduce the measured coarse-scoring bottleneck. Precision may
 change selected keys; independently graded final answers remain mandatory.
@@ -21,3 +21,10 @@ precision drift and native-top512 coverage remain diagnostics, not quality proof
 Only CUDA graph scorer replay is in score timers. Raw operands remain private
 on sp8; no activations, reference calls or comparisons enter serving. All errors,
 samples, allocator observations and lease releases must remain in `runs/`.
+
+The first attempt at `fc0e0698` stops before any scorer compilation or timing:
+its input assertion incorrectly assumes page256, while the first saved capture
+uses page128. Original logs, input/source identity and release remain retained
+in `runs/screen-01`. The probe now derives its tile from the native page geometry;
+neither captured operands nor outcome-independent selection changes. The retry
+uses a new result path and must still establish scorer feasibility.

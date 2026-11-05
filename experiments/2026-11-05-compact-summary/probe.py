@@ -35,7 +35,7 @@ def main():
         assert sha(path)==replay['files'][path.name]['sha256']
         data=torch.load(path,map_location='cpu',weights_only=True)
         page,width=data['page_size'],data['width'];small=page//8;n=width//8
-        assert small==32,'this predeclared tile probe covers page256 captures'
+        assert small in (16,32),'native page128/256 captures required'
         pool=torch.zeros(len(data['pool']),page*100+128,dtype=torch.uint8,device='cuda')[:,:page*100]
         pool[:,:page*68].copy_(data['pool'])
         complete=[i for i,count in enumerate(data['layout']['written_prefixes']) if count==page]
@@ -61,7 +61,7 @@ def main():
             scores={k:torch.empty(rows,n,dtype=torch.bfloat16,device='cuda') for k in ('bf16','fp4','oracle')}
             counts=torch.empty(rows,dtype=torch.int32,device='cuda')
             unpack=prepare_queries(width,page,budget);bf16=prepared_scores(width,page,budget)
-            compact=indexer_score_v41(n,small,block_P=32)
+            compact=indexer_score_v41(n,small,block_P=small)
             def baseline():
                 unpack(q.view(torch.uint8),scales.view(torch.uint8).reshape(rows,32,4),lengths,active,decoded)
                 bf16(decoded,scales.view(torch.uint8).reshape(rows,32,4),weights,means,table,lengths,active,scores['bf16'],counts)
