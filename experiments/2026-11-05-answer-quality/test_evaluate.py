@@ -9,6 +9,7 @@ from unittest.mock import patch
 import evaluate
 from prepare import select
 from summarize import paired
+from code_quality import final_code
 
 
 class Response:
@@ -49,6 +50,12 @@ class AnswerTests(unittest.TestCase):
     def test_no_fuzzy_guess_for_missing_answer_format(self):
         row=self.run_case('I discussed the possibilities.')
         self.assertFalse(row['correct']);self.assertEqual(row['status'],'unparsed-final')
+
+    def test_code_grader_uses_one_unambiguous_final_program(self):
+        self.assertEqual(final_code('Here is the solution:\n```python\ndef f(): return 1\n```'),'def f(): return 1')
+        self.assertEqual(final_code('def f(): return 1'),'def f(): return 1')
+        self.assertIsNone(final_code('```python\ndef f(): return 1\n```\n```python\ndef f(): return 2\n```'))
+        self.assertIsNone(final_code(None))
 
     def test_superiority_counts_only_independent_task_wins_and_losses(self):
         native=[{'id':str(i),'prompt_sha256':str(i),'expected':'A','correct':False} for i in range(5)]

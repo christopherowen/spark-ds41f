@@ -121,3 +121,15 @@ centroid selection plus required dense-summary maintenance; source/reindex
 selection remains native. Budget 65,536 is shared by both arms. The prior
 aggressive, lower-budget cohort is not a performance or quality comparator for
 this window. This is a new pilot operating point, not held-out confirmation.
+
+HumanEvalPlus preparation is separate from inference. `evalplus.lock.json` pins
+v0.1.10, the official checker source archive and all 164 tasks before any coding
+model output. `code_quality.py prepare` verifies the dataset/source hashes and
+exports the standard instruction prompts; `grade` uses the official base and
+plus executable checks on a single completed final program. One Python code
+fence or a plain script is accepted; ambiguous multiple blocks remain unparsed.
+No program is recovered from reasoning. Run grading only in a CPU container with
+no GPU, no network, a read-only root/source/inputs, a temporary work directory,
+limited CPU/memory/processes and host UID/GID. Canonical solutions provide the
+independent expected outputs. Short coding prompts are a regression check and do
+not demonstrate long-context LSA quality gains. No coding model result is claimed.
