@@ -23,9 +23,9 @@ partial/aliased pages, skipped startup, explicit caller identity and overwrite
 refusal. Full native replay must validate every captured row before fitting.
 
 This profile is untimed: copies and synchronization perturb execution. Never
-mount this capture hook in a timed LSA or native control profile. No capture run,
-performance result or quality improvement is claimed. A future collection must
-use the authorized, reserved all-node window and restore C37 after its jobs.
+mount this capture hook in a timed LSA or native control profile. Collection uses
+the authorized, reserved all-node window and restores C37 after its jobs. The
+completed collection below establishes no performance or quality improvement.
 
 Preparation applies the scratch guard and this experiment's ordered patch in a
 fresh named C36 tree; all three overlays match byte-for-byte and `diff --check`
@@ -51,14 +51,14 @@ cohorts before capture. It uses no benchmark questions. The original file hashes
 actual tokenizer counts, exact commit and every response/capture identity are
 recorded; prompts, responses and tensors stay private on the nodes. Replicated
 ranks are mechanical checks, not independent training examples: use rank 0 for a
-fit and keep document-level validation separate. Collection is not yet run.
+fit and keep document-level validation separate.
 
-Future collection command, from the clean published sp5 controller checkout
-after the current answer-quality window restores C37 and releases all nodes:
+Successful collection command, from the clean published sp5 controller checkout
+at `8d1a73108628e81fce673666c6d19368cbac4477`:
 
 ```sh
 python3 experiments/2026-11-05-selector-fitting/collect.py \
-  --out /home/chris/spark-lab/results/selector-fitting/capture-01
+  --out /home/chris/spark-lab/results/selector-fitting/capture-02
 ```
 
 The runner performs all-node preflight, a quiet-service guard, exclusive native
@@ -126,7 +126,7 @@ handoff blocks, refusing padding/unsorted IDs as matches. Per-query values are
 reported, with independent document count one; replicated ranks and adjacent
 rows do not inflate N. Compact-address proxy execution has no timing claim and
 does not replace native geometry replay or completed-answer evaluation. No
-actual retention result is available before collection and fitting.
+actual retention result is available before native replay and fitting.
 
 The first actual collection launch (`runs/capture-01`) fails before any model
 request or operand capture: its arming program reads JSON from stdin, while the
@@ -138,3 +138,13 @@ contract through arm/disarm/overwrite refusal and 12-file manifest hashing. A
 file-handle warning found by the test is fixed with scoped reads; the test passes
 with resource warnings treated as errors. The next attempt keeps native model
 arithmetic and the same disjoint documents unchanged.
+
+The corrected collection succeeds in `runs/capture-02`: three untimed documents
+at 122,789, 131,180 and 126,023 actual prompt tokens, respectively. Each rank
+saves 12 batches (three documents by four layers), with 64 eligible query rows
+per batch. All 36 file sizes and SHA-256 identities are retained; raw operands
+remain node-local. Rank-0 inputs are copied directly to sp8 for exact native
+replay before fitting. The controller restores C37 at 12:15:01 UTC; an independent
+all-node check at 12:16:24 verifies the expected image, clean matching checkouts,
+no experimental mounts/environment, and no remaining reservations. No capture
+request is a completed-answer benchmark. The earlier failure remains preserved.
