@@ -35,7 +35,10 @@ norm-kernel request.
    thermal/cooling evidence, per-rank startup free memory, and graph capture-pool
    high-water marks. Confirm no request changes output when batched with other
    requests, including copy and non-copy requests together.
-5. On both candidate boots, also measure the repaired full-depth request counts
+5. First screen the native-row-only and union alternatives in `alternatives.md`
+   against this proposal, one capture policy per candidate. Include an every-row
+   ladder if measured graph memory permits. Preserve each result. On both
+   candidate boots, also measure the repaired full-depth request counts
    3/5/6/7 and the exact 16/32/64/96/128 kernel boundaries with the same workload
    and seed. These isolate the mechanism; aggregate c1/c8 results alone do not.
    Run c1/c8/c16 client load with the bench's default cooling guard and 95% CI:

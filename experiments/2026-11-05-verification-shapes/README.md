@@ -130,3 +130,8 @@ and coordinated boot/repeat sequence. The added graph captures need a measured
 memory budget, exact outputs under mixed batches, and performance beyond the
 recorded noise. c1/c8/c16 alone do not isolate the repaired 3/5/6/7-request full-
 depth cases, so those boundary cases are included in the plan too.
+
+The follow-up [alternatives audit](alternatives.md) compares eight capture policies
+and bounds the matrix-tile savings of this proposal at zero for four representative
+wide dense projections. Native-row-only and union ladders remain credible
+competitors. The source PR is a coverage repair, not a proved hardware winner.
