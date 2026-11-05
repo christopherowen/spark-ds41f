@@ -73,12 +73,23 @@ def prepare_queries(width:int,page:int,budget:int):
 
 import torch
 from vllm.models.deepseek_v4_1.tilelang import prepare
-from vllm.models.deepseek_v4_1.tilelang.block_shortlist import BlockMeanShortlistPlan
+from vllm.models.deepseek_v4_1.tilelang.block_shortlist import BlockMeanShortlistPlan,block_candidates
+from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerTopK,IndexerV41Plan,CANDIDATE_BLOCKS,CANDIDATE_BLOCK
+from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import remap_blocks
 
 
 class QueryReusePlan(BlockMeanShortlistPlan):
     def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=256):
-        super().__init__(width,page,candidate_blocks=candidate_blocks,budget=budget,row_cap=row_cap)
+        self.width,self.page,self.source,self.row_cap = width,page,candidate_blocks,row_cap
+        self.budget = budget or (512 if candidate_blocks else 64)
+        self.block_budget = self.budget*8
+        self.capacity = (self.budget+8)*64
+        self.coarse = IndexerTopK(width//8,self.block_budget)
+        self.assemble = block_candidates(width,page,self.block_budget)
+        self.final = IndexerV41Plan(self.capacity,page,candidates=True)
+        if self.source:
+            self.select_blocks = IndexerTopK(self.capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK)
+            self.remap = remap_blocks(self.capacity)
         self.unpack = prepare_queries(width,page,self.block_budget)
         self.prepared_score = prepared_scores(width,page,self.block_budget)
         self.score = self._score_reused
