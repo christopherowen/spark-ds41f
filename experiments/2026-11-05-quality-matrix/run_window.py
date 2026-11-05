@@ -154,6 +154,19 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
         w.run(w.spark('restore','cluster','sync','--revision',commit),out,'sync-plan')
         w.run(w.spark('restore','cluster','sync','--revision',commit,'--apply'),out,'sync-apply')
         w.run(w.spark('restore','doctor','--live'),out,'preflight-live')
+        if args.benchmark=='code':
+            # Exercise every official canonical program before grading model output.
+            # This CPU-only job runs before any timed serving arm.
+            sys.path.insert(0,str(HERE.parent/'2026-11-05-answer-quality'))
+            from code_quality import LOCK,inputs
+            cases=inputs(args.cache);oracle=private/'canonical'
+            oracle.mkdir(mode=0o700,parents=True)
+            with (oracle/'samples.jsonl').open('x') as stream:
+                for identity in LOCK['protocol']['task_ids']:
+                    case=cases[identity]
+                    stream.write(json.dumps({'id':identity,'content':case['prompt']+case['canonical_solution'],'finish_reason':'stop'})+'\n')
+            canonical=grade(args.cache,oracle,out,'oracle')
+            assert canonical['complete'] and all(r['correct'] for r in canonical['records']),'official canonical-program check failed; no model comparison is eligible'
         generations={};grades={}
         for label,profile in [('native-a','native'),('lsa-a','candidate'),('lsa-b','candidate'),('native-b','native')]:
             assert w.owns(token) and not errors

@@ -20,6 +20,8 @@ thinking and 65536 generated tokens. Reasoning and failed requests count in
 generation wall time. Grading is a separate CPU-only container job after each
 arm: pinned official base and plus tests, no network/GPU, read-only code/cache/
 samples, no capabilities, no privilege escalation, 2 CPUs, 4 GiB and 64 processes.
+Before timed model requests, the same isolated checker must accept all 164
+official canonical programs. This is oracle validation, not a model result.
 Programs, full responses and reasoning remain private on the node, outside Git.
 Only hashes, counters, timing and executable-test verdicts are public. Grading
 time is separately recorded; it is not a serving-implementation operation.
