@@ -106,3 +106,17 @@ are not evidence of zero GPU memory use. The lease releases at 14:31:57 UTC with
 no remaining containers, and the next reader observes the foreign holder's new
 lease rather than any retained LSA reservation. These checks qualify mechanics,
 not final-answer quality or speed.
+
+
+Both component timing processes pass mechanically but **fail the speed gate**.
+They take 11.95 and 11.61 seconds, starting at 47/51 C and ending at 51/52 C,
+with no active hardware thermal slowdown at the end. All twelve measured shapes
+are slower: native/candidate ratios are 0.50–0.71, or roughly 1.4–2.0x candidate
+latency. Exact event samples, both processes, memory and small-sample t intervals
+remain in `runs/component-01/comparison.json`. Allocator peaks are approximately
+349 MB allocated and 373 MB reserved, not full-model memory. Page-completion
+maintenance is measured separately and does not explain these query-only losses.
+This representation will not advance unchanged to serving. The next diagnostic
+profiles the stages after complete-plan timing; it changes no runtime arithmetic
+or selection. Released at 14:34:32 UTC, independently observed under the next
+foreign holder at 14:35.
