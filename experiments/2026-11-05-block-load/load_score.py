@@ -4,6 +4,7 @@
 import tilelang
 import tilelang.language as T
 from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import decode
+from vllm.models.deepseek_v4_1.tilelang.block_shortlist import STATE_BYTES
 
 @tilelang.jit
 def block_scores(width: int, page: int, budget: int, block_c: int = 64):
