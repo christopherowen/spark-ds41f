@@ -32,7 +32,7 @@ The scale image is built and its initial gates/restoration are recorded in
 `expert-scales/initial-gate-results.json`. The corrected full gate, complete
 unmatched primary, original operator launch failure, exact model comparison and
 restoration are retained in `expert-scales/first-primary-results.json` and its
-110 original/analysis archives. The original supervisor failed before launching
+114 original/analysis archives. The original supervisor failed before launching
 a controller; the corrected supervisor records the actual child exit. The later
 controller exit 1 records the deliberate window handoff, rather than a model or
 hardware failure. No missing companion, repeat or functional result is a pass.
@@ -203,6 +203,10 @@ prefill points and samples match at 32,768, 131,072 and 262,144 tokens. The nati
 repeat has a 500,000-token point, which cannot supply a repeat for the published
 524,288- or 1,000,000-token workloads. Those reference-repeat gaps remain explicit.
 No published baseline is edited and no released image is measured again.
+The published long-prefill extension lacks independent all-rank identity and
+condition records, and its outer duration remains the original run's duration.
+Retain actual prompt-token mismatch warnings and compare per-size observations;
+nominal sizes alone do not establish identical work or a promotion-grade gain.
 
 The saved C36 screen has one boot and uses the newer token-ID/empty-delta progress
 collector. Its client throughput, TTFT, TPOT and event gaps are not a matched

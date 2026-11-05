@@ -222,6 +222,6 @@ An offline comparison with the recorded 1030 model report matches all 256
 generated sequences and 65,536 returned score vectors exactly. The controller
 honored the queued collector handoff after that primary, restored C36 and exited
 1; it did not run companions, a repeat boot or the remaining functional checks.
-`expert-scales/first-primary-results.json` indexes 110 lossless archives, including
+`expert-scales/first-primary-results.json` indexes 114 lossless archives, including
 the native tests, complete primary, original launch error and restoration receipt.
 This is neither a matched performance result nor release qualification.
