@@ -99,6 +99,11 @@ changes; the serving image, row bytes and consumer arithmetic are unchanged.
 Native CPU-only I/O and FD permission controls on every configured rank must pass
 in an owned idle window before the unbuilt Engram arm starts GPU work. They remain
 pending; the source correction alone is not native qualification.
+The published engram/observer_control.py checks the exact serving PID set, all
+I/O counters and each process's FD metadata in a root/IPC_LOCK CPU peer, while
+requiring the same serving image, container identity and start time afterwards.
+It saves bounded raw commands and failures under private results. Run it in the
+owned idle window before any image build; it issues no model requests.
 
 ## Operations
 
