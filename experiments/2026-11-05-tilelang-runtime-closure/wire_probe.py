@@ -48,5 +48,6 @@ for dtype in (torch.int32, torch.int64):
                     kernels=kernels, aten_kernels=[name for name in kernels if "at::native" in name],
                     memory=[e["name"] for e in events if str(e.get("cat", "")).startswith("gpu_mem")],
                     trace_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+                assert not rows[-1]["aten_kernels"], (label, rows[-1]["aten_kernels"])
                 print(label, rows[-1]["aten_kernels"], flush=True)
                 (args.out / "result.json").write_text(json.dumps(dict(cases=rows), indent=2) + "\n")

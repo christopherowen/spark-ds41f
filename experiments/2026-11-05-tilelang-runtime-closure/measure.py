@@ -13,8 +13,8 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire"))
-parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
+parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer"))
+parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
 parser.add_argument("--case-filter", type=Path)
@@ -63,9 +63,9 @@ if args.operation == "tests":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     raise SystemExit(code)
 
-if args.operation in ("copy_screen", "wire"):
+if args.operation in ("copy_screen", "wire", "transfer"):
     import runpy
-    script = HERE / ("copy_screen.py" if args.operation == "copy_screen" else "wire_probe.py")
+    script = HERE / ("copy_screen.py" if args.operation == "copy_screen" else "wire_probe.py" if args.operation == "wire" else "transfer_bench.py")
     sys.argv = [str(script), "--out", str(args.out)]
     runpy.run_path(str(script), run_name="__main__")
     raise SystemExit(0)
@@ -339,7 +339,7 @@ if args.family in ("gather", "all"):
                      expected, dict(world=3, shape=[count, 15],
                                     reference="same TensorIterator copy as movedim reshape, shared output"))
 
-if args.family in ("prompt", "all"):
+if args.family in ("prompt", "wire", "all"):
     from vllm.v1.worker.gpu.sample.prompt_logprob import compute_prompt_logprobs_with_chunking as prompt_scores
 
     spec = importlib.util.spec_from_file_location("previous_prompt", HERE / "control/prompt_logprob.py")

@@ -169,3 +169,19 @@ ID widths, dense and strided IDs, zero/five alternatives and both score modes.
 This checks whether an apparently copy-free GPU result adds a packing kernel
 when it leaves the GPU. Its result is pending; no assumption about that path is
 used to claim complete coverage.
+
+## Wire and tiny-tail follow-up
+
+Both wire boots reproduce the ATen pack for strided, zero-alternative IDs in
+both ID widths and score modes. `0012` transfers the bounded physical column
+span through PyTorch's existing asynchronous DMA path, then preserves the view
+on CPU. No raw host pointer, untracked allocator lifetime or device packing
+buffer is introduced. The extra transferred holes are explicit in the complete
+host-call/stream-wait benchmark; its performance must qualify independently.
+Dense IDs and multi-column results retain their ordinary transfer.
+
+The one-block tiny-tail variant remains unresolved. `0013` tests a warp per
+rank/row, eliminating all division in those at-most-128-word tails. Larger tails
+retain their already measured program. All 598 patches apply in the fresh
+prepared tree and reproduce `446dd388e525ae96c0c90c33350e5802b29ddd7e`.
+Both full prompt confidence extensions pass, including their pooled bounds.
