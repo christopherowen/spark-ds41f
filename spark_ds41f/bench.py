@@ -2028,6 +2028,7 @@ def serve_arg(cluster: dict, flag: str) -> str | None:
 
 
 def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Path) -> dict:
+    from servebench.client import stream_policy
     name = cluster["container"]["name"]
     images = {}
     inspection_problems = []
@@ -2043,6 +2044,7 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
         "client_commit": repository_revision(),
         "client_dirty": bool(repository_dirty()),
         "client_host": socket.gethostname(),
+        "client_stream_policy": stream_policy(),
         "nodes": {},
     }
     for node in nodes["nodes"]:

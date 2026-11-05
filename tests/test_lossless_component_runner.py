@@ -461,6 +461,7 @@ class ComponentTests(unittest.TestCase):
         index = {"suite": definition, "suite_sha256": runner.suite.digest(definition), "finished_utc": "done",
                  "steps": [{"id": "c1", "command": "run", "exit": 0}], "metadata": {"identity": {
                   "live_problems": [], "client_dirty": False, "client_commit": "commit", "cluster_config": "config",
+                  "client_stream_policy": runner.STREAM_POLICY,
                   "nodes": {node: {"image_id": self.image["Id"], "checkout": "commit",
                             "image_layers": self.image["Layers"], "container_started_at": "boot"} for node in self.images}}}}
         conditions = {"halted": None, "fan_stop_failures": [],
@@ -474,6 +475,10 @@ class ComponentTests(unittest.TestCase):
             self.write(directory / "conditions.json", conditions)
             return runner.native_suite_gate(directory, definition, "config", "commit", self.images)
         self.assertEqual(set(check()), set(self.images))
+        index["metadata"]["identity"]["client_stream_policy"] = "current"
+        with self.assertRaises(ValueError):
+            check()
+        index["metadata"]["identity"]["client_stream_policy"] = runner.STREAM_POLICY
         index["steps"][0]["exit"] = 1
         with self.assertRaises(ValueError):
             check()
