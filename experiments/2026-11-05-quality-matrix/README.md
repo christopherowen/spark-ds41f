@@ -164,3 +164,22 @@ seconds (about4.3% lower); decode totals302.35 versus122.38, but decode seconds
 per generated token are about10.3% higher for LSA. These are single-arm
 post-request counters from a quality-rejected run, not a performance qualification
 or proof of faster token generation. All unsuccessful time remains charged.
+
+`--controls-from` can reuse a published complete Native A/B pair from the same
+UTC day for LongBench or RULER. It requires the same benchmark, split, stage,
+four-node map, runtime/profile/lock/mounted native source bytes, client, metrics
+and measurement wrapper. Both recorded native boots must complete naturally,
+repeat the same answer decisions/scores, pass conditions and have a successful
+restoration. Every copied receipt remains byte-identical with source hashes and
+original timestamps; reports explicitly identify historical controls rather than
+claiming new interleaved native boots. Every candidate still receives two fresh
+boots and the same per-case no-loss gate. Coding reuse is unsupported and keeps
+fresh canonical validation and controls.
+
+The first real read-only preflight against the older compact LongBench controls
+rejects them because `measure.py` changed when RULER stage selection was added.
+They are not silently reused even though that change appears unrelated to the
+LongBench payload. Reuse will first be eligible only when a complete matching
+cohort has been published. Tests cover valid pairs, changed code, stale/failed/
+incomplete/unstable controls, protocol/topology/split mismatch, thermal failures,
+unpublished evidence and restoration. No active controller is changed mid-run.

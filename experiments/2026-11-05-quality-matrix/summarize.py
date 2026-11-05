@@ -34,6 +34,7 @@ def main():
         'request_timing':'all generation including thinking and unsuccessful requests; boot, cooling and CPU grading recorded separately',
         'uncertainty':'two boot intervals assume normal boot means with df1; unique tasks are not multiplied by repeat boots',
         'restored':json.loads((root/'restored.json').read_text()) if (root/'restored.json').exists() else None}
+    if (root/'reference-controls.json').exists():report['reference_controls']=json.loads((root/'reference-controls.json').read_text())
     if missing:
         report.update(missing_or_incomplete=missing,conclusion='Incomplete matched cohort; no speed or quality qualification.')
     else:

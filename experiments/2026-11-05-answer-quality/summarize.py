@@ -42,6 +42,7 @@ def main():
             'rule':'grade completed final answers against independent ground truth; reasoning may differ; all runtime counts',
             'uncertainty':'two boot performance intervals assume normal boot means (unverified), df1 component97.5%/joint95%; quality sample size is unique documents, never duplicated boots',
             'restored':json.loads((out/'restored.json').read_text()) if (out/'restored.json').exists() else None,'phases':[]}
+    if (out/'reference-controls.json').exists():result['reference_controls']=json.loads((out/'reference-controls.json').read_text())
     if complete:
         assert len({r['selection_sha256'] for r in runs.values()})==1
         assert len({json.dumps(r['protocol'],sort_keys=True) for r in runs.values()})==1

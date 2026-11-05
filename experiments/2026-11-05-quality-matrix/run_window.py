@@ -119,6 +119,7 @@ def main():
     p.add_argument('--cache',type=Path);p.add_argument('--split',choices=['pilot','heldout'],default='pilot')
     p.add_argument('--ruler-stage',choices=['full','screen'],default='full')
     p.add_argument('--candidate-config',type=Path,default=Path(w.REL)/'candidate.json')
+    p.add_argument('--controls-from',type=Path,help='published complete same-day native pair with identical runtime and client inputs')
     p.add_argument('--watchdog');p.add_argument('--preflight-only',action='store_true')
     args=p.parse_args();out=args.out.resolve()
     assert args.benchmark=='ruler' or args.ruler_stage=='full','ruler-stage applies only to RULER'
@@ -163,6 +164,12 @@ def main():
         reference,manifest,cases,identity=ruler.load_inputs(args.cache,args.split,args.ruler_stage)
         (out/'input-validation.json').write_text(json.dumps({'manifest_sha256':identity,'cases':len(cases),
             'parent_manifest_sha256':reference['evaluation_sha256'],'stage':args.ruler_stage,'model_requests':0},indent=2)+'\n')
+    reused={}
+    if args.controls_from:
+        from reference_controls import load
+        reused,files,provenance=load(ROOT,args.controls_from,args.benchmark,args.split,args.ruler_stage,w.NODES)
+        for name,raw in files.items():(out/name).write_bytes(raw)
+        (out/'reference-controls.json').write_text(json.dumps(provenance,indent=2)+'\n')
     baseline=None
     for i in range(7):
         metrics=urllib.request.urlopen('http://127.0.0.1:8000/metrics',timeout=15).read().decode()
@@ -235,10 +242,11 @@ print(json.dumps({'created':created,'checkout':str(target),'head_before_coordina
             canonical=grade(args.cache,oracle,out,'oracle')
             validation=canonical_check(canonical)
             (out/'oracle-validation.json').write_text(json.dumps(validation,indent=2)+'\n')
-        generations={};grades={}
+        generations=dict(reused);grades=dict(reused)
         jobs=[('native-a','native'),('lsa-a','candidate'),('lsa-b','candidate'),('native-b','native')]
-        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'split':args.split,'nodes':w.NODES,'candidate_config':str(candidate)},indent=2)+'\n')
+        (out/'jobs.json').write_text(json.dumps({'jobs':jobs,'split':args.split,'nodes':w.NODES,'candidate_config':str(candidate),'controls_from':str(args.controls_from) if args.controls_from else None},indent=2)+'\n')
         for label,profile in jobs:
+            if args.controls_from and label.startswith('native-'):continue
             assert w.owns(token) and not errors
             assert not any(h['spark-request.json'] or h['spark3-request.json'] for h in w.each(w.HOLD_CODE,{'action':'read'}).values()),'pending requester'
             config=candidate if profile=='candidate' else Path(w.REL)/(profile+'.json')
