@@ -46,3 +46,8 @@ Official local build preparation exited1 when its temporary canonical fetch ran
 out of disk space. The original receipt and compressed log are preserved. Fresh
 patch replay and offline source checks remain valid; complete official preparation
 and build checks are still required before any image. No image or GPU work ran.
+
+A separate second official vLLM-only preparation subsequently passed and
+reproduced the declared head/tree. Its original log retains an intermediate
+patch whitespace warning; final source whitespace passed. The disk failure
+remains unchanged. Complete Linux inputs/checks and actual-image gates are pending.

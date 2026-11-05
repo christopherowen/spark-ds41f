@@ -1,3 +1,17 @@
+# Current execution
+
+Attempt1 launched20:47:17UTC on2026-11-05 at clean published execution
+`b6896b389c5bb0004e13fe9f4f941a31a60f87ca`. Controller1026892, supervisor1026891.
+The amended wheel-identity control is included; compiler/vLLM sources and metric
+specifications are unchanged. All three serving checkouts and the owned DGX4
+build checkout match this commit cleanly. Normal named-profile source staging
+closed20:46:54UTC with identical preexisting C36 containers and no restart.
+Original queued request and acknowledgment remain preserved. No later evidence
+commit authorizes synchronizing an active checkout. Actual image and measured
+verdict remain pending.
+
+## Preparation history (retained)
+
 # C42 qualification state
 
 C42 is queued after the existing lossless-memory cohort, with no controller,
