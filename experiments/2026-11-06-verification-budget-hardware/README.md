@@ -19,6 +19,9 @@ The expanded tool/schema gate at `e7fe9895` passed nine remote tests, all three
 profile doctors and both dry plans (0.11 s / 26,080 KiB maximum test RSS).
 Those receipts are in `runs/preflight/tool-schema-e7fe9895/`. This validates
 the harness and profile preparation; the HTTP gate still needs real hardware.
+At `5db59423` and `2b959786`, ten remote tests, all three doctors and both plans
+passed after adding handoff resumption and per-rank engine-log capture. The
+last test run took 0.10 s / 25,820 KiB maximum RSS. Both receipts are retained.
 
 The first window, `dgx1-1793922050`, subsequently opened from the captured
 original commit `2c4b23af` and synchronized the three clean checkouts to
@@ -41,7 +44,7 @@ preflight found the exact image on dgx1, dgx2 and dgx3.
 ## Shared window and deployment
 
 At initial preparation the dgx1 hold belonged to the frontend lifetime qualification,
-window `dgx1-1793917240`; `norm-projection-boundaries` has the existing request.
+window `dgx1-1793917240`; `norm-projection-boundaries` had the existing request.
 Neither file was overwritten. The native lab queue had no pending/running
 specs. Current ownership must be read afresh; this experiment must not run through the
 generic `spark-lab` holder-prefix check while another task owns the window.
@@ -133,6 +136,14 @@ latency and TTFT (including tail latency), admitted/accepted drafts and memory.
 A cost setting needs a material throughput improvement beyond its 95% interval
 without worse correctness, c1/queued c16 latency, or error behavior. A neutral,
 negative or inconclusive screen does not justify promotion or a claimed win.
+
+The owner's clarified criterion also accepts a demonstrated correctness repair
+with preserved performance. No allocator correctness defect has been established
+by this audit, and the row-cost changes remain performance experiments. Harness
+validation improvements are not a claim of improved serving correctness. Any
+later runtime correctness repair needs an actual before/after reproducer and
+performance-preservation evidence whose uncertainty excludes a material loss;
+an interval merely containing zero is inconclusive.
 
 Any surviving setting needs the standard release-tp3 prefill points at 32K,
 128K, 256K, 512K and 1,000,000 cold tokens, stalls, sampled c1/c8/c16, and
