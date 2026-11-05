@@ -57,11 +57,15 @@ def make_case(n, m, padded):
     qw = (torch.randn(1280, generator=gen, device="cuda") * .3 + 1).bfloat16()
     kw = (torch.randn(512, generator=gen, device="cuda") * .3 + 1).bfloat16()
     positions = torch.arange(m, device="cuda", dtype=torch.int64) + 100
+    positions[0] = 0
+    if m > 1: positions[1] = 4095
     inv = 1 / (10000 ** (torch.arange(0, 64, 2, device="cuda").double() / 64))
     angles = torch.arange(4096, device="cuda").double()[:, None] * inv
     table = torch.cat((angles.cos(), angles.sin()), -1).float()
     slots = torch.arange(m, device="cuda", dtype=torch.int64) * 2
-    slots[-1] = -1
+    slots[0] = 255
+    if m > 1: slots[1] = 256
+    slots[-1] = 511
     # Q-B: TP3's final rank has 16 real heads and 8 zero-weight padded heads.
     weight = (torch.randn((n, 1280), generator=gen, device="cuda") * .2).to(torch.float8_e4m3fn)
     if padded:
@@ -137,7 +141,7 @@ def make_case(n, m, padded):
         outputs[variant] = (q, cast.values[:m], cast.scales[:m], kv, cache, projected)
     functions["projection_only"] = projection_only
     outputs["projection_only"] = outputs["fused"]
-    return functions, outputs, segs, raw, (qw, kw)
+    return functions, outputs, segs, raw, slots
 
 
 def main():
@@ -154,7 +158,7 @@ def main():
     saved = {}
     for n, padded in ((8192, False), (12288, False), (12288, True)):
         for m in reversed(ROWS):
-            functions, outputs, segs, raw, norm_weights = make_case(n, m, padded)
+            functions, outputs, segs, raw, slots = make_case(n, m, padded)
             for fn in functions.values():
                 fn()
             torch.cuda.synchronize()
@@ -168,21 +172,35 @@ def main():
                 saved[key] = projected.clone()
             else:
                 assert byte_equal(projected, saved[key][:m]), ("batch invariance", n, m, padded)
-            # The normalization non-finite contract is checked on live Q rows;
-            # no production input or router handling is relaxed.
-            original = raw[0, 0].clone()
-            for value in (float("nan"), float("inf"), -float("inf")):
-                raw[0, 0] = value
-                for fn in functions.values():
-                    fn()
-                for variant in VARIANTS:
-                    q = outputs[variant][0]
-                    assert torch.isnan(q[0]).any(), ("nonfinite", variant, value)
-                    assert byte_equal(q[1:], outputs["fused"][0][1:])
-                assert all(byte_equal(outputs["fused"][0], outputs[v][0]) for v in VARIANTS[1:])
-            raw[0, 0] = original
-            for fn in functions.values():
-                fn()
+            # Check skipped slots separately: all timed rows have live cache writes,
+            # including the single-row case. Also cover a page crossing and last slot.
+            saved_slot = slots[-1].clone()
+            slots[-1] = -1
+            for out in outputs.values(): out[4].fill_(91)
+            for fn in functions.values(): fn()
+            for variant in VARIANTS:
+                assert torch.all(outputs[variant][4][1, -RECORD_BYTES["swa"]:] == 91)
+                assert all(byte_equal(a,b) for a,b in zip(outputs["fused"],outputs[variant]))
+            slots[-1] = saved_slot
+            for fn in functions.values(): fn()
+            clean = tuple(x.clone() for x in outputs["fused"])
+            # Live Q and KV norms must preserve the native NaN/Inf response and
+            # leave the disjoint latent unchanged; no non-finite model input is
+            # made acceptable. Downstream NaN payloads are not an accuracy metric.
+            for column, norm_index, unaffected in ((0,0,(3,4)), (1280,3,(0,1,2,5))):
+                original = raw[0, column].clone()
+                for value in (float("nan"), float("inf"), -float("inf")):
+                    raw[0, column] = value
+                    for fn in functions.values(): fn()
+                    for variant in VARIANTS:
+                        normalized = outputs[variant][norm_index]
+                        assert torch.isnan(normalized[0]).any(), ("nonfinite",variant,column,value)
+                        assert byte_equal(normalized[1:],clean[norm_index][1:])
+                        assert byte_equal(normalized,outputs["fused"][norm_index])
+                        assert all(byte_equal(outputs[variant][i],clean[i]) for i in unaffected)
+                raw[0, column] = original
+                for fn in functions.values(): fn()
+            del clean
             prefetch(segs)
             graphs = {v: capture(fn) for v, fn in functions.items()}
             warm = {v: capture(fn, 20) for v, fn in functions.items()}

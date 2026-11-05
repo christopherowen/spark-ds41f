@@ -25,8 +25,9 @@ The kernel screen uses rows 1, 6, 9, 16, 24, 48 and 96; Q-B at TP4 (8192 x 1280)
 and TP3 (12288 x 1280), including the last TP3 rank's zero-weight padded heads.
 Weights and activations are deterministic synthetic inputs of checkpoint shapes,
 not model-quality evidence. Compare every output byte, including quantized values,
-scales, rotated KV and untouched cache locations; check NaN/Inf contracts and row
-invariance separately. The arithmetic remains norm in FP32, BF16 round, then
+scales, rotated KV and untouched cache locations; check NaN/Inf contracts for both latents and row
+invariance separately. Every timed row writes a live cache slot. Skipped-slot checks
+run separately; inputs cover the first/last RoPE positions and cache page edges. The arithmetic remains norm in FP32, BF16 round, then
 E4M3/UE8M0 quantization. No rescaling across the projection is allowed.
 
 Measure CUDA-graph chains with weights resident in L2, after a 128 MiB eviction,
