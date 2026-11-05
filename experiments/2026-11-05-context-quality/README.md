@@ -48,3 +48,12 @@ receipts retain exact commands, seeds, prompt/input hashes, measured raw token
 lengths and needle depths; prompts/references remain in the private cache.
 This is preparation only. No RULER model output has been generated or used for
 selection, and no published RULER score or performance claim is made.
+
+
+Before confirmation generation, inspection catches that using the full RNG seed
+namespace as a QA question offset would exceed HotpotQA's 7405 examples. QA
+question offsets instead use one tenth of the split namespace: pilot0 and
+confirmation1000, plus the declared length/repeat offsets. All are in range and
+the two splits are disjoint. Pilot commands and input bytes are unchanged. The
+confirmation receipt pins its own preparation source hash. No confirmation or
+model output was inspected to make this eligibility correction.

@@ -49,7 +49,7 @@ def main():
     metrics=module(source/'scripts/eval/synthetic/constants.py','ruler_eval_constants').TASKS
     names=args.tasks or lock['tasks'];lengths=args.lengths or lock['generator_lengths']
     assert set(names)<=set(lock['tasks']) and set(lengths)<=set(lock['generator_lengths'])
-    receipt={'source_lock_sha256':sha(LOCK_PATH),'split':args.split,'complete':False,'cases':[],'errors':[],'model_requests_sent':0}
+    receipt={'source_lock_sha256':sha(LOCK_PATH),'split':args.split,'complete':False,'cases':[],'errors':[],'model_requests_sent':0,'prepare_source_sha256':sha(Path(__file__)),'python':'.'.join(map(str,sys.version_info[:3]))}
     def save(): (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     env=dict(os.environ,NLTK_DATA=str(assets/'nltk-data'),TOKENIZERS_PARALLELISM='false',HF_HUB_OFFLINE='1')
     try:
@@ -66,7 +66,7 @@ def main():
                              '--tokens_to_generate',str(base['tokens_to_generate']),'--num_samples','1',
                              '--random_seed',str(seed),'--template',base['template']+base.get('answer_prefix','')]
                     for k,v in config['args'].items():command += ['--'+k,str(v)]
-                    if config['task']=='qa':command += ['--pre_samples',str(lock['split_seed_offsets'][args.split]+lock['generator_lengths'].index(length)*100+repeat)]
+                    if config['task']=='qa':command += ['--pre_samples',str(lock['split_seed_offsets'][args.split]//10+lock['generator_lengths'].index(length)*100+repeat)]
                     (folder/'command.json').write_text(json.dumps(command,indent=2)+'\n')
                     started=time.monotonic()
                     with (folder/'output.txt').open('x') as stream:
