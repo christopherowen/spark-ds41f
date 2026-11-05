@@ -1,0 +1,262 @@
+Using CPython 3.12.3 interpreter at: /usr/bin/python3
+Creating virtual environment at: /tmp/.venv
+....F...F...................                                             [100%]
+=================================== FAILURES ===================================
+____________ test_full_capture_sets_graph_pool_id_before_cuda_graph ____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfe09176374a0>
+
+    def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
+        """FULL capture must set graph_pool_id before entering torch.cuda.graph().
+    
+        NCCL symmetric memory checks this global during graph capture; without
+        it, capture fails with:
+        AssertionError: graph_pool_id is not set under graph capture
+        """
+        graph_pool = object()
+        monkeypatch.setattr(
+            gpu_cudagraph_utils,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        monkeypatch.setattr(
+            gpu_cudagraph_utils.current_platform,
+            "get_global_graph_pool",
+            lambda: graph_pool,
+        )
+    
+        manager = gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=_create_vllm_config(),
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL,
+            decode_query_len=1,
+        )
+    
+        desc = BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=4,
+            num_reqs=4,
+            uniform_token_count=1,
+        )
+        manager._capture_descs[CUDAGraphMode.FULL] = [desc]
+    
+        def create_forward_fn(desc, warmup):
+            return lambda _mode: None
+    
+        @contextmanager
+        def fake_graph_capture(*args, **kwargs):
+            yield SimpleNamespace(stream=MagicMock())
+    
+        fake_offloader = MagicMock()
+    
+        def cuda_graph_enter(*args, **kwargs):
+            assert pynccl_allocator._graph_pool_id is graph_pool
+    
+        mock_cuda_graph_ctx = MagicMock()
+        mock_cuda_graph_ctx.__enter__ = cuda_graph_enter
+        mock_cuda_graph_ctx.__exit__ = MagicMock(return_value=False)
+    
+        with (
+            patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
+            patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+            patch.object(gpu_cudagraph_utils.torch.accelerator, "synchronize"),
+            patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
+            patch.object(
+                gpu_cudagraph_utils.torch.cuda,
+                "graph",
+                return_value=mock_cuda_graph_ctx,
+            ) as mock_cuda_graph,
+        ):
+>           manager.capture(create_forward_fn)
+
+tests/v1/cudagraph/test_cudagraph_manager.py:184: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/cudagraph_utils.py:802: in capture
+    graph, self.pool, stream=self._capture_stream(desc)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/cudagraph_utils.py:669: in _capture_stream
+    return current_stream()
+           ^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def current_stream() -> torch.cuda.Stream:
+        """
+        replace `torch.cuda.current_stream()` with `vllm.utils.current_stream()`.
+        it turns out that `torch.cuda.current_stream()` is quite expensive,
+        as it will construct a new stream object at each call.
+        here we patch `torch.cuda.set_stream` to keep track of the current stream
+        directly, so that we can avoid calling `torch.cuda.current_stream()`.
+    
+        the underlying hypothesis is that we do not call `torch._C._cuda_setStream`
+        from C/C++ code.
+        """
+        from vllm.platforms import current_platform
+    
+        if not hasattr(_current_stream_tls, "value") or _current_stream_tls.value is None:
+            # when this function is called before any stream is set,
+            # we return the default stream.
+            # On ROCm using the default 0 stream in combination with RCCL
+            # is hurting performance.
+            # On CUDA, we capture and replay cudagraph on the same stream,
+            # so we need to avoid using the default stream as well. The default
+            # stream cannot be used for cudagraph capture, see
+            # https://github.com/pytorch/pytorch/blob/42ad9edfb754743fdae3276ade43de000beb4f60/aten/src/ATen/cuda/CUDAGraph.cpp#L77
+            # for more details. Therefore, we create a dedicated stream per process.
+            if current_platform.is_rocm() or current_platform.is_cuda():
+                # Ensure new stream is ordered w.r.t. replaced stream's work.
+                new_stream = torch.cuda.Stream()
+                new_stream.wait_stream(torch.cuda.current_stream())
+                # torch.cuda.set_stream here is the alias of _pathed_set_stream
+                torch.cuda.set_stream(new_stream)
+            elif current_platform.is_cpu():
+                _current_stream_tls.value = _StreamPlaceholder()
+            else:
+                current_stream = current_platform.current_stream
+                if current_stream is not None:
+                    _current_stream_tls.value = current_stream()
+                else:
+>                   raise ValueError(
+                        "Fail to set current stream, current platform "
+                        "may not support current_stream with torch API"
+                    )
+E                   ValueError: Fail to set current stream, current platform may not support current_stream with torch API
+
+vllm/utils/torch_utils.py:844: ValueError
+----------------------------- Captured stdout call -----------------------------
+WARNING 11-05 22:53:15 [interface.py:1294] Current platform  does not have 'current_stream' attribute.
+----------------------------- Captured stderr call -----------------------------
+Capturing CUDA graphs (FULL):   0%|          | 0/1 [00:00<?, ?it/s]Capturing CUDA graphs (FULL):   0%|          | 0/1 [00:00<?, ?it/s]
+------------------------------ Captured log call -------------------------------
+WARNING  vllm.platforms.interface:interface.py:1294 Current platform  does not have 'current_stream' attribute.
+______________ test_capture_synchronizes_auxiliary_warmup_streams ______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfe09174154f0>
+
+    def test_capture_synchronizes_auxiliary_warmup_streams(monkeypatch):
+        """CUDA graph capture starts only after warmup work has completed."""
+        lifecycle: list[str] = []
+        monkeypatch.setattr(
+            gpu_cudagraph_utils,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        monkeypatch.setattr(
+            gpu_cudagraph_utils.current_platform,
+            "get_global_graph_pool",
+            lambda: object(),
+        )
+    
+        manager = gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=_create_vllm_config(),
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL,
+            decode_query_len=1,
+        )
+        desc = BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=4,
+            num_reqs=4,
+            uniform_token_count=1,
+        )
+        manager._capture_descs[CUDAGraphMode.FULL] = [desc]
+    
+        def create_forward_fn(_desc, warmup):
+            def forward_fn(_mode):
+                lifecycle.append("warmup-forward" if warmup else "capture-forward")
+    
+            return forward_fn
+    
+        @contextmanager
+        def fake_graph_capture(*args, **kwargs):
+            yield SimpleNamespace(stream=MagicMock())
+    
+        @contextmanager
+        def fake_cuda_graph(*args, **kwargs):
+            lifecycle.append("capture-begin")
+            yield
+    
+        fake_offloader = MagicMock()
+        with (
+            patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
+            patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+            patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
+            patch.object(gpu_cudagraph_utils.torch.cuda, "graph", fake_cuda_graph),
+            patch.object(
+                gpu_cudagraph_utils.torch.accelerator,
+                "synchronize",
+                side_effect=lambda: lifecycle.append("warmup-synchronize"),
+            ),
+        ):
+>           manager.capture(create_forward_fn)
+
+tests/v1/cudagraph/test_cudagraph_manager.py:330: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py:124: in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/cudagraph_utils.py:802: in capture
+    graph, self.pool, stream=self._capture_stream(desc)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/cudagraph_utils.py:669: in _capture_stream
+    return current_stream()
+           ^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def current_stream() -> torch.cuda.Stream:
+        """
+        replace `torch.cuda.current_stream()` with `vllm.utils.current_stream()`.
+        it turns out that `torch.cuda.current_stream()` is quite expensive,
+        as it will construct a new stream object at each call.
+        here we patch `torch.cuda.set_stream` to keep track of the current stream
+        directly, so that we can avoid calling `torch.cuda.current_stream()`.
+    
+        the underlying hypothesis is that we do not call `torch._C._cuda_setStream`
+        from C/C++ code.
+        """
+        from vllm.platforms import current_platform
+    
+        if not hasattr(_current_stream_tls, "value") or _current_stream_tls.value is None:
+            # when this function is called before any stream is set,
+            # we return the default stream.
+            # On ROCm using the default 0 stream in combination with RCCL
+            # is hurting performance.
+            # On CUDA, we capture and replay cudagraph on the same stream,
+            # so we need to avoid using the default stream as well. The default
+            # stream cannot be used for cudagraph capture, see
+            # https://github.com/pytorch/pytorch/blob/42ad9edfb754743fdae3276ade43de000beb4f60/aten/src/ATen/cuda/CUDAGraph.cpp#L77
+            # for more details. Therefore, we create a dedicated stream per process.
+            if current_platform.is_rocm() or current_platform.is_cuda():
+                # Ensure new stream is ordered w.r.t. replaced stream's work.
+                new_stream = torch.cuda.Stream()
+                new_stream.wait_stream(torch.cuda.current_stream())
+                # torch.cuda.set_stream here is the alias of _pathed_set_stream
+                torch.cuda.set_stream(new_stream)
+            elif current_platform.is_cpu():
+                _current_stream_tls.value = _StreamPlaceholder()
+            else:
+                current_stream = current_platform.current_stream
+                if current_stream is not None:
+                    _current_stream_tls.value = current_stream()
+                else:
+>                   raise ValueError(
+                        "Fail to set current stream, current platform "
+                        "may not support current_stream with torch API"
+                    )
+E                   ValueError: Fail to set current stream, current platform may not support current_stream with torch API
+
+vllm/utils/torch_utils.py:844: ValueError
+----------------------------- Captured stderr call -----------------------------
+Capturing CUDA graphs (FULL):   0%|          | 0/1 [00:00<?, ?it/s]Capturing CUDA graphs (FULL):   0%|          | 0/1 [00:00<?, ?it/s]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/cudagraph/test_cudagraph_manager.py::test_full_capture_sets_graph_pool_id_before_cuda_graph
+FAILED tests/v1/cudagraph/test_cudagraph_manager.py::test_capture_synchronizes_auxiliary_warmup_streams
+2 failed, 26 passed, 14 warnings in 3.18s
