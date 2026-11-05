@@ -21,3 +21,27 @@ required before model startup. All commands, failures, allocator observations
 and releases remain recorded; raw inputs stay node-local. Full-model no-loss
 answer gates and request timing remain mandatory. No speed or quality win is
 assumed from removing duplicate calculations.
+
+
+The first query-reuse screen at `90154e84` passes all 12 actual batches against
+independent coarse/fine score bits. Two fresh processes show native/candidate
+ratios of 1.35–1.37 for dense8, 2.30–2.31 for dense64, approximately 1.50 for
+source8 and 1.81 for source64. Single-query shapes remain slower (dense0.64–0.68,
+source0.87). Samples and small-n t intervals are in `runs/screen-01`. These are
+component results, not a request-speed or final-answer pass. Allocator peaks
+are 281,548,288 allocated and 289,406,976 reserved bytes in the actual check;
+component timings include their own peaks. Processes start at 51/52 C, end at
+52/53 C, with no active hardware thermal slowdown at the end. Release is
+15:09:15 UTC, with no remaining containers; an independent later reader sees
+no LSA lease or pending request.
+
+The prepared serving class keeps every scratch tensor local to its invocation
+instead of retaining a workspace view in the plan. Its kernel sequence and math
+match the screen. Before any model startup, rerun actual-input, strict
+initialization and cache/graph/lifecycle gates on this exact source, then timing.
+Both runtime sources equal a fresh application of the ordered seven-patch stack
+against C36. Named-profile/default doctor and 19 answer-harness checks pass.
+The full build tree is unavailable locally; no image build is claimed. The model
+comparison uses actual Native68 with fresh controls. `native-source.json` is a
+predeclared quality fallback that keeps dense selection and restores native
+source/reindex handoff, with the same 100-byte layout and dense budget.
