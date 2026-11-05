@@ -122,10 +122,11 @@ def main():
                 lab.beat(f"verification budget {args.stage}")
     threading.Thread(target=heartbeat, daemon=True).start()
     save()
+    active_arm = None
     def command(argv, name, restoring=False):
         if not owns(lab.read_hold(), args.window):
             raise RuntimeError("window ownership changed")
-        if not restoring and lab.window_should_close(lab.read_hold()):
+        if not restoring and active_arm is None and lab.window_should_close(lab.read_hold()):
             raise RuntimeError("handoff requested")
         path = out / f"{len(receipt['steps']):03d}-{name}.log"
         entry = {"argv": argv, "started": lab.now(), "log": path.name}
@@ -146,6 +147,8 @@ def main():
     last_config = None
     success = False
     try:
+        if args.stage.startswith("qualify") and lab.window_should_close(lab.read_hold()):
+            raise RuntimeError("handoff requested before qualification")
         nodes = lab.nodes_config()
         identities = {}
         for node in nodes["nodes"]:
@@ -160,8 +163,13 @@ def main():
             if json.loads((screen / "receipt.json").read_text()).get("completed") is not True:
                 raise RuntimeError("qualification needs this window's completed causal screen")
             signatures = json.loads((screen / "control035-a-signatures.json").read_text())
-        for arm in arms:
+        for index, arm in enumerate(arms):
+            # A window's first arm includes its preceding coordinated sync.
+            # Finish that job on a new request, then hand off before the next arm.
+            if index and lab.window_should_close(lab.read_hold()):
+                raise RuntimeError("handoff requested after completed arm")
             config, label = f"{EXPERIMENT}/{arm['config']}", arm["label"]
+            active_arm = label
             # Record the profile before a partial start can fail, for coordinated cleanup.
             last_config = config
             samplers = lab.start_memory_samplers(out / f"startup-{label}")
@@ -193,8 +201,8 @@ def main():
                 if bench.fan_curve_problems(conditions["fan_curve"]):
                     raise RuntimeError("functional gate requires the existing fan curve on all nodes")
                 for name, script, extra in GATES:
-                    if not owns(lab.read_hold(), args.window) or lab.window_should_close(lab.read_hold()):
-                        raise RuntimeError("window changed or handoff requested")
+                    if not owns(lab.read_hold(), args.window):
+                        raise RuntimeError("window ownership changed")
                     log = out / f"{label}-{name}.jsonl"
                     argv = [sys.executable, script, lab.head_url(), *extra]
                     with log.open("w") as stream:
@@ -242,13 +250,16 @@ def main():
                     argv += ["--corpus", str(corpus)]
                 with lab.Telemetry(str(output) + "-telemetry", config):
                     command(argv, label + "-" + stem)
+            receipt.setdefault("completed_arms", []).append({"label": label, "config": config, "ended": lab.now()})
+            save()
+            active_arm = None
         success = True
     except BaseException as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         print(receipt["error"], flush=True)
     finally:
         receipt["completed"] = success
-        if not success or not args.keep_open or args.stage == "restore":
+        if not success or not args.keep_open or args.stage == "restore" or lab.window_should_close(lab.read_hold() or {}):
             try:
                 if not owns(lab.read_hold(), args.window):
                     raise RuntimeError("ownership changed; leave foreign hold alone")

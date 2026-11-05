@@ -12,8 +12,18 @@ sp8. The resolved profiles differ only in row cost (notes excluded). The
 initial row010 doctor failed because overlay option values do not expand
 recipe placeholders; the correction supplies the resolved TP3 values, with a
 regression check. Both attempts remain in `runs/preflight/`. A clean isolated
-dgx1 checkout is prepared at that published commit; its doctor passes. The
-canonical serving checkouts have not been synchronized or changed.
+dgx1 checkout was prepared at that published commit; its doctor passed. At
+that preflight, the canonical serving checkouts remained unchanged.
+
+The first window, `dgx1-1793922050`, subsequently opened from the captured
+original commit `2c4b23af` and synchronized the three clean checkouts to
+`297acf25`. Before a candidate boot, a CED prefill-boundary request arrived.
+This experiment yielded to that ready prefill work: the native sync restored
+all three original checkouts, and native close confirmed C36 was already
+serving at 23:44:58 UTC. No serving container was stopped, started or replaced,
+and no GPU workload or measurement from this experiment ran. The original
+state and both sync logs are retained. This is deployment/handoff evidence,
+not before/after performance evidence.
 
 One causal variable: `adaptive_verification_row_cost`, 0.035 control versus
 0.01 and 0.02. Every arm uses the same existing immutable C40 image, source
