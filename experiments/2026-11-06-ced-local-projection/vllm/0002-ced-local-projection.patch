@@ -1,0 +1,673 @@
+From 51c1a32cd78cfb0a14087e34dfcc06be30928a0e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:41:15 +0000
+Subject: [PATCH] Project CED global KV on local rows before gathering its
+ latent
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Integration base: 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+Immediate base: 2b320049a5df8e62e1b3ee70f53304d6d55a15e3.
+
+Build ratio-one global KV from row-local BF16 projections and gather the
+512-column result, retaining every encoder row for norm, cache and index
+writes. Gather normalized query rows only for the selected replay. Count
+padding and TP3's additional latent gather before choosing the sparse path.
+
+Aligned TP retains one full compressor weight before memory profiling;
+TP3 already holds it. Decode keeps its original weight and kernels. The
+prefill kernel uses the original column shard's K partition and block
+ordering even when a local row slice crosses the decode-size boundary.
+
+Quality: no checkpoint quantization, norm change, floating collective sum,
+attention backend change or replay-selection change. Native equality is a
+qualification requirement, not inferred from the CPU arithmetic stand-ins.
+
+Tests: 151 CPU checks pass, one GPU test skipped. Both BF16 projection
+shapes compile offline for SM121a with the deployed five blocked K parts.
+Added TP3/TP4 native projection and rank-order mHC row-invariance checks
+remain pending hardware. No serving throughput gain is claimed.
+Upstream status: experimental alternative for source-fork review; unpromoted.
+---
+ .../kernels/test_deepseek_v41_tilelang_mhc.py |  55 +++++
+ tests/models/test_deepseek_v4_1_ced_model.py  |   8 +-
+ tests/models/test_deepseek_v4_1_compressor.py |  46 ++++
+ .../test_deepseek_v4_1_compressor_prepare.py  | 201 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  39 +++-
+ vllm/models/deepseek_v4_1/compressor.py       |  63 +++++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  24 ++-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  10 +-
+ 8 files changed, 421 insertions(+), 25 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 21fd2c224..688958b0d 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -972,3 +972,58 @@ def test_rank_order_parts_device_and_compacted_final_collapse_sink_columns(
+     )
+     assert parts.device == residual.device
+     assert parts.dtype == torch.bfloat16
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("tokens", [207, 6144, 16384])
++def test_ced_boundary_local_rows_match_full_rank_order_entry(mhc, world, tokens):
++    """CED must keep native mHC bits across the full-to-local row dispatch."""
++    from vllm.models.deepseek_v4_1.sp_prefill import SPRows
++
++    layout = SPRows(tokens, world, 0)
++    padded = layout.padded_rows
++    residual, fn, scale, base, weight, incoming = _inputs(padded, seed=3641)
++    gen = torch.Generator(device=DEVICE).manual_seed(3642)
++    parts = torch.randn(world, padded, HIDDEN, device=DEVICE, generator=gen).bfloat16()
++    post = torch.rand(padded, 4, device=DEVICE, generator=gen)
++    comb = torch.softmax(torch.randn(padded, 4, 4, device=DEVICE, generator=gen), -1)
++    for nonfinite in (False, True):
++        if nonfinite:
++            residual[0, 0, 0] = float("nan")
++            parts[0, 1, 1] = float("inf")
++            parts[1, 2, 2] = -float("inf")
++        full = mhc.pre(
++            residual[:tokens],
++            fn,
++            scale,
++            base,
++            weight,
++            incoming[:tokens],
++            previous_output=RankOrderParts(parts[:, :tokens].contiguous()),
++            previous_post=post[:tokens],
++            previous_comb=comb[:tokens],
++        )
++        for rank in range(world):
++            sp = SPRows(tokens, world, rank)
++            rows = slice(sp.start, sp.start + sp.local_rows)
++            local = mhc.pre(
++                residual[rows],
++                fn,
++                scale,
++                base,
++                weight,
++                incoming[rows],
++                previous_output=RankOrderParts(parts[:, rows].contiguous()),
++                previous_post=post[rows],
++                previous_comb=comb[rows],
++            )
++            valid = min(sp.local_rows, tokens - sp.start)
++            expected = slice(sp.start, sp.start + valid)
++            for actual, reference in zip(local[:5], full[:5], strict=True):
++                _assert_bytes_equal(actual[:valid], reference[expected])
++            # The boundary discards the eager cast and casts only selected replay
++            # rows; its row-local cast must obey the same native contract too.
++            for field in ("values", "scales"):
++                _assert_bytes_equal(
++                    getattr(local[5], field)[:valid], getattr(full[5], field)[expected]
++                )
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 35bd14e36..ed90e48c2 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -191,7 +191,13 @@ class _Attention(nn.Module):
+         super().__init__()
+         self.index, self.shared, self.rows = index, shared, rows
+ 
+-    def prepare_global_kv(self, positions, hidden):
++    def ced_sp_saves_bytes(self, sp_rows, replay_rows, hc_mult):
++        # This arithmetic stand-in has no compressor or projected-value gather.
++        return replay_rows * sp_rows.world_size < sp_rows.num_tokens
++
++    def prepare_global_kv(self, positions, hidden, *, sp_rows=None):
++        if sp_rows is not None:
++            hidden = sp_rows.gather(hidden)
+         self.shared["global"] = hidden.mean(dim=0)
+         self.shared["global_rows"] = hidden.shape[0]
+ 
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 01b45c20b..01884c5ac 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -576,3 +576,49 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+             if ratio == 2:
+                 assert torch.equal(ranks[0]._gates[:rows], ref_gates), f"rows={rows}"
+             assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++def test_sp_global_projection_matches_native_shards_at_prefill_boundaries(world_size):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
++        pytest.skip("DeepSeek-V4.1 compression requires SM12x")
++    pytest.importorskip("tilelang")
++    from vllm.models.deepseek_v4_1 import sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
++
++    gen = torch.Generator(device="cuda").manual_seed(3601)
++    weight = (torch.randn(512, 5120, device="cuda", generator=gen) * 0.02).bfloat16()
++    inputs = torch.randn(16384, 5120, device="cuda", generator=gen).bfloat16()
++    # Preserve the deployed column shard's five blocked K parts in both layouts.
++    part_cols = 128 if world_size == 4 else 512
++    base = bf16_gemm(part_cols, 5120, shards=5, blocked=True, out_dtype="bfloat16")
++    candidate = bf16_gemm(512, 5120, shards=5, blocked=True, out_dtype="bfloat16")
++    for nonfinite in (False, True):
++        if nonfinite:
++            inputs[0, 0] = float("nan")
++            inputs[1, 1] = float("inf")
++            inputs[2, 2] = -float("inf")
++        for tokens in (205, 206, 207, 385, 6144, 16384):
++            x = inputs[:tokens]
++            columns = []
++            for start in range(0, 512, part_cols):
++                out = torch.empty(
++                    tokens, part_cols, device="cuda", dtype=torch.bfloat16
++                )
++                base(x, weight[start : start + part_cols], out)
++                columns.append(out)
++            expected = torch.cat(columns, dim=-1)
++            row_parts = []
++            for rank in range(world_size):
++                sp = sp_prefill.SPRows(tokens, world_size, rank)
++                out = torch.empty(
++                    sp.local_rows, 512, device="cuda", dtype=torch.bfloat16
++                )
++                candidate(sp.local_slice(x), weight, out)
++                row_parts.append(out)
++            actual = torch.cat(row_parts)[:tokens]
++            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), (
++                world_size,
++                tokens,
++                nonfinite,
++            )
+diff --git a/tests/models/test_deepseek_v4_1_compressor_prepare.py b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+index ebc914af0..dc2e546a4 100644
+--- a/tests/models/test_deepseek_v4_1_compressor_prepare.py
++++ b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+@@ -116,3 +116,204 @@ def test_sequential_compressor_layers_share_capacity_scratch(monkeypatch):
+     ):
+         assert getattr(first, attr) is getattr(second, attr)
+     assert first._values is not other_ratio._values
++
++
++@pytest.mark.parametrize("projection_tp", [1, 4])
++def test_sp_projection_binding_preserves_decode_weight(monkeypatch, projection_tp):
++    from vllm.models.deepseek_v4_1 import compressor as module
++    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
++
++    compressor = _compressor(1)
++    compressor._sp_enabled = True
++    full_weight = torch.arange(512 * 32, dtype=torch.float32).reshape(512, 32)
++    weight = full_weight[: 512 // projection_tp].clone()
++    compressor.fused_wkv_wgate = SimpleNamespace(
++        weight=weight, tp_size=projection_tp, quant_method=TileLangSplitLinearMethod(1)
++    )
++    calls, gathered = {}, []
++    monkeypatch.setattr(
++        prepare,
++        "declare",
++        lambda declaration, **kw: calls.update(kernels=declaration(), bind=kw["bind"]),
++    )
++    kernel = object()
++    monkeypatch.setattr(prepare, "launch", lambda call: kernel)
++
++    def gather(value, dim):
++        assert value.data_ptr() == weight.data_ptr() and dim == 0
++        gathered.append(value.shape)
++        return full_weight
++
++    monkeypatch.setattr(module, "tensor_model_parallel_all_gather", gather)
++    compressor.declare_kernels()
++    call = compressor._sp_projection_call()
++    assert call in calls["kernels"]
++    calls["bind"]()
++    assert compressor.fused_wkv_wgate.weight is weight
++    assert torch.equal(compressor._sp_weight, full_weight)
++    assert compressor._sp_kernel is kernel
++    assert len(gathered) == (projection_tp > 1)
++    if projection_tp == 1:
++        assert compressor._sp_weight.data_ptr() == weight.data_ptr()
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++@pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
++def test_sp_compressor_projects_only_local_rows_and_gathers_512_columns(
++    monkeypatch, world_size, tokens
++):
++    from tests.models.test_deepseek_v4_1_sp_prefill import _World
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    world = _World(world_size)
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
++    )
++    full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
++    # Exact powers-of-two arithmetic makes this an orchestration oracle; native
++    # BF16 projection equality is covered separately on GPU.
++    expected = full_input[:, :1].expand(tokens, 512) * 0.5
++    metadata = object()
++
++    def run(rank):
++        sp = sp_prefill.SPRows(tokens, world_size, rank)
++        compressor = _compressor(1)
++        compressor._values = torch.empty(tokens + world_size, 512)
++        compressor._latent = torch.empty_like(compressor._values)
++        compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
++        compressor._sp_weight = object()
++        seen = []
++
++        def project(inputs, weight, out):
++            assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
++            assert out.shape == (sp.local_rows, 512)
++            out.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
++
++        def normalize(rows, main, state, *, values, **kwargs):
++            assert rows == tokens and main is metadata and state is None
++            assert values.shape == (tokens, 512)
++            assert torch.equal(values, expected)
++            seen.append(values.shape)
++            compressor._latent[:rows].copy_(values)
++            compressor._slots[:rows].copy_(torch.arange(rows))
++
++        compressor._sp_kernel = project
++        compressor._forward_tilelang = normalize
++        output, slots = compressor.forward(
++            sp.local_slice(full_input), metadata, sp_rows=sp
++        )
++        assert seen == [(tokens, 512)]
++        assert torch.equal(output, expected)
++        assert torch.equal(slots, torch.arange(tokens))
++        with pytest.raises(ValueError, match="local rows"):
++            compressor.forward(full_input[:0], metadata, sp_rows=sp)
++        return output.clone()
++
++    assert len(world.run(run)) == world_size
++
++
++def test_attention_global_kv_keeps_full_metadata_after_local_projection(monkeypatch):
++    from vllm.models.deepseek_v4_1 import attention
++
++    tokens, local_rows = 17, 6
++    positions = torch.arange(tokens)
++    values = torch.arange(tokens * 512, dtype=torch.float32).reshape(tokens, 512)
++    main, index_meta = object(), SimpleNamespace(slot_mapping=torch.arange(tokens))
++    compressor = _compressor(1)
++    compressor.state_cache = None
++    compressor._values = torch.empty(tokens, 512)
++    compressor._latent = torch.empty(tokens, 512)
++    compressor._slots = torch.arange(tokens)
++    compressor._sp_weight = object()
++    compressor._sp_kernel = lambda x, weight, out: out.zero_()
++    seen = []
++
++    def normalize(rows, metadata, state, *, values, **kwargs):
++        assert rows == tokens and metadata is main and state is None
++        compressor._latent.copy_(values)
++
++    compressor._forward_tilelang = normalize
++
++    def gather(local):
++        assert local.shape == (local_rows, 512)
++        seen.append("gather-projection")
++        return values
++
++    sp = SimpleNamespace(num_tokens=tokens, local_rows=local_rows, gather=gather)
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata={"global": main, "index": index_meta}),
++    )
++
++    def write_index(key, slots, *, positions):
++        assert key.shape[0] == tokens and len(slots) == tokens
++        assert len(positions) == tokens
++        seen.append("index-full")
++
++    def write_kv(latent, cache, slots, **kwargs):
++        assert torch.equal(latent, values) and len(slots) == tokens
++        assert len(kwargs["positions"]) == tokens
++        seen.append("kv-full")
++
++    target = SimpleNamespace(
++        _ready=True,
++        compressor=compressor,
++        indexer=SimpleNamespace(
++            wk=lambda x: x[:, :4], k_cache=SimpleNamespace(prefix="index")
++        ),
++        _owner=lambda: SimpleNamespace(prefix="global"),
++        _main_page=64,
++        kv_cache=torch.empty(0),
++        _issue_wo_prefetch=lambda rows, **kw: None,
++        _write_index_keys=write_index,
++        _write_v41_cache=write_kv,
++    )
++    attention.DeepseekV4Attention._prepare_global_kv(
++        target, positions, torch.ones(local_rows, 32), sp_rows=sp
++    )
++    assert seen == ["gather-projection", "index-full", "kv-full"]
++
++
++@pytest.mark.parametrize(
++    "world,tokens,replay,expected",
++    [
++        (3, 385, 128, False),
++        (3, 390, 128, False),
++        (3, 391, 128, True),
++        (3, 6144, 128, True),
++        (4, 512, 128, False),
++        (4, 513, 128, True),
++        (4, 16384, 128, True),
++        (3, 3, 1, False),
++        (3, 4, 1, True),
++    ],
++)
++def test_ced_sp_dispatch_counts_replicated_projection_gather(
++    world, tokens, replay, expected
++):
++    from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
++    from vllm.models.deepseek_v4_1.sp_prefill import SPRows
++
++    compressor = _compressor(1)
++    compressor.fused_wkv_wgate.tp_size = 1 if world == 3 else world
++    attention = SimpleNamespace(compressor=compressor, hidden_size=5120)
++    assert (
++        DeepseekV4Attention.ced_sp_saves_bytes(
++            attention, SPRows(tokens, world, 0), replay, 4
++        )
++        is expected
++    )
++
++
++def test_ced_sp_dispatch_keeps_unsupported_compressor_on_full_path():
++    from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
++    from vllm.models.deepseek_v4_1.sp_prefill import SPRows
++
++    for compressor in (None, _compressor(2), SimpleNamespace(compress_ratio=1)):
++        assert not DeepseekV4Attention.ced_sp_saves_bytes(
++            SimpleNamespace(compressor=compressor, hidden_size=5120),
++            SPRows(6144, 3, 0),
++            1,
++            4,
++        )
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index c00e159b9..b467b5d3e 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -959,14 +959,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
+         self.insert_context_kv(kv, positions, swa.slot_mapping[: kv.shape[0]])
+ 
+-    def prepare_global_kv(self, positions, hidden_states):
++    def ced_sp_saves_bytes(self, sp_rows, replay_rows, hc_mult):
++        """Keep the compact boundary only when its gathered payload is smaller.
++
++        TP3's compressor already holds the full weight, so a new row gather must
++        also earn back its cost. Aligned TP replaces an existing column gather.
++        Include SP padding and every replicated compact slot in both estimates.
++        """
++        compressor = self.compressor
++        if type(compressor) is not DeepseekCompressor or compressor.compress_ratio != 1:
++            return False
++        # Native carries: BF16 hidden/residual, FP32 pre/post/residual mixes.
++        carry_bytes = 2 * self.hidden_size * (hc_mult + 1)
++        carry_bytes += 4 * (hc_mult * hc_mult + 2 * hc_mult)
++        latent_bytes = 512 * 2
++        before = sp_rows.padded_rows * carry_bytes
++        if compressor.fused_wkv_wgate.tp_size > 1:
++            before += sp_rows.num_tokens * latent_bytes
++        after = replay_rows * sp_rows.world_size * carry_bytes
++        after += sp_rows.padded_rows * latent_bytes
++        return after < before
++
++    def prepare_global_kv(self, positions, hidden_states, *, sp_rows=None):
+         """Build full-row global KV before the CED boundary gathers decoder rows."""
+         if self.compressor is None or hidden_states.shape[0] == 0:
+             return
+-        self._prepare_global_kv(positions, hidden_states)
++        self._prepare_global_kv(positions, hidden_states, sp_rows=sp_rows)
+ 
+     @eager_break_during_capture
+-    def _prepare_global_kv(self, positions, hidden_states):
++    def _prepare_global_kv(self, positions, hidden_states, *, sp_rows=None):
+         if not self._ready:
+             raise RuntimeError("V4.1 attention metadata is not prepared")
+         metadata = get_forward_context().attn_metadata
+@@ -975,7 +996,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         indexer = self.indexer
+         if indexer is None:
+             raise RuntimeError("V4.1 global KV source requires an indexer")
+-        rows = hidden_states.shape[0]
++        if sp_rows is not None and (
++            type(self.compressor) is not DeepseekCompressor
++            or self.compressor.compress_ratio != 1
++        ):
++            hidden_states = sp_rows.gather(hidden_states)
++            sp_rows = None
++        rows = hidden_states.shape[0] if sp_rows is None else sp_rows.num_tokens
++        sp_kwargs = {} if sp_rows is None else {"sp_rows": sp_rows}
+         # These are deliberately original metadata, never the decoder views.
+         main = metadata[self._owner().prefix]
+         state = (
+@@ -999,9 +1027,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 token_positions=positions,
+                 cos_sin=self.rotary_emb.cos_sin_cache,
+                 kv_page_size=self._main_page,
++                **sp_kwargs,
+             )
+         else:
+-            latent, slots = self.compressor(hidden_states, main, state)
++            latent, slots = self.compressor(hidden_states, main, state, **sp_kwargs)
+         self._issue_wo_prefetch(rows, after="compressor")
+         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+         # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 7fc8a0843..843e0ae53 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -124,6 +124,8 @@ class DeepseekCompressor(nn.Module):
+         hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+         self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
++        self._sp_enabled = compress_ratio == 1 and tp_size > 1
++        self._sp_weight = self._sp_kernel = None
+         disable_tp = tp_size <= 1 or 512 % (tp_size * 64) != 0
+         self.fused_wkv_wgate = MergedColumnParallelLinear(
+             hidden_size,
+@@ -256,6 +258,22 @@ class DeepseekCompressor(nn.Module):
+             ),
+         ]
+ 
++    def _sp_projection_call(self):
++        """Use the original TP shard's K reduction for the full row projection."""
++        from vllm.models.deepseek_v4_1.tilelang import prepare
++        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
++
++        layer = self.fused_wkv_wgate
++        split = layer.quant_method._split(layer)
++        return prepare.call(
++            bf16_gemm,
++            512,
++            layer.weight.shape[1],
++            out_dtype="bfloat16",
++            shards=split["shards"],
++            blocked=split["blocked"],
++        )
++
+     def declare_kernels(self) -> None:
+         """Declare the TileLang compression kernels (the worker calls this after
+         loading); binding allocates the serving storage and ratio 1's placeholder
+@@ -264,13 +282,31 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
++        sp_call = (
++            self._sp_projection_call() if getattr(self, "_sp_enabled", False) else None
++        )
++
+         def bind() -> None:
+             device = self.fused_wkv_wgate.weight.device
+             self._ensure_capacity_buffers(device, self.capacity, self.requests)
+             if self.compress_ratio == 1:
+                 tl.placeholder(self.requests, device)
+-
+-        prepare.declare(self._tilelang_calls, bind=bind)
++            if sp_call is not None:
++                # The decode projection retains its original TP weight and kernels.
++                # TP3 already stores all 512 columns; aligned TP gathers this one
++                # ratio-one weight once before memory profiling (5 MiB at H=5120).
++                weight = self.fused_wkv_wgate.weight.detach()
++                self._sp_weight = (
++                    tensor_model_parallel_all_gather(weight, dim=0)
++                    if self.fused_wkv_wgate.tp_size > 1
++                    else weight
++                )
++                self._sp_kernel = prepare.launch(sp_call)
++
++        prepare.declare(
++            lambda: self._tilelang_calls() + ([] if sp_call is None else [sp_call]),
++            bind=bind,
++        )
+ 
+     def _forward_tilelang(
+         self,
+@@ -282,11 +318,13 @@ class DeepseekCompressor(nn.Module):
+         token_positions=None,
+         cos_sin=None,
+         kv_page_size=None,
++        values=None,
+     ):
+         """The TileLang compression: at ratio 2 the requests' carries from the state
+         ring, then one launch over the step's rows that also saves the ring."""
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+ 
++        values = self._values if values is None else values
+         kv_kwargs = {}
+         if kv_cache is not None and token_positions is not None and cos_sin is not None:
+             kv_kwargs = dict(
+@@ -297,7 +335,7 @@ class DeepseekCompressor(nn.Module):
+             )
+         if self.compress_ratio == 1:
+             tl.compress(
+-                rows, 1, self._values, None, self.norm.weight,
++                rows, 1, values, None, self.norm.weight,
+                 metadata.query_start_loc, metadata.request_positions, self._row_ids,
+                 metadata.slot_mapping, metadata.live_counts, self._latent,
+                 self._emitted, self._slots, **kv_kwargs,
+@@ -331,11 +369,27 @@ class DeepseekCompressor(nn.Module):
+         token_positions=None,
+         cos_sin=None,
+         kv_page_size=None,
++        sp_rows=None,
+     ):
+         rows = hidden_states.shape[0]
+         if self._values is None:
+             raise RuntimeError("compressor kernels must be bound before forwarding")
+-        self._project(hidden_states)
++        values = None
++        if sp_rows is not None:
++            if self.compress_ratio != 1 or self._sp_kernel is None:
++                raise RuntimeError(
++                    "ratio-one SP projection must be bound before forwarding"
++                )
++            if rows != sp_rows.local_rows:
++                raise ValueError("SP compressor input does not match local rows")
++            local = self._values[:rows]
++            # Always use the prefill GEMM, even for a short local slice: it keeps
++            # the global prefill's K reduction and needs no decode workspace.
++            self._sp_kernel(hidden_states, self._sp_weight, local)
++            values = sp_rows.gather(local)
++            rows = sp_rows.num_tokens
++        else:
++            self._project(hidden_states)
+         self._forward_tilelang(
+             rows,
+             metadata,
+@@ -344,5 +398,6 @@ class DeepseekCompressor(nn.Module):
+             token_positions=token_positions,
+             cos_sin=cos_sin,
+             kv_page_size=kv_page_size,
++            values=values,
+         )
+         return self._latent[:rows], self._slots[:rows]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index dec14a6de..0a65be91b 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -404,20 +404,20 @@ class DeepseekV4DecoderLayer(nn.Module):
+             # residual updates and experts only need the selected replay rows.
+             del x_q
+             if sp_rows is not None:
+-                # Normalize local rows, gather only the normalized global KV
+-                # input, and exchange the selected replay rows of the carry.
+-                x = sp_rows.gather(x)
+-                residual, post_mix, res_mix, attn_pre = gather_sp_rows(
+-                    sp_rows, ced_indices, residual, post_mix, res_mix, attn_pre
++                # Global KV projects local rows and gathers its narrow latent.
++                # Decoder queries and residual updates only need replay rows.
++                self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
++                x, residual, post_mix, res_mix, attn_pre = gather_sp_rows(
++                    sp_rows, ced_indices, x, residual, post_mix, res_mix, attn_pre
+                 )
+                 sp_rows = None
+             else:
++                self.attn.prepare_global_kv(positions, x)
++                x = gather_rows(x, ced_indices)
+                 residual = gather_rows(residual, ced_indices)
+                 post_mix = gather_rows(post_mix, ced_indices)
+                 res_mix = gather_rows(res_mix, ced_indices)
+                 attn_pre = gather_rows(attn_pre, ced_indices)
+-            self.attn.prepare_global_kv(positions, x)
+-            x = gather_rows(x, ced_indices)
+             x_q = self.mhc.cast_rows(x)
+             positions = (
+                 gather_rows(positions, ced_indices)
+@@ -810,7 +810,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     ) -> torch.Tensor | IntermediateTensors:
+         sp = None
+         # With CED the encoder layers (before ced_decoder_start) still run on
+-        # every row; the boundary gathers global KV inputs and compact carries.
++        # every row; the boundary gathers global KV latents and compact carries.
+         sp_layers_available = ced_indices is None or (
+             self.ced_decoder_start is not None
+             and self.start_layer < self.ced_decoder_start
+@@ -927,10 +927,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if (
+                 sp is not None
+                 and boundary_indices is not None
+-                and boundary_indices.numel() * sp.world_size >= sp.num_tokens
++                and not layer.attn.ced_sp_saves_bytes(
++                    sp, boundary_indices.numel(), layer.hc_mult
++                )
+             ):
+-                # A dense selection (including prompt logprobs) would exchange
+-                # more compact slots than full rows. Keep the full-carry path.
++                # Dense replay or a replicated compressor can erase the payload
++                # saving. Include the narrow projection gather before choosing SP.
+                 hidden_states, residual, post_mix, res_mix, pre_mix = (
+                     None if t is None else sp.gather(t)
+                     for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index bdc59a933..f03cad2c2 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -9,7 +9,8 @@ layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
+ For a long prefill forward, SP turns the per-layer all-reduces into dim-0
+ reduce-scatters so that each rank owns 1/N of the rows for that work, and
+ all-gathers the rows back before the ops that need all of them. Weights stay
+-exactly as in ordinary TP; nothing is replicated. The static
++exactly as in ordinary TP, except that the CED boundary retains one full
++ratio-one BF16 compressor weight for its local-row projection. The static
+ ``_use_sequence_parallel`` construction flag stays off: this mode changes no
+ module.
+ 
+@@ -29,9 +30,10 @@ only where it cannot apply: tensor parallel size 1, pipeline parallelism,
+ static sequence parallelism and request boundary checkpoints. With CED
+ compaction, only the encoder layers before ``ced_decoder_start`` run on
+ every row: SP covers those and the boundary's row-wise normalization. The
+-boundary gathers its normalized input for full global KV construction and only
+-the selected replay rows of its residual carry. Dense selections keep the full
+-carry gather when compact slots would cost at least as many rows.
++boundary projects local global-KV rows and gathers their 512-column values,
++plus the selected replay rows of its normalized input and residual carry.
++Selections keep the full carry gather when compact slots plus the narrow
++projection gather would cost at least as many bytes.
+ 
+ ## Rows
+ 
+-- 
+2.43.0
+
