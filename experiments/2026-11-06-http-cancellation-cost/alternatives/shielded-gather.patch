@@ -1,0 +1,20 @@
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -93,7 +93,16 @@
+                 # Starlette middleware may cancel an AnyIO scope. Keep asynchronous
+                 # cleanup alive inside that scope, and retrieve both task outcomes.
+                 with anyio.CancelScope(shield=True):
+-                    await asyncio.gather(*tasks, return_exceptions=True)
++                    cleanup = asyncio.gather(*tasks, return_exceptions=True)
++                    interrupted = None
++                    while True:
++                        try:
++                            await asyncio.shield(cleanup)
++                            break
++                        except asyncio.CancelledError as exc:
++                            interrupted = exc
++                    if interrupted is not None:
++                        raise interrupted
+         except BaseException:
+             # A response produced by the handler may be abandoned while we
+             # join the listener. No response background task will release it.

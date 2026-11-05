@@ -1,5 +1,7 @@
 # HTTP request cancellation ownership
 
+Follow-up: [repeated cancellation and measured CPU cost](../2026-11-06-http-cancellation-cost/README.md) closes an additional cleanup edge case and records the newer 574-patch candidate. The source identities and results below remain the evidence for this initial fix.
+
 Cancelling a route can leave its handler and disconnect listener alive, retaining
 request data and continuing work after the caller has gone. Ordinary disconnects
 also return before asynchronous handler cleanup finishes. A response/disconnect
