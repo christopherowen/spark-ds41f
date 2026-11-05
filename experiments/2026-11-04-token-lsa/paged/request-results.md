@@ -69,3 +69,16 @@ Conclusion: the aggressive selector has modest diagnostic request gains while
 failing generated-token equivalence. The wider selector is effectively flat and
 still fails its only long case that prunes keys. Neither is a promotion candidate.
 The request-level performance goal with identical output tokens remains unmet.
+
+
+CPU decoding review of the stored captures clarifies the mismatch: the first
+changed aggressive tokens are at one-based positions 16, 10 and 74 for 32K,
+128K and 256K contexts. The wider preset shares the 256K divergence. Observed
+changes are in reasoning wording. Every long capture stops at the 128-token
+length cap before closing its reasoning span; all retain the correct registry
+code word in that prefix. These receipts establish generated-token divergence,
+not an incorrect final answer. Completed-answer equivalence and relative quality
+remain untested. The stored corpus confirms temperature 0 and seed 0 for every
+request; both qualification and timed requests preserve those settings. See
+[the metadata summary](../runs/request-diagnostic-01/output-difference-summary.json).
+Decoded text and raw IDs remain outside Git.
