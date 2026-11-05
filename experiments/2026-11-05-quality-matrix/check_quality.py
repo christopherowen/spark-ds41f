@@ -40,7 +40,8 @@ def check(generations,grades,benchmark):
         old=max(scores['native-a'],scores['native-b']);new=min(scores['lsa-a'],scores['lsa-b'])
         if new<old:losses.append(identity)
         if new>old:wins.append(identity)
-    return {'passed':not(losses or incomplete or unstable),'benchmark':benchmark,'tasks':len(ids),
+    candidate_incomplete=[r for r in incomplete if r['arm'].startswith('lsa-')]
+    return {'passed':not(losses or candidate_incomplete or unstable),'benchmark':benchmark,'tasks':len(ids),
             'wins':wins,'losses':losses,'incomplete':incomplete,'unstable':unstable,
             'promotion_qualified':False,'scope':'observed per-task no-loss only; no guarantee about untested inputs'}
 

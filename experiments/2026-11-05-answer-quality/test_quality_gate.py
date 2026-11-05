@@ -36,6 +36,14 @@ class QualityGate(unittest.TestCase):
         candidate['phases'][0]['records'][0].update(status='truncated',finish_reason='length',predicted=None)
         self.assertFalse(check([report(False),report(False)],[candidate,candidate])['passed'])
 
+    def test_native_truncation_can_be_outperformed(self):
+        native=report(False)
+        native['phases'][0]['records'][0].update(status='truncated',finish_reason='length',predicted=None)
+        result=check([native,native],[report(),report()])
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['phases'][0]['wins'],['document-a'])
+        self.assertEqual(len(result['phases'][0]['incomplete']),2)
+
     def test_one_bad_repeat_boot_cannot_be_hidden(self):
         result = check([report(),report()],[report(),report(False)])
         self.assertFalse(result['passed'])

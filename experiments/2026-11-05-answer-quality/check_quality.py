@@ -65,7 +65,8 @@ def check(native, candidate):
                'wins':wins,'losses':losses,'incomplete':incomplete,'unstable':unstable,'domains':strata}
         phases.append(row)
         if losses:failures.append({'phase':row['name'],'reason':'new incorrect or incomplete answers','ids':losses})
-        if incomplete:failures.append({'phase':row['name'],'reason':'final-answer evaluation did not complete naturally'})
+        if any(r['boot'].startswith('lsa-') for r in incomplete):
+            failures.append({'phase':row['name'],'reason':'candidate final-answer evaluation did not complete naturally'})
         if unstable:failures.append({'phase':row['name'],'reason':'answer decisions differ between repeated boots'})
     return {'passed':not failures,'failures':failures,'phases':phases,
             'independent_documents':len(documents),'promotion_qualified':False,

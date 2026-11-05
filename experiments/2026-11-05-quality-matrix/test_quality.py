@@ -64,6 +64,15 @@ class GateTests(unittest.TestCase):
         generations,grades=fixture('code');generations['lsa-a']['records'][0]['finish_reason']='length'
         self.assertFalse(check(generations,grades,'code')['passed'])
 
+    def test_candidate_can_solve_a_task_native_truncates(self):
+        generations,grades=fixture('code')
+        for label in ('native-a','native-b'):
+            generations[label]['records'][0].update(status='incomplete',finish_reason='length')
+            grades[label]['records'][0]['correct']=False
+        result=check(generations,grades,'code')
+        self.assertTrue(result['passed']);self.assertEqual(result['wins'],['one'])
+        self.assertEqual(len(result['incomplete']),2)
+
     def test_changed_protocol_and_identity_are_invalid(self):
         for key,value in [('source_lock',{'protocol':'different'}),('manifest_sha256','different')]:
             benchmark='code' if key=='source_lock' else 'ruler'

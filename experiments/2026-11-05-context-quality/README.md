@@ -73,3 +73,8 @@ The four completed cases are unchanged; seeds, templates, eligibility and
 generator commands remain the same. All 156 cases must finish and be frozen
 before confirmation inference. `runs/resume-01` records the retained interruption
 and prefix-integrity check; no model output informed the continuation.
+
+All 156 confirmation inputs now finish with zero generator errors. The complete
+receipt and retained interruption are in `runs/prepare-heldout-01`, and
+`heldout.set.json` seals their request/evaluation/grader hashes. Together with
+the 52-case pilot, all 208 cases are frozen before any RULER model request.

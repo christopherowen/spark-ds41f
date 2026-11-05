@@ -21,6 +21,12 @@ The pinned official answer extractor runs on final content only, outside timing.
 There are no grading calls, comparison passes or host activation copies in the
 serving implementation.
 
+The candidate must complete every final answer naturally. A native budget-limit
+failure remains visible and scores zero, with all its generation time charged;
+it does not disqualify a candidate that completes and independently answers that
+question correctly. Baseline output is not an oracle. Protocol mismatches,
+candidate incompletion and lost native-correct answers still fail closed.
+
 The pilot freezes one example per domain and untemplated-token bin (8K–64K and
 64K–256K), covering all six domains. Up to four independent document contexts per stratum form the
 held-out confirmation set (all remaining independent contexts when a stratum is
