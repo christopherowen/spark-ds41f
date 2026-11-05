@@ -111,7 +111,8 @@ benchmark. It checks exact window ownership, clean source/harness checkouts,
 image identity, every rank's verdict and prerequisite log hashes. Containers
 have two CPUs, 16 GiB with no extra swap (probe: 12 GiB), process and time limits.
 The controller requires 40 GiB free before launch, keeps the existing 24 GiB
-memory floor and thermal limits, cools below 55 C and maintains the window
+memory floor and thermal limits, retains raw memory/thermal samples, cools
+below 55 C and maintains the window
 heartbeat. Management uncertainty stops further launches and retains the hold.
 
 The synthetic matrix has 7 row counts, all-reduce/all-gather/mixed chains and

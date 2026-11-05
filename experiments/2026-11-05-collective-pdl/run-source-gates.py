@@ -205,7 +205,19 @@ def main():
             check = ssh(node, ["docker", "ps", "-q", "--filter", "name=spark-ds41f"])
             assert check.returncode == 0 and not check.stdout.strip(), "serving still runs"
         from spark_ds41f.bench import MemoryWatch
-        watch = MemoryWatch(nodes,24,guard)
+        class RecordedWatch(MemoryWatch):
+            def __init__(self,*args):
+                self.samples=[]
+                super().__init__(*args)
+            def _memory(self,name,text):
+                super()._memory(name,text)
+                with self.lock:
+                    self.samples.append({"at":now(),"node":name,"kind":"memory","available_swap_kib":text})
+            def _temperature(self,name,sample):
+                super()._temperature(name,sample)
+                with self.lock:
+                    self.samples.append({"at":now(),"node":name,"kind":"thermal",**sample})
+        watch = RecordedWatch(nodes,24,guard)
         watch.wait_ready()
         if guard_errors: raise RuntimeError(guard_errors)
         with watch.lock:
@@ -316,7 +328,8 @@ def main():
             if any(x["exit"] or x["problems"] for x in outcomes):
                 raise RuntimeError(f"{kind} failed; retain all rank logs")
             owned()
-            if heartbeat_errors: raise RuntimeError(heartbeat_errors)
+            watch.check()
+            if heartbeat_errors or guard_errors: raise RuntimeError(heartbeat_errors+guard_errors)
         receipt["passed"] = True
     except BaseException as exc:
         if isinstance(exc, ManagementFailure) or "telemetry" in str(exc): management_failure = True
@@ -328,6 +341,9 @@ def main():
         if watch is not None:
             receipt["thermal"] = watch.thermal_summary()
             receipt["memory"] = watch.close()
+            conditions = args.out/"conditions.json"
+            conditions.write_text(json.dumps(watch.samples,indent=2)+"\n")
+            receipt["conditions"]={"path":conditions.name,"sha256":hashlib.sha256(conditions.read_bytes()).hexdigest()}
         if management_failure:
             receipt.setdefault("cleanup_errors",[]).append("management telemetry or command failed; no new hardware launch")
         if fan is not None:
