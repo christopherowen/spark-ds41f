@@ -71,6 +71,7 @@ def prepare_queries(width:int,page:int,budget:int):
     return unpack
 
 
+import math
 import torch
 from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v4_1.tilelang.block_shortlist import BlockMeanShortlistPlan,block_candidates
@@ -92,7 +93,6 @@ class QueryReusePlan(BlockMeanShortlistPlan):
             self.remap = remap_blocks(self.capacity)
         self.unpack = prepare_queries(width,page,self.block_budget)
         self.prepared_score = prepared_scores(width,page,self.block_budget)
-        self.score = self._score_reused
 
     def _specs(self,rows):
         specs = super()._specs(rows)
@@ -106,15 +106,34 @@ class QueryReusePlan(BlockMeanShortlistPlan):
         return [prepare.call(prepare_queries,width,page,b*8),
                 prepare.call(prepared_scores,width,page,b*8),*parent[1:]]
 
-    def _score_reused(self,q,scales,weights,pool,table,lengths,active,scores,counts):
-        decoded = self._query_workspace[:len(q)]
-        self.unpack(q,scales,lengths,active,decoded)
-        means = pool[:,self.page*68//2:self.page*100//2].view(len(pool),self.page//8,128)
-        self.prepared_score(decoded,scales,weights,means,table,lengths,active,scores,counts)
-
     def run(self,q,scales,weights,pool,table,lengths,active,candidates=None,candidate_lengths=None,
             *,out=None,candidate_out=None,candidate_out_lengths=None,scratch=None):
-        if scratch is None:raise ValueError('outputs and scratch must be admitted')
-        self._query_workspace = scratch[list(self._specs(len(q))).index('prepared_q')]
-        return super().run(q,scales,weights,pool,table,lengths,active,candidates,candidate_lengths,
-                           out=out,candidate_out=candidate_out,candidate_out_lengths=candidate_out_lengths,scratch=scratch)
+        if candidates is not None or candidate_lengths is not None:
+            raise ValueError('block summaries cannot consume reindex candidates')
+        if out is None or scratch is None:raise ValueError('outputs and scratch must be admitted')
+        if self.source and (candidate_out is None or candidate_out_lengths is None):
+            raise ValueError('source handoff outputs are required')
+        rows = len(q)
+        specs = self._specs(rows)
+        if len(scratch) != len(specs):raise ValueError('workspace differs from admission')
+        full = dict(zip(specs,scratch))
+        def buffers(name,plan,b):return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
+        for start in range(0,rows,self.row_cap):
+            end = min(start+self.row_cap,rows)
+            r = end-start
+            current = self._specs(r)
+            b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0]) for name,t in full.items()}
+            qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
+            self.unpack(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),lr,active,b['prepared_q'])
+            means = pool.view(torch.bfloat16)[:,self.page*68//2:self.page*100//2].view(len(pool),self.page//8,128)
+            self.prepared_score(b['prepared_q'],sr.view(torch.uint8).reshape(r,32,4),wr,
+                                means,tr,lr,active,b['scores'],b['counts'])
+            self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=buffers('coarse',self.coarse,b))
+            self.assemble(b['selected'],lr,active,b['candidates'],b['candidate_lengths'])
+            _,scores = self.final.run(qr,sr,wr,pool,tr,lr,active,b['candidates'],b['candidate_lengths'],
+                                     out=out[start:end],scratch=buffers('final',self.final,b))
+            if self.source:
+                self.select_blocks.run(scores,b['candidate_lengths'],active,b['compact'],b['block_values'],
+                                       counts=candidate_out_lengths[start:end],scratch=buffers('blocks',self.select_blocks,b))
+                self.remap(b['compact'],b['candidates'],candidate_out[start:end])
+        return out,None
