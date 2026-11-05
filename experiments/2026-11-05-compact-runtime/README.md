@@ -37,3 +37,27 @@ vLLM `6d4e49d1cdbb6513819e47145e0e52fdab327b6b`; the overlays must equal that
 fresh prepared tree. Use only clean published commits for GPU work, hold the
 sp8 native lease and GPU lock, and leave any serving group untouched during
 these isolated component tests.
+
+The first integration at source `4a455449` passes all 12 captured batches,
+four strict uninitialized-memory fixtures with zero sanitizer errors, and six
+graph/cache/recycling cases. The actual-input process peaks at 294157312 bytes
+allocated / 327155712 reserved; lifecycle testing peaks at 651382784 /
+905969664. These include out-of-band oracle fixtures, not serving memory usage.
+Every native prefix and encoded mean check passes. Full receipts remain in
+`runs/gates-01`; no raw operand or generated response is copied into Git.
+
+Two fresh timing processes show Native68 / compact selector ratios of
+1.772–1.791x (dense8), 2.612–2.646x (dense64), 1.629x (source8) and 1.945x
+(source64). Single rows still lose: dense0.793–0.849x and source0.962–0.969x.
+Complete-page maintenance is measured separately, not removed from the design:
+single-page updates take about52–53 microseconds; the fixed full snapshots take
+about78–89 microseconds dense and247–250 microseconds source. Keep these costs
+in subsequent full-model request measurements. No request-speed or answer-quality
+pass follows from these component results.
+
+The sp8 window releases at 19:30:58 UTC with no remaining containers; the later
+independent read finds no native reservation or pending request. The same four
+runtime overlays are selected by `tp4.json` for separate model qualification on
+sp1–sp4. Their new cold four-boot LongBench pilot uses source `08e6ff32`, the
+original frozen inputs and unchanged generation/grading rules. It remains
+unqualified until all final-answer, completion, timing and condition checks pass.
