@@ -1,0 +1,13 @@
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -438,7 +438,9 @@
+     reader->fragment_count = reader->job_count = 0;
+     reader->miss_count = 0;
+     bool use_cache = reader->cache_sets > 0 && (count <= PLE_CACHE_MAX_LOOKUPS || dst_is_cached);
+-    bool check_cache = use_cache && reader->cache_populated > 0;
++    /* Large direct-to-mapped steps must not populate the decode cache, but can
++     * still reuse its immutable rows. Admission remains bounded by use_cache. */
++    bool check_cache = reader->cache_sets > 0 && reader->cache_populated > 0;
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+     reader->miss_src_scales = dst_is_cached ? dst_scales : NULL;
