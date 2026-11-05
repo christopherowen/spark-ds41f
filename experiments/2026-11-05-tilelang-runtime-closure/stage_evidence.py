@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 
 assert socket.gethostname() == "spark-0016", "large evidence processing is remote only"
@@ -39,7 +40,7 @@ for source, name, needs_closure in sources:
             or (needs_closure and not (source / "closure.json").exists())):
         continue
     working = target.with_name(target.name + ".staging")
-    working.mkdir()
+    working.mkdir(exist_ok=True)
     retained, count = [], 0
     for path in sorted(source.rglob("*")):
         if not path.is_file():
@@ -51,11 +52,23 @@ for source, name, needs_closure in sources:
             continue
         destination = working / path.relative_to(source)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.link(path, destination)
+        if destination.exists():
+            assert sha(destination) == sha(path), destination
+        else:
+            try:
+                os.link(path, destination)
+            except PermissionError:
+                # Docker-owned output may be readable without permission to
+                # hardlink it. Copy remotely with a fixed-size buffer instead.
+                pending = destination.with_name(destination.name + ".copying")
+                with path.open("rb") as source_file, pending.open("wb") as sink:
+                    shutil.copyfileobj(source_file, sink, length=1 << 20)
+                assert sha(pending) == sha(path), path
+                pending.rename(destination)
         count += 1
     records[name] = dict(source=str(source), staged_files=count,
                           raw_reports_retained_on_node=retained,
-                          method="Hardlink selected closed-job artifacts; compression replaces only staging links. Original artifacts remain intact on sp8.")
+                          method="Hardlinks where permitted, otherwise bounded remote streaming copies; original artifacts remain intact on sp8.")
     (working / "evidence-source.json").write_text(json.dumps(records[name], indent=2) + "\n")
     working.rename(target)
     print(name, count, "files", flush=True)
