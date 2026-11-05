@@ -1,0 +1,68 @@
+From c975c87353fb839cec412357272450040ee90ed6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 15:51:27 +0100
+Subject: [PATCH] Use fused Markov drafting on a single rank
+
+Upstream base: 1f33102547e4da5c64712390604695d1abd577c4 (candidate-38). Rationale: TP1 used an unfused anchor gather, five embedding lookups and a confidence stack each step. Treat its full vocabulary as one shard and use the existing fused projection/selection/embedding path. Quality: exact greedy rules and supported TileLang head requirement match multi-rank serving; unsupported configurations fail at warmup. Tests: 53 focused checks pass on both boots, including the added full-vocabulary case; a 43-layer dummy trace removes 42 ATen launches and preserves token/logprob bits. Standalone component performance and remaining full qualification are pending. Upstream status: local experiment, not submitted.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 4 ++--
+ tests/v1/worker/test_dspark_greedy_markov.py  | 4 ++--
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 9 ++++++---
+ 3 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 364ad18c70..2c05e8dee1 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -987,11 +987,11 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+             torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
+ 
+ 
+-def test_dspark_tp_defaults_enabled_for_multi_rank(monkeypatch):
++def test_dspark_fused_greedy_enabled_at_every_tp_size(monkeypatch):
+     from vllm.models.deepseek_v4_1.nvidia import dspark
+ 
+     monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+-    assert not dspark._vocab_parallel_greedy()
++    assert dspark._vocab_parallel_greedy()
+     monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
+     assert dspark._vocab_parallel_greedy()
+     assert not hasattr(dspark, "_use_sequence_parallel")
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 71ba577635..942d71e316 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -141,8 +141,8 @@ def _vocab_parallel_speculator(model, rows, n_spec, rank, top2, device):
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize(
+     "padded,shard_vocab,vocab_start",
+-    [(32320, 32320, 96960), (43136, 43008, 86272)],
+-    ids=["tp4", "tp3"],
++    [(129280, 129280, 0), (32320, 32320, 96960), (43136, 43008, 86272)],
++    ids=["tp1", "tp4", "tp3"],
+ )
+ def test_fused_markov_greedy_steps_match_materialized_bias(
+     padded, shard_vocab, vocab_start, dtype, top2, monkeypatch
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 112cf63d3f..d43aeb05ef 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -62,9 +62,12 @@ logger = init_logger(__name__)
+ 
+ 
+ def _vocab_parallel_greedy() -> bool:
+-    """Shard the Markov projection by vocabulary and reduce greedy drafts across
+-    ranks when TP > 1."""
+-    return get_tensor_model_parallel_world_size() > 1
++    """Use the fused vocabulary-shard path at every TP size.
++
++    One rank owns the full vocabulary and its pair gather is a view. It still
++    needs fused Markov selection/embedding and the final confidence layout.
++    """
++    return True
+ 
+ 
+ # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
+-- 
+2.54.0 (Apple Git-157)
+
