@@ -1,5 +1,32 @@
 # Current LSA acceptance criteria
 
+Owner revision, 2026-11-05: **thinking/reasoning may diverge; the completed
+actual answer is the acceptance target.** Reasoning-token mismatches alone do
+not reject a candidate or require proof of superior answer quality. Preserve
+reasoning captures as diagnostics, and charge all reasoning time to performance.
+
+A run must reach a completed final answer before it can qualify final-answer
+behavior. An empty answer after a truncated reasoning prefix is inconclusive,
+not equivalence. The 128-token long-context receipts below are reasoning-prefix
+measurements; their historical all-generated-token failures are not evidence of
+incorrect final answers. No final-answer quality loss is authorized by this
+revision. Changes to actual answers remain subject to the existing requirement
+to preserve them unless superior quality is established.
+
+Task correctness can be scored with predeclared objective checks on completed
+answers. Useful throughput is the number of correctly completed tasks divided
+by workload wall time, including thinking, failures and retries. At concurrency,
+use elapsed workload wall time rather than summing overlapping request times.
+A proposed quality-based comparison uses a lower confidence bound on the paired
+quality difference against a predeclared tolerance, alongside a confidence bound
+on useful speedup. No nonzero quality-loss tolerance or new promotion threshold
+is adopted here. Evaluate important task/context groups separately.
+
+## Historical 2026-11-04 generated-token criterion
+
+The following criterion governed earlier runs. Its requirement to match reasoning
+tokens is superseded by the owner's revision above; retained receipts are unchanged.
+
 Owner revision,2026-11-04: equivalence is the **generated token sequence**.
 Selected keys, cluster membership, scores, intermediate values and attention
 arithmetic may differ. Base checkpoint weights and tokenizer remain unchanged;

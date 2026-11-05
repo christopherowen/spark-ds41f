@@ -1,5 +1,12 @@
 # Paired request results, 2026-11-05
 
+Subsequent owner revision permits divergent thinking and evaluates the completed
+actual answer. The raw-token counts below retain the criterion used when these
+runs were collected. Their reasoning-only differences do not reject final-answer
+quality under the revised rule. Every long capture ends before its final answer,
+so completed-answer qualification remains **inconclusive**. See the [current
+acceptance criteria](../../2026-11-04-clustered-indexer/acceptance.md).
+
 Neither selector meets the generated-token acceptance criterion. The aggressive
 preset matches 6/9 and the wide preset 8/9 on **both fresh boots**, at serial and
 four-concurrent qualification. Aggressive changes all three long notebooks; wide
