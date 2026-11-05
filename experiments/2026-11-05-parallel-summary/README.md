@@ -39,3 +39,23 @@ The arithmetic, operands and expected bytes remain identical. Require the same
 sanitizer/equality checks and two new timing processes before considering it.
 This tests whether more lanes reduce per-thread serial dimension work; retain
 both favorable and unfavorable page/batch results.
+
+The512-thread screen at `727595b8` passes the same actual/synthetic byte checks
+with zero initialization and race errors. Two fresh processes measure dense
+single-page maintenance10.20–10.30 microseconds and source16.56–16.58, versus the
+recorded preceding approximately52–53. Full snapshots measure28.09–29.48 dense
+and90.90–91.01 source microseconds. Skip-only costs2.73–4.08 microseconds are
+retained, not hidden; all samples and memory are in `runs/screen-03`. These are
+maintenance components only. The same lease first qualifies the native reader's
+compact-prefix behavior on all12 actual batches, then releases at21:06:21 UTC.
+Independent verification finds no reservations or compute processes.
+
+The package integration changes only `summarize_compact`; the cooperative kernel
+body equals the512-thread prototype. Candidate fusion and all scoring/selection
+arithmetic remain unchanged. Fresh application of the ordered11-patch stack
+from C36 equals the overlay (`runs/local/source-check.json`). Runtime gates must
+include both summary declarations in the frozen-call preparation, all actual
+coarse/fine checks, strict initialization, lifecycle/recycling and two complete
+selector timing processes. Model recipe `native-source-tp4.json` is an explicit
+interaction of the existing native-source dispatch with the two separately
+screened exact optimizations; it has no answer or request qualification yet.

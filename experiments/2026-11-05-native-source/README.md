@@ -20,3 +20,10 @@ native consistently. Then face the same frozen26-task RULER screen with two
 fresh boots per arm. A newly wrong or incomplete answer rejects it. All later
 full-context, independent held-out, coding and performance/admission gates remain
 required even if this lean pilot passes. Keep every failure and restore receipt.
+
+Source `727595b8` passes all12 actual native key/handoff comparisons under strict
+initialization checking with unwritten compact suffixes (`runs/prefix-01`). CPU
+inspection also verifies both page sizes route source and reindex plans and their
+declarations to native, while dense plans retain the compact route. This is
+cache/dispatch qualification only. The four-boot RULER26 pilot is separate and
+must retain all score, completion, timing and restoration observations.
