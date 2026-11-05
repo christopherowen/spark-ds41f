@@ -30,3 +30,12 @@ fixed inventories are retained in `experiments/2026-11-05-tilelang-runtime-closu
 on branch `feat/tilelang-runtime-closure`. The two patched files match that
 composed source byte-for-byte. A built-image/full-serving check remains separate;
 no serving cluster operation is performed by these isolated sp8 experiments.
+
+## Final combined check
+
+Both final composed boots pass all 1,446 correctness checks. The 16 public
+score-to-CPU routes on each wire boot contain no ATen packing kernel, and all
+12 changed-path complete host-call/stream-wait cases pass both strict timing
+gates. See `final-qualification.json`. Four 43-layer dummy request traces contain
+only TileLang compute and preserve token/logprob bits. This does not qualify
+dense-path host overhead, real-weight throughput or physical networking.
