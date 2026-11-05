@@ -120,3 +120,13 @@ This representation will not advance unchanged to serving. The next diagnostic
 profiles the stages after complete-plan timing; it changes no runtime arithmetic
 or selection. Released at 14:34:32 UTC, independently observed under the next
 foreign holder at 14:35.
+
+
+A separate exact-arithmetic tuning probe changes only the coarse matrix tile
+from 64 to 128 summaries per CTA. It tests whether reusing each decoded query
+across twice as many summaries reduces cost. The runtime default is unchanged.
+`coarse_tile_probe.py` substitutes the existing parameter only in the out-of-band
+check/timing program. All 12 actual batches must retain the independent visible
+coarse BF16 score bits, fine-score bits and ordering before two fresh timing
+processes. Any failed bit check rejects this optimization. This does not change
+summary representation, budgets, fine-score arithmetic or answer protocol.
