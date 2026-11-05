@@ -206,10 +206,22 @@ python3 experiments/2026-11-04-lossless-memory/analyze_screen.py \
 Isolated expert-scale and Engram arms, canonical source locks, exactness
 bundles and repeated release-suite plans are prepared. A portable C fixture
 reproduced signed overflow on invalid Engram metadata; the new guard rejects it
-and preserves every byte in 1,025 valid rows across page boundaries. Native GPU
-tests and serving performance for these two arms remain unqualified.
+and preserves every byte in 1,025 valid rows across page boundaries. The scale
+arm's native GPU gates pass; Engram's native gates and both arms' serving
+performance remain unqualified.
 Complete source/wheel inputs and both local build checks now pass. The final
 Engram arm records cold preparation and cache reuse costs; its qualification
 controller verifies every rank's complete packed file against source bytes
 before timings. See `QUALIFICATION.md` for exact commands and failure guards.
 See `decision.md`, `base.json` and `runs/preparation.json`.
+
+The scale arm's corrected full gate passed all 132 test files on each rank:
+7,337 passed, 355 skipped, zero failed or errored. Its initial complete primary
+suite used the newer stream collector and is retained as a separate observation.
+An offline comparison with the recorded 1030 model report matches all 256
+generated sequences and 65,536 returned score vectors exactly. The controller
+honored the queued collector handoff after that primary, restored C36 and exited
+1; it did not run companions, a repeat boot or the remaining functional checks.
+`expert-scales/first-primary-results.json` indexes 114 lossless archives, including
+the native tests, complete primary, original launch error and restoration receipt.
+This is neither a matched performance result nor release qualification.

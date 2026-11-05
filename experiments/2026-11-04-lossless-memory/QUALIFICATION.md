@@ -4,9 +4,13 @@ These are measurement candidates. The standalone FP8 GPU screen ran and rejected
 all three tested Huffman layouts, all three fixed-field layouts and all four
 independent-plane LZ4 layouts. Each of the twenty fresh containers passed its
 exact-byte gate. The isolated scale image built
-and passed its component gate on every rank; its first full gate failed inherited
-fixtures and did not start serving measurement. Engram remains unbuilt. No
-serving improvement or release acceptance is claimed.
+and passed its component gate on every rank. Its first full gate failed inherited
+fixtures and did not start serving measurement; the corrected full gate passed
+7,337 tests with 355 skips on every rank. The first complete primary under the
+newer collector preserved all 256 generated sequences and 65,536 returned score
+vectors exactly. That window restored C36 after the queued collector handoff;
+the required matched two-boot cohort remains separate. Engram remains unbuilt.
+No serving improvement or release acceptance is claimed.
 
 ## Source identities
 
@@ -25,7 +29,14 @@ auxiliary sources and hash-locked aarch64 wheels. Both `build check` commands
 pass. `runs/full-input-preparation/` retains the initial fetch failure and retry;
 `runs/engram-observation-preparation/` records the final instrumented Engram tree.
 The scale image is built and its initial gates/restoration are recorded in
-`expert-scales/initial-gate-results.json`. Engram image construction and both
+`expert-scales/initial-gate-results.json`. The corrected full gate, complete
+unmatched primary, original operator launch failure, exact model comparison and
+restoration are retained in `expert-scales/first-primary-results.json` and its
+114 original/analysis archives. The original supervisor failed before launching
+a controller; the corrected supervisor records the actual child exit. The later
+controller exit 1 records the deliberate window handoff, rather than a model or
+hardware failure. No missing companion, repeat or functional result is a pass.
+Engram image construction and both
 candidates' complete corrected qualification remain required. The first image attempt was
 rejected before stopping service because its plan used a non-resolving profile
 path; `runs/component-plan-failure/` retains the original receipt and logs.
@@ -183,6 +194,26 @@ exactly; see `recorded-reference-repeat.json`. It issues no inference requests
 and supplies no candidate qualification or new released-build measurement.
 Both candidate comparisons must pass before a release proposal claims unchanged
 recorded model behavior.
+
+`recorded-performance-reference.json` also retains the already-recorded October
+30 first/repeat performance inputs and their original identities. The published
+first decode and companion records match their native JSON values; native stall
+records additionally retain samples omitted from publication. Native/published
+prefill points and samples match at 32,768, 131,072 and 262,144 tokens. The native
+repeat has a 500,000-token point, which cannot supply a repeat for the published
+524,288- or 1,000,000-token workloads. Those reference-repeat gaps remain explicit.
+No published baseline is edited and no released image is measured again.
+The published long-prefill extension lacks independent all-rank identity and
+condition records, and its outer duration remains the original run's duration.
+Retain actual prompt-token mismatch warnings and compare per-size observations;
+nominal sizes alone do not establish identical work or a promotion-grade gain.
+
+The saved C36 screen has one boot and uses the newer token-ID/empty-delta progress
+collector. Its client throughput, TTFT, TPOT and event gaps are not a matched
+comparison to this cohort's recorded policy. C36 can provide context through
+independently compatible engine counters or unchanged prefill workloads, with
+its missing repeat stated. It already contains both storage ideas, so a gain
+against 1030 cannot be called an incremental improvement to C36.
 
 `functional-reference.json` pins the two original 1030 functional JSONL records
 and their unchanged probe scripts. The selected deterministic-control scenarios
