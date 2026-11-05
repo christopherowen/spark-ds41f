@@ -44,3 +44,19 @@ each boot must show a five-standard-error upper ratio at or below one, or prove
 the same GPU program and bindings. Inconclusive measurements remain unresolved.
 This gate covers device execution; host latency and complete model/fabric
 qualification are separate requirements. Results and failures will be appended.
+
+## First screen
+
+Vectorization alone passed 88 tests on both boots but failed the performance gate.
+The 96-row padded FP32 copy remained 1.65% / 1.76% slower; the 96-row dense
+FP16 cast was also unresolved. All raw samples and CUDA traces are retained in
+`runs/sampler-v1/`. The second variable changes only block traversal order for
+aligned copies so consecutive blocks visit adjacent columns. It keeps the scalar
+path above CUDA grid-y's 65,535-row limit and adds both boundary cases.
+
+`run_full.py` runs the combined stack twice each at TP4/TP3-shaped layers on
+sp8 with Nsight graph-node tracing. `inventory.py` assigns every kernel to exact
+generated TileLang symbols, ATen, NCCL or an explicit unknown bucket; it separates
+measured requests and grid replay from startup. This is a single-GPU dummy-weight
+check without Engram or physical peers, so it cannot establish multi-node
+transport coverage or real-weight model quality.

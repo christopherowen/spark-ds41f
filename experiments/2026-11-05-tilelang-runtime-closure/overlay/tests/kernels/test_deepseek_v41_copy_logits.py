@@ -86,3 +86,10 @@ def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols):
     torch.testing.assert_close(got, src.float(), rtol=0, atol=0)
     assert got.is_contiguous() and got.data_ptr() != src.data_ptr()
     assert torch.equal(src, before)
+
+
+@pytest.mark.parametrize("rows", [65535, 65536])
+def test_padded_copy_crosses_grid_y_limit(rows):
+    src = torch.randn((rows, 16), dtype=torch.float32, device="cuda")[:, :4]
+    got = kernels.copy_logits(src)
+    torch.testing.assert_close(got, src, rtol=0, atol=0)

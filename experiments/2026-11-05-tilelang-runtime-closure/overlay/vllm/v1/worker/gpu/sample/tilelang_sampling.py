@@ -3449,7 +3449,11 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False):
         src: T.StridedTensor((rows, cols), source_strides, dtype),
         dst: T.Tensor((rows, cols), T.float32),
     ):
-        with T.Kernel(rows, T.ceildiv(cols, 1024), threads=256) as (row, block):
+        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
+        grid_y = rows if vectorized else T.ceildiv(cols, 1024)
+        with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
+            row = by if vectorized else bx
+            block = bx if vectorized else by
             tx = T.get_thread_binding()
             if vectorized:
                 T.assume(row_stride % 4 == 0)
@@ -3488,6 +3492,7 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
     else:
         vectorized = (
             logits.stride(1) == 1
+            and logits.shape[0] <= 65535
             and logits.shape[1] % 4 == 0
             and _triton_run(logits) > 1
         )
