@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -32,13 +33,17 @@ def main():
     parser.add_argument('--split',choices=['pilot','heldout'],required=True)
     parser.add_argument('--tasks',nargs='+')
     parser.add_argument('--lengths',nargs='+',type=int)
+    parser.add_argument('--resume',action='store_true',help='validate and retain an interrupted preparation before continuing')
     args=parser.parse_args()
     lock=json.loads(LOCK_PATH.read_text())
     assert '.'.join(map(str,sys.version_info[:3]))==lock['python'],'use the pinned preparation interpreter'
     source=args.source.resolve();tokenizer=args.tokenizer.resolve();assets=args.assets.resolve();out=args.out.resolve()
     assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip()==lock['source']['revision']
     subprocess.run(['git','diff','--exit-code'],cwd=source,check=True,stdout=subprocess.DEVNULL)
-    assert not out.exists();out.mkdir(parents=True)
+    if args.resume:
+        assert out.is_dir()
+    else:
+        assert not out.exists();out.mkdir(parents=True)
     for name,expected in lock['tokenizer']['files'].items():assert sha(tokenizer/name)==expected['sha256'],name
     for name,expected in lock['data_artifacts'].items():
         assert sha(assets/name)==expected['sha256'],name
@@ -50,6 +55,24 @@ def main():
     names=args.tasks or lock['tasks'];lengths=args.lengths or lock['generator_lengths']
     assert set(names)<=set(lock['tasks']) and set(lengths)<=set(lock['generator_lengths'])
     receipt={'source_lock_sha256':sha(LOCK_PATH),'split':args.split,'complete':False,'cases':[],'errors':[],'model_requests_sent':0,'prepare_source_sha256':sha(Path(__file__)),'python':'.'.join(map(str,sys.version_info[:3]))}
+    if args.resume:
+        receipt=json.loads((out/'receipt.json').read_text())
+        assert not receipt['complete'] and not receipt['errors'] and receipt['model_requests_sent']==0
+        assert receipt['source_lock_sha256']==sha(LOCK_PATH) and receipt['split']==args.split
+        prior=[json.loads(line) for line in (out/'requests.jsonl').read_text().splitlines()]
+        assert [r['id'] for r in prior]==[r['id'] for r in receipt['cases']]
+        assert len({r['id'] for r in prior})==len(prior)
+        for row,record in zip(prior,receipt['cases']):
+            folder=out/row['id']
+            assert sha(folder/'request.json')==record['request_sha256']
+            assert row==json.loads((folder/'request.json').read_text())
+            assert hashlib.sha256(row['prompt'].encode()).hexdigest()==record['prompt_sha256']
+        history=out/'history';history.mkdir(exist_ok=True)
+        snapshot=history/('receipt-'+str(len(list(history.glob('receipt-*.json')))+1)+'.json')
+        shutil.copyfile(out/'receipt.json',snapshot)
+        receipt.setdefault('resumes',[]).append({'previous_receipt_sha256':sha(snapshot),'prepare_source_sha256':sha(Path(__file__))})
+    completed={r['id'] for r in receipt['cases']}
+    encountered=[]
     def save(): (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     env=dict(os.environ,NLTK_DATA=str(assets/'nltk-data'),TOKENIZERS_PARALLELISM='false',HF_HUB_OFFLINE='1')
     try:
@@ -59,7 +82,20 @@ def main():
                 for repeat in range(lock['samples_per_split'][args.split]):
                     seed=lock['seed_base']+lock['split_seed_offsets'][args.split]+lock['tasks'].index(name)*1000+lock['generator_lengths'].index(length)*100+repeat
                     identity=f'{name}-l{length}-s{seed}'
-                    folder=out/identity;folder.mkdir()
+                    encountered.append(identity)
+                    if identity in completed:
+                        assert receipt['cases'][len(encountered)-1]['id']==identity,'resume must keep the original task order'
+                        continue
+                    assert not completed-set(encountered),'resume cannot skip a previously prepared case'
+                    folder=out/identity
+                    if args.resume and folder.exists():
+                        archive=out/'interrupted';archive.mkdir(exist_ok=True)
+                        target=archive/(identity+'-'+str(len(list(archive.iterdir()))+1))
+                        folder.rename(target)
+                        receipt.setdefault('interruptions',[]).append({'id':identity,'archive':str(target.relative_to(out)),
+                            'reason':'generator was interrupted before its success receipt; original files retained',
+                            'files_sha256':{str(p.relative_to(target)):sha(p) for p in target.rglob('*') if p.is_file()}})
+                    folder.mkdir()
                     command=[sys.executable,str(data/'synthetic'/(config['task']+'.py')),
                              '--save_dir',str(folder),'--save_name',name,'--tokenizer_path',str(tokenizer),
                              '--tokenizer_type','hf','--max_seq_length',str(length),

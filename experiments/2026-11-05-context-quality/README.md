@@ -57,3 +57,19 @@ confirmation1000, plus the declared length/repeat offsets. All are in range and
 the two splits are disjoint. Pilot commands and input bytes are unchanged. The
 confirmation receipt pins its own preparation source hash. No confirmation or
 model output was inspected to make this eligibility correction.
+
+The 52-case pilot is now frozen in `pilot.set.json`, which pins the private
+request manifest, evaluation manifest and official grader hashes before any
+RULER model output. `freeze.py` checks complete coverage and token allowances;
+`evaluate.py` sends only the frozen prompt and grades completed final content.
+Four mock-transport checks establish final/reasoning separation, natural
+completion and the shared generation allowance. They are client checks, not
+model-quality evidence.
+
+Confirmation preparation is interrupted after four successful cases. The
+resume path validates every completed request and hash, retains a receipt
+snapshot and archives the interrupted generator's original files before retry.
+The four completed cases are unchanged; seeds, templates, eligibility and
+generator commands remain the same. All 156 cases must finish and be frozen
+before confirmation inference. `runs/resume-01` records the retained interruption
+and prefix-integrity check; no model output informed the continuation.
