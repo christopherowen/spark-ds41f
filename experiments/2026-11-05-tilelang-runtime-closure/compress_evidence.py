@@ -29,6 +29,7 @@ for path in sorted(root.rglob("*")):
     if not path.is_file() or path == ledger or path.suffix == ".gz":
         continue
     selected = path.suffix in (".cu", ".py") or path.name.endswith(".trace.json")
+    selected |= path.suffix == ".sqlite"
     selected |= path.suffix == ".json" and path.stat().st_size >= 100000
     if not selected:
         continue
