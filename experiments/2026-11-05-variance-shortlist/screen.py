@@ -97,7 +97,10 @@ def one(data, betas):
 
     results = {}
     for beta in betas:
-        b['scores'].copy_((base.float()+beta*margin).bfloat16())
+        if beta == 0:
+            b['scores'].copy_(base)
+        else:
+            b['scores'].copy_((base.float()+beta*margin).bfloat16())
         plan.coarse.run(b['scores'], b['counts'], active, b['selected'], b['values'],
                         scratch=buffers('coarse', plan.coarse))
         plan.compact(b['selected'], pool, table, lengths, active,
@@ -134,6 +137,7 @@ def main():
     assert not args.out.exists()
     replay = json.loads(args.replay_receipt.read_text())
     assert replay['passed'] and replay['actual_captures']
+    torch.cuda.reset_peak_memory_stats()
     paths = sorted(args.inputs.glob('*-rank-0-*.pt'))
     assert len(paths) == 12
     report = {'complete': False, 'betas': BETAS, 'replay_sha256': digest(args.replay_receipt),
@@ -178,6 +182,10 @@ def main():
         report['error'] = {'type': type(error).__name__, 'message': str(error)}
         raise
     finally:
+        report['memory_observations'] = {
+            'torch_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
+            'torch_peak_reserved_bytes': torch.cuda.max_memory_reserved(),
+            'scope': 'standalone tensor allocator only; no model memory qualification'}
         args.out.write_text(json.dumps(report, indent=2)+'\n')
         print('RESULT '+json.dumps(report), flush=True)
 
