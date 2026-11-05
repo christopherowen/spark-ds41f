@@ -19,3 +19,21 @@ and memory/admission gates remain required afterward. Native uses its real
 68-byte/key layout. The candidate pays for all 100 bytes/key and maintenance.
 Record every run, error, command, allocator observation and release. Raw captured
 inputs remain node-local, outside Git. No quality or speed win is assumed.
+
+
+The single-store probe passes all 12 actual batches, strict initialization with
+zero sanitizer errors and six graph/cache/lifecycle cases. Generated CUDA confirms
+zero barriers inside its mean-load loop (the previous code has one per iteration).
+Two fresh-process timings nevertheless remain slower than native in all twelve
+shapes: native/candidate approximately 0.53–0.81. Removing the barrier improves
+the earlier implementation but does not resolve the performance gate. It does
+not advance unchanged to model inference. All receipts are retained.
+
+The next intended variable is page-wise contiguous copying of means, retaining
+the single store, tile64, scores, budgets and representation. `copy_score.py`
+passes a strided view of only the summary headers and copies each complete
+physical page's contiguous means into its matrix region. Partial tile pages
+are zeroed without loading an invalid table suffix. No new tensor allocation or
+GPU work is added by the view. An actual-score check precedes two fresh-process
+performance screens; initialization/lifecycle checks follow only if the screen
+finds a useful gain. Serving requires every gate plus final-answer evaluation.
