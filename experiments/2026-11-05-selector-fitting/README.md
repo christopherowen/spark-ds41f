@@ -127,3 +127,14 @@ reported, with independent document count one; replicated ranks and adjacent
 rows do not inflate N. Compact-address proxy execution has no timing claim and
 does not replace native geometry replay or completed-answer evaluation. No
 actual retention result is available before collection and fitting.
+
+The first actual collection launch (`runs/capture-01`) fails before any model
+request or operand capture: its arming program reads JSON from stdin, while the
+existing native remote helper supplies a `DATA` global and consumes stdin for
+program source. The all-node C37 restoration completes at12:05:35 UTC and passes
+independent verification, with reservations removed. Every error/cleanup receipt
+is retained. The controller now uses `DATA`; a test exercises that exact prefix
+contract through arm/disarm/overwrite refusal and 12-file manifest hashing. A
+file-handle warning found by the test is fixed with scoped reads; the test passes
+with resource warnings treated as errors. The next attempt keeps native model
+arithmetic and the same disjoint documents unchanged.
