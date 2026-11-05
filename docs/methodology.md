@@ -27,6 +27,34 @@ Do not compare a new candidate only with a historical number collected under a
 different client, prompt, model load, or cluster state. Save sufficient identity to
 repeat both sides.
 
+## Round purpose, report and drop rule
+
+Declare the purpose and acceptance criteria before building or measuring. A
+correctness fix, maintenance change or cleanup can pass with neutral performance
+and no material regression. A performance enhancement must show a relevant,
+repeatable gain beyond both candidate and saved-reference repeat margins. Do not
+reclassify an unsuccessful enhancement as cleanup after seeing its results.
+
+Report every completed round to the owner with the compatible saved 1030 and
+C36 records, previous candidate and current candidate. Show signed over/under
+and explicit better, worse or no-proven-change verdicts. Keep both candidate
+boots, all reference/candidate boot pairings and their separate repeat margins;
+identify a missing reference repeat instead of inventing one. Never remeasure a
+released build or an already measured image to refresh its numbers.
+
+Include aggregate and per-user decode, TTFT, TPOT and actual ITL where recorded,
+cold/mixed prefill and first-chunk waits, engine cost, draft acceptance,
+cache/preemptions/KV where recorded, memory/swap, startup and thermals. Retain
+adverse rows and missing-data limits. A component gain or higher mean against an
+old release does not establish an incremental serving gain from the new patch.
+
+A patch that misses its stated mark gets one delegated focused review/rework.
+Make at most one justified corrected candidate with explicit source identity
+and fresh qualification. If it still misses, highlight the problem and drop it.
+A review that finds no defensible correction does not justify another image
+merely to use the allowance. Preserve rejected sources, images, measurements
+and original failures. An unimplemented proposal is not a measured failure.
+
 ## Minimum benchmark matrix
 
 The stable suite must cover:

@@ -6,6 +6,30 @@ describe what runs. Every figure here was measured on this stack; each idea
 enters as an ordinary experiment under `experiments/` and is promoted only by the
 owner.
 
+## Recent candidate decisions
+
+- C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
+  performance claim showed no proven serving-throughput gain against either
+  saved C38 recipe. Preserve the adverse engine-grid cost and original collector
+  failures with their separate revalidation; do not repeat the image.
+- C40 retains the independent scratch-read correctness fix with neutral aggregate
+  serving performance. It is the best validated corrected default-enabled base,
+  not a new serving-speedup claim or a promotion.
+- C41 attempted to remove optional overlap complexity, declared as simplification
+  before measurement. Correctness passed, serving throughput was neutral, but
+  grid cost rose 0.206–0.409% and cold 524K prefill fell 0.181–0.667% against
+  C40. The focused review found no defensible new correction; reject C41 and
+  retain C40. Attribution is unresolved because those pure workloads bypass
+  the changed preparation calls. No extra rebuild or old-image remeasurement.
+  See the [full measured decision](experiments/2026-11-04-copy-overlap-rework/decision.md).
+- The minimum-match-8 policy hypothesis was dropped at source review, not counted
+  as a failed serving benchmark. A future copy-policy idea needs a bounded
+  expected benefit and budget-binding mixed copy/edit/tool correctness evidence.
+- The distinct TileLang refresh in #875 is maintenance/feature preservation.
+  Review its known independent correctness follow-ups #879–#883 and explicitly
+  qualify the selected source/interaction stack before runtime use. Individual
+  author-provided standalone passes do not qualify a combined compiler/image.
+
 ## Goal
 
 Step time and the bench matrix are proxies. The outcome that matters is
