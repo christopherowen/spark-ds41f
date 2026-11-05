@@ -8,6 +8,32 @@ from unittest.mock import patch
 import torch
 
 from overlay import selector_capture as capture
+from fit_metric import decode,projection,covariance
+
+
+def metric_contract():
+    codes = torch.arange(16,dtype=torch.uint8).repeat(8)
+    pairs = codes.reshape(-1,2)
+    packed = (pairs[:,0]|(pairs[:,1]<<4)).reshape(1,64)
+    scales = torch.tensor([[127,128,126,129]],dtype=torch.uint8)
+    values = torch.tensor([0.,.5,1.,1.5,2.,3.,4.,6.,-0.,-.5,-1.,-1.5,-2.,-3.,-4.,-6.],dtype=torch.float64).repeat(8)
+    expected = values*torch.tensor([1.,2.,.5,4.],dtype=torch.float64).repeat_interleave(32)
+    torch.testing.assert_close(decode(packed,scales)[0],expected,atol=0,rtol=0)
+    diagonal = torch.arange(1,129,dtype=torch.float64)
+    metric,basis,energy = projection(torch.diag(diagonal))
+    torch.testing.assert_close(basis.T@basis,torch.eye(32,dtype=torch.float64))
+    assert not basis[:96].count_nonzero()
+    assert abs(energy-float(diagonal[-32:].sum()/diagonal.sum())) < 1e-12
+    torch.testing.assert_close(metric.square().sum(0).double(),diagonal[-32:].flip(0)/diagonal.sum())
+    batch = {'q':packed[:,None,:].expand(2,32,64),'scales':scales[:,None,:].expand(2,32,4),
+             'weights':torch.ones(2,32,dtype=torch.bfloat16)}
+    positive,n = covariance(batch)
+    batch['weights'].neg_()
+    negative,m = covariance(batch)
+    torch.testing.assert_close(positive,negative,atol=0,rtol=0)
+    assert n == m == 64
+    return {'all_mxfp4_codes_and_scales':True,'leading_32_query_directions':True,
+            'weight_sign_invariant_metric':True,'model_fit_performed':False}
 
 
 def check(page):
@@ -74,4 +100,4 @@ def check(page):
 
 
 if __name__ == '__main__':
-    print(json.dumps({'passed':True,'cases':[check(128),check(256)]}))
+    print(json.dumps({'passed':True,'cases':[check(128),check(256)],'metric_contract':metric_contract()}))

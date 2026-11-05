@@ -74,3 +74,14 @@ The thresholds are in each arm record and captured metadata, and every request
 must cover both domains. Mechanical fixtures retain their smaller test domains;
 the collector's full requests remain untimed. The revised series again applies
 to a fresh named C36 base with the scratch guard and identical overlays.
+
+The predeclared fitting probe is a 32-dimensional query-weighted clustering
+metric. `fit_metric.py` forms `M = mean(w_h² q_h q_hᵀ)` from native query heads in
+`fit-a`/`fit-b`, then keeps its leading 32 eigen-directions weighted by square-root
+eigenvalue. It reports retained query-direction energy on the untouched
+`validation-a` document. This is a clustering proxy, not an exclusion bound or a
+quality guarantee. Native BF16 score rounding and final answers still need their
+own checks. The planned use projects block features only during summary updates;
+it introduces no reference or grading work into queries. Actual key-retention
+validation and construction timing must precede any serving candidate. No maps
+have been fitted and this probe is not integrated into serving.
