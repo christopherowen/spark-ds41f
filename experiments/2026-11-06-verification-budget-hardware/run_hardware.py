@@ -176,6 +176,19 @@ def main():
         print(text, flush=True)
         validate_plan(text, operation)
         command([*argv, "--apply"], operation + "-apply", restoring)
+    def engine_snapshot(config, label, phase):
+        if not owns(lab.read_hold(), args.window):
+            raise RuntimeError("window ownership changed")
+        container = lab.container_name(config)
+        for node in lab.nodes_config()["nodes"]:
+            path = out / f"{label}-{phase}-{node['name']}-engine.log"
+            result = lab.spark.run_ssh(lab.nodes_config(), node, "docker", "logs", "--timestamps", container)
+            path.write_text(result.stdout + result.stderr)
+            receipt.setdefault("engine_logs", []).append({"log": path.name, "exit": result.returncode,
+                                                          "captured": lab.now()})
+            save()
+            if result.returncode:
+                raise RuntimeError(f"engine log capture failed for {node['name']}")
     last_config = None
     success = False
     try:
@@ -250,6 +263,7 @@ def main():
             finally:
                 lab.write_json_atomic(out / f"startup-{label}.json", lab.stop_memory_samplers(samplers))
             command([sys.executable, "bin/spark", "--cluster-config", config, "doctor", "--live"], label + "-doctor")
+            engine_snapshot(config, label, "ready")
             # Native benchmark guards also cover functional traffic below.
             cluster = lab.spark.read_cluster(config)
             halted = []
@@ -311,6 +325,8 @@ def main():
                 conditions["memory"] = watch.close()
                 conditions["fan_stop_failures"] = bench.stop_fan_curve(nodes, nodes["nodes"], conditions.get("fan_curve", []))
                 lab.write_json_atomic(out / f"{label}-gate-conditions.json", conditions)
+                if conditions["fan_stop_failures"]:
+                    raise RuntimeError("functional gate fan restoration failed")
             for suite in suites:
                 stem = Path(suite).stem
                 output = out / label / stem
@@ -323,6 +339,7 @@ def main():
                     argv += ["--corpus", str(corpus)]
                 with lab.Telemetry(str(output) + "-telemetry", config):
                     command(argv, label + "-" + stem)
+            engine_snapshot(config, label, "finished")
             receipt.setdefault("completed_arms", []).append({"label": label, "config": config,
                                                             "source_run": str(out), "ended": lab.now()})
             save()
@@ -331,6 +348,11 @@ def main():
     except BaseException as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         print(receipt["error"], flush=True)
+        if last_config and owns(lab.read_hold(), args.window):
+            try:
+                engine_snapshot(last_config, active_arm or "handoff", "interrupted")
+            except Exception as log_error:
+                receipt["engine_log_error"] = str(log_error)
     finally:
         receipt["completed"] = success
         if not success or not args.keep_open or args.stage == "restore" or lab.window_should_close(lab.read_hold() or {}):
