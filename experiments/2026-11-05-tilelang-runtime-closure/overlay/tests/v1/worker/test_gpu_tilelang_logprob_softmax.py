@@ -691,13 +691,14 @@ def test_selected_logits_are_prepared_before_cache_freeze(monkeypatch):
 )
 @pytest.mark.parametrize("num_logprobs", [0, 5])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+@pytest.mark.parametrize("rows", [1, 1024, 1027, 2049])
+def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype, rows):
     from vllm.v1.worker.gpu.sample.prompt_logprob import (
         compute_prompt_logprobs_with_chunking,
     )
 
-    logits = torch.randn(1027, 257, device=DEVICE)
-    ids = (torch.arange(2054, device=DEVICE, dtype=id_dtype) % 257)[::2]
+    logits = torch.randn(rows, 257, device=DEVICE)
+    ids = (torch.arange(2 * rows, device=DEVICE, dtype=id_dtype) % 257)[::2]
     out_ids, scores, ranks = compute_prompt_logprobs_with_chunking(
         ids, logits, lambda hidden: hidden, num_logprobs, mode
     )

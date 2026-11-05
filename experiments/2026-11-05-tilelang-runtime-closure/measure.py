@@ -13,7 +13,7 @@ import time
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("operation", choices=("tests", "pair", "bench", "iket"))
-parser.add_argument("--family", choices=("sampler", "reduction", "gather", "all"), default="sampler")
+parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
 parser.add_argument("--case-filter", type=Path)
@@ -53,7 +53,7 @@ if args.operation == "tests":
 
     report = Report()
     tests = list(dict.fromkeys(t for family, entries in candidate["tests"].items()
-                              if args.family == "all" or family == args.family for t in entries))
+                              if (args.family == "all" and family != "prompt") or family == args.family for t in entries))
     code = pytest.main(["--noconftest", "-c", "/dev/null", "-q", "--maxfail=2",
                         "--junitxml=" + str(args.out / "tests.xml"),
                         *(str(source / test) for test in tests)], plugins=[report])
@@ -240,6 +240,68 @@ if args.family in ("gather", "all"):
                      dict(reference=reference, candidate=launch, previous=launch, null=reference),
                      expected, dict(world=3, shape=[count, 15],
                                     reference="same TensorIterator copy as movedim reshape, shared output"))
+
+if args.family in ("prompt", "all"):
+    from vllm.v1.worker.gpu.sample.prompt_logprob import compute_prompt_logprobs_with_chunking as prompt_scores
+
+    spec = importlib.util.spec_from_file_location("previous_prompt", HERE / "control/prompt_logprob.py")
+    old_prompt = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = old_prompt
+    spec.loader.exec_module(old_prompt)
+    cases = [(count, 8193, k, mode) for count in (1025, 2049) for k in (0, 5)
+             for mode in ("raw_logits", "raw_logprobs")]
+    cases += [(1025, 129280, 5, mode) for mode in ("raw_logits", "raw_logprobs")]
+    for count, vocab, k, mode in cases:
+        logits = torch.randn((count, vocab), device="cuda")
+        ids = torch.randint(vocab, (2 * count,), dtype=torch.int64, device="cuda")[::2]
+        expected = tuple(value.clone() for value in old_prompt.compute_prompt_logprobs_with_chunking(
+            ids, logits, lambda hidden: hidden, k, mode))
+        outputs = tuple(torch.empty_like(value) for value in expected)
+        original_empty, original_cat = torch.empty, torch.cat
+
+        def reference():
+            index = 0
+
+            def cat(tensors, dim=0, **kwargs):
+                nonlocal index
+                output = outputs[index]
+                index += 1
+                return original_cat(tensors, dim=dim, out=output, **kwargs)
+
+            torch.cat = cat
+            try:
+                result = old_prompt.compute_prompt_logprobs_with_chunking(
+                    ids, logits, lambda hidden: hidden, k, mode)
+                assert index == 3
+                return result
+            finally:
+                torch.cat = original_cat
+
+        def launch():
+            pending = list(outputs if k else outputs[1:])
+
+            def empty(*shape, **kwargs):
+                output = pending.pop(0)
+                declared = tuple(shape[0]) if len(shape) == 1 and isinstance(shape[0], tuple) else tuple(shape)
+                assert tuple(output.shape) == declared and output.dtype == kwargs["dtype"]
+                return output
+
+            torch.empty = empty
+            try:
+                result = prompt_scores(ids, logits, lambda hidden: hidden, k, mode)
+                assert not pending
+                return result
+            finally:
+                torch.empty = original_empty
+
+        # Resolve all kernels before the allocation-only hooks and graph capture.
+        prompt_scores(ids, logits, lambda hidden: hidden, k, mode)
+        run_case(f"prompt-{count}-{vocab}-{k}-{mode}",
+                 dict(reference=reference, candidate=launch, previous=reference, null=reference),
+                 expected, dict(shape=[count, vocab], num_logprobs=k, mode=mode,
+                                shared_output_addresses=[value.data_ptr() for value in outputs],
+                                hooks="allocation and cat destinations only; every GPU kernel and intermediate unchanged",
+                                selected_ids_alias_input=k == 0))
 
 assert rows
 print("completed", len(rows), "cases", flush=True)

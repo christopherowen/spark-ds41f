@@ -484,6 +484,8 @@ def logprob_token_ids(
     logits: torch.Tensor,  # [rows, vocab]
     num_logprobs: int,
     sampled: torch.Tensor,  # [rows]
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``torch.cat((sampled[:, None], torch.topk(logits, num_logprobs).indices),
     1)``: ``[rows, 1 + num_logprobs]`` int64, ``num_logprobs`` at most
@@ -492,7 +494,18 @@ def logprob_token_ids(
     rows = logits.shape[0]
     if sampled.dtype not in (torch.int32, torch.int64):
         raise TypeError("sampled token ids must be int32 or int64")
-    out = torch.empty((rows, 1 + num_logprobs), dtype=torch.int64, device=logits.device)
+    shape = (rows, 1 + num_logprobs)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.int64, device=logits.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.int64
+        or out.device != logits.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "top-k ids output must be contiguous int64 with the selected shape"
+        )
     if rows:
         _launch(logits, out, sampled)
     return out

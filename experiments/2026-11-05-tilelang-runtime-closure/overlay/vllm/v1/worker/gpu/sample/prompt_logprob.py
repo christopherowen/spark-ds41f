@@ -9,9 +9,12 @@ from vllm.config.model import LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+from vllm.v1.worker.gpu.sample import (
+    tilelang_auxiliary,
+    tilelang_logprob,
+    tilelang_topk_ids,
+)
 from vllm.v1.worker.gpu.sample.logprob import (
-    compute_topk_scores,
     register_topk_scores_warmup,
 )
 
@@ -184,35 +187,35 @@ def compute_prompt_logprobs_with_chunking(
     num_prompt_logprobs: int,
     logprobs_mode: LogprobsMode = "raw_logprobs",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Since materializing the full prompt logits can take too much memory,
-    # we compute it in chunks.
+    # Bound the logits workspace while writing every chunk into its final rows.
     CHUNK_SIZE = 1024
-    token_ids = []
-    scores = []
-    ranks = []
+    if not 0 <= num_prompt_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX:
+        raise ValueError("prompt logprobs exceed the configured top-k range")
+    rows = prompt_token_ids.shape[0]
+    shape = (rows, 1 + num_prompt_logprobs)
+    token_ids = (
+        torch.empty(shape, dtype=torch.int64, device=prompt_token_ids.device)
+        if num_prompt_logprobs
+        else prompt_token_ids.unsqueeze(-1)
+    )
+    scores = torch.empty(shape, dtype=torch.float32, device=prompt_token_ids.device)
+    ranks = torch.empty(rows, dtype=torch.int64, device=prompt_token_ids.device)
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
-        requested_num = (
-            prompt_logits.shape[-1]
-            if num_prompt_logprobs == -1
-            else num_prompt_logprobs
-        )
-        result = compute_topk_scores(
-            prompt_logits,
-            requested_num,
-            prompt_token_ids[start_idx:end_idx],
-            logits_mode=logits_mode,
-        )
-        token_ids.append(result.logprob_token_ids)
-        scores.append(result.logprobs)
-        ranks.append(result.selected_token_ranks)
+    for start in range(0, rows, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, rows)
+        logits = logits_fn(prompt_hidden_states[start:end])
+        selected = token_ids[start:end]
+        sampled = prompt_token_ids[start:end]
+        if num_prompt_logprobs:
+            tilelang_topk_ids.logprob_token_ids(
+                logits, num_prompt_logprobs, sampled, out=selected
+            )
+        if logits_mode:
+            tilelang_logprob.gather_logits(logits, selected, out=scores[start:end])
+        else:
+            tilelang_logprob.topk_log_softmax(logits, selected, scores[start:end])
+        tilelang_logprob.token_ranks(logits, sampled, ranks[start:end])
 
-    token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
-    scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
-    ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
     return token_ids, scores, ranks
 
 

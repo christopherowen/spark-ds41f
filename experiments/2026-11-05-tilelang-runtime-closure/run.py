@@ -62,7 +62,7 @@ def main():
     )
     parser.add_argument("--paired-rounds", type=int, choices=(120, 480), default=120)
     parser.add_argument("--case-filter", type=Path)
-    parser.add_argument("--family", choices=("sampler", "reduction", "gather", "all"), default="sampler")
+    parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
     args = parser.parse_args()
     if args.case_filter:
         assert args.operations == ["pair"], "filtered runs contain only paired jobs"

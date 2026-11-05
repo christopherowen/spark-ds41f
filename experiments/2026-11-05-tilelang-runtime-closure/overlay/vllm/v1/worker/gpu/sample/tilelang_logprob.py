@@ -529,7 +529,11 @@ def register_gather_logits(logits: Sequence[tuple[torch.dtype, int]]) -> None:
 
 
 def gather_logits(
-    logits: torch.Tensor, token_ids: torch.Tensor, valid: torch.Tensor | None = None
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    valid: torch.Tensor | None = None,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather selected logits as FP32, storing -inf in invalid custom-id columns.
 
@@ -552,7 +556,16 @@ def gather_logits(
         or valid.device != logits.device
     ):
         raise ValueError("valid must be a boolean CUDA matrix matching token_ids")
-    output = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
+    if out is None:
+        out = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
+    elif (
+        out.shape != token_ids.shape
+        or out.dtype != torch.float32
+        or out.device != logits.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("logits output must be contiguous FP32 matching token_ids")
+    output = out
     if output.numel():
         kernel = _kernel(
             gather_logits_kernel,

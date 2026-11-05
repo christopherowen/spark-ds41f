@@ -60,3 +60,25 @@ generated TileLang symbols, ATen, NCCL or an explicit unknown bucket; it separat
 measured requests and grid replay from startup. This is a single-GPU dummy-weight
 check without Engram or physical peers, so it cannot establish multi-node
 transport coverage or real-weight model quality.
+
+## Combined correction
+
+The first combined suite passed 1,076 tests and failed one obsolete test that
+expected the removed partial-pack ATen path. `0003` replaces that expectation
+with exact opaque-bit validation; `runs/traversal-v2/` retains the failure.
+
+`0004` removes the prompt-score chunks' three GPU concatenations. Existing
+TileLang selection, score and rank kernels write into final row slices. With
+zero requested alternatives the IDs remain a view of the native sampled IDs.
+The existing four score-mode test now covers lengths 1, 1,024, 1,027 and 2,049
+with strided int32/int64 IDs. The prompt benchmark compares unmodified GPU
+algorithms while assigning only allocation/concatenation output destinations to
+shared buffers; no compute operation is elided from the reference. At zero
+alternatives the candidate ID result aliases the input and needs no GPU copy.
+
+All 586 patches through `0004` apply from the pinned upstream in a fresh source
+tree, reproducing `701fd9619a4a2af710207f6469a58ede67ce37fc`. Doctor passes with
+the existing ignored site maps. Build check reports missing prepared build
+inputs; no new image has been built. Ruff on the new prompt change reports only
+three inherited diagnostics (the test docstring line and two TileLang DSL nested
+conditions); no new diagnostic is introduced.
