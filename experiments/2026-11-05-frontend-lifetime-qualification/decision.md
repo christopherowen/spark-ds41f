@@ -9,7 +9,10 @@ Source replay, release classification, nine offline control tests and six named
 profile doctors pass. The full protocol is unchanged after identity-only
 normalization. All138 image gate files, actual-image top-k sanitizer, all40
 ordered functional exits and both complete metric boots are still required.
-No image, GPU/controller work or serving result exists for C43 yet.
+The sole attempt1 controller is now running image-and-gate under its shared
+window. No serving measurement or performance verdict exists yet. The original
+prepared control packet is bound to execution commit2c4b23af; later status files
+do not authorize synchronization of active nodes.
 
 Accept neutral maintenance performance only with the scoped correctness benefit
 and no material core regression. Report compatible1030,C36,previous C40,current
