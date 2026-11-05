@@ -64,3 +64,12 @@ on all three nodes. The controller now derives the private path from the complet
 result namespace and checks absence during preflight, before opening a window.
 The retry uses a new result path. This is a client-path failure, not a quality
 or runtime result; no request-speed conclusion is drawn from the failed window.
+
+The completed retry at source `e9eab460` passes the observed final-answer no-loss
+gate on both boots: Native68 scores 8/12 twice and LSA 9/12 twice, with no
+incomplete or unstable answer decisions. Total workload time is 11.6% lower,
+but median individual latency is about 32.4% higher. The improvement is uneven
+and largely comes from shorter reasoning on one long table question. This is
+pilot evidence, not a general quality-superiority claim. Full results, uncertainty,
+memory observations and the next frozen confirmation command are in
+[results.md](results.md). Every run remains in `runs/pilot-window-02`.
