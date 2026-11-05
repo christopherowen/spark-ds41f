@@ -95,7 +95,7 @@ Do the stages in order on every node, and keep the nodes identical:
 | 3 | [Fabric](#3-fabric-cabling-and-addressing) | 9000-byte pings on every path; one IPv4 RoCE v2 GID per port |
 | 4 | [Site configuration](#4-site-configuration) | `bin/spark doctor` |
 | 5 | [Model](#5-model) | the pinned revision on every node |
-| 6 | [Image](#6-image) | the same image (its layers) on every node |
+| 6 | [Image](#6-image) | the same image content (ordered layers and runtime configuration) on every node |
 | 7 | [First start](#7-first-start) | `bin/spark doctor --live` |
 | 8 | [Verify](#8-verify) | `bin/spark bench` |
 
@@ -475,7 +475,8 @@ clone it. A start refuses a read-write mount whose source a node cannot write
 should name `{checkout}` too.
 
 `bin/spark --cluster-config <profile> cluster sync --apply` moves every node's checkout to the head's
-commit and copies the head's node map to the others.
+commit, copies the head's node map to the others, and copies the profile's image from the head to
+every node whose ordered image layers or runtime configuration differ.
 
 Commands that change the nodes need the configuration named with
 `--cluster-config` before the subcommand, for example
@@ -594,15 +595,19 @@ an existing tag, and runs a GPU import smoke test. The first build takes
 longer because it builds TileLang and TileKernels. More detail is in
 [docker/README.md](../docker/README.md).
 
-Copy the image to the other nodes in your node map and confirm the same image layers everywhere:
+`cluster sync` (step 7) copies the image to the other nodes in your node map and checks that
+every node has the same image content. To copy it without a sync, or to copy another tag:
 
 ```sh
 bin/spark --cluster-config config/cluster.json build distribute --apply
 ```
 
-Compare the layers, not the image ID: a node on Docker's containerd image store names an image
+Compare ordered layers and runtime configuration: a node on Docker's containerd image store names an image
 by its manifest and an `overlay2` node by its config, so a faithful copy between the two shows
-a different ID (#488). The layers are the same on every node whatever its storage.
+a different ID (#488). A faithful copy preserves the ordered layers and runtime configuration
+on every node whatever its storage. Matching layers alone is insufficient: labels,
+environment or entrypoint can differ while the filesystem stays the same. A missing image
+can be copied; failed or malformed inspections stop distribution instead of authorizing it.
 Your image differs from ours because the image records the deployment
 commit. The source-tree labels must match the profile's `expected_labels`;
 `doctor --live` and the launch preflight check them.

@@ -1280,42 +1280,16 @@ def command_build_distribute(args: argparse.Namespace) -> int:
                 print(f"docker save {shlex.quote(tag)} | ssh {shlex.quote(target)} docker load")
         print("plan only; pass --apply to distribute the image")
         return 0
-    local_inspect = subprocess.run(
-        ["docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if local_inspect.returncode != 0:
-        raise SystemExit(f"{tag} is not present on this host; build it first")
-    expected_layers = local_inspect.stdout.strip()
+    _, config_relative = cluster_config_path(args)
+    identity, problem, differ = image_copies(cluster, nodes, config_relative, tag)
+    if problem:
+        raise SystemExit(problem)
     for node in nodes["nodes"]:
-        remote_inspect = run_ssh(
-            nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"
-        )
-        if remote_inspect.returncode == 0 and remote_inspect.stdout.strip() == expected_layers:
+        if node not in differ:
             print(f"{node['name']}: {tag} is already present", flush=True)
             continue
-        target = transfer_target(nodes, node)
-        pipeline = (
-            f"docker save {shlex.quote(tag)} | "
-            f"ssh {shlex.join(ssh_options())} {shlex.quote(target)} docker load"
-        )
-        result = subprocess.run(
-            ["bash", "-o", "pipefail", "-c", pipeline],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            raise SystemExit(f"{node['name']}: failed to load {tag}: {detail}")
-        verify = run_ssh(
-            nodes, node, "docker", "image", "inspect", tag, "--format", "{{json .RootFS.Layers}}"
-        )
-        if verify.returncode != 0 or verify.stdout.strip() != expected_layers:
-            raise SystemExit(f"{node['name']}: image layers for {tag} do not match after load")
+        failure = load_image(nodes, node, tag, identity)
+        if failure:
+            raise SystemExit(failure)
         print(f"{node['name']}: loaded {tag}", flush=True)
     return 0
