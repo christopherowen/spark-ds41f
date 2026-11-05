@@ -204,6 +204,9 @@ def main():
             assert check.returncode == 0 and check.stdout.strip() == IMAGE, check
             check = ssh(node, ["docker", "ps", "-q", "--filter", "name=spark-ds41f"])
             assert check.returncode == 0 and not check.stdout.strip(), "serving still runs"
+            check = ssh(node,["cat","/proc/driver/nvidia/version"])
+            assert check.returncode == 0, check
+            receipt.setdefault("driver",{})[node["name"]]=check.stdout.strip()
         from spark_ds41f.bench import MemoryWatch
         class RecordedWatch(MemoryWatch):
             def __init__(self,*args):

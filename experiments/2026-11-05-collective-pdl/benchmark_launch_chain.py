@@ -8,6 +8,7 @@ from datetime import timedelta
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import time
@@ -50,6 +51,7 @@ def main():
     p.add_argument("--samples", type=int, default=40)
     p.add_argument("--calls-per-graph", type=int, default=16)
     args = p.parse_args()
+    started = time.time()
     assert args.samples >= 20 and args.calls_per_graph > 0
     torch.cuda.set_device(0)
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))
@@ -128,6 +130,14 @@ def main():
         torch.cuda.synchronize()
         result={"variant":args.variant,"source_commit":args.source_commit,"run":args.run,
                 "rank":rank,"world_size":world,"kernel_hashes":kernels,"cases":records,
+                "process":{"pid":os.getpid(),"started_unix":started,"ended_unix":time.time()},
+                "workload":{"width":5120,"dtype":"bfloat16","samples":args.samples,
+                            "calls_per_graph":args.calls_per_graph,"eager_warmup":4,"graph_warmup":3,
+                            "cache_policy":"fresh process; image cache plus source-hash JIT; no explicit eviction; data and side-copy buffers reused across replays",
+                            "timing":"CUDA events per replay; Gloo barrier before each sample; slowest rank per sample"},
+                "software":{"torch":torch.__version__,"cuda":torch.version.cuda,
+                            "tilelang":getattr(tilelang,"__version__",None)},
+                "device":{"name":torch.cuda.get_device_name(0),"capability":torch.cuda.get_device_capability(0)},
                 "max_cuda_memory_allocated":torch.cuda.max_memory_allocated(),
                 "max_cuda_memory_reserved":torch.cuda.max_memory_reserved(),
                 "proxy":runtime.stats(),"passed":True,

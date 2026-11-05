@@ -130,7 +130,13 @@ are not adjusted for multiple comparisons.
 
 ## Acceptance and workload identity
 
-This is a performance enhancement. Acceptance requires an incremental gain
+A concrete correctness repair is also acceptable with demonstrated performance
+preservation: an old-fails/new-passes reproducer on the affected path, and
+intervals narrow enough to exclude a material regression. Merely including zero
+is inconclusive. No pre-existing correctness failure has been established for
+this patch: the waits protect the newly enabled overlap, while the earlier
+ordinary launches serialize. The current change remains a performance
+enhancement. Acceptance therefore requires an incremental gain
 beyond the candidate and saved reference repeat margins, exact output identity
 where the existing suite promises it, and no material latency, memory or failure
 regression. An unchanged arithmetic formula is not a GPU correctness result.
