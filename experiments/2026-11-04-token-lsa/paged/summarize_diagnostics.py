@@ -32,6 +32,7 @@ def main():
     complete = all(r and len(r['cases']) == 3 for r in results.values())
     report = {'complete':complete,'scope':'synthetic request timing, diagnostic until every fidelity gate passes',
               'uncertainty':'two fresh boots per arm; df1 Student-t component97.5% and Bonferroni joint95% ratio intervals; normality unverified',
+              'restored':read(out/'restored.json'),
               'native_repeat_gates':{s:read(out/(s+'.txt')) for s in ('native-baseline-repeat','native-parallel-repeat')},
               'presets':{}}
     for profile,labels in groups.items():
@@ -61,15 +62,18 @@ def main():
                 c = {'length':length,'concurrency':concurrency,'phase':phase,'timed_response_digest_count_match':matched,
                      'request_seconds':compare([latency[x] for x in native],[latency[x] for x in labels]),
                      'aggregate_output_tokens_per_s':{label:tps[label] for label in native+labels},
+                     'throughput_candidate_over_native':statistics.mean(tps[x] for x in labels)/statistics.mean(tps[x] for x in native),
                      'actual_cached_tokens':{label:[r['usage'].get('prompt_tokens_details',{}).get('cached_tokens') for r in row] for label,row in rows.items()},
                      'completion_token_counts':{label:[r['usage']['completion_tokens'] for r in row] for label,row in rows.items()}}
+                a,b = interval([tps[x] for x in native]),interval([tps[x] for x in labels])
+                c['throughput_joint95_ratio_interval'] = [b[0]/a[1],b[1]/a[0]] if min(a+b) > 0 else None
                 entry['comparisons'].append(c)
         conditions = {label:read(out/('requests-'+label+'-conditions.json')) for label in native+labels}
         entry['conditions_passed'] = all(v and not v['halted'] and not v['fan_stop_failures']
             and len(v['thermal']) == 3 and not any(t.get('thermal_slowdown_ms') for t in v['thermal'].values()) for v in conditions.values())
         entry['fidelity_passed'] = bool(all(v and v['passed'] for group in gates.values() for v in group.values())
             and all(v and v['passed'] for v in report['native_repeat_gates'].values()) and all(timed_matches))
-        entry['qualified_comparison'] = entry['fidelity_passed'] and entry['conditions_passed']
+        entry['qualified_comparison'] = entry['fidelity_passed'] and entry['conditions_passed'] and bool(report['restored'] and report['restored'].get('restored') and report['restored'].get('holds_removed'))
         entry['verdict'] = 'fidelity-qualified comparison within declared finite screen; owner promotion still required' if entry['qualified_comparison'] else 'diagnostic only; does not establish an accepted speedup'
     if not complete:
         report['missing_or_incomplete'] = [name for name,r in results.items() if not r or len(r['cases']) != 3]

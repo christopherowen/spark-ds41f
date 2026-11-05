@@ -160,3 +160,14 @@ python3 experiments/2026-11-04-token-lsa/paged/run_serving.py \
   --diagnostic-profiles control-a:control aggressive-a:aggressive-fast \
   wide-a:dense-1536-fast wide-b:dense-1536-fast aggressive-b:aggressive-fast control-b:control
 ```
+
+
+The six-boot diagnostic screen is complete at`df2af0bc`: native raw-token repeats
+match9/9; aggressive64/512 matches6/9 and wide1536/native-source8/9 on both boots,
+serially and at concurrency4. Aggressive cached request throughput improves
+8–14% in point estimates, while wide is effectively flat; neither meets token
+acceptance. Broad n=2 uncertainty remains reported. All six timed boots have no
+thermal slowdown, swap growth or memory-guard events. C37 is restored once at
+07:46:26UTC on November5 and independently verified on all three nodes, with
+clean source roots and all reservations removed. See the [complete request
+results](request-results.md) and retained raw receipts. No promotion.

@@ -768,3 +768,13 @@ Don't repeat these without a new reason:
 - **Drivers:** R610 and CUDA 13.3 libraries
   (`experiments/2026-10-02-driver-cuda-refresh`): no consistent gain, and stock
   R610 faults on large copies with 64 KiB pages.
+
+
+- **Page-centroid LSA remains unqualified:** the [paired request screen](experiments/2026-11-04-token-lsa/paged/request-results.md)
+  uses two fresh boots per arm, separate raw-token gates, and required cache
+  maintenance inside timed requests. Aggressive selection gives 8–14% higher
+  cached throughput in point estimates but changes all three long-context token
+  sequences. Wide retention is effectively flat and still changes the 256K
+  sequence. Native repeats match all nine requests. No output-preserving request
+  speedup or superior changed-token quality is established. Keep diagnostic speed
+  visible even when fidelity fails; adoption still requires both gates.
