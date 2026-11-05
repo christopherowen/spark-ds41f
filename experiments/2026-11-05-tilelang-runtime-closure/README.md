@@ -219,3 +219,26 @@ reinterpreted directly as bytes. The helper now materializes logical values on
 both sides before its byte comparison. The raw failure remains on sp8 and will
 be archived. This changes no production code. Full-model inventory runs first
 in the resumed queue so additional runtime kernels are discovered promptly.
+
+## Full-model findings
+
+The first TP4-shaped 43-layer trace completes. Its short-name inventory leaves
+66 request launches unidentified; full demangled symbols identify ATen embeddings,
+an anchor gather, a confidence stack, copies/casts and clamps. Startup and grid
+fixtures have additional work. The inventory now retains both names and classifies
+full symbols, so namespaces cannot disappear in a short-name lookup.
+
+`0015` routes TP1 through the already implemented fused vocabulary-shard drafting
+path: one rank owns the full vocabulary and its pair gather is a view. It shares
+the multi-rank supported-head warmup requirement. Existing exact fused-versus-
+materialized tests now include TP1's full vocabulary. The fresh 600-patch source
+tree is `24ee0b8367fd68179fcae6f0452c69484ed759f3`; GPU/full checks are pending.
+A diagnostic-only `IKET_CALL_ORIGINS=1` mode records CUDA ATen call stacks and
+metadata through TorchDispatchMode, without reading device data. It will identify
+the residual casts/clamps rather than assigning their caller by kernel name alone.
+Four lint diagnostics outside the source diff are inherited (two unused imports,
+one unused fixture variable and one long fixture line); other checks pass.
+
+The first activity attempt stopped before any workload at an outdated operation
+assertion in the driver. `activity` is now admitted by that assertion as well as
+both argument parsers. The raw failed receipt will be archived.

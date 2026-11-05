@@ -134,6 +134,8 @@ def main():
         "TILELANG_CACHE_DIR": "/c/tilelang-off", "TRITON_CACHE_DIR": "/c/triton",
         "VLLM_CACHE_ROOT": "/c/vllm",
     }
+    if os.environ.get("IKET_CALL_ORIGINS") == "1":
+        env["IKET_CALL_ORIGINS"] = "1"
     results = []
     try:
         # Every plain and instrumented point boots twice. Warp-trace is an

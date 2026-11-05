@@ -24,7 +24,12 @@ for relative, expected in candidate["files"].items():
 out = Path(sys.argv[sys.argv.index("--out") + 1])
 out.mkdir(parents=True, exist_ok=True)
 (out / "source-identity.json").write_text(json.dumps(candidate, indent=2) + "\n")
-runpy.run_path("/b/harness/iket_step.py", run_name="__main__")
+if os.environ.get("IKET_CALL_ORIGINS") == "1":
+    from origins import GPUCallOrigins
+    with GPUCallOrigins(out / "aten-origins.jsonl"):
+        runpy.run_path("/b/harness/iket_step.py", run_name="__main__")
+else:
+    runpy.run_path("/b/harness/iket_step.py", run_name="__main__")
 cache = Path(os.environ["TILELANG_CACHE_DIR"])
 compiled = []
 for path in sorted(cache.rglob("*.cu")):

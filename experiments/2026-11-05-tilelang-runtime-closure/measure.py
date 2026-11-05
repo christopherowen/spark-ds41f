@@ -14,7 +14,7 @@ import subprocess
 HERE = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("operation", choices=("tests", "pair", "bench", "iket", "identity", "copy_screen", "wire", "transfer", "activity"))
-parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "all"), default="sampler")
+parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "wire", "draft", "all"), default="sampler")
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--rounds", type=int, default=120)
 parser.add_argument("--case-filter", type=Path)
@@ -133,7 +133,7 @@ if args.operation == "iket":
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     raise SystemExit(0)
 
-assert args.operation in ("pair", "bench")
+assert args.operation in ("pair", "bench", "activity")
 from vllm.v1.worker.gpu.sample import tilelang_sampling as sampling
 from vllm.models.deepseek_v4_1.tilelang import collectives, gather
 
@@ -344,7 +344,7 @@ if args.family in ("gather", "all"):
                      expected, dict(world=3, shape=[count, 15],
                                     reference="same TensorIterator copy as movedim reshape, shared output"))
 
-if args.family in ("prompt", "wire", "all"):
+if args.family in ("prompt", "wire", "draft", "all"):
     from vllm.v1.worker.gpu.sample.prompt_logprob import compute_prompt_logprobs_with_chunking as prompt_scores
 
     spec = importlib.util.spec_from_file_location("previous_prompt", HERE / "control/prompt_logprob.py")
