@@ -73,7 +73,7 @@ and tree; doctor reports configuration OK; complete existing candidate-38 build
 inputs pass `build check`; Python syntax and diff checks pass. The Mac attempts
 that failed before recovery are retained in `runs/recovery.txt`.
 
-Status: prepared; no performance conclusion until the raw receipts exist.
+Status: the first GPU attempt failed during compilation, before timing or a complete exactness gate. See `runs/failed-01-compile` and its conditions/runner receipts. The split factory left inactive legacy-reducer declarations after constant folding; separate Q/KV factories now declare those unused buffers as ordinary fragments. Arithmetic is unchanged. The cold/hot/prefetch screen remains incomplete; no performance conclusion is claimed.
 
 Additional audit: index-key and compression normalization reduce each live row once; Engram gating reduces each distinct token/stream residual and key once. These do not duplicate a hidden-row norm across projection output tiles.
 

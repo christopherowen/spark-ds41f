@@ -36,8 +36,9 @@ def reservation(action):
         f"holder={HOLDER!r}\naction={action!r}\n" +
         "now=datetime.datetime.now(datetime.timezone.utc).isoformat()\n" +
         "record=json.loads(p.read_text()) if p.exists() else None\n" +
+        "requester=json.loads(req.read_text()) if req.exists() else None\n" +
         "if action=='claim':\n" +
-        "    if record or old.exists(): print(json.dumps({'acquired':False,'holder':record}))\n" +
+        "    if record or old.exists() or (requester and requester.get('who')!=holder): print(json.dumps({'acquired':False,'holder':record,'request':requester}))\n" +
         "    else:\n" +
         "        data={'holder':holder,'since':now,'expected_end':None,'heartbeat':now,'rule':'Kernel-only dgx4 reservation. No other GPU work or cluster operations. Serving remains unchanged.','serving_untouched':True}\n" +
         "        try:\n" +
