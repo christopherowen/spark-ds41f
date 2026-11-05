@@ -32,12 +32,15 @@ def one(data,metric):
     pool = torch.zeros(len(data['pool']),page*STATE_BYTES+128,dtype=torch.uint8,device='cuda')[:,:page*STATE_BYTES]
     pool[:,:page*68].copy_(data['pool'].cuda())
     args = [data[k].cuda() for k in ('q','scales','weights')]
-    # Captures retain the model's full-capacity table. This compact proxy uses
-    # the captured live plan width; page scoring requires its exact table ABI.
-    # Native geometry replay above separately validates the original table.
-    assert width%page == 0 and data['table'].shape[1] >= width//page
+    # Captures retain only visible table prefixes. Page scoring has a fixed
+    # planned-width table ABI; pad its unreachable suffix with valid addresses.
+    # Lengths/Active still restrict scoring to exactly the captured key domain.
+    assert width%page == 0
     assert int(data['active'][0]) <= width and int(data['lengths'].max()) <= width
-    table = data['table'][:,:width//page].contiguous().cuda()
+    copied = min(data['table'].shape[1],width//page)
+    assert copied*page >= int(data['lengths'].max())
+    table = torch.zeros(rows,width//page,dtype=torch.int32,device='cuda')
+    table[:,:copied].copy_(data['table'][:,:copied])
     args += [pool,table,data['lengths'].cuda(),data['active'].cuda()]
     native = IndexerV41Plan(width,page,candidate_blocks=source)
     options = {}

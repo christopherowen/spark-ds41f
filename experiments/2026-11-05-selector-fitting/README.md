@@ -164,8 +164,10 @@ training query energy and 60.7–66.6% on the separate validation document. Thos
 energy values establish neither key retention nor answer quality. The map SHA
 and all input identities are recorded; weights remain private on sp8. The GPU
 retention runner then refuses an ABI mismatch before returning a retention
-result: captures preserve a full-capacity table, while its compact page-score
-plan requires the narrower live-width table. The diagnostic now takes a
-contiguous live-width prefix, with explicit width/length guards. Exact native
-geometry replay remains a separate prerequisite. Both failed attempts and their
-clean releases are retained; no serving code or arithmetic changes in this fix.
+result: captures save only visible table prefixes, while the page-score plan requires
+a fixed planned-width table. The first correction assumes the opposite direction
+and refuses the compact input in `runs/actual-probe-03`. The diagnostic now pads
+the unreachable table suffix with valid initialized addresses, preserving every
+visible mapping and the original Lengths/Active domain. Exact native physical
+geometry replay remains a separate prerequisite. All failed attempts and clean
+releases are retained; no serving code or arithmetic changes in this fix.
