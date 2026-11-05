@@ -314,3 +314,11 @@ OpenMP threads, at most two build workers, and the existing memory guards.
 Published source and surviving results are reconciled before resuming; completed
 boots and immutable baselines are not rerun. Remote controllers are detached
 from the workstation connection so local interruptions cannot cancel them.
+
+Recovery found both 2,048-round embedding extensions complete, with matching
+primary input/weight hashes. Every extension and pooled bound passes on both
+boots, and every primary mean is below one. The drafting performance fixture
+then stopped before measurement: it supplied a BF16 confidence weight to the
+FP32 confidence-head contract. Its corrected fixture uses the actual FP32
+weight, records all shared weight/input hashes and forwards the declared round
+count. Production source is unchanged; the failed fixture remains evidence.

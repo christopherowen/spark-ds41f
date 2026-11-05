@@ -66,7 +66,7 @@ if args.operation == "tests":
 if args.operation == "draft_bench":
     import runpy
     script = HERE / "draft_bench.py"
-    sys.argv = [str(script), "--out", str(args.out)]
+    sys.argv = [str(script), "--out", str(args.out), "--rounds", str(args.rounds)]
     runpy.run_path(str(script), run_name="__main__")
     raise SystemExit(0)
 

@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 p = argparse.ArgumentParser()
 p.add_argument('--out', type=Path, required=True)
+p.add_argument('--rounds', type=int, default=120)
 a = p.parse_args()
 path = Path('/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dspark_greedy_markov.py')
 spec = importlib.util.spec_from_file_location('draft_fixture', path)
@@ -30,7 +31,12 @@ num_vocab, rank, hidden, max_rows, steps = 129280, 256, 5120, 16, 5
 w2 = (torch.randn((num_vocab, rank), device='cuda') * 0.05).bfloat16()
 packed = vocab.pack_bf16_weight(w2)
 table = (torch.randn((num_vocab, rank), device='cuda') * 0.5).bfloat16()
-confidence_weight = (torch.randn(hidden + rank, device='cuda') * 0.01).bfloat16()
+confidence_weight = torch.randn(hidden + rank, device='cuda') * 0.01
+
+def digest(tensor):
+    return hashlib.sha256(tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+
+weight_hashes = dict(w1=digest(table), w2=digest(w2), confidence=digest(confidence_weight))
 flush = torch.empty(32 << 20, device='cuda', dtype=torch.uint8)
 results = []
 for dtype in (torch.bfloat16, torch.float32):
@@ -41,6 +47,7 @@ for dtype in (torch.bfloat16, torch.float32):
     vocab.prepare_packed_head(head, dtype)
     base = torch.randn((max_rows * steps, num_vocab), device='cuda').to(dtype)
     states_hidden = torch.randn((max_rows * steps, hidden), device='cuda', dtype=torch.bfloat16)
+    input_hashes = dict(base_logits=digest(base), hidden=digest(states_hidden))
 
     def confidence(h, m, out=None):
         dspark_confidence(h, m, confidence_weight, out)
@@ -79,7 +86,7 @@ for dtype in (torch.bfloat16, torch.float32):
 
         expected = tuple(t.clone() for t in reference())
         launches = dict(reference=reference, candidate=candidate, previous=reference, null=reference)
-        measured, _ = measure(launches, flush, 20261105, expected)
+        measured, _ = measure(launches, flush, 20261105, expected, rounds=a.rounds)
         label = f'{dtype}-{count}'
         profiles = {}
         for role in ('reference', 'candidate'):
@@ -98,7 +105,8 @@ for dtype in (torch.bfloat16, torch.float32):
         results.append(dict(name=label, rows=count, dtype=str(dtype), steps=steps,
             measured=measured, profiles=profiles,
             gate=classify(measured['log_ratios']['candidate']),
-            ids_sha256=hashlib.sha256(old.input_buffers.input_ids.cpu().numpy().tobytes()).hexdigest()))
+            weight_sha256=weight_hashes, input_sha256=input_hashes,
+            ids_sha256=digest(old.input_buffers.input_ids)))
         print(label, results[-1]['gate'], flush=True)
         (a.out / 'result.json').write_text(json.dumps(dict(cases=results,
             shape=dict(vocab=num_vocab, rank=rank, hidden=hidden, steps=steps, capacity=max_rows),
