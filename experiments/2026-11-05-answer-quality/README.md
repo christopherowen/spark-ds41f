@@ -178,3 +178,10 @@ python3 experiments/2026-11-05-answer-quality/run_window.py \
   --candidate-config experiments/2026-11-05-answer-quality/source-1024-fast.json \
   --controls-from experiments/2026-11-05-answer-quality/runs/pilot-window-02
 ```
+
+The full planned-capacity extension also passes (`runs/source-budget-check-02`):
+1,048,576 planned keys with a 98,305-key visible domain, both page sizes, exact
+retained native scores, source handoff and graph/recycling behavior. This covers
+the coarse segmented-selection route of the serving recipe in addition to the
+9-owner smaller-width fixture. The standalone container and reservation are
+removed before the model window. This is not full-visible-1M quality coverage.
