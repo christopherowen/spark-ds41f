@@ -28,12 +28,13 @@ repeated here or new serving-image qualification. No GPU/model arithmetic change
 is intended, but a new source/image still needs its own full release, functional
 and both complete metric boots. Never remeasure an old image/released build.
 
-Compiler/source-base selection remains unfrozen until C42's measured review.
-These source profiles currently preserve C40's old compiler and recorded four
-images/request; the global67-image default is untouched. If C42 is accepted,
-explicitly rebase the packet onto that best validated default-enabled base and
-publish/verify its complete identity before any image. Do not silently inject
-this cleanup into C42 or another active task's frozen matrix.
+C43 selects C40's unchanged validated compiler. C42 built but failed a required
+IKET integration test before serving; that compiler idea is under separate
+focused rework and is not a qualified base. No compiler fix is injected into
+this frontend cleanup. Source TP3/TP4 profiles remain disabled; separate named
+TP3 qualification profiles allow this owner-authorized, unpromoted shared-window
+round. Four images/request and the recorded model/draft/topology policy stay
+unchanged; the global67-image default is untouched.
 
 Primary acceptance includes exact failed-send/cancellation/late-reply and reused
 external-ID behavior, normal results, source/image/rank identity and no material
@@ -52,8 +53,45 @@ reproduced the declared head/tree. Its original log retains an intermediate
 patch whitespace warning; final source whitespace passed. The disk failure
 remains unchanged. Complete Linux inputs/checks and actual-image gates are pending.
 
-C42 subsequently failed its required IKET prepared/frozen check. The VERSION-only
-C44 proposal cannot fix that source branch and is withdrawn unmeasured. C43 now
+C42 subsequently failed its required IKET prepared/frozen check; a focused source
+correction is pending separately. The VERSION-only C44 proposal cannot fix that
+branch and is withdrawn unmeasured. C43 now
 selects C40's unchanged old compiler. Its forthcoming release gate uses an isolated
 fresh directory, preserving the shared test cache C42 touched. Serving-rank
 caches were never touched by C42 because no image was distributed or booted.
+
+## Qualification controls prepared
+
+The new image is unknown until built once on guarded idle DGX4. Its official
+release manifest must include all138 files, including both frontend CPU
+regressions. The whole gate cache, including pytest temporary directories and
+loader fixtures, must start absent at an image-digest-specific path under
+`~/.cache/spark-lab/qualification/candidate-43-<digest>`. Preserve C42's shared
+cache. Strict actual-image top-k initcheck, source labels and all eight ordered
+image/gate exits are required before distribution. A failed release gate keeps
+its native verdict and copied XML/JSONL before the coordinator refuses serving.
+
+Both functional boots require all40 ordered script exits to pass independently
+of their parent exit. The unchanged full release-tp3, single-stream and sampled
+families run on a fresh boot and repeat (six suites/26 ordered steps). Explicit
+current stream policy matches the saved full protocol; no lean/full mixing.
+The coordinator owns heartbeat/guard checks and restores named C36 once at the
+end. Management/telemetry loss retains a hardware-review hold and forbids a new
+launch. No concurrent DGX4 GPU work during TP3 timing.
+
+Nine offline control tests, six named profile doctors, both read-only controller
+plans and Python3.12 parsing passed. Identity-only normalization confirms both
+workload specs match the prior complete protocol; actual prepared top-k bytes
+match the intended hash. Original preparation/setup failures stay recorded.
+Full Linux preparation/build checks, actual image gates and serving measurements
+remain pending. No C43 controller or image has started.
+
+The sole planned command, after publishing and guarded all-node source staging,
+is `python3 -u experiments/2026-11-05-frontend-lifetime-qualification/run_round.py --apply`.
+Default attempt1 is unused. Native head output will be
+`results/private/lab/candidate-43-round/receipt.json`; builder output will be
+`results/private/candidate-rounds/candidate-43-image/receipt.json` in the owned
+DGX4 checkout. Actual launch/exit receipts must use fresh paths under
+`~/tl-logs/frontend-lifetime-qualification/setup/`. Never repeat a completed gate
+or measured arm. A safely scheduled passed-gate-only handoff may use the tested
+immutable receipt resume in a distinct attempt; a failed or measured arm cannot.
