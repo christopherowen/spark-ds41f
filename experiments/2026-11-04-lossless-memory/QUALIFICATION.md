@@ -137,13 +137,22 @@ The controller stops on a failed gate. A management failure latches a review hol
 instead of starting another serving container. A foreign window is never closed.
 Production is restored once at the end of the owned window.
 
-After both boots, also compare each complete model report with the recorded
-1030 model evidence pinned by `model-reference.json`. This is an offline check;
+After each primary suite, the controller compares its complete model report
+with the recorded 1030 evidence pinned by `model-reference.json`. This is an offline check;
 the released build is never run again. The original report covers all 256
 sequences and 65,536 scored positions. Its model step and all other index fields
 match the published reference; the original and published suite definitions
 differ in later prefill extents/description, as the provenance records. This
 model evidence supplies no substitute throughput observation.
+
+The reference's original file size and hash are checked before image or serving
+operations. Each comparison runs after the timed primary suite, before companion
+suites or another boot, in a separate CPU-only container capped at 1 GiB with
+no network or serving namespace. Its report, source/provenance/input hashes and
+failure log are retained. A nonzero exit, missing report, partial vectors or any
+change stops qualification and restores the owned window. It makes no inference
+requests, so it adds no prefix-cache warmup. The command below reproduces the
+same comparison offline outside the controller:
 
 ```sh
 python3 experiments/2026-11-04-lossless-memory/model_identity.py \

@@ -1,6 +1,7 @@
 """Native gate and failure-restoration checks without SSH, containers or GPUs."""
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,11 +32,12 @@ class ComponentTests(unittest.TestCase):
         self.kernel_passes = False
         self.full_gate_passes = None
         self.lab_calls = []
+        self.suite_calls = []
         self.image = {"Id": "sha256:" + "a" * 64, "Layers": ["sha256:" + "b" * 64],
                       "Labels": {"local.spark-ds41f.vllm.tree": "c" * 40, "org.opencontainers.image.revision": "d" * 40}}
         self.images = {f"dgx{i}": self.image for i in (1, 2, 3)}
         self.nodes = {"nodes": [{"name": f"dgx{i}", "rank": i - 1, "head": i == 1} for i in (1, 2, 3)]}
-        self.cluster = {"container": {"image": "candidate", "expected_labels": self.image["Labels"]}}
+        self.cluster = {"container": {"name": "serving", "image": "candidate", "expected_labels": self.image["Labels"]}}
         self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": []})
         self.write(self.here / "expert-scales/image.json", {"run": "image", "jobs": []})
         self.write(self.root / "build/images" / ("a" * 16 + ".json"),
@@ -60,7 +62,8 @@ class ComponentTests(unittest.TestCase):
 
     def process(self, argv, **kwargs):
         if "bin/spark" in argv and "cluster" in argv:
-            self.assertNotIn("--apply", argv)
+            if "--apply" in argv:
+                return SimpleNamespace(returncode=0)
             refused = self.restore_refused and "start" in argv
             return SimpleNamespace(returncode=0, stdout="live: running: 3 nodes\nshape: unchanged\n" +
                                    ("--apply would refuse" if refused else "plan only"), stderr="")
@@ -83,23 +86,34 @@ class ComponentTests(unittest.TestCase):
                           "inputs_sha256": inputs} for node in self.images]}
                 run_name = spec["run"]
                 self.write(self.root / "results/private/lab" / run_name / "verdicts.json", native)
+        if "bin/spark" in argv and "--suite" in argv:
+            self.suite_calls.append(argv[argv.index("--suite") + 1])
+        if argv[:2] == ["docker", "run"]:
+            output = next(value.split("source=", 1)[1].split(",target=", 1)[0]
+                          for value in argv if value.endswith("target=/out"))
+            self.write(Path(output) / "report.json", {"all_identical": False})
         return SimpleNamespace(returncode=0)
 
     def ssh(self, nodes, node, *argv):
         if argv == ("true",):
             self.health.append(node["name"])
             return SimpleNamespace(returncode=0)
+        if argv[0] in ("bash", "head"):
+            return SimpleNamespace(returncode=0, stdout="engine log", stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps(self.image))
 
-    def invoke(self, *, out="results/private/component", extra=()):
+    def invoke(self, *, out="results/private/component", extra=(), through="gate"):
         lab = SimpleNamespace(read_hold=lambda: self.hold, HOLD=self.root / "hold.json", now=lambda: "fixture",
                               window_should_close=lambda hold: None, published_problems=lambda: [],
                               plan=lambda spec: [spec["run"]],
                               plan_problems=lambda steps: ["missing configuration"] if self.plan_failure else [],
                               beat=lambda note: None, write_json_atomic=self.write, window_close=self.close,
-                              production_live=lambda: True)
+                              production_live=lambda: True, stop_cluster=lambda: True,
+                              start_memory_samplers=lambda out: {},
+                              stop_memory_samplers=lambda samplers: {name: {"min_available_gib": 8} for name in self.images})
         spark = SimpleNamespace(configuration=lambda args: (self.cluster, self.nodes, {}), run_ssh=self.ssh,
-                                build_inputs=lambda upstreams: {}, build_directory=lambda inputs: self.root / "build")
+                                build_inputs=lambda upstreams: {}, build_directory=lambda inputs: self.root / "build",
+                                repository_path=lambda config: self.root)
         def output(argv, **kwargs):
             if "status" in argv:
                 return b""
@@ -108,7 +122,7 @@ class ComponentTests(unittest.TestCase):
                 return ("\0".join(str(p.relative_to(self.root)) for p in directory.rglob("*") if p.is_file()) + "\0").encode()
             return "d" * 40
         process = SimpleNamespace(run=self.process, STDOUT=runner.subprocess.STDOUT, check_output=output)
-        argv = ["run_component.py", "--component", "expert-scales", "--window", "owned", "--through", "gate",
+        argv = ["run_component.py", "--component", "expert-scales", "--window", "owned", "--through", through,
                 "--out", out, "--apply", *extra]
         with patch.multiple(runner, ROOT=self.root, HERE=self.here, lab=lab, spark=spark, subprocess=process,
                             os=SimpleNamespace(uname=lambda: SimpleNamespace(nodename="dgx1"))), patch.object(sys, "argv", argv):
@@ -278,6 +292,67 @@ class ComponentTests(unittest.TestCase):
         native["logprobs"] = False
         with self.assertRaises(ValueError):
             runner.determinism_gate(json.dumps(native), logprobs=True)
+
+    def test_failed_recorded_model_identity_stops_before_companion_suite_or_repeat_boot(self):
+        self.image_failure = False
+        self.kernel_passes = True
+        self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": [{
+            "suite": ["primary", "companion"], "arms": [
+                {"label": label, "config": "candidate.json"} for label in ("first", "repeat")]}]})
+        reference = {"path": str(self.root / "reference.json.gz"), "sha256": "reference"}
+        with patch.object(runner, "recorded_model_reference", return_value=reference), \
+             patch.object(runner.suite, "load", return_value={}), \
+             patch.object(runner, "native_suite_gate", return_value={node: "first" for node in self.images}):
+            self.assertEqual(self.invoke(through="release"), 1)
+        self.assertEqual(self.suite_calls, ["primary"])
+        receipt = json.loads((self.root / "results/private/component/receipt.json").read_text())
+        self.assertIn("recorded-model comparison", receipt["error"])
+        self.assertTrue(receipt["restored"])
+        self.assertFalse(receipt.get("completed"))
+        self.assertEqual([r["log"] for r in receipt["steps"] if r["log"].startswith("boot-")], ["boot-first.log"])
+        self.assertIn("first", receipt["model_identity"])
+
+    def test_model_gate_requires_complete_exact_vectors_and_pinned_inputs(self):
+        candidate = self.root / "model.json.gz"
+        candidate.write_bytes(b"fixture")
+        reference = {"sha256": "ref", "provenance_sha256": "provenance", "analysis_sha256": "source",
+                     "sequences": 256, "positions": 65536}
+        row = {"path": "/evidence/candidate.json.gz", "sha256": runner.file_sha256(candidate),
+               "identical": True, "workload_identical": True, "corpus_identical": True,
+               "reference_sequences": 256, "candidate_sequences": 256,
+               "reference_positions": 65536, "candidate_positions": 65536,
+               "generation_differences": [], "score_differences": []}
+        for field in ("generation", "scores"):
+            for prefix in ("reference", "candidate"):
+                row[prefix + "_" + field + "_sha256"] = field
+        value = {"all_identical": True, "inference_requests": 0, "reference_sha256": "ref",
+                 "provenance_sha256": "provenance", "analysis_sha256": "source", "candidates": [row]}
+        runner.native_model_gate(value, candidate, reference)
+        for key, bad in (("identical", False), ("sha256", "other"), ("candidate_positions", 65535),
+                         ("generation_differences", [1]), ("score_differences", [1]),
+                         ("candidate_scores_sha256", "changed"), ("workload_identical", False)):
+            changed = copy.deepcopy(value)
+            changed["candidates"][0][key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.native_model_gate(changed, candidate, reference)
+        for key, bad in (("inference_requests", 1), ("analysis_sha256", "changed"),
+                         ("provenance_sha256", "changed"), ("candidates", [])):
+            changed = copy.deepcopy(value)
+            changed[key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.native_model_gate(changed, candidate, reference)
+
+    def test_recorded_reference_is_checked_before_serving_operations(self):
+        self.write(self.here / "model-reference.json", {"model_path": str(self.root / "results/private/model.json.gz"),
+                   "model_bytes": 7, "model_sha256": "changed"})
+        model = self.root / "results/private/model.json.gz"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"fixture")
+        with patch.multiple(runner, HERE=self.here, ROOT=self.root):
+            with self.assertRaisesRegex(ValueError, "pinned evidence"):
+                runner.recorded_model_reference()
+        self.assertEqual(self.invoke(through="release"), 1)
+        self.assertEqual(self.lab_calls, [])
 
     def test_suite_cannot_pass_with_a_failed_step_changed_image_or_missing_cooling_rank(self):
         definition = {"name": "tiny", "steps": [{"id": "c1", "command": "run"}]}

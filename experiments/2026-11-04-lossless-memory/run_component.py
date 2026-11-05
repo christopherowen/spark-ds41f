@@ -163,6 +163,64 @@ def determinism_gate(text, *, logprobs):
     return summaries[0]
 
 
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def recorded_model_reference():
+    provenance = HERE / "model-reference.json"
+    value = json.loads(provenance.read_text())
+    path = Path(value["model_path"])
+    if (not path.is_relative_to(ROOT / "results/private")
+            or path.stat().st_size != value["model_bytes"]
+            or file_sha256(path) != value["model_sha256"]):
+        raise ValueError("recorded model reference is absent or differs from pinned evidence")
+    return {"path": str(path), "sha256": value["model_sha256"],
+            "provenance_sha256": file_sha256(provenance),
+            "analysis_sha256": file_sha256(HERE / "model_identity.py"),
+            "sequences": value["sequences"], "positions": value["scored_positions"]}
+
+
+def model_gate_command(candidate, output, image, reference):
+    # This process runs only after the complete primary suite. It has no GPU,
+    # network or serving namespace and cannot charge buffers to serving's cap.
+    mounts = [(Path(reference["path"]), "/evidence/reference.json.gz", "ro"),
+              (candidate, "/evidence/candidate.json.gz", "ro"),
+              (HERE / "model-reference.json", "/evidence/provenance.json", "ro"),
+              (HERE / "model_identity.py", "/evidence/model_identity.py", "ro"),
+              (output, "/out", "rw")]
+    argv = ["docker", "run", "--rm", "--memory=1g", "--memory-swap=1g", "--cpus=1",
+            "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--pids-limit=32", "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void"]
+    for source, target, mode in mounts:
+        argv += ["--mount", f"type=bind,source={source},target={target}" + (",readonly" if mode == "ro" else "")]
+    return [*argv, "--entrypoint", "python3", image, "/evidence/model_identity.py",
+            "--reference", "/evidence/reference.json.gz", "--provenance", "/evidence/provenance.json",
+            "--candidate", "/evidence/candidate.json.gz", "--out", "/out/report.json"]
+
+
+def native_model_gate(value, candidate, reference):
+    if (value.get("all_identical") is not True or value.get("inference_requests") != 0
+            or value.get("reference_sha256") != reference["sha256"]
+            or value.get("provenance_sha256") != reference["provenance_sha256"]
+            or value.get("analysis_sha256") != reference["analysis_sha256"]
+            or len(value.get("candidates", [])) != 1):
+        raise ValueError("missing, failed or unpinned recorded-model comparison")
+    row = value["candidates"][0]
+    if (row.get("path") != "/evidence/candidate.json.gz"
+            or row.get("sha256") != file_sha256(candidate)
+            or row.get("identical") is not True or row.get("workload_identical") is not True
+            or row.get("corpus_identical") is not True or row.get("error")
+            or row.get("generation_differences") != [] or row.get("score_differences") != []
+            or any(row.get(prefix + "_sequences") != reference["sequences"] for prefix in ("reference", "candidate"))
+            or any(row.get(prefix + "_positions") != reference["positions"] for prefix in ("reference", "candidate"))
+            or any(not row.get("reference_" + field + "_sha256")
+                   or row.get("reference_" + field + "_sha256") != row.get("candidate_" + field + "_sha256")
+                   for field in ("generation", "scores"))):
+        raise ValueError("recorded tokens or returned score vectors differ or are incomplete")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--component", choices=("expert-scales", "engram"), required=True)
@@ -340,6 +398,9 @@ def main():
         problems = lab.published_problems()
         if problems:
             raise RuntimeError("publish guard: " + "; ".join(problems))
+        if args.through == "release":
+            receipt["model_reference"] = recorded_model_reference()
+            save()
         plan(RESTORE, ["stop"])
         if previous is None:
             run([sys.executable, "scripts/lab.py", "run", str((arm / "image.json").relative_to(ROOT)),
@@ -435,6 +496,22 @@ def main():
                     if starts is not None and starts != observed:
                         raise ValueError("companion suites changed boot")
                     starts = observed
+                    if i == 0:
+                        comparison = out / ("model-identity-" + label)
+                        comparison.mkdir()
+                        candidate_model = directory / "model.json.gz"
+                        argv = model_gate_command(candidate_model, comparison, image_id, receipt["model_reference"])
+                        try:
+                            run(argv, "model-identity-" + label)
+                        finally:
+                            path = comparison / "report.json"
+                            receipt.setdefault("model_identity", {})[label] = {
+                                "path": str(path.relative_to(ROOT)),
+                                "sha256": file_sha256(path) if path.exists() else None}
+                            save()
+                        native_model_gate(json.loads(path.read_text()), candidate_model, receipt["model_reference"])
+                        receipt["model_identity"][label]["passed"] = True
+                        save()
                 if previous_starts and any(starts[node] == previous_starts[node] for node in starts):
                     raise ValueError("repeat did not boot every rank")
                 previous_starts = starts
@@ -445,6 +522,7 @@ def main():
                 run([sys.executable, "scripts/servebench_suite_table.py", release["run"] + suffix,
                      job["arms"][0]["label"], reference, job["arms"][1]["label"]], f"table-{i}")
             receipt["two_serving_boots_complete"] = True
+            receipt["recorded_model_identity_passed"] = True
             functional = ROOT / "results/private/bench" / (release["run"] + "-functional")
             run([sys.executable, "bin/spark", "--cluster-config", profile, "bench", "--compare", "none",
                  "--suites", "quality,prefix,admission", "--prefix-tokens", "32768",

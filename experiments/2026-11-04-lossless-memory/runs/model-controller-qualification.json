@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "scope": "local qualification of automatic offline model-identity gate; no GPU or serving measurement",
+  "base_commit": "2a1c32ecb4116c240cefda1d2d171a49d20e6379",
+  "intended_variable": "require the unchanged recorded-model comparison after each complete primary suite, before companion suites or another boot",
+  "repository_tests": {
+    "command": ".venv312/bin/python -m unittest discover -s tests",
+    "exit": 0,
+    "count": 717,
+    "seconds": 42.759,
+    "native_log": ".work/model-gate-repository-tests.log"
+  },
+  "focused_tests": {
+    "command": ".venv312/bin/python -m unittest tests.test_lossless_component_runner tests.test_lossless_model_identity",
+    "exit": 0,
+    "count": 27
+  },
+  "checks": [
+    {
+      "command": "bin/spark doctor",
+      "exit": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0
+    }
+  ],
+  "source_sha256": {
+    "experiments/2026-11-04-lossless-memory/run_component.py": "2dd2839acdf9f8b4e4635ca2a53ce932e8c34df51ad6ea3d1c6b7e9873466863",
+    "experiments/2026-11-04-lossless-memory/model_identity.py": "bcc59b3d7244a9b2a010d51f3d6c0516a50d17658cac5300c2f704faa6dba983",
+    "tests/test_lossless_component_runner.py": "520dee44e87cf61471c40da45164d9eebcb4cd6acc194f9f7bd354600fd331e7"
+  },
+  "offline_comparison_preparation": {
+    "command": "/usr/bin/time -l .venv312/bin/python experiments/2026-11-04-lossless-memory/model_identity.py --reference .work/recorded-1030-model/model.json.gz --provenance experiments/2026-11-04-lossless-memory/model-reference.json --candidate .work/recorded-1030-model-repeat/model.json.gz --out .work/automatic-model-gate-calibration.json",
+    "exit": 0,
+    "wall_seconds": 3.42,
+    "maximum_resident_bytes": 454344704,
+    "peak_memory_footprint_bytes": 445776688,
+    "host": "local macOS; not a target performance prediction",
+    "model_requests": 0,
+    "all_identical": true
+  },
+  "target_container": {
+    "memory_limit_bytes": 1073741824,
+    "cpus": 1,
+    "gpu_access": false,
+    "network_access": false,
+    "after_timed_primary_suite": true,
+    "target_execution_pending": true
+  },
+  "runtime_source_and_build_inputs_changed": false,
+  "candidate_model_or_performance_qualified": false,
+  "errors": [],
+  "conclusion": "local failure-path tests pass; changed/missing/incomplete/potentially substituted model results prevent companion suites and repeat serving boots; native target execution remains required"
+}
