@@ -1,0 +1,546 @@
+"""Run qualified capture policies on a published branch and restore its parent.
+
+The normal CLI owns every coordinated node operation. This controller adds
+exact window ownership, plan checks, and restoration of the saved Git revision.
+It never uses the continuously syncing lab queue or changes the physical shape.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from spark_ds41f import lab
+
+EXPERIMENT = Path(__file__).resolve().parent
+HOLDER = "spark-lab: verification capture policies"
+
+
+def check_plan(action: str, output: str, status: int) -> None:
+    if (
+        status
+        or "--apply would refuse" in output
+        or re.search(r"^shape:\s+CHANGES", output, re.MULTILINE)
+    ):
+        raise RuntimeError("coordinated plan refused; no shape bypass")
+    if action in ("start", "stop") and not re.search(r"^live:", output, re.MULTILINE):
+        raise RuntimeError("coordinated plan lacks its live identity")
+    if action == "start" and not re.search(
+        r"^shape:\s+(unchanged|new engine)$", output, re.MULTILINE
+    ):
+        raise RuntimeError("start plan lacks an unchanged or new engine shape")
+
+
+def require_owner(hold: dict | None, state: dict) -> None:
+    if not hold or (hold.get("holder"), hold.get("window")) != (
+        HOLDER,
+        state["window"],
+    ):
+        raise RuntimeError("exact window ownership lost; no mutation attempted")
+
+
+def clean_revision(repo: Path) -> str:
+    if subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain"]):
+        raise RuntimeError(f"dirty controller checkout: {repo}")
+    return subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+class Round:
+    def __init__(self, state_path: Path):
+        self.path = state_path
+        self.state = json.loads(state_path.read_text())
+        self.out = state_path.parent
+        self.restore_repo = Path(self.state["restore_checkout"])
+        self.closing = False
+
+    def save(self):
+        lab.write_json_atomic(self.path, self.state)
+
+    def own(self, *, closing=False):
+        require_owner(lab.read_hold(), self.state)
+        if not closing and lab.window_should_close(lab.read_hold()):
+            raise RuntimeError(
+                "window closure requested; finish the active operation and restore"
+            )
+
+    def run(self, argv, *, repo=ROOT, closing=False, input_text=None):
+        self.own(closing=closing)
+        index = len(self.state["commands"])
+        entry = {
+            "argv": list(map(str, argv)),
+            "cwd": str(repo),
+            "started": lab.now(),
+            "log": f"command-{index:03d}.log",
+        }
+        self.state["commands"].append(entry)
+        self.save()
+        process = subprocess.run(
+            argv,
+            check=False,
+            cwd=repo,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        (self.out / entry["log"]).write_text(process.stdout)
+        entry.update(exit=process.returncode, ended=lab.now())
+        self.save()
+        print(process.stdout, end="", flush=True)
+        if process.returncode:
+            raise RuntimeError(
+                f"command {index} exited {process.returncode}; see {entry['log']}"
+            )
+        return process.stdout
+
+    def cli(
+        self, repo, config, operation, action=None, *extra, apply=False, closing=False
+    ):
+        self.own(closing=closing)
+        if "--change-shape" in extra or "--unqualified-shape" in extra:
+            raise RuntimeError("shape bypass is forbidden in this experiment")
+        argv = [
+            sys.executable,
+            str(repo / "bin/spark"),
+            "--cluster-config",
+            config,
+            operation,
+        ]
+        if action:
+            argv.append(action)
+        argv.extend(extra)
+        if apply:
+            output = self.run(argv, repo=repo, closing=closing)
+            check_plan(action, output, 0)
+            argv = [*argv, "--apply"]
+        return self.run(argv, repo=repo, closing=closing)
+
+    def restore(self, reason="round ended", dry=False):
+        if dry:
+            raise RuntimeError("restoration is never simulated by an executing round")
+        if self.state.get("restored"):
+            return True
+        self.closing = True
+        self.own(closing=True)
+        if clean_revision(self.restore_repo) != self.state["restore_revision"]:
+            raise RuntimeError("saved restoration checkout changed")
+        config = self.state["restore_config"]
+        # Stop covers every configured node and the same serving container name.
+        # If sync never started, the verified original service needs no restart.
+        if self.state.get("sync_started"):
+            self.cli(
+                ROOT,
+                self.state["candidate_config"],
+                "cluster",
+                "stop",
+                apply=True,
+                closing=True,
+            )
+            self.cli(
+                self.restore_repo,
+                config,
+                "cluster",
+                "sync",
+                "--revision",
+                self.state["restore_revision"],
+                apply=True,
+                closing=True,
+            )
+            self.cli(
+                self.restore_repo,
+                config,
+                "cluster",
+                "start",
+                "--replace",
+                apply=True,
+                closing=True,
+            )
+        self.cli(self.restore_repo, config, "doctor", "--live", closing=True)
+        cluster, nodes, _ = lab.spark.configuration(
+            argparse.Namespace(cluster_config=config)
+        )
+        for node in nodes["nodes"]:
+            revision, _, dirty = lab.spark.remote_repository_state(cluster, nodes, node)
+            if revision != self.state["restore_revision"] or dirty:
+                raise RuntimeError(
+                    f"{node['name']}: restoration checkout identity differs"
+                )
+        self.run(
+            [
+                sys.executable,
+                str(self.restore_repo / "scripts/lab.py"),
+                "window",
+                "close",
+                "--production-config",
+                config,
+            ],
+            repo=self.restore_repo,
+            closing=True,
+        )
+        if lab.read_hold() is not None:
+            raise RuntimeError("normal window closure did not release the hold")
+        self.state.update(restored=True, restore_reason=reason, ended=lab.now())
+        self.save()
+        return True
+
+    def install_lab_guards(self):
+        original_script = lab.run_script
+        lab.hold_is_ours = lambda hold: bool(
+            hold
+            and hold.get("holder") == HOLDER
+            and hold.get("window") == self.state["window"]
+        )
+        lab.window_close = self.restore
+
+        def cli(*arguments, dry=False, capture=None):
+            if dry:
+                raise RuntimeError("dry command inside an executing round")
+            arguments = list(arguments)
+            # The stock lab boot always adds this flag; remove it and let the
+            # normal CLI's shape refusal apply without any bypass.
+            arguments = [x for x in arguments if x != "--change-shape"]
+            config = arguments[arguments.index("--cluster-config") + 1]
+            index = arguments.index("--cluster-config")
+            arguments = arguments[:index] + arguments[index + 2 :]
+            apply = "--apply" in arguments
+            arguments = [x for x in arguments if x != "--apply"]
+            output = self.cli(
+                ROOT, config, *arguments, apply=apply, closing=self.closing
+            )
+            if capture is not None:
+                capture.extend(output.splitlines())
+            return 0
+
+        def script(step):
+            self.own()
+            code = original_script(step)
+            if code:
+                raise RuntimeError(
+                    f"functional script failed: {step['argv']} (exit {code})"
+                )
+            return code
+
+        lab.spark_cli = cli
+        lab.run_script = script
+
+
+def validate_gate(gate: dict, config: dict, revision: str) -> None:
+    required = {"gpu-smoke", "focused-tests", "graph-replay", "memcheck", "initcheck"}
+    checks = gate.get("checks", {})
+    if (
+        gate.get("passed") is not True
+        or gate.get("commit") != revision
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", gate.get("image", ""))
+        or any(checks.get(name, {}).get("passed") is not True for name in required)
+        or gate.get("source", {}).get("expected_labels")
+        != config["container"]["expected_labels"]
+    ):
+        raise RuntimeError(
+            "qualified image receipt is incomplete or differs from this checkout"
+        )
+    if (
+        not gate.get("ended")
+        or gate.get("error")
+        or gate.get("gate", {}).get("passed") is not True
+        or gate.get("gate", {}).get("failed")
+        or gate.get("gate", {}).get("errors")
+    ):
+        raise RuntimeError("image gate is incomplete or failed")
+    if any(step.get("exit") != 0 for step in gate.get("steps", [])):
+        raise RuntimeError("image gate contains an execution failure")
+    if not {
+        "build-image-cpu.log",
+        "gpu-smoke.log",
+        "release-tests.log",
+        "graph-replay.log",
+        "memcheck.log",
+        "initcheck.log",
+    }.issubset({s.get("log") for s in gate.get("steps", [])}):
+        raise RuntimeError("image gate lacks build and test command records")
+    if gate.get("conditions", {}).get("halted") or gate.get("conditions", {}).get(
+        "fan_stop_failures"
+    ):
+        raise RuntimeError("image gate conditions failed")
+    inspection = json.loads(
+        subprocess.check_output(
+            ["docker", "image", "inspect", config["container"]["image"]], text=True
+        )
+    )[0]
+    if inspection["Id"] != gate["image"]:
+        raise RuntimeError("local image differs from the qualified image")
+    for key, value in config["container"]["expected_labels"].items():
+        if inspection["Config"].get("Labels", {}).get(key) != value:
+            raise RuntimeError(f"qualified image label differs: {key}")
+
+
+def guardian(state_path: Path, parent_pid: int, start: str) -> int:
+    proc = Path(f"/proc/{parent_pid}/stat")
+    while proc.exists() and proc.read_text().split()[21] == start:
+        time.sleep(5)
+    with (state_path.parent / "controller.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        round = Round(state_path)
+        if not round.state.get("restored"):
+            try:
+                round.restore("controller process exited")
+            except BaseException as error:  # noqa: BLE001 - retain evidence even on termination
+                round.state["guardian_error"] = f"{type(error).__name__}: {error}"
+                round.save()
+                return 1
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--restore-checkout", type=Path)
+    parser.add_argument(
+        "--restore-config",
+        default="experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("exact-native", "row-ladder", "shape-union"),
+        default="exact-native",
+    )
+    parser.add_argument("--qualified-receipt", type=Path)
+    parser.add_argument("--run-id", default="verification-shapes-round")
+    parser.add_argument("--guardian", type=Path)
+    parser.add_argument("--parent-pid", type=int)
+    parser.add_argument("--parent-start")
+    args = parser.parse_args()
+    if args.guardian:
+        return guardian(args.guardian, args.parent_pid, args.parent_start)
+    profile_dir = (
+        EXPERIMENT
+        if args.variant == "exact-native"
+        else EXPERIMENT / "variants" / args.variant
+    )
+    candidate = str((profile_dir / "tp3.json").relative_to(ROOT))
+    specs = []
+    for name in ("functional.json", "performance.json"):
+        raw = (
+            (EXPERIMENT / name)
+            .read_text()
+            .replace(
+                str(EXPERIMENT.relative_to(ROOT)) + "/tp3",
+                str(profile_dir.relative_to(ROOT)) + "/tp3",
+            )
+        )
+        if args.qualified_receipt:
+            receipt_path = args.qualified_receipt.resolve()
+            if not receipt_path.is_relative_to(ROOT / "results/private"):
+                raise RuntimeError(
+                    "qualified receipt must be retained under this checkout results/private"
+                )
+            raw = raw.replace(
+                "results/private/candidate-rounds/verification-shapes-qualified-image/receipt.json",
+                str(receipt_path.relative_to(ROOT)),
+            )
+        spec = json.loads(raw)
+        spec["run"] = args.run_id + "-" + name.removesuffix(".json")
+        if any(
+            step["kind"] not in {"boot", "cli", "script", "curves", "table"}
+            for step in lab.plan(spec)
+        ):
+            raise RuntimeError("round spec contains an unsupported mutating step")
+        specs.append(spec)
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "candidate": candidate,
+                    "restore": args.restore_config,
+                    "specs": specs,
+                    "requires": [
+                        "exact qualified image receipt",
+                        "clean published branch",
+                        "exclusive window",
+                        "clean saved restoration checkout",
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if (
+        os.uname().nodename != "dgx1"
+        or lab.read_hold()
+        or lab.REQUEST.exists()
+        or lab.LEGACY_REQUEST.exists()
+    ):
+        raise RuntimeError("wrong host, held window or pending request; defer")
+    if not args.restore_checkout or not args.qualified_receipt:
+        parser.error("--apply requires --restore-checkout and --qualified-receipt")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.run_id):
+        raise RuntimeError("run ID must be a plain lowercase filename component")
+    restore_repo = args.restore_checkout.resolve()
+    if restore_repo == ROOT:
+        raise RuntimeError(
+            "restoration controller must be an independent pinned checkout"
+        )
+    revision, restore_revision = clean_revision(ROOT), clean_revision(restore_repo)
+    cluster, nodes, _ = lab.spark.configuration(
+        argparse.Namespace(cluster_config=candidate)
+    )
+    shape_query = (
+        "import argparse,json,sys; from spark_ds41f import cluster as s; "
+        "c,n,_=s.configuration(argparse.Namespace(cluster_config=sys.argv[1])); "
+        "print(json.dumps({'nodes':n,'shape':s.engine_shape(s.expected_command(c,s.head_node(n)))}))"
+    )
+    original = json.loads(
+        subprocess.check_output(
+            [sys.executable, "-c", shape_query, args.restore_config],
+            cwd=restore_repo,
+            text=True,
+        )
+    )
+    candidate_shape = lab.spark.engine_shape(
+        lab.spark.expected_command(cluster, lab.spark.head_node(nodes))
+    )
+    if original["nodes"] != nodes or original["shape"] != candidate_shape:
+        raise RuntimeError(
+            "candidate and restoration controller disagree on topology or engine shape"
+        )
+    validate_gate(json.loads(args.qualified_receipt.read_text()), cluster, revision)
+    image_gate = json.loads(args.qualified_receipt.read_text())
+    for spec in specs:
+        for job in spec["jobs"]:
+            for script, arguments, _label in job.get("extras", []):
+                if script == "scripts/collect_runtime.py":
+                    index = arguments.index("--image-receipt")
+                    arguments[index : index + 2] = [
+                        "--expected-image-id",
+                        image_gate["image"],
+                    ]
+    for node in nodes["nodes"]:
+        remote, _, dirty = lab.spark.remote_repository_state(cluster, nodes, node)
+        if remote != restore_revision or dirty:
+            raise RuntimeError(
+                "original node revisions must match the saved clean restoration checkout"
+            )
+    lab.PRODUCTION_CONFIG = args.restore_config
+    for spec in specs:
+        problems = lab.plan_problems(lab.plan(spec))
+        if problems:
+            raise RuntimeError("; ".join(problems))
+    out = ROOT / "results/private/verification-shapes" / args.run_id
+    out.mkdir(parents=True, exist_ok=False)
+    # The original checkout enforces publication on main, live identity and idle.
+    subprocess.run(
+        [
+            sys.executable,
+            str(restore_repo / "scripts/lab.py"),
+            "window",
+            "open",
+            "--minutes",
+            "0",
+            "--note",
+            "verification capture policies",
+            "--production-config",
+            args.restore_config,
+        ],
+        cwd=restore_repo,
+        check=True,
+    )
+    opened = lab.read_hold()
+    if not opened or opened.get("holder") != HOLDER:
+        raise RuntimeError("window opening did not establish exact ownership")
+    state_path = out / "receipt.json"
+    lab.write_json_atomic(
+        state_path,
+        {
+            "started": lab.now(),
+            "window": opened["window"],
+            "deployment_commit": revision,
+            "image_gate_receipt": str(args.qualified_receipt.resolve()),
+            "image_gate_sha256": hashlib.sha256(
+                args.qualified_receipt.read_bytes()
+            ).hexdigest(),
+            "restore_checkout": str(restore_repo),
+            "restore_revision": restore_revision,
+            "restore_config": args.restore_config,
+            "candidate_config": candidate,
+            "commands": [],
+            "restored": False,
+        },
+    )
+    round = Round(state_path)
+    with (out / "controller.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (out / "guardian.log").open("a") as log:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--guardian",
+                    str(state_path),
+                    "--parent-pid",
+                    str(os.getpid()),
+                    "--parent-start",
+                    Path(f"/proc/{os.getpid()}/stat").read_text().split()[21],
+                ],
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        done = threading.Event()
+
+        def beat():
+            while not done.wait(30):
+                try:
+                    require_owner(lab.read_hold(), round.state)
+                    lab.beat("verification capture policies")
+                except (RuntimeError, OSError, SystemExit):
+                    return
+
+        threading.Thread(target=beat, daemon=True).start()
+        round.install_lab_guards()
+        signal.signal(
+            signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        status = 1
+        try:
+            round.state["sync_started"] = True
+            round.save()
+            round.cli(
+                ROOT, candidate, "cluster", "sync", "--revision", revision, apply=True
+            )
+            for spec in specs:
+                round.own()
+                if lab.execute(spec, dry=False, keep_open=True, close_on_failure=False):
+                    raise RuntimeError(f"failed specification: {spec['run']}")
+            round.state["completed"] = True
+            status = 0
+        except BaseException as error:  # noqa: BLE001 - retain evidence even on termination
+            round.state["error"] = f"{type(error).__name__}: {error}"
+            round.save()
+        finally:
+            try:
+                round.restore()
+            except BaseException as error:  # noqa: BLE001 - retain evidence even on termination
+                round.state["restore_error"] = f"{type(error).__name__}: {error}"
+                round.save()
+                status = 1
+            done.set()
+        return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,34 @@
+Running as unit: run-r95663407f5ab4b838927ebbb2bd444ce.scope; invocation ID: 13bc4acba580468b849eb16dea573ba9
+..................F.                                                     [100%]
+=================================== FAILURES ===================================
+______________ test_cli_checks_owner_again_between_plan_and_apply ______________
+
+tmp_path = PosixPath('/tmp/pytest-of-chris/pytest-1/test_cli_checks_owner_again_be0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf8e76332bef0>
+
+    def test_cli_checks_owner_again_between_plan_and_apply(tmp_path, monkeypatch):
+        round = controller(tmp_path)
+        holds = iter([
+            {"holder": r.HOLDER, "window": "ours"},
+            {"holder": r.HOLDER, "window": "ours"},
+            {"holder": r.HOLDER, "window": "ours"},
+            {"holder": r.HOLDER, "window": "ours"},
+            {"holder": "spark-lab: different", "window": "new"},
+        ])
+        monkeypatch.setattr(r.lab, "read_hold", lambda: next(holds))
+        monkeypatch.setattr(r.lab, "window_should_close", lambda _: None)
+        command = Mock(return_value=r.subprocess.CompletedProcess([], 0, "live: running\nshape: unchanged\n"))
+        monkeypatch.setattr(r.subprocess, "run", command)
+        with pytest.raises(RuntimeError, match="ownership lost"):
+            round.cli(r.ROOT, "candidate.json", "cluster", "start", apply=True)
+        assert command.call_count == 1
+>       assert "--apply" not in command.call_args.args[0]
+E       AssertionError: assert '--apply' not in ['/home/chris/spark-work/verification-shapes/vllm/.venv/bin/python', '/home/chris/spark-work/verification-shapes/deployment/bin/spark', '--cluster-config', 'candidate.json', 'cluster', 'start', ...]
+
+experiments/2026-11-05-verification-shapes/test_branch_round.py:111: AssertionError
+----------------------------- Captured stdout call -----------------------------
+live: running
+shape: unchanged
+=========================== short test summary info ============================
+FAILED experiments/2026-11-05-verification-shapes/test_branch_round.py::test_cli_checks_owner_again_between_plan_and_apply
+1 failed, 19 passed in 0.04s

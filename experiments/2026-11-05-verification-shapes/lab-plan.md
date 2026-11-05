@@ -8,10 +8,11 @@ is proposed. Do not run these jobs under a foreign hold or jump the existing
 norm-kernel request.
 
 1. On a reserved idle remote build host, prepare the complete locked inputs,
-   run `build check`, and perform the normal memory-guarded image build and GPU
-   smoke test. First coordinate an explicit builder CPU/memory allocation:
-   the current 1-CPU/4-GiB CPU-only reservation does not authorize a larger
-   Docker builder. A controller cgroup does not cap the Docker daemon's workers.
+   run `build check`. The CPU-only build phase below uses a separately recorded
+   two-CPU/24-GiB allocation on SP8, after checking other reservations and host
+   capacity. The controller remains capped at one CPU/4 GiB. A controller
+   cgroup alone does not cap the Docker daemon's workers. The GPU smoke and
+   image gates run only after exclusive GPU window handoff.
    Never run a heavy build on the workstation.
 2. Gate that actual image, without source overlays. Run graph-manager, warmup,
    DSpark context, and MXFP8 linear tests. Test odd and boundary rows
@@ -91,3 +92,40 @@ shared `spark-lab` prefix is insufficient to identify this task. Keep its
 heartbeat and watchdog active. The watchdog does not restore a deployment
 checkout revision, so successful closure additionally requires explicitly
 restoring the recorded commit before releasing the hold.
+
+## CPU build preparation and strict branch controller
+
+`build_cpu_image.py` separates the CPU image stages from all GPU work. It uses
+the exact locked contexts and Dockerfile command printed by `bin/spark build
+image`, the normal host-memory start/reserve guards, and the normal build lock.
+An isolated, digest-pinned BuildKit worker is limited to two CPUs and 24 GiB
+including swap, with one build stage and one compile job at a time. CDI and
+device entitlements are disabled; a worker probe must see no GPU device paths
+before compilation begins. It runs only on SP8 under a recorded CPU reservation.
+The existing 1-CPU/4-GiB controller budget remains separate. This CPU phase may
+progress independently of TP3 or DGX4 GPU windows because it cannot access a
+GPU and does not change any serving node. It cannot produce a passing gate.
+The image is unqualified until the normal GPU smoke and complete applicable
+image gates pass in an owned window. All failures remain in new attempt paths.
+
+`branch_round.py` consumes that completed gate receipt; it cannot start with a
+CPU-only build receipt. The original production controller must be a separate
+clean checkout pinned to the original published main commit. Before opening,
+its shape and node map must exactly match the candidate, and every node must
+match its revision. Window opening retains the normal publish/live/idle guards.
+Each cluster mutation first runs and records its plan, rejects any shape change,
+and checks the exact holder/window again before applying. Functional script
+failures are fatal. Restoration stops all configured ranks, syncs the saved
+revision, starts the saved profile, checks live doctor and every clean checkout,
+then uses normal window closure. A separate recovery process restores after a
+controller exit; it refuses foreign ownership and leaves the hold on failure.
+The existing watchdog remains active.
+
+The CPU controller tests cover foreign/stale ownership, shape/refusal plans,
+window loss between plan and apply, ordered coordinated restoration, and
+retaining the hold after failed sync. The first two test attempts exposed a
+mutable command-list reference in the test observation; constructing the apply
+argv separately fixes the recorded plan identity. Their logs are retained.
+No simulated restoration or CPU controller result is serving-hardware evidence.
+
+The isolated worker uses Docker's documented [container driver limits](https://docs.docker.com/build/builders/drivers/docker-container/) and [CDI/parallelism settings](https://docs.docker.com/build/buildkit/toml-configuration/). No daemon-wide configuration or default builder is changed.

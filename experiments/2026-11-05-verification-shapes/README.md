@@ -154,3 +154,12 @@ The row-only and union alternatives are implemented and replayed, with final
 `runs/implemented-alternative-census.json`; their actual descriptors match the
 structural comparison and add no piecewise graphs. They remain unmeasured on
 GPU, and no policy has been selected as a performance winner.
+
+The strict published-branch controller has 20 passing CPU checks and retains
+its failed setup attempts. Both functional/performance specs pass offline
+preflight for all three policies. The CPU-only build driver uses the official
+locked build command with a separate two-CPU/24-GiB worker, no GPU device
+entitlement/CDI, and a mandatory worker device probe. Its output remains
+unqualified until the owned-window GPU smoke, image tests, sanitizers and
+serving checks finish. See `lab-plan.md` for the complete ownership, restoration
+and resource contract.
