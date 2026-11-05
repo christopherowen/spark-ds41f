@@ -190,7 +190,8 @@ def model_gate_command(candidate, output, image, reference):
               (HERE / "model-reference.json", "/evidence/provenance.json", "ro"),
               (HERE / "model_identity.py", "/evidence/model_identity.py", "ro"),
               (output, "/out", "rw")]
-    argv = ["docker", "run", "--rm", "--memory=1g", "--memory-swap=1g", "--cpus=1",
+    argv = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+            "--memory=1g", "--memory-swap=1g", "--cpus=1",
             "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--pids-limit=32", "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void"]
     for source, target, mode in mounts:

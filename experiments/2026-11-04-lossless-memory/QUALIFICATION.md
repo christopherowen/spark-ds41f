@@ -155,7 +155,9 @@ model evidence supplies no substitute throughput observation.
 The reference's original file size and hash are checked before image or serving
 operations. Each comparison runs after the timed primary suite, before companion
 suites or another boot, in a separate CPU-only container capped at 1 GiB with
-no network or serving namespace. Its report, source/provenance/input hashes and
+no network or serving namespace. It uses the invoking user's numeric UID/GID to
+write its report bind while retaining the dropped capabilities and read-only inputs.
+Its report, source/provenance/input hashes and
 failure log are retained. A nonzero exit, missing report, partial vectors or any
 change stops qualification and restores the owned window. It makes no inference
 requests, so it adds no prefix-cache warmup. The command below reproduces the
