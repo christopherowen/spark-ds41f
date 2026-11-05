@@ -221,6 +221,25 @@ def native_model_gate(value, candidate, reference):
         raise ValueError("recorded tokens or returned score vectors differ or are incomplete")
 
 
+def functional_digest_gate(text, reference):
+    rows = [json.loads(line) for line in text.splitlines() if line.startswith("{")]
+    summaries = [row for row in rows if row.get("summary") == reference["summary"]]
+    if (len(summaries) != 1 or summaries[0].get("digests") != reference["digests"]
+            or any(summaries[0].get(key) != reference[key] for key in ("tokens", "seed") if key in reference)
+            or summaries[0].get("failed", []) != [] or any(row.get("failed") or row.get("error") for row in rows)):
+        raise ValueError("missing, changed or failed deterministic control/vision outputs")
+    return summaries[0]
+
+
+def agent_workload_gate(text):
+    rows = [json.loads(line) for line in text.splitlines() if line.startswith("{")]
+    if (len(rows) != 4 or {row.get("category") for row in rows} != {"prose", "copy", "edit", "tool"}
+            or any(row.get("errors") != 0 or row.get("requests") != 12
+                   or row.get("output_tokens", 0) <= 0 or row.get("error") for row in rows)):
+        raise ValueError("ordinary agent workload has missing or failed requests")
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--component", choices=("expert-scales", "engram"), required=True)
@@ -400,6 +419,11 @@ def main():
             raise RuntimeError("publish guard: " + "; ".join(problems))
         if args.through == "release":
             receipt["model_reference"] = recorded_model_reference()
+            functional_reference = json.loads((HERE / "functional-reference.json").read_text())
+            for check in functional_reference["checks"]:
+                if file_sha256(ROOT / check["script"]) != check["script_sha256"]:
+                    raise ValueError("deterministic functional workload source changed")
+            receipt["functional_reference_sha256"] = file_sha256(HERE / "functional-reference.json")
             save()
         plan(RESTORE, ["stop"])
         if previous is None:
@@ -546,6 +570,16 @@ def main():
             for key in ("reference_text_sha256", "long_text_sha256"):
                 if checks[0][key] != checks[1][key]:
                     raise ValueError("greedy and gathered paths produced different text")
+            receipt["functional_digests"] = {}
+            for check in functional_reference["checks"]:
+                name = "functional-digest-" + check["name"]
+                run([sys.executable, check["script"], lab.head_url(), *check["args"]], name)
+                receipt["functional_digests"][check["name"]] = functional_digest_gate(
+                    (out / (name + ".log")).read_text(), check)
+                save()
+            run([sys.executable, "experiments/2026-10-23-next-release/acceptance/copy_probe.py",
+                 lab.head_url(), "--prompts", "12"], "ordinary-agent-workload")
+            receipt["ordinary_agent_workload"] = agent_workload_gate((out / "ordinary-agent-workload.log").read_text())
             receipt["functional_checks_complete"] = True
         receipt["completed"] = True
         code = 0

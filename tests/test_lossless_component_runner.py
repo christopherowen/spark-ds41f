@@ -2,6 +2,7 @@
 
 import importlib.util
 import copy
+import gzip
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ class ComponentTests(unittest.TestCase):
         self.cluster = {"container": {"name": "serving", "image": "candidate", "expected_labels": self.image["Labels"]}}
         self.write(self.here / "expert-scales/release-tp3.json", {"run": "release", "jobs": []})
         self.write(self.here / "expert-scales/image.json", {"run": "image", "jobs": []})
+        self.write(self.here / "functional-reference.json", {"checks": []})
         self.write(self.root / "build/images" / ("a" * 16 + ".json"),
                    {"image_id": self.image["Id"], "tag": "candidate", "compile_jobs": 2,
                     "min_available_gib": 80, "built_utc": "fixture", "deployment_commit": "d" * 40})
@@ -353,6 +355,55 @@ class ComponentTests(unittest.TestCase):
                 runner.recorded_model_reference()
         self.assertEqual(self.invoke(through="release"), 1)
         self.assertEqual(self.lab_calls, [])
+
+    def test_functional_digests_require_exact_selected_outputs_and_workload(self):
+        reference = {"summary": "controls digests", "tokens": 96, "seed": 7,
+                     "digests": {"penalties/alone": "recorded", "penalties/c8": "recorded"}}
+        native = {**reference, "failed": []}
+        runner.functional_digest_gate(json.dumps(native), reference)
+        for key, bad in (("tokens", 95), ("seed", 8), ("digests", {"penalties/alone": "recorded"}),
+                         ("failed", ["penalties"])):
+            changed = copy.deepcopy(native)
+            changed[key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                runner.functional_digest_gate(json.dumps(changed), reference)
+        changed = copy.deepcopy(native)
+        changed["digests"]["penalties/c8"] = "changed"
+        with self.assertRaises(ValueError):
+            runner.functional_digest_gate(json.dumps(changed), reference)
+        with self.assertRaises(ValueError):
+            runner.functional_digest_gate(json.dumps(native) + "\n" + json.dumps(native), reference)
+
+    def test_selected_reference_digests_and_scripts_match_original_archives(self):
+        manifest = json.loads((HERE / "functional-reference.json").read_text())
+        for check in manifest["checks"]:
+            archive = HERE / check["archive"]
+            self.assertEqual(runner.file_sha256(archive), check["archive_sha256"])
+            original = gzip.decompress(archive.read_bytes())
+            self.assertEqual(runner.hashlib.sha256(original).hexdigest(), check["native_sha256"])
+            rows = [json.loads(line) for line in original.decode().splitlines() if line.startswith("{")]
+            summary = next(row for row in rows if row.get("summary") == check["summary"])
+            self.assertEqual({key: summary["digests"][key] for key in check["digests"]}, check["digests"])
+            self.assertEqual(runner.file_sha256(HERE.parents[1] / check["script"]), check["script_sha256"])
+
+    def test_agent_workload_requires_every_request_and_all_four_categories(self):
+        rows = [{"category": category, "requests": 12, "errors": 0, "output_tokens": 100}
+                for category in ("prose", "copy", "edit", "tool")]
+        runner.agent_workload_gate("\n".join(map(json.dumps, rows)))
+        for change in ("partial", "error", "missing", "duplicate", "empty"):
+            changed = copy.deepcopy(rows)
+            if change == "partial":
+                changed[0]["requests"] = 11
+            elif change == "error":
+                changed[0]["errors"] = 1
+            elif change == "missing":
+                changed.pop()
+            elif change == "duplicate":
+                changed[0] = changed[1]
+            else:
+                changed[0]["output_tokens"] = 0
+            with self.assertRaises(ValueError, msg=change):
+                runner.agent_workload_gate("\n".join(map(json.dumps, changed)))
 
     def test_suite_cannot_pass_with_a_failed_step_changed_image_or_missing_cooling_rank(self):
         definition = {"name": "tiny", "steps": [{"id": "c1", "command": "run"}]}
