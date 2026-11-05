@@ -13,5 +13,10 @@ class SourcePlan(DirectPageShortlistPlan):
 
 if __name__ == '__main__':
     check_pages.PageShortlistPlan = SourcePlan
-    cases = [check_pages.case(page,True,9,98305,width=131072,audit_pages=False) for page in (128,256)]
-    print('RESULT '+json.dumps({'passed':True,'source_budget':1024,'rows':9,'scope':'mechanical only; no token or quality claim','cases':cases}),flush=True)
+    cases = []
+    for page in (128,256):
+        for width,rows in ((131072,9),(1048576,1)):
+            result = check_pages.case(page,True,rows,98305,width=width,audit_pages=False)
+            result['planned_width'] = width
+            cases.append(result)
+    print('RESULT '+json.dumps({'passed':True,'source_budget':1024,'scope':'mechanical only; no token or quality claim','cases':cases}),flush=True)
