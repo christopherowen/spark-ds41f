@@ -62,6 +62,7 @@ def main():
     )
     parser.add_argument("--paired-rounds", type=int, choices=(120, 480), default=120)
     parser.add_argument("--case-filter", type=Path)
+    parser.add_argument("--boots", type=int, nargs="+", choices=(1, 2), default=[1, 2])
     parser.add_argument("--family", choices=("sampler", "reduction", "gather", "prompt", "all"), default="sampler")
     args = parser.parse_args()
     if args.case_filter:
@@ -104,6 +105,9 @@ def main():
         scope=["sp8"],
         rule="exclusive sp8 GPU checks; no serving changes",
     )
+    request = Path.home() / "spark-request.json"
+    if request.exists():
+        assert json.loads(request.read_text()).get("who") == state["holder"], "another check is queued"
     out = Path.home() / "spark-lab/tilelang-runtime-closure-20261105" / args.run
     out.mkdir(parents=True, exist_ok=False)
     folders = [ROOT / name for name in args.experiments]
@@ -114,7 +118,7 @@ def main():
         dict(experiment=str(p.relative_to(ROOT)), operation=op, boot=boot)
         for p in folders
         for op in args.operations
-        for boot in (1, 2)
+        for boot in args.boots
     ]
     write(
         out / "identity.json",
@@ -196,6 +200,11 @@ def main():
                 assert time.monotonic() < until, "cooling timeout"
                 stop.wait(2)
             assert not failed.is_set(), "memory/reservation guard failed"
+            if request.exists() and len(results) < len(jobs):
+                queued = json.loads(request.read_text())
+                if queued.get("who") != state["holder"]:
+                    write(out / "yielded.json", dict(ended=utc(), request=queued, pending=jobs[len(results):]))
+                    return 75
             state["job"] = label
             write(hold, state)
             cmd = [

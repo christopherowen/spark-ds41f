@@ -140,7 +140,7 @@ spec = importlib.util.spec_from_file_location("previous_sampling", HERE / "contr
 previous_sampling = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = previous_sampling
 spec.loader.exec_module(previous_sampling)
-spec = importlib.util.spec_from_file_location("previous_collectives", HERE / "control/collectives.py")
+spec = importlib.util.spec_from_file_location("previous_collectives", HERE / "control/collectives-v4.py")
 previous_collectives = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = previous_collectives
 spec.loader.exec_module(previous_collectives)
@@ -176,7 +176,8 @@ def inventory(label, launch):
 def run_case(name, launches, expected, data, identical=False):
     if args.case_filter and name not in json.loads(args.case_filter.read_text()):
         return
-    measured, _ = measure(launches, flush, 20261105, expected, args.rounds)
+    measured, _ = measure(launches, flush, 20261105, expected, args.rounds,
+                          samples_per_replay=64 if name.startswith("gather-tail") else 8)
     profiles = {role: inventory(name + "-" + role, launch)
                 for role, launch in launches.items() if role != "null"}
     row = dict(name=name, data=data, identical_program=identical,
@@ -200,18 +201,25 @@ if args.family in ("sampler", "all"):
                 untouched = src.clone()
                 out = torch.empty((count, cols), dtype=torch.float32, device="cuda")
                 expected = src.float().clone()
-                observed = []
+                observed, pitched = [], []
                 original_bind = sampling._kernel
+                original_pitched = sampling._pitched_logits_copy
 
                 def record(factory, *key):
                     observed.append((factory, key))
                     return original_bind(factory, *key)
 
+                def record_pitched(src, dst):
+                    pitched.append(True)
+                    return original_pitched(src, dst)
+
                 sampling._kernel = record
+                sampling._pitched_logits_copy = record_pitched
                 try:
                     actual = sampling.copy_logits(src)
                 finally:
                     sampling._kernel = original_bind
+                    sampling._pitched_logits_copy = original_pitched
                 assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
                 assert actual.data_ptr() != src.data_ptr()
                 reference = lambda: out.copy_(src)
@@ -229,14 +237,26 @@ if args.family in ("sampler", "all"):
                     def before(old=old, src=src, out=out):
                         old(src, out)
                         return out
+                elif pitched:
+                    assert len(pitched) == 1
+
+                    def launch(src=src, out=out):
+                        original_pitched(src, out)
+                        return out
+
+                    old = previous_sampling._kernel(previous_sampling.copy_logits_kernel, sampling._DTYPES[dtype])
+
+                    def before(old=old, src=src, out=out):
+                        old(src, out)
+                        return out
                 else:
                     launch = before = reference
                 run_case(f"sampler-{dtype}-{count}-{layout}",
                          dict(reference=reference, candidate=launch, previous=before, null=reference),
                          expected, dict(shape=list(src.shape), strides=list(src.stride()),
                                         source_address=src.data_ptr(), output_address=out.data_ptr(),
-                                        selected_key=list(observed[0][1]) if observed else "native DMA",
-                                        seed=20261105), identical=not observed)
+                                        selected_key=list(observed[0][1]) if observed else "pitched DMA" if pitched else "native DMA",
+                                        seed=20261105), identical=not observed and not pitched)
                 assert torch.equal(src.view(torch.uint8), untouched.view(torch.uint8))
 
 if args.family in ("reduction", "all"):
@@ -310,8 +330,7 @@ if args.family in ("gather", "all"):
                 return out
 
             def before(src=src, out=out, count=count):
-                previous_collectives.rank_rows_bytes_kernel()(src.view(-1).view(torch.uint8),
-                    out.view(-1).view(torch.uint8), 3, count, 5 * src.element_size())
+                previous_collectives._rank_rows_tail(src, out, 3, count, 5 * src.element_size())
                 return out
 
             run_case(f"gather-tail-{dtype}-{count}",

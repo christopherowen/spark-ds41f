@@ -52,7 +52,9 @@ for dtype in (torch.float16, torch.bfloat16, torch.float32):
     exercise(f"rank-strided-{dtype}", lambda: collectives.rank_order_sum(sources), expected.to(dtype))
 
 source = torch.randn((32, 4112), device="cuda")[:, :4100]
-exercise("copy-wide-tile", lambda: tilelang_sampling.copy_logits(source), source.clone())
+exercise("copy-padded32", lambda: tilelang_sampling.copy_logits(source), source.clone())
+source = torch.randn((32, 129296), device="cuda")[:, :129280]
+exercise("copy-pitched-dma", lambda: tilelang_sampling.copy_logits(source), source.clone())
 sources = [torch.randn((1, 5120), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
 expected = sources[0].float().clone()
 for source in sources[1:]:

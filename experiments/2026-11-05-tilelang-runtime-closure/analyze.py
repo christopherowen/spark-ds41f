@@ -34,7 +34,8 @@ for folder in sorted(args.run.glob("*-pair-*")):
             averages = {}
             for role, batches in record["times_us"].items():
                 values = [t for batch in batches for t in batch]
-                assert len(values) == 16 and all(math.isfinite(t) and t > 0 for t in values)
+                assert len(values) == 2 * row["measured"]["samples_per_replay"]
+                assert all(math.isfinite(t) and t > 0 for t in values)
                 averages[role] = sum(values) / len(values)
             logs.append(math.log(averages["candidate"] / averages["reference"]))
         expected_logs = row["measured"]["log_ratios"]["candidate"]

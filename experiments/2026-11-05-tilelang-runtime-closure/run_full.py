@@ -67,6 +67,9 @@ def main():
         raise SystemExit("less than 105 GiB available before isolated profiling")
     if HOLD.exists() or (HOME_DIR / "spark3-hold.json").exists():
         raise SystemExit("sp8 already has a reservation")
+    request = HOME_DIR / "spark-request.json"
+    if request.exists() and json.loads(request.read_text()).get("who") not in (HOLDER, "tilelang-runtime-closure"):
+        raise SystemExit("another check is queued on sp8")
     OUT.mkdir(parents=True, exist_ok=True)
     if any(OUT.iterdir()):
         raise SystemExit("experiment output is not empty; refusing to overwrite evidence")
@@ -89,6 +92,8 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     with HOLD.open("x") as handle:
         json.dump(held, handle, indent=2)
+    if request.exists() and json.loads(request.read_text()).get("who") in (HOLDER, "tilelang-runtime-closure"):
+        request.unlink()
     stopped = threading.Event()
     active = threading.Event()
     guard_failure = threading.Event()
@@ -202,6 +207,11 @@ def main():
             print(stamp(), "END", json.dumps(item), flush=True)
             if code or guard_failure.is_set():
                 raise RuntimeError(f"{label} failed; receipt retained")
+            if request.exists() and len(results) < len(jobs):
+                queued = json.loads(request.read_text())
+                if queued.get("who") not in (HOLDER, "tilelang-runtime-closure"):
+                    write_json(OUT / "yielded.json", dict(ended=stamp(), request=queued, pending=jobs[len(results):]))
+                    return 75
         write_json(OUT / "completed.json", {"finished": stamp(), "jobs": len(results)})
     finally:
         stopped.set()
@@ -213,4 +223,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -69,10 +69,9 @@ def test_sampler_declarations_include_the_copy_specializations():
     calls = kernels.sampling_calls([torch.float16, torch.bfloat16, torch.float32])
     # The declaration goes through the same factory/key as the runtime launch.
     expected = [
-        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized, span)
+        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized)
         for d in (torch.float16, torch.bfloat16, torch.float32)
         for vectorized in (False, True)
-        for span in ((1024, 4096) if vectorized and d == torch.float32 else (1024,))
     ]
     assert all(c in calls for c in expected)
 
@@ -95,3 +94,30 @@ def test_padded_copy_crosses_grid_y_limit(rows):
     src = torch.randn((rows, 16), dtype=torch.float32, device="cuda")[:, :4]
     got = kernels.copy_logits(src)
     torch.testing.assert_close(got, src, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [32, 96])
+def test_large_pitched_copy_replays_into_owned_storage(rows):
+    backing = torch.randn((rows, 129296), device="cuda")
+    src = backing[:, :129280]
+    kernels.copy_logits(src)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = kernels.copy_logits(src)
+    for scale in (0.5, -2.0):
+        backing.mul_(scale)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert got.data_ptr() != src.data_ptr()
+        assert torch.equal(got.view(torch.int32), src.view(torch.int32))
+
+
+def test_large_pitched_copy_uses_the_current_stream():
+    backing = torch.randn((32, 129296), device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        backing.mul_(2)
+        got = kernels.copy_logits(backing[:, :129280])
+    torch.cuda.current_stream().wait_stream(stream)
+    assert torch.equal(got, backing[:, :129280])

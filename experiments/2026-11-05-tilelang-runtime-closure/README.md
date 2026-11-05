@@ -130,3 +130,26 @@ All 594 patches reproduce source tree `d18eb2a61a5c02b4d7c8747f621a4438889db43e`
 Large evidence files are stored as deterministic gzip with original and stored
 SHA-256 hashes in `runs/compressed-evidence.json`; every decompressed payload
 was verified byte-for-byte before replacing its text representation.
+
+## Selected copy backend and precision plan
+
+The independent backend screen passes eager/graph payload checks on two boots.
+At 96 padded FP32 rows pitched DMA is 2.19% / 2.04% faster; 32 rows also pass
+the strict gate. The 128-thread scalar alternative remains unresolved. Both
+backends are slower on the deliberately odd-width probe, which stays TileLang.
+`0010` selects pitched DMA only for wide (at least 65,536 columns), 64-byte-aligned
+FP32 matrices of at least 8 MiB, with 64-byte row pitches. Smaller/cast/general
+copies retain the 1,024-element TileLang path. The rejected 4,096-element path
+and its unused warmup variant are removed. Live-data graph replay and side-stream
+tests cover the actual public route; its final qualification remains pending.
+
+Tail timing now uses 64 cold samples per replay for both reference and candidate,
+with the previous word-copy kernel measured in the same protocol. This increases
+precision without changing the zero-margin gate. Two prompt-logit cases whose
+primary means are below one receive one predeclared 480-round extension; both
+the extension and pooled five-standard-error bounds must pass. It is not a new
+slowdown allowance. Filters use the full family traversal to preserve RNG inputs.
+
+Controllers now honor queued reservations between atomic jobs and can resume a
+specific boot with `--boots`. They release sp8 and exit 75 when another check is
+queued; they never interrupt the current timed job.

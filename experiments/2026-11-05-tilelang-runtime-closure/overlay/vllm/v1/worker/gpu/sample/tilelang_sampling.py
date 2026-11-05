@@ -3439,18 +3439,17 @@ def declare(calls: Callable[[], list]) -> None:
 
 
 @tilelang.jit(pass_configs=_PASS)
-def copy_logits_kernel(dtype: str, vectorized: bool = False, span: int = 1024):
+def copy_logits_kernel(dtype: str, vectorized: bool = False):
     """Own an FP32 logits copy, including cast and non-contiguous source rows."""
     rows, cols, row_stride, col_stride = T.dynamic("rows, cols, row_stride, col_stride")
     source_strides = (row_stride, 1) if vectorized else (row_stride, col_stride)
-    assert span in (1024, 4096) and (vectorized or span == 1024)
 
     @T.prim_func
     def copy_logits(
         src: T.StridedTensor((rows, cols), source_strides, dtype),
         dst: T.Tensor((rows, cols), T.float32),
     ):
-        grid_x = T.ceildiv(cols, span) if vectorized else rows
+        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
         grid_y = rows if vectorized else T.ceildiv(cols, 1024)
         with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
             row = by if vectorized else bx
@@ -3459,11 +3458,10 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False, span: int = 1024):
             if vectorized:
                 T.assume(row_stride % 4 == 0)
                 T.assume(cols % 4 == 0)
-                for i in T.unroll(span // 1024):
-                    col = block * span + (i * 256 + tx) * 4
-                    if col + 4 <= cols:
-                        for j in T.vectorized(4):
-                            dst[row, col + j] = T.cast(src[row, col + j], T.float32)
+                col = block * 1024 + tx * 4
+                if col + 4 <= cols:
+                    for j in T.vectorized(4):
+                        dst[row, col + j] = T.cast(src[row, col + j], T.float32)
             else:
                 for j in T.unroll(4):
                     col = block * 1024 + j * 256 + tx
@@ -3473,11 +3471,26 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False, span: int = 1024):
     return copy_logits
 
 
+def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
+    from cuda.bindings import runtime as cudart
+
+    with torch.cuda.device(logits.device):
+        error, = cudart.cudaMemcpy2DAsync(
+            out.data_ptr(), out.stride(0) * 4,
+            logits.data_ptr(), logits.stride(0) * 4,
+            logits.shape[1] * 4, logits.shape[0],
+            cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+            torch.cuda.current_stream(logits.device).cuda_stream,
+        )
+    if error != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"pitched logits copy failed: {error}")
+
+
 def copy_logits(logits: torch.Tensor) -> torch.Tensor:
     """FP32-owned logits for processing; leave the raw logits unchanged.
 
-    Dense FP32 is a device memcpy, which stays on PyTorch's DMA path. Casts and
-    strided sources otherwise launch generic ATen kernels; use TileLang for them.
+    Dense FP32 uses PyTorch's DMA path. Wide aligned FP32 matrices above 8 MiB
+    use pitched DMA; smaller copies, casts and other strides use TileLang.
     Tensor allocation and views do not launch compute kernels.
     """
     if (
@@ -3491,6 +3504,17 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
         return out
     if logits.dtype == torch.float32 and logits.is_contiguous():
         out.copy_(logits)
+    elif (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.shape[1] >= 65536
+        and logits.shape[1] % 16 == 0
+        and logits.numel() * 4 >= 8 << 20
+        and logits.stride(0) >= logits.shape[1]
+        and logits.stride(0) % 16 == 0
+        and logits.data_ptr() % 64 == 0
+    ):
+        _pitched_logits_copy(logits, out)
     else:
         vectorized = (
             logits.stride(1) == 1
@@ -3498,16 +3522,7 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
             and logits.shape[1] % 4 == 0
             and _triton_run(logits) > 1
         )
-        span = (
-            4096
-            if vectorized
-            and logits.dtype == torch.float32
-            and logits.shape[0] >= 32
-            and logits.shape[1] >= 4096
-            else 1024
-        )
-        kernel = _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized, span)
-        kernel(logits, out)
+        _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized)(logits, out)
     return out
 
 
@@ -3536,10 +3551,9 @@ def sampling_calls(
         for apply_temp in apply_temps
     ]
     calls += [
-        _call(copy_logits_kernel, _DTYPES[dtype], vectorized, span)
+        _call(copy_logits_kernel, _DTYPES[dtype], vectorized)
         for dtype in dict.fromkeys(logits_dtypes)
         for vectorized in (False, True)
-        for span in ((1024, 4096) if vectorized and dtype == torch.float32 else (1024,))
     ]
     if temperature:
         calls += [

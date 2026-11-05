@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import time
+import importlib.util
+import sys
 
 import torch
 from cuda.bindings import runtime as cudart
@@ -49,6 +51,10 @@ def profile(label, launch):
 
 torch.manual_seed(20261105)
 flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+spec = importlib.util.spec_from_file_location("wide_previous_copy", Path(__file__).parent / "control/tilelang_sampling-v5.py")
+wide_previous = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = wide_previous
+spec.loader.exec_module(wide_previous)
 rows = []
 started = time.monotonic()
 for count, cols in ((8, 129280), (32, 129280), (96, 129280), (8, 129281)):
@@ -57,7 +63,7 @@ for count, cols in ((8, 129280), (32, 129280), (96, 129280), (8, 129281)):
     expected = source.clone()
     vector = source.stride(0) % 16 == 0 and cols % 4 == 0
     span = 4096 if vector and count >= 32 else 1024
-    old = ops._kernel(ops.copy_logits_kernel, "float32", vector, span)
+    old = wide_previous._kernel(wide_previous.copy_logits_kernel, "float32", vector, span)
 
     def reference():
         return out.copy_(source)
