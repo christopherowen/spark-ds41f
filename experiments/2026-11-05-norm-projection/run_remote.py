@@ -1,8 +1,10 @@
 """Bounded kernel-only runner; never changes serving state or deployment checkouts."""
+import atexit
 import datetime
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -18,6 +20,7 @@ HOLDER = "norm-projection-boundaries"
 IMAGE = "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b"
 stop = threading.Event()
 held = False
+CONTAINER = "norm-projection-screen"
 
 def head(script):
     p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "dgx1", "python3", "-"], input=script, text=True, capture_output=True, timeout=20)
@@ -49,6 +52,27 @@ def reservation(action):
         "    if record and record.get('holder')==holder: p.unlink()\n" +
         "    print(json.dumps({'released':True}))\n")
 
+def stop_owned_container():
+    inspected=subprocess.run(['docker','inspect',CONTAINER,'--format','{{index .Config.Labels "spark.experiment"}} {{.State.Running}}'],text=True,capture_output=True,timeout=15)
+    if inspected.returncode:
+        if "no such" in inspected.stderr.lower(): return
+        raise RuntimeError(inspected.stderr or "Cannot verify owned container state")
+    label, running=inspected.stdout.strip().split()
+    if label != HOLDER: raise RuntimeError('Container name is owned by another task; leaving it untouched')
+    if running == 'true':
+        subprocess.run(['docker','stop','--time','10',CONTAINER],check=True,timeout=25)
+
+def cleanup():
+    global held
+    if not held: return
+    stop_owned_container()
+    stop.set()
+    reservation('release')
+    held=False
+
+atexit.register(cleanup)
+signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit('Runner terminated; cleaning up its own kernel container'))
+
 def telemetry():
     data={}
     for line in Path('/proc/meminfo').read_text().splitlines():
@@ -68,6 +92,7 @@ def heartbeat():
                 try: reservation('refresh')
                 except Exception as e:
                     print('Heartbeat failed:',e,flush=True)
+                    os.kill(os.getpid(),signal.SIGTERM)
                     return
 
 def main():
@@ -97,7 +122,7 @@ def main():
         original=lab.bundle_command
         def bounded(*args):
             command=original(*args)
-            return command[:2]+['--memory=12g','--memory-swap=12g','--cpus=2','--pids-limit=256']+command[2:]
+            return command[:2]+['--name',CONTAINER,'--label',f'spark.experiment={HOLDER}','--memory=12g','--memory-swap=12g','--cpus=2','--pids-limit=256']+command[2:]
         lab.bundle_command=bounded
         for run in (1,2):
             if reservation('refresh').get('requested'): break
@@ -114,6 +139,7 @@ def main():
             (EXP/'runs/run-records.json').write_text(json.dumps(records,indent=2)+'\n')
             if result: raise RuntimeError(f'Kernel run {run} failed; preserved output')
     finally:
+        stop_owned_container()
         stop.set(); thread.join(timeout=25)
         reservation('release'); held=False
 

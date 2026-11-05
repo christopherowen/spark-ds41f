@@ -12,6 +12,7 @@ import torch
 from vllm.models.deepseek_v4_1.tilelang import pdl
 from vllm.models.deepseek_v4_1.tilelang.cache_writer import RECORD_BYTES, write_cache
 from vllm.models.deepseek_v4_1.tilelang.front import attention_front
+from front_variants import front_variant
 from vllm.models.deepseek_v4_1.tilelang.gemm import (
     WIDE_DECODE, pack_scale_words, pack_weight_tiles,
 )
@@ -22,7 +23,7 @@ from vllm.models.deepseek_v4_1.tilelang.rope import rope_
 from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
 
 ROWS = (1, 6, 9, 16, 24, 48, 96)
-VARIANTS = ("fused", "split_q", "standalone")
+VARIANTS = ("fused", "fused64", "fused128", "fused256", "split_qkv", "split_kvq", "split_parallel", "split_q", "standalone", "projection_only")
 MODES = ("l2", "cold", "prefetch")
 EPS, PAGE, PAGES = 1e-6, 256, 2
 
@@ -78,7 +79,8 @@ def make_case(n, m, padded):
     segs = torch.tensor([packed.data_ptr(), packed.numel(), sf.data_ptr(), sf.numel() * 4],
                         dtype=torch.int64, device="cuda")
     outputs, functions = {}, {}
-    for variant in VARIANTS:
+    for variant in VARIANTS[:-1]:
+        auxiliary = torch.cuda.Stream()
         q = torch.empty((m, 1280), device="cuda", dtype=torch.bfloat16)
         cast = empty_mxfp8(q)
         # Explicit poison in unread row padding: live outputs must ignore it.
@@ -88,10 +90,22 @@ def make_case(n, m, padded):
         cache = torch.full((PAGES, PAGE * RECORD_BYTES["swa"]), 91, device="cuda", dtype=torch.uint8)
         projected = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
 
-        def front(variant=variant, q=q, cast=cast, kv=kv, cache=cache):
+        def front(variant=variant, q=q, cast=cast, kv=kv, cache=cache, auxiliary=auxiliary):
             if variant == "fused":
                 attention_front(raw, qw, kw, EPS, positions, table, cache, slots,
                                 PAGE, q, cast.values, cast.scales, kv)
+            elif variant in ("fused64", "fused128", "fused256", "split_qkv", "split_kvq", "split_parallel"):
+                args = (raw, qw, kw, EPS, positions, table, cache, slots, PAGE, q, cast.values, cast.scales, kv)
+                if variant.startswith("fused"):
+                    front_variant(*args, threads=int(variant[5:]))
+                elif variant == "split_parallel":
+                    auxiliary.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(auxiliary):
+                        front_variant(*args, partition=2)
+                    front_variant(*args, partition=1)
+                else:
+                    for partition in ((1,2) if variant == "split_qkv" else (2,1)):
+                        front_variant(*args, partition=partition)
             elif variant == "split_q":
                 pdl.norm_forward_and_per_token_cast(
                     raw[:, :1280], qw, EPS, "e4m3", 32, round_sf=True,
@@ -109,12 +123,20 @@ def make_case(n, m, padded):
                 rope_(kv, positions, table, 1, False)
                 write_cache(kv, cache, slots, page_size=PAGE, cache_kind="swa")
 
-        def chain(front=front, cast=cast, projected=projected):
+        def chain(front=front, cast=cast, projected=projected, variant=variant, auxiliary=auxiliary):
             front()
             _block32_gemm(layer, cast.values, cast.scales, projected, m)
+            if variant == "split_parallel":
+                torch.cuda.current_stream().wait_stream(auxiliary)
+
+        if variant == "fused":
+            def projection_only(cast=cast, projected=projected):
+                _block32_gemm(layer, cast.values, cast.scales, projected, m)
 
         functions[variant] = chain
         outputs[variant] = (q, cast.values[:m], cast.scales[:m], kv, cache, projected)
+    functions["projection_only"] = projection_only
+    outputs["projection_only"] = outputs["fused"]
     return functions, outputs, segs, raw, (qw, kw)
 
 
@@ -122,7 +144,7 @@ def main():
     torch.manual_seed(517)
     emit(identity={"image_vllm_tree": "c061e5f6931306fa4655ba531428f639c365bf10",
                    "torch": torch.__version__, "gpu": torch.cuda.get_device_name(),
-                   "rows": ROWS, "weights": "seeded synthetic checkpoint shapes",
+                   "rows": ROWS, "variants": VARIANTS, "sm_count": torch.cuda.get_device_properties(0).multi_processor_count, "weights": "seeded synthetic checkpoint shapes",
                    "evict_bytes": 128 << 20, "prefetch_grid": 2,
                    "prefetch_block": 128, "prefetch_chunk": 4096})
     evict = torch.ones((128 << 20) // 4, device="cuda", dtype=torch.int32)
