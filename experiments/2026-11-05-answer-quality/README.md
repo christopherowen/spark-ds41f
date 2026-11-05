@@ -140,3 +140,14 @@ tests, and a deliberately wrong program fails both groups. The container has no
 GPU or network access; it is removed and the preparation reservation released.
 Eight local oracle/selection tests pass. This validates the grading path, not
 model coding quality.
+
+The next predeclared source-retention probe is `source-1024-fast.json`: dense
+budget 64 and row capacity 256 remain fixed, with source retention 1024 buckets
+rather than the original aggressive 512. It tests the source-selection operating
+point between aggressive pruning and the current native-source pilot. It uses
+this same 65,536-token pilot protocol, with two fresh candidate boots; same-day
+native controls may be reused only after the full matched window is published,
+restored and accepted by the strict reference guard. The old 8192-token cohort is
+not a comparator. The 45 held-out documents remain unseen. No outcome is assumed.
+The separate mechanical check covers 98,305 visible keys, both page sizes,
+9 owners/rows, graph replay, source handoff and selected native score bits.

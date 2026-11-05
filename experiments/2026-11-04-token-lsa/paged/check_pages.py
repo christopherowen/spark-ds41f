@@ -26,8 +26,8 @@ def summaries(pool,page,physical):
     return membership.cpu().tolist()
 
 
-def case(page,source,rows,extent):
-    width = 32768 if source else 8192
+def case(page,source,rows,extent,*,width=None,audit_pages=True):
+    width = width or (32768 if source else 8192)
     pages = width//page
     g = torch.Generator(device='cuda').manual_seed(page+rows+int(source))
     pool = torch.empty((rows*pages+1,page*STATE_BYTES+128),dtype=torch.uint8,device='cuda')[:,:page*STATE_BYTES]
@@ -48,8 +48,9 @@ def case(page,source,rows,extent):
     if len(slots):
         update(pool,pool.view(torch.bfloat16),slots)
     torch.testing.assert_close(pool[:,:page*68],records,atol=0,rtol=0)
-    for physical in completed.tolist():
-        summaries(pool,page,physical)
+    if audit_pages:
+        for physical in completed.tolist():
+            summaries(pool,page,physical)
     old = pool.clone()
     update(pool,pool.view(torch.bfloat16),torch.tensor([-1,0,page,2*page-2],device='cuda',dtype=torch.int64))
     torch.testing.assert_close(pool,old,atol=0,rtol=0)
