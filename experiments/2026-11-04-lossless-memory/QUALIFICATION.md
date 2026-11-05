@@ -88,6 +88,18 @@ other processes; neither snapshot type is a per-row latency measurement or an
 unrecorded baseline comparison. Original outputs and the probe source hash are
 retained, including failed observations.
 
+The Engram observer's original host-account metadata control failed before image
+construction: UID 1000 cannot read the root-owned serving process's `/proc/PID/io`.
+`engram/observer-permission-control.json` retains the failure. The isolated CPU
+observer now uses root and the same IPC_LOCK capability as the serving peer,
+reads only the inspected host PID set, and uses the gated immutable image with
+128 MiB, one CPU, no network or GPU access. The complete-cache verifier also
+matches the peer UID/capability for read-only FD inspection. These are observer
+changes; the serving image, row bytes and consumer arithmetic are unchanged.
+Native CPU-only I/O and FD permission controls on every configured rank must pass
+in an owned idle window before the unbuilt Engram arm starts GPU work. They remain
+pending; the source correction alone is not native qualification.
+
 ## Operations
 
 The current site is TP3 triangle. Do not start a TP4 arm on that cabling. TP4

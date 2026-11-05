@@ -68,7 +68,10 @@ def main():
                 mounts += ["--volume", f"{source_path}:{target}:ro"]
         if len(mounts) != 4:
             raise ValueError("expected exactly the checkpoint hub and cache mounts")
-        remote = ["docker", "run", "--rm", "-i", "--memory=1g", "--memory-swap=1g",
+        # The serving root process has IPC_LOCK. /proc FD inspection requires
+        # matching its UID and permitted capability set, even for read access.
+        remote = ["docker", "run", "--rm", "-i", "--user=0", "--cap-add=IPC_LOCK",
+                  "--memory=1g", "--memory-swap=1g",
                   "--network=none", f"--pid=container:{config['container']['name']}",
                   "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void",
                   *mounts, "--entrypoint", "python3", image, "-c", wrapper,

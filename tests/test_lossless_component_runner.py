@@ -299,6 +299,9 @@ class ComponentTests(unittest.TestCase):
                  "processes": {"42": {"start_ticks": 100, "io": dict.fromkeys(keys, 0)}},
                  "nvme_diskstats": {"nvme0n1": [0] * 11}}
         runner.io_gate(value, "candidate")
+        runner.io_gate(value, "candidate", expected_pids=["42"])
+        with self.assertRaisesRegex(ValueError, "inspected serving process set"):
+            runner.io_gate(value, "candidate", expected_pids=["43"])
         for bad in ("identity", "counter", "disk", "clock"):
             row = json.loads(json.dumps(value))
             if bad == "identity":
@@ -311,6 +314,27 @@ class ComponentTests(unittest.TestCase):
                 row["monotonic_end_ns"] = 0
             with self.assertRaises(ValueError, msg=bad):
                 runner.io_gate(row, "candidate")
+
+    def test_io_process_list_rejects_empty_duplicate_and_non_pid_rows(self):
+        self.assertEqual(runner.io_process_ids("PID\n 42\n 73\n"), ["42", "73"])
+        for text in ("", "PID\n", "USER PID\nroot 42\n", "PID\n42\n42\n", "PID\n0\n", "PID\n42;true\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                runner.io_process_ids(text)
+
+    def test_io_cpu_probe_uses_the_gated_image_and_matching_peer_permissions(self):
+        image = "sha256:" + "a" * 64
+        argv = runner.io_command(image, "serving", ["42"])
+        self.assertIn("--user=0", argv)
+        self.assertIn("--cap-add=IPC_LOCK", argv)
+        self.assertIn("--pid=host", argv)
+        self.assertIn("--memory=128m", argv)
+        self.assertIn("--network=none", argv)
+        self.assertIn("NVIDIA_VISIBLE_DEVICES=void", argv)
+        self.assertNotIn("--gpus", argv)
+        self.assertEqual(argv[argv.index("python3") + 1], image)
+        self.assertEqual(argv[-2:], ["serving", "42"])
+        with self.assertRaisesRegex(ValueError, "immutable image"):
+            runner.io_command("candidate:mutable", "serving", ["42"])
 
     def test_determinism_cannot_silently_drop_logprobs(self):
         native = {"summary": "temperature-0 determinism", "identical": True, "logprobs": True,

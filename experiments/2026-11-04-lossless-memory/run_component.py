@@ -26,12 +26,11 @@ MANAGEMENT_ERRORS = ("ssh: connect", "cannot reach", "kex_exchange_identificatio
                      "memory telemetry did not start")
 
 IO_PROGRAM = r'''
-import datetime, json, pathlib, re, subprocess, sys, time
+import datetime, json, pathlib, re, sys, time
 started = time.monotonic_ns()
-lines = subprocess.check_output(["docker", "top", sys.argv[1], "-eo", "pid"], text=True).splitlines()
 processes = {}
-for line in lines[1:]:
-    pid = int(line.strip())
+for value in sys.argv[2:]:
+    pid = int(value)
     root = pathlib.Path("/proc") / str(pid)
     stat = (root / "stat").read_text()
     counters = {key: int(value) for key, value in
@@ -48,10 +47,12 @@ print(json.dumps({"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(
 '''
 
 
-def io_gate(value, container):
+def io_gate(value, container, *, expected_pids=None):
     required = {"rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes"}
     if value.get("container") != container or not value.get("processes") or not value.get("nvme_diskstats"):
         raise ValueError("I/O observation omits serving processes or NVMe counters")
+    if expected_pids is not None and set(value["processes"]) != set(expected_pids):
+        raise ValueError("I/O observation differs from the inspected serving process set")
     if not 0 < value["monotonic_start_ns"] <= value["monotonic_end_ns"]:
         raise ValueError("I/O observation has an invalid clock extent")
     for pid, row in value["processes"].items():
@@ -62,6 +63,30 @@ def io_gate(value, container):
     for row in value["nvme_diskstats"].values():
         if len(row) < 11 or any(type(number) is not int or number < 0 for number in row):
             raise ValueError("invalid NVMe disk counter")
+
+
+def io_process_ids(text):
+    lines = text.splitlines()
+    pids = [line.strip() for line in lines[1:]]
+    if (len(text.encode()) > 65536 or not lines or lines[0].strip() != "PID"
+            or not 1 <= len(pids) <= 1024 or len(pids) != len(set(pids))
+            or any(not pid.isascii() or not pid.isdecimal() or int(pid) <= 0 for pid in pids)):
+        raise ValueError("invalid serving process list")
+    return pids
+
+
+def io_command(image, container, pids):
+    if (not image.startswith("sha256:") or len(image) != 71
+            or any(c not in "0123456789abcdef" for c in image[7:])):
+        raise ValueError("I/O observer requires the inspected immutable image identity")
+    # Serving is root with IPC_LOCK. Matching its permitted capabilities is
+    # necessary for Linux's /proc read checks; the SSH account cannot read io.
+    # This separate CPU container reads only the explicitly inspected host PIDs.
+    return ["docker", "run", "--rm", "--user=0", "--pid=host", "--cap-add=IPC_LOCK",
+            "--memory=128m", "--memory-swap=128m", "--cpus=1", "--pids-limit=32",
+            "--network=none", "--read-only", "--security-opt=no-new-privileges",
+            "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void",
+            "--entrypoint", "python3", image, "-c", IO_PROGRAM, container, *pids]
 
 
 def preflight(arm, through):
@@ -387,16 +412,24 @@ def main():
         for node in nodes["nodes"]:
             if not owns():
                 raise RuntimeError("window changed before I/O observation")
-            process = spark.run_ssh(nodes, node, "python3", "-c", IO_PROGRAM, cluster["container"]["name"])
-            raw = process.stdout + process.stderr
-            record = {"node": node["name"], "exit": process.returncode, "stdout": process.stdout,
-                      "stderr": process.stderr, "program_sha256": hashlib.sha256(IO_PROGRAM.encode()).hexdigest()}
-            management_lost |= process.returncode == 255 or any(marker in raw.lower() for marker in MANAGEMENT_ERRORS)
+            top = spark.run_ssh(nodes, node, "docker", "top", cluster["container"]["name"], "-eo", "pid")
+            record = {"node": node["name"], "top": {"exit": top.returncode, "stdout": top.stdout, "stderr": top.stderr},
+                      "program_sha256": hashlib.sha256(IO_PROGRAM.encode()).hexdigest()}
+            management_lost |= top.returncode == 255 or any(
+                marker in (top.stdout + top.stderr).lower() for marker in MANAGEMENT_ERRORS)
             try:
+                if top.returncode:
+                    raise ValueError("serving process inspection failed")
+                pids = io_process_ids(top.stdout)
+                argv = io_command(receipt["images"][node["name"]]["Id"], cluster["container"]["name"], pids)
+                process = spark.run_ssh(nodes, node, *argv)
+                record.update(argv=argv, exit=process.returncode, stdout=process.stdout, stderr=process.stderr)
+                raw = process.stdout + process.stderr
+                management_lost |= process.returncode == 255 or any(marker in raw.lower() for marker in MANAGEMENT_ERRORS)
                 if process.returncode or len(raw.encode()) > 65536:
                     raise ValueError("I/O observation failed or exceeded its output bound")
                 record["observation"] = json.loads(process.stdout)
-                io_gate(record["observation"], cluster["container"]["name"])
+                io_gate(record["observation"], cluster["container"]["name"], expected_pids=pids)
             except (ValueError, KeyError, TypeError) as error:
                 record["error"] = f"{type(error).__name__}: {error}"
                 failed = True
