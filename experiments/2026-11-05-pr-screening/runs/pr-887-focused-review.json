@@ -1,0 +1,1710 @@
+{
+  "recorded": "2026-11-05T16:15:52.318106+00:00",
+  "PR": 887,
+  "reviewed_ref": "refs/review/pr-887",
+  "reviewed_head": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+  "retained_integration_evidence_commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+  "verdict": "Unqualified for its stated strict device-performance purpose; retain draft/pending the already active independent direct-duration follow-up. No new source correction is justified by this review.",
+  "declared_gate": {
+    "purpose": "Performance enhancement/runtime replacement, not cleanup",
+    "method_source_sha256": "491dd6b8c33fcce84d1e273422107e20e4e4d2dc50c7e4904a8474fb4124b27d",
+    "formula": "Per round log(mean(candidate samples)/mean(reference samples)); exp(mean(log ratios)+5*sample_sd(log ratios)/sqrt(120)) must be <=1 on EACH boot, or exact GPU program and binding identity must be proved.",
+    "no_slowdown_allowance": true,
+    "both_boots_required": true,
+    "new_tolerance_or_pooling_across_variants": false
+  },
+  "main_fused_gather": {
+    "published_pass": true,
+    "boots": {
+      "1": {
+        "cases": 24,
+        "all_better": true
+      },
+      "2": {
+        "cases": 24,
+        "all_better": true
+      }
+    },
+    "scope": "The 24 unchanged main fused-gather programs; tiny tails are a separate pending gate",
+    "limit": "These24 unchanged main-path cases do not waive the independent tiny-tail gate or prove serving/fabric performance."
+  },
+  "correctness": {
+    "recorded_combined_boots": [
+      {
+        "group": "final-tests-v8",
+        "boot": 1,
+        "exit": 0,
+        "pytest_exit": 0,
+        "outcomes": {
+          "passed": 1266
+        },
+        "source_head": "6c83ff0ea945bc67c4e0e8009428b4b0d152ab07",
+        "source_tree": "446dd388e525ae96c0c90c33350e5802b29ddd7e"
+      },
+      {
+        "group": "final-tests-v9",
+        "boot": 2,
+        "exit": 0,
+        "pytest_exit": 0,
+        "outcomes": {
+          "passed": 1266
+        },
+        "source_head": "a96c0ab4a1c55d11ee2c281ca545509e807ff8d8",
+        "source_tree": "9c4c49ec3bbcec299f3f48eb87012106789a0303"
+      }
+    ],
+    "limit": "Correctness observations support output integrity on the isolated setup, not performance equivalence or distributed real-model qualification."
+  },
+  "retained_tail_variants": [
+    {
+      "variant": "final-tails-v6",
+      "boots": [
+        {
+          "boot": 1,
+          "source_head": "4d2060db8e581e2a081d1986b4280036818d4fa0",
+          "source_tree": "9bb3e679b972b91d04fe6cfaa5dfbb7a4e5699c3",
+          "base_image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+          "cases": [
+            {
+              "case": "gather-tail-torch.bfloat16-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9940243578563569,
+                "upper_ratio": 1.0150310016004842,
+                "lower_ratio": 0.9734524585492929,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.0059780710573951,
+                "upper_ratio": 1.0321737103495918,
+                "lower_ratio": 0.9804472535011584,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.08507919096337,
+                "candidate": 4.05693544183426,
+                "previous": 4.109033358478579,
+                "null": 4.080614609165423
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.784
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.249
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.247
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.bfloat16-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.6626815443453632,
+                "upper_ratio": 0.67692829685994,
+                "lower_ratio": 0.648734631500886,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.6719030816965661,
+                "upper_ratio": 0.6816430772525071,
+                "lower_ratio": 0.6623022609031887,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 6.1313125777815,
+                "candidate": 4.069845862674508,
+                "previous": 4.12312918532128,
+                "null": 6.1283417561753595
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.207
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.184
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.441
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9922560712085239,
+                "upper_ratio": 1.0178380514377177,
+                "lower_ratio": 0.9673170593882261,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.990719101423016,
+                "upper_ratio": 1.0204278456260962,
+                "lower_ratio": 0.9618752978288257,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.119470859586727,
+                "candidate": 4.076364603452021,
+                "previous": 4.065739608070847,
+                "null": 4.070950023105979
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.184
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.184
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.376
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9489914182466004,
+                "upper_ratio": 0.9800432437877002,
+                "lower_ratio": 0.9189234430361333,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9594570585089515,
+                "upper_ratio": 0.9904805256196215,
+                "lower_ratio": 0.9294052970367793,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.363454131635081,
+                "candidate": 4.1526875180655525,
+                "previous": 4.20174375761538,
+                "null": 4.3303999660111
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.76
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.12
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.408
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "boot": 2,
+          "source_head": "4d2060db8e581e2a081d1986b4280036818d4fa0",
+          "source_tree": "9bb3e679b972b91d04fe6cfaa5dfbb7a4e5699c3",
+          "base_image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+          "cases": [
+            {
+              "case": "gather-tail-torch.bfloat16-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0032508679371872,
+                "upper_ratio": 1.0269316290791781,
+                "lower_ratio": 0.9801161786391093,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.0034940127513152,
+                "upper_ratio": 1.0240644982291955,
+                "lower_ratio": 0.9833367286621437,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.072395857322893,
+                "candidate": 4.090577108687891,
+                "previous": 4.084822939254688,
+                "null": 4.095206274996599
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.624
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.377
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.bfloat16-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.6649797584932013,
+                "upper_ratio": 0.6807112453367673,
+                "lower_ratio": 0.6496118320873462,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.6713272746912023,
+                "upper_ratio": 0.6825827702187875,
+                "lower_ratio": 0.6602573774311077,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 6.132533428808529,
+                "candidate": 4.081750022911971,
+                "previous": 4.121831264546927,
+                "null": 6.130964663558795
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.784
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.376
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0023212790980713,
+                "upper_ratio": 1.023865396180027,
+                "lower_ratio": 0.9812304920950233,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.006260645918518,
+                "upper_ratio": 1.0317605070676634,
+                "lower_ratio": 0.9813910113715458,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.055925022930751,
+                "candidate": 4.06298960838285,
+                "previous": 4.081089602035111,
+                "null": 4.075512524498966
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.184
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 0.96
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.94396112203722,
+                "upper_ratio": 0.9760152278029365,
+                "lower_ratio": 0.9129597310931284,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9577202669979723,
+                "upper_ratio": 0.9811397733713934,
+                "lower_ratio": 0.9348597770803719,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.339935390574586,
+                "candidate": 4.087812521220258,
+                "previous": 4.155456262621253,
+                "null": 4.273929142982524
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.76
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.12
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.439
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "final-tails-v7",
+      "boots": [
+        {
+          "boot": 1,
+          "source_head": "87fc093c5038f3d43ae17e469e24b52ae4105a9c",
+          "source_tree": "ae0dea96608c81e28ca41f1ebce5a10c4ffdf1a7",
+          "base_image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+          "cases": [
+            {
+              "case": "gather-tail-torch.bfloat16-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0018522989869074,
+                "upper_ratio": 1.025927249688438,
+                "lower_ratio": 0.9783423037941198,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.001790762535135,
+                "upper_ratio": 1.0208754018438009,
+                "lower_ratio": 0.9830628988495119,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.081818771404262,
+                "candidate": 4.089420857402122,
+                "previous": 4.090354188747369,
+                "null": 4.086781271871587
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.656
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 1.28
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.376
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.bfloat16-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.6646994847251263,
+                "upper_ratio": 0.674990476347056,
+                "lower_ratio": 0.6545653908851264,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.667941570870389,
+                "upper_ratio": 0.682852849720429,
+                "lower_ratio": 0.6533559057115487,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 6.138508431528559,
+                "candidate": 4.08317919577712,
+                "previous": 4.100054184436885,
+                "null": 6.135225078408742
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.888
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.184
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.28
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9985304116782404,
+                "upper_ratio": 1.025520115059174,
+                "lower_ratio": 0.9722510250213712,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.003625224582859,
+                "upper_ratio": 1.0329255955177423,
+                "lower_ratio": 0.9751559994155382,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.071337536061037,
+                "candidate": 4.061285457585957,
+                "previous": 4.0823104508641945,
+                "null": 4.064583373459148
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.056
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 0.96
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9436277611596291,
+                "upper_ratio": 0.9700991520576648,
+                "lower_ratio": 0.917878703163947,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9568614949408127,
+                "upper_ratio": 0.9797378009077377,
+                "lower_ratio": 0.9345193373697215,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.34121246783737,
+                "candidate": 4.086391686617692,
+                "previous": 4.144918760827447,
+                "null": 4.312022881595112
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.376
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.088
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.312
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "boot": 2,
+          "source_head": "87fc093c5038f3d43ae17e469e24b52ae4105a9c",
+          "source_tree": "ae0dea96608c81e28ca41f1ebce5a10c4ffdf1a7",
+          "base_image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+          "cases": [
+            {
+              "case": "gather-tail-torch.bfloat16-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9955404270037886,
+                "upper_ratio": 1.0167002305502673,
+                "lower_ratio": 0.9748210062492793,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9960375097846786,
+                "upper_ratio": 1.019212829297807,
+                "lower_ratio": 0.9733891611054099,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.094072935625566,
+                "candidate": 4.073256272810492,
+                "previous": 4.0707229352240875,
+                "null": 4.085983354965113
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.848
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 1.248
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.472
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.bfloat16-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.6674420314919687,
+                "upper_ratio": 0.6824711076517554,
+                "lower_ratio": 0.6527439189842461,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.6785293304215801,
+                "upper_ratio": 0.6969833667835235,
+                "lower_ratio": 0.6605639017858435,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 6.147850078680979,
+                "candidate": 4.11151252125516,
+                "previous": 4.184360422853691,
+                "null": 6.123054259357256
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.856
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.024
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.312
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0005935858339876,
+                "upper_ratio": 1.0179374868646627,
+                "lower_ratio": 0.9835451949960735,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.0126899187645932,
+                "upper_ratio": 1.0337441724621543,
+                "lower_ratio": 0.9920644767697433,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.062814607777909,
+                "candidate": 4.068493773456794,
+                "previous": 4.120564596344896,
+                "null": 4.052808357740408
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.153
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 1.056
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9345861853376259,
+                "upper_ratio": 0.9545848526773708,
+                "lower_ratio": 0.9150064924811281,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9471217260976843,
+                "upper_ratio": 0.9682922491746437,
+                "lower_ratio": 0.9264140705565685,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.376972879754248,
+                "candidate": 4.0942791913948895,
+                "previous": 4.149750010356001,
+                "null": 4.331260379785817
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.408
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.088
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.312
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "final-tails-v9",
+      "boots": [
+        {
+          "boot": 1,
+          "source_head": "a96c0ab4a1c55d11ee2c281ca545509e807ff8d8",
+          "source_tree": "9c4c49ec3bbcec299f3f48eb87012106789a0303",
+          "base_image": "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b",
+          "cases": [
+            {
+              "case": "gather-tail-torch.bfloat16-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0005872662324196,
+                "upper_ratio": 1.0279390758580336,
+                "lower_ratio": 0.9739632443788302,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.001156595379237,
+                "upper_ratio": 1.0214044824285986,
+                "lower_ratio": 0.9813100938113535,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.064868787418163,
+                "candidate": 4.067954202870776,
+                "previous": 4.066795870539863,
+                "null": 4.078350035767168
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 2.88
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 1.279
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.408
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.bfloat16-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.6647207747937156,
+                "upper_ratio": 0.6815919447912923,
+                "lower_ratio": 0.6482672100499309,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.6656238038950278,
+                "upper_ratio": 0.6778978091848276,
+                "lower_ratio": 0.653572031519707,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 6.131091746738093,
+                "candidate": 4.081177122695105,
+                "previous": 4.07961669316137,
+                "null": 6.105075065655304
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.824
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.024
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.28
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-7",
+              "data": {
+                "world": 3,
+                "shape": [
+                  7,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 1.0032238983949724,
+                "upper_ratio": 1.0222966749983018,
+                "lower_ratio": 0.98450695862087,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "previous_gate": {
+                "mean_ratio": 1.0100484585299752,
+                "upper_ratio": 1.029161884058347,
+                "lower_ratio": 0.9912900044022037,
+                "rounds": 120,
+                "status": "not_proved"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.0376000345834955,
+                "candidate": 4.0530604492384255,
+                "previous": 4.083912534239668,
+                "null": 4.077660449866016
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.152
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_small_kernel",
+                    "duration_us": 1.024
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.248
+                  }
+                ]
+              }
+            },
+            {
+              "case": "gather-tail-torch.float32-129",
+              "data": {
+                "world": 3,
+                "shape": [
+                  129,
+                  15
+                ],
+                "reference": "same TensorIterator copy as movedim reshape, shared output"
+              },
+              "gate": {
+                "mean_ratio": 0.9539269955846236,
+                "upper_ratio": 0.9761794292337902,
+                "lower_ratio": 0.9321818158157188,
+                "rounds": 120,
+                "status": "better"
+              },
+              "previous_gate": {
+                "mean_ratio": 0.9586134297372118,
+                "upper_ratio": 0.9824743397177891,
+                "lower_ratio": 0.9353320188866217,
+                "rounds": 120,
+                "status": "better"
+              },
+              "identical_program": false,
+              "identity_reason": null,
+              "event_role_arithmetic_mean_us": {
+                "reference": 4.284149978578474,
+                "candidate": 4.0952167000644595,
+                "previous": 4.103060437197807,
+                "null": 4.253168729898486
+              },
+              "raw_balanced_mirrored_rounds_verified": 120,
+              "raw_samples_per_role_per_round": 128,
+              "stored_log_ratios_and_gate_recomputed": true,
+              "single_profile_launches_diagnostic_only": {
+                "reference": [
+                  {
+                    "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+                    "duration_us": 1.376
+                  }
+                ],
+                "candidate": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 0.992
+                  }
+                ],
+                "previous": [
+                  {
+                    "name": "collectives_rank_rows_bytes_kernel",
+                    "duration_us": 1.28
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "latest_event_variant": {
+    "variant": "final-tails-v9",
+    "published_timing_boots": 1,
+    "second_boot_not_fabricated": true,
+    "yield_receipt": {
+      "ended": "2026-11-05T14:20:36Z",
+      "request": {
+        "who": "latent-sparse-attention",
+        "why": "Complete the two remaining finer-summary runtime gates after the successful mechanics job: actual-input replay and strict initcheck. No serving change.",
+        "how_long": "about three minutes",
+        "at": "2026-11-05T14:20:33.510752+00:00"
+      },
+      "pending": [
+        {
+          "experiment": "experiments/2026-11-05-tilelang-runtime-closure",
+          "operation": "pair",
+          "boot": 2
+        }
+      ]
+    },
+    "BF16_7_mean_change_pct": 0.05872662324195588,
+    "BF16_7_upper_change_pct": 2.793907585803357,
+    "FP32_7_mean_change_pct": 0.3223898394972391,
+    "FP32_7_upper_change_pct": 2.229667499830179,
+    "verdict": "Both tiny cases not_proved. The unchanged129-row cases pass this boot; this cannot stand in for missing tiny-tail qualification."
+  },
+  "instrument_assessment": {
+    "observation": "Tiny event intervals and unchanged-reference null controls are all approximately4us, while individual profiler kernel observations are around1us to a few us. External event-node overhead dominates/dilutes the ratio and adds uncertainty.",
+    "qualification_limit": "This supports instrument/scope concern, not a measured no-slowdown pass. Do not subtract an assumed3us constant, replace failed results with a single diagnostic sample, or call the two programs identical.",
+    "identity_distinction": "identical_program is explicitly false. Candidate and independent TensorIterator reference have different kernels and launch geometry; source AST equality between narrow PR and measured integration only transfers candidate source identity, not candidate/reference program equality.",
+    "direct_activity_attempts": [
+      {
+        "variant": "tail-activity-v12",
+        "runs": [
+          {
+            "job": {
+              "experiment": "experiments/2026-11-05-tilelang-runtime-closure",
+              "operation": "activity",
+              "boot": 1
+            },
+            "label": "2026-11-05-tilelang-runtime-closure-activity-1",
+            "exit": 1,
+            "seconds": 1.4197713510366157,
+            "memory_guard": false
+          },
+          {
+            "job": {
+              "experiment": "experiments/2026-11-05-tilelang-runtime-closure",
+              "operation": "activity",
+              "boot": 2
+            },
+            "label": "2026-11-05-tilelang-runtime-closure-activity-2",
+            "skipped": "earlier variant failure"
+          }
+        ],
+        "retained_error_tail": "Using CPython 3.12.3 interpreter at: /usr/bin/python3\nCreating virtual environment at: /tmp/.venv\nTraceback (most recent call last):\n  File \"/r/experiments/2026-11-05-tilelang-runtime-closure/measure.py\", line 136, in <module>\n    assert args.operation in (\"pair\", \"bench\")\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+        "qualification": "Failed instrument/setup attempt; no completed two-boot direct-duration result"
+      },
+      {
+        "variant": "tail-activity-v18",
+        "runs": [
+          {
+            "job": {
+              "experiment": "experiments/2026-11-05-tilelang-runtime-closure",
+              "operation": "activity",
+              "boot": 1
+            },
+            "label": "2026-11-05-tilelang-runtime-closure-activity-1",
+            "exit": 1,
+            "seconds": 39.759487470961176,
+            "memory_guard": false
+          },
+          {
+            "job": {
+              "experiment": "experiments/2026-11-05-tilelang-runtime-closure",
+              "operation": "activity",
+              "boot": 2
+            },
+            "label": "2026-11-05-tilelang-runtime-closure-activity-2",
+            "skipped": "earlier variant failure"
+          }
+        ],
+        "retained_error_tail": "5:33:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `copy_logits`\n2026-11-05 15:33:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `copy_logits` with `out_idx=None`\n2026-11-05 15:33:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `copy_logits`\n2026-11-05 15:33:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `copy_logits` with `out_idx=None`\n2026-11-05 15:33:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `copy_logits`\n2026-11-05 15:33:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `collectives_rank_rows_small` with `out_idx=None`\n2026-11-05 15:33:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `collectives_rank_rows_small`\n2026-11-05 15:33:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `collectives_rank_rows_bytes` with `out_idx=None`\n2026-11-05 15:33:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `collectives_rank_rows_bytes`\nUSDT:2026-11-05 15:33:31 1:1 SyncActivityProfilerHandler.cpp:52] profiler_start\nUSDT:2026-11-05 15:33:52 1:1 SyncActivityProfilerHandler.cpp:59] profiler_stop\nTraceback (most recent call last):\n  File \"/r/experiments/2026-11-05-tilelang-runtime-closure/measure.py\", line 349, in <module>\n    run_case(f\"gather-tail-{dtype}-{count}\",\n  File \"/r/experiments/2026-11-05-tilelang-runtime-closure/measure.py\", line 189, in run_case\n    measured, _ = measure_activity(launches, flush, 20261105, expected,\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/r/experiments/2026-11-05-tilelang-runtime-closure/activity.py\", line 52, in measure_activity\n    assert len(kernels) == rounds * len(launches) * 2 * samples, (len(kernels), samples)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (122880, 64)\n",
+        "qualification": "Failed instrument/setup attempt; no completed two-boot direct-duration result"
+      }
+    ],
+    "published_pilot_reconstruction": "The integration README reports a diagnostic BF16 activity reconstruction ratio0.8731/upper0.8794 after separating cache flushes. This review did not duplicate that reconstruction/capture. A single pilot is not complete two-boot qualification.",
+    "current_followup": "Another task owns the current CUPTI/direct-duration implementation/capture. Its complete validated results are not present in this frozen evidence commit and are not claimed here."
+  },
+  "source_review": {
+    "narrow_and_integration_files": [
+      {
+        "path": "tests/kernels/test_deepseek_v41_gather_into.py",
+        "narrow_sha256": "54f1f27024177267d9ebbff8e7e3f2a82a189d074fbab5e5e3a99b97aa6bd401",
+        "combined_sha256": "54f1f27024177267d9ebbff8e7e3f2a82a189d074fbab5e5e3a99b97aa6bd401",
+        "byte_identical": true
+      },
+      {
+        "path": "tests/models/test_deepseek_v4_1_compressor.py",
+        "narrow_sha256": "96b56246e076537c756e0b47b41ebc7944c76e51d1bf819b9ccad157bbe507c0",
+        "combined_sha256": "96b56246e076537c756e0b47b41ebc7944c76e51d1bf819b9ccad157bbe507c0",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/models/deepseek_v4_1/compressor.py",
+        "narrow_sha256": "9e4711ba8be5389b520eac6eebf4dd901d76a1174857d708814a9bdba76d5be5",
+        "combined_sha256": "9e4711ba8be5389b520eac6eebf4dd901d76a1174857d708814a9bdba76d5be5",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py",
+        "narrow_sha256": "45bc9d94004328922cd2e5174fc3a4c2985ca9c807feae7c7bc590b9f978eddb",
+        "combined_sha256": "45bc9d94004328922cd2e5174fc3a4c2985ca9c807feae7c7bc590b9f978eddb",
+        "byte_identical": true
+      },
+      {
+        "path": "vllm/models/deepseek_v4_1/tilelang/gather.py",
+        "narrow_sha256": "afb3df90bdf456b374be5c7fd74333447b9a85eccf6fa49f2eb30b2f0e436eb6",
+        "combined_sha256": "afb3df90bdf456b374be5c7fd74333447b9a85eccf6fa49f2eb30b2f0e436eb6",
+        "byte_identical": true
+      },
+      {
+        "path": "tests/kernels/test_deepseek_v41_tilelang_collectives.py",
+        "narrow_sha256": "9a1f8a5442c2550aa10e5a08c697b3e5b34f68aba77031a92ad71af52e1dde0d",
+        "combined_sha256": "9a1f8a5442c2550aa10e5a08c697b3e5b34f68aba77031a92ad71af52e1dde0d",
+        "byte_identical": true
+      }
+    ],
+    "narrow_and_integration_gather_AST": [
+      {
+        "name": "_RANK_ROWS_THREADS",
+        "identical_AST": true,
+        "AST_sha256": "766b6337b3d2dfdd5e65b3e449806bdaff5bf914e0895bb3538a644db29901e9"
+      },
+      {
+        "name": "_RANK_ROWS_HEADER",
+        "identical_AST": true,
+        "AST_sha256": "3f7ff2517b98496b496107ed5e6dcd25985114e041a9f43e5e6010cde6d418c0"
+      },
+      {
+        "name": "rank_rows_kernel",
+        "identical_AST": true,
+        "AST_sha256": "a604e3b8c0196ba90b2218d43d63282aa5112678d402e1bafa1bd2618134e27c"
+      },
+      {
+        "name": "_TAIL_DIV",
+        "identical_AST": true,
+        "AST_sha256": "cd6586cc6960c7a1153bd207919136fe8d9c712ef30218863fb42d91c511eca8"
+      },
+      {
+        "name": "_tail_div_magic",
+        "identical_AST": true,
+        "AST_sha256": "6792bc68360ce4574dbbdb51bb2a9e54ce49e2636813587f5113e7f0a02e0bd8"
+      },
+      {
+        "name": "rank_rows_bytes_kernel",
+        "identical_AST": true,
+        "AST_sha256": "47c7b7a2aef79fbfb5c0af215fc8a540bee7d9e11094b0b722e38b8d3b3708c5"
+      },
+      {
+        "name": "rank_rows_small_kernel",
+        "identical_AST": true,
+        "AST_sha256": "3ac4998486e1713f1275a8b72ae3ff8e851cb5d1897198d8e4da5ec3a3388e89"
+      },
+      {
+        "name": "_rank_rows_tail",
+        "identical_AST": true,
+        "AST_sha256": "07639ceeab42fb627abae4c1d57fb57656484af93249709f5809f95e01ed13fc"
+      },
+      {
+        "name": "rank_rows_calls",
+        "identical_AST": true,
+        "AST_sha256": "f84e33f84668496a15d336edb8287ba3776c04fceab145d76a1ad770dc6118db"
+      },
+      {
+        "name": "concat_rank_shards",
+        "identical_AST": true,
+        "AST_sha256": "efb26efc25d482f026ec24b00c374160fcbc26b3695e38af7babbd46ae2657c2"
+      }
+    ],
+    "tiny_program": "Current tiny path maps a warp per rank/row, uses opaque aligned1/2/4-byte units and no device division; larger tails retain host reciprocal correction. Rank-one returns a view.",
+    "historical_rework": "Reciprocal word-copy, one-block tiny copy and warp-per-rank/row variants remain in the retained evidence. Their unresolved event gates must not be erased or pooled across distinct programs.",
+    "bounded_new_correction": "No remaining source correction has a measured/bounded win established here. Repeating prior tile/block variants or inventing another tail implementation is not justified merely to consume an attempt.",
+    "instrument_correction_is_not_program_proof": "An invalid or unsuitable timing instrument can motivate the already declared validated direct-duration protocol; it cannot prove program identity or retroactively pass old bounds."
+  },
+  "original_evidence_preserved": {
+    "original_28case_range_pct": [
+      -50.249124158831115,
+      0.4201682213676561
+    ],
+    "interval_limit": "95% Student t on two boot medians, df=1; 21 cold-L2 graph samples per method per boot. Ratios of means are descriptive and do not establish significance.",
+    "all_prior_files_untouched": true
+  },
+  "recommendation": {
+    "now": "Keep PR887 unqualified/draft; do not merge it as performance-qualified or promote it from these results.",
+    "already_active_followup": "Let its owner finish the current direct-duration protocol without duplicate capture or another source experiment. Require each intended case on both fresh boots, complete flush/copy classification and preserved raw samples/source/bindings to pass the unchanged zero-margin five-SE gate.",
+    "if_followup_misses": "Highlight the unresolved/failed tiny-tail purpose and drop the current performance candidate/claim under the one-review/rework policy. No convenient slowdown tolerance, cleanup relabel or speculative retry. Preserve any proved main-path benefits separately; a narrowed future patch needs its own explicit scope/acceptance.",
+    "even_if_followup_passes": "Kernel qualification still does not establish serving gain, host latency, complete real-weight correctness, physical dim-zero transport behavior or release promotion."
+  },
+  "bindings": [
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-04-gather-stores/README.md",
+      "stored_bytes": 5539,
+      "stored_sha256": "623b272b7a3664a1d2f11a7383f608d7ab61fa5d7322958d53714a057c3a5070"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-04-gather-stores/decision.md",
+      "stored_bytes": 615,
+      "stored_sha256": "d444b5ca5d4cbe3b698c095c05c493d5c00c9fa351dd5ceeebcfa36a2de9c516"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-04-gather-stores/vllm/0001-gather.patch",
+      "stored_bytes": 26947,
+      "stored_sha256": "f0964b2e988fb0404ccb2d4e1b374f7b558d2b3a873e05541fc807a01a941803"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/README.md",
+      "stored_bytes": 2063,
+      "stored_sha256": "6a9058f07cc6c5a092c62c718562224ebb0bf80fec6e24477dbd161934b0d95c"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/base.json",
+      "stored_bytes": 1192,
+      "stored_sha256": "a095c2f7f20d80270978061f51cccfd09407e770e10c31d9e2d048d8acab2088"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/candidate.json",
+      "stored_bytes": 1329,
+      "stored_sha256": "c97bbd203be25a77e03251a68b68fdbd37f2b7badbd26fb6065e3fa5d1a53f43"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/vllm/0002-word-tails-and-rank-rows.patch",
+      "stored_bytes": 12008,
+      "stored_sha256": "a45e07752e7a02d7b29ce7f218aa778e942e18c705e50e22d94b1aad11a34de8"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/vllm/series",
+      "stored_bytes": 90,
+      "stored_sha256": "a5e4b9a7d96ce59302abc4d22cc623d499be6fc880cdc4b7ba0f101295ad1e67"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-04-gather-stores/results.json",
+      "stored_bytes": 34622,
+      "stored_sha256": "529f3451ecfb3d9fd7cdf91f158e6417f949b9fbe1240d0ea73e667ede107579"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/source-equivalence.json",
+      "stored_bytes": 1779,
+      "stored_sha256": "8e6b7f12d9a0ca480578c3c76acf7c500b550efa4851f5391f5442d362a558e4"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/main-results.json",
+      "stored_bytes": 16109,
+      "stored_sha256": "5f6754ffc5efd7c103528cace5f488c52f98d7b4ebf1ba252eb3df510887c6bd"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/paired.py",
+      "stored_bytes": 5946,
+      "stored_sha256": "491dd6b8c33fcce84d1e273422107e20e4e4d2dc50c7e4904a8474fb4124b27d"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/measure.py",
+      "stored_bytes": 21947,
+      "stored_sha256": "4b65c496ca983a3ddce2841b656ac1c5308babb174e2998a547b60f79f55c7e5"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/README.md",
+      "stored_bytes": 18083,
+      "stored_sha256": "7ca48b060dd526b52f486c32c31d4a0d293eca0e53e0f9eb566ace43facf2404"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/kernels/test_deepseek_v41_gather_into.py",
+      "stored_bytes": 5150,
+      "stored_sha256": "54f1f27024177267d9ebbff8e7e3f2a82a189d074fbab5e5e3a99b97aa6bd401"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/tests/kernels/test_deepseek_v41_gather_into.py",
+      "stored_bytes": 5150,
+      "stored_sha256": "54f1f27024177267d9ebbff8e7e3f2a82a189d074fbab5e5e3a99b97aa6bd401"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/models/test_deepseek_v4_1_compressor.py",
+      "stored_bytes": 26121,
+      "stored_sha256": "96b56246e076537c756e0b47b41ebc7944c76e51d1bf819b9ccad157bbe507c0"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/tests/models/test_deepseek_v4_1_compressor.py",
+      "stored_bytes": 26121,
+      "stored_sha256": "96b56246e076537c756e0b47b41ebc7944c76e51d1bf819b9ccad157bbe507c0"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/compressor.py",
+      "stored_bytes": 14875,
+      "stored_sha256": "9e4711ba8be5389b520eac6eebf4dd901d76a1174857d708814a9bdba76d5be5"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/vllm/models/deepseek_v4_1/compressor.py",
+      "stored_bytes": 14875,
+      "stored_sha256": "9e4711ba8be5389b520eac6eebf4dd901d76a1174857d708814a9bdba76d5be5"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py",
+      "stored_bytes": 29051,
+      "stored_sha256": "45bc9d94004328922cd2e5174fc3a4c2985ca9c807feae7c7bc590b9f978eddb"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py",
+      "stored_bytes": 29051,
+      "stored_sha256": "45bc9d94004328922cd2e5174fc3a4c2985ca9c807feae7c7bc590b9f978eddb"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/tilelang/gather.py",
+      "stored_bytes": 5618,
+      "stored_sha256": "afb3df90bdf456b374be5c7fd74333447b9a85eccf6fa49f2eb30b2f0e436eb6"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/vllm/models/deepseek_v4_1/tilelang/gather.py",
+      "stored_bytes": 5618,
+      "stored_sha256": "afb3df90bdf456b374be5c7fd74333447b9a85eccf6fa49f2eb30b2f0e436eb6"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/tests/kernels/test_deepseek_v41_tilelang_collectives.py",
+      "stored_bytes": 17368,
+      "stored_sha256": "9a1f8a5442c2550aa10e5a08c697b3e5b34f68aba77031a92ad71af52e1dde0d"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/tests/kernels/test_deepseek_v41_tilelang_collectives.py",
+      "stored_bytes": 17368,
+      "stored_sha256": "9a1f8a5442c2550aa10e5a08c697b3e5b34f68aba77031a92ad71af52e1dde0d"
+    },
+    {
+      "commit": "f9d3700586a36b888cf457ed3c9eb59f4201858d",
+      "path": "experiments/2026-11-05-gather-tail-performance/overlay/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+      "stored_bytes": 20267,
+      "stored_sha256": "729459c3061c408d7974907184efac4c2045798d867ec7550cb60392cd4810cf"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/overlay/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+      "stored_bytes": 29239,
+      "stored_sha256": "e403993974dd9a81c4aecac6c78e8d44975f3f4bc9a187c25fc69f113462a413"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v6/2026-11-05-tilelang-runtime-closure-pair-1/result.json.gz",
+      "stored_bytes": 393106,
+      "stored_sha256": "79e87e05111521b91a21bac56a276dfe35c06f07561b9446199321ca1a660ee4",
+      "decompressed_bytes": 9580033,
+      "decompressed_sha256": "3f826d568860b9e909ab300ba509b6e946d55edddc29a9cff20ac850c884c133"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v6/2026-11-05-tilelang-runtime-closure-pair-2/result.json.gz",
+      "stored_bytes": 389544,
+      "stored_sha256": "2aa748a355f16f2bc987e021265ebefaa4bb1ea7b06df97164807efc92c61b29",
+      "decompressed_bytes": 9586344,
+      "decompressed_sha256": "1ff25349d5c3212adc911848618940486523f851a3d6a68e82c8b7b23f351639"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v7/2026-11-05-tilelang-runtime-closure-pair-1/result.json.gz",
+      "stored_bytes": 392530,
+      "stored_sha256": "d6f3f71d7ced522182389f444b5d78a254d7e36f43fc195d3d12eebbae2571af",
+      "decompressed_bytes": 9582928,
+      "decompressed_sha256": "34413614ddd5f40962634257c3f782d84be13d32d2572a8d97c7aec09135aa9a"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v7/2026-11-05-tilelang-runtime-closure-pair-2/result.json.gz",
+      "stored_bytes": 397407,
+      "stored_sha256": "aa2d361abaf02f91ae03d22b55c2f4b58daeb0269e67f7df51c0bbe5733407c6",
+      "decompressed_bytes": 9585602,
+      "decompressed_sha256": "5e1e7739d9440180b6e66b66a9512f88357af952ea425eac3b979493b231d08e"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v9/2026-11-05-tilelang-runtime-closure-pair-1/result.json.gz",
+      "stored_bytes": 386860,
+      "stored_sha256": "aebcc07935e366942b320f8a670ef5288de8589da84b73e1ba188f300695e112",
+      "decompressed_bytes": 9584535,
+      "decompressed_sha256": "13504b34325b63ee5800ec98a0a8d3619d26a78f243d0be8e3ceaa878a4bf269"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tails-v9/yielded.json",
+      "stored_bytes": 492,
+      "stored_sha256": "8155348accea11c5d34665ea0c4203652c309069a594c7cfbba67d6c2ada860d"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tests-v8/results.json",
+      "stored_bytes": 8502,
+      "stored_sha256": "2790792865c847dd05e32739ba6fde15ac04791429f969ca7db5ff1fdf791343"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/final-tests-v9/results.json",
+      "stored_bytes": 8658,
+      "stored_sha256": "6c94d130ddc89c2c6426cc867d9cadac42411ca61cafc10e60864d95ddbd17c2"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/tail-activity-v12/results.json",
+      "stored_bytes": 540,
+      "stored_sha256": "ce2f1ebbd8d9effe895865cfcde55828b35e496cac85fff103c2a5e4868de85d"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/tail-activity-v12/2026-11-05-tilelang-runtime-closure-activity-1/output.txt",
+      "stored_bytes": 336,
+      "stored_sha256": "4f152cb2a08984217d542ec8fbffe84f4cdae503f665a2bed836a197fc295238"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/tail-activity-v18/results.json",
+      "stored_bytes": 540,
+      "stored_sha256": "e91ef8cd3be22dd8485182a1384584b645b52fde66a8e1ad311ad32ccc7d9031"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/tail-activity-v18/2026-11-05-tilelang-runtime-closure-activity-1/output.txt",
+      "stored_bytes": 3153,
+      "stored_sha256": "b5b6ea149310e128ba137d470963ef8ca1e629b6208db4a9058923b0d0fd3e51"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/tail-results-v7.json",
+      "stored_bytes": 4083,
+      "stored_sha256": "e77f3d0fa1b290a7cc2fc83ba33c377c10a6517885c9831daa0b01df02c735c0"
+    },
+    {
+      "commit": "a2358397b0e8056d2693fbf4377e8f6edb1ed621",
+      "path": "experiments/2026-11-05-tilelang-runtime-closure/runs/compressed-evidence.json",
+      "stored_bytes": 823607,
+      "stored_sha256": "9cb7c308fb3cfb7eb7e56349543d36cdc14755c9d29dab240c6c566732f176a1"
+    }
+  ],
+  "read_only_inspection_history": [
+    "An attempted deployment git lookup of vLLM source head a96c0ab4 failed: source commit is not a deployment tree; no fetch was completed and later reads use GIT_NO_LAZY_FETCH=1.",
+    "Missing final-tails-v9 boot2 and compressed final-tests-v9 aggregate are explicit absences; the retained uncompressed correctness aggregate and scheduling-yield receipt were used."
+  ],
+  "operations": {
+    "source_or_receipt_edits": false,
+    "GPU_capture_or_benchmark": false,
+    "SSH_image_reservation": false,
+    "messages_to_other_tasks": false,
+    "subagents": false,
+    "single_new_review_file_only": true
+  }
+}

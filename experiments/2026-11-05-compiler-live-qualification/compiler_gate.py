@@ -13,7 +13,6 @@ import runpy
 import shutil
 import subprocess
 import sys
-import sysconfig
 import traceback
 import uuid
 import xml.etree.ElementTree as ET
@@ -59,9 +58,10 @@ def installed_identity():
     import tilelang
     import torch
     module = Path(tilelang.__file__).resolve()
-    assert module.is_relative_to(Path(sysconfig.get_paths()["purelib"]).resolve()), module
-    assert torch.cuda.get_device_capability() == (12, 1)
     dist = importlib.metadata.distribution("tilelang")
+    assert module == Path(dist.locate_file("tilelang/__init__.py")).resolve(), module
+    assert not any(module.is_relative_to(Path(p)) for p in ("/tests", "/test-support", "/packet", "/out")), module
+    assert torch.cuda.get_device_capability() == (12, 1)
     libraries = {str(dist.locate_file(p).resolve()): sha(dist.locate_file(p))
                  for p in dist.files if str(p).endswith(".so")}
     assert libraries, "installed compiler native libraries are absent"

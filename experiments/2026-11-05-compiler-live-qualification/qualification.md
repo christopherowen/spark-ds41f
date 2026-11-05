@@ -1,5 +1,15 @@
 # C42 qualification state
 
+C42 is queued after the existing lossless-memory cohort, with no controller,
+image or GPU work started. The original request named published source-control commit
+`a1690f3e3d289eb034c0ef3a6e9cf0da51c0cee1`. A prelaunch portability-only
+control amendment binds imports directly to the installed wheel metadata.
+Select and record the amended published execution commit before staging;
+compiler/vLLM sources, image policy and metric specifications are unchanged.
+No queue/evidence publication is a reason to synchronize active nodes. The atomic matching request was written
+at16:07:04UTC on2026-11-05 under foreign windowdgx1-1793885062. Preserve all
+foreign holds/requests and wait for its normal safe restored boundary.
+
 Prepared for one guarded compiler interaction round; no image or controller has
 started. The selected source is unchanged corrected default-enabled C40 plus
 only the declared TileLang refresh/fix stack. Its canonical identities and
