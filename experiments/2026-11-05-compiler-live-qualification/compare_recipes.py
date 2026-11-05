@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Compare both new boots with both saved boots of each earlier recipe."""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+
+from analyze_functional import PIN, ROOT, load, require, sha
+from analyze_performance import AA_FLOOR_PCT, behaviour, compare_results, read_json, suite
+
+
+def compare(snapshot, performance):
+    raw = snapshot / "raw/results/private/suites"
+    saved = ROOT / "experiments/2026-11-03-candidate-38-tp3-qualification/runs/2026-11-03-dgx1-3"
+    current_labels = ("candidate-42", "candidate-42-repeat")
+    judge = lambda a, b: compare_results(a, b, 3.0)
+    result = {}
+    for recipe, labels in (("default", ("candidate-38", "candidate-38-repeat")),
+                           ("copy", ("candidate-38-copy", "candidate-38-copy-repeat")),
+                           ("candidate-39", ("candidate-39", "candidate-39-repeat")),
+                           ("candidate-40", ("candidate-40", "candidate-40-repeat")),
+                           ("candidate-41", ("candidate-41", "candidate-41-repeat"))):
+        normalized = recipe in ("candidate-39", "candidate-40", "candidate-41")
+        bases = {"candidate-39": ROOT / "experiments/2026-11-04-copy-default-screening/runs/2026-11-04-dgx/attempt-3",
+                 "candidate-40": ROOT / "experiments/2026-11-04-topk-live-qualification/runs/2026-11-04-dgx/attempt-2",
+                 "candidate-41": ROOT / "experiments/2026-11-04-copy-overlap-rework/runs/2026-11-05-dgx/attempt-2"}
+        base = bases[recipe] if normalized else saved / ("performance-" + recipe)
+        publication = load(base / "publication-receipt.json")
+        checked = {}
+        for name, record in publication["published"].items():
+            path = base / name
+            digest = sha(path.read_bytes())
+            require(digest == record["sha256"], f"saved reference hash differs: {path}")
+            relative = str(path.relative_to(ROOT))
+            require(sha(subprocess.check_output(["git", "-C", str(ROOT), "show", f"{PIN}:{relative}"])) == digest,
+                    f"saved reference changed since execution: {relative}")
+            checked[name] = digest
+        original = load(base / ("performance-analysis.json" if normalized else "analysis.json"))
+        comparisons = {}
+        for number, name in enumerate(("release-tp3", "single-stream", "sampled")):
+            run = "candidate-42-release-tp3" + ("-" + name if number else "")
+            a, b = [raw / run / label for label in current_labels]
+            x, y = [(base / "performance" / label / name) if normalized else (base / label / name) for label in labels]
+            aa = suite.compare(read_json, str(a), str(b), judge)
+            reference_aa = suite.compare(read_json, str(x), str(y), judge)
+            pairs = {}
+            headlines = {}
+            for i, reference in enumerate((x, y), 1):
+                first = suite.compare(read_json, str(reference), str(a), judge)
+                repeat = suite.compare(read_json, str(reference), str(b), judge)
+                pairs[f"reference_boot{i}_to_candidate_boot1"] = first
+                pairs[f"reference_boot{i}_to_candidate_boot2"] = repeat
+                headlines[f"reference_boot{i}_candidate_repeat_floor"] = suite.with_floor(
+                    first, aa, floors=AA_FLOOR_PCT, reference_to_repeat=repeat)
+                headlines[f"reference_boot{i}_saved_reference_repeat_floor"] = suite.with_floor(
+                    first, reference_aa, floors=AA_FLOOR_PCT, reference_to_repeat=repeat)
+            adverse = []
+            for pair, outcome in pairs.items():
+                for step, record in outcome["steps"].items():
+                    if "skipped" not in record:
+                        adverse.extend({"pair": pair, "step": step, **row}
+                                       for row in record[1].get("rows", [])
+                                       if row["verdict"].startswith("worse"))
+            comparisons[name] = {"pairs": pairs, "headlines": headlines,
+                                 "candidate_repeat": aa, "saved_reference_repeat": reference_aa,
+                                 "adverse_rows": adverse}
+        model_matches = []
+        for old_boot in original["boots"]:
+            old_digest = old_boot["suites"]["release-tp3"]["steps"]["model"]["corpus_sha256"]
+            for new_boot in performance["boots"]:
+                new_digest = new_boot["suites"]["release-tp3"]["steps"]["model"]["corpus_sha256"]
+                model_matches.append({"reference": old_boot["label"], "candidate": new_boot["label"],
+                                      "reference_digest": old_digest, "candidate_digest": new_digest,
+                                      "matches": old_digest == new_digest})
+        model_pairs = []
+        if normalized:
+            source_receipt = base / "source-receipt.json"
+            require(sha(subprocess.check_output(["git", "-C", str(ROOT), "show", f"{PIN}:" + str(source_receipt.relative_to(ROOT))])) == sha(source_receipt.read_bytes()), "saved candidate private model hash manifest changed")
+            source_files = load(source_receipt)["files"]
+            for old_label in labels:
+                native = f"results/private/suites/{recipe}-release-tp3/{old_label}/model.json.gz"
+                old_path = base / "final-export/raw" / native
+                require(old_path.stat().st_size == source_files[native]["size"] and sha(old_path.read_bytes()) == source_files[native]["sha256"], "saved candidate private model artifact hash differs")
+                for new_label in current_labels:
+                    new_path = raw / "candidate-42-release-tp3" / new_label / "model.json.gz"
+                    model_pairs.append({"reference": old_label, "candidate": new_label,
+                                        "reference_sha256": source_files[native]["sha256"],
+                                        "candidate_sha256": sha(new_path.read_bytes()),
+                                        "comparison": behaviour.compare(read_json(str(old_path)), read_json(str(new_path)))})
+        result[recipe] = {"verified_reference_files": checked, "comparisons": comparisons,
+                          "private_model_comparisons": model_pairs,
+                          "model_corpus_digest_matches": model_matches,
+                          "limits": ["Every pairing is retained; the earlier recipes are not pooled.",
+                                     "Headlines are assessed against both candidate and saved-reference repeat floors.",
+                                     "Saved model text is omitted; corpus digest equality is reported separately.",
+                                     "Tail percentiles without an interval are observations, not a proven gain."]}
+    # C36 has one compatible saved boot. Never manufacture its missing A/A repeat.
+    previous = saved / "previous-candidates"
+    publication = load(previous / "publication-receipt.json")
+    checked = {}
+    for relative, record in publication["files"].items():
+        if not relative.startswith("candidate-36-"):
+            continue
+        path = previous / relative
+        digest = sha(path.read_bytes())
+        require(digest == record["sha256"], f"C36 reference hash differs: {path}")
+        require(sha(subprocess.check_output(["git", "-C", str(ROOT), "show", f"{PIN}:" + str(path.relative_to(ROOT))])) == digest, "C36 saved reference changed since execution")
+        checked[relative] = digest
+    comparisons = {}
+    for number, name in enumerate(("release-tp3", "single-stream", "sampled")):
+        suffix = "-" + name if number else ""
+        reference = previous / ("candidate-36-screen-tp3" + suffix) / "candidate-36"
+        a, b = [raw / ("candidate-42-release-tp3" + suffix) / label for label in current_labels]
+        require(load(reference / "suite.json")["suite_sha256"] == load(a / "suite.json")["suite_sha256"], "C36 suite definition differs")
+        first = suite.compare(read_json, str(reference), str(a), judge)
+        repeat = suite.compare(read_json, str(reference), str(b), judge)
+        aa = suite.compare(read_json, str(a), str(b), judge)
+        adverse = []
+        for pair, outcome in (("reference_to_boot1", first), ("reference_to_boot2", repeat)):
+            for step, record in outcome["steps"].items():
+                if "skipped" not in record:
+                    adverse.extend({"pair": pair, "step": step, **row}
+                                   for row in record[1].get("rows", [])
+                                   if row["verdict"].startswith("worse"))
+        comparisons[name] = {"pairs": {"reference_to_boot1": first, "reference_to_boot2": repeat},
+                             "candidate_repeat": aa,
+                             "headlines": suite.with_floor(first, aa, floors=AA_FLOOR_PCT, reference_to_repeat=repeat),
+                             "reference_repeat_available": False, "adverse_rows": adverse}
+    result["candidate-36"] = {"verified_reference_files": checked, "comparisons": comparisons,
+                              "model_corpus_digest_matches": [],
+                              "limits": ["One saved compatible C36 boot; no reference repeat is invented or remeasured.",
+                                         "Candidate repeats, paired intervals and global floors are retained; C36-specific A/A drift is unknown.",
+                                         "C36 model text/corpus digest is not established by this archived suite."]}
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("snapshot", type=Path)
+    parser.add_argument("performance", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    require(not args.output.exists(), "refusing to overwrite a comparison")
+    result = compare(args.snapshot, load(args.performance))
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps({recipe: {"reference_files": len(data["verified_reference_files"]),
+                               "all_model_corpus_digests_match": all(r["matches"] for r in data["model_corpus_digest_matches"]) if data["model_corpus_digest_matches"] else None,
+                               "adverse_rows": {k: len(v["adverse_rows"]) for k, v in data["comparisons"].items()}}
+                      for recipe, data in result.items()}))
+
+
+if __name__ == "__main__":
+    main()
