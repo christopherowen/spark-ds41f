@@ -1,3 +1,17 @@
+# Qualification provenance review
+
+At21:27:19UTC a normal closure-only request was submitted for the owned C42
+window after the current image/gate job and before serving/functional/timed work.
+Read-only cache inspection found both compiler packages identify0.1.15; the
+release gate uses the existing shared cache with no library-stamp flag. This
+creates a potential stale-kernel provenance gap, not evidence of observed stale
+consumption or compiler corruption. A focused delegated review is running.
+Native receipts/image remain untouched. Do not automatically resume a native
+passed image gate while this semantic qualification question is unresolved.
+No C42 serving-performance verdict exists.
+
+## Original execution and preparation record
+
 # Current execution
 
 Attempt1 launched20:47:17UTC on2026-11-05 at clean published execution
