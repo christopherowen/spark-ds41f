@@ -12,13 +12,17 @@ use exact host-computed reciprocals with one correction. Rank-one concatenations
 return views. The packed path and main fused gather kernels remain unchanged.
 Explicit wrapper bounds and disjoint-output validation protect opaque payloads.
 
-All 24 main fused-gather cases already pass both strict GPU timing gates, and
-the previous variant passes 147 gather tests per boot. The final combined source passes all 1,266 correctness tests on both boots.
-The two tiny-tail event-based timing gates remain unresolved; their measured
-interval contains about 3 us of event-node overhead around an approximately
-1 us kernel. Paired hardware-activity measurements are pending and must pass
-the same strict zero-margin bound. The previous inconclusive results remain. Historical unresolved
-variants remain in the combined experiment. Nothing is promoted by this folder.
+All 24 main fused-gather cases and all four tail cases pass their strict GPU
+timing gates on both boots. The tail check retains the original event ordering
+markers and times the actual copy kernel through CUPTI hardware activity; the
+earlier unresolved event intervals and failed parser variants remain recorded.
+Tail mean improvements range from about 10% to 50%, with every five-standard-
+error upper ratio below one. See `tail-results.json`.
+
+The previous focused gather boots pass 147 checks each. Both final composed
+boots pass all 1,446 correctness tests. Four single-GPU, 43-layer dummy traces
+contain only TileLang compute in the request window, with unchanged token IDs
+and logprob bits. Physical fabric qualification remains a separate release gate.
 
 `source-equivalence.json` proves the non-collectives files match the composed
 source byte-for-byte; all gather functions and constants in the shared module
