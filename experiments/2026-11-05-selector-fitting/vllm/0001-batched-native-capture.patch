@@ -44,10 +44,10 @@ index cf0b4d7adb..f2c1407d93 100644
          scores, values = buffers[:2]
 diff --git a/vllm/models/deepseek_v4_1/tilelang/selector_capture.py b/vllm/models/deepseek_v4_1/tilelang/selector_capture.py
 new file mode 100644
-index 0000000000..97364b1da7
+index 0000000000..96faa17f26
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/selector_capture.py
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,98 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Explicitly armed batches of native operands for separate selector fitting.
@@ -128,7 +128,9 @@ index 0000000000..97364b1da7
 +    ordinal = sum(k[0] == case and k[2] == kind for k in _captured)
 +    if key in _captured or ordinal >= (1 if kind else 3):
 +        return
-+    data = copy_batch(q,scales,weights,pool,table,lengths,active,width,page_size)
++    minimum = request.get('source_min_keys' if kind else 'dense_min_keys',32769)
++    assert isinstance(minimum,int) and minimum > 0
++    data = copy_batch(q,scales,weights,pool,table,lengths,active,width,page_size,min_keys=minimum)
 +    if data is None:
 +        return
 +    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -138,6 +140,7 @@ index 0000000000..97364b1da7
 +    assert not target.exists() and not temporary.exists(), 'refusing capture overwrite'
 +    data.update(case_id=case,prompt_sha256=request['prompt_sha256'],capture_context=context,
 +                candidate_blocks=kind,rank=rank,pool_ordinal=ordinal,mode='prefill',
++                capture_minimum_keys=minimum,
 +                source='native C36 with live-list scratch guard; diagnostic copies only')
 +    torch.save(data,temporary)
 +    temporary.replace(target)

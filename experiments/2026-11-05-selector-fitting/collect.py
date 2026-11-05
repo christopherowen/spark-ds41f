@@ -148,7 +148,9 @@ def main():
             (private/(case['case_id']+'-prompt.txt')).write_text(case['prompt'])
             tokens = request('/tokenize',{'model':model,'prompt':case['prompt'],'add_special_tokens':True},120)
             assert 2*(32769+256+64) <= int(tokens['count']) < int(tokens['max_model_len'])-1
-            w.each(ARM,{'action':'arm','case':{k:case[k] for k in ('case_id','prompt_sha256')}})
+            arm = {k:case[k] for k in ('case_id','prompt_sha256')}
+            arm.update(dense_min_keys=32769,source_min_keys=65537)
+            w.each(ARM,{'action':'arm','case':arm})
             try:
                 response = request('/v1/completions',{'model':model,'prompt':case['prompt'],'temperature':0,'seed':0,
                     'max_tokens':1,'ignore_eos':True,'stream':False,'cache_salt':uuid.uuid4().hex},1800)

@@ -78,7 +78,9 @@ def maybe_capture(q,scales,weights,pool,table,lengths,active,width,page_size,can
     ordinal = sum(k[0] == case and k[2] == kind for k in _captured)
     if key in _captured or ordinal >= (1 if kind else 3):
         return
-    data = copy_batch(q,scales,weights,pool,table,lengths,active,width,page_size)
+    minimum = request.get('source_min_keys' if kind else 'dense_min_keys',32769)
+    assert isinstance(minimum,int) and minimum > 0
+    data = copy_batch(q,scales,weights,pool,table,lengths,active,width,page_size,min_keys=minimum)
     if data is None:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -88,6 +90,7 @@ def maybe_capture(q,scales,weights,pool,table,lengths,active,width,page_size,can
     assert not target.exists() and not temporary.exists(), 'refusing capture overwrite'
     data.update(case_id=case,prompt_sha256=request['prompt_sha256'],capture_context=context,
                 candidate_blocks=kind,rank=rank,pool_ordinal=ordinal,mode='prefill',
+                capture_minimum_keys=minimum,
                 source='native C36 with live-list scratch guard; diagnostic copies only')
     torch.save(data,temporary)
     temporary.replace(target)

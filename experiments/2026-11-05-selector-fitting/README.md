@@ -66,3 +66,11 @@ reservations, heartbeat/watchdog, published commit sync and named coherent
 capture startup. Each explicitly armed document has one untimed generation
 request. It disarms every node and restores C37 once before releasing holds.
 Every actual captured batch still needs exact native replay before fitting.
+
+Before collection, source captures are explicitly delayed to 65,537 visible
+keys; dense captures retain 32,769. Both require 64 eligible rows. This gives the
+source validation a domain larger than its 32,768-key aggressive shortlist.
+The thresholds are in each arm record and captured metadata, and every request
+must cover both domains. Mechanical fixtures retain their smaller test domains;
+the collector's full requests remain untimed. The revised series again applies
+to a fresh named C36 base with the scratch guard and identical overlays.

@@ -44,6 +44,10 @@ def check(page):
         assert not list(Path(directory).glob('*.pt'))
         arm = Path(directory,'arm.json')
         arm.write_text(json.dumps({'case_id':'synthetic-copy','prompt_sha256':'a'*64}))
+        arm.write_text(json.dumps({'case_id':'synthetic-copy','prompt_sha256':'a'*64,'source_min_keys':width+1}))
+        capture.maybe_capture(*args,True,context)
+        assert not list(Path(directory).glob('*.pt'))
+        arm.write_text(json.dumps({'case_id':'synthetic-copy','prompt_sha256':'a'*64}))
         with patch('torch.cuda.is_current_stream_capturing',return_value=True):
             capture.maybe_capture(*args,True,context)
             assert not list(Path(directory).glob('*.pt'))
