@@ -25,8 +25,10 @@ sources and unchanged stall request builders. Stall body construction moved
 before thread startup; its request parameters remain identical.
 
 The initial scale window reached its first primary suite before the handoff
-request was queued. That atomic suite finishes and all original observations
-remain under `lossless-scales-release-tp3`. They are an unmatched-collector
+request was queued. That atomic suite completed and all original observations
+remain under `lossless-scales-release-tp3`; the controller then restored C36.
+`expert-scales/first-primary-results.json` retains the native suite, tests,
+operator errors, restoration and offline exact model comparison. They are an unmatched-collector
 observation, not the matched promotion comparison. No performance values were
 reviewed before this decision. The new cohort uses
 `lossless-scales-recorded-release-tp3`, two fresh boots and the exact recorded

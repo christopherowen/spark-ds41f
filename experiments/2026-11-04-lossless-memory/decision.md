@@ -22,7 +22,13 @@ Cold prefix storage needs a model-compatible restoration path before timing.
   native evidence is retained in each family's `gpu-results.json` archive map.
 - Expert scales: reuse the existing exact compaction design in an isolated
   promoted-base arm. Prior persistent-memory observations are hypotheses for this
-  arm. Unchanged scale words, kernel/output bits and two serving boots are required.
+  arm. The corrected full gate passes on all three ranks (7,337 passed, 355 skipped
+  each). The complete initial primary matches all 256 recorded generated sequences
+  and 65,536 returned score vectors exactly. Its newer stream collector prevents
+  treating it as the matched 1030 performance comparison. The deliberate handoff
+  restored C36; all observations and errors remain in
+  `expert-scales/first-primary-results.json`. Unchanged scale words, kernel/output
+  bits, two matched serving boots and the remaining functional gates are required.
 - Engram: the packed-row arm now rejects negative column deltas before signed
   subtraction. The portable C fixture reproduced the old overflow and passed
   the corrected guard plus 1,025 valid rows. Native reader tests, packing time,

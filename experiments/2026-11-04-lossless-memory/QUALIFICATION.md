@@ -4,9 +4,13 @@ These are measurement candidates. The standalone FP8 GPU screen ran and rejected
 all three tested Huffman layouts, all three fixed-field layouts and all four
 independent-plane LZ4 layouts. Each of the twenty fresh containers passed its
 exact-byte gate. The isolated scale image built
-and passed its component gate on every rank; its first full gate failed inherited
-fixtures and did not start serving measurement. Engram remains unbuilt. No
-serving improvement or release acceptance is claimed.
+and passed its component gate on every rank. Its first full gate failed inherited
+fixtures and did not start serving measurement; the corrected full gate passed
+7,337 tests with 355 skips on every rank. The first complete primary under the
+newer collector preserved all 256 generated sequences and 65,536 returned score
+vectors exactly. That window restored C36 after the queued collector handoff;
+the required matched two-boot cohort remains separate. Engram remains unbuilt.
+No serving improvement or release acceptance is claimed.
 
 ## Source identities
 
@@ -25,7 +29,14 @@ auxiliary sources and hash-locked aarch64 wheels. Both `build check` commands
 pass. `runs/full-input-preparation/` retains the initial fetch failure and retry;
 `runs/engram-observation-preparation/` records the final instrumented Engram tree.
 The scale image is built and its initial gates/restoration are recorded in
-`expert-scales/initial-gate-results.json`. Engram image construction and both
+`expert-scales/initial-gate-results.json`. The corrected full gate, complete
+unmatched primary, original operator launch failure, exact model comparison and
+restoration are retained in `expert-scales/first-primary-results.json` and its
+110 original/analysis archives. The original supervisor failed before launching
+a controller; the corrected supervisor records the actual child exit. The later
+controller exit 1 records the deliberate window handoff, rather than a model or
+hardware failure. No missing companion, repeat or functional result is a pass.
+Engram image construction and both
 candidates' complete corrected qualification remain required. The first image attempt was
 rejected before stopping service because its plan used a non-resolving profile
 path; `runs/component-plan-failure/` retains the original receipt and logs.
