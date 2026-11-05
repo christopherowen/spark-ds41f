@@ -13,8 +13,39 @@ The patched build uses `spark-ds41f:candidate-36`, with its lock and source
 manifest in this directory. The original image and all original test receipts
 remain recorded in [the backport record](../../2026-11-05-candidate-36-direct-exchange/README.md).
 DGX4 reproduced the complete patch stack and passed all 17 source-lock and build
-tests; its doctor reports the two inherited configuration errors documented in
-the backport record. `results.json` records the current build's qualification status.
+tests. The topology profiles below resolve the two inherited configuration
+errors identified by that run. `results.json` records the current build's qualification status.
+
+## Topology profiles
+
+| Profile | Fabric | Nodes |
+| --- | --- | ---: |
+| [tp3-triangle.json](tp3-triangle.json) | Switchless triangle | 3 |
+| [tp4-ring.json](tp4-ring.json) | Switchless neighbour ring | 4 |
+| [tp3-switched.json](tp3-switched.json) | Switched | 3 |
+| [tp4-switched.json](tp4-switched.json) | Switched | 4 |
+| [tp5-switched.json](tp5-switched.json) | Switched | 5 |
+| [tp6-switched.json](tp6-switched.json) | Switched | 6 |
+| [tp7-switched.json](tp7-switched.json) | Switched | 7 |
+| [tp8-switched.json](tp8-switched.json) | Switched | 8 |
+
+All profiles select `spark-ds41f:candidate-36` and this directory's source lock.
+Switched profiles inherit the corresponding shape of the frozen 1030 recipe,
+including the site node-map path and direct switched NCCL settings. The site
+supplies its node-local map, whose head address must match `distributed.master_addr`; `config/examples/nodes-switched*.json` are templates.
+These candidate profiles await image and hardware qualification.
+
+The former `tp3.json` and `tp4.json` are now `tp3-triangle.json` and
+`tp4-ring.json`. Triangle variants are `tp3-triangle-dev.json`,
+`tp3-triangle-copy.json`, `tp3-triangle-copy-dev.json` and
+`tp3-triangle-8192.json`. Their lab jobs are `candidate-tp3-triangle.json`,
+`release-tp3-triangle.json` and `screen-tp3-triangle.json`.
+`image-dgx4.json` follows `tp4-ring.json` for the shared image build.
+
+The ring profile names the same 1030 baseline as its lock and lets the renderer
+select adapters. [Profile validation and the rename map](../../2026-11-05-candidate-36-profiles/README.md)
+record these configuration corrections. All 13 profiles pass offline doctor
+checks on DGX4, and all 64 relevant tests pass; original run receipts are preserved.
 
 ## Historical candidate-34 kernel audit
 
