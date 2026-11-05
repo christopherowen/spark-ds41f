@@ -1,0 +1,407 @@
+From 4774d7faea7dbf4f670d16a5e267fa7e2ae9d663 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 16:33:05 +0100
+Subject: [PATCH] Read native TP1 IDs and normalize them in the embedding
+ lookup
+
+Upstream base: 1f33102547e4da5c64712390604695d1abd577c4 (candidate-38). Rationale: remove the separate TP1 clamp/int64 conversion and the plain-table ATen lookup. TileLang methods read native integer IDs and flat strides and clamp negatives to row zero in the lookup; other quantization methods retain their preprocessing. Quality: opaque payloads and TP1 negative-ID semantics are preserved, with separate non-clamping parallel variants. Tests: all 127 embedding checks pass on both boots; includes 36 new public eager/graph cases. Strict two-boot public-route timings and unchanged parallel CUDA-source identities are recorded separately. Upstream status: local experiment, not submitted.
+---
+ .../test_deepseek_v41_tilelang_embedding.py   |  55 ++++++++-
+ .../layers/vocab_parallel_embedding.py        |   7 +-
+ .../deepseek_v4_1/tilelang/embedding.py       | 113 ++++++++++++++----
+ 3 files changed, 144 insertions(+), 31 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_embedding.py b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+index 417b665612..83989dfb20 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_embedding.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+@@ -230,7 +230,9 @@ def test_declared_as_the_lookup_calls_it():
+ 
+ def _embedding_table_with_exceptions(rows: int, width: int, seed: int) -> torch.Tensor:
+     generator = torch.Generator(device="cuda").manual_seed(seed)
+-    weight = (torch.randn(rows, width, generator=generator, device="cuda") * 0.02).bfloat16()
++    weight = (
++        torch.randn(rows, width, generator=generator, device="cuda") * 0.02
++    ).bfloat16()
+     flat = weight.view(-1)
+     picks = torch.randint(0, flat.numel(), (128,), generator=generator, device="cuda")
+     flat[picks[:48]] = 300.0
+@@ -256,7 +258,9 @@ def test_packed_embedding_bit_identical_to_the_cuda_kernel(tp, rank, tokens, id_
+     want = _cuda(ids, original, shard)
+ 
+     layer = torch.nn.Module()
+-    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
++    layer.register_parameter(
++        "weight", torch.nn.Parameter(original.clone(), requires_grad=False)
++    )
+     layer.shard_indices = shard
+     method = embedding.TileLangEmbeddingMethod()
+     method.process_weights_after_loading(layer)
+@@ -276,8 +280,11 @@ def test_packed_embedding_declaration_and_tp1_embedding():
+     width = 256
+     original = _embedding_table_with_exceptions(rows, width, seed=55)
+     layer = torch.nn.Module()
+-    layer.register_parameter("weight", torch.nn.Parameter(original.clone(), requires_grad=False))
++    layer.register_parameter(
++        "weight", torch.nn.Parameter(original.clone(), requires_grad=False)
++    )
+     layer.shard_indices = shard
++    layer.tp_size = 1
+     method = embedding.TileLangEmbeddingMethod()
+     method.process_weights_after_loading(layer)
+ 
+@@ -289,7 +296,7 @@ def test_packed_embedding_declaration_and_tp1_embedding():
+         (
+             embedding.packed_vocab_embedding_kernel,
+             (width, layer.packed_bf16_exponent_base, d),
+-            {"threads": 128},
++            {"threads": 128, "clamp_negative": True},
+         )
+         for d in ("int32", "int64")
+     ]
+@@ -299,3 +306,43 @@ def test_packed_embedding_declaration_and_tp1_embedding():
+     want_2d = torch.nn.functional.embedding(ids_2d, original)
+     assert got_2d.shape == (4, 7, width)
+     assert torch.equal(_bits(got_2d), _bits(want_2d))
++
++
++@pytest.mark.parametrize("packed", [False, True])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("tokens", [0, 1, 17])
++@pytest.mark.parametrize("layout", ["flat", "strided", "matrix"])
++def test_tp1_native_ids_preserve_lookup_bits(packed, id_dtype, tokens, layout):
++    """The public TP1 path clamps negative IDs in its lookup and retains native
++    widths/strides, including empty/shifted/multidimensional graph inputs."""
++    rows, width = 2048, 256
++    original = _embedding_table_with_exceptions(rows, width, seed=72)
++    shard, _ = _shard_indices(rows, rows, 0, 1)
++    method = embedding.TileLangEmbeddingMethod()
++    layer = torch.nn.Module()
++    layer.weight = torch.nn.Parameter(original.clone(), requires_grad=False)
++    layer.shard_indices = shard
++    layer.tp_size = 1
++    layer.quant_method = method
++    if packed:
++        method.process_weights_after_loading(layer)
++    storage = torch.randint(-16, rows, (2 * tokens + 5,), device="cuda", dtype=id_dtype)
++    ids = storage[1 : 1 + 2 * tokens : 2]
++    if tokens:
++        ids[0] = -7
++    if layout == "flat":
++        ids = ids.contiguous()
++    elif layout == "matrix":
++        ids = ids.view(1, tokens)
++    expected = torch.nn.functional.embedding(ids.clamp_min(0).long(), original)
++    actual = VocabParallelEmbedding.forward(layer, ids)
++    assert actual.shape == expected.shape
++    assert torch.equal(_bits(actual), _bits(expected))
++    assert ids.dtype == id_dtype
++    if tokens:
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            replayed = VocabParallelEmbedding.forward(layer, ids)
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(_bits(replayed), _bits(expected))
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 921d1785ea..a365767a1b 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -726,7 +726,12 @@ class VocabParallelEmbedding(PluggableLayer):
+ 
+     def forward(self, input_):
+         if self.tp_size == 1:
+-            return self.quant_method.embedding(self, input_.clamp_min(0).long())
++            ids = (
++                input_
++                if getattr(self.quant_method, "supports_native_embedding_ids", False)
++                else input_.clamp_min(0).long()
++            )
++            return self.quant_method.embedding(self, ids)
+ 
+         if self.use_fused_embedding:
+             output_parallel = self._fused_embedding(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index b21e800514..8a30d5e1f4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -197,6 +197,7 @@ def vocab_embedding_kernel(
+     threads: int = _THREADS,
+     coherent: bool = True,
+     per_thread: int = 1,
++    clamp_negative: bool = False,
+ ):
+     """``out[t] = table[row(ids[t])]`` or zeros, for rows of ``words`` 32-bit words,
+     ``per_thread`` pieces a thread.
+@@ -209,10 +210,12 @@ def vocab_embedding_kernel(
+     blocks = -(-pieces // (threads * per_thread))
+     tokens = T.dynamic("tokens")
+     span = T.dynamic("span")
++    id_stride = T.dynamic("id_stride", "int64")
++    strides = (id_stride,) if clamp_negative else (1,)
+ 
+     @T.prim_func
+     def vocab_embedding(
+-        ids: T.Tensor((tokens,), id_dtype),
++        ids: T.StridedTensor((tokens,), strides, id_dtype),
+         table: T.Tensor((span,), T.int32),
+         out: T.Tensor((tokens, words), T.int32),
+         org_start: T.int64,
+@@ -227,6 +230,8 @@ def vocab_embedding_kernel(
+             tx = T.get_thread_binding()
+             data = T.alloc_local((per_thread * _WORDS,), T.int32)
+             token = T.alloc_var(T.int64, init=T.cast(ids[t], T.int64))
++            if clamp_negative:
++                token = T.max(token, T.int64(0))
+             # The shard row, or -1 for an id this rank does not own.
+             row = T.alloc_var(
+                 T.int64,
+@@ -276,6 +281,7 @@ def packed_vocab_embedding_kernel(
+     exponent_base: int,
+     id_dtype: str,
+     threads: int = _THREADS,
++    clamp_negative: bool = False,
+ ):
+     """``out[t] = unpack(values[row(ids[t])])`` or zeros, for 12-bit packed BF16
+     rows of ``k`` elements (`k` divisible by 128) with SWAR ``__byte_perm`` decode
+@@ -287,10 +293,12 @@ def packed_vocab_embedding_kernel(
+     rows = T.dynamic("rows")
+     exceptions = T.dynamic("exceptions")
+     offsets = T.dynamic("offsets")
++    id_stride = T.dynamic("id_stride", "int64")
++    strides = (id_stride,) if clamp_negative else (1,)
+ 
+     @T.prim_func
+     def vocab_packed_embedding(
+-        ids: T.Tensor((tokens,), id_dtype),
++        ids: T.StridedTensor((tokens,), strides, id_dtype),
+         values: T.Tensor((rows, row_bytes), T.uint8),
+         exception_entries: T.Tensor((exceptions,), T.int32),
+         row_offsets: T.Tensor((offsets,), T.int32),
+@@ -306,6 +314,8 @@ def packed_vocab_embedding_kernel(
+             T.annotate_restrict_buffers(ids, values, exception_entries, row_offsets)
+             tx = T.get_thread_binding()
+             token = T.alloc_var(T.int64, init=T.cast(ids[t], T.int64))
++            if clamp_negative:
++                token = T.max(token, T.int64(0))
+             row = T.alloc_var(
+                 T.int64,
+                 init=T.if_then_else(
+@@ -334,27 +344,39 @@ def packed_vocab_embedding_kernel(
+ 
+ 
+ @cache
+-def _packed_kernel(k: int, exponent_base: int, id_dtype: str):
++def _packed_kernel(k: int, exponent_base: int, id_dtype: str, clamp_negative=False):
+     return packed_vocab_embedding_kernel(
+-        k, exponent_base, id_dtype, threads=_packed_threads(k)
++        k,
++        exponent_base,
++        id_dtype,
++        threads=_packed_threads(k),
++        **({"clamp_negative": True} if clamp_negative else {}),
+     )
+ 
+ 
+-def packed_kernel_calls(k: int, exponent_base: int) -> list[prepare.TileLangCall]:
++def packed_kernel_calls(
++    k: int, exponent_base: int, clamp_negative=False
++) -> list[prepare.TileLangCall]:
+     threads = _packed_threads(k)
+     return [
+         prepare.call(
+-            packed_vocab_embedding_kernel, k, exponent_base, d, threads=threads
++            packed_vocab_embedding_kernel,
++            k,
++            exponent_base,
++            d,
++            threads=threads,
++            **({"clamp_negative": True} if clamp_negative else {}),
+         )
+         for d in _ID_DTYPES.values()
+     ]
+ 
+ 
+-def declare_packed(k: int, exponent_base: int) -> None:
++def declare_packed(k: int, exponent_base: int, clamp_negative=False) -> None:
+     prepare.declare(
+-        lambda: packed_kernel_calls(k, exponent_base),
++        lambda: packed_kernel_calls(k, exponent_base, clamp_negative),
+         bind=lambda: [
+-            _packed_kernel(k, exponent_base, d) for d in _ID_DTYPES.values()
++            _packed_kernel(k, exponent_base, d, clamp_negative)
++            for d in _ID_DTYPES.values()
+         ],
+     )
+ 
+@@ -372,6 +394,8 @@ def vocab_embedding_packed(
+     num_org_vocab_padding: int,
+     added_vocab_start_index: int,
+     added_vocab_end_index: int,
++    *,
++    clamp_negative: bool = False,
+ ) -> None:
+     """This rank's partial BF16 embeddings of ``input_ids`` ([T] int32 or int64)
+     decoded directly from its 12-bit packed shard ``values`` into ``out`` ([T, K]
+@@ -386,7 +410,8 @@ def vocab_embedding_packed(
+         or values.shape[1] != row_bytes
+         or out.shape != (tokens, in_features)
+         or out.dtype != torch.bfloat16
+-        or not (input_ids.is_contiguous() and values.is_contiguous())
++        or (not clamp_negative and not input_ids.is_contiguous())
++        or not values.is_contiguous()
+         or not out.is_contiguous()
+     ):
+         raise ValueError(
+@@ -408,7 +433,9 @@ def vocab_embedding_packed(
+         + num_org_vocab_padding
+         - added_vocab_start_index
+     )
+-    _packed_kernel(in_features, exponent_base, _ID_DTYPES[input_ids.dtype])(
++    _packed_kernel(
++        in_features, exponent_base, _ID_DTYPES[input_ids.dtype], clamp_negative
++    )(
+         input_ids,
+         values,
+         exception_entries,
+@@ -434,8 +461,13 @@ def _layouts(words: int) -> tuple[int, ...]:
+ 
+ 
+ @cache
+-def _kernel(words: int, id_dtype: str, per_thread: int):
+-    return vocab_embedding_kernel(words, id_dtype, per_thread=per_thread)
++def _kernel(words: int, id_dtype: str, per_thread: int, clamp_negative=False):
++    return vocab_embedding_kernel(
++        words,
++        id_dtype,
++        per_thread=per_thread,
++        **({"clamp_negative": True} if clamp_negative else {}),
++    )
+ 
+ 
+ def row_words(weight: torch.Tensor) -> int:
+@@ -449,22 +481,30 @@ def row_words(weight: torch.Tensor) -> int:
+     return row_bytes // 4
+ 
+ 
+-def kernel_calls(words: int) -> list[prepare.TileLangCall]:
++def kernel_calls(words: int, clamp_negative=False) -> list[prepare.TileLangCall]:
+     """The calls ``vocab_embedding`` makes for rows of ``words`` words: int32 ids
+     (the model runner's) and int64 ids, in both layouts."""
+     return [
+-        prepare.call(vocab_embedding_kernel, words, d, per_thread=p)
++        prepare.call(
++            vocab_embedding_kernel,
++            words,
++            d,
++            per_thread=p,
++            **({"clamp_negative": True} if clamp_negative else {}),
++        )
+         for d in _ID_DTYPES.values()
+         for p in _layouts(words)
+     ]
+ 
+ 
+-def declare(words: int) -> None:
++def declare(words: int, clamp_negative=False) -> None:
+     """Declare the lookups of rows of ``words`` words, and keep them."""
+     prepare.declare(
+-        lambda: kernel_calls(words),
++        lambda: kernel_calls(words, clamp_negative),
+         bind=lambda: [
+-            _kernel(words, d, p) for d in _ID_DTYPES.values() for p in _layouts(words)
++            _kernel(words, d, p, clamp_negative)
++            for d in _ID_DTYPES.values()
++            for p in _layouts(words)
+         ],
+     )
+ 
+@@ -478,6 +518,8 @@ def vocab_embedding(
+     num_org_vocab_padding: int,
+     added_vocab_start_index: int,
+     added_vocab_end_index: int,
++    *,
++    clamp_negative: bool = False,
+ ) -> None:
+     """This rank's partial embeddings of ``input_ids`` ([T] int32 or int64) from its
+     shard ``weight`` into ``out`` ([T, width], the weight's dtype): the arguments of
+@@ -489,7 +531,8 @@ def vocab_embedding(
+         or weight.dim() != 2
+         or out.shape != (tokens, weight.shape[1])
+         or out.dtype != weight.dtype
+-        or not (input_ids.is_contiguous() and weight.is_contiguous())
++        or (not clamp_negative and not input_ids.is_contiguous())
++        or not weight.is_contiguous()
+         or not out.is_contiguous()
+     ):
+         raise ValueError(
+@@ -511,7 +554,9 @@ def vocab_embedding(
+         + num_org_vocab_padding
+         - added_vocab_start_index
+     )
+-    _kernel(words, _ID_DTYPES[input_ids.dtype], _per_thread(words, tokens))(
++    _kernel(
++        words, _ID_DTYPES[input_ids.dtype], _per_thread(words, tokens), clamp_negative
++    )(
+         input_ids,
+         weight.view(torch.int32).view(-1),
+         out.view(torch.int32),
+@@ -532,6 +577,8 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+     on the fly during lookup.
+     """
+ 
++    supports_native_embedding_ids = True
++
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+         super().process_weights_after_loading(layer)
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+@@ -563,19 +610,32 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+         layer._already_called_process_weights_after_loading = True
+ 
+     def declare_layer_kernels(self, layer: nn.Module) -> None:
++        native = getattr(layer, "tp_size", 2) == 1
+         if hasattr(layer, "packed_bf16_exponent_base"):
+             declare_packed(
+-                layer.packed_bf16_in_features, layer.packed_bf16_exponent_base
++                layer.packed_bf16_in_features, layer.packed_bf16_exponent_base, native
+             )
+             return
+-        declare(row_words(layer.weight))
++        declare(row_words(layer.weight), native)
+ 
+     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+-        if not hasattr(layer, "packed_bf16_exponent_base"):
+-            return super().embedding(layer, input_)
+         flat = input_ if input_.ndim == 1 else input_.reshape(-1)
+-        if not flat.is_contiguous():
+-            flat = flat.contiguous()
++        if not hasattr(layer, "packed_bf16_exponent_base"):
++            width = layer.weight.shape[1]
++            out = layer.weight.new_empty((flat.shape[0], width))
++            # The original TP1 unquantized lookup indexes the physical table.
++            vocab_embedding(
++                flat,
++                layer.weight,
++                out,
++                0,
++                layer.weight.shape[0],
++                0,
++                0,
++                0,
++                clamp_negative=True,
++            )
++            return out if input_.ndim == 1 else out.view(*input_.shape, width)
+         in_features = layer.packed_bf16_in_features
+         out = torch.empty(
+             (flat.shape[0], in_features),
+@@ -596,6 +656,7 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+             shard.num_org_vocab_padding,
+             shard.added_vocab_start_index,
+             shard.added_vocab_end_index,
++            clamp_negative=True,
+         )
+         return out if input_.ndim == 1 else out.view(*input_.shape, in_features)
+ 
+-- 
+2.54.0 (Apple Git-157)
+
