@@ -106,3 +106,13 @@ as the independent partition oracle predicts; original-space centroids are
 bit-exact for the fixture, native bytes are untouched, partial writes are no-ops,
 and graph replay/page recycling pass at both page sizes. No trained map or model
 quality is tested. A separate strict initialization process is prepared next.
+
+`metric/runs/metric-screen-01` retains the zero-error strict initialization run
+and two fresh construction-timing processes. For 1024 completed pages, projected
+construction is slower in point estimates: 0.216 versus 0.124 ms at page128,
+and 0.625 versus 0.463 ms at page256. All samples, original-before/after arms,
+process medians and broad two-process intervals remain in the comparison JSON.
+These synthetic construction results establish no request gain or quality gain.
+The map has not been fitted and is not integrated into serving. Its extra work
+would need to earn back cost through improved retained-key quality or a cheaper
+query operating point. Every standalone container and reservation is removed.
