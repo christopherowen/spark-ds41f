@@ -34,7 +34,10 @@ elif x['action']=='disarm':
  (p/'arm.json').unlink(missing_ok=True)
 elif x['action']=='manifest':
  import hashlib
- files={a.name:{'bytes':a.stat().st_size,'sha256':hashlib.file_digest(a.open('rb'),'sha256').hexdigest()} for a in p.glob('*.pt')}
+ def identity(a):
+  with a.open('rb') as stream:sha=hashlib.file_digest(stream,'sha256').hexdigest()
+  return {'bytes':a.stat().st_size,'sha256':sha}
+ files={a.name:identity(a) for a in p.glob('*.pt')}
  assert len(files)==12 and not list(p.glob('*.tmp')) and not (p/'arm.json').exists(),files
  print(json.dumps(files));raise SystemExit
 print(json.dumps({'ok':True}))
