@@ -1,0 +1,62 @@
+From a4f0958ce91a5faa99dcc6e329ebcccdbe3c4220 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 21:30:10 +0100
+Subject: [PATCH] Limit selected-logit staging to one warp
+
+Upstream-base: db5cd9a082b746a9fd733afc7b88c72f55228a20.
+
+Rationale: multiwarp staging regresses a 129-column BF16 case despite improving the small selection. Stage one warp's selection in 128 bytes of shared memory and retain the previously qualified native-stride program for larger selections. The bound follows the hardware warp size; dtype and request shape are not special-cased.
+
+Quality: no new CUDA launch, global buffer, dtype/layout materialization or arithmetic reordering. The final store consumes the same FP32 selected values. Startup declares both paths, and tests cover 31, 32 and 33 selected columns.
+
+Tests: repeat numerical/native-layout/startup/graph, strict paired GPU timings and IKET qualification. The rejected multiwarp source and measurements remain in the deployment experiment.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ tests/v1/worker/test_gpu_tilelang_logprob_softmax.py | 4 ++--
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py        | 6 +++---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 1b784863cf..98ecaa00b7 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -717,8 +717,8 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+         ("padded", 33),
+         ("sliced", 33),
+         ("transposed", 33),
+-        ("transposed", 1024),
+-        ("transposed", 1025),
++        ("transposed", 31),
++        ("transposed", 32),
+         ("general", 33),
+     ],
+ )
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index f02a99c091..8d334f8c0e 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -293,9 +293,9 @@ def topk_log_softmax_kernel(
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+             if prefetch_ids:
+-                T.assume(topk <= threads)
++                T.assume(topk <= 32)
+                 # Reuse the reduction barriers; each thread later reads its own slot.
+-                selected = T.alloc_shared((threads,), T.float32)
++                selected = T.alloc_shared((32,), T.float32)
+                 if tx < topk:
+                     selected[tx] = T.cast(logits[row, token_ids[row, tx]], T.float32)
+             raw = T.alloc_local((per,), logits_dtype)
+@@ -424,7 +424,7 @@ def _score_key(logits: torch.Tensor, ids: torch.Tensor, masked: bool) -> tuple:
+         masked,
+         ids.dtype,
+         layout,
+-        layout == "transpose" and ids.shape[1] <= _SOFTMAX_THREADS,
++        layout == "transpose" and ids.shape[1] <= 32,
+     )
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,113 @@
+From 988fb40ac7de1ebbfe87c48a101ac1e1ab586545 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 13:01:49 +0100
+Subject: [PATCH] Widen vectorized FP32 copy tiles for large logits batches
+
+Upstream base: 87fe535783e2304982732a18b267d1963b35efa6. Rationale: column traversal alone left a measured 0.5 percent slowdown at 96 padded FP32 rows. Move four vector groups per thread for large matrices while retaining the 1024-element grid for small batches and casts. Quality: exact payload copies and existing alignment/tail rules. Tests: partial blocks at both tile widths, two row counts and registry declarations; GPU screening pending. Upstream status: local experiment, not submitted.
+---
+ .../kernels/test_deepseek_v41_copy_logits.py  | 10 ++++---
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 27 +++++++++++++------
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_copy_logits.py b/tests/kernels/test_deepseek_v41_copy_logits.py
+index fcb7d1f44d..b2b98da0a3 100644
+--- a/tests/kernels/test_deepseek_v41_copy_logits.py
++++ b/tests/kernels/test_deepseek_v41_copy_logits.py
+@@ -69,18 +69,20 @@ def test_sampler_declarations_include_the_copy_specializations():
+     calls = kernels.sampling_calls([torch.float16, torch.bfloat16, torch.float32])
+     # The declaration goes through the same factory/key as the runtime launch.
+     expected = [
+-        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized)
++        kernels._call(kernels.copy_logits_kernel, kernels._DTYPES[d], vectorized, span)
+         for d in (torch.float16, torch.bfloat16, torch.float32)
+         for vectorized in (False, True)
++        for span in ((1024, 4096) if vectorized and d == torch.float32 else (1024,))
+     ]
+     assert all(c in calls for c in expected)
+ 
+ 
+-@pytest.mark.parametrize("cols", [1020, 1024, 1028])
++@pytest.mark.parametrize("cols", [1020, 1024, 1028, 4092, 4096, 4100])
++@pytest.mark.parametrize("rows", [5, 96])
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+-def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols):
++def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols, rows):
+     pitch = (cols + 31) // 16 * 16
+-    src = torch.randn((5, pitch), dtype=dtype, device="cuda")[:, :cols]
++    src = torch.randn((rows, pitch), dtype=dtype, device="cuda")[:, :cols]
+     before = src.clone()
+     got = kernels.copy_logits(src)
+     torch.testing.assert_close(got, src.float(), rtol=0, atol=0)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 11fa37b98c..24b1e22430 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3439,17 +3439,18 @@ def declare(calls: Callable[[], list]) -> None:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_logits_kernel(dtype: str, vectorized: bool = False):
++def copy_logits_kernel(dtype: str, vectorized: bool = False, span: int = 1024):
+     """Own an FP32 logits copy, including cast and non-contiguous source rows."""
+     rows, cols, row_stride, col_stride = T.dynamic("rows, cols, row_stride, col_stride")
+     source_strides = (row_stride, 1) if vectorized else (row_stride, col_stride)
++    assert span in (1024, 4096) and (vectorized or span == 1024)
+ 
+     @T.prim_func
+     def copy_logits(
+         src: T.StridedTensor((rows, cols), source_strides, dtype),
+         dst: T.Tensor((rows, cols), T.float32),
+     ):
+-        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
++        grid_x = T.ceildiv(cols, span) if vectorized else rows
+         grid_y = rows if vectorized else T.ceildiv(cols, 1024)
+         with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
+             row = by if vectorized else bx
+@@ -3458,10 +3459,11 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False):
+             if vectorized:
+                 T.assume(row_stride % 4 == 0)
+                 T.assume(cols % 4 == 0)
+-                col = block * 1024 + tx * 4
+-                if col + 4 <= cols:
+-                    for j in T.vectorized(4):
+-                        dst[row, col + j] = T.cast(src[row, col + j], T.float32)
++                for i in T.unroll(span // 1024):
++                    col = block * span + (i * 256 + tx) * 4
++                    if col + 4 <= cols:
++                        for j in T.vectorized(4):
++                            dst[row, col + j] = T.cast(src[row, col + j], T.float32)
+             else:
+                 for j in T.unroll(4):
+                     col = block * 1024 + j * 256 + tx
+@@ -3496,7 +3498,15 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+             and logits.shape[1] % 4 == 0
+             and _triton_run(logits) > 1
+         )
+-        _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized)(logits, out)
++        span = (
++            4096
++            if vectorized
++            and logits.dtype == torch.float32
++            and logits.shape[0] >= 32
++            and logits.shape[1] >= 4096
++            else 1024
++        )
++        _kernel(copy_logits_kernel, _DTYPES[logits.dtype], vectorized, span)(logits, out)
+     return out
+ 
+ 
+@@ -3525,9 +3535,10 @@ def sampling_calls(
+         for apply_temp in apply_temps
+     ]
+     calls += [
+-        _call(copy_logits_kernel, _DTYPES[dtype], vectorized)
++        _call(copy_logits_kernel, _DTYPES[dtype], vectorized, span)
+         for dtype in dict.fromkeys(logits_dtypes)
+         for vectorized in (False, True)
++        for span in ((1024, 4096) if vectorized and dtype == torch.float32 else (1024,))
+     ]
+     if temperature:
+         calls += [
+-- 
+2.54.0 (Apple Git-157)
+

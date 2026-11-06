@@ -1,0 +1,187 @@
+From 87fe535783e2304982732a18b267d1963b35efa6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 12:53:49 +0100
+Subject: [PATCH] Write prompt scores directly into their final chunk rows
+
+Upstream base: d9fe59752be7d2e8abad2a2295e6c95bedd58252. Rationale: eliminate three GPU concatenations and per-chunk result allocations. Quality: keep top-k order, native sampled ID dtype and strides, logits/log-softmax arithmetic and rank order unchanged. Tests: extend the existing four-mode prompt test across one row, an exact chunk, one partial tail and three chunks with strided int32/int64 IDs; two GPU boots pending. Upstream status: local experiment, not submitted.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      |  7 ++-
+ vllm/v1/worker/gpu/sample/prompt_logprob.py   | 59 ++++++++++---------
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 17 +++++-
+ .../v1/worker/gpu/sample/tilelang_topk_ids.py | 15 ++++-
+ 4 files changed, 64 insertions(+), 34 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 98ecaa00b7..a676efae19 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -691,13 +691,14 @@ def test_selected_logits_are_prepared_before_cache_freeze(monkeypatch):
+ )
+ @pytest.mark.parametrize("num_logprobs", [0, 5])
+ @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+-def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
++@pytest.mark.parametrize("rows", [1, 1024, 1027, 2049])
++def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype, rows):
+     from vllm.v1.worker.gpu.sample.prompt_logprob import (
+         compute_prompt_logprobs_with_chunking,
+     )
+ 
+-    logits = torch.randn(1027, 257, device=DEVICE)
+-    ids = (torch.arange(2054, device=DEVICE, dtype=id_dtype) % 257)[::2]
++    logits = torch.randn(rows, 257, device=DEVICE)
++    ids = (torch.arange(2 * rows, device=DEVICE, dtype=id_dtype) % 257)[::2]
+     out_ids, scores, ranks = compute_prompt_logprobs_with_chunking(
+         ids, logits, lambda hidden: hidden, num_logprobs, mode
+     )
+diff --git a/vllm/v1/worker/gpu/sample/prompt_logprob.py b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+index 3aae474ba7..f547a69c66 100644
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -9,9 +9,12 @@ from vllm.config.model import LogprobsMode
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
++from vllm.v1.worker.gpu.sample import (
++    tilelang_auxiliary,
++    tilelang_logprob,
++    tilelang_topk_ids,
++)
+ from vllm.v1.worker.gpu.sample.logprob import (
+-    compute_topk_scores,
+     register_topk_scores_warmup,
+ )
+ 
+@@ -184,35 +187,35 @@ def compute_prompt_logprobs_with_chunking(
+     num_prompt_logprobs: int,
+     logprobs_mode: LogprobsMode = "raw_logprobs",
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    # Since materializing the full prompt logits can take too much memory,
+-    # we compute it in chunks.
++    # Bound the logits workspace while writing every chunk into its final rows.
+     CHUNK_SIZE = 1024
+-    token_ids = []
+-    scores = []
+-    ranks = []
++    if not 0 <= num_prompt_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX:
++        raise ValueError("prompt logprobs exceed the configured top-k range")
++    rows = prompt_token_ids.shape[0]
++    shape = (rows, 1 + num_prompt_logprobs)
++    token_ids = (
++        torch.empty(shape, dtype=torch.int64, device=prompt_token_ids.device)
++        if num_prompt_logprobs
++        else prompt_token_ids.unsqueeze(-1)
++    )
++    scores = torch.empty(shape, dtype=torch.float32, device=prompt_token_ids.device)
++    ranks = torch.empty(rows, dtype=torch.int64, device=prompt_token_ids.device)
+     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
+-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
+-        end_idx = start_idx + CHUNK_SIZE
+-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+-        requested_num = (
+-            prompt_logits.shape[-1]
+-            if num_prompt_logprobs == -1
+-            else num_prompt_logprobs
+-        )
+-        result = compute_topk_scores(
+-            prompt_logits,
+-            requested_num,
+-            prompt_token_ids[start_idx:end_idx],
+-            logits_mode=logits_mode,
+-        )
+-        token_ids.append(result.logprob_token_ids)
+-        scores.append(result.logprobs)
+-        ranks.append(result.selected_token_ranks)
++    for start in range(0, rows, CHUNK_SIZE):
++        end = min(start + CHUNK_SIZE, rows)
++        logits = logits_fn(prompt_hidden_states[start:end])
++        selected = token_ids[start:end]
++        sampled = prompt_token_ids[start:end]
++        if num_prompt_logprobs:
++            tilelang_topk_ids.logprob_token_ids(
++                logits, num_prompt_logprobs, sampled, out=selected
++            )
++        if logits_mode:
++            tilelang_logprob.gather_logits(logits, selected, out=scores[start:end])
++        else:
++            tilelang_logprob.topk_log_softmax(logits, selected, scores[start:end])
++        tilelang_logprob.token_ranks(logits, sampled, ranks[start:end])
+ 
+-    token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
+-    scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
+-    ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
+     return token_ids, scores, ranks
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 0fb90ccbe8..34c0f774c2 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -529,7 +529,11 @@ def register_gather_logits(logits: Sequence[tuple[torch.dtype, int]]) -> None:
+ 
+ 
+ def gather_logits(
+-    logits: torch.Tensor, token_ids: torch.Tensor, valid: torch.Tensor | None = None
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    valid: torch.Tensor | None = None,
++    *,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Gather selected logits as FP32, storing -inf in invalid custom-id columns.
+ 
+@@ -552,7 +556,16 @@ def gather_logits(
+         or valid.device != logits.device
+     ):
+         raise ValueError("valid must be a boolean CUDA matrix matching token_ids")
+-    output = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
++    if out is None:
++        out = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
++    elif (
++        out.shape != token_ids.shape
++        or out.dtype != torch.float32
++        or out.device != logits.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError("logits output must be contiguous FP32 matching token_ids")
++    output = out
+     if output.numel():
+         kernel = _kernel(
+             gather_logits_kernel,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+index 3c9e1304b0..ffd42359b6 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+@@ -484,6 +484,8 @@ def logprob_token_ids(
+     logits: torch.Tensor,  # [rows, vocab]
+     num_logprobs: int,
+     sampled: torch.Tensor,  # [rows]
++    *,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """``torch.cat((sampled[:, None], torch.topk(logits, num_logprobs).indices),
+     1)``: ``[rows, 1 + num_logprobs]`` int64, ``num_logprobs`` at most
+@@ -492,7 +494,18 @@ def logprob_token_ids(
+     rows = logits.shape[0]
+     if sampled.dtype not in (torch.int32, torch.int64):
+         raise TypeError("sampled token ids must be int32 or int64")
+-    out = torch.empty((rows, 1 + num_logprobs), dtype=torch.int64, device=logits.device)
++    shape = (rows, 1 + num_logprobs)
++    if out is None:
++        out = torch.empty(shape, dtype=torch.int64, device=logits.device)
++    elif (
++        out.shape != shape
++        or out.dtype != torch.int64
++        or out.device != logits.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "top-k ids output must be contiguous int64 with the selected shape"
++        )
+     if rows:
+         _launch(logits, out, sampled)
+     return out
+-- 
+2.54.0 (Apple Git-157)
+

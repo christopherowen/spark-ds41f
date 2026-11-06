@@ -1,0 +1,28 @@
+From 8dea43f62a149a3aef2be4b24fa1c68e9b33407d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:01:55 +0000
+Subject: [PATCH] Keep warmup fixtures aligned with decode-width configuration
+
+Base: 6c86c2931724906ba45d5d8e47a5effd8b4c6e8a. The workload fixture now supplies the existing uniform_decode_query_len property consumed by shape preparation. Tests only; no output or quality change. CPU graph/warmup/context checks: 70 passed, 18 unrelated collective-name cases deselected because the isolated harness omits their global fixture. Upstream status: companion test update for the native-depth capture proposal.
+---
+ tests/model_executor/test_b12x_warmup.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
+index b432d5b80..7f8c83be3 100644
+--- a/tests/model_executor/test_b12x_warmup.py
++++ b/tests/model_executor/test_b12x_warmup.py
+@@ -771,7 +771,9 @@ def _config_worker(
+         runner.decode_query_len = decode_query_len
+     return SimpleNamespace(
+         vllm_config=SimpleNamespace(
+-            compilation_config=compilation, speculative_config=spec
++            compilation_config=compilation,
++            speculative_config=spec,
++            uniform_decode_query_len=1 + speculative_tokens,
+         ),
+         scheduler_config=SimpleNamespace(
+             max_num_batched_tokens=128, max_num_seqs=max_seqs
+-- 
+2.43.0
+

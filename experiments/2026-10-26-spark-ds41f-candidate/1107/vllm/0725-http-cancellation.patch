@@ -1,0 +1,471 @@
+From 385a31417f9d484dd130ccedd868bc7c88615734 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:49:13 +0000
+Subject: [PATCH] Release HTTP handler tasks before completing cancellation
+
+Own and join the handler and disconnect listener on every exit, including
+cancellation of the route itself. Preserve receive errors and shield async
+cleanup from surrounding AnyIO cancellation. Count tracked requests once,
+including cancellation while a completed response is being handed off.
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Rationale: abandoned handlers can retain prompts and overlap later work;
+disconnect/response races can also double-decrement the frontend load count.
+Quality: no model arithmetic, sampling, scheduler policy or response data changes.
+Tests: 15 CPU lifetime regressions and 12 real-HTTP boundary checks using the
+candidate-38 Python runtime; original source fails the lifetime regressions.
+Upstream status: proposed to the contribution fork; deployment evidence and
+source PR are linked in the HTTP cancellation experiment.
+---
+ .../serve/utils/test_api_cancellation.py      | 337 ++++++++++++++++++
+ vllm/entrypoints/serve/utils/api_utils.py     |  55 +--
+ 2 files changed, 372 insertions(+), 20 deletions(-)
+ create mode 100644 tests/entrypoints/serve/utils/test_api_cancellation.py
+
+diff --git a/tests/entrypoints/serve/utils/test_api_cancellation.py b/tests/entrypoints/serve/utils/test_api_cancellation.py
+new file mode 100644
+index 000000000..7c4fae99b
+--- /dev/null
++++ b/tests/entrypoints/serve/utils/test_api_cancellation.py
+@@ -0,0 +1,337 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import asyncio
++import functools
++from types import SimpleNamespace
++
++import anyio
++import pytest
++from fastapi.responses import JSONResponse, StreamingResponse
++from starlette.background import BackgroundTask, BackgroundTasks
++
++from vllm.entrypoints.serve.utils.api_utils import load_aware_call, with_cancellation
++
++
++class Request:
++    def __init__(self, state=None):
++        self.app = SimpleNamespace(
++            state=state
++            or SimpleNamespace(enable_server_load_tracking=True, server_load_metrics=0)
++        )
++        self.state = SimpleNamespace()
++        self.messages = asyncio.Queue()
++        self.listening = asyncio.Event()
++        self.listener_closed = asyncio.Event()
++
++    async def receive(self):
++        self.listening.set()
++        try:
++            return await self.messages.get()
++        finally:
++            # Cleanup may require an await (e.g. an engine abort).
++            await asyncio.sleep(0)
++            self.listener_closed.set()
++
++
++def route(func):
++    return with_cancellation(load_aware_call(func))
++
++
++def run_async(test):
++    """Run each case in its own loop, including a strict ownership check."""
++
++    @functools.wraps(test)
++    def wrapper(*args, **kwargs):
++        async def run():
++            before = asyncio.all_tasks()
++            try:
++                return await test(*args, **kwargs)
++            finally:
++                leaked = [
++                    task for task in asyncio.all_tasks() - before if not task.done()
++                ]
++                for task in leaked:
++                    task.cancel()
++                await asyncio.gather(*leaked, return_exceptions=True)
++                assert not leaked, [task.get_coro().__qualname__ for task in leaked]
++
++        return asyncio.run(run())
++
++    return wrapper
++
++
++@run_async
++@pytest.mark.parametrize("tracking", [False, True])
++async def test_outer_cancellation_waits_for_both_children(tracking):
++    request = Request()
++    request.app.state.enable_server_load_tracking = tracking
++    started, closed = asyncio.Event(), asyncio.Event()
++
++    @route
++    async def handle(_, raw_request):
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            await asyncio.sleep(0)
++            closed.set()
++
++    task = asyncio.create_task(handle(None, request))
++    await started.wait()
++    await request.listening.wait()
++    task.cancel("caller timeout")
++    with pytest.raises(asyncio.CancelledError, match="caller timeout"):
++        await task
++    assert closed.is_set()
++    assert request.listener_closed.is_set()
++    assert request.app.state.server_load_metrics == 0
++
++
++@run_async
++async def test_disconnect_waits_for_abort_before_returning():
++    request = Request()
++    started, abort_started, finish_abort, closed = (asyncio.Event() for _ in range(4))
++
++    @route
++    async def handle(_, raw_request):
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            abort_started.set()
++            await finish_abort.wait()
++            closed.set()
++
++    task = asyncio.create_task(handle(None, request))
++    await started.wait()
++    await request.messages.put({"type": "http.disconnect"})
++    await abort_started.wait()
++    assert not task.done()
++    finish_abort.set()
++    assert await task is None
++    assert closed.is_set()
++    assert request.app.state.server_load_metrics == 0
++
++
++@run_async
++async def test_cancellation_scope_allows_async_cleanup():
++    request = Request()
++    started, closed = asyncio.Event(), asyncio.Event()
++
++    @route
++    async def handle(_, raw_request):
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            await asyncio.sleep(0)
++            closed.set()
++
++    async with anyio.create_task_group() as group:
++        group.start_soon(handle, None, request)
++        await started.wait()
++        await request.listening.wait()
++        group.cancel_scope.cancel()
++    assert closed.is_set()
++    assert request.listener_closed.is_set()
++    assert request.app.state.server_load_metrics == 0
++
++
++@run_async
++async def test_listener_error_propagates_and_cleans_handler():
++    request = Request()
++    closed = asyncio.Event()
++
++    async def receive():
++        await asyncio.sleep(0)
++        raise OSError("receive failed")
++
++    request.receive = receive
++
++    @route
++    async def handle(_, raw_request):
++        try:
++            await asyncio.Event().wait()
++        finally:
++            await asyncio.sleep(0)
++            closed.set()
++
++    with pytest.raises(OSError, match="receive failed"):
++        await handle(None, request)
++    assert closed.is_set()
++    assert request.app.state.server_load_metrics == 0
++
++
++@run_async
++async def test_handler_error_preserved():
++    request = Request()
++    error = ValueError("invalid input")
++
++    @route
++    async def handle(_, raw_request):
++        await raw_request.listening.wait()
++        raise error
++
++    with pytest.raises(ValueError) as caught:
++        await handle(None, request)
++    assert caught.value is error
++    assert request.listener_closed.is_set()
++    assert request.app.state.server_load_metrics == 0
++
++
++@run_async
++async def test_cancelled_handler_cleanup_error_is_retrieved():
++    request = Request()
++    started = asyncio.Event()
++    errors = []
++    loop = asyncio.get_running_loop()
++    previous = loop.get_exception_handler()
++    loop.set_exception_handler(lambda _, context: errors.append(context))
++
++    @route
++    async def handle(_, raw_request):
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            await asyncio.sleep(0)
++            raise RuntimeError("abort failed")
++
++    try:
++        task = asyncio.create_task(handle(None, request))
++        await started.wait()
++        await request.messages.put({"type": "http.disconnect"})
++        assert await task is None
++        assert not errors
++        assert request.app.state.server_load_metrics == 0
++    finally:
++        loop.set_exception_handler(previous)
++
++
++@run_async
++@pytest.mark.parametrize("background", ["none", "single", "multiple"])
++@pytest.mark.parametrize("stream", [False, True])
++async def test_response_handoff_keeps_background_and_bytes(background, stream):
++    request = Request()
++    calls = []
++
++    async def record():
++        calls.append("existing")
++
++    bg = {
++        "none": None,
++        "single": BackgroundTask(record),
++        "multiple": BackgroundTasks([BackgroundTask(record)]),
++    }[background]
++
++    async def chunks():
++        yield 'data: {"text":"hello"}\n\n'
++        yield "data: [DONE]\n\n"
++
++    response = (
++        StreamingResponse(chunks(), background=bg)
++        if stream
++        else JSONResponse({"text": "hello"}, background=bg)
++    )
++
++    @route
++    async def handle(_, raw_request):
++        await raw_request.listening.wait()
++        # Both child tasks complete in the same event-loop turn.
++        await raw_request.messages.put({"type": "http.disconnect"})
++        return response
++
++    assert await handle(None, request) is response
++    assert request.listener_closed.is_set()
++    assert request.app.state.server_load_metrics == 1
++    if stream:
++        assert [chunk async for chunk in response.body_iterator] == [
++            'data: {"text":"hello"}\n\n',
++            "data: [DONE]\n\n",
++        ]
++    else:
++        assert response.body == b'{"text":"hello"}'
++    await response.background()
++    assert request.app.state.server_load_metrics == 0
++    assert calls == ([] if background == "none" else ["existing"])
++
++
++@run_async
++async def test_four_long_requests_short_traffic_and_immediate_retry():
++    state = SimpleNamespace(enable_server_load_tracking=True, server_load_metrics=0)
++    active = set()
++    starts = {i: asyncio.Event() for i in range(4)}
++    requests = [Request(state) for _ in range(4)]
++    # No token work is performed: these payloads exercise frontend ownership.
++    payload = [[7] * (1048576 - 1024) for _ in range(4)]
++    retained = {}
++
++    @route
++    async def handle(data, raw_request):
++        key, prompt, block = data
++        assert key not in active, "retry overlapped abandoned work"
++        active.add(key)
++        retained[key] = prompt
++        try:
++            if block:
++                starts[key].set()
++                await asyncio.Event().wait()
++            return JSONResponse({"id": key, "tokens": len(prompt)})
++        finally:
++            await asyncio.sleep(0)
++            active.remove(key)
++            del retained[key]
++
++    tasks = [
++        asyncio.create_task(handle((i, payload[i], True), r))
++        for i, r in enumerate(requests)
++    ]
++    await asyncio.gather(*(event.wait() for event in starts.values()))
++    assert state.server_load_metrics == 4
++    for i in range(16):
++        response = await handle((100 + i, [1, 2], False), Request(state))
++        assert response.status_code == 200
++        await response.background()
++    assert active == set(range(4))
++    tasks[0].cancel()
++    tasks[1].cancel()
++    for i in (2, 3):
++        await requests[i].messages.put({"type": "http.disconnect"})
++    results = await asyncio.gather(*tasks, return_exceptions=True)
++    assert all(isinstance(x, asyncio.CancelledError) for x in results[:2])
++    assert results[2:] == [None, None]
++    assert not active and not retained
++    assert state.server_load_metrics == 0
++    for i in range(4):
++        response = await handle((i, [7], False), Request(state))
++        await response.background()
++    assert not active and not retained
++    assert state.server_load_metrics == 0
++
++
++@run_async
++async def test_cancel_during_response_handoff_releases_load():
++    request = Request()
++    cleanup_started = asyncio.Event()
++
++    async def receive():
++        request.listening.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            cleanup_started.set()
++            await asyncio.Event().wait()
++
++    request.receive = receive
++
++    @route
++    async def handle(_, raw_request):
++        await raw_request.listening.wait()
++        return JSONResponse({"ok": True})
++
++    task = asyncio.create_task(handle(None, request))
++    await cleanup_started.wait()
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++    assert request.app.state.server_load_metrics == 0
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index aa089cff4..90aa7398b 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -10,6 +10,7 @@ from logging import Logger
+ from string import Template
+ from typing import Any
+ 
++import anyio
+ from fastapi import Request
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse, StreamingResponse
+@@ -38,13 +39,6 @@ async def listen_for_disconnect(request: Request) -> None:
+     while True:
+         message = await request.receive()
+         if message["type"] == "http.disconnect":
+-            # If load tracking is enabled *and* the counter exists, decrement
+-            # it. Combines the previous nested checks into a single condition
+-            # to satisfy the linter rule.
+-            if getattr(
+-                request.app.state, "enable_server_load_tracking", False
+-            ) and hasattr(request.app.state, "server_load_metrics"):
+-                request.app.state.server_load_metrics -= 1
+             break
+ 
+ 
+@@ -80,21 +74,39 @@ def with_cancellation(handler_func):
+         handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+         cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+ 
+-        done, pending = await asyncio.wait(
+-            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
+-        )
+-        for task in pending:
+-            task.cancel()
+-
+-        if handler_task in done:
+-            return handler_task.result()
+-        return None
++        tasks = (handler_task, cancellation_task)
++        try:
++            try:
++                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
++                if handler_task in done:
++                    return handler_task.result()
++                # A broken receive channel is an error, not a client disconnect.
++                cancellation_task.result()
++                return None
++            finally:
++                # The route owns both children until it hands off the response.
++                # Cancelling without joining lets an abort overlap the caller's retry;
++                # cancellation of the route itself must also release both children.
++                for task in tasks:
++                    if not task.done():
++                        task.cancel()
++                # Starlette middleware may cancel an AnyIO scope. Keep asynchronous
++                # cleanup alive inside that scope, and retrieve both task outcomes.
++                with anyio.CancelScope(shield=True):
++                    await asyncio.gather(*tasks, return_exceptions=True)
++        except BaseException:
++            # A response produced by the handler may be abandoned while we
++            # join the listener. No response background task will release it.
++            decrement_server_load(request)
++            raise
+ 
+     return wrapper
+ 
+ 
+ def decrement_server_load(request: Request):
+-    request.app.state.server_load_metrics -= 1
++    if getattr(request.state, "_server_load_counted", False):
++        request.state._server_load_counted = False
++        request.app.state.server_load_metrics -= 1
+ 
+ 
+ def load_aware_call(func):
+@@ -115,10 +127,13 @@ def load_aware_call(func):
+             raw_request.app.state.server_load_metrics = 0
+ 
+         raw_request.app.state.server_load_metrics += 1
++        raw_request.state._server_load_counted = True
+         try:
+             response = await func(*args, **kwargs)
+-        except Exception:
+-            raw_request.app.state.server_load_metrics -= 1
++        except BaseException:
++            # This call owns the count until a response takes it over.
++            # In particular, CancelledError is not an Exception.
++            decrement_server_load(raw_request)
+             raise
+ 
+         if isinstance(response, (JSONResponse, StreamingResponse)):
+@@ -138,7 +153,7 @@ def load_aware_call(func):
+                 tasks.add_task(decrement_server_load, raw_request)
+                 response.background = tasks
+         else:
+-            raw_request.app.state.server_load_metrics -= 1
++            decrement_server_load(raw_request)
+ 
+         return response
+ 
+-- 
+2.43.0
+

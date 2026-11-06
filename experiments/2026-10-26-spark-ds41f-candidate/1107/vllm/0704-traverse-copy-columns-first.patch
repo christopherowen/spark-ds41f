@@ -1,0 +1,54 @@
+From 226325d63ae55a0b95f3ee3b05c74d3f449a337e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 12:46:00 +0100
+Subject: [PATCH] Traverse vectorized logits copies in column order
+
+Upstream base: b869ea59effaa401709d558fd8aca6695946cc05. Rationale: row-first block scheduling scatters adjacent blocks across padded rows and left a measured 1.6 percent FP32 slowdown. Keep scalar traversal above the CUDA grid-y limit. Quality: unchanged payloads, allocation and cast semantics. Tests: partial-block cases and both sides of the grid-y boundary; two GPU boots pending. Upstream status: local experiment, not submitted.
+---
+ tests/kernels/test_deepseek_v41_copy_logits.py | 7 +++++++
+ vllm/v1/worker/gpu/sample/tilelang_sampling.py | 7 ++++++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_copy_logits.py b/tests/kernels/test_deepseek_v41_copy_logits.py
+index 16a2ba21d8..fcb7d1f44d 100644
+--- a/tests/kernels/test_deepseek_v41_copy_logits.py
++++ b/tests/kernels/test_deepseek_v41_copy_logits.py
+@@ -86,3 +86,10 @@ def test_vector_copy_handles_partial_blocks_and_padded_rows(dtype, cols):
+     torch.testing.assert_close(got, src.float(), rtol=0, atol=0)
+     assert got.is_contiguous() and got.data_ptr() != src.data_ptr()
+     assert torch.equal(src, before)
++
++
++@pytest.mark.parametrize("rows", [65535, 65536])
++def test_padded_copy_crosses_grid_y_limit(rows):
++    src = torch.randn((rows, 16), dtype=torch.float32, device="cuda")[:, :4]
++    got = kernels.copy_logits(src)
++    torch.testing.assert_close(got, src, rtol=0, atol=0)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 85a6411035..11fa37b98c 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3449,7 +3449,11 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False):
+         src: T.StridedTensor((rows, cols), source_strides, dtype),
+         dst: T.Tensor((rows, cols), T.float32),
+     ):
+-        with T.Kernel(rows, T.ceildiv(cols, 1024), threads=256) as (row, block):
++        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
++        grid_y = rows if vectorized else T.ceildiv(cols, 1024)
++        with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
++            row = by if vectorized else bx
++            block = bx if vectorized else by
+             tx = T.get_thread_binding()
+             if vectorized:
+                 T.assume(row_stride % 4 == 0)
+@@ -3488,6 +3492,7 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+     else:
+         vectorized = (
+             logits.stride(1) == 1
++            and logits.shape[0] <= 65535
+             and logits.shape[1] % 4 == 0
+             and _triton_run(logits) > 1
+         )
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,117 @@
+From bb5573c200131b963a1fca31d118de1a9c79e18c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 13:05:14 +0100
+Subject: [PATCH] Copy gather tails as aligned words across a flat grid
+
+Upstream base: 988fb40ac7de1ebbfe87c48a101ac1e1ab586545. Rationale: tiny tail gathers were not measurably better than ATen with a byte-per-thread, block-per-row copy. Use whole naturally aligned 1/2/4-byte payloads and flatten the grid. Preserve opaque bits, the packed 16-byte path and all rank ordering. Tests: existing tail matrix extended to byte tensors; two GPU boots pending. Upstream status: local experiment, not submitted.
+---
+ .../kernels/test_deepseek_v41_gather_into.py  |  2 +-
+ .../deepseek_v4_1/tilelang/collectives.py     | 54 +++++++++++--------
+ 2 files changed, 33 insertions(+), 23 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_gather_into.py b/tests/kernels/test_deepseek_v41_gather_into.py
+index 49a70709fc..ed40a8569c 100644
+--- a/tests/kernels/test_deepseek_v41_gather_into.py
++++ b/tests/kernels/test_deepseek_v41_gather_into.py
+@@ -93,7 +93,7 @@ def test_bad_layouts_fail_explicitly():
+ 
+ 
+ @pytest.mark.parametrize(
+-    "dtype", [torch.bfloat16, torch.float32, torch.int64, torch.complex64]
++    "dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.int64, torch.complex64]
+ )
+ @pytest.mark.parametrize("width", [1, 5, 17])
+ def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 594b4396fe..b06ea2c3bf 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -406,31 +406,46 @@ def rank_rows_kernel():
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def rank_rows_bytes_kernel():
+-    """The tail/unaligned all-gather layout conversion, as exact payload bytes."""
+-    source_bytes, output_bytes = T.dynamic("source_bytes, output_bytes")
++def rank_rows_bytes_kernel(unit: int = 1):
++    """Tail/unaligned rank rows as opaque 1-, 2- or 4-byte payloads."""
++    assert unit in (1, 2, 4)
++    dtype = {1: T.uint8, 2: T.uint16, 4: T.uint32}[unit]
++    source_units, output_units = T.dynamic("source_units, output_units")
+ 
+     @T.prim_func
+     def collectives_rank_rows_bytes(
+-        src: T.Tensor((source_bytes,), T.uint8),
+-        dst: T.Tensor((output_bytes,), T.uint8),
++        src: T.Tensor((source_units,), dtype),
++        dst: T.Tensor((output_units,), dtype),
+         world: T.int32,
+         rows: T.int32,
+-        row_bytes: T.int32,
++        row_units: T.int32,
+     ):
+-        with T.Kernel(rows, T.ceildiv(world * row_bytes, 256), threads=256) as (
+-            row,
+-            block,
+-        ):
+-            col = block * 256 + T.get_thread_binding()
+-            if col < world * row_bytes:
+-                dst[row * (world * row_bytes) + col] = src[
+-                    ((col // row_bytes) * rows + row) * row_bytes + col % row_bytes
++        with T.Kernel(T.ceildiv(output_units, 256), threads=256) as block:
++            index = block * 256 + T.get_thread_binding()
++            if index < output_units:
++                row = index // (world * row_units)
++                col = index % (world * row_units)
++                dst[index] = src[
++                    ((col // row_units) * rows + row) * row_units + col % row_units
+                 ]
+ 
+     return collectives_rank_rows_bytes
+ 
+ 
++def _rank_rows_tail(gathered, out, world, rows, row_bytes):
++    unit = next(
++        n for n in (4, 2, 1) if row_bytes % n == 0 and gathered.data_ptr() % n == 0
++    )
++    dtype = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[unit]
++    rank_rows_bytes_kernel(unit)(
++        gathered.view(-1).view(dtype),
++        out.view(-1).view(dtype),
++        world,
++        rows,
++        row_bytes // unit,
++    )
++
++
+ def rank_rows_calls() -> list[prepare.TileLangCall]:
+     """The rank-major-to-concatenated launch of the TP group's last-dimension
+     all-gathers that NCCL carries (``concat_rank_shards``)."""
+@@ -439,7 +454,8 @@ def rank_rows_calls() -> list[prepare.TileLangCall]:
+     return (
+         []
+         if get_tp_group().world_size < 2
+-        else [prepare.call(rank_rows_kernel), prepare.call(rank_rows_bytes_kernel)]
++        else [prepare.call(rank_rows_kernel)]
++        + [prepare.call(rank_rows_bytes_kernel, unit) for unit in (1, 2, 4)]
+     )
+ 
+ 
+@@ -473,13 +489,7 @@ def concat_rank_shards(
+                 row_bytes // 16,
+             )
+         else:
+-            rank_rows_bytes_kernel()(
+-                gathered.view(-1).view(torch.uint8),
+-                out.view(-1).view(torch.uint8),
+-                world,
+-                rows,
+-                row_bytes,
+-            )
++            _rank_rows_tail(gathered, out, world, rows, row_bytes)
+     return out
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,171 @@
+From d9f9a0076af0dfcd64f675eac006547d73b29483 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 18:53:01 +0100
+Subject: [PATCH] Retire native-id inputs before score and selection reductions
+
+Upstream-base: native-input source da925efbc8, after candidate-38 and selected-logit source c88a692e98.
+
+Rationale: native id pointers and dynamic strides otherwise stay live across register-heavy reductions. Gather selected values into the existing score output before normalization for noncompact ids, and write native sampled top-k columns before selection. Compact int64 inputs retain the original kernel form, selected without a copy. Compact int64 score arithmetic remains unchanged.
+
+Quality: no extra allocation, dtype/layout materialization, precision change or change to score ordering and ranks. Each selected value is stored as the same FP32 value that the final arithmetic consumed before.
+
+Tests: full numerical/native-layout/graph/prompt/speculative checks and controlled interleaved performance qualification required. This change is not performance-qualified yet.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ tests/v1/worker/test_gpu_tilelang_topk_ids.py |  3 +-
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 16 +++++++++-
+ .../v1/worker/gpu/sample/tilelang_topk_ids.py | 32 +++++++++++++++----
+ 3 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_topk_ids.py b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+index 27c94c3c2a..826918efbc 100644
+--- a/tests/v1/worker/test_gpu_tilelang_topk_ids.py
++++ b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+@@ -570,7 +570,7 @@ def test_runner_declares_the_launched_calls():
+     assert declared == {
+         (
+             id(tki.topk_ids_kernel),
+-            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype),
++            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for ids_dtype in (torch.int64, torch.int32)
+@@ -578,6 +578,7 @@ def test_runner_declares_the_launched_calls():
+         for sampled_dtype in (
+             (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
+         )
++        for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
+     }
+     prepare.prepare_declared(registry)
+     for dtype in (torch.bfloat16, torch.float32):
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 875e6ba746..93eb5a2722 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -210,6 +210,7 @@ def topk_log_softmax_kernel(
+     logits_stride = T.dynamic("logits_stride", "int64")
+     id_row, id_col = T.dynamic("id_row, id_col", "int64")
+     id_strides = (topk, 1) if compact_ids else (id_row, id_col)
++    gather_first = not compact_ids
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+     threads = _SOFTMAX_THREADS
+     loads = _SOFTMAX_LOADS
+@@ -285,6 +286,16 @@ def topk_log_softmax_kernel(
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
++            if gather_first:
++                # Retire native-id pointers and strides before the row reduction.
++                # The output is also the selected-value scratch; no extra buffer.
++                row64 = T.cast(row, T.int64)
++                for c in T.serial(T.ceildiv(topk, threads)):
++                    col = c * threads + tx
++                    if col < topk:
++                        output[row64, col] = T.cast(
++                            logits[row, token_ids[row64, col]], T.float32
++                        )
+             raw = T.alloc_local((per,), logits_dtype)
+             peak = T.alloc_local((loads,), T.float32)
+             total = T.alloc_local((loads,), T.float32)
+@@ -353,7 +364,10 @@ def topk_log_softmax_kernel(
+             for c in T.serial(T.ceildiv(topk, threads)):
+                 col = c * threads + tx
+                 if col < topk:
+-                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
++                    if gather_first:
++                        picked = output[row64, col]
++                    else:
++                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                     value = T.call_extern(
+                         "float32",
+                         "vllm_sub",
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+index 0bc898495c..3c9e1304b0 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+@@ -215,7 +215,11 @@ __device__ __forceinline__ int vllm_tki_order(unsigned long long entry, int k) {
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def topk_ids_kernel(
+-    logits_dtype: str, ids_dtype: str, run: int, sampled_dtype: str = "int64"
++    logits_dtype: str,
++    ids_dtype: str,
++    run: int,
++    sampled_dtype: str = "int64",
++    compact_sampled: bool = True,
+ ):
+     """A block a row: its ``k = width - first`` top columns in ``torch.topk``'s order,
+     at ``out[row, first:]``. int64 ids take the sampled token at column 0 (``first``
+@@ -224,7 +228,7 @@ def topk_ids_kernel(
+     alignment, or one element)."""
+     rows, vocab, width = T.dynamic("rows, vocab, width")
+     logits_stride = T.dynamic("logits_stride", "int64")
+-    sampled_stride = T.dynamic("sampled_stride", "int64")
++    sampled_stride = 1 if compact_sampled else T.dynamic("sampled_stride", "int64")
+     with_sampled = ids_dtype == "int64"
+     first = 1 if with_sampled else 0
+     vectors = _PER // run
+@@ -373,9 +377,13 @@ def topk_ids_kernel(
+                 tx = T.get_thread_binding()
+                 lists = T.alloc_shared((_WARPS, 32), T.uint64)
+                 chosen = T.alloc_shared((32,), T.uint64)
++                if sampled_dtype != "int64" or not compact_sampled:
++                    if tx == 0:
++                        out[row, 0] = sampled[row]
+                 select(logits, out, row, tx, lists, chosen)
+-                if tx == 0:
+-                    out[row, 0] = sampled[row]
++                if sampled_dtype == "int64" and compact_sampled:
++                    if tx == 0:
++                        out[row, 0] = sampled[row]
+ 
+         return topk_ids
+ 
+@@ -399,8 +407,15 @@ def topk_ids_key(
+     ids_dtype: torch.dtype,
+     run: int,
+     sampled_dtype: torch.dtype = torch.int64,
++    compact_sampled: bool = True,
+ ) -> tuple:
+-    return (_DTYPES[logits_dtype], _DTYPES[ids_dtype], run, _DTYPES[sampled_dtype])
++    return (
++        _DTYPES[logits_dtype],
++        _DTYPES[ids_dtype],
++        run,
++        _DTYPES[sampled_dtype],
++        compact_sampled,
++    )
+ 
+ 
+ # The ids each path writes: the fast path's int64 rows with the sampled token, the
+@@ -412,13 +427,17 @@ def topk_ids_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     """The calls for logits of each of ``logits_dtypes``: both ids layouts, in both
+     load layouts a launch may take (``_runs``)."""
+     return [
+-        _call(topk_ids_kernel, *topk_ids_key(dtype, ids_dtype, run, sampled_dtype))
++        _call(
++            topk_ids_kernel,
++            *topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
++        )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for ids_dtype in _IDS_DTYPES
+         for run in _runs(dtype)
+         for sampled_dtype in (
+             (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
+         )
++        for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
+     ]
+ 
+ 
+@@ -452,6 +471,7 @@ def _launch(
+             out.dtype,
+             _triton_run(logits),
+             torch.int64 if sampled is None else sampled.dtype,
++            sampled is None or sampled.is_contiguous(),
+         ),
+     )
+     if sampled is None:
+-- 
+2.54.0 (Apple Git-157)
+

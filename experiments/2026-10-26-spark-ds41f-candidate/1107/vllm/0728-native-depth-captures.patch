@@ -1,0 +1,223 @@
+From 6c86c2931724906ba45d5d8e47a5effd8b4c6e8a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:54:52 +0000
+Subject: [PATCH] Retain native full-depth graphs with wider copy verification
+
+Copy verification raises a request's maximum width from six to seventeen
+rows. Keep the ordinary full-depth shapes alongside the wider copy shapes,
+and use the same shape set for target capture, context capture, and weight
+warmup. For example, six native full-depth requests keep 36 rows instead of
+padding the target and context to 40.
+
+Base: candidate-40 patch head 5f926df6d3126266a9c88c82c06544060008c33c,
+tree ca1496c6481dc5bc4b4234b743e4ca023a6c7597, on upstream
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Quality: changes capture selection only, with unchanged live arithmetic,
+verification policy, and maximum capture rows. GPU batch invariance and
+capture memory still require qualification before adoption.
+Tests: all 28 graph-manager tests pass in the candidate-38 dependency image
+with the complete candidate-40 Python delta and this patch, on CPU only.
+Offline dispatch enumeration covers 2,560 shapes at widths 6/17 and request
+capacities 8/16. Non-copy graph counts are unchanged.
+Upstream status: prepared for review against the pinned candidate source;
+not submitted to the canonical upstream and not promoted.
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 10 +++-
+ tests/v1/cudagraph/test_cudagraph_manager.py  | 49 +++++++++++++++++++
+ vllm/model_executor/warmup/b12x_prepare.py    |  5 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  5 +-
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 22 +++++++--
+ 5 files changed, 82 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 16fd00509..41d1982e8 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -397,6 +397,7 @@ def _decode_config(max_num_seqs, capture_sizes, drafts=5, verification=5):
+     vllm_config.parallel_config = ParallelConfig()
+     vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=False)
+     vllm_config.num_speculative_tokens = drafts
++    vllm_config.uniform_decode_query_len = 1 + drafts
+     vllm_config.num_verification_tokens = verification
+     speculative_config = MagicMock()
+     speculative_config.uses_acceptance_length_adaptation.return_value = False
+@@ -462,8 +463,8 @@ def _context_graphs(vllm_config, limit):
+ 
+ @pytest.mark.parametrize(
+     "max_num_seqs,rows,verification",
+-    [(8, 48, 5), (16, 96, 5), (8, 48, 8)],
+-    ids=["tp3-triangle", "tp4-ring", "copy-drafts"],
++    [(8, 48, 5), (16, 96, 5), (8, 48, 8), (8, 59, 16), (16, 107, 16)],
++    ids=["tp3-triangle", "tp4-ring", "copy-drafts", "copy-tp3", "copy-tp4"],
+ )
+ def test_context_capture_sizes_are_the_target_decode_graph_sizes(
+     monkeypatch, max_num_seqs, rows, verification
+@@ -486,6 +487,11 @@ def test_context_capture_sizes_are_the_target_decode_graph_sizes(
+         sizes = _context_capture_sizes(vllm_config, limit)
+         assert sizes == sorted({n for n in target_sizes if n <= limit} | {limit})
+     assert _context_capture_sizes(vllm_config, 0) == []
++    assert all(
++        n * 6 in _context_capture_sizes(vllm_config, rows)
++        for n in range(1, max_num_seqs + 1)
++        if n * 6 <= rows
++    )
+     if (max_num_seqs, verification) == (8, 5):
+         # TP3: 23 graphs, every one- and two-request total and every full-depth
+         # step exact, where powers of two captured 7.
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index 1b3882728..28d685b38 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -390,6 +390,7 @@ def _create_decode_vllm_config(
+     vllm_config.parallel_config = ParallelConfig()
+     vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=use_kda_recoverssm)
+     vllm_config.num_speculative_tokens = num_speculative_tokens
++    vllm_config.uniform_decode_query_len = 1 + num_speculative_tokens
+     if dynamic_spec_schedule is None and num_speculative_tokens == 0:
+         vllm_config.speculative_config = None
+     else:
+@@ -601,6 +602,54 @@ def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch
+         assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+ 
+ 
++@pytest.mark.parametrize("max_num_seqs", [8, 16])
++def test_copy_verification_keeps_native_full_depth_captures(monkeypatch, max_num_seqs):
++    """Copy lookahead must not replace the ordinary six-row DSpark shapes."""
++    cap = max_num_seqs * 6 + 11
++    sizes = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, cap, 8), cap]
++    manager = _make_spec_decode_manager(
++        monkeypatch,
++        decode_query_len=17,
++        capture_sizes=sizes,
++        num_speculative_tokens=5,
++        max_num_seqs=max_num_seqs,
++        varlen_decode=True,
++    )
++    for reqs in range(1, max_num_seqs + 1):
++        for width in (6, 17):
++            rows = reqs * width
++            if rows > cap:
++                continue
++            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=width)
++            assert desc.cg_mode == CUDAGraphMode.FULL
++            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
++    for reqs in (1, 2):
++        for rows in range(reqs, reqs * 17 + 1):
++            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=17)
++            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
++    # Queries outside the verification limit still use the mixed path.
++    mixed = manager.dispatch(3, 36, None, 0, max_query_len=18)
++    assert mixed.cg_mode == CUDAGraphMode.PIECEWISE
++    assert all(d.num_tokens <= cap for d in manager._capture_descs[CUDAGraphMode.FULL])
++
++    from vllm.model_executor.warmup.b12x_prepare import b12x_workload
++
++    config = manager.vllm_config
++    config.speculative_config.num_speculative_tokens = 5
++    config.speculative_config.enable_adaptive_verification = True
++    worker = SimpleNamespace(
++        vllm_config=config,
++        scheduler_config=config.scheduler_config,
++        model_config=SimpleNamespace(dtype=torch.bfloat16, max_model_len=1048576),
++        model_runner=SimpleNamespace(decode_query_len=17, cudagraph_manager=None),
++    )
++    weights = b12x_workload(worker, stage="weights")
++    worker.model_runner.cudagraph_manager = manager
++    state = b12x_workload(worker, stage="state")
++    assert set(manager.planned_token_counts()) <= set(weights.fixed_token_counts)
++    assert weights.fixed_token_counts == state.fixed_token_counts
++
++
+ @pytest.mark.parametrize(
+     ("num_reqs", "num_tokens", "expected_shape"),
+     [
+diff --git a/vllm/model_executor/warmup/b12x_prepare.py b/vllm/model_executor/warmup/b12x_prepare.py
+index 3cf49bd87..60a7f97b2 100644
+--- a/vllm/model_executor/warmup/b12x_prepare.py
++++ b/vllm/model_executor/warmup/b12x_prepare.py
+@@ -110,7 +110,10 @@ def _planned_decode_counts(
+                 {
+                     tokens
+                     for _, tokens in dense_varlen_decode_shapes(
+-                        max_reqs, query_len, limit
++                        max_reqs,
++                        query_len,
++                        limit,
++                        worker.vllm_config.uniform_decode_query_len,
+                     )
+                 }
+             )
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 112cf63d3..c0afb7dac 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -100,7 +100,10 @@ def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
+     sizes.update(
+         num_tokens
+         for _, num_tokens in dense_varlen_decode_shapes(
+-            vllm_config.scheduler_config.max_num_seqs, decode_query_len, limit
++            vllm_config.scheduler_config.max_num_seqs,
++            decode_query_len,
++            limit,
++            vllm_config.uniform_decode_query_len,
+         )
+     )
+     sizes.update(
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 4eebaf7c7..e431baf00 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -60,14 +60,19 @@ _DENSE_VARLEN_DECODE_MAX_REQS = 2
+ 
+ 
+ def dense_varlen_decode_shapes(
+-    max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
++    max_num_reqs: int,
++    decode_query_len: int,
++    max_capture_tokens: int,
++    uniform_query_len: int | None = None,
+ ) -> tuple[tuple[int, int], ...]:
+     """Return request and token counts of exact variable-length decode graphs.
+ 
+     Covers every valid token total for low-concurrency batches (``1`` to
+     ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
+     adaptively trimmed totals) and the full-depth speculative batch for each
+-    higher request count up to ``max_num_reqs``.
++    higher request count up to ``max_num_reqs``. When copy drafts widen the
++    verification limit, retain full-depth batches at the drafter's ordinary
++    ``uniform_query_len`` too.
+     """
+     dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
+     dense = (
+@@ -76,10 +81,14 @@ def dense_varlen_decode_shapes(
+         for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
+         if num_tokens <= max_capture_tokens
+     )
++    widths = {decode_query_len}
++    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
++        widths.add(uniform_query_len)
+     uniform = (
+-        (num_reqs, num_reqs * decode_query_len)
++        (num_reqs, num_reqs * width)
+         for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
+-        if decode_query_len > 1 and num_reqs * decode_query_len <= max_capture_tokens
++        for width in sorted(widths)
++        if width > 1 and num_reqs * width <= max_capture_tokens
+     )
+     return (*dense, *uniform)
+ 
+@@ -519,7 +528,10 @@ class CudaGraphManager:
+             for num_active_loras, (dense_num_reqs, num_tokens) in product(
+                 self.lora_capture_cases,
+                 dense_varlen_decode_shapes(
+-                    self.max_num_reqs, self.decode_query_len, max_cg_capture_size
++                    self.max_num_reqs,
++                    self.decode_query_len,
++                    max_cg_capture_size,
++                    self.vllm_config.uniform_decode_query_len,
+                 ),
+             ):
+                 desc = BatchExecutionDescriptor(
+-- 
+2.43.0
+
