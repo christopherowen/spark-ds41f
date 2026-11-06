@@ -99,6 +99,13 @@ def build_matches(record, inspection, current, expected, changed):
             raise RuntimeError(f"source label differs: {key}")
 
 
+def sanitizer_passed(result: str) -> bool:
+    if "ERROR SUMMARY: 0 errors" not in result:
+        return False
+    lines = [line for line in result.splitlines() if "ERROR SUMMARY:" not in line]
+    return bool(lab.suite_verdict(lines)["passed"])
+
+
 def validated_screen(path, revision, image):
     record = json.loads(path.read_text())
     checks = {"gpu-smoke", "graph-replay", "memcheck", "initcheck"}
@@ -451,10 +458,7 @@ def main():
                         name,
                         600,
                     )
-                    if (
-                        "ERROR SUMMARY: 0 errors" not in result
-                        or not lab.suite_verdict(result.splitlines())["passed"]
-                    ):
+                    if not sanitizer_passed(result):
                         raise RuntimeError(
                             name + " lacks zero-error and exact-output evidence"
                         )

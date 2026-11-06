@@ -143,3 +143,13 @@ def test_boundary_grid_rejects_missing_full_model_path():
     wrong["grid"][0]["drafter_ms"] = []
     with pytest.raises(RuntimeError, match="samples"):
         boundary.validate_grid(wrong, shapes, 2, 3)
+
+
+def test_sanitizer_passed_accepts_trailing_zero_error_summary():
+    sample_log = """========= COMPUTE-SANITIZER
+108 passed, 14 warnings in 10.48s
+========= ERROR SUMMARY: 0 errors
+"""
+    assert g.sanitizer_passed(sample_log) is True
+    assert g.sanitizer_passed(sample_log.replace("0 errors", "1 errors")) is False
+    assert g.sanitizer_passed("========= ERROR SUMMARY: 0 errors\n") is False
