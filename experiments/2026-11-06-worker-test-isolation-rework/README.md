@@ -88,6 +88,20 @@ native assertion or resource limit. Original failed attempts remain in
 [final-control-verification.json](runs/preflight/final-control-verification.json).
 Software readiness grants no hardware reservation.
 
+The separate `stage_source.py` helper and ten offline staging controls passed
+bounded remote CPU verification at `b55924190e2372ff7c0c948cfd08ba3c04683b6c`.
+Actual wait exit0 was recorded at03:46:27UTC; parsing and whitespace checks also
+passed. The one-CPU/4GiB/no-swap job released its matching claim and both CPU
+locks. Small original logs and hashes are in
+[source-staging-controls-attempt-1](runs/preflight/source-staging-controls-attempt-1/).
+This helper stages source
+from a private published DGX1 controller, retains the normal named sync and
+site-map authority, and never restarts the already-matching C36 service. Its
+new checks are additional to the67 completed qualification controls above.
+Its native operation remains unexercised; preserve the actual publication,
+live/shape, ownership, map and clean-source checks and earlier queue order.
+No private controller checkout or staging lease exists yet.
+
 The control packet retains all138 native files and eight image/gate steps,
 40 ordered functional exits and26 ordered performance steps across the unchanged
 full `release-tp3`, `single-stream` and `sampled` families. No C46 image ID or
