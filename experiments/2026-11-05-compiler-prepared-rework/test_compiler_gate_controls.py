@@ -338,10 +338,12 @@ class GateControls(unittest.TestCase):
 
     def test_serving_cache_mapping_and_rank_collector(self):
         root = HERE.parents[1]
+        sys.path.insert(0, str(root))
+        from spark_ds41f import config
         for rel in ("experiments/2026-10-26-spark-ds41f-candidate/candidate-45/tp3-qualification.json",
                     "experiments/2026-10-26-spark-ds41f-candidate/candidate-45/tp3-qualification-dev.json"):
-            cluster = json.loads((root / rel).read_text())
-            mapping = c45_cache.mapped_namespace(cluster, lambda _cluster, src: "/home/swank/" + src.removeprefix("${HOME}/"))
+            cluster = config.read_cluster(rel)
+            mapping = c45_cache.mapped_namespace(cluster, config.host_path)
             self.assertEqual(mapping["host_root"], "/home/swank/.cache/vllm/tilelang")
             self.assertEqual(mapping["namespace"], c45_cache.NAMESPACE)
         management = mock.Mock()
