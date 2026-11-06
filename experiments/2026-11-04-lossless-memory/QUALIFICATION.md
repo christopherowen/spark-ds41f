@@ -313,3 +313,29 @@ the claimed benefit. A capacity gain is reported as capacity, not invented TPS.
   per-chunk synchronization; its costs are not the older experiment's numbers.
 - Every accepted variable needs owner acceptance and a new promotion commit
   updating configuration, documentation and immutable baseline evidence together.
+
+## Scoped DGX window and exact deployment recovery
+
+The existing DGX1–3 request stays behind the collective and budget reservations.
+Use the published scoped_window.py controller from its exact Git blob, staging
+that small script under the task's remote operator log directory. The opener
+requires the captured original commit, a clean published checkout, the exact
+three-node map, no applicable foreign hold, the native C36 live check and 30 idle
+seconds. It atomically publishes a complete DGX1–3-only hold and starts an
+independent 15-minute stale-heartbeat watchdog; it never exposes a broad hold
+which could exclude a disjoint Spaceport pool. The watchdog and normal close
+use native coordinated stop/sync/start plans and restore the captured deployment
+commit before C36. Unknown or failed restoration retains a review reservation.
+
+The exec mode keeps a heartbeat only while its explicit setup command runs.
+Use it for bounded remote source preparation and the four-worker image build.
+The serving controller takes over its own heartbeat and records its PID/source
+in the same scope. Pass --restore-revision with the captured original commit to
+run_component.py. Engram rejects an absent, foreign or overlapping scope and a
+mismatched restore identity. Every apply still names its profile, and no shape
+bypass is used. These controller changes do not change the row or model kernels.
+
+The declared functional requirements are unchanged: actual quality, prefix and
+admission verdicts, exact model comparisons and required deterministic digests
+are checked. A process exit is not substituted for those verdicts. This cohort
+does not add a universal seeded sampled-batch identity requirement.

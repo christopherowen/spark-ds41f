@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ sys.path.insert(0, str(ROOT))
 import spark_ds41f as spark
 from spark_ds41f import lab
 from servebench import suite
+
+_scope_spec = importlib.util.spec_from_file_location("lossless_scoped_window_runtime", HERE / "scoped_window.py")
+scoped_window = importlib.util.module_from_spec(_scope_spec)
+_scope_spec.loader.exec_module(scoped_window)
 
 HOLDER = "spark-lab: owner-authorized lossless memory qualification"
 STREAM_POLICY = "recorded-1030"
@@ -279,6 +284,7 @@ def main():
                        help="reuse completed native image gates before any serving measurement")
     reuse.add_argument("--reuse-kernel-from", type=Path,
                        help="reuse an image and passed component gate, then run a new full gate")
+    parser.add_argument("--restore-revision", help="captured published deployment commit to restore before C36 starts")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     arm = HERE / args.component
@@ -297,8 +303,12 @@ def main():
         return int(bool(problems))
     def owns():
         hold = lab.read_hold()
-        return bool(hold and hold.get("window") == args.window and hold.get("holder") == HOLDER
-                    and hold.get("production_config") == RESTORE)
+        valid = bool(hold and hold.get("window") == args.window and hold.get("holder") == HOLDER
+                     and hold.get("production_config") == RESTORE)
+        if valid and args.component == "engram":
+            valid = (scoped_window.owns(hold, args.window)
+                     and hold["resource_scope"]["restore"].get("commit") == args.restore_revision)
+        return valid
     if os.uname().nodename != "dgx1" or out.exists() or not owns():
         raise SystemExit("wrong host, prior receipts or foreign window; no operation")
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT).strip():
@@ -325,6 +335,9 @@ def main():
     if args.through == "release" and any((ROOT / prefix / release["run"]).exists()
                                         for prefix in ("results/private/suites", "results/private/determinism")):
         raise SystemExit("prior serving observations exist; no overwrite or repeated measurement")
+    if args.restore_revision and (len(args.restore_revision) != 40
+            or any(c not in "0123456789abcdef" for c in args.restore_revision)):
+        parser.error("restore revision must be the captured full commit")
     lab.PRODUCTION_CONFIG = RESTORE
     out.mkdir(parents=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -334,14 +347,38 @@ def main():
     if previous is not None:
         receipt["reused_gates_from" if args.reuse_gates_from else "reused_kernel_from"] = str(reuse_path)
         receipt["prior_receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if args.component == "engram":
+        hold = lab.read_hold()
+        hold["resource_scope"]["controller"] = {
+            "commit": commit, "path": str(Path(__file__).relative_to(ROOT)), "pid": os.getpid()}
+        lab.write_json_atomic(lab.HOLD, hold)
     done, management_lost = threading.Event(), False
     active_profile, active_label = None, None
     cluster, nodes, upstreams = spark.configuration(argparse.Namespace(cluster_config=config))
     def save():
         lab.write_json_atomic(out / "receipt.json", receipt)
+    def check_pool_holds():
+        if args.component != "engram":
+            return
+        rows, problems = scoped_window.node_hold_observations(spark, nodes, args.window)
+        receipt.setdefault("node_hold_checks", []).append({"utc": lab.now(), "observations": rows,
+                                                         "problems": problems})
+        save()
+        if problems:
+            if owns():
+                hold = lab.read_hold()
+                done.set()
+                thread.join(timeout=5)
+                hold.update(holder="lossless-memory-ownership-review",
+                            rule="foreign or unreadable participating-node hold; preserve scopes and review")
+                if isinstance(hold.get("resource_scope"), dict):
+                    hold["resource_scope"]["holder"] = hold["holder"]
+                lab.write_json_atomic(lab.HOLD, hold)
+            raise RuntimeError("; ".join(problems))
     def guard():
         if not owns() or lab.window_should_close(lab.read_hold()):
             raise RuntimeError("window changed or closure requested; retain partial observations")
+        check_pool_holds()
     def heartbeat():
         while not done.wait(30):
             if owns():
@@ -629,20 +666,42 @@ def main():
                     save_logs("cleanup", strict=False)
                     if args.component == "engram":
                         save_io("cleanup", strict=False)
+                check_pool_holds()
                 unreachable = [n["name"] for n in nodes["nodes"] if spark.run_ssh(nodes, n, "true").returncode]
                 if management_lost or unreachable:
                     hold = lab.read_hold()
+                    done.set()
+                    thread.join(timeout=5)
                     hold.update(holder="lossless-memory-hardware-review",
                                 rule="management unavailable; no launch until isolated and explicitly authorized")
+                    if isinstance(hold.get("resource_scope"), dict):
+                        hold["resource_scope"]["holder"] = hold["holder"]
                     lab.write_json_atomic(lab.HOLD, hold)
                     receipt["management_unreachable"] = unreachable
                     receipt["management_loss_latched"] = management_lost
                     raise RuntimeError("management loss; reservation kept without a restoration launch")
                 if not owns():
                     raise RuntimeError("window changed during cleanup; no restoration launch")
+                if args.restore_revision:
+                    # Stop with the candidate profile before its source may disappear.
+                    stop = plan(active_profile or RESTORE, ["stop", "--parallel"])
+                    with (out / "restore-stop.log").open("x") as log:
+                        stopped = subprocess.run([*stop, "--apply"], cwd=ROOT,
+                                                 stdout=log, stderr=subprocess.STDOUT)
+                    if stopped.returncode or not owns():
+                        raise RuntimeError("coordinated stop failed before deployment restoration")
+                    sync = plan(RESTORE, ["sync", "--revision", args.restore_revision])
+                    with (out / "restore-deployment.log").open("x") as log:
+                        restored_source = subprocess.run([*sync, "--apply"], cwd=ROOT,
+                                                         stdout=log, stderr=subprocess.STDOUT)
+                    if restored_source.returncode or not owns():
+                        raise RuntimeError("exact deployment restoration failed")
+                    receipt["restored_deployment_revision"] = args.restore_revision
                 plan(RESTORE, ["start", "--replace"])
                 if owns():
                     receipt["restored"] = lab.window_close("lossless component measurement finished or deferred")
+                    if not receipt["restored"]:
+                        raise RuntimeError("native restoration verdict is false; preserve reservation for review")
             elif lab.read_hold() is None:
                 receipt["restored"] = lab.production_live()
             else:
@@ -651,8 +710,12 @@ def main():
             receipt["restore_error"] = f"{type(error).__name__}: {error}"
             if owns():
                 hold = lab.read_hold()
+                done.set()
+                thread.join(timeout=5)
                 hold.update(holder="lossless-memory-restoration-review",
                             rule="restoration guard failed; retain reservation without another launch")
+                if isinstance(hold.get("resource_scope"), dict):
+                    hold["resource_scope"]["holder"] = hold["holder"]
                 lab.write_json_atomic(lab.HOLD, hold)
         done.set()
         thread.join(timeout=5)
