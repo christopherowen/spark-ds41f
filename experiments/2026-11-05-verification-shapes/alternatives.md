@@ -95,3 +95,21 @@ job and the norm-kernel request is ahead of this task; authorization does not
 override that queue. A finite search cannot prove a global
 optimum; the current evidence also does not yet prove the strongest feasible
 hardware implementation.
+
+
+## Final Policy Decision (2026-11-06)
+
+The exact native-depth + wider-copy capture policy (`0001-native-depth-captures.patch`
+and `0002-warmup-width-fixture.patch`, paired with `0003-bound-mxfp8-live-rows.patch`)
+is selected as the single canonical policy, and runtime `--variant` optionality
+is removed from `gpu_gate.py`:
+
+- Restores 100% native full-depth graph coverage for `num_reqs = 3, 5, 6, 7`
+  (`18, 30, 36, 42` rows) with only 2 additional target/context captures (50 vs
+  48 total captures, compared to 65 in `shape-union`).
+- Preserves exact `(num_tokens, num_reqs)` specialization (unlike `row-ladder`).
+- Passes all 2-boot GPU gates (`gpu-smoke`, `graph-replay` 108/108, `memcheck`
+  108/108 0 errors, and `initcheck` 108/108 0 errors) and delivers up to
+  `25.90%` `Sparse-MLA` decode speedup (`49.71 us` vs `67.09 us` at `42 vs 48`
+  rows; `45.10 us` vs `46.75 us` at `36 vs 40` rows; `29.09 us` vs `29.93 us`
+  at `18 vs 20` rows).

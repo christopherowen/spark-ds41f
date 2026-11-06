@@ -148,19 +148,11 @@ def main():
     parser.add_argument("--built-inspection", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument(
-        "--variant",
-        choices=("exact-native", "row-ladder", "shape-union"),
-        default="exact-native",
-    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--screen-only", action="store_true")
     modes.add_argument("--screen-receipt", type=Path)
     args = parser.parse_args()
-    directory = (
-        EXP if args.variant == "exact-native" else EXP / "variants" / args.variant
-    )
-    profile = str((directory / "tp3.json").relative_to(ROOT))
+    profile = str((EXP / "tp3.json").relative_to(ROOT))
     configured = config.read_cluster(profile)
     upstreams = json.loads((ROOT / configured["upstreams_config"]).read_text())
     expected_head = upstreams["sources"]["vllm"]["patch_head"]

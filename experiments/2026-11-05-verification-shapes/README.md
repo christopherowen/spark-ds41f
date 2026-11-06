@@ -270,3 +270,52 @@ replay benchmark on `dgx4` under the `dgx4-single` node-scoped hold
     - `num_reqs=7` (`42` vs `48` rows): `context_inputs` `4.10 / 4.11 us` vs
       `4.11 / 4.12 us`; `mxfp8_decode` `4.09 / 4.09 us` vs `4.10 / 4.10 us`;
       `mxfp8_splitk` `4.10 / 4.10 us` vs `4.09 / 4.09 us`.
+
+
+### Paired live-row MXFP8 bound + 2-boot 0-error `initcheck` and `Sparse-MLA` speedup (2026-11-06)
+
+Paired the native-depth verification shape fix with `0003-bound-mxfp8-live-rows.patch`
+(`2541c9a1372f7f35589b0aafc343b00711999de9`, preserved under
+`runs/paired-mxfp8-live-rows/`) and re-ran the full 2-boot GPU screen and
+row-proportional `Sparse-MLA` (`vllm/models/deepseek_v4_1/tilelang/sparse_mla.py`)
+benchmark on `dgx4` (`runs/dgx4-gpu-screen-v2-2boot/`):
+
+1. **Unambiguous 2-boot GPU gate pass (`screen_passed: true`, `exit 0` on both boots)**:
+   - `gpu-smoke`: passed on Boot 1 & Boot 2 (`exit 0`).
+   - `graph-replay` (`test_graph_replay.py`): `108/108 passed` on Boot 1 & Boot 2 (`exit 0`).
+   - `memcheck` (`compute-sanitizer --tool memcheck`): `108/108 passed`,
+     `ERROR SUMMARY: 0 errors` (`exit 0`) on Boot 1 & Boot 2.
+   - `initcheck` (`compute-sanitizer --tool initcheck`): **`108/108 passed` in
+     `9.88s` (Boot 1) and `9.93s` (Boot 2) with `ERROR SUMMARY: 0 errors` (`exit 0`)**
+     on both boots.
+2. **2-boot `Sparse-MLA` (`decode` & `extend`) verification-shape speedup (`heads=24`, TP3 per-rank)**:
+   - In `Sparse-MLA` (`SparseMlaV41Plan`), each token row launches its own CTAs
+     (`1` CTA/row in `extend`; `5` segment CTAs/row + merge in `decode` for
+     `swa_width=128, idx_width=512`), whereas `mxfp8_decode` tiles in `M = 16/32/64`.
+   - Across all four affected verification request counts (`num_reqs = 3, 5, 6, 7`),
+     live-row outputs are bit-identical between native and wider padded shapes
+     and between `extend` and `decode` schedules (`exact_match: true`).
+   - Measured `Sparse-MLA` `decode` median CUDA graph replay latency (`us`, Boot 1 / Boot 2):
+     - **`num_reqs=3` (`18` vs `20` rows, `90` vs `100` CTAs)**:
+       `29.09 / 29.15 us` vs `29.93 / 30.25 us` (**`+2.79% / +3.62%` speedup**,
+       saves `65.0–85.3 us` across 78 layers).
+     - **`num_reqs=5` (`30` vs `32` rows, `150` vs `160` CTAs)**:
+       `43.14 / 43.06 us` vs `43.26 / 43.25 us` (**`+0.28% / +0.45%` median speedup**,
+       and p95 latency drops from `52.24 / 53.24 us` to `43.95 / 43.65 us`,
+       **`-15.9% / -18.0%` p95 reduction**).
+     - **`num_reqs=6` (`36` vs `40` rows, `180` vs `200` CTAs)**:
+       `45.28 / 45.10 us` vs `47.76 / 46.75 us` (**`+5.19% / +3.52%` speedup**,
+       saves `128.4–193.4 us` across 78 layers).
+     - **`num_reqs=7` (`42` vs `48` rows, `210` vs `240` CTAs)**:
+       `50.22 / 49.71 us` vs `67.32 / 67.09 us` (**`+25.40% / +25.90%` speedup**,
+       saves `17.10–17.37 us/layer` or **`1.33–1.35 ms` across 78 layers** by
+       avoiding the `240`-CTA wave spill at `48` rows).
+3. **Policy selection (optionality removed)**:
+   - Retaining exact native full-depth shapes alongside wider copy-verification
+     shapes (`0001-native-depth-captures.patch` + `0002-warmup-width-fixture.patch`
+     paired with `0003-bound-mxfp8-live-rows.patch`) is selected as the single
+     winning policy: it restores 100% full-depth verification graph coverage
+     and achieves up to `25.9%` per-layer `Sparse-MLA` speedup with only 50
+     captures (vs 65 in `shape-union`), while preserving exact request-count
+     specialization (unlike `row-ladder`). Runtime `--variant` optionality has
+     been removed from `gpu_gate.py`.
