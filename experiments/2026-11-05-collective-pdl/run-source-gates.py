@@ -52,6 +52,30 @@ def validate_gate(path, map_hash):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def probe_counter_problems(timings,hcas):
+    from sparknet.probe.counters import RDMA_ERROR_COUNTERS
+    problems=[]
+    for row in timings:
+        if row.get("expected_backend") == "oneshot":
+            payload=row.get("proxy_payload_bytes",{})
+            if set(payload) != hcas or any(value <= 0 for value in payload.values()):
+                problems.append("one-shot payload evidence missing on a configured lane")
+        errors=row.get("rdma_error_deltas",{})
+        for hca in hcas:
+            values=errors.get(hca,{})
+            if set(RDMA_ERROR_COUNTERS)-set(values):
+                problems.append(f"missing RDMA error counter evidence for {hca}")
+            elif any(values[key] != 0 for key in RDMA_ERROR_COUNTERS):
+                problems.append(f"RDMA error counter changed on {hca}")
+        ports=row.get("port_deltas",{})
+        if not ports or any(not values for values in ports.values()):
+            problems.append("physical-port counter evidence missing")
+        for values in ports.values():
+            if any(values.get(key,0) != 0 for key in ("rx_out_of_buffer","rx_dropped","tx_dropped","rx_missed_errors")):
+                problems.append("port drop/error counter changed")
+    return problems
+
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -86,7 +110,7 @@ def plans(nodes, run=1):
         assert not render.environment_problems(env, "oneshot-direct", 3)
         env.update(ENV)
         shared = ["docker", "run", "--rm", "--name=collective-pdl-gpu-test", "--network=host",
-                  "--gpus=all", "--memory=16g", "--memory-swap=16g", "--cpus=2", "--pids-limit=512",
+                  "--gpus=all", "--memory=16g", "--memory-swap=16g", "--cpus=4", "--pids-limit=512",
                   "--device=/dev/infiniband:/dev/infiniband:rwm", "--cap-add=IPC_LOCK",
                   "--ulimit=memlock=-1:-1", "--shm-size=2g", "--label", f"collective-pdl.source={PIN}"]
         shared += [v for k, val in sorted(env.items()) for v in ("--env", f"{k}={val}")]
@@ -101,7 +125,7 @@ def plans(nodes, run=1):
         probe = docker_probe_command(image=IMAGE, environment=env, rank=node["rank"], world_size=3,
                     master_addr=head["management_ip"], master_port=29650, transport="oneshot-direct",
                     package_source=str(SOURCE/"sparknet"), extra_args=("--benchmark", "--counter-samples", "--port-samples"))
-        probe[2:2] = ["--cpus=2", "--pids-limit=512", "--label", f"collective-pdl.source={PIN}"]
+        probe[2:2] = ["--cpus=4", "--pids-limit=512", "--label", f"collective-pdl.source={PIN}"]
         benchmark = shared + ["--signal=TERM", "--kill-after=15s", "1200s", "python3", "-m",
                     "torch.distributed.run", "--nnodes=3", "--nproc-per-node=1",
                     f"--node-rank={node['rank']}", f"--master-addr={head['management_ip']}",
@@ -279,6 +303,10 @@ def main():
                         if any(row.get("exact") is not True or len(row.get("rank_samples_us",[])) != 3
                                or any(len(samples) != 40 for samples in row.get("rank_samples_us",[])) for row in cases):
                             problems.append("benchmark output or samples incomplete")
+                        if any(len(row.get("rank_cpu_stat_deltas",[])) != 3 or
+                               any(value.get("nr_throttled",0) > 0 for value in row.get("rank_cpu_stat_deltas",[]))
+                               for row in cases):
+                            problems.append("CPU throttling evidence missing or timed samples throttled")
                 elif kind == "probe" and code == 0:
                     from sparknet.probe.fleet import _result_from_log
                     data = _result_from_log(path)
@@ -290,19 +318,8 @@ def main():
                             problems.append("probe topology identity differs")
                         timings = data.get("timings", [])
                         if not timings: problems.append("no benchmark cases")
-                        for row in timings:
-                            if row.get("expected_backend") == "oneshot":
-                                counters = row.get("proxy_payload_bytes", {})
-                                if not counters or any(value <= 0 for value in counters.values()):
-                                    problems.append("a one-shot lane posted no payload")
-                        def leaves(value):
-                            if isinstance(value, dict):
-                                for child in value.values(): yield from leaves(child)
-                            elif isinstance(value, (list,tuple)):
-                                for child in value: yield from leaves(child)
-                            else: yield value
-                        if any(value != 0 for row in timings for value in leaves(row.get("rdma_error_deltas", {}))):
-                            problems.append("RDMA error counter changed")
+                        hcas = {hca for route in item["node"]["roce_peer_hcas"].values() for hca in route}
+                        problems.extend(probe_counter_problems(timings,hcas))
                 if code: problems.append(f"exit {code}")
                 return {"node":item["node"]["name"], "exit":code, "problems":problems, **detail,
                         "log":path.name, "sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -320,6 +337,8 @@ def main():
                         receipt.setdefault("cleanup_errors",[]).extend(cleanup())
                         killed = True
                     time.sleep(1)
+                if any(not future.exception() and future.result()["exit"] == 255 for future in futures):
+                    management_failure = True
                 outcomes = [future.result() for future in futures]
             if any(row["exit"] == 255 for row in outcomes): management_failure = True
             receipt["guard_errors"] = guard_errors

@@ -1,4 +1,5 @@
 """CPU controls: hardware commands are bounded and foreign windows cannot run."""
+import copy
 import hashlib
 import json
 import importlib.util
@@ -28,7 +29,7 @@ class Controls(unittest.TestCase):
         for item in plans:
             for kind, memory, deadline in [("tests", "16g", "1500s"),("probe", "12g", "600s"),("benchmark","16g","1200s")]:
                 command = item[kind]
-                for flag in ["--cpus=2", "--pids-limit=512", f"--memory={memory}",
+                for flag in ["--cpus=4", "--pids-limit=512", f"--memory={memory}",
                              f"--memory-swap={memory}", deadline, gates.IMAGE,
                              f"collective-pdl.source={gates.PIN}"]:
                     self.assertIn(flag, command)
@@ -63,6 +64,22 @@ class Controls(unittest.TestCase):
             with self.assertRaises(RuntimeError): gates.validate_gate(path,"wrong-map")
             (Path(tmp)/"probe-0.log").write_text("changed")
             with self.assertRaises(RuntimeError): gates.validate_gate(path,"map")
+
+    def test_probe_requires_counters_on_every_lane(self):
+        from sparknet.probe.counters import RDMA_ERROR_COUNTERS
+        row={"expected_backend":"oneshot","proxy_payload_bytes":{"rail0":1,"rail1":1},
+             "rdma_error_deltas":{rail:{key:0 for key in RDMA_ERROR_COUNTERS} for rail in ("rail0","rail1")},
+             "port_deltas":{"net0":{"tx_bytes":1,"rx_bytes":1,"rx_dropped":0}}}
+        self.assertEqual(gates.probe_counter_problems([row],{"rail0","rail1"}),[])
+        for changed in ("missing_error_counter","error_increase","missing_port","drop_increase","missing_payload"):
+            sample=copy.deepcopy(row)
+            if changed == "missing_error_counter": sample["rdma_error_deltas"]["rail1"].clear()
+            elif changed == "error_increase": sample["rdma_error_deltas"]["rail0"][RDMA_ERROR_COUNTERS[0]]=1
+            elif changed == "missing_port": sample["port_deltas"].clear()
+            elif changed == "drop_increase": sample["port_deltas"]["net0"]["rx_dropped"]=1
+            else: sample["proxy_payload_bytes"]["rail1"]=0
+            with self.subTest(changed=changed):
+                self.assertTrue(gates.probe_counter_problems([sample],{"rail0","rail1"}))
 
     def test_foreign_or_mismatched_window_cannot_touch_hardware(self):
         cases = [None,

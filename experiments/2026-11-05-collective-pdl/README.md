@@ -80,9 +80,10 @@ DGX4, CPU-only, `CPUQuota=200%`, `MemoryMax=8G`, `TasksMax=64`, nice 10:
   and all-gather compile for every TP3 and TP4 rank: 28 SM121 specializations per
   phase, 84 total. GPU access was explicitly disabled. Generated CUDA records
   the dependency wait before the epoch and the intended trigger placement.
-- The synthetic benchmark's two copy kernels compile. Four CPU controller
+- The synthetic benchmark's two copy kernels compile. Five CPU controller
   checks cover bounded all-rank commands, variant identity, gate-log hashes and
-  rejecting a foreign or mismatched window before any hardware action.
+  rejecting a foreign or mismatched window before any hardware action, and
+  requiring all lane/error/port counters. Missing counters cannot qualify a gate.
 - New GPU tests are written but unrun: delayed PDL producers/consumers,
   cancellation-sensitive rank-order sums, mixed collective slot reuse, eager
   and graph execution, and generated CUDA's wait before the epoch read.
@@ -105,11 +106,15 @@ The later placements test whether keeping waiting consumer CTAs out of the
 peer-wait interval leaves more capacity for side work. The winning placement
 must be measured; early triggering is not assumed to be best.
 
+The three variants emit byte-identical CUDA after removing only the moved
+trigger line: 56 alternative/entry comparisons across all 28 specializations.
+This supports arithmetic/transport isolation, not a hardware correctness claim.
+
 The bounded [run-source-gates.py](run-source-gates.py) runs the full source GPU
 suite and fabric probe on every triangle rank before allowing that variant's
 benchmark. It checks exact window ownership, clean source/harness checkouts,
 image identity, every rank's verdict and prerequisite log hashes. Containers
-have two CPUs, 16 GiB with no extra swap (probe: 12 GiB), process and time limits.
+have four CPUs, 16 GiB with no extra swap (probe: 12 GiB), process and time limits.
 The controller requires 40 GiB free before launch, keeps the existing 24 GiB
 memory floor and thermal limits, retains raw memory/thermal samples, cools
 below 55 C and maintains the window
@@ -121,7 +126,8 @@ Two fresh process runs reverse the variant order. All rank samples, exact-output
 checks, graph/compile warmup, memory and thermal evidence are retained. Background
 cases fork a side stream after the producer, so that event orders the producer;
 the measured launch chain still includes the collective and its consumer. This
-is controlled resource contention, not a model-layer or serving result. A
+is controlled resource contention, not a model-layer or serving result. CPU bandwidth-throttled samples are rejected; four CPUs leave room for
+the proxy, launcher and coordination, while compilation stays at two jobs. A
 within-process interval cannot substitute for serving boot/repeat variability.
 `analyze_launch_chain.py` retains all cells and reports pointwise Student-t
 intervals on the two independent process-round means/differences (df=1), without

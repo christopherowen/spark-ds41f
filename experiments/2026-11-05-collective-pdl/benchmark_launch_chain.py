@@ -39,6 +39,12 @@ def copy_kernel(fixed_grid: int):
     return copy
 
 
+def cpu_stat():
+    values={key:int(value) for key,value in (line.split() for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines())}
+    if "nr_throttled" not in values: raise RuntimeError("cgroup CPU throttling counters unavailable")
+    return values
+
+
 def digest(tensor):
     return hashlib.sha256(tensor.cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
 
@@ -106,11 +112,16 @@ def main():
                     for _ in range(3): graph.replay()
                     torch.cuda.synchronize();dist.barrier()
                     samples=[]
+                    cpu_before=cpu_stat()
                     for sample in range(args.samples):
                         dist.barrier()
                         start,end = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
                         start.record();graph.replay();end.record();end.synchronize()
                         samples.append(start.elapsed_time(end)*1000/args.calls_per_graph)
+                    cpu_after=cpu_stat()
+                    cpu_delta={key:cpu_after[key]-cpu_before[key] for key in cpu_before}
+                    rank_cpu_deltas=[None]*world
+                    dist.all_gather_object(rank_cpu_deltas,cpu_delta)
                     runtime.check_health()
                     assert torch.equal(output,expected), (rows,operation,background_mib,"timed")
                     if background_elements:
@@ -122,6 +133,7 @@ def main():
                             "background_mib":background_mib,"rank_samples_us":rank_samples,
                             "slowest_rank_mean_us":statistics.mean(worst),
                             "within_process_ci95_us":1.96*statistics.stdev(worst)/math.sqrt(len(worst)),
+                            "rank_cpu_stat_deltas":rank_cpu_deltas,
                             "output_sha256":digest(output),"exact":True}
                     records.append(record)
                     if rank == 0: print(json.dumps({"case":record}),flush=True)
