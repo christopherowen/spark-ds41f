@@ -76,8 +76,11 @@ PR934's declared functional-evidence enforcement is merged after source review;
 it preserves C40's sampled isolated-repeat requirement and batch limitation.
 C46 adopts its API alongside the remaining C40 semantic predicates and a
 complete-suite audit. The existing first model operation must pass before its
-engine grid; no model workload is duplicated. New orchestration controls remain
-under bounded remote testing and exact-window lifecycle review, not launch-ready.
+engine grid; no model workload is duplicated. All67 unique new/affected controls
+are covered by passing bounded remote checks, with original setup failures
+preserved. Software is ready for normal guarded scheduling; no hardware lease
+or C46 image/serving qualification follows. C45's independent draft profiles also
+pass both static example-map doctors and retain the corrected compiler identity.
 
 Evidence-only925's187 archive members pass independent size/hash verification,
 and its original performance analysis/core summary reproduce exactly on SP8.

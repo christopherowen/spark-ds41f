@@ -80,6 +80,14 @@ changed no source head/tree/runtime bytes. See the preflight receipts and
 
 ## Qualification still required
 
+The integrated software controls now cover67 unique new/affected checks in
+bounded SP8 runs. Strict telemetry, exact window ownership/restoration, native
+invariant coverage, model barriers and full-cohort metadata rejection checks
+pass. The final two test setup corrections changed no runtime implementation,
+native assertion or resource limit. Original failed attempts remain in
+[final-control-verification.json](runs/preflight/final-control-verification.json).
+Software readiness grants no hardware reservation.
+
 The control packet retains all138 native files and eight image/gate steps,
 40 ordered functional exits and26 ordered performance steps across the unchanged
 full `release-tp3`, `single-stream` and `sampled` families. No C46 image ID or

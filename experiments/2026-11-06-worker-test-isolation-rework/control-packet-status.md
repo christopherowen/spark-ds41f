@@ -1,10 +1,10 @@
-# C46 control packet awaiting remote verification
+# C46 controls ready for normal guarded scheduling
 
-All source hooks are connected; launch stays blocked until the new remote
-controls pass and their exact source is reviewed. No C46 image, native gate,
-functional boot or serving point has run. Initial16 semantic/model/suite checks
-passed across retained bounded CPU runs; peer model corrections and new exact
-lifecycle, native-invariant and strict-telemetry checks still require verification.
+All source hooks are connected and67 unique new/affected controls are covered
+by passing bounded SP8 checks. Original fixture/selector/assertion errors and
+actual wait exits remain preserved. No C46 image, native gate, functional boot
+or serving point has run. Software readiness grants no hardware lease: normal
+shared scheduling, clean source staging and every native guard remain required.
 
 The source is unchanged C43 frontend lifetime cleanup on corrected default C40,
 plus one fixture-isolation correction. Canonical head d92f9c26/tree8056f1ef and
