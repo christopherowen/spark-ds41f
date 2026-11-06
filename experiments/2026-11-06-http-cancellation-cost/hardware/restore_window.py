@@ -158,24 +158,49 @@ def restore(state_path):
                 timeout=300,
             )
             for node in state["nodes"]:
-                command = shlex.join(
-                    ["docker", "inspect", state["container"], "--format", "{{.Image}}"]
-                )
-                actual = subprocess.check_output(
+                prefix = [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=8",
+                    node["target"],
+                ]
+                image = json.loads(
+                    subprocess.check_output(
+                        [
+                            *prefix,
+                            shlex.join(["docker", "inspect", state["container"]]),
+                        ],
+                        text=True,
+                        timeout=15,
+                    )
+                )[0]
+                if (
+                    image["Image"] != state["restore_images"][node["name"]]
+                    or not image["State"]["Running"]
+                ):
+                    raise RuntimeError(f"{node['name']} original image is not running")
+                actual_commit = subprocess.check_output(
                     [
-                        "ssh",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=8",
-                        node["target"],
-                        command,
+                        *prefix,
+                        shlex.join(["git", "-C", str(root), "rev-parse", "HEAD"]),
                     ],
                     text=True,
                     timeout=15,
                 ).strip()
-                if actual != state["restore_images"][node["name"]]:
-                    raise RuntimeError(f"{node['name']} restore image changed")
+                dirty = subprocess.check_output(
+                    [
+                        *prefix,
+                        shlex.join(["git", "-C", str(root), "status", "--porcelain"]),
+                    ],
+                    text=True,
+                    timeout=15,
+                ).strip()
+                if actual_commit != state["restore_commit"] or dirty:
+                    raise RuntimeError(
+                        f"{node['name']} original clean checkout is not restored"
+                    )
             state.update(restored=True, ended=stamp())
             save(state_path, state)
             ownership(state, restoring=True)
