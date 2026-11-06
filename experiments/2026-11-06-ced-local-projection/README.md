@@ -465,7 +465,7 @@ UTF-8 prompts, native completion token IDs, payloads, tokenizer and source hashe
 The top requested size is 1,048,000 so it fits the standard 1M-context size filter;
 actual token counts are authoritative. Cache salts must be fresh for every replay.
 This is CPU-only fixture preparation, not a benchmark; it does not reconstruct
-the unavailable historical prompt bytes. The first preparation run is pending.
+the unavailable historical prompt bytes. Preparation results are recorded below.
 
 The first preparation attempt stopped before writing prompts because the frozen
 CPU dependency image does not include Git. Its log and capped-run receipt are
@@ -495,4 +495,37 @@ recorded in `receipts/prefill-standard-fixtures-summary.json`; the standard text
 recipe can fall materially below its nominal length. `--sizing exact` therefore
 adds an explicitly separate companion, adjusting only document length to land
 within 64 tokens below each requested size. It records every sizing attempt and
-keeps the standard corpus unchanged. Exact-size preparation is pending.
+keeps the standard corpus unchanged. Exact-size preparation results are recorded below.
+
+Exact-length preparation completed with 15 prompts. Every input is within 64
+tokens below its requested length; hashes, payload text and token-file lengths
+verify. Three actual top-size inputs are 1047975, 1047974, 1047998 tokens.
+The corpus remains remote at `results/private/ced-local-projection/prefill-exact-v1/`;
+its manifest, complete sizing attempts and CPU run receipt are retained under
+`receipts/prefill-exact-*`. No model request has used these inputs yet.
+
+
+## Prepared full-model correctness cohort
+
+The unexecuted serving mode runs C36 twice and the combined CED candidate twice
+on the same existing SP5-SP7 group, with identical C36 serving arguments and
+separate fresh containers. It reuses the published CED cross-shape, temperature-0
+wide determinism (with and without logprobs), and seeded temperature-1 clients.
+Every HTTP request body is archived before sending. Strict summaries and raw
+scenario checks treat negative functional results as failures even when a client
+exits zero. Negative results may be characterized by subsequent correctness-only
+arms; any failure blocks performance and selection. No timing path exists.
+
+The 120-minute controller retains 35 minutes before beginning another arm, uses
+the same independent C37 recovery watchdog, polls every node for thermal and
+memory limits, cools below 55 C before each command, stops above 70 C, and retains
+the published 5 GiB startup / 3 GiB steady host reserves. Clients are limited to
+one CPU and 1 GiB address space. A failed monitor terminates the active command
+before coordinated restoration. Raw per-node startup/steady observations, image
+identities, complete bounded engine logs, and cross-boot digests are retained.
+
+The serving profiles use the same existing node-local `/cache` source as the
+published C37 restore profile (`{home}/projects/spark-ds41f/cache`), while all
+serving source authority remains in the clean private deployment checkout. No
+cache data or ignored files are deployed. The first dry plans retained their
+expected publication/synchronization and missing-cache-path refusals.

@@ -1,4 +1,4 @@
-"""Bounded native-only SP5-SP7 window with the published C37 recovery controller."""
+"""Bounded correctness-only SP5-SP7 window with the published C37 recovery controller."""
 import argparse
 import concurrent.futures
 import datetime as dt
@@ -237,7 +237,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--watchdog')
     parser.add_argument('--apply', action='store_true')
-    parser.add_argument('--job', choices=('native','collective'), default='native')
+    parser.add_argument('--job', choices=('native','collective','serving'), default='native')
     route = parser.add_mutually_exclusive_group(required=True)
     route.add_argument('--global-host', help='verified reachable management address of dgx1')
     route.add_argument('--global-observation', type=Path, help='continuously refreshed authenticated DGX1 observation')
@@ -272,6 +272,13 @@ def main():
     shape=next((line for line in plan.splitlines() if line.startswith('shape:')),None)
     assert shape and 'unchanged' in shape and '--apply would refuse:' not in plan, plan
     (out/'plan-review.json').write_text(json.dumps({'stop_live':live,'restore_shape':shape},indent=2)+'\n')
+    if args.job=='serving':
+        for kind in ('control','candidate'):
+            profile=str(EXP.relative_to(ROOT)/('sp567-serving-'+kind+'.json'))
+            argv=[str(ROOT/'bin/spark'),'--cluster-config',profile,'cluster','start','--replace']
+            recovery.run(argv,out,'serving-'+kind+'-plan')
+            text=(out/('serving-'+kind+'-plan.txt')).read_text()
+            assert 'shape:   unchanged' in text and '--apply would refuse:' not in text,text
     idle(out)
     if not args.apply:
         print('preflight passed; no ownership or serving state changed', flush=True)
@@ -280,8 +287,8 @@ def main():
     state = holds(); assert not any(any(v.values()) for v in state.values()), state
     token = uuid.uuid4().hex
     held = {'holder': HOLDER, 'token': token, 'since': stamp(), 'heartbeat': stamp(),
-            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=90 if args.job=='collective' else 45)).isoformat(),
-            'nodes': NAMES, 'rule': 'exclusive native correctness only; coordinated exact C37 restoration before release',
+            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=120 if args.job=='serving' else 90 if args.job=='collective' else 45)).isoformat(),
+            'nodes': NAMES, 'rule': 'exclusive correctness only; coordinated exact C37 restoration before release',
             'phase': 'preparing', 'job':args.job, 'controller_commit': commit, 'source_commit': '51c1a32cd78cfb0a14087e34dfcc06be30928a0e',
             'restore_commit': RESTORE_COMMIT, 'production_config': RESTORE_PROFILE,
             'controller_output': str(out)}
@@ -364,19 +371,27 @@ print('true')
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                 results=list(pool.map(one,enumerate(recovery.NODES)))
             assert results==[0,0,0], results
-        if args.job=='collective':
-            recovery.each(PHASE, {'token':token,'phase':'copying'})
-            command=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@10.30.0.16',
-                     'systemd-run','--user','--scope','-p','MemoryMax=4G','-p','CPUQuota=100%',
-                     'taskset','-c','4','flock','-n','/tmp/spark-cpu-analysis.lock','python3','-B',
-                     '/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/distribute_sp567.py',
-                     '--token',token,'--commit',commit,'--apply']
-            recovery.run(command,out,'image-distribution')
-        recovery.each(PHASE, {'token':token,'phase':'native'})
-        if args.job=='collective':batch('smoke','smoke')
-        for boot in ('boot-1','boot-2'):batch(boot,args.job)
-        (out/'native-complete.json').write_text(json.dumps({'at':stamp(),'boots':2,'nodes':NAMES,
-                                                          'scope':args.job+' correctness only; no serving or performance claim'},indent=2)+'\n')
+        if args.job=='serving':
+            recovery.each(PHASE, {'token':token,'phase':'serving'})
+            from serving_gate import run_cohort
+            run_cohort(sys.modules[__name__],token,out,commit,held,errors)
+        else:
+            if args.job=='collective':
+                recovery.each(PHASE, {'token':token,'phase':'copying'})
+                command=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@10.30.0.16',
+                         'systemd-run','--user','--scope','-p','MemoryMax=4G','-p','CPUQuota=100%',
+                         'taskset','-c','4','flock','-n','/tmp/spark-cpu-analysis.lock','python3','-B',
+                         '/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/distribute_sp567.py',
+                         '--token',token,'--commit',commit,'--apply']
+                recovery.run(command,out,'image-distribution')
+            recovery.each(PHASE, {'token':token,'phase':'native'})
+            if args.job=='collective':batch('smoke','smoke')
+            for boot in ('boot-1','boot-2'):batch(boot,args.job)
+        completion={'at':stamp(),'boots':2,'nodes':NAMES,
+                    'scope':args.job+' correctness only; no performance claim'}
+        if args.job=='serving':completion.update(images=['control','candidate'],boots_per_image=2)
+        filename='functional-complete.json' if args.job=='serving' else 'native-complete.json'
+        (out/filename).write_text(json.dumps(completion,indent=2)+'\n')
     except BaseException:
         (out/'error.txt').write_text(traceback.format_exc())
         raise
