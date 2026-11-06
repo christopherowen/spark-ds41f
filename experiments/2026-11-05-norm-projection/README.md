@@ -73,7 +73,7 @@ and tree; doctor reports configuration OK; complete existing candidate-38 build
 inputs pass `build check`; Python syntax and diff checks pass. The Mac attempts
 that failed before recovery are retained in `runs/recovery.txt`.
 
-Status: the first GPU attempt failed during compilation, before timing or a complete exactness gate. See `runs/failed-01-compile` and its conditions/runner receipts. The split factory left inactive legacy-reducer declarations after constant folding; separate Q/KV factories now declare those unused buffers as ordinary fragments. Arithmetic is unchanged. The cold/hot/prefetch screen remains incomplete; no performance conclusion is claimed.
+The first GPU attempt failed during compilation, before timing or a complete exactness gate. See `runs/failed-01-compile` and its conditions/runner receipts. The split factory left inactive legacy-reducer declarations after constant folding; separate Q/KV factories now declare those unused buffers as ordinary fragments. Arithmetic is unchanged. The cold/hot/prefetch screen remains incomplete; no performance conclusion is claimed.
 
 Additional audit: index-key and compression normalization reduce each live row once; Engram gating reduces each distinct token/stream residual and key once. These do not duplicate a hidden-row norm across projection output tiles.
 
@@ -86,3 +86,47 @@ An independent user-service watchdog is scoped to the acquired hold's exact `sin
 Capture, warm-up, KV overlap and racing prefetch each use an explicitly retained distinct CUDA stream, checked before the screen. This avoids relying on repeated stream-pool allocation for the overlap comparison.
 
 `model-config.json` records the pinned checkpoint configuration. The attention RMSNorm epsilon is `1e-20` (`rms_norm_eps`), distinct from mHC's `1e-6`. The first failed compilation attempt used `1e-6` and produced no timings; the retry uses the checkpoint epsilon and prints it in its identity record. Synthetic values and the generated RoPE table remain explicitly separate from model-quality evidence.
+
+## First completed process and pending repeat
+
+At published experiment commit c51e824b876c45df79bca0c3c44415a4ed69f0b9,
+the first process passed all 21 row/shape cases in 50.6 seconds. The full raw
+samples, exact image ID and input hashes are in runs/run-1; process conditions
+are in runs/run-records.json and runs/telemetry.jsonl. Peak allocated GPU
+memory was 303,746,560 bytes; peak reserved was 400,556,032 bytes. Available system
+memory stayed above 121 GB, the hottest recorded board sensor reached 54.5 C, and
+the GPU thermal-slowdown counter did not increase. All earlier failures remain
+recorded. No released build was remeasured and serving was unchanged.
+
+This is incomplete screening evidence. A foreign request arrived after the first
+process, so the runner yielded. Its subsequent generic acquisition waiter was
+stopped to honor the explicitly reserved hardware order. The unchanged repeat
+remains ready at the original clean checkout and exact c51e824b commit.
+refinement/ready.txt records the command, limits and expected one-minute job
+duration; its handoff order is a snapshot, not authorization to acquire a lease.
+Always re-read the live hold, request and coordination records first.
+
+The experimental 128-thread control and native front generate byte-identical
+CUDA source (24,353 bytes, SHA-256
+f19c497de4ea911ef0c76639231fd1fbb00d5ddef1c5cef55db8230a98b23deb).
+Despite that equality, its first-process L2 timing differences range from
+-5.20% to +7.82%. Some within-process intervals exclude zero for this identical
+code, exposing systematic measurement effects that repeated samples alone do
+not eliminate. No speedup, absence of regression, correctness repair or optimal
+implementation is established by this first process.
+
+refinement/bench.py is a prospective measurement revision, outside the active
+bundle. It keeps independent-buffer correctness checks, then uses the same output
+addresses for every timed arm and checks each call/replay against a frozen
+independent oracle. It captures external timing events inside the CUDA graph so
+host launch gaps are excluded. Its syntax is checked, but this revision has not
+run on the GPU. The recorded image's torch.cuda.Event supports external=True.
+
+Complete and preserve the unchanged second process first. Then publish and
+validate the refinement as a separate two-process measurement campaign; archive
+the original records and do not pool the two methods. Source alternatives and
+GEMM arithmetic are unchanged. The racing-prefetch case is still an isolated
+segment experiment, and neither it nor a kernel-only gain proves serving gains.
+The full c1/c8/c16 and distinct-agent traffic, cold 32K–1M prefill, candidate boot
+and repeat boot remain required wherever applicable before claiming a serving
+improvement. No runtime/source PR or promotion is warranted by the current data.
