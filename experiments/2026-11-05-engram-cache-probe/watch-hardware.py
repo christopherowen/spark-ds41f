@@ -30,11 +30,12 @@ def command(argv):
 def hold():
     if args.fixture_hold:
         return json.loads(args.fixture_hold.read_text())
-    result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'dgx1',
-                             'cat', '/home/swank/spark-hold.json'], capture_output=True, text=True, timeout=10)
-    if result.returncode:
-        raise RuntimeError('Cannot verify window: ' + result.stderr)
-    return json.loads(result.stdout)
+    local_hold = Path.home() / 'spark-hold.json'
+    if not local_hold.exists():
+        raise RuntimeError('Cannot verify window: local spark-hold.json absent')
+    data = json.loads(local_hold.read_text())
+    assert data.get('pool') == 'dgx4-single' and data.get('nodes') == ['dgx4']
+    return data
 
 def persist():
     if root.exists():

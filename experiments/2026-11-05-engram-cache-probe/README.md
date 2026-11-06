@@ -1,7 +1,8 @@
 # Engram row-cache locality
 
 Status: unpromoted source experiments. Thirteen native planner designs have been
-screened; two cache-metadata layouts are awaiting exact-source hardware checks.
+screened; two cache-metadata layouts completed exact-source GPU gates (43/43 each)
+and a two-boot GPU component screen on DGX4.
 There is no measured serving improvement, correctness repair, or promotion.
 The initial wider-probe work is retained in [bounded-probe.md](bounded-probe.md).
 
@@ -182,3 +183,39 @@ The cleanup records account for 579,403,776 allocated bytes removed; they do not
 attribute concurrent filesystem-wide recovery to this task. Substantial source,
 build and test work remains remote. The prepared C38 Git object store is retained:
 the three remote source worktrees depend on it through alternates.
+
+## DGX4 GPU hardware gates and two-boot component screen
+
+Under node-scoped hold `dgx4-engram-cache-20261106` (`pool: dgx4-single`, `nodes: ["dgx4"]`) with an independent 15-minute stale-heartbeat watchdog and per-phase `watch-hardware.py` user units:
+
+1. **Phase 1 — GPU Hardware Gates (`runs/gpu-gates/`)**:
+   - Both `aligned` (`745da6586fdebf8d48133639002ed41858831e13`) and `filter` (`e6fe9fb614d1b6488bb1310044a408822feaa6f6`) passed all **43/43** native GPU tests (`test_deepseek_v41_engram_rows.py`) in pinned image `sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b` with `--security-opt=seccomp=unconfined`, zero failures, zero errors, and zero skips (`gates_receipt_sha256`: recorded in `runs/gpu-screen/receipt.json.gz`).
+2. **Phase 2 — Two-Boot GPU Component Screen (`runs/gpu-screen/`)**:
+   - Executed Boot A (`control`, `aligned`, `filter` in forward case order) and Boot B (`filter`, `aligned`, `control` in `--reverse` case order) across 13 cases (TP3 6/48-row at 0/75/100% hot, TP4 96-row at 0/75/100% hot, and TP3 129/6,144-row chunks with `early=False/True`), using two readers, real `O_DIRECT` NVMe reads, CUDA write-combined mapped destinations, and the production GPU gather.
+   - Every iteration and singleton batch-invariance check (`{0, 1, tokens//2, tokens-1}`) matched the exact E4M3-to-BF16 reference bit-for-bit (`int16` view equality).
+   - Cache hits, cache misses, `read_calls`, and `read_bytes` were 100% identical across `control`, `aligned`, and `filter` in every case.
+
+Combined two-layer per-step means and paired 95% Student-t differences vs `control` (`runs/gpu-screen/summary.json`):
+
+| Case (TP / tokens / hot / early) | Variant | Plan A / B (us) | Plan diff All (95% CI, us) | GPU wait A / B (us) | GPU wait diff All (95% CI, us) | GPU step A / B (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| TP3 / 6 / 0% / False | `control` | 10.55 / 6.40 | — | 426.13 / 266.29 | — | 0.4606 / 0.3156 |
+| TP3 / 6 / 0% / False | `aligned` | 9.64 / 6.90 | -0.21 [-0.52, +0.10] | 418.48 / 512.64 | +119.35 [+55.06, +183.64] | 0.4546 / 0.5599 |
+| TP3 / 6 / 0% / False | `filter` | 7.73 / 4.80 | -2.21 [-2.43, -1.99] | 319.58 / 264.18 | -54.33 [-96.57, -12.08] | 0.3517 / 0.3154 |
+| TP3 / 6 / 75% / False | `control` | 5.85 / 3.33 | — | 308.90 / 173.14 | — | 0.3731 / 0.2284 |
+| TP3 / 6 / 75% / False | `aligned` | 4.28 / 3.45 | -0.72 [-1.24, -0.20] | 139.33 / 129.14 | -106.78 [-173.88, -39.69] | 0.1848 / 0.1812 |
+| TP3 / 6 / 75% / False | `filter` | 4.10 / 2.71 | -1.19 [-1.68, -0.69] | 127.52 / 129.00 | -112.76 [-183.68, -41.84] | 0.1843 / 0.1834 |
+| TP3 / 6 / 100% / False | `control` | 6.53 / 3.04 | — | 244.80 / 48.37 | — | 0.3021 / 0.1114 |
+| TP3 / 6 / 100% / False | `aligned` | 3.82 / 2.79 | -1.48 [-2.22, -0.74] | 101.93 / 63.86 | -63.69 [-109.04, -18.33] | 0.1703 / 0.1192 |
+| TP3 / 6 / 100% / False | `filter` | 3.73 / 5.19 | -0.33 [-1.38, +0.72] | 117.94 / 137.51 | -18.86 [-69.51, +31.79] | 0.1858 / 0.2111 |
+| TP3 / 48 / 0% / False | `control` | 75.27 / 61.22 | — | 1381.46 / 1261.71 | — | 1.3974 / 1.3204 |
+| TP3 / 48 / 0% / False | `aligned` | 57.95 / 55.20 | -11.67 [-13.50, -9.84] | 1327.35 / 1252.44 | -31.69 [-62.55, -0.83] | 1.3467 / 1.3078 |
+| TP3 / 48 / 0% / False | `filter` | 51.68 / 50.91 | -16.95 [-18.94, -14.96] | 1256.69 / 1250.85 | -67.82 [-128.55, -7.09] | 1.3119 / 1.3069 |
+| TP3 / 48 / 75% / False | `control` | 32.14 / 34.30 | — | 522.90 / 574.02 | — | 0.5850 / 0.6351 |
+| TP3 / 48 / 75% / False | `aligned` | 25.89 / 25.77 | -7.39 [-7.92, -6.85] | 517.03 / 512.78 | -33.55 [-57.80, -9.31] | 0.5795 / 0.5740 |
+| TP3 / 48 / 75% / False | `filter` | 25.01 / 29.58 | -5.92 [-6.43, -5.42] | 517.69 / 522.03 | -28.60 [-53.52, -3.68] | 0.5841 / 0.5833 |
+| TP3 / 48 / 100% / False | `control` | 69.85 / 35.01 | — | 370.85 / 106.87 | — | 0.4556 / 0.1652 |
+| TP3 / 48 / 100% / False | `aligned` | 35.49 / 33.76 | -17.81 [-24.57, -11.05] | 257.41 / 104.77 | -57.77 [-104.64, -10.90] | 0.3271 / 0.1710 |
+| TP3 / 48 / 100% / False | `filter` | 28.11 / 36.10 | -20.32 [-27.36, -13.29] | 105.35 / 119.24 | -126.56 [-174.32, -78.80] | 0.1688 / 0.1818 |
+
+Conclusion: Both layouts preserve exact BF16 outputs and reduce CPU planning time (`plan_ns`) on TP3 verification steps (`aligned` by 7.39–17.81 us across both layers on 48-row steps without warm-hit regressions; `filter` by 16.95 us on cold 48-row steps but +1.09 us in Boot B on 100%-hot 48-row steps and +834.98 us GPU step on 6,144-row `early=False` chunks). However, because cache hit rates and issued `O_DIRECT` NVMe reads are unchanged, exposed GPU wait remains dominated by NVMe read latency, and the ~7–18 us CPU planning reduction represents <0.07% of a 28.44 ms TP3 8x48 verification step. Neither candidate warrants image build or serving promotion.

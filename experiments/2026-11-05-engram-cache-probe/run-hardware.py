@@ -74,17 +74,18 @@ def run(argv, check=True):
     return result
 
 def beat(note):
-    script = ('import datetime,json,os;from pathlib import Path;'
-              'p=Path.home()/"spark-hold.json";x=json.loads(p.read_text());'
-              'assert x["window"]==' + repr(window) + ';'
-              'assert x["holder"]=="spark-lab: engram-cache native component qualification";'
-              'x["heartbeat"]=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ");'
-              'x["current"]=' + repr(note) + ';'
-              't=p.with_name("engram-heartbeat.tmp");t.write_text(json.dumps(x,indent=2)+"\\n");os.replace(t,p)')
-    result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'dgx1', 'python3', '-'],
-                            input=script, capture_output=True, text=True, timeout=15)
-    if result.returncode:
-        raise RuntimeError('Lost exclusive window: ' + result.stderr)
+    p = Path.home() / 'spark-hold.json'
+    if not p.exists():
+        raise RuntimeError('Lost exclusive window: local spark-hold.json absent')
+    x = json.loads(p.read_text())
+    assert x.get('window') == window
+    assert x.get('holder') == 'spark-lab: engram-cache native component qualification'
+    assert x.get('pool') == 'dgx4-single' and x.get('nodes') == ['dgx4']
+    x['heartbeat'] = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    x['current'] = note
+    t = p.with_name('engram-heartbeat.tmp')
+    t.write_text(json.dumps(x, indent=2) + '\n')
+    os.replace(t, p)
     save_watch()
 
 def thermal(label):
