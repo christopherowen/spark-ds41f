@@ -35,13 +35,13 @@ def check(result):
     return result[1] if len(result) == 2 else result[1:]
 
 
-def window(stream, tensor=None, fraction=1.0):
+def window(stream, tensor=None, fraction=1.0, num_bytes=None, hit_prop=None):
     value = cu.CUstreamAttrValue()
     w = value.accessPolicyWindow
     w.base_ptr = 0 if tensor is None else tensor.data_ptr()
-    w.num_bytes = 0 if tensor is None else tensor.numel() * tensor.element_size()
+    w.num_bytes = 0 if tensor is None else (tensor.numel() * tensor.element_size() if num_bytes is None else int(num_bytes))
     w.hitRatio = fraction
-    w.hitProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING
+    w.hitProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING if hit_prop is None else hit_prop
     w.missProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL
     check(cu.cuStreamSetAttribute(
         cu.CUstream(stream.cuda_stream),
@@ -169,7 +169,15 @@ def main():
                     ('window_small', 1 << 20, True, 0), ('both_small', 1 << 20, True, 1),
                     ('partition_fit', min(b, maximum), False, 0),
                     ('window_fit', min(b, maximum), True, 0),
-                    ('both_fit', min(b, maximum), True, 1)]
+                    ('both_fit', min(b, maximum), True, 1),
+                    ('contig_default', original, 'contig', 0),
+                    ('both_contig_default', original, 'contig', 1),
+                    ('pos0_default', original, 'pos0', 0),
+                    ('base_stream_default', original, 'base_stream', 0),
+                    ('both_base_stream_default', original, 'base_stream', 1),
+                    ('contig_mid', 8 << 20, 'contig', 0),
+                    ('both_contig_mid', 8 << 20, 'contig', 1),
+                    ('pos0_fit', min(b, maximum), 'pos0', 0)]
             for rows in (1, 8, 16):
                 xs = [torch.randn(rows, 256, device='cuda', dtype=torch.bfloat16) for _ in range(5)]
                 base = torch.randn(rows, 5, n, device='cuda', dtype=torch.float32)
@@ -186,7 +194,22 @@ def main():
                         check(cu.cuCtxSetLimit(limit, budget))
                         actual = int(check(cu.cuCtxGetLimit(limit)))
                         check(cu.cuCtxResetPersistingL2Cache())
-                        window(stream, packed.values if uses_window else None, min(1.0, actual / b))
+                        window(stream, packed.values if uses_window is True else None, min(1.0, actual / b))
+
+                        def apply_phase_window(pos):
+                            if uses_window == 'contig':
+                                window(stream, packed.values, 1.0, num_bytes=min(b, actual))
+                            elif uses_window == 'pos0':
+                                if pos == 0:
+                                    window(stream, packed.values, min(1.0, actual / b), num_bytes=b)
+                                else:
+                                    window(stream)
+                            elif uses_window == 'base_stream':
+                                window(stream, base, 1.0, hit_prop=cu.CUaccessProperty.CU_ACCESS_PROPERTY_STREAMING)
+
+                        def clear_phase_window():
+                            if uses_window in ('contig', 'pos0', 'base_stream'):
+                                window(stream)
 
                         def step():
                             if prefetch == 1:
@@ -194,9 +217,11 @@ def main():
                             for pos in range(5):
                                 if prefetch == 2:
                                     pref(segs)
+                                apply_phase_window(pos)
                                 partial(xs[pos], packed.values, packed.exception_rows,
                                         packed.exception_entries, packed.row_offsets,
                                         base[:, pos], vals, ids, n)
+                                clear_phase_window()
                                 finish(vals, ids, outputs[pos], 0)
                                 if stress and pos != 4:
                                     read(stream_segs, sink)
@@ -209,18 +234,28 @@ def main():
                         with torch.cuda.graph(graph, stream=stream):
                             step()
                         captured_attrs[name] = graph_windows(graph)
-                        if uses_window and any(a[0] != b for a in captured_attrs[name]):
+                        if uses_window is True and any(a[0] != b for a in captured_attrs[name]):
                             explicit_graph_window(graph, packed.values, min(1.0, actual / b))
                         attrs[name] = graph_windows(graph)
                         assert attrs[name], name
-                        assert all(a[0] == (b if uses_window else 0) for a in attrs[name]), (name, attrs[name])
-                        if uses_window:
-                            expected_ratio = min(1.0, actual / b)
-                            assert all(abs(a[1] - expected_ratio) < 1e-6
-                                       and a[2] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING)
-                                       and a[3] == packed.values.data_ptr()
-                                       and a[4] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL)
-                                       for a in attrs[name]), (name, attrs[name])
+                        if isinstance(uses_window, bool):
+                            assert all(a[0] == (b if uses_window else 0) for a in attrs[name]), (name, attrs[name])
+                            if uses_window:
+                                expected_ratio = min(1.0, actual / b)
+                                assert all(abs(a[1] - expected_ratio) < 1e-6
+                                           and a[2] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING)
+                                           and a[3] == packed.values.data_ptr()
+                                           and a[4] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL)
+                                           for a in attrs[name]), (name, attrs[name])
+                        elif uses_window == 'contig':
+                            active = [a for a in attrs[name] if a[0] > 0]
+                            assert len(active) == 5 and all(a[0] == min(b, actual) and abs(a[1] - 1.0) < 1e-6 for a in active), (name, attrs[name])
+                        elif uses_window == 'pos0':
+                            active = [a for a in attrs[name] if a[0] > 0]
+                            assert len(active) == 1 and active[0][0] == b, (name, attrs[name])
+                        elif uses_window == 'base_stream':
+                            active = [a for a in attrs[name] if a[0] > 0]
+                            assert len(active) == 5 and all(a[0] == base.numel() * base.element_size() and a[2] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_STREAMING) for a in active), (name, attrs[name])
                         graph.instantiate()
                         window(stream)
                         graph.replay()

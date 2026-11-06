@@ -46,7 +46,10 @@ def main():
         arms = sorted({s['arm'] for s in cases[0]['samples']})
         comparisons = [('driver_default', arm) for arm in arms if arm != 'driver_default']
         comparisons += [('prefetch_default', arm) for arm in
-                        ('window_default', 'both_default', 'window_small', 'both_small', 'window_fit', 'both_fit')]
+                        ('window_default', 'both_default', 'window_small', 'both_small', 'window_fit', 'both_fit',
+                         'contig_default', 'both_contig_default', 'pos0_default', 'base_stream_default',
+                         'both_base_stream_default', 'contig_mid', 'both_contig_mid', 'pos0_fit')
+                        if arm in arms]
         comparisons += [('partition_small', 'window_small'), ('partition_fit', 'window_fit'), ('demand', 'null')]
         case_result = {'tp': key[0], 'rows': key[1], 'expert_stream_stress': key[2],
                        'payload_bytes': cases[0]['payload_bytes'], 'comparisons': []}
