@@ -129,3 +129,19 @@ argv separately fixes the recorded plan identity. Their logs are retained.
 No simulated restoration or CPU controller result is serving-hardware evidence.
 
 The isolated worker uses Docker's documented [container driver limits](https://docs.docker.com/build/builders/drivers/docker-container/) and [CDI/parallelism settings](https://docs.docker.com/build/buildkit/toml-configuration/). No daemon-wide configuration or default builder is changed.
+
+The first worker setup stopped before the worker probe or compilation because
+Buildx 0.35's managed container driver automatically requested all GPU devices.
+The resource/device guard rejected it, and that builder was stopped. Its log
+and failed receipt are retained. The CPU-only path now uses the supported
+[remote driver over a Docker container connection](https://docs.docker.com/build/builders/drivers/remote/)
+with an explicitly created bounded `runc` container, no device requests, and a
+direct `buildkitd` entrypoint. The same CDI/device and worker-probe gates remain.
+The default builder and host daemon settings are unchanged.
+
+The owner's clarified acceptance criterion permits a demonstrated coverage or
+correctness repair with preserved performance; a speedup is not required.
+Native exact-shape restoration remains distinct from the optional row-only and
+union tuning trials. Report a correctness/coverage reproducer on the affected
+path and repeatable latency/throughput/memory preservation. An interval that
+merely contains zero while allowing a meaningful regression is inconclusive.

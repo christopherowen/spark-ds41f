@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +24,8 @@ sys.path.insert(0, str(ROOT))
 from spark_ds41f import build
 
 EXP = Path(__file__).resolve().parent
-BUILDER = "verification-shapes-cpu"
+BUILDER = "verification-shapes-cpu-remote"
+CONTAINER = "verification-shapes-buildkit"
 BUILDKIT = "docker.io/moby/buildkit@sha256:92f93f25966c544549b88144406ce8cd9dcdf5df128250711031a4acd9149a8e"
 MEMORY = 24 * 1024**3
 
@@ -36,10 +38,7 @@ def output(argv):
     return subprocess.check_output(argv, text=True).strip()
 
 
-def builder_identity():
-    data = json.loads(
-        output(["docker", "inspect", "buildx_buildkit_" + BUILDER + "0"])
-    )[0]
+def check_builder_container(data):
     host = data["HostConfig"]
     if (
         host["Memory"] != MEMORY
@@ -49,20 +48,28 @@ def builder_identity():
         or host.get("DeviceRequests")
         or host.get("Devices")
         or host["RestartPolicy"]["Name"] != "no"
+        or host.get("Runtime") != "runc"
     ):
         raise RuntimeError("BuildKit resource/device settings differ")
-    if data["Config"]["Image"] != BUILDKIT:
-        raise RuntimeError("BuildKit image differs from the pinned ARM64 manifest")
+    if data["Config"]["Image"] != BUILDKIT or data["Config"].get("Entrypoint") != [
+        "buildkitd"
+    ]:
+        raise RuntimeError("BuildKit image or direct daemon entrypoint differs")
+    if (
+        data["Config"].get("Labels", {}).get("spark.experiment")
+        != "verification-shapes"
+    ):
+        raise RuntimeError("BuildKit container is not owned by this experiment")
+
+
+def builder_identity():
+    data = json.loads(output(["docker", "inspect", CONTAINER]))[0]
+    check_builder_container(data)
+    host = data["HostConfig"]
     configured = output(
-        [
-            "docker",
-            "exec",
-            "buildx_buildkit_" + BUILDER + "0",
-            "cat",
-            "/etc/buildkit/buildkitd.toml",
-        ]
+        ["docker", "exec", CONTAINER, "cat", "/etc/buildkit/buildkitd.toml"]
     )
-    if configured.strip() != (EXP / "buildkitd.toml").read_text().strip():
+    if tomllib.loads(configured) != tomllib.loads((EXP / "buildkitd.toml").read_text()):
         raise RuntimeError("BuildKit configuration differs")
     return {
         "image": data["Image"],
@@ -71,6 +78,8 @@ def builder_identity():
         "memory_swap": host["MemorySwap"],
         "cpu_quota": host["CpuQuota"],
         "cpu_period": host["CpuPeriod"],
+        "device_requests": host.get("DeviceRequests"),
+        "runtime": host["Runtime"],
         "config_sha256": hashlib.sha256(configured.encode()).hexdigest(),
     }
 
@@ -146,9 +155,57 @@ def main():
         (out / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
     save()
+    owned_builder = False
     with build.BUILD_LOCK.open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
+            existing = subprocess.run(
+                ["docker", "inspect", CONTAINER],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            if existing.returncode:
+                run(
+                    [
+                        "docker",
+                        "run",
+                        "-d",
+                        "--name",
+                        CONTAINER,
+                        "--label",
+                        "spark.experiment=verification-shapes",
+                        "--runtime=runc",
+                        "--privileged",
+                        "--memory=24g",
+                        "--memory-swap=24g",
+                        "--cpu-quota=200000",
+                        "--cpu-period=100000",
+                        "--restart=no",
+                        "-e",
+                        "NVIDIA_VISIBLE_DEVICES=void",
+                        "-e",
+                        "CUDA_VISIBLE_DEVICES=-1",
+                        "-v",
+                        f"{EXP / 'buildkitd.toml'}:/etc/buildkit/buildkitd.toml:ro",
+                        "-v",
+                        "verification-shapes-buildkit-state:/var/lib/buildkit",
+                        "--entrypoint",
+                        "buildkitd",
+                        BUILDKIT,
+                        "--config",
+                        "/etc/buildkit/buildkitd.toml",
+                        "--allow-insecure-entitlement",
+                        "network.host",
+                    ]
+                )
+                owned_builder = True
+            else:
+                previous = json.loads(existing.stdout)[0]
+                check_builder_container(previous)
+                owned_builder = True
+                if not previous["State"]["Running"]:
+                    run(["docker", "start", CONTAINER])
             present = (
                 subprocess.run(
                     ["docker", "buildx", "inspect", BUILDER],
@@ -167,13 +224,8 @@ def main():
                         "--name",
                         BUILDER,
                         "--driver",
-                        "docker-container",
-                        "--buildkitd-config",
-                        str(EXP / "buildkitd.toml"),
-                        "--buildkitd-flags",
-                        "--allow-insecure-entitlement network.host",
-                        "--driver-opt",
-                        f"image={BUILDKIT},memory=24g,memory-swap=24g,cpu-quota=200000,cpu-period=100000,restart-policy=no",
+                        "remote",
+                        "docker-container://" + CONTAINER,
                     ]
                 )
             run(["docker", "buildx", "inspect", BUILDER, "--bootstrap"])
@@ -181,7 +233,7 @@ def main():
             # Check the actual worker RUN environment without importing a CUDA
             # library or issuing any GPU operation. Device entitlement is disabled.
             base = inputs["base_image"]
-            probe = f"FROM {base}\nRUN python3 -c \"import glob; p=glob.glob('/dev/nvidia*')+glob.glob('/dev/nvhost*')+glob.glob('/dev/dri/*'); print('GPU device paths:',p); assert not p\"\n"
+            probe = f"FROM {base}\nRUN python3 -c \"import glob; p=glob.glob('/dev/nvidia*')+glob.glob('/dev/nvhost*')+glob.glob('/dev/dri/*')+glob.glob('/dev/nvmap')+glob.glob('/dev/nvgpu*'); print('GPU device paths:',p); assert not p\"\n"
             (out / "device-probe.Dockerfile").write_text(probe)
             probe_context = out / "probe-context"
             probe_context.mkdir()
@@ -253,6 +305,14 @@ def main():
             receipt["error"] = f"{type(error).__name__}: {error}"
             raise
         finally:
+            if owned_builder:
+                stopped = subprocess.run(
+                    ["docker", "stop", CONTAINER],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
+                receipt["builder_stop_exit"] = stopped.returncode
             receipt["ended"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             save()
     print(json.dumps(receipt, indent=2))
