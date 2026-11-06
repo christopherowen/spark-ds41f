@@ -212,3 +212,12 @@ full-graph and drafter evidence at each requested live shape. It does not claim
 that its existing mode fields expose padded capture sizes. The latest bounded
 CPU preflight is 54 passed, with clean lint, configuration validation and
 `git diff --check`; earlier unsuccessful preflights remain recorded.
+
+The immutable image was subsequently streamed from SP8 to DGX4, without a
+workstation archive. Both endpoints recorded 10,347,186,017 compressed bytes
+and SHA-256 `699f1bcf829764f677d16c954027f1b2483977e391b8d9bc02eecbb8a1e15ef8`.
+DGX4 retained the same image ID. Static validation confirmed exact ordered
+layers, runtime configuration, source labels and clean prepared source, and
+accepted only qualification/evidence changes after the build commit.
+`runs/image-transfer-1/` preserves the commands, stream receipts, loader logs
+and validation record. No GPU operation was run by this transfer or validation.
