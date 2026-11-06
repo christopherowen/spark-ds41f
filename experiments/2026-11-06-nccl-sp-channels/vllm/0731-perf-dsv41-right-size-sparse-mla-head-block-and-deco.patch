@@ -1,0 +1,159 @@
+From ec74bbbca3ada2b879024b1d8c4703e152f789ed Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 08:30:00 +0000
+Subject: [PATCH] perf(dsv41): right-size sparse-MLA head block and
+ multi-segment decode wave bound
+
+Cap SparseMlaV41Plan.routes block_H to the 16-head MMA multiple covering local
+heads and scale threads accordingly so 16-head ranks (TP3 rank 2 after
+_trim_padded_groups and all TP4 ranks) run extend and decode with a 16-head,
+128-thread CTA instead of padding to 32 heads and 256 threads and discarding
+half the warps. Add an explicit skip_inactive flag on sparse_mla_fwd_v41 so
+multi-wave decode still skips inactive segments and dead rows when block_H is
+16 while single-wave split remains branch-free. On multi-segment indexed
+layers, keep segment-split decode until unsplit extend fills a full wave of SMs
+(rows <= sms // head_blocks = 48 on GB10) while leaving single-segment SWA
+layers unchanged.
+
+Base: 1107 patch head c47b54ae471a24b830e3515212b8c0bf5ee14604, tree
+13e4781d19bc4a18b0d3d4daad7921c465e3355e, on upstream
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Quality: 100% bit-identical output and exact precision preserved. segment_chunks
+(4), block_I (32), FP32 accumulators, FOLD rounding order, and wo_input rotation
+and quantization are unchanged. Peak workspace memory across target and drafter
+lanes is unchanged.
+Tests: test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves and
+offline SM121 TileLang lowering + PDL verification across all 12 route variants.
+Upstream status: prepared for review against the pinned candidate source; not
+submitted to the canonical upstream and not promoted.
+---
+ .../attention/test_deepseek_v41_tilelang.py   | 48 +++++++++++++++++--
+ .../deepseek_v4_1/tilelang/sparse_mla.py      | 16 +++++--
+ 2 files changed, 56 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index fa520df76..3502cc819 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1220,9 +1220,9 @@ def _wo_input_kernel(heads: int, block_heads: int, threads: int):
+     return kernel
+ 
+ 
+-# The extend kernel's head block (32 heads, 256 threads) and the decode merge's (one
+-# head, 128 threads).
+-@pytest.mark.parametrize(("block_heads", "threads"), [(32, 256), (1, 128)])
++# The extend kernel's head blocks (16 heads / 128 threads, 32 heads / 256 threads)
++# and the decode merge's (one head, 128 threads).
++@pytest.mark.parametrize(("block_heads", "threads"), [(16, 128), (32, 256), (1, 128)])
+ def test_wo_input_is_the_reference_rotation_and_act_quant(block_heads, threads):
+     """The sparse MLA's output store gives WO-A's input bit for bit as the reference
+     prepares it: TileKernels' inverse rotation in BF16, then per_token_cast's values
+@@ -1244,3 +1244,45 @@ def test_wo_input_is_the_reference_rotation_and_act_quant(block_heads, threads):
+     want = wo_input_reference(o, positions, table)
+     differ = int((out.view(torch.int16) != want.view(torch.int16)).sum())
+     assert differ == 0, f"{differ} of {out.numel()} values differ from the reference"
++
++
++def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypatch):
++    """16-head ranks (TP3 rank 2 and TP4) use a 16-head, 128-thread block in extend
++    and decode instead of padding to 32 heads / 256 threads, and multi-segment layers
++    keep segment-split decode until unsplit extend fills one wave of SMs."""
++    from types import SimpleNamespace
++
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda _device: SimpleNamespace(multi_processor_count=48),
++    )
++    r16 = SparseMlaV41Plan.routes(16, 128, 512, 128, swa_page_size=128, max_rows=2048)
++    assert r16.segments == 5
++    assert r16.split_max_rows == 9
++    assert r16.decode_max_rows == 48
++    assert r16.kernels["extend"][2]["block_H"] == 16
++    assert r16.kernels["extend"][2]["threads"] == 128
++    assert r16.kernels["decode"][2]["block_H"] == 16
++    assert r16.kernels["decode"][2]["threads"] == 128
++    assert r16.kernels["decode"][2].get("skip_inactive", True) is True
++    assert r16.kernels["split"][2]["block_H"] == 16
++    assert r16.kernels["split"][2]["threads"] == 128
++    assert r16.kernels["split"][2]["skip_inactive"] is False
++
++    r24 = SparseMlaV41Plan.routes(24, 128, 512, 128, swa_page_size=128, max_rows=2048)
++    assert r24.segments == 5
++    assert r24.split_max_rows == 4
++    assert r24.decode_max_rows == 48
++    assert r24.kernels["extend"][2]["block_H"] == 32
++    assert r24.kernels["extend"][2]["threads"] == 256
++    assert r24.kernels["decode"][2]["block_H"] == 32
++    assert r24.kernels["decode"][2]["threads"] == 256
++    assert r24.kernels["split"][2]["block_H"] == 16
++    assert r24.kernels["split"][2]["threads"] == 128
++    assert r24.kernels["split"][2]["skip_inactive"] is False
++
++    swa24 = SparseMlaV41Plan.routes(24, 128, 0, 128, swa_page_size=128, max_rows=2048)
++    assert swa24.segments == 1
++    assert swa24.split_max_rows == 24
++    assert swa24.decode_max_rows == 144
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index ea0291388..85ddf129c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -138,6 +138,7 @@ def sparse_mla_fwd_v41(
+     block_I: int = 32,
+     threads: int = 256,
+     segment_chunks: int = SEGMENT_CHUNKS,
++    skip_inactive: bool = True,
+ ):
+     """Build one schedule of the sparse MLA kernel.
+ 
+@@ -569,7 +570,7 @@ def sparse_mla_fwd_v41(
+             alpha = T.alloc_fragment([block_H], accum_dtype)
+             row_sum = T.alloc_fragment([block_H], accum_dtype)
+ 
+-            if True if block_H < 32 else seg_active(seg, SwaLengths, IdxLengths, row):
++            if not skip_inactive or seg_active(seg, SwaLengths, IdxLengths, row):
+                 for c in T.serial(G):
+                     chunk = seg * G + c
+                     if not idx_blocks:
+@@ -658,9 +659,9 @@ def sparse_mla_fwd_v41(
+             L = 1.0
+             T.clear(o)
+             pdl.chain()
+-            if True if block_H < 32 else row_active(SwaLengths, IdxLengths, rc):
++            if not skip_inactive or row_active(SwaLengths, IdxLengths, rc):
+                 for c in T.unroll(segments):
+-                    if True if block_H < 32 else seg_active(c, SwaLengths, IdxLengths, rc):
++                    if not skip_inactive or seg_active(c, SwaLengths, IdxLengths, rc):
+                         m_new = T.max(M, PartialStats[rc, c, hc, 0])
+                         a = T.exp2(M - m_new)
+                         b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
+@@ -886,12 +887,16 @@ class SparseMlaV41Plan:
+             segment_chunks=segment_chunks,
+             swa_page_size=swa_page_size,
+         )
++        block_H = min(block_H, tilelang.cdiv(heads, 16) * 16)
++        threads = min(threads, 32 * min(8, (block_H // 16) * (block_I // 8)))
++        head_blocks = tilelang.cdiv(heads, block_H)
+         chunks = tilelang.cdiv(swa_width, block_I) + tilelang.cdiv(idx_width, block_I)
+         segments = tilelang.cdiv(chunks, segment_chunks)
+         sms = torch.cuda.get_device_properties(device).multi_processor_count
+         if decode_max_rows is None:
+-            decode_max_rows = (
+-                DECODE_MAX_WAVES * sms // (segments * tilelang.cdiv(heads, block_H))
++            decode_max_rows = max(
++                DECODE_MAX_WAVES * sms // (segments * head_blocks),
++                sms // head_blocks if segments > 1 else 0,
+             )
+         if split_max_rows is None:
+             split_max_rows = (
+@@ -929,6 +934,7 @@ class SparseMlaV41Plan:
+                 "decode",
+                 block_H=split_block_H,
+                 threads=split_threads,
++                skip_inactive=False,
+                 **config,
+             )
+         return SimpleNamespace(
+-- 
+2.43.0
+
