@@ -1,11 +1,130 @@
 # Verification row-cost hardware qualification
 
-Base: `6d152f4a15ed539f402fc264bc089cf77f4f94fb`. The owner authorized hardware
-testing on 2026-11-06, including coordinated replacement and restoration. This
-extends the offline `2026-11-05-verification-budget-replay` experiment. No
-speedup is claimed. The first candidate boot failed its declared sampled
-batch-invariance gate before any throughput measurement; see the retained result
-below. The row-cost alternatives remain unqualified.
+Base: `6d152f4a15ed539f402fc264bc089cf77f4f94fb` (rebased onto `main`
+`297c0663e0d9a385f99220364702ab61b08ba359` at `d2e6fa5d932007a24c9ef146927a0accbf98d888`).
+The owner authorized hardware testing on 2026-11-06, including coordinated
+replacement and restoration. This extends the offline
+`2026-11-05-verification-budget-replay` experiment. **Decision: retain the
+promoted `adaptive_verification_row_cost = 0.035` policy; no runtime or
+configuration change is proposed.** In the live TP3 hardware screen on
+`dgx1–3`, lowering `adaptive_verification_row_cost` from `0.035` (`control035-a`,
+window `dgx1-1793961102`) to `0.01` (`row010-a`, window `dgx1-1793958294`)
+passed all five functional gates with byte-identical temperature-0 and
+tool/schema digests across arms, admitted `+28.6%` / `+28.1%` more draft tokens
+per draft event at `c8` / `c16` (`1.950 -> 2.508` / `1.957 -> 2.506`), reduced
+step rate by `-8.10%` / `-8.23%` (`9.830 -> 9.033` / `9.847 -> 9.037 steps/s`),
+and regressed net serving throughput at `c4` (`-0.61%`, `125.74 -> 124.98 tok/s`),
+`c8` (`-1.24%`, `163.49 -> 161.47 tok/s`), and `c16` (`-1.17%`,
+`163.52 -> 161.61 tok/s`) along with higher TTFT and TPOT latencies.
+
+## Live TP3 hardware screen: `row010-a` (`0.01`) vs `control035-a` (`0.035`)
+
+After merging PR #934 (`spark_ds41f/functional_evidence.py` and
+`sampled_digest.py --record-dir`) at commit
+`d2e6fa5d932007a24c9ef146927a0accbf98d888` and verifying the 2-boot single-GPU
+container check on `sp8` (`experiments/2026-11-05-verification-budget-replay/runs/sp8-gpu-2boot-c3/summary.json`),
+two node-scoped TP3 windows (`pool: dgx-triangle`, `nodes: ["dgx1", "dgx2", "dgx3"]`)
+executed the first two screen arms (`row010-a` and `control035-a`) on `dgx1–3`:
+
+1. **Window `dgx1-1793958294` (`row010-a`, `adaptive_verification_row_cost = 0.01`)**:
+   - Exported receipt: `runs/hardware-dgx1-1793958294/` (77 native files recorded
+     in `source-receipt.json`; 44 summary/gate/handoff files exported).
+   - Startup took 116.6 s; minimum available memory during startup was
+     `6.933 / 10.151 / 10.238 GiB` on `dgx1 / dgx2 / dgx3`.
+   - All five predeclared functional gates passed (`greedy`, `greedy-fast`,
+     `sampled`, `controls`, `tool-schema`). In `sampled`, all 8 isolated repeats
+     matched (`differing: []`, `reference_sha256 == isolated_repeat_sha256 ==
+     469dd2a888bb65e21ab334e2a0981a5ba782f917e58412526bb4e52c58213836`), while
+     `observed_c8` recorded cases `[0, 2, 3, 4, 6]` with 24 per-case private
+     request files verified by `row010-a-sampled.requests/manifest.json`
+     (`3ed43759445392505e4774fa3501d25d69b5b1950812fa0d887729def0ba0923`).
+   - Completed `screen-suite` (`model`, `c1`, `c4`, `c8`, `c16`) with zero failed
+     requests, zero foreign requests, zero thermal slowdown (`0.0 ms`), zero
+     power cap (`0.0 ms`), zero swap growth (`0.0 GiB`), and minimum available
+     memory `6.07 / 9.63 / 9.56 GiB` on `dgx1 / dgx2 / dgx3`.
+   - At the `row010-a` arm boundary, a short `nccl-sp-channels` request arrived;
+     the controller yielded cleanly, synchronized `dgx1–3` back to
+     `2c4b23afcd834ba2adf6a15ca434e59fa4f49f74`, restored `C36`, verified live
+     doctor, and closed the window.
+
+2. **Window `dgx1-1793961102` (`control035-a`, `adaptive_verification_row_cost = 0.035`)**:
+   - Resumed from `dgx1-1793958294/screen/receipt.json` (`sha256:
+     e00a6d2007b15bc79f9a7882f9c54f30062e911eb9414cf282bdccdb9e821c07`) at the
+     identical commit `d2e6fa5d932007a24c9ef146927a0accbf98d888`.
+   - Exported receipt: `runs/hardware-dgx1-1793961102/` (77 native files recorded
+     in `source-receipt.json`; 44 summary/gate/handoff files exported).
+   - Startup took 117.3 s; minimum available memory during startup was
+     `6.676 / 10.100 / 8.843 GiB` on `dgx1 / dgx2 / dgx3`.
+   - All five predeclared functional gates passed (`greedy`, `greedy-fast`,
+     `sampled`, `controls`, `tool-schema`). Every deterministic signature matched
+     `row010-a` byte-for-byte (`greedy` `reference_sha256 =
+     9d88fc72428ecc9de74a5931400ff4dea5ae1a17a047c4dceabd759a8f3a8736`,
+     `long_sha256 = a7a87615853db0bb6e9814f63427c1dec8a92f57d4c7ee2a1ca2603257c8c6d7`,
+     `greedy-fast` text hashes `4d143977...` and `12fd8257...`, all 10
+     deterministic `controls` digests, and all 12 `tool-schema` digests plus
+     `invalid_request_status = 400`). In `sampled`, all 8 isolated repeats
+     matched (`differing: []`, `reference_sha256 == isolated_repeat_sha256 ==
+     fffc1214059b1e39326d962bdad214335683a0b2ccd681df0b133ca82085b291`), while
+     `observed_c8` recorded `[0, 1, 2, 3, 4, 5, 6, 7]` with 24 per-case private
+     request files verified by `control035-a-sampled.requests/manifest.json`
+     (`1fa8c7dfc416bd013c82ee0ad2217872a89f34eca58d9346677ec091ddebbb0a`).
+   - Completed `screen-suite` (`model` scoring against `row010-a`'s corpus, plus
+     `c1`, `c4`, `c8`, `c16`) with zero failed requests, zero foreign requests,
+     zero thermal slowdown (`0.0 ms`), zero power cap (`0.0 ms`), zero swap
+     growth (`0.0 GiB`), and minimum available memory `5.73 / 9.59 / 9.55 GiB`
+     on `dgx1 / dgx2 / dgx3`.
+   - Stopped cleanly at the `control035-a` arm boundary via coordinator handoff,
+     synchronized `dgx1–3` back to `2c4b23afcd834ba2adf6a15ca434e59fa4f49f74`,
+     restored `C36`, verified live doctor, and closed the window.
+
+### Screen comparison table (`control035-a` `0.035` vs `row010-a` `0.01`)
+
+| Metric | `control035-a` (`0.035`, before) | `row010-a` (`0.01`, after) | Absolute delta | % delta | 95% CI (before / after) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `model` acceptance length | 2.2411 | 2.2712 | +0.0301 | +1.34% | deterministic (128 prompts) |
+| `model` outputs SHA-256 | `64f96079b0a3...` | `64f96079b0a3...` | identical | 0.00% | rank1 `1.0`, ppl `1.316431` |
+| `c1` output throughput (`tok/s`) | 65.34 | 66.07 | +0.73 | +1.12% | ±1.60 (±2.45%) / ±1.76 (±2.67%) |
+| `c1` step rate (`steps/s`) | 29.047 | 28.773 | -0.273 | -0.94% | 10 x 30 s windows |
+| `c1` output `tok/step` | 2.2510 | 2.2985 | +0.0475 | +2.11% | ±4.09% |
+| `c1` drafted / accepted per draft | 3.0576 / 1.2509 | 3.7289 / 1.2984 | +0.6713 / +0.0475 | +21.96% / +3.80% | ±2.90% / ±7.29% |
+| `c1` TTFT p50 / p99 (`ms`) | 143.10 / 178.55 | 142.89 / 181.43 | -0.21 / +2.88 | -0.15% / +1.61% | 76 / 77 requests, 0 failed |
+| `c1` TPOT p50 / p99 (`ms`) | 15.222 / 18.792 | 15.001 / 18.761 | -0.221 / -0.031 | -1.45% / -0.16% | 76 / 77 requests, 0 failed |
+| `c4` output throughput (`tok/s`) | **125.74** | 124.98 | **-0.76** | **-0.61%** | ±1.39 (±1.11%) / ±1.41 (±1.12%) |
+| `c4` step rate (`steps/s`) | 14.453 | 13.853 | -0.600 | -4.15% | 10 x 30 s windows |
+| `c4` output `tok/step` | 8.7058 | 9.0283 | +0.3225 | +3.70% | 10 x 30 s windows |
+| `c4` drafted / accepted per draft | 2.2621 / 1.2885 | 2.9215 / 1.3070 | +0.6594 / +0.0185 | +29.15% / +1.44% | 10 x 30 s windows |
+| `c4` TTFT p50 / p99 (`ms`) | **248.59 / 302.37** | 254.91 / 322.05 | +6.32 / +19.68 | +2.54% / +6.51% | 148 / 147 requests, 0 failed |
+| `c4` TPOT p50 / p99 (`ms`) | 31.668 / 42.185 | 31.685 / 40.823 | +0.017 / -1.362 | +0.05% / -3.23% | 148 / 147 requests, 0 failed |
+| `c8` output throughput (`tok/s`) | **163.49** | 161.47 | **-2.02** | **-1.24%** | ±1.36 (±0.83%) / ±1.50 (±0.93%) |
+| `c8` step rate (`steps/s`) | 9.830 | 9.033 | -0.797 | -8.10% | 10 x 30 s windows |
+| `c8` output `tok/step` | 16.6490 | 17.8942 | +1.2452 | +7.48% | 10 x 30 s windows |
+| `c8` drafted / accepted per draft | 1.9502 / 1.3077 | 2.5080 / 1.3024 | +0.5578 / -0.0053 | +28.60% / -0.41% | 10 x 30 s windows |
+| `c8` TTFT p50 / p99 (`ms`) | **349.58 / 419.99** | 365.05 / 439.14 | +15.47 / +19.15 | +4.43% / +4.56% | 194 / 190 requests, 0 failed |
+| `c8` TPOT p50 / p99 (`ms`) | **48.055 / 65.175** | 48.875 / 66.154 | +0.820 / +0.979 | +1.71% / +1.50% | 194 / 190 requests, 0 failed |
+| `c16` output throughput (`tok/s`) | **163.52** | 161.61 | **-1.91** | **-1.17%** | ±1.29 (±0.79%) / ±1.29 (±0.80%) |
+| `c16` step rate (`steps/s`) | 9.847 | 9.037 | -0.810 | -8.23% | 10 x 30 s windows |
+| `c16` output `tok/step` | 16.6209 | 17.9027 | +1.2818 | +7.71% | 10 x 30 s windows |
+| `c16` drafted / accepted per draft | 1.9568 / 1.3087 | 2.5062 / 1.3016 | +0.5494 / -0.0071 | +28.08% / -0.54% | 10 x 30 s windows |
+| `c16` TTFT p50 / p99 (`ms`) | **13035.17 / 15521.85** | 13182.28 / 15630.57 | +147.11 / +108.72 | +1.13% / +0.70% | 193 / 191 requests, 0 failed |
+| `c16` TPOT p50 / p99 (`ms`) | **48.621 / 64.614** | 48.949 / 67.354 | +0.328 / +2.740 | +0.67% / +4.24% | 193 / 191 requests, 0 failed |
+
+### Causal interpretation and conclusion
+
+Lowering `adaptive_verification_row_cost` from `0.035` to `0.01` admits
+`+0.55` to `+0.67` additional low-confidence draft tokens per draft event across
+`c1/c4/c8/c16`. At `c8` and `c16`, those marginal third-draft admissions do not
+increase `accepted_per_draft` (`1.3077 -> 1.3024` at `c8`; `1.3087 -> 1.3016` at
+`c16`), while the extra verification rows reduce target step rate by `-8.10%`
+and `-8.23%`, causing net serving throughput to drop by `-1.24%` (`-2.02 tok/s`)
+at `c8` and `-1.17%` (`-1.91 tok/s`) at `c16` and increasing both TTFT and TPOT
+p50/p99 latencies. Even at `c4`, where `accepted_per_draft` rises slightly
+(`1.2885 -> 1.3070`, `+1.44%`), the `-4.15%` step-rate penalty dominates and net
+throughput drops by `-0.61%` (`-0.76 tok/s`). This directly confirms on live TP3
+hardware the conclusion of `experiments/2026-11-05-verification-budget-replay/`:
+the current `adaptive_verification_row_cost = 0.035` parameter already sits at
+the empirical trade-off boundary where marginal verification row cost matches
+marginal draft survival. Remaining screen arms and qualification stages are
+therefore skipped to preserve cluster time, and `0.035` is retained.
 
 ## First hardware result: required sampled gate failed
 
@@ -265,7 +384,11 @@ provisioned independent CPU client: do not squeeze a 12-GiB client into the
 TP3 head's serving memory margin. Prepare and validate that stage only after
 a promising screen, with the same corpus/revision/seed for before and after.
 
-The final evidence table must include metric, before, after, absolute and
-percentage delta, 95% interval, and native receipt links. CPU/offline results
-remain separately labelled. Until actual hardware runs finish, the status is
-preparation or pending shared-window access, never a proved improvement.
+The screen comparison table above records metric, before (`control035-a`,
+`runs/hardware-dgx1-1793961102/`), after (`row010-a`,
+`runs/hardware-dgx1-1793958294/`), absolute and percentage delta, 95% interval,
+and native receipt identities, with the 2-boot `sp8` single-GPU verification
+labelled separately (`experiments/2026-11-05-verification-budget-replay/runs/sp8-gpu-2boot-c3/`).
+Because `row010-a` (`0.01`) regressed serving throughput and latency at
+`c4/c8/c16` relative to `control035-a` (`0.035`), the screen concludes with
+`adaptive_verification_row_cost = 0.035` retained and no runtime config change.

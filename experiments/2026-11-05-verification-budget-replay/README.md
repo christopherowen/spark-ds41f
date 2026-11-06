@@ -228,7 +228,20 @@ trace inputs and boundary costs on the same source, then separate boot/repeat
 serving tests at c1/c4/c8/c16 and scored agent traffic. A trace-only run must not
 be used for timing, and any serving replacement still requires authorization.
 
-The owner supplied that hardware-testing authorization on 2026-11-06. The
+The owner supplied that hardware-testing authorization on 2026-11-06. Before the
+TP3 serving screen on `dgx1–3`, a 2-boot single-GPU container verification ran on
+`sp8` (`NVIDIA GB10`) under a node-scoped hold (`pool: sp8-single`, `nodes: ["sp8"]`)
+at commit `d2e6fa5d932007a24c9ef146927a0accbf98d888` using image
+`spark-ds41f:candidate-38` (`213ba4df68d0`, identical `adaptive_verification.py`
+SHA-256 `54c2e186cdc17aea950d3f8d6549b1f463cc780c836dac75f6c33eaf9d45c7d1`); see
+`runs/sp8-gpu-2boot-c3/summary.json`. Across both fresh container boots (`boot-1`:
+14.33 s, 27,588 KiB max host RSS, zero swaps; `boot-2`: 14.05 s, 27,588 KiB max
+host RSS, zero swaps), the live GPU `AdaptiveVerificationManager` TileLang kernels
+(`assign_draft_budget`, `fill_rows`, `adaptive_offsets`), all 42 unit and contract
+tests (`test_audit.py`, `test_replay.py`, `test_runner.py`,
+`test_functional_evidence.py`), and the `audit.py` / `replay.py` receipts matched
+with byte-identical SHA-256 digests (`da24920094a1a8a5911b14fb7c2de2c514680b88faa35a00e6726fe8d88d7905`
+and `45e7c9aac358f7756c3e25b7ebffdfeff1dd5f5daed452ee0c9598238898c870`). The
 separate `experiments/2026-11-06-verification-budget-hardware/` directory holds
-the one-variable runtime profiles and guarded execution plan. This offline
-record remains unchanged evidence; hardware results are pending there.
+the one-variable TP3 runtime profiles, guarded execution runner, and live TP3
+hardware screen receipts.

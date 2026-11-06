@@ -1,0 +1,57 @@
+profile: experiments/2026-11-06-verification-budget-hardware/control.json on dgx1, dgx2, dgx3
+live:    running: 3 nodes, TP3, context 1,048,576, KV 4.9 GiB, image spark-ds41f:candidate-36, started from experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json
+plan:    3 nodes, TP3, context 1,048,576, KV 4.9 GiB, image spark-ds41f@sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82
+shape:   unchanged
+start plan (fail-closed startup memory guards):
+  dgx2: pre-arm startup memguard, launch rank 1
+  dgx3: pre-arm startup memguard, launch rank 2
+  dgx1: pre-arm startup memguard, launch rank 0
+  wait for API/JIT readiness, then switch every node to steady memguard
+preflight: clean
+plan only; pass --apply to start the cluster (--verbose prints each docker command)
+
+fan curve: dgx1 already running, dgx2 already running, dgx3 started
+fan curve: stopped on dgx3
+RuntimeError: handoff requested after completed arm
+live: running: 3 nodes, TP3, context 1,048,576, KV 4.9 GiB, image spark-ds41f@sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82, started from experiments/2026-11-06-verification-budget-hardware/control.json
+dgx1: stop exact container spark-ds41f and stop its memguard
+dgx2: stop exact container spark-ds41f and stop its memguard
+dgx3: stop exact container spark-ds41f and stop its memguard
+plan only; pass --apply to stop the cluster
+
+dgx1: fetch origin and detach /home/swank/projects/spark-ds41f at 2c4b23afcd834ba2adf6a15ca434e59fa4f49f74
+dgx2: fetch origin and detach /home/swank/projects/spark-ds41f at 2c4b23afcd834ba2adf6a15ca434e59fa4f49f74
+dgx3: fetch origin and detach /home/swank/projects/spark-ds41f at 2c4b23afcd834ba2adf6a15ca434e59fa4f49f74
+image: then copy the one experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json names at 2c4b23afcd834ba2adf6a15ca434e59fa4f49f74 from this host to every node whose copy differs
+plan only; pass --apply to synchronize
+
+2026-11-06T11:12:16Z closing window (verification budget finished)
+2026-11-06T11:12:25Z start experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json
+profile: experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json on dgx1, dgx2, dgx3
+live:    stopped: 3 nodes, TP3, context 1,048,576, KV 4.9 GiB, image spark-ds41f@sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82, started from experiments/2026-11-06-verification-budget-hardware/control.json
+plan:    3 nodes, TP3, context 1,048,576, KV 4.9 GiB, image spark-ds41f:candidate-36
+shape:   unchanged
+start plan (fail-closed startup memory guards):
+  dgx2: pre-arm startup memguard, launch rank 1
+  dgx3: pre-arm startup memguard, launch rank 2
+  dgx1: pre-arm startup memguard, launch rank 0
+  wait for API/JIT readiness, then switch every node to steady memguard
+dgx1: MemAvailable 116.2 GiB after the old engine stopped
+dgx2: MemAvailable 117.6 GiB after the old engine stopped
+dgx3: MemAvailable 117.7 GiB after the old engine stopped
+dgx2: startup memguard active for spark-ds41f (threshold 5 GiB, interval 0.25s, no warn line, mode prelaunch)
+dgx3: startup memguard active for spark-ds41f (threshold 5 GiB, interval 0.25s, no warn line, mode prelaunch)
+dgx2: launched 48fe53378f44a2bbe94b819dcfb7878ddc6815cc8c6f006d122afa63c876443a (+5.5s)
+dgx3: launched a36edaf2e943aa76fe3d9dcfff6e2321d415144d3e5f910e58af7e74b1908398 (+5.5s)
+dgx1: startup memguard active for spark-ds41f (threshold 5 GiB, interval 0.25s, no warn line, mode prelaunch)
+dgx1: launched 673ff633617097da5e3deb7061c3a71a690d3b85b0253395c35a37689b17a212 (+5.9s)
+waiting up to 3600s for dgx1 API readiness
+API ready; JIT/autotuning startup has completed
+API ready at +99.8s
+dgx3: steady memguard active for spark-ds41f (threshold 3 GiB, interval 2s, no warn line, mode running)
+dgx2: steady memguard active for spark-ds41f (threshold 3 GiB, interval 2s, no warn line, mode running)
+dgx1: steady memguard active for spark-ds41f (threshold 3 GiB, interval 2s, no warn line, mode running)
+cluster ready; memory guards are active on all nodes (+100.1s)
+2026-11-06T11:14:11Z boot tp3-dev.json: ready +100.1 s, command 106 s
+2026-11-06T11:14:20Z doctor --live OK
+2026-11-06T11:14:20Z window closed; hold removed
